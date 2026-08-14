@@ -13,21 +13,19 @@
 //!
 //! Per-object value serialization is not part of this boundary — qpdf
 //! delegates it to `QPDFObjectHandle::writeJSON`, whose flpdf counterpart is
-//! still in [`crate::json_inspect`]. Per-stream serialization
-//! (`QPDF_Stream::writeStreamJSON`) is not separated either: it stays inlined
-//! in the object-entry writers below, because the entry writers derive the
-//! emitted stream dictionary before writing the object key and moving that
-//! derivation behind a call boundary would change which bytes reach the sink
-//! when the conversion fails.
+//! on [`ObjectHandle`]. Per-stream serialization is likewise delegated to the
+//! canonical `ObjectHandle::write_stream_json` port of
+//! `QPDF_Stream::writeStreamJSON` (`libqpdf/QPDF_Stream.cc:207-295`); this
+//! module retains only object-map framing and side-file ownership.
 
 use crate::json::Json;
 use crate::json_inspect::{
-    normalized_emitted_stream_dict, ordered_qpdf_dict, qpdf_resolve_top_level_object,
-    side_file_io_error, stream_payload_with_decode_status, ConvertError, DecodeLevel,
-    JsonObjectSelector, JsonOutputError, StreamDataMode,
+    side_file_io_error, ConvertError, DecodeLevel, JsonObjectSelector, JsonOutputError,
+    StreamDataMode,
 };
-use crate::object::{Object, ObjectRef, Stream};
-use crate::object_handle::ObjectHandle;
+use crate::object::ObjectRef;
+use crate::object_handle::{ObjectHandle, QpdfStreamJsonData};
+use crate::pipeline::buffer::Buffer;
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PlStdioFile};
 use crate::Pdf;
@@ -168,7 +166,7 @@ pub fn write_json_key<R: Read + Seek>(
                 pdf,
                 &handle,
                 decode_level,
-                NonFileStreamDataMode::None,
+                QpdfStreamJsonData::None,
                 out,
                 &mut objects_first,
             ),
@@ -176,7 +174,7 @@ pub fn write_json_key<R: Read + Seek>(
                 pdf,
                 &handle,
                 decode_level,
-                NonFileStreamDataMode::Inline,
+                QpdfStreamJsonData::Inline,
                 out,
                 &mut objects_first,
             ),
@@ -232,16 +230,20 @@ fn trailer_selected(selectors: &[JsonObjectSelector]) -> bool {
             .any(|selector| matches!(selector, JsonObjectSelector::Trailer))
 }
 
-pub(crate) enum NonFileStreamDataMode {
-    None,
-    Inline,
+fn stream_decode_level(level: DecodeLevel) -> crate::writer::DecodeLevel {
+    match level {
+        DecodeLevel::None => crate::writer::DecodeLevel::None,
+        DecodeLevel::Generalized => crate::writer::DecodeLevel::Generalized,
+        DecodeLevel::Specialized => crate::writer::DecodeLevel::Specialized,
+        DecodeLevel::All => crate::writer::DecodeLevel::All,
+    }
 }
 
 fn write_non_file_mode_object_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
     decode_level: DecodeLevel,
-    stream_mode: NonFileStreamDataMode,
+    stream_mode: QpdfStreamJsonData,
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
@@ -263,45 +265,30 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
         .resolve_object_handle_to_terminal(handle)
         .map_err(ConvertError::from)?;
     if handle.type_code() == 10 {
-        // Stream payload/retry behavior remains the QPDF_Stream::writeStreamJSON
-        // boundary owned by flpdf-3yn9.9. Keep that narrow legacy adapter until
-        // the stream consumer moves, while non-stream values use the canonical
-        // ObjectHandle writer below.
-        let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
-            return Err(ConvertError::PdfError(
-                "canonical stream handle has no legacy stream payload".to_string(),
-            )
-            .into());
-        };
-        {
-            let (data, dict) = match stream_mode {
-                NonFileStreamDataMode::None => (None, ordered_qpdf_dict(pdf, &stream.dict)?),
-                NonFileStreamDataMode::Inline => {
-                    let payload = stream_payload_with_decode_status(&stream, decode_level);
-                    let dict = normalized_emitted_stream_dict(&stream, payload.decode_succeeded);
-                    let ordered = ordered_qpdf_dict(pdf, &dict)?;
-                    let bytes = payload.bytes.into_owned();
-                    (
-                        Some(Json::make_blob(move |sink| sink.write(&bytes))),
-                        ordered,
-                    )
-                }
-            };
+        // The former split consumer resolved and converted the complete
+        // stream value before it wrote the object key. Keep that established
+        // failure prefix while routing the conversion itself through the
+        // canonical ObjectHandle writer.
+        let mut stream_value = Buffer::new("stream JSON", None);
+        handle.write_stream_json(
+            SUPPORTED_JSON_VERSION,
+            &mut stream_value,
+            stream_mode,
+            stream_decode_level(decode_level),
+            None,
+            "",
+            false,
+            4,
+        )?;
+        stream_value.finish()?;
+        let stream_value = stream_value.take_buffer()?;
 
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
-            let mut stream_first = true;
-            Json::write_dictionary_open(out, &mut stream_first, 4)?;
-            if let Some(data) = data {
-                Json::write_dictionary_item(out, &mut stream_first, b"data", &data, 5)?;
-            }
-            Json::write_dictionary_key(out, &mut stream_first, b"dict", 5)?;
-            dict.write(out, 5)?;
-            Json::write_dictionary_close(out, stream_first, 4)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
+        Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+        let mut object_first = true;
+        Json::write_dictionary_open(out, &mut object_first, 3)?;
+        Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
+        out.write(&stream_value)?;
+        Json::write_dictionary_close(out, object_first, 3)?;
         return Ok(());
     }
 
@@ -328,26 +315,16 @@ fn write_file_mode_object_entry<R: Read + Seek>(
         .resolve_object_handle_to_terminal(handle)
         .map_err(ConvertError::from)?;
     if handle.type_code() == 10 {
-        // See the non-file writer: stream payload/datafile retry semantics are
-        // intentionally left to the following stream consumer slice.
-        let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
-            return Err(ConvertError::PdfError(
-                "canonical stream handle has no legacy stream payload".to_string(),
-            )
-            .into());
-        };
-        {
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
+        Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
+        let mut object_first = true;
+        Json::write_dictionary_open(out, &mut object_first, 3)?;
+        Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
 
-            let side_path = format_json_side_file_path(prefix, object_ref.number);
-            let mut side_file = File::create(&side_path)
-                .map_err(|source| side_file_io_error("open", &side_path, source))?;
-            write_json_stream_file(pdf, &stream, decode_level, &side_path, &mut side_file, out)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
+        let side_path = format_json_side_file_path(prefix, object_ref.number);
+        let mut side_file = File::create(&side_path)
+            .map_err(|source| side_file_io_error("open", &side_path, source))?;
+        write_json_stream_file(&handle, decode_level, &side_path, &mut side_file, out)?;
+        Json::write_dictionary_close(out, object_first, 3)?;
         return Ok(());
     }
 
@@ -374,9 +351,8 @@ fn write_non_stream_value_entry(
 ///
 /// The side file's terminal stage is finished explicitly before the file is
 /// closed, matching qpdf's side-file lifecycle.
-pub(crate) fn write_json_stream_file<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    stream: &Stream,
+pub(crate) fn write_json_stream_file(
+    handle: &ObjectHandle,
     decode_level: DecodeLevel,
     side_path: &str,
     side_file: &mut dyn Write,
@@ -384,36 +360,17 @@ pub(crate) fn write_json_stream_file<R: Read + Seek>(
 ) -> Result<(), JsonOutputError> {
     let mut buffered = StdioBuffer::new(side_file);
     let mut terminal = PlStdioFile::new("stream data", &mut buffered);
-    write_file_mode_stream_value(pdf, stream, decode_level, side_path, &mut terminal, out)?;
-    terminal.finish()?;
-    Ok(())
-}
-
-fn write_file_mode_stream_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    stream: &Stream,
-    decode_level: DecodeLevel,
-    side_path: &str,
-    side_file: &mut dyn Pipeline,
-    out: &mut dyn Pipeline,
-) -> Result<(), JsonOutputError> {
-    let payload = stream_payload_with_decode_status(stream, decode_level);
-    let mut stream_first = true;
-    Json::write_dictionary_open(out, &mut stream_first, 4)?;
-    Json::write_dictionary_item(
+    handle.write_stream_json(
+        SUPPORTED_JSON_VERSION,
         out,
-        &mut stream_first,
-        b"datafile",
-        &Json::make_string(side_path),
-        5,
+        QpdfStreamJsonData::File,
+        stream_decode_level(decode_level),
+        Some(&mut terminal),
+        side_path,
+        false,
+        4,
     )?;
-    side_file.write(payload.bytes.as_ref())?;
-
-    let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
-    let dict_json = ordered_qpdf_dict(pdf, &dict)?;
-    Json::write_dictionary_key(out, &mut stream_first, b"dict", 5)?;
-    dict_json.write(out, 5)?;
-    Json::write_dictionary_close(out, stream_first, 4)?;
+    terminal.finish()?;
     Ok(())
 }
 
@@ -422,11 +379,9 @@ fn write_file_mode_stream_value<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::Dictionary;
-    use crate::object_handle::ObjectValue;
     use crate::pipeline::test_support::{RecordingSink, TraceCall};
     use crate::pipeline::PlString;
-    use std::rc::Rc;
+    use crate::{Dictionary, Object, Stream};
 
     fn load_one_page_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -539,50 +494,56 @@ mod tests {
     }
 
     #[test]
-    fn stream_consumer_rejects_a_legacy_value_that_disagrees_with_the_canonical_stream() {
+    fn stream_decode_level_maps_all_qpdf_levels() {
+        assert_eq!(
+            stream_decode_level(DecodeLevel::None),
+            crate::writer::DecodeLevel::None
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::Generalized),
+            crate::writer::DecodeLevel::Generalized
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::Specialized),
+            crate::writer::DecodeLevel::Specialized
+        );
+        assert_eq!(
+            stream_decode_level(DecodeLevel::All),
+            crate::writer::DecodeLevel::All
+        );
+    }
+
+    #[test]
+    fn non_file_stream_conversion_failure_precedes_object_key() {
         let mut pdf = load_one_page_pdf();
-        let object_ref = ObjectRef::new(1, 0);
-        pdf.set_object(object_ref, Object::Integer(42));
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(b"/Bad", Object::Real(f64::NAN));
+        let object_ref = ObjectRef::new(7, 0);
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(stream_dict, Vec::new())),
+        );
         let handle = pdf.get_object_handle(object_ref);
-        handle.set_resolved(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(vec![]),
-            stream_data: Some(Rc::new(Vec::new())),
-            stream_provider: None,
-            stream_length: 0,
-        });
-
         let mut bytes = Vec::new();
-        let mut out = PlString::new("json", None, &mut bytes);
+        let mut output = PlString::new("json", None, &mut bytes);
         let mut objects_first = true;
-        let non_file_error = write_non_file_mode_object_entry(
-            &mut pdf,
-            &handle,
-            DecodeLevel::None,
-            NonFileStreamDataMode::None,
-            &mut out,
-            &mut objects_first,
-        )
-        .expect_err("non-file stream bridge must reject the mismatched legacy value");
-        assert!(matches!(
-            non_file_error,
-            JsonOutputError::Convert(ConvertError::PdfError(message))
-                if message == "canonical stream handle has no legacy stream payload"
-        ));
 
-        let file_error = write_file_mode_object_entry(
+        let error = write_non_file_mode_object_entry(
             &mut pdf,
             &handle,
             DecodeLevel::None,
-            "unused-prefix",
-            &mut out,
+            QpdfStreamJsonData::None,
+            &mut output,
             &mut objects_first,
         )
-        .expect_err("file stream bridge must reject the mismatched legacy value");
+        .expect_err("non-finite stream dictionary values must fail conversion");
+
         assert!(matches!(
-            file_error,
-            JsonOutputError::Convert(ConvertError::PdfError(message))
-                if message == "canonical stream handle has no legacy stream payload"
+            error,
+            JsonOutputError::Convert(ConvertError::NonFiniteFloat)
         ));
+        assert!(bytes.is_empty());
+        assert!(objects_first);
     }
 
     /// qpdf's replaced `qpdf_resolve_top_level_object` chased a
@@ -613,7 +574,7 @@ mod tests {
                 &mut pdf,
                 &handle,
                 DecodeLevel::None,
-                NonFileStreamDataMode::None,
+                QpdfStreamJsonData::None,
                 &mut out,
                 &mut objects_first,
             )
@@ -658,7 +619,7 @@ mod tests {
                 &mut pdf,
                 &handle,
                 DecodeLevel::None,
-                NonFileStreamDataMode::Inline,
+                QpdfStreamJsonData::Inline,
                 &mut out,
                 &mut objects_first,
             )
@@ -782,7 +743,7 @@ mod tests {
                 &mut pdf,
                 &handle,
                 DecodeLevel::None,
-                NonFileStreamDataMode::None,
+                QpdfStreamJsonData::None,
                 &mut out,
                 &mut objects_first,
             )
@@ -851,7 +812,7 @@ mod tests {
                 &mut pdf,
                 &handle,
                 DecodeLevel::None,
-                NonFileStreamDataMode::None,
+                QpdfStreamJsonData::None,
                 &mut out,
                 &mut objects_first,
             )
@@ -887,7 +848,7 @@ mod tests {
                 &mut pdf,
                 &handle,
                 DecodeLevel::None,
-                NonFileStreamDataMode::Inline,
+                QpdfStreamJsonData::Inline,
                 &mut out,
                 &mut objects_first,
             )

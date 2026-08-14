@@ -103,7 +103,7 @@ use crate::{
         count::Count,
         flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE},
         qpdf_tokenizer::QpdfTokenizer,
-        Pipeline, PipelineError, PipelineRef, PlString,
+        Discard, Pipeline, PipelineError, PipelineRef, PlString,
     },
     stream_filter::{
         decode_params_from_handle, normalize_filter_name, stream_filter_for, OwnedDecodePipeline,
@@ -111,7 +111,7 @@ use crate::{
     },
     writer::DecodeLevel,
 };
-use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
+use crate::{json::Json, Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -4464,6 +4464,161 @@ impl ObjectHandle {
         Ok(Rc::new(buffer.take_buffer()?))
     }
 
+    /// Write qpdf's extended stream JSON representation.
+    ///
+    /// This is `QPDF_Stream::writeStreamJSON`
+    /// (`libqpdf/QPDF_Stream.cc:207-295`), kept on the canonical stream handle
+    /// rather than split between a legacy `Object::Stream` payload reader and
+    /// a document-level dictionary writer. `json_data` matches qpdf's three
+    /// `qpdf_json_stream_data_e` values. The optional pipeline is the side-file
+    /// sink required by `File`; it is deliberately not the JSON output sink.
+    ///
+    /// The returned decode level is the effective level used after qpdf's
+    /// filtered-to-raw retry. Callers that do not need it may discard it, but
+    /// retaining it is what lets a future `getStreamJSON` facade attach an
+    /// inline blob to the exact successful decode level.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_stream_json(
+        &self,
+        json_version: i32,
+        out: &mut dyn Pipeline,
+        json_data: QpdfStreamJsonData,
+        mut decode_level: DecodeLevel,
+        pipeline: Option<&mut dyn Pipeline>,
+        data_filename: &str,
+        no_data_key: bool,
+        depth: usize,
+    ) -> std::result::Result<DecodeLevel, ObjectJsonError> {
+        if !matches!(json_version, 1 | 2) {
+            return Err(ObjectJsonError::UnsupportedVersion(json_version));
+        }
+
+        match json_data {
+            QpdfStreamJsonData::None | QpdfStreamJsonData::Inline if pipeline.is_some() => {
+                return Err(ObjectJsonError::Pdf(
+                    "QPDF_Stream::writeStreamJSON: pipeline should only be supplied when json_data is file"
+                        .to_owned(),
+                ));
+            }
+            QpdfStreamJsonData::File if pipeline.is_none() => {
+                return Err(ObjectJsonError::Pdf(
+                    "QPDF_Stream::writeStreamJSON: pipeline must be supplied when json_data is file"
+                        .to_owned(),
+                ));
+            }
+            QpdfStreamJsonData::File if data_filename.is_empty() => {
+                return Err(ObjectJsonError::Pdf(
+                    "QPDF_Stream::writeStreamJSON: data_filename must be supplied when json_data is file"
+                        .to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        self.try_dereference()
+            .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
+        let stream_dict = self.as_stream_dict().ok_or_else(|| {
+            ObjectJsonError::Pdf(
+                "QPDF_Stream::writeStreamJSON called on a non-stream object".to_owned(),
+            )
+        })?;
+
+        let mut stream_first = true;
+        Json::write_dictionary_open(out, &mut stream_first, depth)?;
+
+        if matches!(json_data, QpdfStreamJsonData::None) {
+            Json::write_dictionary_key(out, &mut stream_first, b"dict", depth + 1)?;
+            stream_dict.write_json(json_version, out, false, depth + 1)?;
+            Json::write_dictionary_close(out, stream_first, depth)?;
+            return Ok(decode_level);
+        }
+
+        let mut payload = None;
+        let mut filtered = false;
+        let mut filter = !matches!(decode_level, DecodeLevel::None);
+        for attempt in 1..=2 {
+            let mut buffer = Buffer::new("stream data", None);
+            let mut discard = Discard;
+            let data_pipeline: &mut dyn Pipeline =
+                if no_data_key && matches!(json_data, QpdfStreamJsonData::Inline) {
+                    &mut discard
+                } else {
+                    &mut buffer
+                };
+            let mut filtering_attempted = false;
+            let succeeded = self
+                .pipe_stream_data(
+                    data_pipeline,
+                    &mut filtering_attempted,
+                    0,
+                    decode_level,
+                    false,
+                    attempt == 1,
+                )
+                .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
+            if !succeeded || (filter && !filtering_attempted) {
+                filter = false;
+                decode_level = DecodeLevel::None;
+                continue;
+            }
+
+            filtered = filter && filtering_attempted;
+            if !no_data_key || !matches!(json_data, QpdfStreamJsonData::Inline) {
+                buffer.finish().map_err(ObjectJsonError::Pipeline)?;
+                payload = Some(buffer.take_buffer().map_err(ObjectJsonError::Pipeline)?);
+            } else {
+                payload = Some(Vec::new());
+            }
+            break;
+        }
+
+        let payload = payload.ok_or_else(|| {
+            ObjectJsonError::Pdf("QPDF_Stream: failed to get stream data".to_owned())
+        })?;
+
+        let dict = stream_dict
+            .shallow_copy()
+            .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
+        dict.remove_key(b"/Length");
+        if filter && filtered {
+            dict.remove_key(b"/Filter");
+            dict.remove_key(b"/DecodeParms");
+        }
+
+        match json_data {
+            QpdfStreamJsonData::Inline if !no_data_key => {
+                Json::write_dictionary_item(
+                    out,
+                    &mut stream_first,
+                    b"data",
+                    &Json::make_blob(move |sink| sink.write(&payload)),
+                    depth + 1,
+                )?;
+            }
+            QpdfStreamJsonData::Inline => {}
+            QpdfStreamJsonData::File => {
+                Json::write_dictionary_item(
+                    out,
+                    &mut stream_first,
+                    b"datafile",
+                    &Json::make_string(data_filename.as_bytes()),
+                    depth + 1,
+                )?;
+                pipeline
+                    .expect("file mode pipeline was validated above")
+                    .write(&payload)?;
+            }
+            QpdfStreamJsonData::None => {
+                unreachable!("none mode returned before payload piping") // cov:ignore: none mode returns before payload piping
+            }
+        }
+
+        Json::write_dictionary_key(out, &mut stream_first, b"dict", depth + 1)?;
+        dict.write_json(json_version, out, false, depth + 1)?;
+        Json::write_dictionary_close(out, stream_first, depth)?;
+        Ok(decode_level)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pipe_stream_data_inner(
         &self,
@@ -6431,6 +6586,18 @@ fn unparse_dict_entries_qdf(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QpdfStreamJsonData {
+    /// qpdf's `qpdf_sj_none`: emit only the stream dictionary.
+    None,
+    /// qpdf's `qpdf_sj_inline`: emit payload as a base64 JSON string unless
+    /// the caller is using the `getStreamJSON` no-data-key path.
+    Inline,
+    /// qpdf's `qpdf_sj_file`: emit a datafile name and send payload to the
+    /// caller-supplied side-file pipeline.
+    File,
+}
+
 /// Errors raised by the canonical ObjectHandle JSON writer.
 ///
 /// Pipeline failures stay typed until the caller chooses its public error
@@ -6882,7 +7049,62 @@ fn json_encode_string(value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod object_json_writer_tests {
     use super::*;
+    use crate::pipeline::PipelineResult;
     use crate::pipeline::PlString;
+    use serde_json::Value as JsonValue;
+    use std::rc::Rc;
+
+    struct FailOnChunk {
+        fail_on: &'static [u8],
+        bytes: Vec<u8>,
+    }
+
+    impl Pipeline for FailOnChunk {
+        fn identifier(&self) -> &str {
+            "fail-on-chunk"
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> PipelineResult<()> {
+            if bytes == self.fail_on {
+                return Err(PipelineError::runtime("json sink failed"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+
+        // cov:ignore-start: this caller-owned sink is never finished by the JSON writer
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    struct AlwaysFailStreamResolver;
+
+    impl DocumentResolver for AlwaysFailStreamResolver {
+        fn resolve_indirect(&self, _object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+            handle.set_resolved(ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(Vec::new()),
+                stream_data: None,
+                stream_provider: None,
+                stream_length: 0,
+            });
+            Ok(())
+        }
+
+        fn pipe_stream_data(
+            &self,
+            _object_ref: ObjectRef,
+            _offset: i64,
+            _length: usize,
+            _stream_dict: &ObjectHandle,
+            _pipeline: &mut dyn Pipeline,
+            _suppress_warnings: bool,
+            _will_retry: bool,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+    }
 
     #[test]
     fn writer_rejects_a_direct_reserved_handle_before_type_dispatch() {
@@ -6951,6 +7173,323 @@ mod object_json_writer_tests {
             b't', b'\\', b'u', b'0', b'0', b'0', b'1',
         ];
         assert_eq!(encoded, expected);
+    }
+
+    fn flate_stream() -> ObjectHandle {
+        ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(13)),
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (
+                    b"/DecodeParms".to_vec(),
+                    ObjectHandle::dictionary(Vec::new()),
+                ),
+            ]),
+            Rc::new(vec![
+                0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
+            ]),
+        )
+    }
+
+    fn write_stream(
+        stream: &ObjectHandle,
+        mode: QpdfStreamJsonData,
+        decode_level: DecodeLevel,
+        no_data_key: bool,
+        pipeline: Option<&mut dyn Pipeline>,
+        data_filename: &str,
+    ) -> (Vec<u8>, DecodeLevel) {
+        let mut bytes = Vec::new();
+        let level = {
+            let mut output = PlString::new("stream-json", None, &mut bytes);
+            stream
+                .write_stream_json(
+                    2,
+                    &mut output,
+                    mode,
+                    decode_level,
+                    pipeline,
+                    data_filename,
+                    no_data_key,
+                    0,
+                )
+                .expect("stream JSON should be written")
+        };
+        (bytes, level)
+    }
+
+    #[test]
+    fn stream_json_none_preserves_the_original_dictionary_and_omits_data() {
+        let stream = flate_stream();
+        let (bytes, level) = write_stream(
+            &stream,
+            QpdfStreamJsonData::None,
+            DecodeLevel::Generalized,
+            false,
+            None,
+            "",
+        );
+
+        assert_eq!(level, DecodeLevel::Generalized);
+        let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(json["dict"]["/Length"], 13);
+        assert_eq!(json["dict"]["/Filter"], "/FlateDecode");
+        assert!(json.get("data").is_none());
+    }
+
+    #[test]
+    fn stream_json_inline_decodes_and_normalizes_the_dictionary() {
+        let stream = flate_stream();
+        let (bytes, level) = write_stream(
+            &stream,
+            QpdfStreamJsonData::Inline,
+            DecodeLevel::Generalized,
+            false,
+            None,
+            "",
+        );
+
+        assert_eq!(level, DecodeLevel::Generalized);
+        let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(json["data"], "aGVsbG8=");
+        assert_eq!(json["dict"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn stream_json_inline_no_data_key_discards_payload_but_keeps_effective_level() {
+        let stream = flate_stream();
+        let (bytes, level) = write_stream(
+            &stream,
+            QpdfStreamJsonData::Inline,
+            DecodeLevel::Generalized,
+            true,
+            None,
+            "",
+        );
+
+        assert_eq!(level, DecodeLevel::Generalized);
+        let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert!(json.get("data").is_none());
+        assert_eq!(json["dict"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn stream_json_file_writes_the_payload_to_the_supplied_pipeline() {
+        let stream = flate_stream();
+        let mut side_bytes = Vec::new();
+        let (bytes, level) = {
+            let mut side = PlString::new("side-file", None, &mut side_bytes);
+            write_stream(
+                &stream,
+                QpdfStreamJsonData::File,
+                DecodeLevel::Generalized,
+                false,
+                Some(&mut side),
+                "side-file-7",
+            )
+        };
+
+        assert_eq!(level, DecodeLevel::Generalized);
+        assert_eq!(side_bytes, b"hello");
+        let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(json["datafile"], "side-file-7");
+        assert_eq!(json["dict"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn stream_json_retries_an_unfilterable_stream_as_raw_data() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Length".to_vec(), ObjectHandle::integer(3)),
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"UnknownDecode".to_vec()),
+                ),
+            ]),
+            Rc::new(b"raw".to_vec()),
+        );
+        let (bytes, level) = write_stream(
+            &stream,
+            QpdfStreamJsonData::Inline,
+            DecodeLevel::Generalized,
+            false,
+            None,
+            "",
+        );
+
+        assert_eq!(level, DecodeLevel::None);
+        let json: JsonValue = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(json["data"], "cmF3");
+        assert_eq!(json["dict"]["/Filter"], "/UnknownDecode");
+        assert!(json["dict"].get("/Length").is_none());
+    }
+
+    #[test]
+    fn stream_json_validates_pipeline_and_filename_combinations_before_output() {
+        let stream = flate_stream();
+        let mut side_bytes = Vec::new();
+        let mut side = PlString::new("side-file", None, &mut side_bytes);
+        let mut output_bytes = Vec::new();
+        let mut output = PlString::new("stream-json", None, &mut output_bytes);
+
+        let error = stream
+            .write_stream_json(
+                3,
+                &mut output,
+                QpdfStreamJsonData::None,
+                DecodeLevel::None,
+                None,
+                "",
+                false,
+                0,
+            )
+            .expect_err("only qpdf JSON versions 1 and 2 are supported");
+        assert!(matches!(error, ObjectJsonError::UnsupportedVersion(3)));
+        drop(output);
+        assert!(output_bytes.is_empty());
+
+        let mut output = PlString::new("stream-json", None, &mut output_bytes);
+
+        let error = stream
+            .write_stream_json(
+                2,
+                &mut output,
+                QpdfStreamJsonData::None,
+                DecodeLevel::None,
+                Some(&mut side),
+                "",
+                false,
+                0,
+            )
+            .expect_err("none mode rejects a supplied pipeline");
+        assert!(
+            matches!(error, ObjectJsonError::Pdf(message) if message.contains("pipeline should only"))
+        );
+
+        let error = stream
+            .write_stream_json(
+                2,
+                &mut output,
+                QpdfStreamJsonData::File,
+                DecodeLevel::None,
+                None,
+                "side-file-7",
+                false,
+                0,
+            )
+            .expect_err("file mode requires a pipeline");
+        assert!(
+            matches!(error, ObjectJsonError::Pdf(message) if message.contains("pipeline must be supplied"))
+        );
+
+        let error = stream
+            .write_stream_json(
+                2,
+                &mut output,
+                QpdfStreamJsonData::File,
+                DecodeLevel::None,
+                Some(&mut side),
+                "",
+                false,
+                0,
+            )
+            .expect_err("file mode requires a filename");
+        assert!(
+            matches!(error, ObjectJsonError::Pdf(message) if message.contains("data_filename must be supplied"))
+        );
+        drop(output);
+        assert!(output_bytes.is_empty());
+    }
+
+    #[test]
+    fn stream_json_rejects_a_non_stream_handle() {
+        let scalar = ObjectHandle::integer(7);
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("stream-json", None, &mut bytes);
+
+        let error = scalar
+            .write_stream_json(
+                2,
+                &mut output,
+                QpdfStreamJsonData::None,
+                DecodeLevel::None,
+                None,
+                "",
+                false,
+                0,
+            )
+            .expect_err("stream JSON requires a stream handle");
+
+        assert!(matches!(
+            error,
+            ObjectJsonError::Pdf(message)
+                if message == "QPDF_Stream::writeStreamJSON called on a non-stream object"
+        ));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn stream_json_reports_failure_after_both_source_attempts() {
+        let resolver = Rc::new(AlwaysFailStreamResolver);
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver;
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("stream-json", None, &mut bytes);
+
+        let error = stream
+            .write_stream_json(
+                2,
+                &mut output,
+                QpdfStreamJsonData::Inline,
+                DecodeLevel::Generalized,
+                None,
+                "",
+                false,
+                0,
+            )
+            .expect_err("a source that fails both attempts must be reported");
+
+        assert!(matches!(
+            error,
+            ObjectJsonError::Pdf(message) if message == "QPDF_Stream: failed to get stream data"
+        ));
+        assert_eq!(bytes, b"{");
+    }
+
+    #[test]
+    fn stream_json_propagates_inline_output_failure() {
+        let stream = flate_stream();
+        let mut output = FailOnChunk {
+            fail_on: br#""data": "#,
+            bytes: Vec::new(),
+        };
+        assert_eq!(output.identifier(), "fail-on-chunk");
+
+        let error = stream
+            .write_stream_json(
+                2,
+                &mut output,
+                QpdfStreamJsonData::Inline,
+                DecodeLevel::Generalized,
+                None,
+                "",
+                false,
+                0,
+            )
+            .expect_err("the output sink failure must be preserved");
+
+        assert!(matches!(
+            error,
+            ObjectJsonError::Pipeline(PipelineError::Runtime(message))
+                if message.as_bytes() == b"json sink failed"
+        ));
+        assert_eq!(output.bytes, b"{\n  ");
     }
 }
 

@@ -274,8 +274,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `JSONHandler.cc` | 189 | `json/` | ✅ |
 | `QPDF_json.cc` 入力側（`QPDF_json.cc:1-833`: `JSONReactor` / `createFromJSON` / `updateFromJSON` / `importJSON` / `test_json_validators`） | 833 | 無し。flpdf に `--json-input` 相当は存在しない | ❌ |
 | `QPDF_json.cc` 出力側（`QPDF_json.cc:834-946`: free function `writeJSONStreamFile`(834-849) + `QPDF::writeJSON` ×2 overload(851-946)） | 113 | `document_json.rs`(361: `write_json` = 6 引数 overload(851-861)、`write_json_key` = `complete`/`first_key` overload(863-946)、`write_json_stream_file` = `writeJSONStreamFile`。side file は `PlStdioFile` explicit finish) | ✅ 出力側は境界一致。入力側（下記 ❌ 行）が未実装なので `QPDF_json.cc` 全体としては D1 未達。`qpdf --json-output=2` は complete overload と同一バイトを書くため、`crates/flpdf/tests/document_json_tests.rs` が 7 fixture で qpdf 出力と直接照合する |
-| `QPDFObjectHandle::getJSON` / `QPDFObjectHandle::writeJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::get_json` / `ObjectHandle::write_json`（`QPDFObjectHandle.cc:1613-1647` の外側 dispatch と `qpdf/JSON_writer.hh:16-135` の pipeline 境界）、`json_inspect.rs` の `pdf_object_to_json`（getJSON false の consumer） | 🔀 canonical ObjectHandle writer は移送済み。`false` は間接 identity を先に検査して `"N G R"` を出力し、array/dictionary child は非再帰の reference dispatch、stream は `QPDF_Stream::writeJSON` と同じく dictionary のみを出力する。`true` の一段解決 primitive も writer に実装済みだが、document-level `QPDF::writeJSON` の object-map cutover は `flpdf-25kg.3.37`、historical stream payload/datafile は `flpdf-3yn9.9` の bounded follow-up に残す。`json_inspect.rs` の `ordered_qpdf_*` はこの残存 bridge と historical-view oracle のために保持する |
-| `QPDF_Stream::writeStreamJSON`（行数は §1 の `QPDF_Stream.cc` に計上済み。ここは所在の相互参照） | — | `json_inspect.rs` の `stream_payload_with_decode_status` / `normalized_emitted_stream_dict` + `document_json.rs` の object entry writer に inline された `"data"` / `"datafile"` / `"dict"` 出力 | 🔀 1 関数に対応する flpdf 実装が存在せず、payload/dict 導出と出力が別モジュールに分かれている。qpdf の `no_data_key` / `attempt` 二重試行は未移植 |
+| `QPDFObjectHandle::getJSON` / `QPDFObjectHandle::writeJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::get_json` / `ObjectHandle::write_json`（`QPDFObjectHandle.cc:1613-1647` の外側 dispatch と `qpdf/JSON_writer.hh:16-135` の pipeline 境界）、`json_inspect.rs` の `pdf_object_to_json`（getJSON false の consumer） | 🔀 canonical ObjectHandle writer は移送済み。`false` は間接 identity を先に検査して `"N G R"` を出力し、array/dictionary child は非再帰の reference dispatch、stream は `QPDF_Stream::writeJSON` と同じく dictionary のみを出力する。`true` の一段解決 primitive も writer に実装済みで、document-level `QPDF::writeJSON` の object-map は `flpdf-25kg.3.37` で cutover 済み。`json_inspect.rs` の `ordered_qpdf_*` は本番 bridge ではなく、既存の pipeline-write 境界テスト専用で保持する |
+| `QPDF_Stream::writeStreamJSON`（行数は §1 の `QPDF_Stream.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::write_stream_json`（`QPDF_Stream.cc:207-295` の mode validation、`no_data_key`、二重試行、dict normalization、payload routing、effective decode level） + `document_json.rs` の object-map framing / side-file ownership。`json_inspect.rs` の `stream_payload_with_decode_status` は既存の公開 raw-payload helper とテスト oracle に限定 | ✅ `flpdf-3yn9.9` で qpdf の 1 関数責務へ統合。旧 `Object/Stream` payload/dict bridge は本番経路から外し、`QPDF_json.cc:917-925` 相当の consumer は canonical handle を呼ぶ。非 file entry は既存 flpdf の変換失敗時接頭辞を保つため canonical 結果を先に buffer 化する |
 
 ### `flpdf-25kg.3.37` bounded consumer cutover (2026-08-15)
 
@@ -301,6 +301,40 @@ fixtureを `crates/flpdf/tests/document_json_tests.rs` の byte differential に
 `pdf_dest_to_json`へ渡し、`["6 0 R", "7 0 R"]` を確認する。reserved handleはqpdfの
 true-mode dispatchどおり `QPDFObjectHandle: attempting to get JSON from a reserved object`
 で失敗する。
+
+### `flpdf-3yn9.9` bounded stream consumer cutover (2026-08-15)
+
+`QPDF_Stream::writeStreamJSON` (`libqpdf/QPDF_Stream.cc:207-295`) に対応する
+`ObjectHandle::write_stream_json` は、`None` / `Inline` / `File` の引数検証、
+inline の `no_data_key`、`pipeStreamData` の最大二回試行と raw fallback、
+`/Length`・成功した decode 時の `/Filter`/`/DecodeParms` 除去、`data`/
+`datafile`/`dict` の出力、実効 `DecodeLevel` の返却を一つの責務として持つ。
+ストリーム source は `ObjectHandle::pipe_stream_data` (`object_handle.rs`:
+4393-) を通り、辞書の shallow copy は `ObjectHandle::shallow_copy` と
+`remove_key` を使う。
+
+`document_json.rs` は `QPDF_json.cc:917-925` 相当の object-map framing と、
+`writeJSONStreamFile` (`QPDF_json.cc:834-849`) 相当の side-file 作成・明示 finish
+だけを所有する。非 file の stream value は canonical writer の完成結果を
+`Buffer` に受けてから object key を書くため、変換失敗時の既存 sink prefix を
+維持する。旧 `json_inspect.rs` の split payload/dict writer は本番 consumer から
+除去し、Ordered JSON writer は pipeline 境界の test-only oracle として限定した。
+
+確認済みの qpdf 11.9.0 差分:
+
+- Flate stream の inline/file 出力は decoded payload と正規化後 dictionary を一致。
+- 未対応 filter は qpdf と同じく二回目の raw payload に落ち、`/Filter` を保持。
+- inline `no_data_key` は payload を discard しつつ effective decode level を保持。
+- pipeline / filename の不正組み合わせは qpdf の `writeStreamJSON` 文言で拒否。
+
+主な検証:
+
+```text
+cargo test -p flpdf --lib object_json_writer_tests --quiet
+cargo test -p flpdf --test document_json_tests --quiet
+cargo test -p flpdf --lib json_inspect::tests::side_file --quiet
+cargo test -p flpdf-cli --test cli_json --quiet
+```
 
 破損した遅延オブジェクトについても、qpdfの `QPDF::resolve` が診断をwarningへ送り、
 対象をnullへフォールバックしてJSON本体を完了する挙動を採用する。CLIの
