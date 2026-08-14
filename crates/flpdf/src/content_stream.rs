@@ -10,9 +10,13 @@
 //! [`parse_content_operations`] provides the common operand/operator adapter
 //! for consumers that do not need inline-image payload events.
 
-use crate::parser::Parser;
+use crate::parser::{ContentHandleParser, Parser};
 use crate::tokenizer::{TokenType, Tokenizer, TokenizerStateError};
-use crate::{Error, Object, Result};
+use crate::{
+    object_handle::{DocumentResolver, ObjectHandle},
+    Error, Object, Result,
+};
+use std::rc::Rc;
 
 /// Whether content-stream parsing should continue after an object callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +50,122 @@ pub trait ParserCallbacks {
 
     /// Receive normal content EOF.
     fn handle_eof(&mut self) -> Result<()>;
+}
+
+/// qpdf's `QPDFObjectHandle::ParserCallbacks` boundary.
+///
+/// This is deliberately distinct from the legacy raw [`ParserCallbacks`]
+/// surface. Parsed values are canonical [`ObjectHandle`]s, so callback code
+/// can inspect identity and parsed offsets without introducing an
+/// ObjectHandle-to-Object consumer bridge.
+pub trait ObjectHandleParserCallbacks {
+    /// Receive the full decoded content size before the first object.
+    fn content_size(&mut self, _size: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Receive one parsed ObjectHandle and its qpdf content span.
+    fn handle_object(
+        &mut self,
+        object: ObjectHandle,
+        offset: usize,
+        length: usize,
+    ) -> Result<ParseControl>;
+
+    /// Receive a non-fatal parser recovery diagnostic.
+    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Receive normal content EOF. A [`ParseControl::Stop`] return from
+    /// `handle_object` skips this callback, matching qpdf's
+    /// `terminateParsing` path.
+    fn handle_eof(&mut self) -> Result<()>;
+}
+
+/// Parse decoded content bytes into ObjectHandle callbacks.
+pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
+    input: &[u8],
+    context: Option<Rc<dyn DocumentResolver>>,
+    callbacks: &mut C,
+) -> Result<()> {
+    callbacks.content_size(input.len())?;
+
+    let mut tokenizer = Tokenizer::new(input);
+    tokenizer.allow_eof();
+
+    while tokenizer.position() < input.len() {
+        let probe = tokenizer.read_token(true, 0)?;
+        let offset = probe.start;
+        tokenizer.set_position(offset)?;
+
+        let (object, length, diagnostics) = {
+            let mut parser = ContentHandleParser::with_tokenizer(&mut tokenizer, context.clone());
+            let object = match parser.parse_content_object()? {
+                Some(object) => object,
+                None => break,
+            };
+            let length = parser.position() - offset;
+            let diagnostics = parser.take_diagnostics();
+            (object, length, diagnostics)
+        };
+        for diagnostic in diagnostics {
+            callbacks.handle_diagnostic(diagnostic.relative_offset, &diagnostic.message)?;
+        }
+        let is_id = object.as_operator().as_deref() == Some(b"ID");
+
+        if callbacks.handle_object(object, offset, length)? == ParseControl::Stop {
+            return Ok(());
+        }
+
+        if is_id {
+            // qpdf discards the byte after ID without making a short read an
+            // exception; the subsequent inline-image token read reports the
+            // warning-only EOF case (QPDFObjectHandle.cc:1820-1848).
+            if tokenizer.consume_one_byte().is_err() {
+                callbacks.handle_diagnostic(input.len(), "EOF found while reading inline image")?;
+                break;
+            }
+            let inline_offset = tokenizer.position();
+            // The shared tokenizer is reset by consume_one_byte, so this
+            // state failure is unreachable through this pull route. Keep the
+            // defensive mapping documented for callers that change tokenizer
+            // state handling.
+            // cov:ignore-start: consume_one_byte resets the shared tokenizer; qpdf state errors are unreachable here
+            tokenizer.expect_inline_image().map_err(|error| {
+                let message = match error {
+                    TokenizerStateError::TokenWaiting => "tokenizer already has a token waiting",
+                    TokenizerStateError::ImproperInlineImageState => {
+                        "tokenizer is in an improper inline image state"
+                    }
+                };
+                Error::parse(inline_offset, message)
+            })?;
+            // cov:ignore-end
+            let image = tokenizer.read_token(true, 0)?;
+            if image.token_type == TokenType::Bad {
+                // QPDFObjectHandle::parseContentStream_data warns and lets the
+                // surrounding parseContentStream_internal deliver handleEOF;
+                // an incomplete inline image is not a parser exception on this
+                // owning ObjectHandle route (QPDFObjectHandle.cc:1826-1848).
+                let diagnostic = "EOF found while reading inline image";
+                callbacks.handle_diagnostic(image.error_offset, diagnostic)?;
+                break;
+            }
+            let image_offset = image.start;
+            let image_length = image.end - image.start;
+            if callbacks.handle_object(
+                ObjectHandle::inline_image(image.value),
+                image_offset,
+                image_length,
+            )? == ParseControl::Stop
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    callbacks.handle_eof()
 }
 
 /// Parse raw content-stream bytes and deliver qpdf-shaped object callbacks.
