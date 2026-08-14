@@ -39,6 +39,35 @@ const OBJSTM_CASES: &[&str] = &[
     "corrupt-objstm-big",
 ];
 
+/// Edge cases in the object-stream/cross-reference-stream scanner added for
+/// flpdf-9hc.43, each confirmed against the live `fix-qdf` 11.9.0 oracle
+/// (`fix-qdf <input> > <golden>`) before being committed:
+///
+/// * `corrupt-xref-truncated` — a cross-reference-stream object truncated
+///   right after its `stream` keyword, with no `endstream` anywhere in the
+///   file. The oracle classifies `/Type /XRef` from the dictionary alone
+///   (`qpdf/fix-qdf.cc`'s `st_in_obj`, `line.find("/Type /XRef")`) and
+///   completes on the `stream\n` line itself (`st_in_xref_stream_dict`
+///   writing its binary payload and tail the moment that line is seen) —
+///   `endstream` is never looked for.
+/// * `corrupt-trailing-garbage` — a well-formed classic-tail QDF with a
+///   syntactically valid `N G obj ... endobj` block appended *after* the
+///   original `%%EOF`. The oracle's `st_top`/`st_at_xref`/.../`st_done`
+///   state machine can never re-enter object recognition once the tail
+///   `xref` line is seen, so this trailing block is discarded entirely
+///   (not copied through, not treated as an object).
+/// * `corrupt-nested-type-xref` — a regular stream whose dictionary has a
+///   nested sub-dictionary containing `/Type /XRef`. The oracle's
+///   `line.find("/Type /XRef") != line.npos` check is a plain per-line
+///   substring search with no `<<`/`>>` nesting awareness, so it
+///   misclassifies this object exactly like flpdf does — this fixture
+///   pins that (buggy but byte-identical) shared behavior.
+const SCANNER_EDGE_CASES: &[&str] = &[
+    "corrupt-xref-truncated",
+    "corrupt-trailing-garbage",
+    "corrupt-nested-type-xref",
+];
+
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
 /// oracle golden byte-for-byte.
 #[test]
@@ -52,6 +81,7 @@ fn matches_oracle_golden_byte_for_byte() {
     ]
     .into_iter()
     .chain(OBJSTM_CASES.iter().copied())
+    .chain(SCANNER_EDGE_CASES.iter().copied())
     {
         let input = read(&format!("{case}.qdf"));
         let golden = read(&format!("{case}.golden.qdf"));
@@ -95,6 +125,7 @@ fn idempotent() {
     ]
     .into_iter()
     .chain(OBJSTM_CASES.iter().copied())
+    .chain(SCANNER_EDGE_CASES.iter().copied())
     {
         let input = read(&format!("{case}.qdf"));
         let once = flpdf::fix_qdf(&input).unwrap();
@@ -1112,6 +1143,41 @@ fn duplicate_object_number_is_rejected() {
     assert!(
         format!("{err}").contains("non-sequential object numbering"),
         "unexpected error: {err}"
+    );
+}
+
+/// A top-level object header with a non-zero generation (`1 1 obj`) is
+/// rejected. Confirmed against the live oracle: `fix-qdf.cc`'s object-header
+/// regex is `re_n_0_obj = "^(\d+) 0 obj\n$"` (`qpdf/fix-qdf.cc:87`), which
+/// hard-codes generation `0` — a `1 1 obj` line simply does not match, so
+/// `st_top` falls through to its default `std::cout << line;` and echoes it
+/// as plain text WITHOUT calling `checkObjId`/incrementing `last_obj`
+/// (`qpdf/fix-qdf.cc:126-134`). The real `fix-qdf 1 1 obj ... 2 0 obj ...`
+/// binary exits 2 with `expected object 1` at the `2 0 obj` line — the
+/// generation is neither preserved nor threaded through the regenerated
+/// xref (whose type-1 entries have no generation field at all;
+/// `qpdf/fix-qdf.cc:222-233`), it is simply never recognized as an object.
+#[test]
+fn nonzero_generation_top_level_object_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"1 1 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"2 0 obj\n<<\n  /Type /Pages\n  /Kids [ ]\n  /Count 0\n>>\nendobj\n\n");
+    pdf.extend_from_slice(
+        b"xref\n0 3\n0000000000 65535 f \n0000000000 00001 n \n0000000000 00000 n \n",
+    );
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 1 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).expect_err("non-zero top-level generation must be rejected");
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "expected a Parse error, got {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("non-sequential object numbering"),
+        "a `1 1 obj` header must not be recognized as object 1, so the next \
+         real object (`2 0 obj`) must fail the sequential-numbering check \
+         (matching the oracle's `expected object 1` fatal at that same \
+         point), got: {err}"
     );
 }
 
