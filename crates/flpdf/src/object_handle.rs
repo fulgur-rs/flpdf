@@ -6618,7 +6618,11 @@ impl<'a> ObjectJsonWriter<'a> {
                     ObjectJsonError::Pdf("stream's dict handle is not a dictionary".to_string())
                 })?;
                 // cov:ignore-end
-                self.write_handle(&dictionary, json_version, false, depth + 1)
+                // QPDF_Stream::writeJSON delegates to its dictionary with the
+                // same JSON::Writer, without emitting a stream container of
+                // its own (`QPDF_Stream.cc:181-184`). Keep the logical depth
+                // unchanged so the bound counts JSON containers only.
+                self.write_handle(&dictionary, json_version, false, depth)
             }
             13 => Err(ObjectJsonError::Unresolved), // cov:ignore: as_reference dispatches bare references before type_code
             14 => Err(ObjectJsonError::Destroyed),

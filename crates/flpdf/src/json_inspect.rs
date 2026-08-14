@@ -75,6 +75,7 @@ impl From<ObjectJsonError> for JsonOutputError {
             ObjectJsonError::Pipeline(error) => Self::Pipeline(error),
             ObjectJsonError::NonFiniteFloat => Self::Convert(ConvertError::NonFiniteFloat),
             ObjectJsonError::Json(message) => Self::Convert(ConvertError::JsonError(message)),
+            ObjectJsonError::Pdf(message) => Self::Convert(ConvertError::PdfError(message)),
             other => Self::Convert(ConvertError::PdfError(other.to_string())),
         }
     }
@@ -681,8 +682,8 @@ const JSON_CONVERT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 /// (`libqpdf/QPDF_Stream.cc:181-184`); the document-level `{"stream":{"dict":...}}`
 /// wrapper remains the separate `writeStreamJSON` consumer.
 ///
-/// This never resolves indirection: an indirect `handle` (whether or not it
-/// has already been resolved elsewhere) is always rendered as its own
+/// The top-level `handle` is never resolved: an indirect `handle` (whether or
+/// not it has already been resolved elsewhere) is always rendered as its own
 /// `"N G R"` reference string, matching qpdf's non-dereferenced `getJSON`/
 /// `writeJSON` contract (`include/qpdf/QPDFObjectHandle.hh:1166-1219`,
 /// `libqpdf/QPDFObjectHandle.cc:1605-1659`) — the check for
@@ -691,6 +692,14 @@ const JSON_CONVERT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 /// etc. return the *resolved* value for an indirect handle that some other
 /// code path already resolved, which would otherwise inline it instead of
 /// reporting the reference.
+///
+/// A direct dictionary is the qpdf exception at the child boundary:
+/// `QPDF_Dictionary::writeJSON` calls `isNull()` on each child before writing
+/// its key (`libqpdf/QPDF_Dictionary.cc:75-76`), and `isNull()` dereferences
+/// an indirect child (`libqpdf/QPDFObjectHandle.cc:353-356`) to decide whether
+/// to omit it. A non-null child is still rendered as its own reference string
+/// because the child writer retains `dereference_indirect=false`; resolver I/O
+/// or resolver failures can nevertheless occur while making that null check.
 ///
 /// # Errors
 ///
@@ -712,6 +721,7 @@ fn convert_object_json_error(error: ObjectJsonError) -> ConvertError {
         ObjectJsonError::NonFiniteFloat => ConvertError::NonFiniteFloat,
         ObjectJsonError::Json(message) => ConvertError::JsonError(message),
         ObjectJsonError::Pipeline(error) => ConvertError::PdfError(error.to_string()),
+        ObjectJsonError::Pdf(message) => ConvertError::PdfError(message),
         other => ConvertError::PdfError(other.to_string()),
     }
 }
@@ -5145,6 +5155,25 @@ mod tests {
     }
 
     #[test]
+    fn object_handle_write_json_does_not_count_stream_dispatch_as_extra_depth() {
+        // QPDF_Stream::writeJSON delegates transparently to its dictionary.
+        // Build 251 dictionary containers separated by stream dispatches:
+        // qpdf's JSON parser accepts this, while counting each transparent
+        // stream as another level would reject it at the 500-level writer cap.
+        let mut nested = ObjectHandle::dictionary(vec![]);
+        for _ in 0..250 {
+            nested = ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![(b"Next".to_vec(), nested)]),
+                Rc::new(Vec::new()),
+            );
+        }
+
+        nested
+            .get_json(2, false)
+            .expect("transparent stream dispatches must not consume JSON depth");
+    }
+
+    #[test]
     fn object_handle_write_json_true_resolves_only_the_outer_indirect_handle() {
         let mut pdf = empty_pdf();
         let outer_ref = ObjectRef::new(8, 0);
@@ -5341,6 +5370,20 @@ mod tests {
 
         assert!(matches!(error, ObjectJsonError::Pdf(message) if message == "resolver failed"));
         assert_eq!(bytes, b"{");
+    }
+
+    #[test]
+    fn json_error_conversion_preserves_the_pdf_error_body_once() {
+        let converted =
+            super::convert_object_json_error(ObjectJsonError::Pdf("resolver failed".to_string()));
+        assert_eq!(
+            converted,
+            ConvertError::PdfError("resolver failed".to_string())
+        );
+        assert_eq!(converted.to_string(), "PDF error: resolver failed");
+
+        let output = JsonOutputError::from(ObjectJsonError::Pdf("resolver failed".to_string()));
+        assert_eq!(output.to_string(), "PDF error: resolver failed");
     }
 
     #[test]
