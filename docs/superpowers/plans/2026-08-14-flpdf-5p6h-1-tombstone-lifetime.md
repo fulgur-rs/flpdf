@@ -83,7 +83,7 @@
 
 - [ ] Run the complete quality gates from the repository instructions:
   - `cargo test -p flpdf`
-  - `cargo test` 
+  - `cargo test`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   - `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" cargo doc --workspace --all-features --no-deps --document-private-items`
   - `scripts/qpdf-tombstone-lifetime-probe.sh`
