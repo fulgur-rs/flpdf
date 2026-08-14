@@ -263,6 +263,116 @@ fn objstm_with_comment_between_type_and_objstm_is_processed() {
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
+/// A line starting with the literal `%% Object stream: object ` prefix but
+/// with no digit immediately after is not a member marker (mirrors qpdf's
+/// `re_ostream_obj`, which requires `(\d+)` right there) — it stays part of
+/// the current member's body, copied verbatim, rather than starting a new
+/// member.
+#[test]
+fn objstm_marker_prefix_without_digit_is_not_a_marker() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Type /ObjStm\n  /Length 0\n  /N 0\n  /First 0\n>>\n\
+          stream\n0 0\n%% Object stream: object 2, index 0\n<<\n\
+          %% Object stream: object X\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"3 0 obj\n<<\n  /Type /XRef\n  /Length 0\n  /W [ 0 0 0 ]\n  /Root 2 0 R\n  /Size 0\n>>\n\
+          stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
+    );
+    let fixed = flpdf::fix_qdf(&pdf).expect("a decoy marker-prefix line must not break scanning");
+    assert!(
+        find(&fixed, b"/N 1").is_some(),
+        "the decoy line must not be counted as a second member;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert!(
+        find(&fixed, b"%% Object stream: object X").is_some(),
+        "the decoy line's text must survive verbatim as member 2's body content;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+/// An `/Extends` entry with no digit following is not a match (mirrors
+/// qpdf's `re_extends = "/Extends (\d+ 0 R)"`) — the object stream is
+/// processed with no `/Extends` in its regenerated dict.
+#[test]
+fn objstm_extends_without_digit_is_ignored() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Type /ObjStm\n  /Extends none\n  /Length 0\n  /N 0\n  /First 0\n>>\n\
+          stream\n0 0\n%% Object stream: object 2, index 0\n<<\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"3 0 obj\n<<\n  /Type /XRef\n  /Length 0\n  /W [ 0 0 0 ]\n  /Root 2 0 R\n  /Size 0\n>>\n\
+          stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
+    );
+    let fixed = flpdf::fix_qdf(&pdf).expect("a non-matching /Extends must not be an error");
+    assert!(
+        find(&fixed, b"/Extends").is_none(),
+        "no /Extends N 0 R match means none is emitted;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+/// An `/Extends` entry whose digits are NOT followed by exactly ` 0 R`
+/// (e.g. a non-zero generation) does not match either — same qpdf regex,
+/// same "no /Extends emitted" outcome.
+#[test]
+fn objstm_extends_wrong_generation_is_ignored() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Type /ObjStm\n  /Extends 9 1 R\n  /Length 0\n  /N 0\n  /First 0\n>>\n\
+          stream\n0 0\n%% Object stream: object 2, index 0\n<<\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"3 0 obj\n<<\n  /Type /XRef\n  /Length 0\n  /W [ 0 0 0 ]\n  /Root 2 0 R\n  /Size 0\n>>\n\
+          stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
+    );
+    let fixed = flpdf::fix_qdf(&pdf).expect("a non-zero-generation /Extends must not be an error");
+    assert!(
+        find(&fixed, b"/Extends").is_none(),
+        "a non-zero-generation /Extends N G R does not match qpdf's regex;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+}
+
+/// Real `qpdf --qdf` always pairs an object stream with a
+/// cross-reference-stream tail (a classic `xref` table has no entry type
+/// for a compressed object), so this combination cannot arise from genuine
+/// QDF input — an object stream in a file whose tail is a classic table is
+/// `Unsupported`.
+#[test]
+fn objstm_in_classic_xref_form_is_unsupported() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Type /ObjStm\n  /Length 0\n  /N 0\n  /First 0\n>>\n\
+          stream\n0 0\n%% Object stream: object 2, index 0\n<<\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 2 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        matches!(err, flpdf::Error::Unsupported(_)),
+        "an ObjStm with a classic xref tail must be Unsupported, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("classic"),
+        "error should explain the classic-xref-tail restriction, got: {err}"
+    );
+}
+
 /// Regression for roborev job 989 (qdf_fix.rs robustness):
 ///   1. A decompressed stream body that contains a line-anchored `xref` must
 ///      NOT be mistaken for the cross-reference table (use the LAST one).
