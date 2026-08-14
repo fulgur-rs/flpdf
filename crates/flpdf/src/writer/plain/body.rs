@@ -327,7 +327,8 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
             continue;
         };
         for member in members {
-            let is_signature = object_streams::is_qpdf_signature_dict(pdf, member.source)?;
+            let member_handle = pdf.get_object_handle(member.source);
+            let is_signature = object_streams::is_qpdf_signature_dict(pdf, &member_handle)?;
             let violation = {
                 let object = pdf.resolve_borrowed(member.source)?;
                 planned_member_body_violation(member.source, member.output, object, &context)
@@ -790,7 +791,6 @@ mod tests {
         );
 
         let error = emit_bodies(&mut pdf, &options, &plan).unwrap_err();
-
         assert!(matches!(error, crate::Error::Unsupported(ref message)
             if message.contains("/Extends 99999 0 R is absent from renumber map")));
     }

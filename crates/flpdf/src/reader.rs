@@ -1216,6 +1216,13 @@ impl<R: Read + Seek> Pdf<R> {
         // Refresh the legacy cache before replacing the canonical value, or
         // an old object-stream entry can incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
+        // qpdf's replaceObject changes only the requested cache slot; already
+        // resolved members of an ObjStm remain live in their own cache slots.
+        // Promote those compatibility-cache values before the replacement
+        // overwrites the source container, for the same reason delete_object
+        // preserves them below.
+        self.promote_resolved_object_stream_members(object_ref)
+            .expect("a parsed ObjStm member must be representable as an ObjectHandle");
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1224,19 +1231,7 @@ impl<R: Read + Seek> Pdf<R> {
         if let Some(CacheEntry::Compressed { stream, index }) =
             self.cache.entry(object_ref).cloned()
         {
-            let stream_ref = ObjectRef::new(stream, 0);
-            let (parent_ref, parent_index) = self
-                .compressed_parent_for_entry(stream_ref, index)
-                .unwrap_or((stream_ref, index));
-            self.compressed_member_parents.insert(
-                object_ref,
-                CompressedMemberProvenance {
-                    parent_ref,
-                    parent_index,
-                    source_stream: stream,
-                    source_index: index,
-                },
-            );
+            self.record_compressed_member_provenance(object_ref, stream, index);
         }
 
         // Write through to the canonical handle graph too (not just
@@ -1364,6 +1359,109 @@ impl<R: Read + Seek> Pdf<R> {
         })
     }
 
+    /// Preserve resolved compressed members when their source ObjStm is
+    /// replaced or removed. qpdf's `replaceObject` and `removeObject` mutate
+    /// only the requested cache slot (`QPDF.cc:1980-2005`); a member already
+    /// materialized in `m->obj_cache` remains available through its own
+    /// `QPDFObject` handle. The legacy reader cache and the canonical handle
+    /// graph are separate during this migration, so mirror either side's
+    /// resolved value before changing the source slot. A planner can resolve
+    /// a member canonically while the old body consumer still sees a
+    /// `Compressed` cache entry; leaving that entry untouched would make the
+    /// body consumer reparse through the source after it has been replaced.
+    fn promote_resolved_object_stream_members(
+        &mut self,
+        object_stream_ref: ObjectRef,
+    ) -> Result<()> {
+        if object_stream_ref.generation != 0 {
+            return Ok(());
+        }
+        if !matches!(
+            self.cache.entry(object_stream_ref),
+            Some(CacheEntry::Resolved(Object::Stream(_)))
+        ) {
+            // A compressed member can only have been materialized after its
+            // source stream was loaded into the legacy cache. Avoid scanning
+            // the complete xref/cache for ordinary object mutations.
+            return Ok(());
+        }
+
+        let mut members = Vec::new();
+        for (member_ref, entry) in self.resolver.source_xref_entries() {
+            let XrefEntry::Compressed { stream, index: _ } = entry else {
+                continue;
+            };
+            if stream != object_stream_ref.number || self.qpdf_removed_refs.contains(&member_ref) {
+                continue;
+            }
+
+            let cache_state = match self.cache.entry(member_ref) {
+                Some(CacheEntry::Compressed { stream, index }) => {
+                    Some((Some((*stream, *index)), None))
+                }
+                Some(CacheEntry::Resolved(object)) => Some((None, Some(object.clone()))),
+                Some(CacheEntry::Missing | CacheEntry::Deleted)
+                | Some(CacheEntry::Unresolved { .. } | CacheEntry::Reserved)
+                | None => None,
+            };
+            let Some((compressed_entry, legacy_object)) = cache_state else {
+                continue;
+            };
+
+            // Prefer the canonical value when the planner has already
+            // materialized the member. This preserves direct ObjectHandle
+            // mutations even if the legacy cache still contains an older
+            // snapshot from before the handle route was introduced.
+            let canonical_object = self
+                .resolver
+                .registered_handle(member_ref)
+                .filter(ObjectHandle::is_resolved)
+                .map(|handle| handle.materialize())
+                .transpose()?;
+            let Some(object) = canonical_object.or(legacy_object) else {
+                continue;
+            };
+            members.push((member_ref, compressed_entry, object));
+        }
+
+        for (member_ref, compressed_entry, object) in members {
+            let handle = self
+                .resolver
+                .registered_handle(member_ref)
+                .unwrap_or_else(|| self.get_object_handle(member_ref));
+            if !handle.is_resolved() {
+                let value = self.lift_for_set_object(&object, &handle)?;
+                handle.set_resolved(value);
+            }
+            if let Some((stream, index)) = compressed_entry {
+                self.record_compressed_member_provenance(member_ref, stream, index);
+            }
+            self.cache.set_resolved(member_ref, object);
+        }
+        Ok(())
+    }
+
+    fn record_compressed_member_provenance(
+        &mut self,
+        object_ref: ObjectRef,
+        source_stream: u32,
+        source_index: u32,
+    ) {
+        let stream_ref = ObjectRef::new(source_stream, 0);
+        let (parent_ref, parent_index) = self
+            .compressed_parent_for_entry(stream_ref, source_index)
+            .unwrap_or((stream_ref, source_index));
+        self.compressed_member_parents.insert(
+            object_ref,
+            CompressedMemberProvenance {
+                parent_ref,
+                parent_index,
+                source_stream,
+                source_index,
+            },
+        );
+    }
+
     /// Remove `object_ref`, marking it deleted.
     ///
     /// Subsequent [`Pdf::resolve`]/[`Pdf::resolve_borrowed`] calls for
@@ -1392,6 +1490,8 @@ impl<R: Read + Seek> Pdf<R> {
         // Keep the indirect identity for this legacy public API, but remove
         // the source row and mark the retained handle missing. The qpdf-facing
         // object snapshot filters this compatibility slot below.
+        self.promote_resolved_object_stream_members(object_ref)
+            .expect("a parsed ObjStm member must be representable as an ObjectHandle");
         self.resolver
             .remove_object_preserving_handle(object_ref)
             .expect("canonical resolver object removal is infallible");
@@ -10693,6 +10793,81 @@ mod tests {
             "object 1 0: deleted object warning"
         );
         assert_ne!(handle.description(), source_description);
+    }
+
+    #[test]
+    fn deleting_an_objstm_container_promotes_resolved_members_to_canonical_handles() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(path).expect("open ObjStm fixture"),
+        ))
+        .expect("open ObjStm fixture");
+        let member_ref = ObjectRef::new(7, 0);
+
+        // The legacy cache has already materialized the member, matching
+        // qpdf's cached compressed object before QPDF::removeObject erases
+        // only the requested ObjStm cache entry (QPDF.cc:1996-2004).
+        assert!(matches!(
+            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            Object::Dictionary(_)
+        ));
+
+        pdf.delete_object(ObjectRef::new(1, 0));
+
+        let member = pdf.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("cached ObjStm member must survive source-container deletion");
+        assert!(
+            member.as_dictionary().is_some(),
+            "deleting the source ObjStm must not turn an already-resolved member into null"
+        );
+    }
+
+    #[test]
+    fn replacing_an_objstm_container_promotes_resolved_members_to_canonical_handles() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(path).expect("open ObjStm fixture"),
+        ))
+        .expect("open ObjStm fixture");
+        let member_ref = ObjectRef::new(7, 0);
+
+        assert!(matches!(
+            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            Object::Dictionary(_)
+        ));
+
+        // Keep both an unrelated object-stream row and an unmaterialized row
+        // in the source xref so the promotion walk exercises its filtering
+        // boundaries without manufacturing a second parsed stream fixture.
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(90, 0),
+            XrefEntry::Compressed {
+                stream: 2,
+                index: 0,
+            },
+        );
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(91, 0),
+            XrefEntry::Compressed {
+                stream: 1,
+                index: 99,
+            },
+        );
+
+        pdf.set_object(ObjectRef::new(1, 0), Object::Null);
+
+        let member = pdf.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("cached ObjStm member must survive source-container replacement");
+        assert!(
+            member.as_dictionary().is_some(),
+            "replacing the source ObjStm must not turn an already-resolved member into null"
+        );
     }
 
     #[test]

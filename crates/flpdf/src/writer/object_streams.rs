@@ -15,6 +15,7 @@ use std::num::NonZeroUsize;
 
 use crate::object::{Dictionary, Object, ObjectRef};
 use crate::writer::WriterOptions;
+use crate::ObjectHandle;
 use crate::XrefEntry;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -28,50 +29,52 @@ pub(crate) struct EligibilityContext {
 
 // ── Predicate ────────────────────────────────────────────────────────────────
 
-/// Returns `true` when the object identified by `object_ref` with body
-/// `object` may be stored inside an ObjStm.
+/// Returns `true` when the object identified by `object_ref` and represented by
+/// the live `ObjectHandle` may be stored inside an ObjStm.
 ///
 /// Disqualifying conditions (PDF spec + implementation constraints):
 /// 1. `object_ref.generation != 0`  — ObjStm members must have generation 0.
-/// 2. `object` is a [`Object::Stream`] — streams cannot be embedded in ObjStm.
+/// 2. `object` is a stream — streams cannot be embedded in ObjStm.
 /// 3. The object is a dictionary with `/Type /ObjStm` — no nested ObjStm.
 /// 4. The object is a dictionary with `/Type /XRef` — xref streams must be direct.
 /// 5. `object_ref` is the encryption dictionary reference.
-pub(crate) fn is_eligible_for_objstm(
+pub(crate) fn is_eligible_for_objstm_handle(
     object_ref: ObjectRef,
-    object: &Object,
+    object: &ObjectHandle,
     ctx: &EligibilityContext,
-) -> bool {
+) -> crate::Result<bool> {
     // 1. Generation must be 0.
     if object_ref.generation != 0 {
-        return false;
+        return Ok(false);
     }
 
     // 2. Stream objects cannot be embedded.
-    if matches!(object, Object::Stream(_)) {
-        return false;
+    object.try_dereference()?;
+    if object.as_stream_dict().is_some() {
+        return Ok(false);
     }
 
     // 3 & 4. Check /Type for Dictionary objects.
-    if let Some(dict) = object.as_dict() {
-        if dict_type_is(dict, b"ObjStm") || dict_type_is(dict, b"XRef") {
-            return false;
-        }
+    if object.try_is_dictionary_of_type(b"ObjStm", b"")?
+        || object.try_is_dictionary_of_type(b"XRef", b"")?
+    {
+        return Ok(false);
     }
 
     // 5. Encryption dictionary must not be embedded.
     if Some(object_ref) == ctx.encryption_ref {
-        return false;
+        return Ok(false);
     }
 
-    true
+    Ok(true)
 }
 
 // ── Context builder ──────────────────────────────────────────────────────────
 
 /// Build an eligibility context by querying pdf for the encryption reference.
 /// Must be called once before processing any objects; the result is then used
-/// with is_eligible_for_objstm, which is a pure function.
+/// with [`is_eligible_for_objstm_handle`], which resolves and inspects the
+/// canonical handle value.
 pub(crate) fn eligibility_context<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<EligibilityContext> {
@@ -308,8 +311,8 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
                 continue;
             }
             let eligible_for_objstm = {
-                let object = pdf.resolve_borrowed(member)?;
-                is_eligible_for_objstm(member, object, &ctx)
+                let object = pdf.get_object_handle(member);
+                is_eligible_for_objstm_handle(member, &object, &ctx)?
             };
             if eligible_for_objstm {
                 retained.push(member);
@@ -359,20 +362,6 @@ pub(crate) struct CompressiblePlan {
     pub removed_refs: BTreeSet<ObjectRef>,
 }
 
-/// Snapshot a resolved object without retaining opaque stream payload bytes.
-///
-/// The traversal only follows stream dictionaries, so cloning their data would
-/// add memory proportional to the largest stream for no semantic benefit.
-fn snapshot_traversal_object(object: &Object) -> Object {
-    match object {
-        Object::Stream(stream) => Object::Stream(crate::Stream {
-            dict: stream.dict.clone(),
-            data: Vec::new(),
-        }),
-        other => other.clone(),
-    }
-}
-
 pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<CompressiblePlan> {
@@ -390,52 +379,48 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
             .or_insert(object_ref.generation);
     }
     // The encryption dictionary is excluded from the result, matching qpdf's
-    // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay a
-    // plain indirect object so the rest of the file can be decrypted. Read it
-    // from the trailer's `/Encrypt` reference (it is still traversed for any
-    // child references, like a stream or signature dictionary).
-    let encrypt_ref = match pdf.trailer().get("Encrypt") {
-        Some(Object::Reference(r)) => Some(*r),
-        _ => None,
-    };
+    // `m->trailer.getKey("/Encrypt")` guard (QPDF.cc:2402/2437): it must stay
+    // a plain indirect object so the rest of the file can be decrypted. Read it
+    // from the live trailer handle (it is still traversed for any child
+    // references, like a stream or signature dictionary).
     // qpdf seeds the stack with the trailer dictionary itself (a direct object).
-    let mut stack: Vec<Object> = vec![Object::Dictionary(pdf.trailer().clone())];
+    let trailer_handle = pdf.trailer_handle();
+    let encrypt_ref = trailer_handle.try_get_key(b"/Encrypt")?.object_ref();
+    let mut stack: Vec<ObjectHandle> = vec![trailer_handle];
 
-    while let Some(obj) = stack.pop() {
-        match obj {
-            Object::Reference(r) => {
-                if r.number == 0 {
-                    continue;
-                }
-                if highest_live_generation
-                    .get(&r.number)
-                    .is_some_and(|generation| *generation > r.generation)
-                {
-                    removed_refs.insert(r);
-                    continue;
-                }
-                if !visited.insert(r.number) {
-                    continue;
-                }
-                let resolved = {
-                    let object = pdf.resolve_borrowed(r)?;
-                    snapshot_traversal_object(object)
-                };
-                let is_signature = is_qpdf_signature_dict(pdf, r)?;
-                // Streams, signature value dictionaries, and the encryption
-                // dictionary cannot be stored inside an object stream, so they
-                // are excluded from the result — but they are still traversed for
-                // child references (QPDF.cc:2437-2445).
-                if !matches!(resolved, Object::Stream(_)) && !is_signature && Some(r) != encrypt_ref
-                {
-                    result.push(r);
-                }
-                push_children(pdf, &resolved, &mut stack)?;
-            }
-            // Direct (inline) container: traversed for its children but never
-            // contributes a reference (it has no object number of its own).
-            other => push_children(pdf, &other, &mut stack)?,
+    while let Some(object) = stack.pop() {
+        let Some(object_ref) = object.object_ref() else {
+            // Direct (inline) containers are traversed for their children but
+            // never contribute a reference of their own.
+            push_handle_children(&object, &mut stack)?;
+            continue;
+        };
+
+        if object_ref.number == 0 {
+            continue;
         }
+        if highest_live_generation
+            .get(&object_ref.number)
+            .is_some_and(|generation| *generation > object_ref.generation)
+        {
+            removed_refs.insert(object_ref);
+            continue;
+        }
+        if !visited.insert(object_ref.number) {
+            continue;
+        }
+
+        object.try_dereference()?;
+        let is_stream = object.as_stream_dict().is_some();
+        let is_signature = !is_stream && is_qpdf_signature_dict(pdf, &object)?;
+        // Streams, signature value dictionaries, and the encryption dictionary
+        // cannot be stored inside an object stream, so they are excluded from
+        // the result — but they are still traversed for child references
+        // (QPDF.cc:2437-2445).
+        if !is_stream && !is_signature && Some(object_ref) != encrypt_ref {
+            result.push(object_ref);
+        }
+        push_handle_children(&object, &mut stack)?;
     }
 
     Ok(CompressiblePlan {
@@ -468,64 +453,35 @@ pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectR
 /// Preserve's source-container filtering.
 pub(crate) fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
-    object_ref: ObjectRef,
+    object: &ObjectHandle,
 ) -> crate::Result<bool> {
-    let (mut type_value, byte_range, contents) = {
-        let object = pdf.resolve_borrowed(object_ref)?;
-        let Object::Dictionary(dict) = object else {
-            return Ok(false);
-        };
-        (
-            dict.get("Type")
-                .map(snapshot_traversal_object)
-                .unwrap_or(Object::Null),
-            dict.get("ByteRange").map(snapshot_traversal_object),
-            dict.get("Contents").map(snapshot_traversal_object),
-        )
-    };
-    let mut type_refs = BTreeSet::new();
-    while let Object::Reference(reference) = type_value {
-        if reference.number == 0 || !type_refs.insert(reference) {
-            return Ok(false);
-        }
-        type_value = match pdf.resolve_borrowed(reference)? {
-            Object::Reference(next) => Object::Reference(*next),
-            Object::Name(name) => Object::Name(name.clone()),
-            _ => return Ok(false),
-        };
-    }
-    if !matches!(type_value, Object::Name(name) if name.as_slice() == b"Sig") {
+    if !object.try_is_dictionary_of_type(b"", b"")? {
         return Ok(false);
     }
-
-    let key_is_visible = |pdf: &mut crate::Pdf<R>, value: Option<&Object>| -> crate::Result<bool> {
-        match value {
-            Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
-            None => Ok(false),
-        }
-    };
-    Ok(key_is_visible(pdf, byte_range.as_ref())? && key_is_visible(pdf, contents.as_ref())?)
+    let type_value = object.try_get_key(b"/Type")?;
+    let type_value = pdf.resolve_object_handle_to_terminal(&type_value)?;
+    if !type_value.try_is_name_and_equals(b"Sig")? {
+        return Ok(false);
+    }
+    Ok(object.try_has_key(b"/ByteRange")? && object.try_has_key(b"/Contents")?)
 }
 
 /// Push an object's child values onto the DFS stack so they pop in qpdf's
 /// traversal order: dictionary values in ascending key order, array items in
 /// index order. (A LIFO stack pops in reverse insertion order, so children are
 /// pushed reversed.)
-fn push_children<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    obj: &Object,
-    stack: &mut Vec<Object>,
-) -> crate::Result<()> {
-    match obj {
-        Object::Dictionary(d) => push_dict_children(pdf, d, stack, false)?,
-        // A stream is traversed via its dictionary; the data bytes are opaque.
-        Object::Stream(s) => push_dict_children(pdf, &s.dict, stack, true)?,
-        Object::Array(items) => {
-            for v in items.iter().rev() {
-                stack.push(v.clone());
-            }
+fn push_handle_children(object: &ObjectHandle, stack: &mut Vec<ObjectHandle>) -> crate::Result<()> {
+    object.try_dereference()?;
+    if let Some(dict) = object.as_stream_dict() {
+        return push_handle_dict_children(&dict, stack, true);
+    }
+    if object.try_is_dictionary_of_type(b"", b"")? {
+        return push_handle_dict_children(object, stack, false);
+    }
+    if let Some(items) = object.try_as_array()? {
+        for item in items.into_iter().rev() {
+            stack.push(item);
         }
-        _ => {}
     }
     Ok(())
 }
@@ -534,16 +490,17 @@ fn push_children<R: std::io::Read + std::io::Seek>(
 /// For a stream dictionary (`is_stream`), `/Length` is omitted from the
 /// traversal, matching qpdf (QPDF.cc:2451): an indirect length holder must not
 /// be pulled into the compressible set via the stream.
-fn push_dict_children<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-    dict: &Dictionary,
-    stack: &mut Vec<Object>,
+fn push_handle_dict_children(
+    dict: &ObjectHandle,
+    stack: &mut Vec<ObjectHandle>,
     is_stream: bool,
 ) -> crate::Result<()> {
-    let entries = crate::qpdf_null::snapshot_entries(dict, is_stream);
-    let entries = crate::qpdf_null::visible_entries(pdf, entries)?;
-    for (_, value) in entries.into_iter().rev() {
-        stack.push(value);
+    let keys = dict.try_get_keys()?;
+    for key in keys.into_iter().rev() {
+        if is_stream && key.as_slice() == b"/Length" {
+            continue;
+        }
+        stack.push(dict.try_get_key(&key)?);
     }
     Ok(())
 }
@@ -557,13 +514,20 @@ pub(crate) fn collect_indirect_objstm_length_refs<R: std::io::Read + std::io::Se
     let mut excluded = BTreeSet::new();
     let refs: Vec<ObjectRef> = pdf.object_refs();
     for r in refs {
-        let obj = pdf.resolve_borrowed(r)?;
-        if let Some(s) = obj.as_stream() {
-            if dict_type_is(&s.dict, b"ObjStm") {
-                if let Some(Object::Reference(len_ref)) = s.dict.get("Length") {
-                    excluded.insert(*len_ref);
-                }
-            }
+        let object = pdf.get_object_handle(r);
+        object.try_dereference()?;
+        let Some(dict) = object.as_stream_dict() else {
+            continue;
+        };
+        if !dict
+            .try_get_key(b"/Type")
+            .and_then(|type_value| type_value.try_is_name_and_equals(b"ObjStm"))?
+        {
+            continue;
+        }
+        let length = dict.try_get_key(b"/Length")?;
+        if let Some(length_ref) = length.object_ref() {
+            excluded.insert(length_ref);
         }
     }
     Ok(excluded)
@@ -605,8 +569,8 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
                 continue;
             }
             let eligible_for_objstm = {
-                let obj = pdf.resolve_borrowed(obj_ref)?;
-                is_eligible_for_objstm(obj_ref, obj, ctx)
+                let obj = pdf.get_object_handle(obj_ref);
+                is_eligible_for_objstm_handle(obj_ref, &obj, ctx)?
             };
             if !eligible_for_objstm {
                 continue;
@@ -667,8 +631,8 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
         if length_exclusions.contains(&obj_ref) {
             continue;
         }
-        let obj = pdf.resolve_borrowed(obj_ref)?;
-        if !is_eligible_for_objstm(obj_ref, obj, ctx) {
+        let obj = pdf.get_object_handle(obj_ref);
+        if !is_eligible_for_objstm_handle(obj_ref, &obj, ctx)? {
             continue;
         }
         current_batch.push(obj_ref);
@@ -867,19 +831,11 @@ pub(crate) fn wrap_objstm_body(
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Returns `true` when `dict` contains `/Type /<expected>`.
-fn dict_type_is(dict: &Dictionary, expected: &[u8]) -> bool {
-    matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == expected)
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{Dictionary, Stream};
 
     fn no_ctx() -> EligibilityContext {
         EligibilityContext {
@@ -961,6 +917,54 @@ mod tests {
             order,
             vec![ref0(1), ref0(2), ref0(5), ref0(4), ref0(3)],
             "eligible objects must be in qpdf depth-first traversal order, not numeric order"
+        );
+    }
+
+    #[test]
+    fn compressible_objgens_follows_live_object_handle_mutation() {
+        let bytes = pdf_from_bodies(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /AddedByHandle true >>".to_vec()),
+        ]);
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let root = pdf.get_object_handle(ref0(1));
+        root.try_dereference().unwrap();
+        root.replace_key(b"/Added", pdf.get_object_handle(ref0(4)))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
+
+        let order = compressible_objgens(&mut pdf).unwrap();
+
+        assert_eq!(
+            order,
+            vec![ref0(1), ref0(4), ref0(2), ref0(3)],
+            "planner must traverse the live ObjectHandle graph rather than a stale legacy snapshot"
+        );
+    }
+
+    #[test]
+    fn handle_eligibility_checks_the_canonical_object_value() {
+        let bytes = pdf_from_bodies(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+            ),
+            (4, b"<< /Canonical true >>".to_vec()),
+        ]);
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let object = pdf.get_object_handle(ref0(4));
+        object.try_dereference().unwrap();
+
+        assert!(
+            is_eligible_for_objstm_handle(ref0(4), &object, &no_ctx()).unwrap(),
+            "eligibility must inspect the canonical ObjectHandle value"
         );
     }
 
@@ -1199,9 +1203,10 @@ mod tests {
             (4, b"<< /Type /Sig /ByteRange [0 10 20 30] >>".to_vec()),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let signature = pdf.get_object_handle(ref0(4));
 
         assert!(
-            !is_qpdf_signature_dict(&mut pdf, ref0(4)).unwrap(),
+            !is_qpdf_signature_dict(&mut pdf, &signature).unwrap(),
             "missing /Contents is absent under qpdf's hasKey semantics"
         );
     }
@@ -1212,7 +1217,7 @@ mod tests {
             (
                 1,
                 b"<< /Type /Catalog /Pages 2 0 R /DictOnly 4 0 R \
-                  /Array [5 0 R 99 0 R] >>"
+                  /Array [5 0 R 99 0 R 0 0 R] >>"
                     .to_vec(),
             ),
             (2, b"<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>".to_vec()),
@@ -1224,6 +1229,17 @@ mod tests {
             (5, b"null".to_vec()),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let root = pdf.get_object_handle(ref0(1));
+        root.try_dereference().unwrap();
+        root.replace_key(
+            b"/Array",
+            crate::ObjectHandle::array(vec![
+                pdf.get_object_handle(ref0(5)),
+                pdf.get_object_handle(ref0(99)),
+                pdf.get_object_handle(ObjectRef::new(0, 0)),
+            ]),
+        )
+        .unwrap();
         let eligible = compressible_objgens(&mut pdf).unwrap();
         let dict_only_real_null = ref0(4);
         let array_real_null = ref0(5);
@@ -1485,37 +1501,26 @@ mod tests {
         );
     }
 
-    fn typed_dict(type_name: &[u8]) -> Object {
-        let mut d = Dictionary::new();
-        d.insert("Type", Object::Name(type_name.to_vec()));
-        Object::Dictionary(d)
+    fn typed_dict(type_name: &[u8]) -> crate::ObjectHandle {
+        crate::ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            crate::ObjectHandle::name(type_name.to_vec()),
+        )])
     }
 
     #[test]
     fn generation_one_is_ineligible() {
-        let obj = Object::Null;
-        assert!(!is_eligible_for_objstm(ref1(1), &obj, &no_ctx()));
+        let obj = crate::ObjectHandle::null();
+        assert!(!is_eligible_for_objstm_handle(ref1(1), &obj, &no_ctx()).unwrap());
     }
 
     #[test]
     fn stream_object_is_ineligible() {
-        let obj = Object::Stream(Stream::new(Dictionary::new(), vec![]));
-        assert!(!is_eligible_for_objstm(ref0(1), &obj, &no_ctx()));
-    }
-
-    #[test]
-    fn traversal_snapshot_replaces_stream_payload_with_dictionary() {
-        let mut dict = Dictionary::new();
-        dict.insert("Child", Object::Reference(ref0(7)));
-        let obj = Object::Stream(Stream::new(dict.clone(), vec![0x5a; 1024 * 1024]));
-
-        let snapshot = snapshot_traversal_object(&obj);
-
-        assert_eq!(
-            snapshot,
-            Object::Stream(Stream::new(dict, Vec::new())),
-            "stream traversal snapshot must retain its kind without payload bytes"
+        let obj = crate::ObjectHandle::stream(
+            crate::ObjectHandle::dictionary(Vec::new()),
+            std::rc::Rc::new(Vec::new()),
         );
+        assert!(!is_eligible_for_objstm_handle(ref0(1), &obj, &no_ctx()).unwrap());
     }
 
     #[test]
@@ -1552,13 +1557,13 @@ mod tests {
     #[test]
     fn objstm_typed_dict_is_ineligible() {
         let obj = typed_dict(b"ObjStm");
-        assert!(!is_eligible_for_objstm(ref0(1), &obj, &no_ctx()));
+        assert!(!is_eligible_for_objstm_handle(ref0(1), &obj, &no_ctx()).unwrap());
     }
 
     #[test]
     fn xref_typed_dict_is_ineligible() {
         let obj = typed_dict(b"XRef");
-        assert!(!is_eligible_for_objstm(ref0(1), &obj, &no_ctx()));
+        assert!(!is_eligible_for_objstm_handle(ref0(1), &obj, &no_ctx()).unwrap());
     }
 
     #[test]
@@ -1566,8 +1571,8 @@ mod tests {
         let ctx = EligibilityContext {
             encryption_ref: Some(ref0(5)),
         };
-        let obj = Object::Null;
-        assert!(!is_eligible_for_objstm(ref0(5), &obj, &ctx));
+        let obj = crate::ObjectHandle::null();
+        assert!(!is_eligible_for_objstm_handle(ref0(5), &obj, &ctx).unwrap());
     }
 
     #[test]
@@ -1597,13 +1602,13 @@ mod tests {
     #[test]
     fn plain_page_dict_is_eligible() {
         let obj = typed_dict(b"Page");
-        assert!(is_eligible_for_objstm(ref0(3), &obj, &no_ctx()));
+        assert!(is_eligible_for_objstm_handle(ref0(3), &obj, &no_ctx()).unwrap());
     }
 
     #[test]
     fn plain_null_object_is_eligible() {
-        let obj = Object::Null;
-        assert!(is_eligible_for_objstm(ref0(10), &obj, &no_ctx()));
+        let obj = crate::ObjectHandle::null();
+        assert!(is_eligible_for_objstm_handle(ref0(10), &obj, &no_ctx()).unwrap());
     }
 
     // ── Planner tests ────────────────────────────────────────────────────────
@@ -1964,7 +1969,7 @@ mod tests {
     fn planner_preserve_mode_skips_ineligible_members() {
         // ObjStm has 3 compressed members:
         //   obj 2: Pages dict          → eligible
-        //   obj 3: /Type /XRef dict    → ineligible (is_eligible_for_objstm rejects XRef-typed dicts)
+        //   obj 3: /Type /XRef dict    → ineligible (the handle predicate rejects XRef-typed dicts)
         //   obj 4: plain string        → eligible
         //
         // Preserve mode must include only obj 2 and obj 4 in the output batch,
