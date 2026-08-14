@@ -135,10 +135,10 @@ pub(crate) mod xref_stream {
     //! is backend-independent.
 
     use std::collections::BTreeMap;
-    use std::io::Write as _;
 
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
+    use crate::pipeline::buffer::Buffer;
+    use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
+    use crate::pipeline::Pipeline;
 
     use crate::object::{Dictionary, Object, ObjectRef};
     use crate::Result;
@@ -219,16 +219,27 @@ pub(crate) mod xref_stream {
         .expect("xref row geometry is always a valid PNG predictor configuration")
     }
 
-    /// Flate-compress with zlib at `Compression::default()` (level 6), matching
+    /// Flate-compress with Pl_Flate's default zlib compression (level 6), matching
     /// qpdf's `Z_DEFAULT_COMPRESSION`.
     fn flate_compress(data: &[u8]) -> Vec<u8> {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(data)
-            .expect("ZlibEncoder::write_all on Vec<u8> cannot fail");
-        encoder
-            .finish()
-            .expect("ZlibEncoder::finish on Vec<u8> cannot fail")
+        let mut sink = Buffer::new("compressed xref stream", None);
+        {
+            let mut flate = Flate::new(
+                "compress xref",
+                &mut sink,
+                FlateAction::Deflate,
+                DEFAULT_OUT_BUFFER_SIZE,
+            )
+            .expect("Pl_Flate construction with the fixed output buffer cannot fail");
+            flate
+                .write(data)
+                .expect("Pl_Flate::write to an in-memory xref sink cannot fail");
+            flate
+                .finish()
+                .expect("Pl_Flate::finish to an in-memory xref sink cannot fail");
+        }
+        sink.take_buffer()
+            .expect("Pl_Buffer must be ready after Pl_Flate::finish")
     }
 
     /// Encode the cross-reference stream payload: PNG-Up predictor over the
@@ -575,6 +586,17 @@ pub(crate) mod xref_stream {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn xref_production_route_has_no_direct_zlib_encoder() {
+            let source = include_str!("serialize.rs");
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            let direct_encoder = ["flate2::write::", "ZlibEncoder"].concat();
+            assert!(
+                !production.contains(&direct_encoder),
+                "xref production must use the canonical pipeline Flate route"
+            );
+        }
 
         // Object map decoded from the qpdf 11.9.0 golden
         // (`--linearize --object-streams=generate --deterministic-id` of
