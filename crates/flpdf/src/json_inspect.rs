@@ -5209,6 +5209,34 @@ mod tests {
     }
 
     #[test]
+    fn object_handle_write_json_rejects_versions_other_than_qpdf_one_or_two() {
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+
+        let error = ObjectHandle::null()
+            .write_json(3, &mut output, false, 0)
+            .expect_err("qpdf only accepts JSON versions 1 and 2");
+
+        assert!(matches!(error, ObjectJsonError::UnsupportedVersion(3)));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn object_handle_write_json_maps_outer_resolver_failure() {
+        let (handle, _resolver) =
+            crate::object_handle::identity_tests::error_resolving_handle(ObjectRef::new(12, 0));
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+
+        let error = handle
+            .write_json(2, &mut output, true, 0)
+            .expect_err("the resolver failure must reach the JSON boundary");
+
+        assert!(matches!(error, ObjectJsonError::Pdf(message) if message == "resolver failed"));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
     fn object_handle_write_json_scalar_chunks_match_qpdf_writer_boundaries() {
         let cases = [
             (ObjectHandle::null(), vec![b"null".to_vec()]),
@@ -5265,6 +5293,91 @@ mod tests {
             .expect("missing dictionary values are qpdf null entries");
 
         assert_eq!(bytes, b"{\n  \"/Value\": 1\n}");
+    }
+
+    #[test]
+    fn object_handle_write_json_reports_uninitialized_dictionary_children() {
+        let value = ObjectHandle::dictionary(vec![(
+            b"/Broken".to_vec(),
+            ObjectHandle::new_indirect_unresolved(ObjectRef::new(13, 0), 0),
+        )]);
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+
+        let error = value
+            .write_json(2, &mut output, false, 0)
+            .expect_err("qpdf resolves a dictionary child before isNull");
+
+        assert!(matches!(error, ObjectJsonError::Uninitialized));
+        assert_eq!(bytes, b"{");
+    }
+
+    #[test]
+    fn object_handle_write_json_maps_dictionary_child_resolver_failure() {
+        let (child, _resolver) =
+            crate::object_handle::identity_tests::error_resolving_handle(ObjectRef::new(14, 0));
+        let value = ObjectHandle::dictionary(vec![(b"/Broken".to_vec(), child)]);
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+
+        let error = value
+            .write_json(2, &mut output, false, 0)
+            .expect_err("the child resolver failure must reach the JSON boundary");
+
+        assert!(matches!(error, ObjectJsonError::Pdf(message) if message == "resolver failed"));
+        assert_eq!(bytes, b"{");
+    }
+
+    #[test]
+    fn object_handle_write_json_reports_destroyed_handles() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(15, 0), 0);
+        handle.set_resolved(crate::object_handle::ObjectValue::Integer(1));
+        handle.disconnect();
+
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+        let error = handle
+            .write_json(2, &mut output, false, 0)
+            .expect_err("a handle outliving its PDF is destroyed");
+
+        assert!(matches!(error, ObjectJsonError::Destroyed));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn object_handle_write_json_matches_qpdf_v1_and_v2_string_name_forms() {
+        let cases = [
+            (
+                ObjectHandle::string(b"hello".to_vec()),
+                1,
+                b"\"hello\"".as_slice(),
+            ),
+            (
+                ObjectHandle::name(b"Fit".to_vec()),
+                1,
+                b"\"/Fit\"".as_slice(),
+            ),
+            (
+                ObjectHandle::string(b"\xef\xbb\xbfhello".to_vec()),
+                2,
+                b"\"u:hello\"".as_slice(),
+            ),
+            (ObjectHandle::string(vec![0x08]), 2, b"\"u:\\b\"".as_slice()),
+            (
+                ObjectHandle::dictionary(vec![(b"Plain".to_vec(), ObjectHandle::integer(1))]),
+                2,
+                b"{\n  \"/Plain\": 1\n}".as_slice(),
+            ),
+        ];
+
+        for (handle, version, expected) in cases {
+            let mut bytes = Vec::new();
+            let mut output = PlString::new("object-handle-json", None, &mut bytes);
+            handle
+                .write_json(version, &mut output, false, 0)
+                .expect("the qpdf JSON form is serializable");
+            assert_eq!(bytes, expected);
+        }
     }
 
     // ── 9. Real (float) conversion ────────────────────────────────────────────
@@ -5703,6 +5816,66 @@ mod tests {
         let malformed = ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(vec![]));
         let result = project(super::pdf_object_to_json(&malformed).unwrap()).unwrap();
         assert_eq!(result, number(1));
+    }
+
+    #[test]
+    fn detached_stream_reference_seeding_walks_stream_dictionary_entries() {
+        use crate::object::{Dictionary, Stream};
+
+        let object_ref = ObjectRef::new(16, 0);
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Child", Object::Reference(object_ref));
+        let object = Object::Stream(Stream::new(dictionary, vec![]));
+        let mut pdf = empty_pdf();
+
+        seed_detached_reference_targets(&mut pdf, &object);
+
+        assert!(!pdf.get_object_handle(object_ref).is_null());
+    }
+
+    #[test]
+    fn object_json_error_conversions_preserve_pipeline_and_conversion_categories() {
+        let pipeline = JsonOutputError::from(ObjectJsonError::Pipeline(PipelineError::runtime(
+            "sink failed",
+        )));
+        assert!(matches!(pipeline, JsonOutputError::Pipeline(_)));
+
+        let non_finite = JsonOutputError::from(ObjectJsonError::NonFiniteFloat);
+        assert!(matches!(
+            non_finite,
+            JsonOutputError::Convert(ConvertError::NonFiniteFloat)
+        ));
+
+        let json = JsonOutputError::from(ObjectJsonError::Json("invalid".to_string()));
+        assert!(matches!(
+            json,
+            JsonOutputError::Convert(ConvertError::JsonError(_))
+        ));
+
+        let other = JsonOutputError::from(ObjectJsonError::UnsupportedVersion(3));
+        assert!(matches!(
+            other,
+            JsonOutputError::Convert(ConvertError::PdfError(_))
+        ));
+
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::NonFiniteFloat),
+            ConvertError::NonFiniteFloat
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::Json("invalid".to_string())),
+            ConvertError::JsonError(_)
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::Pipeline(PipelineError::runtime(
+                "sink failed",
+            ))),
+            ConvertError::PdfError(_)
+        ));
+        assert!(matches!(
+            convert_object_json_error(ObjectJsonError::UnsupportedVersion(3)),
+            ConvertError::PdfError(_)
+        ));
     }
 
     // ══════════════════════════════════════════════════════════════════════════

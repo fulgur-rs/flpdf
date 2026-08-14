@@ -6857,6 +6857,55 @@ fn json_encode_string(value: &[u8]) -> Vec<u8> {
     encoded
 }
 
+#[cfg(test)]
+mod object_json_writer_tests {
+    use super::*;
+    use crate::pipeline::PlString;
+
+    #[test]
+    fn writer_rejects_a_direct_reserved_handle_before_type_dispatch() {
+        let handle = ObjectHandle::new_reserved_direct();
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+
+        let error = handle
+            .write_json(2, &mut output, false, 0)
+            .expect_err("reserved values have no JSON representation");
+
+        assert!(matches!(error, ObjectJsonError::Reserved));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn writer_treats_a_reserved_dictionary_child_as_non_null_then_rejects_it() {
+        let handle = ObjectHandle::dictionary(vec![(
+            b"Reserved".to_vec(),
+            ObjectHandle::new_reserved_direct(),
+        )]);
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+
+        let error = handle
+            .write_json(2, &mut output, false, 0)
+            .expect_err("reserved children retain their identity but cannot be written");
+
+        assert!(matches!(error, ObjectJsonError::Reserved));
+        assert_eq!(bytes, b"{\n  \"/Reserved\": ");
+    }
+
+    #[test]
+    fn json_name_and_string_helpers_cover_empty_and_json_escape_forms() {
+        assert_eq!(json_normalize_name(&[]), Vec::<u8>::new());
+
+        let encoded = json_encode_string(b"\\\"\x08\x0c\n\r\t\x01");
+        let expected = vec![
+            b'\\', b'\\', b'\\', b'"', b'\\', b'b', b'\\', b'f', b'\\', b'n', b'\\', b'r', b'\\',
+            b't', b'\\', b'u', b'0', b'0', b'0', b'1',
+        ];
+        assert_eq!(encoded, expected);
+    }
+}
+
 impl ObjectHandle {
     /// This stream-dictionary handle's writer-emission form, matching
     /// `Dictionary::write_pdf_stream`'s established layout (`object.rs`)
