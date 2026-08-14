@@ -187,7 +187,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// resurrect an explicitly removed reference.
     pub(crate) qpdf_removed_refs: BTreeSet<ObjectRef>,
     /// Caller replacements installed while their exact object reference has
-    /// no source xref row. qpdf's `replaceObject` updates `obj_cache` without
+    /// no effective xref row. qpdf's `replaceObject` updates `obj_cache` without
     /// manufacturing an `xref_table` row (`QPDF.cc:1986-1993`), so a later
     /// flpdf recovery scan must not let a stale source body turn this
     /// cache-only replacement into a public xref snapshot entry. This is exact

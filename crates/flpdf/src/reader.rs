@@ -1015,7 +1015,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// reconstruction or a table derived from resolved values. The returned
     /// map is a snapshot because the resolver owns the table behind interior
     /// mutability; resolution-time recovery is reflected in a subsequent
-    /// snapshot. Caller replacements that originated without a source row
+    /// snapshot. Caller replacements that originated without an effective row
     /// stay in qpdf's object cache but do not manufacture an xref entry
     /// (`QPDF.cc:1986-1993`).
     pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
@@ -1211,7 +1211,7 @@ impl<R: Read + Seek> Pdf<R> {
         // legacy cache before using it to classify the replacement, or an old
         // object-stream entry can incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
-        if self.resolver.xref_entry(object_ref).is_none() {
+        if !self.resolver.xref_entries().contains_key(&object_ref) {
             self.qpdf_replacement_only_refs.insert(object_ref);
         }
         self.qpdf_removed_refs.remove(&object_ref);
@@ -1751,7 +1751,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
-        let replacement_only = self.resolver.xref_entry(object_ref).is_none();
+        let replacement_only = !self.resolver.xref_entries().contains_key(&object_ref);
         let target = self.resolver.replace_object(object_ref, replacement)?;
         if replacement_only {
             self.qpdf_replacement_only_refs.insert(object_ref);
@@ -8737,6 +8737,65 @@ mod tests {
             !pdf.qpdf_replacement_only_refs.contains(&target_ref),
             "a rejected replacement must not change the cache-only xref snapshot state"
         );
+    }
+
+    #[test]
+    fn set_object_preserves_an_objstm_default_xref_row() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        // `resolveObjectsInStream` creates this effective type-0 row when an
+        // ObjStm header names a member absent from the source xref table.
+        pdf.resolver.insert_default_xref_entry_for_test(object_ref);
+        assert!(pdf.resolver.xref_entry(object_ref).is_none());
+        assert_eq!(
+            pdf.get_xref_table().get(&object_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+
+        pdf.set_object(object_ref, Object::Integer(41));
+
+        assert!(
+            !pdf.qpdf_replacement_only_refs.contains(&object_ref),
+            "an effective ObjStm default row is not a cache-only replacement"
+        );
+        assert_eq!(
+            pdf.get_xref_table().get(&object_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+        let current = pdf.get_object_handle(object_ref);
+        assert!(current.is_same_object_as(&handle));
+        assert_eq!(current.as_integer(), Some(41));
+    }
+
+    #[test]
+    fn replace_object_handle_preserves_an_objstm_default_xref_row() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        // This is qpdf's `m->xref_table[og]` side effect for an ObjStm
+        // header member not declared by the source xref table.
+        pdf.resolver.insert_default_xref_entry_for_test(object_ref);
+        assert!(pdf.resolver.xref_entry(object_ref).is_none());
+        assert_eq!(
+            pdf.get_xref_table().get(&object_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+
+        let current = pdf
+            .replace_object_handle(object_ref, ObjectHandle::integer(42))
+            .expect("replace canonical handle");
+
+        assert!(
+            !pdf.qpdf_replacement_only_refs.contains(&object_ref),
+            "an effective ObjStm default row is not a cache-only replacement"
+        );
+        assert_eq!(
+            pdf.get_xref_table().get(&object_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+        assert!(current.is_same_object_as(&handle));
+        assert_eq!(current.as_integer(), Some(42));
     }
 
     #[test]

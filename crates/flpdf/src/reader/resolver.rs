@@ -1672,6 +1672,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .insert(object_ref);
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_default_xref_entry_for_test(&self, object_ref: ObjectRef) {
+        self.insert_default_xref_entry(object_ref);
+    }
+
     fn has_default_xref_entry(&self, object_ref: ObjectRef) -> bool {
         self.core
             .borrow()
