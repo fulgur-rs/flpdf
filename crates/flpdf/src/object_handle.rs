@@ -67,6 +67,7 @@ use crate::token_filter::TokenFilter;
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
     pipeline::{
+        buffer::Buffer,
         count::Count,
         flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE},
         qpdf_tokenizer::QpdfTokenizer,
@@ -255,6 +256,32 @@ impl StreamDataProvider for CopiedStreamDataProvider {
 
 pub(crate) fn copied_stream_data_provider(source: ObjectHandle) -> Rc<dyn StreamDataProvider> {
     Rc::new(CopiedStreamDataProvider { source })
+}
+
+/// qpdf's `CoalesceProvider` (`QPDFObjectHandle.cc:94-118`), retaining the
+/// page and the pre-coalesced `/Contents` handle so the replacement stream
+/// stays lazy and reuses the canonical content-stream pipeline every time it
+/// is read.
+struct CoalesceContentProvider {
+    containing_page: ObjectHandle,
+    old_contents: ObjectHandle,
+}
+
+impl StreamDataProvider for CoalesceContentProvider {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        let description = format!(
+            "page object {}",
+            object_generation_description(&self.containing_page)
+        );
+        let mut all_description = String::new();
+        self.old_contents
+            .pipe_content_streams(pipeline, &description, &mut all_description)
+    }
 }
 
 struct StreamFilterPlan {
@@ -3687,6 +3714,206 @@ impl ObjectHandle {
     /// handles retain their canonical identity and no stream data is decoded.
     pub fn get_page_contents(&self) -> Result<Vec<ObjectHandle>> {
         Ok(self.page_contents_with_description()?.0)
+    }
+
+    /// Add a content stream to this page, preserving qpdf's always-array
+    /// result and prepend/append order.
+    ///
+    /// This ports `QPDFObjectHandle::addPageContents`
+    /// (`libqpdf/QPDFObjectHandle.cc:1495-1513`). The incoming handle is
+    /// checked before the existing page contents are inspected, matching
+    /// qpdf's `assertStream` ordering. Existing malformed content arrays use
+    /// the same normalization and warning boundary as [`Self::get_page_contents`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::System`] when `new_contents` is not a stream, and
+    /// propagates content normalization, ownership, or replacement failures.
+    pub fn add_page_contents(&self, new_contents: ObjectHandle, first: bool) -> Result<()> {
+        new_contents.try_dereference()?;
+        if new_contents.type_code() != 10 {
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {}",
+                new_contents.type_name()
+            )));
+        }
+
+        let mut content_streams = Vec::new();
+        if first {
+            content_streams.push(new_contents.clone());
+        }
+        content_streams.extend(self.get_page_contents()?);
+        if !first {
+            content_streams.push(new_contents);
+        }
+        self.replace_key(b"/Contents", ObjectHandle::array(content_streams))
+    }
+
+    /// Set this page's rotation, optionally adding the nearest inherited
+    /// `/Rotate` value.
+    ///
+    /// This ports `QPDFObjectHandle::rotatePage`
+    /// (`libqpdf/QPDFObjectHandle.cc:1517-1546`). Relative lookup walks
+    /// `/Parent` through dictionary handles, stops at the first integer
+    /// `/Rotate`, ignores a non-quarter-turn inherited value, and uses
+    /// canonical object identity to break cycles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::System`] for a non-multiple-of-90 angle and
+    /// propagates lazy-resolution, warning, or dictionary replacement errors.
+    pub fn rotate_page(&self, angle: i32, relative: bool) -> Result<()> {
+        if angle % 90 != 0 {
+            return Err(Error::System(
+                "QPDF::rotatePage called with an angle that is not a multiple of 90".to_owned(),
+            ));
+        }
+
+        let mut new_angle = i64::from(angle);
+        if relative {
+            let mut old_angle = 0_i64;
+            let mut current = self.clone();
+            // qpdf's visited set is keyed by canonical object identity. The
+            // retained Rc is intentional: it keeps pointer identity stable
+            // for the duration of the parent walk.
+            #[allow(
+                clippy::mutable_key_type,
+                reason = "identity key compares only Rc pointer identity and retains the slot deliberately"
+            )]
+            let mut visited = std::collections::HashSet::new();
+            while visited.insert(current.identity_key()) {
+                let rotate = current.try_get_key(b"/Rotate")?;
+                if let Some(value) = rotate.try_as_integer()? {
+                    old_angle = value;
+                    break;
+                }
+
+                let parent = current.try_get_key(b"/Parent")?;
+                parent.try_dereference()?;
+                if parent.as_dictionary().is_some() {
+                    current = parent;
+                } else {
+                    break;
+                }
+            }
+            if old_angle % 90 != 0 {
+                old_angle = 0;
+            }
+            new_angle += old_angle;
+        }
+
+        // Keep C++'s remainder semantics for negative angles while widening
+        // before the addition so the Rust implementation cannot overflow at
+        // the edge of the i32 API domain.
+        let normalized = (new_angle + 360) % 360;
+        self.replace_key(b"/Rotate", ObjectHandle::integer(normalized))
+    }
+
+    /// Replace an array-valued `/Contents` entry with one lazy stream whose
+    /// bytes are produced by the canonical page-content pipeline.
+    ///
+    /// This ports `QPDFObjectHandle::coalesceContentStreams`
+    /// (`libqpdf/QPDFObjectHandle.cc:1550-1572`). A single stream, missing
+    /// `/Contents`, null, and other non-array values are no-ops. An array
+    /// requires an owning document because qpdf creates a document-owned
+    /// replacement stream and registers a deferred provider; no decoded byte
+    /// cache is installed here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when an array needs coalescing but this
+    /// handle has no owning document, and propagates resolution, ownership,
+    /// stream allocation, or provider-registration failures.
+    pub fn coalesce_content_streams(&self) -> Result<()> {
+        self.try_dereference()?;
+        let old_contents = self.try_get_key(b"/Contents")?;
+        old_contents.try_dereference()?;
+        if old_contents.type_code() == 10 || old_contents.as_array().is_none() {
+            return Ok(());
+        }
+
+        let resolver = self.context().ok_or_else(|| {
+            Error::System(
+                "coalesceContentStreams called on object  with no associated PDF file".to_owned(),
+            )
+        })?;
+        let new_contents = resolver.new_stream()?;
+        self.replace_key(b"/Contents", new_contents.clone())?;
+        let provider = Rc::new(CoalesceContentProvider {
+            containing_page: self.clone(),
+            old_contents,
+        });
+        new_contents.replace_stream_data_provider(
+            provider,
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )
+    }
+
+    /// Pipe this page's `/Contents` through qpdf's decoded, newline-joining
+    /// content-stream pipeline.
+    ///
+    /// This ports `QPDFObjectHandle::pipePageContents`
+    /// (`libqpdf/QPDFObjectHandle.cc:1702-1707`). `all_description` is kept
+    /// internal to the delegated call so parse/stream errors retain the same
+    /// page and object-generation context as qpdf.
+    pub fn pipe_page_contents(&self, pipeline: &mut dyn Pipeline) -> Result<()> {
+        let description = format!("page object {}", object_generation_description(self));
+        let contents = self.try_get_key(b"/Contents")?;
+        let mut all_description = String::new();
+        contents.pipe_content_streams(pipeline, &description, &mut all_description)
+    }
+
+    /// Pipe this handle when it is a stream or an array of streams, decoding
+    /// each stream at qpdf's specialized level and inserting one newline only
+    /// when the preceding decoded stream did not end in one.
+    ///
+    /// This ports `QPDFObjectHandle::pipeContentStreams`
+    /// (`libqpdf/QPDFObjectHandle.cc:1709-1737`). A private buffer mirrors
+    /// qpdf's `Pl_Buffer`: stream pipelines may finish it after each member,
+    /// while the caller's pipeline is written and finished exactly once after
+    /// all members have been decoded.
+    pub fn pipe_content_streams(
+        &self,
+        pipeline: &mut dyn Pipeline,
+        description: &str,
+        all_description: &mut String,
+    ) -> Result<()> {
+        let (streams, generated_description) = self.array_or_stream_to_stream_array(description)?;
+        all_description.clear();
+        all_description.push_str(&generated_description);
+
+        let mut buffer = Buffer::new("concatenated content stream buffer", None);
+        let mut need_newline = false;
+        for stream in streams {
+            if need_newline {
+                buffer.write(b"\n")?;
+            }
+
+            let mut last_char = Count::new("last character", &mut buffer);
+            let mut filtering_attempted = false;
+            let succeeded = stream.pipe_stream_data(
+                &mut last_char,
+                &mut filtering_attempted,
+                0,
+                DecodeLevel::Specialized,
+                false,
+                false,
+            )?;
+            if !succeeded {
+                return Err(Error::Unsupported(format!(
+                    "content stream object {}: errors while decoding content stream",
+                    object_generation_description(&stream)
+                )));
+            }
+            last_char.finish()?;
+            need_newline = last_char.last_byte() != b'\n';
+        }
+
+        let data = buffer.take_buffer()?;
+        pipeline.write(&data)?;
+        pipeline.finish()?;
+        Ok(())
     }
 
     /// The normalized page content streams plus the qpdf description used by
