@@ -93,6 +93,7 @@
 // (where qpdf warns) is outside the try_array_item contract. See
 // docs/qpdf-correspondence.md.
 
+use crate::pdf_string::{decode_pdf_text_string, lossy_utf16_to_utf8, utf8_value};
 use crate::token_filter::TokenFilter;
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
@@ -102,7 +103,7 @@ use crate::{
         count::Count,
         flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE},
         qpdf_tokenizer::QpdfTokenizer,
-        Pipeline, PipelineError, PipelineRef,
+        Pipeline, PipelineError, PipelineRef, PlString,
     },
     stream_filter::{
         decode_params_from_handle, normalize_filter_name, stream_filter_for, OwnedDecodePipeline,
@@ -5030,6 +5031,58 @@ impl ObjectHandle {
         }
     }
 
+    /// Write this handle through qpdf 11.9.0's `QPDFObjectHandle::writeJSON`
+    /// pipeline boundary.
+    ///
+    /// The writer is deliberately owned by the handle layer: qpdf dispatches
+    /// from `QPDFObjectHandle::writeJSON` into each `QPDF_*::writeJSON`
+    /// implementation using one `JSON::Writer`, and the caller retains the
+    /// outer pipeline's `finish` boundary. `dereference_indirect` applies only
+    /// to this handle. Array and dictionary children use qpdf's ordinary
+    /// non-dereferencing child dispatch, so an indirect child remains an
+    /// `"N G R"` string even when the parent was requested with
+    /// `dereference_indirect = true`.
+    ///
+    /// Correspondence: `libqpdf/QPDFObjectHandle.cc:1630-1647`,
+    /// `QPDF_Array.cc:153-187`, `QPDF_Dictionary.cc:72-95`, and
+    /// `qpdf/JSON_writer.hh:16-135`.
+    pub(crate) fn write_json(
+        &self,
+        json_version: i32,
+        out: &mut dyn Pipeline,
+        dereference_indirect: bool,
+        depth: usize,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        if !matches!(json_version, 1 | 2) {
+            return Err(ObjectJsonError::UnsupportedVersion(json_version));
+        }
+        ObjectJsonWriter::new(out, depth).write_handle(
+            self,
+            json_version,
+            dereference_indirect,
+            depth,
+        )
+    }
+
+    /// The qpdf `QPDFObjectHandle::getJSON` wrapper around [`Self::write_json`].
+    ///
+    /// `PlString` is the flpdf equivalent of qpdf's `Pl_Buffer` at this
+    /// boundary. It is intentionally not exposed as a new serializer path:
+    /// `get_json` writes through the same canonical handle writer and only
+    /// parses the completed bytes after that writer returns.
+    pub(crate) fn get_json(
+        &self,
+        json_version: i32,
+        dereference_indirect: bool,
+    ) -> std::result::Result<crate::json::Json, ObjectJsonError> {
+        let mut bytes = Vec::new();
+        {
+            let mut out = PlString::new("object json", None, &mut bytes);
+            self.write_json(json_version, &mut out, dereference_indirect, 0)?;
+        }
+        crate::json::Json::parse(&bytes).map_err(|error| ObjectJsonError::Json(error.to_string()))
+    }
+
     // `None` for an indirect handle that has not yet been resolved — value
     // access on an unresolved handle must not perform hidden I/O (design,
     // `Pdf` section). A resolved indirect handle exposes its real value.
@@ -6376,6 +6429,432 @@ fn unparse_dict_entries_qdf(
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
     Ok(())
+}
+
+/// Errors raised by the canonical ObjectHandle JSON writer.
+///
+/// Pipeline failures stay typed until the caller chooses its public error
+/// boundary. qpdf's object-level logic errors remain distinguishable from
+/// those failures so get_json and document JSON can preserve their existing
+/// conversion/error classifications.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ObjectJsonError {
+    #[error(transparent)]
+    Pipeline(#[from] PipelineError),
+    #[error("non-finite float cannot be serialized as JSON")]
+    NonFiniteFloat,
+    #[error("PDF error: {0}")]
+    Pdf(String),
+    #[error("JSON error: {0}")]
+    Json(String),
+    #[error("QPDF::writeJSON: only version 1 or 2 is supported (got {0})")]
+    UnsupportedVersion(i32),
+    #[error("QPDFObjectHandle: attempting to get JSON from a reserved object")]
+    Reserved,
+    #[error("attempted to get JSON from an unresolved QPDFObjectHandle")]
+    Unresolved,
+    #[error("attempted to dereference an uninitialized QPDFObjectHandle")]
+    Uninitialized,
+    #[error("attempted to get JSON from a QPDFObjectHandle from a destroyed QPDF")]
+    Destroyed,
+}
+
+// qpdf's JSON::Writer grows the native stack around recursive object writers
+// only indirectly through the caller's traversal. ObjectHandle graphs can be
+// built directly in Rust, including a direct dictionary cycle, so retain the
+// parser's bounded recursion contract here as well.
+const OBJECT_JSON_STACK_RED_ZONE: usize = 32 * 1024;
+const OBJECT_JSON_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+struct ObjectJsonWriter<'a> {
+    out: &'a mut dyn Pipeline,
+    first: bool,
+    indent: usize,
+}
+
+impl<'a> ObjectJsonWriter<'a> {
+    const SPACES: &'static [u8; 52] = b",\n                                                  ";
+    const SPACE_BLOCK: usize = Self::SPACES.len() - 2;
+
+    fn new(out: &'a mut dyn Pipeline, depth: usize) -> Self {
+        Self {
+            out,
+            first: true,
+            indent: 2 * depth,
+        }
+    }
+
+    fn write_handle(
+        &mut self,
+        handle: &ObjectHandle,
+        json_version: i32,
+        dereference_indirect: bool,
+        depth: usize,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        if depth > crate::parser::MAX_PARSE_DEPTH {
+            return Err(ObjectJsonError::Pdf(format!(
+                "object nesting exceeds maximum depth of {}",
+                crate::parser::MAX_PARSE_DEPTH
+            )));
+        }
+        stacker::maybe_grow(
+            OBJECT_JSON_STACK_RED_ZONE,
+            OBJECT_JSON_STACK_GROWTH_SIZE,
+            || self.write_handle_inner(handle, json_version, dereference_indirect, depth),
+        )
+    }
+
+    fn write_handle_inner(
+        &mut self,
+        handle: &ObjectHandle,
+        json_version: i32,
+        dereference_indirect: bool,
+        depth: usize,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        if let Some(object_ref) = handle.object_ref() {
+            if !dereference_indirect {
+                return self.write_reference(object_ref);
+            }
+            if handle.is_reserved() {
+                return Err(ObjectJsonError::Reserved);
+            }
+            if !handle.is_resolved() {
+                if handle.0.borrow().resolver.is_none() {
+                    return Err(ObjectJsonError::Uninitialized);
+                }
+                handle
+                    .try_dereference()
+                    .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
+            }
+        }
+
+        if handle.is_reserved() {
+            return Err(ObjectJsonError::Reserved);
+        }
+        if let Some(object_ref) = handle.as_reference() {
+            // A direct reference is the flpdf representation of the legacy
+            // Object::Reference redirect. qpdf's ordinary child writer emits
+            // the same reference scalar for an indirect child before it
+            // reaches any type-specific writer.
+            return self.write_reference(object_ref);
+        }
+
+        match handle.type_code() {
+            2 | 11 | 12 => self.write(b"null"),
+            3 => self.write(
+                if handle
+                    .as_boolean()
+                    .expect("type_code()==3 (boolean) => as_boolean")
+                {
+                    b"true"
+                } else {
+                    b"false"
+                },
+            ),
+            4 => {
+                let value = handle
+                    .as_integer()
+                    .expect("type_code()==4 (integer) => as_integer");
+                self.write(value.to_string().as_bytes())
+            }
+            5 => self.write_real(handle),
+            6 => self.write_string(
+                &handle
+                    .as_string()
+                    .expect("type_code()==6 (string) => as_string"),
+                json_version,
+            ),
+            7 => self.write_name_value(
+                &handle.as_name().expect("type_code()==7 (name) => as_name"),
+                json_version,
+            ),
+            8 => {
+                self.write_start(b'[')?;
+                for child in handle
+                    .as_array()
+                    .expect("type_code()==8 (array) => as_array")
+                {
+                    self.write_next()?;
+                    self.write_handle(&child, json_version, false, depth + 1)?;
+                }
+                self.write_end(b']')
+            }
+            9 => {
+                self.write_start(b'{')?;
+                for (key, child) in handle
+                    .as_dictionary()
+                    .expect("type_code()==9 (dictionary) => as_dictionary")
+                {
+                    // QPDF_Dictionary::writeJSON calls isNull() before
+                    // emitting a key. isNull() resolves an indirect child,
+                    // so missing/dangling values disappear from the JSON
+                    // object while non-null indirect children still emit
+                    // their own reference form below.
+                    if child.is_reserved() {
+                        // A reserved child is not null; its non-dereferenced
+                        // identity is still a valid JSON reference.
+                    } else if child.object_ref().is_some() && !child.is_resolved() {
+                        if child.0.borrow().resolver.is_none() {
+                            return Err(ObjectJsonError::Uninitialized);
+                        }
+                        child
+                            .try_dereference()
+                            .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?;
+                    }
+                    if child.is_null() {
+                        continue;
+                    }
+                    self.write_key(&key, json_version)?;
+                    self.write_handle(&child, json_version, false, depth + 1)?;
+                }
+                self.write_end(b'}')
+            }
+            10 => {
+                // QPDF_Stream::writeJSON writes only its dictionary. The
+                // outer stream wrapper belongs to QPDF_Stream::writeStreamJSON
+                // and the document JSON layer.
+                let dictionary = handle.as_stream_dict().ok_or_else(|| {
+                    ObjectJsonError::Pdf("stream's dict handle is not a dictionary".to_string())
+                })?;
+                self.write_handle(&dictionary, json_version, false, depth + 1)
+            }
+            13 => Err(ObjectJsonError::Unresolved),
+            14 => Err(ObjectJsonError::Destroyed),
+            1 => Err(ObjectJsonError::Reserved),
+            other => Err(ObjectJsonError::Pdf(format!(
+                "unsupported qpdf object type code {other}"
+            ))),
+        }
+    }
+
+    fn write_real(&mut self, handle: &ObjectHandle) -> std::result::Result<(), ObjectJsonError> {
+        let value = handle.as_real().expect("type_code()==5 (real) => as_real");
+        if !value.is_finite() {
+            return Err(ObjectJsonError::NonFiniteFloat);
+        }
+        if let Some((value, literal)) = handle.as_real_literal() {
+            let mut encoded = Vec::new();
+            Object::RealLiteral { value, literal }.write_pdf(&mut encoded);
+            if encoded.starts_with(b"-.") {
+                self.write(b"-0.")?;
+                self.write(&encoded[2..])
+            } else if encoded.starts_with(b".") {
+                self.write(b"0")?;
+                self.write(&encoded)
+            } else {
+                self.write(&encoded)
+            }
+        } else {
+            self.write(value.to_string().as_bytes())
+        }
+    }
+
+    fn write_string(
+        &mut self,
+        value: &[u8],
+        json_version: i32,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        if json_version == 1 {
+            return self.write_quoted(&utf8_value(value));
+        }
+        if let Some(rest) = value.strip_prefix(&[0xFE, 0xFF]) {
+            return self.write_prefixed_quoted(b"u:", lossy_utf16_to_utf8(rest, false).as_bytes());
+        }
+        if let Some(rest) = value.strip_prefix(&[0xFF, 0xFE]) {
+            return self.write_prefixed_quoted(b"u:", lossy_utf16_to_utf8(rest, true).as_bytes());
+        }
+        if let Some(rest) = value.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+            if std::str::from_utf8(rest).is_ok() {
+                return self.write_prefixed_quoted(b"u:", rest);
+            }
+        }
+        if !json_use_hex_string(value) {
+            if let Some(text) = decode_pdf_text_string(value) {
+                return self.write_prefixed_quoted(b"u:", text.as_bytes());
+            }
+        }
+        self.write(b"\"b:")?;
+        let mut hex = Vec::with_capacity(value.len() * 2);
+        for &byte in value {
+            hex.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+            hex.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+        }
+        self.write(&hex)?;
+        self.write(b"\"")
+    }
+
+    fn write_name_value(
+        &mut self,
+        value: &[u8],
+        json_version: i32,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        let mut raw = Vec::with_capacity(value.len() + 1);
+        raw.push(b'/');
+        raw.extend_from_slice(value);
+        self.write_name_raw(&raw, json_version)
+    }
+
+    fn write_key(
+        &mut self,
+        key: &[u8],
+        json_version: i32,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        self.write_next()?;
+        let raw = if key.first() == Some(&b'/') {
+            key.to_vec()
+        } else {
+            let mut raw = Vec::with_capacity(key.len() + 1);
+            raw.push(b'/');
+            raw.extend_from_slice(key);
+            raw
+        };
+        self.write_name_raw(&raw, json_version)?;
+        self.write(b": ")
+    }
+
+    fn write_name_raw(
+        &mut self,
+        raw: &[u8],
+        json_version: i32,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        if json_version == 1 {
+            return self.write_quoted(&json_normalize_name(raw));
+        }
+        if std::str::from_utf8(raw).is_ok() {
+            self.write_quoted(raw)
+        } else {
+            self.write(b"\"n:")?;
+            self.write(&json_encode_string(&json_normalize_name(raw)))?;
+            self.write(b"\"")
+        }
+    }
+
+    fn write_prefixed_quoted(
+        &mut self,
+        prefix: &[u8],
+        value: &[u8],
+    ) -> std::result::Result<(), ObjectJsonError> {
+        let mut head = Vec::with_capacity(prefix.len() + 1);
+        head.push(b'"');
+        head.extend_from_slice(prefix);
+        self.write(&head)?;
+        self.write(&json_encode_string(value))?;
+        self.write(b"\"")
+    }
+
+    fn write_quoted(&mut self, value: &[u8]) -> std::result::Result<(), ObjectJsonError> {
+        self.write(b"\"")?;
+        self.write(&json_encode_string(value))?;
+        self.write(b"\"")
+    }
+
+    fn write_reference(
+        &mut self,
+        object_ref: ObjectRef,
+    ) -> std::result::Result<(), ObjectJsonError> {
+        self.write(b"\"")?;
+        self.write(format!("{} {}", object_ref.number, object_ref.generation).as_bytes())?;
+        self.write(b" R\"")
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::result::Result<(), ObjectJsonError> {
+        self.out.write(bytes).map_err(ObjectJsonError::from)
+    }
+
+    fn write_next(&mut self) -> std::result::Result<(), ObjectJsonError> {
+        let spaces = self.indent;
+        let remainder = spaces % Self::SPACE_BLOCK;
+        if self.first {
+            self.first = false;
+            self.write(&Self::SPACES[1..remainder + 2])?;
+        } else {
+            self.write(&Self::SPACES[..remainder + 2])?;
+        }
+        let mut remaining = spaces;
+        while remaining >= Self::SPACE_BLOCK {
+            self.write(&Self::SPACES[2..])?;
+            remaining -= Self::SPACE_BLOCK;
+        }
+        Ok(())
+    }
+
+    fn write_start(&mut self, delimiter: u8) -> std::result::Result<(), ObjectJsonError> {
+        self.write(&[delimiter])?;
+        self.first = true;
+        self.indent += 2;
+        Ok(())
+    }
+
+    fn write_end(&mut self, delimiter: u8) -> std::result::Result<(), ObjectJsonError> {
+        if self.indent > 1 {
+            self.indent -= 2;
+        }
+        if !self.first {
+            self.first = true;
+            self.write_next()?;
+        }
+        self.first = false;
+        self.write(&[delimiter])
+    }
+}
+
+fn json_use_hex_string(bytes: &[u8]) -> bool {
+    let mut non_ascii = 0usize;
+    for &byte in bytes {
+        match byte {
+            0x20..=0x7e => {}
+            0x18..=0x1f | 0x7f | 0x80..=0xff => non_ascii += 1,
+            0x08 | 0x09 | 0x0a | 0x0c | 0x0d => {}
+            _ => return true,
+        }
+    }
+    5 * non_ascii > bytes.len()
+}
+
+fn json_normalize_name(raw: &[u8]) -> Vec<u8> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut normalized = Vec::with_capacity(raw.len() + 2);
+    normalized.push(raw[0]);
+    for &byte in &raw[1..] {
+        if byte == 0 {
+            normalized.push(b'#');
+        } else if !(33..=126).contains(&byte)
+            || matches!(
+                byte,
+                b'#' | b'/' | b'(' | b')' | b'{' | b'}' | b'<' | b'>' | b'[' | b']' | b'%'
+            )
+        {
+            normalized.push(b'#');
+            normalized.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+            normalized.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+        } else {
+            normalized.push(byte);
+        }
+    }
+    normalized
+}
+
+fn json_encode_string(value: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(value.len());
+    for &byte in value {
+        match byte {
+            b'\\' => encoded.extend_from_slice(b"\\\\"),
+            b'"' => encoded.extend_from_slice(b"\\\""),
+            b'\x08' => encoded.extend_from_slice(b"\\b"),
+            b'\x0c' => encoded.extend_from_slice(b"\\f"),
+            b'\n' => encoded.extend_from_slice(b"\\n"),
+            b'\r' => encoded.extend_from_slice(b"\\r"),
+            b'\t' => encoded.extend_from_slice(b"\\t"),
+            0x00..=0x1f => {
+                encoded.extend_from_slice(if byte < 0x10 { b"\\u000" } else { b"\\u001" });
+                encoded.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+            }
+            _ => encoded.push(byte),
+        }
+    }
+    encoded
 }
 
 impl ObjectHandle {
