@@ -132,9 +132,9 @@ fn append_xref_stream_and_trailer(
         max_generation.max(max_member_index),
     );
     let payload = if trailer.structural_filtered {
-        xref_stream::encode_payload(&entries, widths)
+        xref_stream::encode_payload(&entries, widths)?
     } else {
-        xref_stream::encode_payload_raw(&entries, widths)
+        xref_stream::encode_payload_raw(&entries, widths)?
     };
 
     let mut dictionary = trailer.dictionary.clone();

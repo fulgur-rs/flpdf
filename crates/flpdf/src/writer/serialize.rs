@@ -138,7 +138,8 @@ pub(crate) mod xref_stream {
 
     use crate::pipeline::buffer::Buffer;
     use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
-    use crate::pipeline::Pipeline;
+    use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
+    use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
 
     use crate::object::{Dictionary, Object, ObjectRef};
     use crate::Result;
@@ -158,6 +159,10 @@ pub(crate) mod xref_stream {
 
     /// `/W` field widths `[type, field2, field3]` in bytes.
     pub(crate) type XrefWidths = [u8; 3];
+
+    const XREF_BUFFER_ID: &str = "xref stream";
+    const XREF_FLATE_ID: &str = "compress xref";
+    const XREF_PNG_ID: &str = "pngify xref";
 
     /// Width of the `/Prev` value field. qpdf 11.9.0 left-justifies the offset in a
     /// fixed-width run (observed: a 21-character field) so the value can be
@@ -181,14 +186,108 @@ pub(crate) mod xref_stream {
         widths[0] as usize + widths[1] as usize + widths[2] as usize
     }
 
-    /// Append the low `width` big-endian bytes of `value` to `out`.
+    /// Write the low `width` big-endian bytes of `value` to the active qpdf pipeline.
+    fn write_be(pipeline: &mut dyn Pipeline, value: u64, width: u8) -> PipelineResult<()> {
+        if width as usize > std::mem::size_of::<u64>() {
+            return Err(PipelineError::logic(
+                "QPDFWriter::writeBinary called with too many bytes",
+            ));
+        }
+        let bytes = value.to_be_bytes();
+        pipeline.write(&bytes[bytes.len() - width as usize..])
+    }
+
+    /// Write each `/W`-formatted entry directly to the active pipeline.
+    fn write_entries(
+        pipeline: &mut dyn Pipeline,
+        entries: &[XrefStreamEntry],
+        widths: XrefWidths,
+    ) -> PipelineResult<()> {
+        for entry in entries {
+            write_be(pipeline, u64::from(entry.entry_type), widths[0])?;
+            write_be(pipeline, entry.field2, widths[1])?;
+            write_be(pipeline, entry.field3, widths[2])?;
+        }
+        Ok(())
+    }
+
+    fn predictor_columns(widths: XrefWidths) -> u32 {
+        u32::from(widths[0]) + u32::from(widths[1]) + u32::from(widths[2])
+    }
+
+    /// Encode through qpdf's `Pl_PNGFilter("pngify xref")` and
+    /// `Pl_Flate("compress xref")` stages into `Pl_Buffer("xref stream")`.
+    pub(crate) fn encode_payload(
+        entries: &[XrefStreamEntry],
+        widths: XrefWidths,
+    ) -> Result<Vec<u8>> {
+        let columns = predictor_columns(widths);
+        let mut sink = Buffer::new(XREF_BUFFER_ID, None);
+        {
+            let mut flate = Flate::new(
+                XREF_FLATE_ID,
+                &mut sink,
+                FlateAction::Deflate,
+                DEFAULT_OUT_BUFFER_SIZE,
+            )?; // cov:ignore: fixed nonzero qpdf output buffer cannot fail construction
+            let mut predictor = PngFilter::new(
+                XREF_PNG_ID,
+                &mut flate,
+                PngFilterAction::Encode,
+                columns,
+                1,
+                8,
+            )?;
+            write_entries(&mut predictor, entries, widths)?;
+            predictor.finish()?;
+        }
+        Ok(sink.take_buffer()?)
+    }
+
+    /// Encode the unfiltered cross-reference payload used when qpdf's global
+    /// stream-compression policy is disabled.
+    pub(crate) fn encode_payload_raw(
+        entries: &[XrefStreamEntry],
+        widths: XrefWidths,
+    ) -> Result<Vec<u8>> {
+        let mut sink = Buffer::new(XREF_BUFFER_ID, None);
+        write_entries(&mut sink, entries, widths)?;
+        sink.finish()?;
+        Ok(sink.take_buffer()?)
+    }
+
+    /// PNG-Up-predicted rows WITHOUT Flate — qpdf's pass-1 (`skip_compression`) xref
+    /// stream payload. qpdf still declares `/Filter /FlateDecode` on the pass-1
+    /// object (an invalid but throwaway buffer used only to size the region and seed
+    /// the deterministic `/ID`), so the payload is the predictor output alone.
+    pub(crate) fn encode_payload_uncompressed(
+        entries: &[XrefStreamEntry],
+        widths: XrefWidths,
+    ) -> Result<Vec<u8>> {
+        let columns = predictor_columns(widths);
+        let mut sink = Buffer::new(XREF_BUFFER_ID, None);
+        {
+            let mut predictor = PngFilter::new(
+                XREF_PNG_ID,
+                &mut sink,
+                PngFilterAction::Encode,
+                columns,
+                1,
+                8,
+            )?;
+            write_entries(&mut predictor, entries, widths)?;
+            predictor.finish()?;
+        }
+        Ok(sink.take_buffer()?)
+    }
+
+    #[cfg(test)]
     fn push_be(out: &mut Vec<u8>, value: u64, width: u8) {
         let bytes = value.to_be_bytes();
         out.extend_from_slice(&bytes[bytes.len() - width as usize..]);
     }
 
-    /// Build the raw (un-predicted) `/W`-formatted rows: each entry is `Σ/W` bytes,
-    /// big-endian, one field after another.
+    #[cfg(test)]
     fn build_rows(entries: &[XrefStreamEntry], widths: XrefWidths) -> Vec<u8> {
         let mut rows = Vec::with_capacity(entries.len() * columns(widths));
         for entry in entries {
@@ -199,72 +298,15 @@ pub(crate) mod xref_stream {
         rows
     }
 
-    /// Apply the PNG "Up" predictor (`/Predictor 12`): prefix each `cols`-byte row
-    /// with the filter-type tag `2` and replace each byte with the difference from
-    /// the byte directly above (the first row predicts against an all-zero row).
-    ///
-    /// `rows` always holds a whole number of `cols`-byte rows, because
-    /// `build_rows` emits exactly `/W` bytes per entry.
+    #[cfg(test)]
     fn png_up_predict(rows: &[u8], cols: usize) -> Vec<u8> {
-        debug_assert!(
-            cols > 0 && rows.len().is_multiple_of(cols),
-            "xref rows must be a whole number of {cols}-byte rows"
-        );
         crate::stream_filter::encode_png_predictor(
             rows,
-            u32::try_from(cols).expect("xref row width is bounded by the /W field widths"),
+            u32::try_from(cols).expect("test xref row width fits PNG predictor columns"),
             1,
             8,
         )
-        .expect("xref row geometry is always a valid PNG predictor configuration")
-    }
-
-    /// Flate-compress with Pl_Flate's default zlib compression (level 6), matching
-    /// qpdf's `Z_DEFAULT_COMPRESSION`.
-    fn flate_compress(data: &[u8]) -> Vec<u8> {
-        let mut sink = Buffer::new("compressed xref stream", None);
-        {
-            let mut flate = Flate::new(
-                "compress xref",
-                &mut sink,
-                FlateAction::Deflate,
-                DEFAULT_OUT_BUFFER_SIZE,
-            )
-            .expect("Pl_Flate construction with the fixed output buffer cannot fail");
-            flate
-                .write(data)
-                .expect("Pl_Flate::write to an in-memory xref sink cannot fail");
-            flate
-                .finish()
-                .expect("Pl_Flate::finish to an in-memory xref sink cannot fail");
-        }
-        sink.take_buffer()
-            .expect("Pl_Buffer must be ready after Pl_Flate::finish")
-    }
-
-    /// Encode the cross-reference stream payload: PNG-Up predictor over the
-    /// `/W`-formatted rows, then Flate. This is the body written between `stream`
-    /// and `endstream`.
-    pub(crate) fn encode_payload(entries: &[XrefStreamEntry], widths: XrefWidths) -> Vec<u8> {
-        let rows = build_rows(entries, widths);
-        flate_compress(&png_up_predict(&rows, columns(widths)))
-    }
-
-    /// Encode the unfiltered cross-reference payload used when qpdf's global
-    /// stream-compression policy is disabled.
-    pub(crate) fn encode_payload_raw(entries: &[XrefStreamEntry], widths: XrefWidths) -> Vec<u8> {
-        build_rows(entries, widths)
-    }
-
-    /// PNG-Up-predicted rows WITHOUT Flate — qpdf's pass-1 (`skip_compression`) xref
-    /// stream payload. qpdf still declares `/Filter /FlateDecode` on the pass-1
-    /// object (an invalid but throwaway buffer used only to size the region and seed
-    /// the deterministic `/ID`), so the payload is the predictor output alone.
-    pub(crate) fn encode_payload_uncompressed(
-        entries: &[XrefStreamEntry],
-        widths: XrefWidths,
-    ) -> Vec<u8> {
-        png_up_predict(&build_rows(entries, widths), columns(widths))
+        .expect("test xref row geometry is valid")
     }
 
     /// Stream-dictionary metadata for a cross-reference stream, in qpdf key order.
@@ -884,9 +926,80 @@ pub(crate) mod xref_stream {
             // inflates back to the predicted rows.
             let rows = build_rows(&three_page_obj5_entries(), [1, 2, 1]);
             let predicted = png_up_predict(&rows, 4);
-            let payload = encode_payload(&three_page_obj5_entries(), [1, 2, 1]);
+            let payload = encode_payload(&three_page_obj5_entries(), [1, 2, 1]).unwrap();
             let inflated = inflate(&payload);
             assert_eq!(inflated, predicted);
+        }
+
+        #[test]
+        fn encode_payload_reports_invalid_geometry_without_panicking() {
+            let entries = [XrefStreamEntry {
+                entry_type: 1,
+                field2: 0,
+                field3: 0,
+            }];
+            let result = std::panic::catch_unwind(|| encode_payload(&entries, [0, 0, 0]));
+            assert!(
+                result.is_ok(),
+                "xref pipeline construction must return its error channel instead of panicking"
+            );
+            let error = result.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                crate::Error::System(message)
+                    if message == "PNGFilter created with invalid columns value"
+            ));
+        }
+
+        #[test]
+        fn encode_payload_uncompressed_reports_invalid_geometry() {
+            let entries = [XrefStreamEntry {
+                entry_type: 1,
+                field2: 0,
+                field3: 0,
+            }];
+            let error = encode_payload_uncompressed(&entries, [0, 0, 0]).unwrap_err();
+            assert!(matches!(
+                error,
+                crate::Error::System(message)
+                    if message == "PNGFilter created with invalid columns value"
+            ));
+        }
+
+        #[test]
+        fn encode_payload_reports_field_width_overflow() {
+            let entries = [XrefStreamEntry {
+                entry_type: 1,
+                field2: 0,
+                field3: 0,
+            }];
+            let error = encode_payload(&entries, [9, 1, 1]).unwrap_err();
+            assert!(matches!(
+                error,
+                crate::Error::Internal(message)
+                    if message == "QPDFWriter::writeBinary called with too many bytes"
+            ));
+        }
+
+        #[test]
+        fn xref_pipeline_stage_identifiers_match_qpdf() {
+            let mut sink = Buffer::new(XREF_BUFFER_ID, None);
+            let mut flate = Flate::new(
+                XREF_FLATE_ID,
+                &mut sink,
+                FlateAction::Deflate,
+                DEFAULT_OUT_BUFFER_SIZE,
+            )
+            .unwrap();
+            {
+                let predictor =
+                    PngFilter::new(XREF_PNG_ID, &mut flate, PngFilterAction::Encode, 4, 1, 8)
+                        .unwrap();
+                assert_eq!(predictor.identifier(), XREF_PNG_ID);
+            }
+            assert_eq!(flate.identifier(), XREF_FLATE_ID);
+            drop(flate);
+            assert_eq!(sink.identifier(), XREF_BUFFER_ID);
         }
 
         /// The stream dictionary is emitted in qpdf's fixed key order, including the
@@ -1005,7 +1118,7 @@ pub(crate) mod xref_stream {
         #[cfg(feature = "qpdf-zlib-compat")]
         #[test]
         fn first_half_xref_object_is_byte_identical_to_qpdf() {
-            let payload = encode_payload(&three_page_obj7_entries(), [1, 2, 1]);
+            let payload = encode_payload(&three_page_obj7_entries(), [1, 2, 1]).unwrap();
             let mut out = Vec::new();
             write_object(
                 &mut out,
@@ -1030,7 +1143,7 @@ pub(crate) mod xref_stream {
         #[cfg(feature = "qpdf-zlib-compat")]
         #[test]
         fn main_xref_object_is_byte_identical_to_qpdf() {
-            let payload = encode_payload(&three_page_obj5_entries(), [1, 2, 1]);
+            let payload = encode_payload(&three_page_obj5_entries(), [1, 2, 1]).unwrap();
             let mut out = Vec::new();
             write_object(
                 &mut out,

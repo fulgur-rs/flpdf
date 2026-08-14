@@ -1453,9 +1453,9 @@ fn patch_first_page_xref(
         );
         let widths = xref_stream::first_pass_widths(patch.max_id, patch.max_ostream_index, 0);
         let payload = if patch.filtered {
-            xref_stream::encode_payload_uncompressed(&entries, widths)
+            xref_stream::encode_payload_uncompressed(&entries, widths)?
         } else {
-            xref_stream::encode_payload_raw(&entries, widths)
+            xref_stream::encode_payload_raw(&entries, widths)?
         };
         (widths, payload, 0u64)
     } else {
@@ -1468,9 +1468,9 @@ fn patch_first_page_xref(
             patch.max_ostream_index,
         );
         let payload = if patch.filtered {
-            xref_stream::encode_payload(&entries, widths)
+            xref_stream::encode_payload(&entries, widths)?
         } else {
-            xref_stream::encode_payload_raw(&entries, widths)
+            xref_stream::encode_payload_raw(&entries, widths)?
         };
         (widths, payload, main_xref_offset as u64)
     };
@@ -1564,11 +1564,11 @@ fn write_main_xref_stream_and_trailer(
     // payload (qpdf's `skip_compression`) and the final pass Flate-compresses
     // it. With compression disabled, both passes write raw `/W` rows.
     let payload = if !filtered {
-        xref_stream::encode_payload_raw(&entries, widths)
+        xref_stream::encode_payload_raw(&entries, widths)?
     } else if pass1 {
-        xref_stream::encode_payload_uncompressed(&entries, widths)
+        xref_stream::encode_payload_uncompressed(&entries, widths)?
     } else {
-        xref_stream::encode_payload(&entries, widths)
+        xref_stream::encode_payload(&entries, widths)?
     };
 
     // Main (second-half) xref: no `/Index`, `/Info`, `/Root`, or `/Prev` — it is

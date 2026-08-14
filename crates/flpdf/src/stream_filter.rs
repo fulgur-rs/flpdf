@@ -2357,6 +2357,7 @@ fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Ve
 /// qpdf's `Pl_PNGFilter` encoder always emits the Up filter, so the predictor
 /// number selects only whether the predictor runs, never which row filter the
 /// output uses.
+#[cfg(test)]
 pub(crate) fn encode_png_predictor(
     data: &[u8],
     columns: u32,
