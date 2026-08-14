@@ -14,8 +14,14 @@
 //! (`libqpdf/QPDFObjectHandle.cc:869-955`, `libqpdf/QPDF_Array.cc:220-313`),
 //! and direct-node promotion preserves the existing allocation like `QPDF::makeIndirectObject`
 //! (`libqpdf/QPDF.cc:1835-1902`).
+//! Indirect traversal identity follows qpdf's `QPDFObjGen::set`
+//! (`include/qpdf/QPDFObjGen.hh:87-120`, `libqpdf/QPDFObjGen.cc:25-35`);
+//! direct canonical handles use the existing `ObjectHandleIdentity` primitive,
+//! which matches `QPDFObjectHandle::isSameObjectAs`
+//! (`include/qpdf/QPDFObjectHandle.hh:304-309`,
+//! `libqpdf/QPDFObjectHandle.cc:224-227`).
 
-use crate::object_handle::canonical_dictionary_key;
+use crate::object_handle::{canonical_dictionary_key, ObjectHandleIdentity};
 use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
@@ -107,16 +113,24 @@ enum NodeAnchor {
     Indirect(ObjectRef),
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct NodeIdentity {
-    anchor: NodeAnchor,
-    direct_kids: Vec<usize>,
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum NodeIdentity {
+    /// qpdf's `QPDFObjGen::set` identity for an indirect node.
+    Indirect(ObjectRef),
+    /// The live allocation identity for a direct canonical ObjectHandle.
+    Direct(ObjectHandleIdentity),
+    /// Synthetic path-only handles used by raw compatibility tests.
+    Path {
+        anchor: NodeAnchor,
+        direct_kids: Vec<usize>,
+    },
 }
 
 /// A node path keeps the qpdf diagnostic anchor and the live node handle
-/// separately. Direct children are identified by their parent path; indirect
-/// children keep their own ObjGen anchor. The `handle` field is the only value
-/// the canonical engine reads or mutates.
+/// separately. Direct canonical children are identified by their live handle;
+/// indirect children keep their own ObjGen anchor. Path identity remains only
+/// for synthetic raw-compatibility test handles without a live handle. The
+/// `handle` field is the only value the canonical engine reads or mutates.
 #[derive(Clone, Debug)]
 struct NodeHandle {
     anchor: NodeAnchor,
@@ -185,7 +199,15 @@ impl NodeHandle {
     }
 
     fn identity(&self) -> NodeIdentity {
-        NodeIdentity {
+        if self.direct_kids.is_empty() {
+            if let NodeAnchor::Indirect(object_ref) = self.anchor {
+                return NodeIdentity::Indirect(object_ref);
+            }
+        }
+        if let Some(handle) = &self.handle {
+            return NodeIdentity::Direct(handle.identity_key());
+        }
+        NodeIdentity::Path {
             anchor: self.anchor.clone(),
             direct_kids: self.direct_kids.clone(),
         }
@@ -2267,6 +2289,9 @@ impl<K: TreeKey> NNTree<K> {
         let root = self.root_handle(pdf)?;
         let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
+        // `ObjectHandleIdentity` hashes and compares only its Rc allocation
+        // pointer; the RefCell payload cannot change the set key.
+        #[allow(clippy::mutable_key_type)]
         let mut seen: HashSet<NodeIdentity> = HashSet::new();
         let mut cursor = NNTreeCursor::for_pdf(pdf.unique_id());
 
@@ -2461,6 +2486,9 @@ impl<K: TreeKey> NNTree<K> {
         let original_raw = cursor.raw.clone();
         let original_current = cursor.current.clone();
         let original_current_handle = cursor.current_handle.clone();
+        // `ObjectHandleIdentity` hashes and compares only its Rc allocation
+        // pointer; the RefCell payload cannot change the set key.
+        #[allow(clippy::mutable_key_type)]
         let mut seen: HashSet<NodeIdentity> = cursor
             .path
             .iter()
@@ -4901,6 +4929,36 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|message| message.contains("loop detected while traversing")));
+    }
+
+    #[test]
+    fn canonical_direct_kids_cycle_uses_handle_identity() {
+        let mut pdf = empty_pdf();
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        first
+            .replace_key(b"/Kids", ObjectHandle::array(vec![second.clone()]))
+            .unwrap();
+        second
+            .replace_key(b"/Kids", ObjectHandle::array(vec![first.clone()]))
+            .unwrap();
+
+        // qpdf 11.9.0's NNTree::deepen uses QPDFObjGen::set and returns after
+        // warning when a node repeats (libqpdf/NNTree.cc:593-601). Direct
+        // ObjectHandle graphs are not serializable PDF nodes, so the
+        // canonical flpdf route uses the live allocation identity here while
+        // retaining qpdf's bounded warning behavior.
+        let mut tree = HandleNameTree::new(first, pdf.unique_id(), false);
+        tree.inner.max_depth = Some(8);
+        assert!(tree.entries(&mut pdf).unwrap().is_empty());
+
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| warning
+                .message
+                .contains("loop detected while traversing name/number tree")));
     }
 
     #[test]
