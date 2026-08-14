@@ -130,7 +130,8 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
             // The shared tokenizer is reset by consume_one_byte, so this
             // state failure is unreachable through this pull route. Keep the
             // defensive mapping documented for callers that change tokenizer
-            // state handling. // cov:ignore-start: consume_one_byte resets the shared tokenizer; qpdf state errors are unreachable here
+            // state handling.
+            // cov:ignore-start: consume_one_byte resets the shared tokenizer; qpdf state errors are unreachable here
             tokenizer.expect_inline_image().map_err(|error| {
                 let message = match error {
                     TokenizerStateError::TokenWaiting => "tokenizer already has a token waiting",
