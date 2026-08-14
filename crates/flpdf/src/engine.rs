@@ -137,7 +137,6 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_entries,
             options.repair,
             loaded_state.already_reconstructed,
-            loaded_state.deleted_objects,
             loaded.repair_diagnostics,
             warning_options,
             unique_id,
