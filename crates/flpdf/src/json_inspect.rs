@@ -12,7 +12,7 @@
 //!
 //! The `qpdf` top-level key is not built here: qpdf serializes it in
 //! `QPDF_json.cc`, and [`crate::document_json`] holds that boundary. The
-//! canonical ordinary-object serializer is in [`ObjectHandle::write_json`].
+//! canonical ordinary-object serializer is in [`ObjectHandle`]::write_json.
 //! This module still retains the raw-Object bridge used by the document JSON
 //! stream/payload path until its bounded `writeStreamJSON` follow-up moves
 //! that remaining consumer; the bridge is not the canonical object path.
