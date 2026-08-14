@@ -676,8 +676,10 @@ const JSON_CONVERT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 /// Convert a PDF object handle into the qpdf v2 JSON value form.
 ///
 /// For streams, only the dictionary part is included; the stream data body is
-/// handled through a separate path. A stream nested inside another object also
-/// returns `{"stream":{"dict":...}}`.
+/// handled through a separate path. The canonical ObjectHandle writer emits
+/// the stream dictionary directly, matching `QPDF_Stream::writeJSON`
+/// (`libqpdf/QPDF_Stream.cc:181-184`); the document-level `{"stream":{"dict":...}}`
+/// wrapper remains the separate `writeStreamJSON` consumer.
 ///
 /// This never resolves indirection: an indirect `handle` (whether or not it
 /// has already been resolved elsewhere) is always rendered as its own
@@ -5258,6 +5260,19 @@ mod tests {
             (
                 ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0),
                 vec![b"\"".to_vec(), b"2 0".to_vec(), b" R\"".to_vec()],
+            ),
+            (
+                ObjectHandle::dictionary(vec![(b"Plain".to_vec(), ObjectHandle::integer(1))]),
+                vec![
+                    b"{".to_vec(),
+                    b"\n  ".to_vec(),
+                    b"\"".to_vec(),
+                    b"/Plain".to_vec(),
+                    b"\": ".to_vec(),
+                    b"1".to_vec(),
+                    b"\n".to_vec(),
+                    b"}".to_vec(),
+                ],
             ),
         ];
 

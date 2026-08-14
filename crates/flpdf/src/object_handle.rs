@@ -6712,8 +6712,22 @@ impl<'a> ObjectJsonWriter<'a> {
             raw.extend_from_slice(key);
             raw
         };
-        self.write_name_raw(&raw, json_version)?;
-        self.write(b": ")
+        // qpdf duplicates QPDF_Name::writeJSON's encoding branches in
+        // QPDF_Dictionary::writeJSON so the closing quote and dictionary
+        // separator are one Pipeline write (`QPDF_Dictionary.cc:78-90`).
+        // Keep that observable chunk boundary here instead of routing through
+        // write_name_raw, whose value form must close its quote on its own.
+        if json_version == 1 {
+            self.write(b"\"")?;
+            self.write(&json_encode_string(&json_normalize_name(&raw)))?;
+        } else if std::str::from_utf8(&raw).is_ok() {
+            self.write(b"\"")?;
+            self.write(&json_encode_string(&raw))?;
+        } else {
+            self.write(b"\"n:")?;
+            self.write(&json_encode_string(&json_normalize_name(&raw)))?;
+        }
+        self.write(b"\": ")
     }
 
     fn write_name_raw(
