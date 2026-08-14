@@ -1188,8 +1188,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Replace the canonical value for `object_ref` without replacing the
     /// canonical handle itself.
     ///
-    /// qpdf's `QPDF::replaceObject` rejects an indirect replacement, checks
-    /// ownership before mutating the cache, and then calls `updateCache`.
+    /// qpdf's `QPDF::replaceObject` rejects an indirect handle or a handle for
+    /// which `isInitialized()` is false before mutating the cache, and then
+    /// calls `updateCache` (`QPDF.cc:1986-1993`). qpdf's
+    /// `QPDFObjectHandle::isInitialized()` is only the non-null object-pointer
+    /// check (`QPDFObjectHandle.hh:1636`), so qpdf Reserved/Destroyed values
+    /// are not rejected by that guard. flpdf deliberately retains its existing
+    /// narrower `Resolved(ObjectValue)` source contract; the preflight below
+    /// enforces that contract before minting an absent target cache entry.
     /// `QPDFObject::assign` inside that update shares the replacement's
     /// `QPDFValue` (`QPDF.cc:1986-1993,1835-1857`;
     /// `QPDFObject_private.hh:117-120`), which is represented by
@@ -1210,6 +1216,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
             ));
         }
+        // `share_value_state_with` retains the same contract, but this
+        // preflight must run before `get_object_handle`: a failed replacement
+        // must not leave an absent target in the canonical object cache.
+        replacement.validate_replacement_source()?;
 
         let target = self.get_object_handle(object_ref);
         target.share_value_state_with(&replacement)?;
@@ -11346,8 +11356,12 @@ mod tests {
         assert!(pdf.reconstructed_xref());
         let xref = pdf.get_xref_table();
         assert!(
-            !xref.contains_key(&source_ref) && !xref.contains_key(&replacement_ref),
-            "qpdf keeps replacement-only entries out of getXRefTable after recovery"
+            xref.contains_key(&source_ref),
+            "physical recovery must expose the source generation in getXRefTable"
+        );
+        assert!(
+            !xref.contains_key(&replacement_ref),
+            "a cache-only replacement generation must stay out of getXRefTable"
         );
 
         let all_objects = pdf.get_all_objects().expect("enumerate recovered objects");

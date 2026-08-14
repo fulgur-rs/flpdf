@@ -159,14 +159,15 @@ main(int argc, char* argv[])
 
         QPDF baseline_recovery;
         open_memory(baseline_recovery, "baseline recovery", recovery_fixture);
+        auto baseline_before = baseline_recovery.getObject(1, 0).isInitialized();
         require(
-            baseline_recovery.getObject(1, 0).isInitialized(),
-            "baseline recovery trigger did not initialize object 1 0");
+            baseline_before,
+            "baseline pre-recovery handle was not allocated");
+        auto baseline_all = keys(baseline_recovery.getAllObjects()); // calls fixDanglingReferences
         auto baseline_xref = keys(baseline_recovery.getXRefTable());
-        auto baseline_all = keys(baseline_recovery.getAllObjects());
         auto baseline_object = baseline_recovery.getObject(3, 0);
         require(
-            baseline_xref == "1.0,2.0",
+            baseline_xref == "1.0,2.0,3.0",
             "baseline recovery xref observation drifted: " + baseline_xref);
         require(
             baseline_all == "1.0,2.0,3.0",
@@ -174,8 +175,10 @@ main(int argc, char* argv[])
         require(
             baseline_object.isInitialized() && baseline_object.getIntValue() == 99,
             "baseline recovery object 3 0 observation drifted");
-        std::cout << "baseline.recovery.xref=" << baseline_xref << '\n';
-        std::cout << "baseline.recovery.all=" << baseline_all << '\n';
+        std::cout << "baseline.before_recovery.get_1_0_initialized="
+                  << (baseline_before ? "true" : "false") << '\n';
+        std::cout << "baseline.after_recovery.xref=" << baseline_xref << '\n';
+        std::cout << "baseline.after_recovery.all=" << baseline_all << '\n';
 
         QPDF removed;
         open_memory(removed, "removed-object recovery", recovery_fixture);
@@ -183,21 +186,26 @@ main(int argc, char* argv[])
         // Its public API documents a direct null replacement as the supported
         // way to remove an object from a file.
         removed.replaceObject(3, 0, QPDFObjectHandle::newNull());
-        require(removed.getObject(1, 0).isInitialized(), "recovery trigger did not initialize object 1 0");
+        auto removed_before = removed.getObject(1, 0).isInitialized();
+        require(removed_before, "pre-recovery handle was not allocated");
+        auto removed_all = keys(removed.getAllObjects()); // calls fixDanglingReferences
         auto removed_xref = keys(removed.getXRefTable());
-        auto removed_all = keys(removed.getAllObjects());
         auto removed_object = removed.getObject(3, 0);
-        require(removed_xref == "1.0,2.0", "null-replacement xref observation drifted: " + removed_xref);
+        require(
+            removed_xref == "1.0,2.0,3.0",
+            "null-replacement xref observation drifted: " + removed_xref);
         require(
             removed_all == "1.0,2.0,3.0",
             "null-replacement getAllObjects observation drifted: " + removed_all);
         require(removed_object.isInitialized(), "null replacement object 3 0 is no longer initialized");
         require(removed_object.isNull(), "recovery replaced the public null-removal object body");
-        std::cout << "removal_proxy.recovery.xref=" << removed_xref << '\n';
-        std::cout << "removal_proxy.recovery.all=" << removed_all << '\n';
-        std::cout << "removal_proxy.recovery.get_3_0_initialized="
+        std::cout << "removal_proxy.before_recovery.get_1_0_initialized="
+                  << (removed_before ? "true" : "false") << '\n';
+        std::cout << "removal_proxy.after_recovery.xref=" << removed_xref << '\n';
+        std::cout << "removal_proxy.after_recovery.all=" << removed_all << '\n';
+        std::cout << "removal_proxy.after_recovery.get_3_0_initialized="
                   << (removed_object.isInitialized() ? "true" : "false") << '\n';
-        std::cout << "removal_proxy.recovery.get_3_0_null="
+        std::cout << "removal_proxy.after_recovery.get_3_0_null="
                   << (removed_object.isNull() ? "true" : "false") << '\n';
 
         QPDF replaced;
@@ -211,13 +219,14 @@ main(int argc, char* argv[])
             replaced.getObject(3, 0).getIntValue() == 70,
             "same-generation replacement was not visible before recovery");
         replaced.replaceObject(3, 1, QPDFObjectHandle::newInteger(71));
-        require(replaced.getObject(1, 0).isInitialized(), "replacement recovery trigger did not initialize object 1 0");
+        auto replacement_before = replaced.getObject(1, 0).isInitialized();
+        require(replacement_before, "pre-recovery handle was not allocated");
+        auto replacement_all = keys(replaced.getAllObjects()); // calls fixDanglingReferences
         auto replacement_xref = keys(replaced.getXRefTable());
-        auto replacement_all = keys(replaced.getAllObjects());
         auto replacement_source = replaced.getObject(3, 0);
         auto replacement_object = replaced.getObject(3, 1);
         require(
-            replacement_xref == "1.0,2.0",
+            replacement_xref == "1.0,2.0,3.0",
             "generation-replacement xref observation drifted: " + replacement_xref);
         require(
             replacement_all == "1.0,2.0,3.0,3.1",
@@ -228,15 +237,17 @@ main(int argc, char* argv[])
         require(
             replacement_object.isInitialized() && replacement_object.getIntValue() == 71,
             "generation-replacement object 3 1 observation drifted");
-        std::cout << "replacement.recovery.xref=" << replacement_xref << '\n';
-        std::cout << "replacement.recovery.all=" << replacement_all << '\n';
-        std::cout << "replacement.recovery.get_3_0_initialized="
+        std::cout << "replacement.before_recovery.get_1_0_initialized="
+                  << (replacement_before ? "true" : "false") << '\n';
+        std::cout << "replacement.after_recovery.xref=" << replacement_xref << '\n';
+        std::cout << "replacement.after_recovery.all=" << replacement_all << '\n';
+        std::cout << "replacement.after_recovery.get_3_0_initialized="
                   << (replacement_source.isInitialized() ? "true" : "false") << '\n';
-        std::cout << "replacement.recovery.get_3_0_value=" << replacement_source.getIntValue()
+        std::cout << "replacement.after_recovery.get_3_0_value=" << replacement_source.getIntValue()
                   << '\n';
-        std::cout << "replacement.recovery.get_3_1_initialized="
+        std::cout << "replacement.after_recovery.get_3_1_initialized="
                   << (replacement_object.isInitialized() ? "true" : "false") << '\n';
-        std::cout << "replacement.recovery.get_3_1_value=" << replacement_object.getIntValue()
+        std::cout << "replacement.after_recovery.get_3_1_value=" << replacement_object.getIntValue()
                   << '\n';
         return 0;
     } catch (std::exception const& error) {

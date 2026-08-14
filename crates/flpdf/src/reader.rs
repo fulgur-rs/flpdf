@@ -1016,17 +1016,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// map is a snapshot because the resolver owns the table behind interior
     /// mutability; resolution-time recovery is reflected in a subsequent
     /// snapshot. Caller replacements that originated without an effective row
-    /// stay in qpdf's object cache but do not manufacture an xref entry
-    /// (`QPDF.cc:1986-1993`).
+    /// stay in qpdf's object cache and do not manufacture an xref entry
+    /// (`QPDF.cc:1986-1993`), while a later physical recovery may register and
+    /// expose that source row.
     pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         let removed = &self.qpdf_removed_refs;
-        let replacement_only = &self.qpdf_replacement_only_refs;
         self.resolver
             .xref_entries()
             .into_iter()
-            .filter(|(object_ref, _)| {
-                !removed.contains(object_ref) && !replacement_only.contains(object_ref)
-            })
+            .filter(|(object_ref, _)| !removed.contains(object_ref))
             .collect()
     }
 
@@ -1213,12 +1211,9 @@ impl<R: Read + Seek> Pdf<R> {
         // candidate re-read (`:516-575`, especially `:575`; `:576-607`). This
         // method must neither clear nor extend either registration. Canonical
         // xref/cache removal is separately `removeObject` (`:1996-2005`).
-        // Refresh the legacy cache before classifying this replacement, or an
-        // old object-stream entry can incorrectly retain provenance.
+        // Refresh the legacy cache before replacing the canonical value, or
+        // an old object-stream entry can incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
-        if !self.resolver.xref_entries().contains_key(&object_ref) {
-            self.qpdf_replacement_only_refs.insert(object_ref);
-        }
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1382,7 +1377,6 @@ impl<R: Read + Seek> Pdf<R> {
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
         }
-        self.qpdf_replacement_only_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
@@ -1762,11 +1756,7 @@ impl<R: Read + Seek> Pdf<R> {
         // line-scan filter at `:575` before a candidate re-read (`:516-607`).
         // Never clear or add either registration here. Exact xref/cache removal
         // remains `removeObject` (`QPDF.cc:1996-2005`).
-        let replacement_only = !self.resolver.xref_entries().contains_key(&object_ref);
         let target = self.resolver.replace_object(object_ref, replacement)?;
-        if replacement_only {
-            self.qpdf_replacement_only_refs.insert(object_ref);
-        }
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1786,7 +1776,6 @@ impl<R: Read + Seek> Pdf<R> {
     #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         self.resolver.remove_object(object_ref)?;
-        self.qpdf_replacement_only_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
@@ -2967,14 +2956,11 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         let removed = &self.qpdf_removed_refs;
-        let replacement_only = &self.qpdf_replacement_only_refs;
         let entries = self
             .resolver
             .source_xref_entries()
             .into_iter()
-            .filter(|(object_ref, _)| {
-                !removed.contains(object_ref) && !replacement_only.contains(object_ref)
-            })
+            .filter(|(object_ref, _)| !removed.contains(object_ref))
             .collect();
         self.cache.synchronize_with_xref(&entries);
         // Keep the actual `/Extends`-resolved parent for a still-identical
@@ -8744,9 +8730,53 @@ mod tests {
         assert!(target.is_same_object_as(&pdf.get_object_handle(target_ref)));
         assert!(!target.is_resolved());
         assert!(!pdf.is_dirty(target_ref));
+    }
+
+    #[test]
+    fn replace_object_handle_rejects_direct_reserved_without_registering_target() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let replacement = reserved.shallow_copy().expect("reserved copy");
+        let target_ref = ObjectRef::new(99, 0);
+        assert!(replacement.is_direct());
+        assert!(replacement.is_reserved());
+        assert!(pdf.resolver.registered_handle(target_ref).is_none());
+
+        let error = pdf
+            .replace_object_handle(target_ref, replacement)
+            .expect_err("reserved replacement is outside flpdf's resolved-only contract");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: replacement ObjectHandle is not initialized"
+        );
         assert!(
-            !pdf.qpdf_replacement_only_refs.contains(&target_ref),
-            "a rejected replacement must not change the cache-only xref snapshot state"
+            pdf.resolver.registered_handle(target_ref).is_none(),
+            "a rejected source-state preflight must not register an absent target"
+        );
+    }
+
+    #[test]
+    fn replace_object_handle_rejects_same_pdf_destroyed_source_without_registering_target() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let destroyed = pdf.new_reserved().expect("reserved object");
+        destroyed.disconnect();
+        let target_ref = ObjectRef::new(99, 0);
+        assert!(destroyed.is_direct());
+        assert_eq!(destroyed.type_code(), 14);
+        assert!(pdf.resolver.registered_handle(target_ref).is_none());
+
+        let error = pdf
+            .replace_object_handle(target_ref, destroyed)
+            .expect_err("destroyed replacement is outside flpdf's resolved-only contract");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: replacement ObjectHandle is not initialized"
+        );
+        assert!(
+            pdf.resolver.registered_handle(target_ref).is_none(),
+            "a rejected source-state preflight must not register an absent target"
         );
     }
 
@@ -8766,10 +8796,6 @@ mod tests {
 
         pdf.set_object(object_ref, Object::Integer(41));
 
-        assert!(
-            !pdf.qpdf_replacement_only_refs.contains(&object_ref),
-            "an effective ObjStm default row is not a cache-only replacement"
-        );
         assert_eq!(
             pdf.get_xref_table().get(&object_ref),
             Some(&XrefEntry::Free { next: 0 })
@@ -8797,16 +8823,47 @@ mod tests {
             .replace_object_handle(object_ref, ObjectHandle::integer(42))
             .expect("replace canonical handle");
 
-        assert!(
-            !pdf.qpdf_replacement_only_refs.contains(&object_ref),
-            "an effective ObjStm default row is not a cache-only replacement"
-        );
         assert_eq!(
             pdf.get_xref_table().get(&object_ref),
             Some(&XrefEntry::Free { next: 0 })
         );
         assert!(current.is_same_object_as(&handle));
         assert_eq!(current.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn set_object_then_objstm_default_xref_row_is_visible_later() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(99, 0);
+
+        pdf.set_object(object_ref, Object::Integer(41));
+        assert!(!pdf.get_xref_table().contains_key(&object_ref));
+
+        pdf.resolver.insert_default_xref_entry_for_test(object_ref);
+
+        assert_eq!(
+            pdf.get_xref_table().get(&object_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+        assert_eq!(pdf.get_object_handle(object_ref).as_integer(), Some(41));
+    }
+
+    #[test]
+    fn replace_object_handle_then_objstm_default_xref_row_is_visible_later() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(99, 0);
+
+        pdf.replace_object_handle(object_ref, ObjectHandle::integer(42))
+            .expect("replace canonical handle");
+        assert!(!pdf.get_xref_table().contains_key(&object_ref));
+
+        pdf.resolver.insert_default_xref_entry_for_test(object_ref);
+
+        assert_eq!(
+            pdf.get_xref_table().get(&object_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+        assert_eq!(pdf.get_object_handle(object_ref).as_integer(), Some(42));
     }
 
     #[test]
