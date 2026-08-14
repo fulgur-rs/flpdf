@@ -1206,10 +1206,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`Pdf::resolve_borrowed`] calls for `object_ref` observe `object`
     /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
-        // qpdf discards stale uncompressed xref entries and repopulates the live
-        // table during reconstruction (`libqpdf/QPDF.cc:532-562`). Refresh the
-        // legacy cache before using it to classify the replacement, or an old
-        // object-stream entry can incorrectly retain provenance.
+        // This is the canonical cache replacement boundary, not xref
+        // registration: reconstruction's `deleted_objects` is a transient
+        // free-row filter (`QPDF.cc:516-575`, `:1187-1210`) that qpdf clears
+        // after `/Size` validation (`:686-708`). It must neither be cleared
+        // nor extended here. Canonical xref/cache removal is separately
+        // `removeObject` (`QPDF.cc:1996-2005`). Refresh the legacy cache before
+        // classifying this replacement, or an old object-stream entry can
+        // incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
         if !self.resolver.xref_entries().contains_key(&object_ref) {
             self.qpdf_replacement_only_refs.insert(object_ref);
@@ -1751,6 +1755,11 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
+        // Like `set_object`, this is canonical cache replacement only. Keep it
+        // separate from the registration/recovery-only `deleted_objects`
+        // filter (`QPDF.cc:516-575`, `:1187-1210`), which is consumed after
+        // `/Size` validation (`:686-708`); never clear or add that set here.
+        // Exact xref/cache removal remains `removeObject` (`QPDF.cc:1996-2005`).
         let replacement_only = !self.resolver.xref_entries().contains_key(&object_ref);
         let target = self.resolver.replace_object(object_ref, replacement)?;
         if replacement_only {

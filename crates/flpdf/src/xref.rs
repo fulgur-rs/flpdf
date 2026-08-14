@@ -75,6 +75,12 @@ enum ParsedXrefEntry {
 #[derive(Debug, Default)]
 struct XrefRegistration {
     entries: BTreeMap<ObjectRef, XrefEntry>,
+    /// A construction-only, object-number-wide free-row filter. qpdf builds
+    /// it while registering/reconstructing xref entries
+    /// (`QPDF.cc:516-575`, `:1187-1210`), uses it for `/Size`, then clears it
+    /// (`QPDF.cc:686-708`). It deliberately never crosses into `ResolverCore`:
+    /// canonical cache/xref replacement and removal are a separate `Pdf`
+    /// mutation boundary.
     deleted_objects: BTreeSet<u32>,
 }
 

@@ -29,11 +29,11 @@
   - replacing `3 0` with `3 1` and recording the effective xref keys, `getAllObjects` keys, and whether `getObject(3, 1)` is initialized after recovery.
 - [ ] Add `scripts/qpdf-tombstone-lifetime-probe.sh` following the existing pinned-probe safeguards: resolve `fetch-qpdf-source.sh --print-path`, verify the exact qpdf commit and clean tracked tree, build only `libqpdf` in a validated `/tmp` directory, compile the probe with the pinned headers/library, validate `ldd` resolves the pinned shared library, and run it with the pinned `LD_LIBRARY_PATH`.
 - [ ] Run the probe and `/usr/bin/qpdf` on the same in-memory/file fixture, record the observed qpdf rows in the probe's assertions, and make the probe fail if the source or runtime oracle drifts.
-- [ ] Convert `reconstruction_does_not_reintroduce_a_removed_unindexed_object` into a qpdf-shaped regression whose name and assertions describe the observed recovery result; retain the existing fixture `synthetic_mismatch_discovers_unindexed_object_pdf()` and force recovery through the same resolver entrypoint.
+- [ ] Convert `reconstruction_reregisters_privately_removed_unindexed_object_like_qpdf` into a qpdf-shaped regression whose name and assertions describe the observed recovery result; retain the existing fixture `synthetic_mismatch_discovers_unindexed_object_pdf()` and force recovery through the same resolver entrypoint.
 - [ ] Add resolver tests named `set_object_generation_replacement_matches_qpdf_tombstone_lifetime` and `replace_object_handle_generation_replacement_matches_qpdf_tombstone_lifetime`. Each test must cover removal, same-generation replacement, different-generation replacement (`3 0` → `3 1`), recovery, `get_xref_table`, `get_all_objects`, and `get_object_handle`/resolver minting, with assertions taken from the oracle probe.
 - [ ] Add the direct xref test `xref_registration_free_object_suppression_is_local_to_registration` beside `xref_registration_free_object_suppresses_later_generations`; assert that the free row suppresses the later row in that registration while a fresh registration has no inherited tombstone.
 - [ ] Run the focused RED commands and save their failure evidence before editing production code:
-  - `cargo test -p flpdf --lib reconstruction_does_not_reintroduce_a_removed_unindexed_object -- --exact`
+  - `cargo test -p flpdf --lib reconstruction_reregisters_privately_removed_unindexed_object_like_qpdf -- --exact`
   - `cargo test -p flpdf --lib set_object_generation_replacement_matches_qpdf_tombstone_lifetime -- --exact`
   - `cargo test -p flpdf --lib replace_object_handle_generation_replacement_matches_qpdf_tombstone_lifetime -- --exact`
   - `cargo test -p flpdf --lib xref_registration_free_object_suppression_is_local_to_registration -- --exact`
@@ -61,7 +61,7 @@
 - [ ] Make the Task 1 replacement matrix pass for both routes, including same-generation replacement and different-generation `3 0` → `3 1` replacement followed by recovery and resolver handle creation.
 - [ ] Keep existing `get_all_objects_excludes_deleted_objects_from_xref_and_canonical_snapshots` and any `qpdf_removed_refs` assertions green; if an assertion depended specifically on the removed persistent tombstone, rewrite it to assert the canonical xref/cache contract instead of preserving the old hardening policy.
 - [ ] Run focused GREEN checks:
-  - `cargo test -p flpdf --lib reconstruction_does_not_reintroduce_a_removed_unindexed_object -- --exact`
+  - `cargo test -p flpdf --lib reconstruction_reregisters_privately_removed_unindexed_object_like_qpdf -- --exact`
   - `cargo test -p flpdf --lib set_object_generation_replacement_matches_qpdf_tombstone_lifetime -- --exact`
   - `cargo test -p flpdf --lib replace_object_handle_generation_replacement_matches_qpdf_tombstone_lifetime -- --exact`
   - `cargo test -p flpdf --lib xref_registration_free_object_suppression_is_local_to_registration -- --exact`
@@ -94,4 +94,3 @@
 - [ ] Run `bd dep cycles` and `bd dolt push`, requiring the exact `Push complete.` result.
 - [ ] Check the current stacked ancestry and open-PR count with `gh-stack`/GitHub. Create the next Draft PR on the approved parent branch, include the qpdf source citations and verification summary, and keep it Draft until all required CI checks pass.
 - [ ] Push the implementation branch and verify remote branch/PR state; do not merge and stop if the open-PR pause threshold of five is reached.
-
