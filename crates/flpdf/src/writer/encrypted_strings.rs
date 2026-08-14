@@ -1,6 +1,7 @@
 //! qpdf correspondence: QPDFWriter.cc:785-803 encryption-dictionary binary-key hex selection, QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities.
 
 use crate::object::{write_hex_string, write_name_escaped, write_string_value};
+use crate::object_handle::ObjectHandle;
 use crate::security::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::{EncryptionContext, WriteCipher};
@@ -32,6 +33,7 @@ pub(crate) struct EncryptedStringEmitter {
     cipher: WriteCipher,
     static_aes_iv: bool,
     aes_iv_generator: Box<AesIvGenerator>,
+    encrypt_ref: ObjectRef,
 }
 
 impl EncryptedStringEmitter {
@@ -54,6 +56,7 @@ impl EncryptedStringEmitter {
             cipher: ctx.cipher,
             static_aes_iv: ctx.static_aes_iv,
             aes_iv_generator,
+            encrypt_ref: ctx.encrypt_ref,
         }
     }
 
@@ -92,6 +95,47 @@ impl EncryptedStringEmitter {
                     object.try_write_pdf_qdf_with_string_writer(out, 0, &mut write_string)
                 } else {
                     object.try_write_pdf_with_string_writer(out, &mut write_string)
+                }
+            })
+    }
+
+    /// Emit an ObjectHandle tree with qpdf's per-object string-encryption
+    /// lifecycle. The handle walker retains indirect identity and the source
+    /// graph is never materialized or mutated. `/Encrypt` itself is emitted
+    /// through [`write_encryption_dictionary_handle`] and therefore stays
+    /// plaintext.
+    #[allow(dead_code)] // consumed by the writer ObjectHandle cutover
+    pub(crate) fn write_handle_object(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        qdf: bool,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                if qdf {
+                    object.unparse_object_qdf_with_string_writer(out, 0, &mut write_string)
+                } else {
+                    object.unparse_object_with_string_writer(out, &mut write_string)
                 }
             })
     }
@@ -140,9 +184,102 @@ impl EncryptedStringEmitter {
             })
     }
 
+    /// Emit an ObjectHandle stream dictionary with the same encryption switch
+    /// used by the legacy writer. Stream payload bytes are intentionally not
+    /// handled here; the caller must put the handle's payload through the
+    /// canonical stream pipeline, and `encrypt_strings` is the cleartext
+    /// metadata exemption selected by qpdf's stream writer.
+    #[allow(dead_code)] // consumed by the writer ObjectHandle cutover
+    pub(crate) fn write_handle_stream_dict(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        options: StreamDictOptions,
+    ) -> crate::Result<()> {
+        if !options.encrypt_strings {
+            if options.qdf {
+                return dict.unparse_stream_body_qdf(out, 0);
+            }
+            return dict.unparse_stream_body(out, options.refiltered);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                if options.qdf {
+                    dict.unparse_stream_body_qdf_with_string_writer(out, 0, &mut write_string)
+                } else {
+                    dict.unparse_stream_body_with_string_writer(
+                        out,
+                        options.refiltered,
+                        &mut write_string,
+                    )
+                }
+            })
+    }
+
     #[cfg(test)]
     fn current_data_key_for_test(&self) -> Option<&[u8]> {
         self.state.current_data_key()
+    }
+}
+
+impl EncryptionContext {
+    /// Return the context's `/Encrypt` snapshot as a canonical direct handle
+    /// tree. This is an additive view for the future ObjectHandle writer route;
+    /// the existing legacy dictionary remains owned by the current consumer
+    /// until that cutover lands.
+    #[allow(dead_code)]
+    pub(crate) fn encrypt_dict_handle(&self) -> ObjectHandle {
+        let entries = self
+            .encrypt_dict
+            .iter()
+            .map(|(key, value)| (key.to_vec(), object_to_handle(value)))
+            .collect();
+        ObjectHandle::dictionary(entries)
+    }
+}
+
+fn object_to_handle(object: &Object) -> ObjectHandle {
+    match object {
+        Object::Null => ObjectHandle::null(),
+        Object::Boolean(value) => ObjectHandle::boolean(*value),
+        Object::Integer(value) => ObjectHandle::integer(*value),
+        Object::Real(value) => ObjectHandle::real(*value),
+        Object::RealLiteral { value, literal } => {
+            ObjectHandle::real_literal(*value, literal.clone())
+        }
+        Object::Name(value) => ObjectHandle::name(value.clone()),
+        Object::String(value) => ObjectHandle::string(value.clone()),
+        Object::Reference(value) => {
+            ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(*value))
+        }
+        Object::Operator(value) => ObjectHandle::operator(value.clone()),
+        Object::InlineImage(value) => ObjectHandle::inline_image(value.clone()),
+        Object::Array(values) => ObjectHandle::array(values.iter().map(object_to_handle).collect()),
+        Object::Dictionary(dict) => ObjectHandle::dictionary(
+            dict.iter()
+                .map(|(key, value)| (key.to_vec(), object_to_handle(value)))
+                .collect(),
+        ),
+        Object::Stream(stream) => ObjectHandle::stream(
+            object_to_handle(&Object::Dictionary(stream.dict.clone())),
+            std::rc::Rc::new(stream.data.clone()),
+        ),
     }
 }
 
@@ -240,11 +377,45 @@ pub(crate) fn write_encryption_dictionary(out: &mut Vec<u8>, dict: &Dictionary) 
     out.extend_from_slice(b" >>");
 }
 
+/// Serialize an ObjectHandle-backed `/Encrypt` dictionary with the same
+/// direct-entry hex policy as [`write_encryption_dictionary`]. The handle
+/// tree is kept as the source of truth; nested values and indirect references
+/// use the canonical ObjectHandle writer rather than materializing `Object`.
+pub(crate) fn write_encryption_dictionary_handle(
+    out: &mut Vec<u8>,
+    handle: &ObjectHandle,
+) -> crate::Result<()> {
+    const HEX_ENCRYPT_KEYS: [&[u8]; 5] = [b"/O", b"/U", b"/OE", b"/UE", b"/Perms"];
+
+    let Some(entries) = handle.as_dictionary() else {
+        return Err(crate::Error::System(
+            "encryption handle does not contain a dictionary".to_string(),
+        ));
+    };
+
+    out.extend_from_slice(b"<<");
+    for (key, value) in entries {
+        let key_without_slash = key.strip_prefix(b"/").unwrap_or(&key);
+        out.extend_from_slice(b" /");
+        write_name_escaped(out, key_without_slash);
+        out.push(b' ');
+        if HEX_ENCRYPT_KEYS.contains(&key.as_slice()) {
+            if let Some(bytes) = value.as_string() {
+                write_hex_string(out, &bytes);
+                continue;
+            }
+        }
+        value.unparse_object(out)?;
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        serialize_encrypted_string, write_encryption_dictionary, EncryptedStringEmitter,
-        StreamDictOptions,
+        serialize_encrypted_string, write_encryption_dictionary,
+        write_encryption_dictionary_handle, EncryptedStringEmitter, StreamDictOptions,
     };
     use crate::encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
     use crate::security::standard::{
@@ -254,7 +425,7 @@ mod tests {
         build_copy_encryption_context, build_encryption_context, EncryptionContext, WriteCipher,
         WriterOptions,
     };
-    use crate::{Dictionary, Object, ObjectRef};
+    use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Stream};
 
     fn fixed_context(
         file_key: Vec<u8>,
@@ -382,6 +553,321 @@ mod tests {
         assert!(wire
             .windows(b"/Nested << /O (nested) >>".len())
             .any(|part| part == b"/Nested << /O (nested) >>"));
+    }
+
+    #[test]
+    fn handle_encryption_dictionary_matches_legacy_direct_encoding() {
+        let mut nested = Dictionary::new();
+        nested.insert("O", Object::String(b"nested".to_vec()));
+
+        let mut dict = Dictionary::new();
+        for key in ["O", "U", "OE", "UE", "Perms"] {
+            dict.insert(key, Object::String(b"printable".to_vec()));
+        }
+        dict.insert("Custom", Object::String(b"custom".to_vec()));
+        dict.insert("Nested", Object::Dictionary(nested));
+
+        let mut context = fixed_context(
+            vec![0x42; 16],
+            WriteCipher::PerObject(ObjectKeyAlg::Aes),
+            4,
+            4,
+        );
+        context.encrypt_dict = dict.clone();
+        let handle = context.encrypt_dict_handle();
+
+        let mut legacy = Vec::new();
+        write_encryption_dictionary(&mut legacy, &dict);
+        let mut handle_wire = Vec::new();
+        write_encryption_dictionary_handle(&mut handle_wire, &handle)
+            .expect("direct encryption dictionary handle must serialize");
+
+        assert_eq!(handle_wire, legacy);
+    }
+
+    #[test]
+    fn handle_encryption_dictionary_rejects_non_dictionary() {
+        let mut wire = Vec::new();
+        let error = write_encryption_dictionary_handle(
+            &mut wire,
+            &ObjectHandle::string(b"not a dictionary".to_vec()),
+        )
+        .expect_err("an encryption dictionary writer needs a dictionary handle");
+
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "encryption handle does not contain a dictionary"
+        ));
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn handle_encryption_dictionary_falls_back_for_a_non_string_hex_key() {
+        let handle = ObjectHandle::dictionary(vec![(b"O".to_vec(), ObjectHandle::integer(7))]);
+        let mut wire = Vec::new();
+        write_encryption_dictionary_handle(&mut wire, &handle)
+            .expect("a non-string encryption entry still uses the handle writer");
+        assert_eq!(wire, b"<< /O 7 >>");
+    }
+
+    #[test]
+    fn object_to_handle_preserves_every_legacy_object_variant() {
+        let mut nested_dict = Dictionary::new();
+        nested_dict.insert("Value", Object::Integer(1));
+        let objects = [
+            (Object::Null, b"null".as_slice()),
+            (Object::Boolean(true), b"true".as_slice()),
+            (Object::Integer(7), b"7".as_slice()),
+            (Object::Real(0.5), b"0.5".as_slice()),
+            (
+                Object::RealLiteral {
+                    value: 0.4,
+                    literal: b".4".to_vec(),
+                },
+                b".4".as_slice(),
+            ),
+            (Object::Name(b"Name".to_vec()), b"/Name".as_slice()),
+            (Object::String(b"text".to_vec()), b"(text)".as_slice()),
+            (Object::Reference(ObjectRef::new(4, 0)), b"4 0 R".as_slice()),
+            (Object::Operator(b"q".to_vec()), b"q".as_slice()),
+            (Object::InlineImage(b"BI".to_vec()), b"BI".as_slice()),
+            (Object::Array(vec![Object::Integer(1)]), b"[ 1 ]".as_slice()),
+            (
+                Object::Dictionary(nested_dict),
+                b"<< /Value 1 >>".as_slice(),
+            ),
+            (
+                Object::Stream(Stream::new(
+                    {
+                        let mut dict = Dictionary::new();
+                        dict.insert("Length", Object::Integer(0));
+                        dict
+                    },
+                    Vec::new(),
+                )),
+                b"<< /Length 0 >>".as_slice(),
+            ),
+        ];
+
+        for (object, expected) in objects {
+            let handle = super::object_to_handle(&object);
+            let mut out = Vec::new();
+            handle
+                .unparse_object(&mut out)
+                .expect("converted object handle must unparse");
+            assert_eq!(out, expected, "unexpected conversion for {object:?}");
+        }
+    }
+
+    #[test]
+    fn handle_object_emission_round_trips_rc4_aes128_and_aes256() {
+        let cases = [
+            (
+                vec![0x11; 5],
+                WriteCipher::PerObject(ObjectKeyAlg::Rc4),
+                1,
+                2,
+            ),
+            (
+                vec![0x22; 16],
+                WriteCipher::PerObject(ObjectKeyAlg::Aes),
+                4,
+                4,
+            ),
+            (vec![0x33; 32], WriteCipher::FileKeyAes256, 5, 6),
+        ];
+
+        for (file_key, cipher, encryption_v, encryption_r) in cases {
+            let emitted_ref = ObjectRef::new(10, 0);
+            let context = fixed_context(file_key.clone(), cipher, encryption_v, encryption_r);
+            let object = ObjectHandle::string(b"ObjectHandle plaintext".to_vec());
+            let mut emitter = EncryptedStringEmitter::from_context(&context);
+            let mut out = Vec::new();
+
+            emitter
+                .write_handle_object(&mut out, emitted_ref, None, &object, false)
+                .expect("ObjectHandle string emission");
+
+            assert_eq!(
+                decrypt_emitted_string(&out, emitted_ref, &file_key, cipher),
+                b"ObjectHandle plaintext"
+            );
+            assert_eq!(
+                object.as_string().expect("source handle is a string"),
+                b"ObjectHandle plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_object_emission_encrypts_nested_strings_without_materializing_children() {
+        let emitted_ref = ObjectRef::new(18, 0);
+        let file_key = vec![0x44; 16];
+        let cipher = WriteCipher::PerObject(ObjectKeyAlg::Aes);
+        let context = fixed_context(file_key.clone(), cipher, 4, 4);
+        let object = ObjectHandle::dictionary(vec![
+            (
+                b"Title".to_vec(),
+                ObjectHandle::string(b"top-level".to_vec()),
+            ),
+            (
+                b"Nested".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::string(b"nested".to_vec())]),
+            ),
+        ]);
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let mut out = Vec::new();
+
+        emitter
+            .write_handle_object(&mut out, emitted_ref, None, &object, true)
+            .expect("nested ObjectHandle emission");
+
+        let emitted = crate::parse_object(&out).expect("emitted object must parse");
+        let dict = emitted
+            .as_dict()
+            .expect("emitted object must be a dictionary");
+        assert_eq!(
+            decrypt_ciphertext(
+                dict.get("Title")
+                    .and_then(Object::as_string)
+                    .expect("encrypted title")
+                    .to_vec(),
+                emitted_ref,
+                &file_key,
+                cipher,
+            ),
+            b"top-level"
+        );
+        let nested = dict
+            .get("Nested")
+            .and_then(Object::as_array)
+            .and_then(|items| items.first())
+            .and_then(Object::as_string)
+            .expect("encrypted nested string");
+        assert_eq!(
+            decrypt_ciphertext(nested.to_vec(), emitted_ref, &file_key, cipher),
+            b"nested"
+        );
+        assert_eq!(
+            object
+                .get_key(b"/Title")
+                .as_string()
+                .expect("source title remains available"),
+            b"top-level"
+        );
+    }
+
+    #[test]
+    fn handle_object_emission_keeps_encrypt_and_object_stream_members_plain() {
+        let context = fixed_context(
+            vec![0x42; 16],
+            WriteCipher::PerObject(ObjectKeyAlg::Aes),
+            4,
+            4,
+        );
+        let object = ObjectHandle::string(b"plain".to_vec());
+        let encrypt_object = ObjectHandle::dictionary(vec![(
+            b"O".to_vec(),
+            ObjectHandle::string(b"printable".to_vec()),
+        )]);
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+
+        let mut encrypt_output = Vec::new();
+        emitter
+            .write_handle_object(
+                &mut encrypt_output,
+                context.encrypt_ref,
+                None,
+                &encrypt_object,
+                false,
+            )
+            .expect("/Encrypt object must remain cleartext");
+        assert_eq!(encrypt_output, b"<< /O <7072696e7461626c65> >>");
+
+        let mut member_output = Vec::new();
+        emitter
+            .write_handle_object(
+                &mut member_output,
+                ObjectRef::new(10, 0),
+                Some(3),
+                &object,
+                false,
+            )
+            .expect("ObjStm member must remain cleartext");
+        assert_eq!(member_output, b"(plain)");
+    }
+
+    #[test]
+    fn handle_stream_dictionary_switches_between_encrypted_and_cleartext_metadata() {
+        let emitted_ref = ObjectRef::new(12, 0);
+        let file_key = vec![0x21; 16];
+        let cipher = WriteCipher::PerObject(ObjectKeyAlg::Aes);
+        let context = fixed_context(file_key.clone(), cipher, 4, 4);
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"MetadataMarker".to_vec(),
+                ObjectHandle::string(b"metadata-dictionary-secret".to_vec()),
+            ),
+            (b"Length".to_vec(), ObjectHandle::integer(5)),
+        ]);
+
+        for qdf in [false, true] {
+            let mut cleartext = Vec::new();
+            EncryptedStringEmitter::from_context(&context)
+                .write_handle_stream_dict(
+                    &mut cleartext,
+                    emitted_ref,
+                    None,
+                    &dict,
+                    StreamDictOptions::new(qdf, false, false),
+                )
+                .expect("cleartext metadata dictionary emission");
+            assert!(cleartext
+                .windows(b"metadata-dictionary-secret".len())
+                .any(|window| window == b"metadata-dictionary-secret"));
+
+            let mut encrypted = Vec::new();
+            EncryptedStringEmitter::from_context(&context)
+                .write_handle_stream_dict(
+                    &mut encrypted,
+                    emitted_ref,
+                    None,
+                    &dict,
+                    StreamDictOptions::new(qdf, false, true),
+                )
+                .expect("encrypted metadata dictionary emission");
+            let ciphertext = parse_dict_string(&encrypted, "MetadataMarker");
+            assert_eq!(
+                decrypt_ciphertext(ciphertext, emitted_ref, &file_key, cipher),
+                b"metadata-dictionary-secret"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_object_callback_errors_clear_the_current_data_key() {
+        let context = fixed_context(vec![0x5a; 31], WriteCipher::FileKeyAes256, 5, 6);
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let mut out = Vec::new();
+
+        let error = emitter
+            .write_handle_object(
+                &mut out,
+                ObjectRef::new(44, 0),
+                None,
+                &ObjectHandle::string(b"plaintext".to_vec()),
+                false,
+            )
+            .expect_err("invalid AES-256 handle key must fail in the string callback");
+
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message)
+                if message == "V=5 AES-256 data key is not 32 bytes"
+        ));
+        assert!(out.is_empty());
+        assert_eq!(emitter.current_data_key_for_test(), None);
     }
 
     #[test]
@@ -712,6 +1198,14 @@ mod tests {
                 "wrong V/R for {:?}",
                 params.method
             );
+
+            let handle = context.encrypt_dict_handle();
+            let mut legacy_wire = Vec::new();
+            write_encryption_dictionary(&mut legacy_wire, &context.encrypt_dict);
+            let mut handle_wire = Vec::new();
+            write_encryption_dictionary_handle(&mut handle_wire, &handle)
+                .expect("generated encryption dictionary handle");
+            assert_eq!(handle_wire, legacy_wire);
         }
     }
 
@@ -735,5 +1229,12 @@ mod tests {
             build_copy_encryption_context(&source, &WriterOptions::default(), 10, None).unwrap();
 
         assert_eq!((context.encryption_v, context.encryption_r), (4, 4));
+        let handle = context.encrypt_dict_handle();
+        let mut legacy_wire = Vec::new();
+        write_encryption_dictionary(&mut legacy_wire, &context.encrypt_dict);
+        let mut handle_wire = Vec::new();
+        write_encryption_dictionary_handle(&mut handle_wire, &handle)
+            .expect("copied encryption dictionary handle");
+        assert_eq!(handle_wire, legacy_wire);
     }
 }

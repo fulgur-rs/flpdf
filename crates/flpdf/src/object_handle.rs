@@ -5484,6 +5484,27 @@ impl ObjectHandle {
         unparse_object_walk(self, out)
     }
 
+    /// Writer-emission counterpart of [`Self::unparse_object`] that routes
+    /// every ordinary direct PDF string through `write_string`. The qpdf
+    /// signature `/Contents` exception remains cleartext hexadecimal because
+    /// `QPDFWriter.cc:1501` supplies `f_hex_string | f_no_encryption`; it is
+    /// therefore intentionally not sent to the callback. This is the
+    /// emission-time hook used by qpdf's encrypted `unparseObject` branch
+    /// (`QPDFWriter.cc:1567-1599`): containers and indirect child identity
+    /// remain owned by `ObjectHandle`, while the caller supplies only the
+    /// string representation policy.
+    #[allow(dead_code)] // production callers land with the writer cutover
+    pub(crate) fn unparse_object_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        unparse_object_walk_with_string_writer(self, out, write_string)
+    }
+
     /// QDF-mode counterpart of [`Self::unparse_object`] — same qpdf function
     /// and the same call shape (`QPDFWriter::unparseObject`,
     /// `QPDFWriter.cc:1318-1527`, `level=0, flags=0`), but with the writer's
@@ -5522,6 +5543,21 @@ impl ObjectHandle {
     #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
     pub(crate) fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
+    }
+
+    /// QDF-mode counterpart of [`Self::unparse_object_with_string_writer`],
+    /// including its cleartext hexadecimal signature `/Contents` exception.
+    #[allow(dead_code)] // production callers land with the writer cutover
+    pub(crate) fn unparse_object_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        unparse_object_walk_qdf_with_string_writer(self, indent, out, write_string)
     }
 
     /// Writer-emission counterpart that rewrites indirect child references
@@ -6586,6 +6622,276 @@ fn unparse_dict_entries_qdf(
     Ok(())
 }
 
+fn write_child_with_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    if let Some(object_ref) = handle.object_ref() {
+        out.extend_from_slice(object_ref.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_with_string_writer(handle, out, write_string)
+}
+
+fn unparse_container_with_string_writer<F>(
+    container: UnparseContainer,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match container {
+        UnparseContainer::Array(children) => {
+            out.push(b'[');
+            for child in children {
+                out.push(b' ');
+                write_child_with_string_writer(&child, out, write_string)?;
+            }
+            out.extend_from_slice(b" ]");
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_with_string_writer(&entries, out, write_string)?;
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_with_string_writer(&stream_dict, out, write_string)?;
+        }
+    }
+    Ok(())
+}
+
+fn unparse_object_walk_with_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_with_string_writer(value, out, write_string).map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: successful dereference exposes Null for
+                // missing states or errors while unresolved.
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(container) => unparse_container_with_string_writer(container, out, write_string),
+            None => Ok(()),
+        }
+    })
+}
+
+fn unparse_object_value_with_string_writer<F>(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match value {
+        ObjectValue::String(bytes) => write_string(out, bytes),
+        _ => unparse_object_value(value, out),
+    }
+}
+
+fn try_write_sig_contents_with_string_writer(
+    handle: &ObjectHandle,
+    force_hex_string: bool,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    if !force_hex_string || handle.object_ref().is_some() {
+        return Ok(false);
+    }
+    handle.try_dereference()?;
+    let bytes = handle.with_value(|value| match value {
+        Some(ObjectValue::String(bytes)) => Some(bytes.clone()),
+        _ => None,
+    });
+    let Some(bytes) = bytes else {
+        return Ok(false);
+    };
+    // QPDFWriter.cc:1501 adds f_no_encryption together with f_hex_string for
+    // signature contents. The ordinary string callback is therefore bypassed
+    // here: qpdf keeps this value cleartext and only changes its spelling to
+    // hexadecimal, even while the surrounding object is encrypted.
+    crate::object::write_hex_string(out, &bytes);
+    Ok(true)
+}
+
+fn unparse_dict_entries_with_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
+            continue;
+        }
+        write_child_with_string_writer(value, out, write_string)?;
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn write_child_qdf_with_string_writer<F>(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    if let Some(object_ref) = handle.object_ref() {
+        out.extend_from_slice(object_ref.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_qdf_with_string_writer(handle, indent, out, write_string)
+}
+
+fn unparse_container_qdf_with_string_writer<F>(
+    container: UnparseContainer,
+    indent: usize,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match container {
+        UnparseContainer::Array(children) => {
+            out.push(b'[');
+            out.push(b'\n');
+            for child in children {
+                push_spaces(out, indent + 2);
+                write_child_qdf_with_string_writer(&child, indent + 2, out, write_string)?;
+                out.push(b'\n');
+            }
+            push_spaces(out, indent);
+            out.push(b']');
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_qdf_with_string_writer(&entries, indent, out, write_string)?;
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_qdf_with_string_writer(&stream_dict, indent, out, write_string)?;
+        }
+    }
+    Ok(())
+}
+
+fn unparse_object_walk_qdf_with_string_writer<F>(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_qdf_with_string_writer(value, indent, out, write_string)
+                        .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: successful dereference exposes Null for
+                // missing states or errors while unresolved.
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(container) => {
+                unparse_container_qdf_with_string_writer(container, indent, out, write_string)
+            }
+            None => Ok(()),
+        }
+    })
+}
+
+fn unparse_object_value_qdf_with_string_writer<F>(
+    value: &ObjectValue,
+    _indent: usize,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match value {
+        ObjectValue::String(bytes) => write_string(out, bytes),
+        _ => unparse_object_value(value, out),
+    }
+}
+
+fn unparse_dict_entries_qdf_with_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<\n");
+    for (key, value) in visible_dict_entries(entries)? {
+        push_spaces(out, indent + 2);
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
+            out.push(b'\n');
+            continue;
+        }
+        write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QpdfStreamJsonData {
     /// qpdf's `qpdf_sj_none`: emit only the stream dictionary.
@@ -7581,6 +7887,47 @@ impl ObjectHandle {
         })
     }
 
+    /// Stream-dictionary counterpart of
+    /// [`Self::unparse_stream_body`] that routes ordinary direct PDF strings
+    /// through `write_string` while retaining qpdf's `/Length` and refilter
+    /// ordering. A signature `/Contents` value remains cleartext hexadecimal,
+    /// matching qpdf's `f_hex_string | f_no_encryption` flags.
+    #[allow(dead_code)] // production callers land with the writer cutover
+    pub(crate) fn unparse_stream_body_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_with_string_writer(&entries, refiltered, out, write_string)
+        })
+    }
+
     /// QDF-mode counterpart of [`Self::unparse_stream_body`] -- same
     /// delegation-target dimension as [`Self::unparse_object_qdf`] is to
     /// [`Self::unparse_object`] (`m->qdf_mode` set to `true` inside the
@@ -7654,6 +8001,45 @@ impl ObjectHandle {
                 _ => Vec::new(),
             };
             unparse_stream_dict_entries_qdf(&entries, indent, out)
+        })
+    }
+
+    /// QDF-mode stream-dictionary counterpart of
+    /// [`Self::unparse_stream_body_with_string_writer`], including its
+    /// cleartext hexadecimal signature `/Contents` exception.
+    #[allow(dead_code)] // production callers land with the writer cutover
+    pub(crate) fn unparse_stream_body_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_qdf_with_string_writer(&entries, indent, out, write_string)
         })
     }
 
@@ -7830,6 +8216,95 @@ fn unparse_stream_dict_entries_qdf(
         push_spaces(out, indent + 2);
         out.extend_from_slice(b"/Length ");
         write_child_qdf(length, indent + 2, out)?;
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_with_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    refiltered: bool,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let excluded_entries;
+    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
+        excluded_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &excluded_entries
+    } else {
+        entries
+    };
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
+            continue;
+        }
+        write_child_with_string_writer(value, out, write_string)?;
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_string_writer(length, out, write_string)?;
+    }
+    if refiltered {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_qdf_with_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<\n");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        push_spaces(out, indent + 2);
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_with_string_writer(value, force_hex_string, out)? {
+            out.push(b'\n');
+            continue;
+        }
+        write_child_qdf_with_string_writer(value, indent + 2, out, write_string)?;
+        out.push(b'\n');
+    }
+    if let Some(length) = length_value {
+        push_spaces(out, indent + 2);
+        out.extend_from_slice(b"/Length ");
+        write_child_qdf_with_string_writer(length, indent + 2, out, write_string)?;
         out.push(b'\n');
     }
     push_spaces(out, indent);
@@ -11580,6 +12055,20 @@ mod unparse_object_tests {
     use super::identity_tests::{error_resolving_handle, resolver_bearing_handle};
     use super::*;
 
+    fn compact_string_hook(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+        out.extend_from_slice(b"<hook:");
+        out.extend_from_slice(value);
+        out.extend_from_slice(b">");
+        Ok(())
+    }
+
+    fn qdf_string_hook(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
+        out.extend_from_slice(b"{hook:");
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"}");
+        Ok(())
+    }
+
     #[test]
     fn visible_dict_entries_keeps_non_null_and_drops_direct_null() {
         let entries: Vec<(Vec<u8>, ObjectHandle)> = vec![
@@ -12174,6 +12663,298 @@ mod unparse_object_tests {
         drop(resolver);
         let mut out = Vec::new();
         assert!(indirect.unparse_object(&mut out).is_err());
+    }
+
+    #[test]
+    fn unparse_encrypted_string_writer_replaces_direct_strings_only() {
+        let (indirect, _resolver) =
+            resolver_bearing_handle(ObjectValue::String(b"hidden".to_vec()));
+        let handle = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::string(b"plain".to_vec())),
+            (b"Indirect".to_vec(), indirect),
+            (
+                b"Nested".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::string(b"nested".to_vec())]),
+            ),
+        ]);
+        let mut out = Vec::new();
+        let mut callback = compact_string_hook;
+        handle
+            .unparse_object_with_string_writer(&mut out, &mut callback)
+            .unwrap();
+        assert_eq!(
+            out,
+            b"<< /A <hook:plain> /Indirect 20 0 R /Nested [ <hook:nested> ] >>"
+        );
+    }
+
+    #[test]
+    fn unparse_encrypted_string_writer_qdf_keeps_signature_contents_cleartext_hex() {
+        let handle = ObjectHandle::dictionary(vec![
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (
+                b"Contents".to_vec(),
+                ObjectHandle::string(b"contents".to_vec()),
+            ),
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+        ]);
+        let mut out = Vec::new();
+        let mut callback = qdf_string_hook;
+        handle
+            .unparse_object_qdf_with_string_writer(&mut out, 4, &mut callback)
+            .unwrap();
+        assert_eq!(
+            out,
+            b"<<\n      /ByteRange [\n      ]\n      /Contents <636f6e74656e7473>\n      /Type /Sig\n    >>"
+        );
+
+        let mut compact = Vec::new();
+        let mut compact_callback = compact_string_hook;
+        handle
+            .unparse_object_with_string_writer(&mut compact, &mut compact_callback)
+            .unwrap();
+        assert_eq!(
+            compact,
+            b"<< /ByteRange [ ] /Contents <636f6e74656e7473> /Type /Sig >>"
+        );
+
+        let mut stream_compact = Vec::new();
+        let mut stream_compact_callback = compact_string_hook;
+        handle
+            .unparse_stream_body_with_string_writer(
+                &mut stream_compact,
+                false,
+                &mut stream_compact_callback,
+            )
+            .unwrap();
+        assert_eq!(
+            stream_compact,
+            b"<< /ByteRange [ ] /Contents <636f6e74656e7473> /Type /Sig >>"
+        );
+
+        let mut stream_qdf = Vec::new();
+        let mut stream_qdf_callback = qdf_string_hook;
+        handle
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut stream_qdf,
+                0,
+                &mut stream_qdf_callback,
+            )
+            .unwrap();
+        assert_eq!(
+            stream_qdf,
+            b"<<\n  /ByteRange [\n  ]\n  /Contents <636f6e74656e7473>\n  /Type /Sig\n>>"
+        );
+    }
+
+    #[test]
+    fn unparse_encrypted_string_writer_stream_bodies_keep_qpdf_layout() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"Name".to_vec(),
+                    ObjectHandle::string(b"params".to_vec()),
+                )]),
+            ),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut compact = Vec::new();
+        let mut compact_callback = compact_string_hook;
+        dict.unparse_stream_body_with_string_writer(&mut compact, false, &mut compact_callback)
+            .unwrap();
+        assert_eq!(
+            compact,
+            b"<< /DecodeParms << /Name <hook:params> >> /Filter /FlateDecode /Length 3 >>"
+        );
+
+        let mut qdf = Vec::new();
+        let mut qdf_callback = qdf_string_hook;
+        dict.unparse_stream_body_qdf_with_string_writer(&mut qdf, 2, &mut qdf_callback)
+            .unwrap();
+        assert_eq!(
+            qdf,
+            b"<<\n    /DecodeParms <<\n      /Name {hook:params}\n    >>\n    /Filter /FlateDecode\n    /Length 3\n  >>"
+        );
+    }
+
+    #[test]
+    fn unparse_string_writer_covers_stream_reserved_refiltered_and_special_children() {
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"Name".to_vec(),
+                    ObjectHandle::string(b"params".to_vec()),
+                )]),
+            ),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"Label".to_vec(), ObjectHandle::string(b"stream".to_vec())),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let stream = ObjectHandle::stream(stream_dict.clone(), Rc::new(b"raw".to_vec()));
+        let mut compact = Vec::new();
+        let mut compact_callback = compact_string_hook;
+        stream
+            .unparse_object_with_string_writer(&mut compact, &mut compact_callback)
+            .expect("direct stream object callback emission");
+        assert!(compact
+            .windows(b"<hook:stream>".len())
+            .any(|part| part == b"<hook:stream>"));
+
+        let mut qdf = Vec::new();
+        let mut qdf_callback = qdf_string_hook;
+        stream
+            .unparse_object_qdf_with_string_writer(&mut qdf, 2, &mut qdf_callback)
+            .expect("direct stream object QDF callback emission");
+        assert!(qdf
+            .windows(b"{hook:stream}".len())
+            .any(|part| part == b"{hook:stream}"));
+
+        let mut stream_body = Vec::new();
+        let mut stream_body_callback = compact_string_hook;
+        stream
+            .unparse_stream_body_with_string_writer(
+                &mut stream_body,
+                false,
+                &mut stream_body_callback,
+            )
+            .expect("direct stream compact body callback emission");
+        assert!(stream_body
+            .windows(b"<hook:stream>".len())
+            .any(|part| part == b"<hook:stream>"));
+
+        let mut refiltered = Vec::new();
+        let mut refiltered_callback = compact_string_hook;
+        stream_dict
+            .unparse_stream_body_with_string_writer(&mut refiltered, true, &mut refiltered_callback)
+            .expect("refiltered stream dictionary callback emission");
+        assert!(!refiltered
+            .windows(b"DecodeParms".len())
+            .any(|part| part == b"DecodeParms"));
+        assert!(refiltered
+            .windows(b"/Filter /FlateDecode".len())
+            .any(|part| part == b"/Filter /FlateDecode"));
+
+        let mut stream_qdf = Vec::new();
+        let mut stream_qdf_callback = qdf_string_hook;
+        stream
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut stream_qdf,
+                1,
+                &mut stream_qdf_callback,
+            )
+            .expect("stream value QDF body callback emission");
+        assert!(stream_qdf
+            .windows(b"{hook:stream}".len())
+            .any(|part| part == b"{hook:stream}"));
+
+        let scalar_stream = ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
+        let mut scalar_stream_body = Vec::new();
+        let mut scalar_stream_callback = compact_string_hook;
+        scalar_stream
+            .unparse_stream_body_with_string_writer(
+                &mut scalar_stream_body,
+                false,
+                &mut scalar_stream_callback,
+            )
+            .expect("stream with a non-dictionary dictionary handle uses an empty body");
+        assert_eq!(scalar_stream_body, b"<< >>");
+        let mut scalar_stream_qdf_body = Vec::new();
+        let mut scalar_stream_qdf_callback = qdf_string_hook;
+        scalar_stream
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut scalar_stream_qdf_body,
+                1,
+                &mut scalar_stream_qdf_callback,
+            )
+            .expect("QDF stream with a non-dictionary dictionary handle uses an empty body");
+        assert_eq!(scalar_stream_qdf_body, b"<<\n >>");
+
+        let mut scalar_body = Vec::new();
+        let mut scalar_callback = compact_string_hook;
+        ObjectHandle::integer(1)
+            .unparse_stream_body_with_string_writer(&mut scalar_body, false, &mut scalar_callback)
+            .expect("non-dictionary stream body degrades to an empty dictionary");
+        assert_eq!(scalar_body, b"<< >>");
+        let mut scalar_qdf_body = Vec::new();
+        let mut scalar_qdf_callback = qdf_string_hook;
+        ObjectHandle::integer(1)
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut scalar_qdf_body,
+                1,
+                &mut scalar_qdf_callback,
+            )
+            .expect("non-dictionary QDF stream body degrades to an empty dictionary");
+        assert_eq!(scalar_qdf_body, b"<<\n >>");
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let mut reserved_out = Vec::new();
+        let mut reserved_callback = compact_string_hook;
+        assert!(reserved
+            .unparse_object_with_string_writer(&mut reserved_out, &mut reserved_callback)
+            .is_err());
+        assert!(reserved
+            .unparse_object_qdf_with_string_writer(&mut reserved_out, 0, &mut reserved_callback,)
+            .is_err());
+        assert!(reserved
+            .unparse_stream_body_with_string_writer(
+                &mut reserved_out,
+                false,
+                &mut reserved_callback,
+            )
+            .is_err());
+        assert!(reserved
+            .unparse_stream_body_qdf_with_string_writer(
+                &mut reserved_out,
+                0,
+                &mut reserved_callback,
+            )
+            .is_err());
+
+        let non_string_sig = ObjectHandle::dictionary(vec![
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::integer(7)),
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+        ]);
+        let mut non_string_sig_out = Vec::new();
+        let mut non_string_sig_callback = compact_string_hook;
+        non_string_sig
+            .unparse_object_with_string_writer(
+                &mut non_string_sig_out,
+                &mut non_string_sig_callback,
+            )
+            .expect("non-string signature contents use the ordinary child writer");
+        assert!(non_string_sig_out
+            .windows(b"/Contents 7".len())
+            .any(|part| part == b"/Contents 7"));
+
+        let (indirect_contents, _resolver) =
+            resolver_bearing_handle(ObjectValue::String(b"indirect".to_vec()));
+        let indirect_sig = ObjectHandle::dictionary(vec![
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), indirect_contents),
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+        ]);
+        let mut indirect_sig_out = Vec::new();
+        let mut indirect_sig_callback = qdf_string_hook;
+        indirect_sig
+            .unparse_object_qdf_with_string_writer(
+                &mut indirect_sig_out,
+                0,
+                &mut indirect_sig_callback,
+            )
+            .expect("indirect signature contents use the reference writer");
+        assert!(indirect_sig_out
+            .windows(b"/Contents 20 0 R".len())
+            .any(|part| part == b"/Contents 20 0 R"));
     }
 
     #[test]
