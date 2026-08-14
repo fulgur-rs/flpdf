@@ -76,7 +76,7 @@
 //! `libqpdf/Pl_QPDFTokenizer.cc:36-65`. This module owns the handle identity,
 //! stream normalization, provider/filter dispatch, and public consumer
 //! boundary; PageObjectHelper and page-tree orchestration are intentionally
-//! outside this table and their own Beads.
+//! outside this table and tracked separately.
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
