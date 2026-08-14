@@ -595,9 +595,10 @@ fn emit_xref_stream(
             // only ever pushes `Uncompressed`/`Compressed`; this arm exists
             // solely to satisfy exhaustiveness against the crate's shared
             // `XrefEntry` type.
+            // cov:ignore-start: unreachable arm, see comment above
             crate::XrefEntry::Free { .. } => {
                 unreachable!("qdf_fix's entries vector only ever holds Uncompressed/Compressed")
-            } // cov:ignore: unreachable by construction, see comment above
+            } // cov:ignore-end
         }
     }
     out.extend_from_slice(b"\nendstream\nendobj\n\n");
