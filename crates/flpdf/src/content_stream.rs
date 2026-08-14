@@ -148,10 +148,8 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 // surrounding parseContentStream_internal deliver handleEOF;
                 // an incomplete inline image is not a parser exception on this
                 // owning ObjectHandle route (QPDFObjectHandle.cc:1826-1848).
-                callbacks.handle_diagnostic(
-                    image.error_offset,
-                    "EOF found while reading inline image",
-                )?;
+                let diagnostic = "EOF found while reading inline image";
+                callbacks.handle_diagnostic(image.error_offset, diagnostic)?;
                 break;
             }
             let image_offset = image.start;

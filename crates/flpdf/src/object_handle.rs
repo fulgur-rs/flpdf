@@ -4007,7 +4007,8 @@ impl ObjectHandle {
             DecodeLevel::Specialized,
             false,
             false,
-        )?;
+        );
+        let success = success?;
         if success {
             Ok(())
         } else {
