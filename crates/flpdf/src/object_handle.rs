@@ -3591,6 +3591,159 @@ impl ObjectHandle {
         Ok(())
     }
 
+    /// Return the unique resource name qpdf would select for `prefix`.
+    ///
+    /// This ports `QPDFObjectHandle::getUniqueResourceName`
+    /// (`libqpdf/QPDFObjectHandle.cc:1175-1192`). When `resource_names` is
+    /// absent, the names are collected from the second-level dictionary keys
+    /// exactly as the private `get_resource_names` helper does. `min_suffix` is left at
+    /// the suffix that was selected, rather than advanced past it, so callers
+    /// can reuse the cursor for a later insertion. The `usize`/byte-vector
+    /// representation is the Rust spelling of qpdf's `int`/`std::string`
+    /// boundary; no PDF bytes are materialized while searching.
+    pub fn get_unique_resource_name(
+        &self,
+        prefix: &[u8],
+        min_suffix: &mut usize,
+        resource_names: Option<&std::collections::BTreeSet<Vec<u8>>>,
+    ) -> Result<Vec<u8>> {
+        let names = match resource_names {
+            Some(names) => names.clone(),
+            None => {
+                self.try_dereference()?;
+                try_get_resource_names(self)?
+            }
+        };
+        let max_suffix = *min_suffix + names.len();
+        while *min_suffix <= max_suffix {
+            let mut candidate = prefix.to_vec();
+            candidate.extend(min_suffix.to_string().into_bytes());
+            if !names.contains(&candidate) {
+                return Ok(candidate);
+            }
+            *min_suffix += 1;
+        }
+        // qpdf treats this as an internal coding error. The loop tests one
+        // more candidate than there are entries in `names`, so this is
+        // unreachable unless the invariant above is broken.
+        unreachable!("unable to find unconflicting resource name") // cov:ignore: qpdf invariant
+    }
+
+    /// Whether this handle is a Form XObject.
+    ///
+    /// This ports `QPDFObjectHandle::isFormXObject`
+    /// (`libqpdf/QPDFObjectHandle.cc:2340-2343`). The stream and subtype
+    /// holder are resolved through the owning document before inspection;
+    /// programmatically constructed direct handles remain context-free.
+    pub fn is_form_xobject(&self) -> Result<bool> {
+        self.try_dereference()?;
+        if self.type_code() != 10 {
+            return Ok(false);
+        }
+        let Some(stream_dict) = self.as_stream_dict() else {
+            return Ok(false); // cov:ignore: stream values always carry a dictionary
+        };
+        stream_dict
+            .try_get_key(b"/Subtype")?
+            .try_is_name_and_equals(b"Form")
+    }
+
+    /// Whether this handle is an Image XObject.
+    ///
+    /// This ports `QPDFObjectHandle::isImage`
+    /// (`libqpdf/QPDFObjectHandle.cc:2345-2352`). With
+    /// `exclude_imagemask` set, a boolean `/ImageMask true` excludes the
+    /// stream; non-boolean or missing `/ImageMask` values do not.
+    pub fn is_image(&self, exclude_imagemask: bool) -> Result<bool> {
+        self.try_dereference()?;
+        if self.type_code() != 10 {
+            return Ok(false);
+        }
+        let Some(stream_dict) = self.as_stream_dict() else {
+            return Ok(false); // cov:ignore: stream values always carry a dictionary
+        };
+        if !stream_dict
+            .try_get_key(b"/Subtype")?
+            .try_is_name_and_equals(b"Image")?
+        {
+            return Ok(false);
+        }
+        if !exclude_imagemask {
+            return Ok(true);
+        }
+        let image_mask = stream_dict.try_get_key(b"/ImageMask")?;
+        image_mask.try_dereference()?;
+        Ok(!(image_mask.as_boolean() == Some(true)))
+    }
+
+    /// Return the page's `/Contents` as the qpdf-normalized stream list.
+    ///
+    /// This ports `QPDFObjectHandle::getPageContents` and its
+    /// `arrayOrStreamToStreamArray` helper
+    /// (`libqpdf/QPDFObjectHandle.cc:1438-1493`). A missing or null `/Contents`
+    /// is an empty list. A single stream is returned as a one-item list. An
+    /// array resolves each member, keeps stream members in order, and reports
+    /// non-stream members at the same warning boundary as qpdf. The returned
+    /// handles retain their canonical identity and no stream data is decoded.
+    pub fn get_page_contents(&self) -> Result<Vec<ObjectHandle>> {
+        Ok(self.page_contents_with_description()?.0)
+    }
+
+    /// The normalized page content streams plus the qpdf description used by
+    /// downstream pipe/parse error messages. Keeping this alongside
+    /// [`Self::get_page_contents`] prevents later entry points from
+    /// reimplementing array/null handling.
+    fn page_contents_with_description(&self) -> Result<(Vec<ObjectHandle>, String)> {
+        self.try_dereference()?;
+        let description = format!("page object {}", object_generation_description(self));
+        let contents = self.try_get_key(b"/Contents")?;
+        contents.array_or_stream_to_stream_array(&description)
+    }
+
+    /// Normalize this handle when it is a stream or an array of streams.
+    ///
+    /// The helper is intentionally private to the ObjectHandle content family;
+    /// callers should use [`Self::get_page_contents`] so the description is
+    /// attached to the page object rather than guessed at each call site.
+    fn array_or_stream_to_stream_array(
+        &self,
+        description: &str,
+    ) -> Result<(Vec<ObjectHandle>, String)> {
+        self.try_dereference()?;
+        let mut result = Vec::new();
+        if let Some(items) = self.as_array() {
+            for (index, item) in items.into_iter().enumerate() {
+                item.try_dereference()?;
+                if item.type_code() == 10 {
+                    result.push(item);
+                } else {
+                    item.warn_through_context(format!(
+                        "{description}: item index {index} (from 0): ignoring non-stream in an array of streams"
+                    ))?;
+                }
+            }
+        } else if self.type_code() == 10 {
+            result.push(self.clone());
+        } else if !self.is_null() {
+            self.warn_through_context(format!(
+                "{description}: object is supposed to be a stream or an array of streams but is neither"
+            ))?;
+        }
+
+        let mut all_description = description.to_owned();
+        let mut first = true;
+        for item in &result {
+            if first {
+                first = false;
+            } else {
+                all_description.push(',');
+            }
+            all_description.push_str(" stream ");
+            all_description.push_str(&object_generation_description(item));
+        }
+        Ok((result, all_description))
+    }
+
     /// Replace this handle's stream data with the given buffer, and — when
     /// given — its `/Filter` and `/DecodeParms` dictionary keys, mirroring
     /// `QPDFObjectHandle::replaceStreamData`'s buffer overload
@@ -6639,6 +6792,28 @@ fn get_resource_names(dict: &ObjectHandle) -> std::collections::BTreeSet<Vec<u8>
     result
 }
 
+fn try_get_resource_names(dict: &ObjectHandle) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    dict.try_dereference()?;
+    let mut result = std::collections::BTreeSet::new();
+    let Some(entries) = dict.as_dictionary() else {
+        return Ok(result);
+    };
+    for (_, value) in entries {
+        value.try_dereference()?;
+        if let Some(sub_entries) = value.as_dictionary() {
+            result.extend(sub_entries.into_keys());
+        }
+    }
+    Ok(result)
+}
+
+fn object_generation_description(handle: &ObjectHandle) -> String {
+    handle
+        .object_ref()
+        .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation))
+        .unwrap_or_else(|| "0 0".to_owned())
+}
+
 // Mirrors `getUniqueResourceName` (`libqpdf/QPDFObjectHandle.cc:1175-1192`):
 // append a decimal suffix (starting at `*min_suffix`) to `key` + `"_"`
 // until the result is absent from `names`, leaving `*min_suffix` at the
@@ -6716,6 +6891,41 @@ fn drain_dictionary_onto(dict: &mut Dictionary, stack: &mut Vec<Object>) {
         if let Some(value) = dict.remove(key) {
             stack.push(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod content_shape_internal_tests {
+    use super::*;
+
+    #[test]
+    fn supplied_resource_names_do_not_resolve_the_receiver_like_qpdf() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), 0);
+        let names = std::collections::BTreeSet::from([b"/F0".to_vec()]);
+        let mut min_suffix = 0;
+
+        assert_eq!(
+            handle
+                .get_unique_resource_name(b"/F", &mut min_suffix, Some(&names))
+                .unwrap(),
+            b"/F1"
+        );
+    }
+
+    #[test]
+    fn all_description_separates_multiple_streams_like_qpdf() {
+        let page = ObjectHandle::dictionary(vec![(
+            b"/Contents".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ]),
+        )]);
+
+        let (streams, all_description) = page.page_contents_with_description().unwrap();
+
+        assert_eq!(streams.len(), 2);
+        assert_eq!(all_description, "page object 0 0 stream 0 0, stream 0 0");
     }
 }
 
