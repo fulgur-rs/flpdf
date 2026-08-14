@@ -66,6 +66,7 @@
 use crate::token_filter::TokenFilter;
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
+    content_stream::{parse_content_stream_handles, ObjectHandleParserCallbacks},
     pipeline::{
         buffer::Buffer,
         count::Count,
@@ -3916,6 +3917,107 @@ impl ObjectHandle {
         Ok(())
     }
 
+    /// Parse this page's decoded `/Contents` through qpdf's ObjectHandle
+    /// callback boundary.
+    ///
+    /// This ports `QPDFObjectHandle::parsePageContents`
+    /// (`libqpdf/QPDFObjectHandle.cc:1740-1744`). The decoded bytes are
+    /// buffered only for the parser, just as qpdf's `Pl_Buffer` path is; the
+    /// page-content source remains the canonical stream/provider pipeline.
+    pub fn parse_page_contents<C: ObjectHandleParserCallbacks>(
+        &self,
+        callbacks: &mut C,
+    ) -> Result<()> {
+        let contents = self.try_get_key(b"/Contents")?;
+        self.parse_content_stream_handles(
+            &contents,
+            format!("page object {}", object_generation_description(self)),
+            callbacks,
+        )
+    }
+
+    /// Parse this stream or stream array as content, matching qpdf's
+    /// `QPDFObjectHandle::parseAsContents` (`:1747-1751`).
+    pub fn parse_as_contents<C: ObjectHandleParserCallbacks>(
+        &self,
+        callbacks: &mut C,
+    ) -> Result<()> {
+        self.parse_content_stream_handles(
+            self,
+            format!("object {}", object_generation_description(self)),
+            callbacks,
+        )
+    }
+
+    fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
+        &self,
+        contents: &ObjectHandle,
+        description: String,
+        callbacks: &mut C,
+    ) -> Result<()> {
+        let mut buffer = Buffer::new("concatenated content stream buffer", None);
+        let mut all_description = String::new();
+        contents.pipe_content_streams(&mut buffer, &description, &mut all_description)?;
+        let data = buffer.take_buffer()?;
+        parse_content_stream_handles(
+            &data,
+            contents.context().or_else(|| self.context()),
+            callbacks,
+        )
+    }
+
+    /// Apply one qpdf lexical token filter to decoded page contents.
+    ///
+    /// `next` is the optional downstream pipeline corresponding to qpdf's
+    /// nullable `Pipeline*` argument. The canonical page-content route owns
+    /// tokenizer construction and finishes it exactly once.
+    pub fn filter_page_contents<'a>(
+        &self,
+        filter: &'a mut dyn TokenFilter,
+        next: Option<&'a mut dyn Pipeline>,
+    ) -> Result<()> {
+        let description = format!(
+            "token filter for page object {}",
+            object_generation_description(self)
+        );
+        let mut token_pipeline = QpdfTokenizer::new(description, filter, next);
+        self.pipe_page_contents(&mut token_pipeline)
+    }
+
+    /// Apply one qpdf lexical token filter to this stream/Form contents.
+    ///
+    /// This ports `QPDFObjectHandle::filterAsContents`
+    /// (`libqpdf/QPDFObjectHandle.cc:1762-1767`) over the specialized decode
+    /// path, without introducing a second tokenizer or filter implementation.
+    pub fn filter_as_contents<'a>(
+        &self,
+        filter: &'a mut dyn TokenFilter,
+        next: Option<&'a mut dyn Pipeline>,
+    ) -> Result<()> {
+        let description = format!(
+            "token filter for object {}",
+            object_generation_description(self)
+        );
+        let mut token_pipeline = QpdfTokenizer::new(description, filter, next);
+        let mut filtering_attempted = false;
+        let success = self.pipe_stream_data(
+            &mut token_pipeline,
+            &mut filtering_attempted,
+            0,
+            DecodeLevel::Specialized,
+            false,
+            false,
+        )?;
+        if success {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(format!(
+                "object {}: errors while decoding content stream",
+                object_generation_description(self)
+            )))
+        }
+    }
+
     /// The normalized page content streams plus the qpdf description used by
     /// downstream pipe/parse error messages. Keeping this alongside
     /// [`Self::get_page_contents`] prevents later entry points from
@@ -4208,7 +4310,7 @@ impl ObjectHandle {
     /// Register a qpdf-style lazy token filter on this stream. The original
     /// source bytes remain untouched; the filter is inserted into the decoded
     /// stream pipeline only when a filtering pipe is requested.
-    pub(crate) fn add_token_filter(&self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
+    pub fn add_token_filter(&self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
         self.try_dereference()?;
         if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
             return Err(Error::System(format!(
@@ -4227,6 +4329,14 @@ impl ObjectHandle {
         }
         filters.borrow_mut().push(filter);
         Ok(())
+    }
+
+    /// Coalesce a page's content array through the canonical lazy provider and
+    /// attach a token filter to the replacement stream, matching qpdf's
+    /// `QPDFObjectHandle::addContentTokenFilter` (`:1850-1854`).
+    pub fn add_content_token_filter(&self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
+        self.coalesce_content_streams()?;
+        self.try_get_key(b"/Contents")?.add_token_filter(filter)
     }
 
     /// Pipe this stream through qpdf's filter branch.

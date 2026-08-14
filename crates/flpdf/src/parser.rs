@@ -1,9 +1,13 @@
 //! qpdf correspondence: QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries.
 use std::collections::VecDeque;
 
-use crate::object_handle::{ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::{
+    canonical_dictionary_key_from_legacy, DocumentResolver, ObjectHandle, ObjectValue,
+    NO_PARSED_OFFSET,
+};
 use crate::tokenizer::{is_delimiter, is_ws, Token, TokenType, Tokenizer};
 use crate::{Dictionary, Error, Object, ObjectRef, Result};
+use std::rc::{Rc, Weak};
 
 /// Supplies handles created while building the parser's object graph: the
 /// canonical indirect [`ObjectHandle`] for an `N G R` reference and, for a
@@ -2274,6 +2278,346 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Handle-native counterpart of [`Parser`] for qpdf's content callback path.
+///
+/// The ordinary `Parser` remains the compatibility surface for existing raw
+/// content consumers. This parser shares the same tokenizer, recovery counters,
+/// and content grammar but builds `ObjectHandle` values directly, so the
+/// ObjectHandle entry points never round-trip through the legacy `Object` tree.
+pub(crate) struct ContentHandleParser<'tokenizer, 'input> {
+    tokenizer: &'tokenizer mut Tokenizer<'input>,
+    buffered: VecDeque<Token>,
+    resolver: ContentHandleResolver,
+    depth: usize,
+    diagnostics: Vec<ParserDiagnostic>,
+    content_good_count: usize,
+    content_bad_count: usize,
+    content_give_up: bool,
+}
+
+struct ContentHandleResolver {
+    resolver: Option<Weak<dyn DocumentResolver>>,
+}
+
+impl ContentHandleResolver {
+    fn new(context: Option<Rc<dyn DocumentResolver>>) -> Self {
+        Self {
+            resolver: context.as_ref().map(Rc::downgrade),
+        }
+    }
+
+    fn direct(&self, value: ObjectValue) -> ObjectHandle {
+        match &self.resolver {
+            Some(resolver) => ObjectHandle::from_value_with_resolver(value, resolver.clone()),
+            None => ObjectHandle::from_value(value),
+        }
+    }
+}
+
+impl HandleResolver for ContentHandleResolver {
+    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        self.direct(ObjectValue::Reference(object_ref))
+    }
+
+    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+        self.direct(value)
+    }
+
+    fn direct_handle_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+        let handle = self.direct(value);
+        if !handle.is_null() {
+            handle.set_parsed_offset_if_unset(offset);
+        }
+        handle
+    }
+}
+
+impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
+    pub(crate) fn with_tokenizer(
+        tokenizer: &'tokenizer mut Tokenizer<'input>,
+        context: Option<Rc<dyn DocumentResolver>>,
+    ) -> Self {
+        tokenizer.allow_eof();
+        Self {
+            tokenizer,
+            buffered: VecDeque::new(),
+            resolver: ContentHandleResolver::new(context),
+            depth: 0,
+            diagnostics: Vec::new(),
+            content_good_count: 0,
+            content_bad_count: 0,
+            content_give_up: false,
+        }
+    }
+
+    pub(crate) fn position(&self) -> usize {
+        self.buffered
+            .front()
+            .map_or_else(|| self.tokenizer.position(), |token| token.start)
+    }
+
+    pub(crate) fn parse_content_object(&mut self) -> Result<Option<ObjectHandle>> {
+        let token = self.next_token()?;
+        if token.token_type == TokenType::Eof {
+            return Ok(None);
+        }
+        self.unread_token(token);
+        self.object().map(Some)
+    }
+
+    pub(crate) fn take_diagnostics(&mut self) -> Vec<ParserDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
+    fn object(&mut self) -> Result<ObjectHandle> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.depth -= 1;
+            return Err(Error::parse(self.position(), "object nesting too deep"));
+        }
+        let result = stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || self.object_inner());
+        self.depth -= 1;
+        result
+    }
+
+    fn object_inner(&mut self) -> Result<ObjectHandle> {
+        let token = self.next_token()?;
+        if self.depth > 1 {
+            self.content_good_count += 1;
+        }
+        match token.token_type {
+            TokenType::DictOpen => {
+                self.reset_content_recovery_at_top_level();
+                self.content_dictionary(token.start, token.end)
+            }
+            TokenType::ArrayOpen => {
+                self.reset_content_recovery_at_top_level();
+                self.array(token.start)
+            }
+            TokenType::Name => Ok(self.direct_at(
+                ObjectValue::Name(token.value[1..].to_vec()),
+                token.start as i64,
+            )),
+            TokenType::String => {
+                Ok(self.direct_at(ObjectValue::String(token.value), token.start as i64))
+            }
+            TokenType::Bool => Ok(self.direct_at(
+                ObjectValue::Boolean(token.value == b"true"),
+                token.start as i64,
+            )),
+            TokenType::Null => Ok(ObjectHandle::null()),
+            TokenType::Integer => Ok(self.direct_at(
+                ObjectValue::Integer(parse_integer_token(&token)?),
+                token.start as i64,
+            )),
+            TokenType::Real => {
+                let offset = token.start as i64;
+                let value = match classify_real(token)? {
+                    RealClassification::Canonical(value) => ObjectValue::Real(value),
+                    RealClassification::Literal { value, literal } => {
+                        ObjectValue::RealLiteral { value, literal }
+                    }
+                };
+                Ok(self.direct_at(value, offset))
+            }
+            TokenType::Word => {
+                Ok(self.direct_at(ObjectValue::Operator(token.value), token.start as i64))
+            }
+            TokenType::Bad => Ok(self.recover_content_null(
+                &token,
+                token
+                    .error_message
+                    .as_deref()
+                    .map(|message| String::from_utf8_lossy(message).into_owned())
+                    .unwrap_or_else(|| "bad token".to_owned()),
+            )),
+            TokenType::BraceOpen | TokenType::BraceClose => Ok(self.recover_content_null(
+                &token,
+                "treating unexpected brace token as null".to_owned(),
+            )),
+            TokenType::ArrayClose => Ok(self.recover_content_null(
+                &token,
+                "treating unexpected array close token as null".to_owned(),
+            )),
+            TokenType::DictClose => {
+                Ok(self
+                    .recover_content_null(&token, "unexpected dictionary close token".to_owned()))
+            }
+            TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
+            TokenType::Space | TokenType::Comment | TokenType::InlineImage => {
+                Err(Error::parse(token.start, "expected PDF object"))
+            }
+        }
+    }
+
+    fn content_dictionary(
+        &mut self,
+        object_offset: usize,
+        frame_offset: usize,
+    ) -> Result<ObjectHandle> {
+        let mut values = std::collections::BTreeMap::new();
+        let mut missing_key_values = Vec::new();
+        loop {
+            let token = self.next_token()?;
+            if token.token_type == TokenType::DictClose {
+                self.content_good_count += 1;
+                return Ok(self.finish_content_dictionary(
+                    values,
+                    missing_key_values,
+                    object_offset,
+                    frame_offset,
+                ));
+            }
+            if token.token_type == TokenType::Eof {
+                return Err(Error::parse(token.start, "unexpected EOF in dictionary"));
+            }
+            if token.token_type == TokenType::Name {
+                self.content_good_count += 1;
+                let key = token.value[1..].to_vec();
+                let value_token = self.peek_token()?;
+                if value_token.token_type == TokenType::DictClose {
+                    let _ = self.next_token()?;
+                    self.content_good_count += 1;
+                    self.diagnostics.push(ParserDiagnostic {
+                        relative_offset: frame_offset,
+                        message: "dictionary ended prematurely; using null as value for last key"
+                            .to_owned(),
+                    });
+                    values.insert(
+                        canonical_dictionary_key_from_legacy(&key),
+                        ObjectHandle::null(),
+                    );
+                    return Ok(self.finish_content_dictionary(
+                        values,
+                        missing_key_values,
+                        object_offset,
+                        frame_offset,
+                    ));
+                }
+                let value = self.object()?;
+                if self.content_give_up {
+                    return Ok(ObjectHandle::null());
+                }
+                values.insert(canonical_dictionary_key_from_legacy(&key), value);
+            } else {
+                self.unread_token(token);
+                missing_key_values.push(self.object()?);
+                if self.content_give_up {
+                    return Ok(ObjectHandle::null());
+                }
+            }
+        }
+    }
+
+    fn finish_content_dictionary(
+        &mut self,
+        mut values: std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+        missing_key_values: Vec<ObjectHandle>,
+        object_offset: usize,
+        frame_offset: usize,
+    ) -> ObjectHandle {
+        let mut next_fake_key = 1;
+        for value in missing_key_values {
+            let key = loop {
+                let candidate = format!("/QPDFFake{next_fake_key}").into_bytes();
+                next_fake_key += 1;
+                if !values.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            self.diagnostics.push(ParserDiagnostic {
+                relative_offset: frame_offset,
+                message: format!(
+                    "expected dictionary key but found non-name object; inserting key {}",
+                    String::from_utf8_lossy(&key)
+                ),
+            });
+            values.insert(key, value);
+        }
+        self.direct_at(ObjectValue::Dictionary(values), object_offset as i64)
+    }
+
+    fn array(&mut self, object_offset: usize) -> Result<ObjectHandle> {
+        let mut values = Vec::new();
+        loop {
+            let token = self.peek_token()?;
+            if token.token_type == TokenType::ArrayClose {
+                let _ = self.next_token()?;
+                self.content_good_count += 1;
+                return Ok(self.direct_at(ObjectValue::Array(values), object_offset as i64));
+            }
+            if token.token_type == TokenType::Eof {
+                return Err(Error::parse(token.start, "unexpected EOF in array"));
+            }
+            values.push(self.object()?);
+            if self.content_give_up {
+                return Ok(ObjectHandle::null());
+            }
+        }
+    }
+
+    fn reset_content_recovery_at_top_level(&mut self) {
+        if self.depth == 1 {
+            self.content_good_count = 0;
+            self.content_bad_count = 0;
+            self.content_give_up = false;
+        }
+    }
+
+    fn recover_content_null(&mut self, token: &Token, message: String) -> ObjectHandle {
+        self.diagnostics.push(ParserDiagnostic {
+            relative_offset: token.error_offset,
+            message,
+        });
+        if self.depth > 1 {
+            if self.content_good_count <= 4 {
+                self.content_bad_count += 1;
+            } else {
+                self.content_bad_count = 1;
+            }
+            self.content_good_count = 0;
+            if self.content_bad_count > 5 {
+                self.diagnostics.push(ParserDiagnostic {
+                    relative_offset: token.error_offset,
+                    message: "too many errors; giving up on reading object".to_owned(),
+                });
+                self.content_give_up = true;
+            }
+        }
+        ObjectHandle::null()
+    }
+
+    fn direct_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+        self.resolver.direct_handle_at(value, offset)
+    }
+
+    fn next_token(&mut self) -> Result<Token> {
+        if let Some(token) = self.buffered.pop_front() {
+            return Ok(token);
+        }
+        let token = self.tokenizer.read_token(true, 0)?;
+        if token.token_type != TokenType::Bad {
+            if let Some(message) = token.error_message.clone() {
+                self.diagnostics.push(ParserDiagnostic {
+                    relative_offset: token.start,
+                    message: String::from_utf8_lossy(&message).into_owned(),
+                });
+            }
+        }
+        Ok(token)
+    }
+
+    fn unread_token(&mut self, token: Token) {
+        self.buffered.push_front(token);
+    }
+
+    fn peek_token(&mut self) -> Result<Token> {
+        let token = self.next_token()?;
+        self.unread_token(token.clone());
+        Ok(token)
     }
 }
 

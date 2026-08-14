@@ -169,11 +169,7 @@ pub(crate) mod stream_filter;
 pub mod struct_tree_pg;
 pub mod subset_prune;
 pub mod thread_bead_p;
-pub(crate) mod token_filter;
-#[cfg(not(feature = "qtest-driver"))]
-pub(crate) mod tokenizer;
-#[cfg(feature = "qtest-driver")]
-#[doc(hidden)]
+pub mod token_filter;
 pub mod tokenizer;
 pub mod writer;
 pub mod xref;
@@ -197,8 +193,10 @@ pub use check::{
     check_reader_with_options_and_limits, CheckReport, CheckSummary,
 };
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
+pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
 pub use content_stream::{
-    parse_content_operations, parse_content_stream_data, ParseControl, ParserCallbacks,
+    parse_content_operations, parse_content_stream_data, ObjectHandleParserCallbacks, ParseControl,
+    ParserCallbacks,
 };
 pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextColor};
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
@@ -260,6 +258,7 @@ pub use parser::parse_object;
 pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, PdfVersion};
 pub use permissions::{PermissionsConfig, PrintPermission};
+pub use pipeline::{Pipeline, PipelineError, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::{EncryptionInfo, PdfOpenOptions, Permissions};
 pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
@@ -278,6 +277,8 @@ pub use struct_tree_pg::{
 };
 pub use subset_prune::prune_after_subset;
 pub use thread_bead_p::drop_thread_bead_dangling_p;
+pub use token_filter::{TokenFilter, TokenFilterOutput};
+pub use tokenizer::{Token as ContentToken, TokenType as ContentTokenType};
 #[cfg(any(test, feature = "qpdf-zlib-compat"))]
 #[doc(hidden)]
 pub use writer::V5Randomness;
