@@ -83,17 +83,15 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 struct ObjStmMember {
     num: u32,
-    /// Byte offset (in the *input*) of this member's own `%% Object
-    /// stream: object N` marker line. Only `members[0]`'s value is used
-    /// (as `ObjectBody::ObjStm::first_marker_start`); kept per-member for a
-    /// uniform, easy-to-scan struct.
-    marker_line_start: usize,
     /// Byte offset (in the *input*) one past this member's own marker
     /// line's EOL — where its body begins. The regenerated offset table
     /// stores each member's offset relative to `members[0].body_start`
     /// (this becomes `/First`); the marker+body bytes themselves need no
     /// individual bookkeeping beyond this, since they are copied as a
-    /// single verbatim block (see `ObjectBody::ObjStm`).
+    /// single verbatim block (see `ObjectBody::ObjStm`). The first
+    /// member's marker-line start (`ObjectBody::ObjStm::first_marker_start`)
+    /// is returned separately by `scan_objstm_members` rather than stored
+    /// per-member here, since no other member's marker position is used.
     body_start: usize,
 }
 
@@ -414,25 +412,31 @@ fn parse_ostream_marker(line: &[u8]) -> Option<u32> {
 /// order. The original offset-table lines preceding the first marker (and
 /// any non-marker line, defensively) are ignored — qpdf discards them
 /// unconditionally and regenerates the table from these positions.
+///
+/// Returns `None` if no marker line is found (a malformed object stream —
+/// every real one has at least one member). On success, also returns the
+/// byte offset of the *first* member's own marker line (the start of the
+/// verbatim copy-through region; see `ObjectBody::ObjStm`).
 fn scan_objstm_members(
     input: &[u8],
     content_start: usize,
     endstream_kw: usize,
-) -> Vec<ObjStmMember> {
+) -> Option<(usize, Vec<ObjStmMember>)> {
+    let mut first_marker_start = None;
     let mut members = Vec::new();
     let mut line_start = content_start;
     while line_start < endstream_kw {
         let line_end = line_end_after(input, line_start).min(endstream_kw);
         if let Some(num) = parse_ostream_marker(&input[line_start..line_end]) {
+            first_marker_start.get_or_insert(line_start);
             members.push(ObjStmMember {
                 num,
-                marker_line_start: line_start,
                 body_start: line_end,
             });
         }
         line_start = line_end;
     }
-    members
+    first_marker_start.map(|start| (start, members))
 }
 
 /// Scan a region (the discarded lines of an ObjStm's original dictionary)
@@ -452,18 +456,6 @@ fn find_extends(region: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(rest[..digits + b" 0 R".len()].to_vec())
-}
-
-/// One entry in a cross-reference stream's binary table
-/// (`qpdf/fix-qdf.cc`'s `std::vector<QPDFXRefEntry> xref`), in encounter
-/// order: a top-level object's own position, or one of an object stream's
-/// members.
-enum XrefEntry {
-    /// A regular (in-use) object: its byte offset in the *rewritten* output.
-    Type1 { offset: usize },
-    /// A compressed object: the object number of its containing object
-    /// stream, and its 0-based index within that stream (reset per stream).
-    Type2 { objstm_num: u32, index: u32 },
 }
 
 /// Minimum big-endian byte width needed to hold `v` (0 for `v == 0`) —
@@ -498,10 +490,12 @@ fn emit_objstm(
     members: &[ObjStmMember],
     extends: &Option<Vec<u8>>,
 ) {
+    use std::fmt::Write as _;
+
     let base = members[0].body_start;
     let mut offsets = String::new();
     for m in members {
-        offsets.push_str(&format!("{} {}\n", m.num, m.body_start - base));
+        let _ = writeln!(offsets, "{} {}", m.num, m.body_start - base);
     }
     // /First = len(regenerated offset table) + len(the first member's own
     // marker line) — the marker line is retained as literal stream content
@@ -545,7 +539,7 @@ fn emit_xref_stream(
     input: &[u8],
     type_line_end: usize,
     content_start: usize,
-    entries: &[XrefEntry],
+    entries: &[crate::XrefEntry],
     size: usize,
     this_offset: usize,
 ) {
@@ -553,8 +547,8 @@ fn emit_xref_stream(
     let max_index = entries
         .iter()
         .filter_map(|e| match e {
-            XrefEntry::Type2 { index, .. } => Some(*index),
-            XrefEntry::Type1 { .. } => None,
+            crate::XrefEntry::Compressed { index, .. } => Some(*index),
+            crate::XrefEntry::Uncompressed { .. } | crate::XrefEntry::Free { .. } => None,
         })
         .max()
         .unwrap_or(0);
@@ -587,15 +581,18 @@ fn emit_xref_stream(
     write_binary(out, 0, f2_nbytes);
     for e in entries {
         match e {
-            XrefEntry::Type1 { offset } => {
+            crate::XrefEntry::Uncompressed { offset } => {
                 write_binary(out, 1, 1);
-                write_binary(out, *offset as u64, f1_nbytes);
+                write_binary(out, *offset, f1_nbytes);
                 write_binary(out, 0, f2_nbytes);
             }
-            XrefEntry::Type2 { objstm_num, index } => {
+            crate::XrefEntry::Compressed { stream, index } => {
                 write_binary(out, 2, 1);
-                write_binary(out, u64::from(*objstm_num), f1_nbytes);
+                write_binary(out, u64::from(*stream), f1_nbytes);
                 write_binary(out, u64::from(*index), f2_nbytes);
+            }
+            crate::XrefEntry::Free { .. } => {
+                unreachable!("qdf_fix's entries vector only ever holds Uncompressed/Compressed")
             }
         }
     }
@@ -603,6 +600,22 @@ fn emit_xref_stream(
     out.extend_from_slice(b"startxref\n");
     out.extend_from_slice(format!("{this_offset}\n").as_bytes());
     out.extend_from_slice(b"%%EOF\n");
+}
+
+/// Validate that `num` continues the sequential `1..N` counter from `last`
+/// (qpdf's `fix-qdf.cc` `checkObjId`, which fatals on the first out-of-order
+/// object number), returning the new counter value. Callers pass the
+/// containing top-level object's line as `err_offset` for both the object
+/// itself and any of its object-stream members.
+fn check_sequential(num: u32, last: u32, err_offset: usize) -> Result<u32> {
+    if num != last + 1 {
+        return Err(Error::parse(
+            err_offset,
+            "fix_qdf: non-sequential object numbering \
+             (canonical QDF numbers objects 1..N in order)",
+        ));
+    }
+    Ok(num)
 }
 
 /// Read and recompute a hand-edited QDF file.
@@ -637,6 +650,10 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // valid file (everything after its `stream` keyword is ignored) so we
     // stop there immediately.
     let mut objects: Vec<ObjectSpan> = Vec::new();
+    // Whether the last-scanned object is a cross-reference stream — set
+    // alongside the `break` below, and reused as-is after the loop instead
+    // of re-matching `objects.last()` to answer the same question twice.
+    let mut is_xref_stream_form = false;
     let mut cursor = 0usize;
     while let Some((num, gen, line_start, kw_end)) = find_next_obj(input, cursor) {
         // Determine whether this object contains a stream BEFORE searching for
@@ -708,8 +725,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             let dict = &input[kw_end..stream_kw_abs];
             if let Some(type_pos) = find_type_value(dict, b"/ObjStm") {
                 let type_line_end = line_end_after(input, kw_end + type_pos);
-                let members = scan_objstm_members(input, content_start_abs, endstream_kw_abs);
-                let Some(first) = members.first() else {
+                let Some((first_marker_start, members)) =
+                    scan_objstm_members(input, content_start_abs, endstream_kw_abs)
+                else {
                     return Err(Error::parse(
                         line_start,
                         "fix_qdf: object stream (/Type /ObjStm) has no \
@@ -719,7 +737,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                 let extends = find_extends(&input[type_line_end..stream_kw_abs]);
                 ObjectBody::ObjStm {
                     type_line_end,
-                    first_marker_start: first.marker_line_start,
+                    first_marker_start,
                     endstream_kw: endstream_kw_abs,
                     members,
                     extends,
@@ -761,7 +779,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             }
         };
 
-        let is_xref_stream = matches!(body, ObjectBody::XRefStream { .. });
+        is_xref_stream_form = matches!(body, ObjectBody::XRefStream { .. });
         objects.push(ObjectSpan {
             num,
             gen,
@@ -769,7 +787,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             end,
             body,
         });
-        if is_xref_stream {
+        if is_xref_stream_form {
             // Always the last real object in a valid file — everything
             // after its `stream` keyword is discarded and regenerated, so
             // there is nothing further to scan.
@@ -782,17 +800,20 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::parse(0, "fix_qdf: no objects found before xref"));
     }
 
-    let is_xref_stream_form = matches!(objects.last().unwrap().body, ObjectBody::XRefStream { .. });
-
     if !is_xref_stream_form
         && objects
             .iter()
             .any(|o| matches!(o.body, ObjectBody::ObjStm { .. }))
     {
-        // Real `qpdf --qdf` always pairs object streams with a
-        // cross-reference stream (a classic xref table has no entry type
-        // for a compressed object), so this combination cannot arise from
-        // genuine QDF input; see the `fix_qdf` doc's `# Errors`.
+        // Deliberate deviation, not a mirror of qpdf: qpdf's own `st_at_xref`
+        // (`fix-qdf.cc`) writes a classic entry for EVERY xref vector member
+        // unconditionally, calling `e.getOffset()` even on a type-2
+        // (compressed) entry — undefined/garbage output, since real
+        // `qpdf --qdf` always pairs object streams with a cross-reference
+        // stream (a classic table has no entry type for a compressed
+        // object) and this combination never arises from genuine QDF input.
+        // Rather than reproduce that undefined behavior, fail loud; see the
+        // `fix_qdf` doc's `# Errors`.
         return Err(Error::Unsupported(
             "fix_qdf: an object stream (/Type /ObjStm) in a file whose tail is a classic \
              `xref` table (rather than a cross-reference stream) is not supported"
@@ -814,24 +835,10 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // `--qdf`) produces.
     let mut last_obj: u32 = 0;
     for obj in &objects {
-        if obj.num != last_obj + 1 {
-            return Err(Error::parse(
-                obj.obj_line_start,
-                "fix_qdf: non-sequential object numbering \
-                 (canonical QDF numbers objects 1..N in order)",
-            ));
-        }
-        last_obj = obj.num;
+        last_obj = check_sequential(obj.num, last_obj, obj.obj_line_start)?;
         if let ObjectBody::ObjStm { members, .. } = &obj.body {
             for m in members {
-                if m.num != last_obj + 1 {
-                    return Err(Error::parse(
-                        obj.obj_line_start,
-                        "fix_qdf: non-sequential object numbering \
-                         (canonical QDF numbers objects 1..N in order)",
-                    ));
-                }
-                last_obj = m.num;
+                last_obj = check_sequential(m.num, last_obj, obj.obj_line_start)?;
             }
         }
     }
@@ -870,11 +877,16 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // non-zero generations are rejected above). The holder must therefore be
     // an object whose number is M AND whose generation is 0 — matching on the
     // number alone would wrongly accept/rewrite an `M G` object with G != 0.
-    // Only TOP-LEVEL objects are eligible holders: canonical QDF never places
-    // a length-holder integer inside an object stream, and there is no oracle
-    // evidence either way for a hand-edited input that does — a holder
-    // number that resolves to a compressed member fails loud as "missing"
-    // below, consistent with this file's fail-loud-on-uncertain-shape ethos.
+    // Only TOP-LEVEL objects are eligible holders — provably so, not just by
+    // convention: in `fix-qdf.cc`, `st_in_length` (where an indirect
+    // /Length's holder value is written) is reachable only from
+    // `st_after_stream` matching `re_n_0_obj`, and `st_after_stream` is only
+    // reachable from `st_top`/`st_in_obj` (top-level object states). The
+    // `st_in_ostream_*` states used while inside an object stream have no
+    // transition into `st_after_stream`/`st_in_length` at all, so qpdf's own
+    // state machine can never treat a compressed member as a length holder.
+    // A holder number that resolves to one therefore correctly fails loud as
+    // "missing" below.
     let gen0_object_numbers: std::collections::HashSet<u32> = objects
         .iter()
         .filter(|o| o.gen == 0)
@@ -927,7 +939,9 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // The full cross-reference vector in encounter order — used only by the
     // cross-reference-stream tail (built regardless of form; cheap, and
     // `is_xref_stream_form` is already known not to change mid-function).
-    let mut entries: Vec<XrefEntry> = Vec::new();
+    // Capacity is the exact final entry count: `last_obj` (validated above)
+    // counts every top-level object and object-stream member.
+    let mut entries: Vec<crate::XrefEntry> = Vec::with_capacity(last_obj as usize);
 
     for (i, obj) in objects.iter().enumerate() {
         // Copy any inter-object bytes (comments like `%% Original object ID`,
@@ -942,8 +956,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         // This object's offset = current output length (start of `N G obj`).
         let this_offset = out.len();
         new_offsets.push((obj.num, obj.gen, this_offset));
-        entries.push(XrefEntry::Type1 {
-            offset: this_offset,
+        entries.push(crate::XrefEntry::Uncompressed {
+            offset: this_offset as u64,
         });
 
         match &obj.body {
@@ -982,8 +996,8 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                 // next object: verbatim.
                 out.extend_from_slice(&input[*endstream_kw..obj.end]);
                 for (idx, _) in members.iter().enumerate() {
-                    entries.push(XrefEntry::Type2 {
-                        objstm_num: obj.num,
+                    entries.push(crate::XrefEntry::Compressed {
+                        stream: obj.num,
                         index: idx as u32,
                     });
                 }
