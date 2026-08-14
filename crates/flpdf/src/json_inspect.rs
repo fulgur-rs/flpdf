@@ -13,9 +13,9 @@
 //! The `qpdf` top-level key is not built here: qpdf serializes it in
 //! `QPDF_json.cc`, and [`crate::document_json`] holds that boundary. The
 //! canonical ordinary-object serializer is in [`ObjectHandle`]::write_json.
-//! This module still retains the raw-Object bridge used by the document JSON
-//! stream/payload path until its bounded `writeStreamJSON` follow-up moves
-//! that remaining consumer; the bridge is not the canonical object path.
+//! The former raw-Object JSON bridge is retained only in test builds for
+//! byte-boundary regression coverage. Production object and stream values
+//! route through [`ObjectHandle`] and [`crate::document_json`].
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json::Json;
@@ -27,7 +27,9 @@ use crate::Pdf;
 use std::borrow::Cow;
 use std::io::{Read, Seek, Write};
 
-pub(crate) use crate::pdf_string::{decode_pdf_text_string, lossy_utf16_to_utf8};
+pub(crate) use crate::pdf_string::decode_pdf_text_string;
+#[cfg(test)]
+pub(crate) use crate::pdf_string::lossy_utf16_to_utf8;
 
 /// The qpdf JSON version these builders emit.
 ///
@@ -176,6 +178,7 @@ fn test_value(value: &Json) -> Result<serde_json::Value, ConvertError> {
 ///
 /// After the scan, hex is used when `5 * non_ascii > len` — i.e. when more
 /// than 20% of the bytes are non-ASCII / control symbols.
+#[cfg(test)]
 fn use_hex_string(bytes: &[u8]) -> bool {
     let mut non_ascii: usize = 0;
     for &b in bytes {
@@ -205,6 +208,7 @@ fn use_hex_string(bytes: &[u8]) -> bool {
 ///    [`decode_pdf_text_string`] returns `None` for any byte without a
 ///    1-to-1 PDFDoc mapping — so decode-success implies round-trip-success.
 /// 4. Otherwise emit `b:<hex>` (lowercase).
+#[cfg(test)]
 fn pdf_string_to_json_string(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return format!("u:{}", lossy_utf16_to_utf8(rest, false));
@@ -240,6 +244,7 @@ fn pdf_string_to_json_string(bytes: &[u8]) -> String {
 /// qpdf emits a valid UTF-8 name directly, including the leading slash. The
 /// JSON writer itself escapes controls and quotes. Only a name that is not
 /// valid UTF-8 gets the `n:` prefix and PDF `#xx` normalization.
+#[cfg(test)]
 fn qpdf_name_to_json_string(bytes: &[u8]) -> String {
     let mut raw = Vec::with_capacity(bytes.len() + 1);
     raw.push(b'/');
@@ -275,12 +280,14 @@ fn qpdf_name_to_json_string(bytes: &[u8]) -> String {
 /// qpdf 11.9.0 dispatches every PDF object to its type-specific `writeJSON`
 /// implementation through one shared `JSON::Writer`. That writer's start,
 /// next, and end methods also define observable pipeline-write boundaries.
+#[cfg(test)]
 pub(crate) enum OrderedPdfJson {
     Scalar(RawPdfJsonScalar),
     Array(Vec<OrderedPdfJson>),
     Dictionary(Vec<(RawPdfJsonKey, OrderedPdfJson)>),
 }
 
+#[cfg(test)]
 pub(crate) enum RawPdfJsonScalar {
     Null,
     Boolean(bool),
@@ -291,21 +298,25 @@ pub(crate) enum RawPdfJsonScalar {
     Reference(Vec<u8>),
 }
 
+#[cfg(test)]
 pub(crate) enum RawPdfJsonKey {
     PdfName(RawPdfName),
     Literal(Vec<u8>),
 }
 
+#[cfg(test)]
 pub(crate) struct RawPdfName {
     non_utf8: bool,
     encoded: Vec<u8>,
 }
 
+#[cfg(test)]
 pub(crate) struct RawPdfString {
     unicode: bool,
     encoded: Vec<u8>,
 }
 
+#[cfg(test)]
 impl RawPdfName {
     fn from_decoded(bytes: &[u8]) -> Self {
         let rendered = qpdf_name_to_json_string(bytes).into_bytes();
@@ -320,6 +331,7 @@ impl RawPdfName {
     }
 }
 
+#[cfg(test)]
 impl RawPdfString {
     fn from_pdf_bytes(bytes: &[u8]) -> Self {
         let rendered = pdf_string_to_json_string(bytes).into_bytes();
@@ -340,6 +352,7 @@ impl RawPdfString {
     }
 }
 
+#[cfg(test)]
 fn encode_raw_pdf_json_string(value: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(value.len());
     for &byte in value {
@@ -361,12 +374,14 @@ fn encode_raw_pdf_json_string(value: &[u8]) -> Vec<u8> {
     encoded
 }
 
+#[cfg(test)]
 struct RawPdfJsonWriter<'a> {
     out: &'a mut dyn Pipeline,
     first: bool,
     indent: usize,
 }
 
+#[cfg(test)]
 impl<'a> RawPdfJsonWriter<'a> {
     const SPACES: &'static [u8; 52] = b",\n                                                  ";
     const SPACE_BLOCK: usize = Self::SPACES.len() - 2;
@@ -491,6 +506,7 @@ impl<'a> RawPdfJsonWriter<'a> {
     }
 }
 
+#[cfg(test)]
 impl OrderedPdfJson {
     pub(crate) fn write(
         &self,
@@ -502,6 +518,7 @@ impl OrderedPdfJson {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn ordered_qpdf_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &Dictionary,
@@ -519,6 +536,7 @@ pub(crate) fn ordered_qpdf_dict<R: Read + Seek>(
     Ok(OrderedPdfJson::Dictionary(entries))
 }
 
+#[cfg(test)]
 pub(crate) fn ordered_qpdf_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
@@ -710,21 +728,6 @@ pub enum StreamDataMode {
     File { prefix: String },
 }
 
-pub(crate) fn normalized_emitted_stream_dict(
-    stream: &Stream,
-    decode_succeeded: bool,
-) -> Dictionary {
-    // qpdf 11.9.0 QPDF_Stream.cc:272-292 normalizes only dictionaries whose
-    // payload is emitted; dict-only mode keeps the original stream dictionary.
-    let mut dict = stream.dict.clone();
-    dict.remove("Length");
-    if decode_succeeded {
-        dict.remove("Filter");
-        dict.remove("DecodeParms");
-    }
-    dict
-}
-
 // ── DecodeLevel ──────────────────────────────────────────────────────────────
 
 /// Controls which stream filters are applied when reading PDF streams.
@@ -788,6 +791,7 @@ pub fn stream_payload_for_decode_level(
 
 pub(crate) struct StreamPayload<'a> {
     pub(crate) bytes: Cow<'a, [u8]>,
+    #[allow(dead_code)]
     pub(crate) decode_succeeded: bool,
 }
 
@@ -2625,6 +2629,7 @@ mod tests {
     use crate::document_json::{format_json_side_file_path, write_json_stream_file};
     use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
+    use crate::{Dictionary, Object, Stream};
     use std::rc::Rc;
 
     fn number(value: impl ToString) -> serde_json::Value {
@@ -2645,6 +2650,11 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
+    }
+
+    fn stream_handle<R: Read + Seek>(pdf: &mut Pdf<R>, stream: Stream) -> ObjectHandle {
+        pdf.lift_object_to_handle(&Object::Stream(stream))
+            .expect("legacy test stream must lift to a canonical handle")
     }
 
     struct FailAfterWriter {
@@ -4264,6 +4274,7 @@ mod tests {
     fn side_file_pipeline_write_failure_keeps_datafile_prefix() {
         let mut pdf = load_one_page_pdf();
         let stream = Stream::new(Dictionary::new(), vec![b'x'; 4096]);
+        let handle = stream_handle(&mut pdf, stream);
         let mut side_file = FailAfterWriter {
             remaining: 0,
             bytes: Vec::new(),
@@ -4272,8 +4283,7 @@ mod tests {
         let result = {
             let mut output = PlString::new("file-mode main output", None, &mut out);
             write_json_stream_file(
-                &mut pdf,
-                &stream,
+                &handle,
                 DecodeLevel::None,
                 "side-file",
                 &mut side_file,
@@ -4306,6 +4316,7 @@ mod tests {
     fn side_file_explicit_finish_ignores_enospc() {
         let mut pdf = empty_pdf();
         let stream = Stream::new(Dictionary::new(), b"small payload".to_vec());
+        let handle = stream_handle(&mut pdf, stream);
         let mut side_file = FlushProbe {
             errno: Some(28),
             ..FlushProbe::default()
@@ -4314,8 +4325,7 @@ mod tests {
         let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
         write_json_stream_file(
-            &mut pdf,
-            &stream,
+            &handle,
             DecodeLevel::None,
             "side-file",
             &mut side_file,
@@ -4344,6 +4354,7 @@ mod tests {
         let mut pdf = empty_pdf();
         let payload = vec![b'x'; 4097];
         let stream = Stream::new(Dictionary::new(), payload.clone());
+        let handle = stream_handle(&mut pdf, stream);
         let mut side_file = FlushProbe {
             remaining: Some(4096),
             overflow_errno: Some(28),
@@ -4353,8 +4364,7 @@ mod tests {
         {
             let mut output = PlString::new("file-mode main output", None, &mut out);
             write_json_stream_file(
-                &mut pdf,
-                &stream,
+                &handle,
                 DecodeLevel::None,
                 "side-file",
                 &mut side_file,
@@ -4372,13 +4382,13 @@ mod tests {
     fn side_file_buffer_does_not_retry_interrupted_finish_write() {
         let mut pdf = empty_pdf();
         let stream = Stream::new(Dictionary::new(), vec![b'x'; 4095]);
+        let handle = stream_handle(&mut pdf, stream);
         let mut side_file = SingleAttemptInterruptedWriter::default();
         let mut out = Vec::new();
         {
             let mut output = PlString::new("file-mode main output", None, &mut out);
             write_json_stream_file(
-                &mut pdf,
-                &stream,
+                &handle,
                 DecodeLevel::None,
                 "side-file",
                 &mut side_file,
@@ -4395,13 +4405,13 @@ mod tests {
     fn side_file_explicit_finish_flushes_empty_payload() {
         let mut pdf = empty_pdf();
         let stream = Stream::new(Dictionary::new(), Vec::new());
+        let handle = stream_handle(&mut pdf, stream);
         let mut side_file = FlushProbe::default();
         let mut out = Vec::new();
         {
             let mut output = PlString::new("file-mode main output", None, &mut out);
             write_json_stream_file(
-                &mut pdf,
-                &stream,
+                &handle,
                 DecodeLevel::None,
                 "side-file",
                 &mut side_file,
@@ -4419,6 +4429,7 @@ mod tests {
     fn side_file_explicit_finish_reports_ebadf_logic_error() {
         let mut pdf = empty_pdf();
         let stream = Stream::new(Dictionary::new(), b"small payload".to_vec());
+        let handle = stream_handle(&mut pdf, stream);
         let mut side_file = FlushProbe {
             errno: Some(9),
             ..FlushProbe::default()
@@ -4427,8 +4438,7 @@ mod tests {
         let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
         let error = write_json_stream_file(
-            &mut pdf,
-            &stream,
+            &handle,
             DecodeLevel::None,
             "side-file",
             &mut side_file,
