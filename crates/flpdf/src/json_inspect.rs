@@ -268,34 +268,6 @@ fn qpdf_name_to_json_string(bytes: &[u8]) -> String {
     normalized
 }
 
-/// Convert a canonical ObjectHandle dictionary key to qpdf JSON v2's name
-/// representation. ObjectHandle keys include the PDF name delimiter; the
-/// decoded name value passed to [`qpdf_name_to_json_string`] does not.
-fn qpdf_dictionary_key_to_json_string(bytes: &[u8]) -> String {
-    qpdf_name_to_json_string(bytes.strip_prefix(b"/").unwrap_or(bytes))
-}
-
-/// Convert a PDF dictionary's entries to a JSON object, with keys sorted
-/// alphabetically (with the `/` prefix included in the sort key).
-fn dict_to_json(
-    entries: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
-    depth: usize,
-) -> Result<Json, ConvertError> {
-    // The BTreeMap already yields entries in lexicographic order of raw
-    // bytes. qpdf JSON v2 emits valid UTF-8 names directly and uses an
-    // `n:`-prefixed normalized form for non-UTF8 names.
-    let mut pairs = Vec::new();
-    for (raw_key, value) in entries {
-        let key_str = qpdf_dictionary_key_to_json_string(raw_key);
-        let json_val = pdf_object_to_json_bounded(value, depth + 1, false)?;
-        pairs.push((key_str, json_val));
-    }
-    // Sort by the escaped "/Name" string so the lexicographic order is stable
-    // across runs and matches qpdf's alphabetical output.
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    json_dictionary(pairs)
-}
-
 /// A prepared raw-PDF value that retains both container order and PDF scalar
 /// type until emission. This is intentionally separate from generic [`Json`],
 /// whose scalar writer coalesces each value into one pipeline write.
@@ -641,39 +613,6 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
     ))
 }
 
-/// Convert a stream handle's dict to a JSON stream-shape object:
-/// `{ "stream": { "dict": ... } }`.
-fn stream_to_json(handle: &ObjectHandle, depth: usize) -> Result<Json, ConvertError> {
-    let dict_handle = handle
-        .as_stream_dict()
-        .expect("caller only reaches stream_to_json for a handle with type_code()==10 (stream)");
-    // Unlike the legacy `Object::Stream(Stream { dict: Dictionary, .. })`,
-    // whose `dict` field was structurally guaranteed to be a `Dictionary`,
-    // `ObjectHandle::stream`'s public constructor does not validate its
-    // `dict` argument — a caller can build a stream handle whose "dict" is
-    // any other value. Report that as a conversion error rather than
-    // panicking on publicly-constructible input.
-    let entries = dict_handle.as_dictionary().ok_or_else(|| {
-        ConvertError::PdfError("stream's dict handle is not a dictionary".to_string())
-    })?;
-    let dict_json = dict_to_json(&entries, depth + 1)?;
-    json_dictionary([(
-        "stream".to_string(),
-        json_dictionary([("dict".to_string(), dict_json)])?,
-    )])
-}
-
-fn reference_json(object_ref: ObjectRef) -> Json {
-    Json::make_string(format!("{} {} R", object_ref.number, object_ref.generation))
-}
-
-// Stack-growth protection for pdf_object_to_json_bounded's recursion, mirroring
-// object_handle.rs's UNPARSE_STACK_RED_ZONE/materialize's own hub and
-// reader.rs's READER_STACK_RED_ZONE — each recursive hub in this crate keeps
-// its own private copy of these constants rather than sharing one.
-const JSON_CONVERT_STACK_RED_ZONE: usize = 32 * 1024;
-const JSON_CONVERT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
-
 /// Convert a PDF object handle into the qpdf v2 JSON value form.
 ///
 /// For streams, only the dictionary part is included; the stream data body is
@@ -745,132 +684,9 @@ fn convert_object_json_error(error: ObjectJsonError) -> ConvertError {
 /// 0 R` with object 8 holding `[3 0 R /Fit]` emits `"dest": ["3 0 R",
 /// "/Fit"]`.
 fn pdf_dest_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
-    pdf_object_to_json_bounded(handle, 0, true)
-}
-
-fn pdf_object_to_json_bounded(
-    handle: &ObjectHandle,
-    depth: usize,
-    dereference_indirect: bool,
-) -> Result<Json, ConvertError> {
-    if depth > crate::parser::MAX_PARSE_DEPTH {
-        return Err(ConvertError::PdfError(format!(
-            "object nesting exceeds maximum depth of {}",
-            crate::parser::MAX_PARSE_DEPTH
-        )));
-    }
-    // Every recursive path (array elements, dict/stream-dict values) passes
-    // back through this function at least once per nesting level, so
-    // wrapping this one call site protects the whole walk — see
-    // object_handle.rs's materialize_bounded for the same pattern.
-    stacker::maybe_grow(
-        JSON_CONVERT_STACK_RED_ZONE,
-        JSON_CONVERT_STACK_GROWTH_SIZE,
-        || {
-            if let Some(object_ref) = handle.object_ref() {
-                // `dereference_indirect` resolves only *this* handle's own
-                // identity, one level — see `pdf_dest_to_json`'s doc for the
-                // qpdf citation. It cannot force resolution of a handle no
-                // other code path has resolved yet (design: no hidden I/O in
-                // this pure `ObjectHandle`→JSON conversion), and a Reserved
-                // sentinel (see `Pdf::new_reserved`) has no real value to
-                // dispatch on either, so both states still fall back to the
-                // reference form even when `dereference_indirect` is set —
-                // the same reference form the early return below produces
-                // unconditionally when it is not.
-                if !dereference_indirect || !handle.is_resolved() || handle.is_reserved() {
-                    return Ok(reference_json(object_ref));
-                }
-            }
-            // A *direct* handle can still hold a literal `ObjectValue::Reference`:
-            // `Pdf::set_object(holder, Object::Reference(target))` resolves
-            // `holder`'s indirect slot to that value in place, and
-            // `ObjectHandle::shallow_copy` on the result privatizes it into a
-            // fresh direct handle that keeps the same `ObjectValue::Reference`
-            // payload (`shallow_copy_value`'s catch-all `other => other.clone()`
-            // arm) — a publicly reachable state distinct from every other direct
-            // value this crate's public factories can build.
-            if let Some(object_ref) = handle.as_reference() {
-                return Ok(reference_json(object_ref));
-            }
-            match handle.type_code() {
-                // Null, Operator, InlineImage: qpdf's JSON writer maps every
-                // content-stream-only type to `null` the same way it maps a
-                // genuine null (`QPDF_Operator.cc:30`, `QPDF_InlineImage.cc:30`).
-                2 | 11 | 12 => Ok(Json::make_null()),
-                3 => Ok(Json::make_bool(
-                    handle
-                        .as_boolean()
-                        .expect("type_code()==3 (boolean) ⇒ as_boolean"),
-                )),
-                4 => Ok(Json::make_int(
-                    handle
-                        .as_integer()
-                        .expect("type_code()==4 (integer) ⇒ as_integer"),
-                )),
-                5 => {
-                    if let Some((value, literal)) = handle.as_real_literal() {
-                        if !value.is_finite() {
-                            return Err(ConvertError::NonFiniteFloat);
-                        }
-                        // Reuse Object::write_pdf's validated literal-or-shortest
-                        // fallback contract (real_literal_is_safe, private to
-                        // object.rs) via a throwaway Object rather than
-                        // duplicating its safety check here, then apply
-                        // QPDF_Real::writeJSON's JSON-only leading-zero repair
-                        // (libqpdf/QPDF_Real.cc:43-53).
-                        let mut encoded = Vec::new();
-                        Object::RealLiteral { value, literal }.write_pdf(&mut encoded);
-                        if encoded.starts_with(b".") {
-                            encoded.insert(0, b'0');
-                        } else if encoded.starts_with(b"-.") {
-                            encoded.insert(1, b'0');
-                        }
-                        Ok(Json::make_number(encoded))
-                    } else {
-                        let f = handle
-                            .as_real()
-                            .expect("type_code()==5 (real) with no real_literal ⇒ as_real");
-                        if !f.is_finite() {
-                            return Err(ConvertError::NonFiniteFloat);
-                        }
-                        Ok(Json::make_number(f.to_string()))
-                    }
-                }
-                6 => Ok(Json::make_string(pdf_string_to_json_string(
-                    &handle
-                        .as_string()
-                        .expect("type_code()==6 (string) ⇒ as_string"),
-                ))),
-                7 => Ok(Json::make_string(qpdf_name_to_json_string(
-                    &handle.as_name().expect("type_code()==7 (name) ⇒ as_name"),
-                ))),
-                8 => {
-                    let children = handle
-                        .as_array()
-                        .expect("type_code()==8 (array) ⇒ as_array");
-                    let values: Result<Vec<Json>, ConvertError> = children
-                        .iter()
-                        .map(|child| pdf_object_to_json_bounded(child, depth + 1, false))
-                        .collect();
-                    json_array(values?)
-                }
-                9 => {
-                    let entries = handle
-                        .as_dictionary()
-                        .expect("type_code()==9 (dictionary) ⇒ as_dictionary");
-                    dict_to_json(&entries, depth)
-                }
-                // Stream nested inside a container — not spec-compliant, but handle safely.
-                10 => stream_to_json(handle, depth),
-                // `object_ref()`/`as_reference()` returned above for every
-                // indirect handle and every direct handle whose value is a bare
-                // reference, so no remaining direct value can produce
-                // `type_code()`'s `ot_unresolved`/`ot_destroyed` ordinals here.
-                other => unreachable!("unexpected direct type_code() {other}"), // cov:ignore: unreachable per this match's own doc
-            }
-        },
-    )
+    handle
+        .get_json(QPDF_JSON_VERSION, true)
+        .map_err(convert_object_json_error)
 }
 
 // ── StreamDataMode ────────────────────────────────────────────────────────────
@@ -5755,31 +5571,40 @@ mod tests {
     }
 
     #[test]
-    fn pdf_dest_to_json_falls_back_to_the_reference_form_for_an_unresolved_handle() {
-        // `dereference_indirect` cannot force resolution (no I/O capability
-        // in this pure ObjectHandle -> JSON conversion): a dest handle no
-        // other code path has resolved yet must still render as its own
-        // "N G R" string rather than panicking on an unresolved type_code().
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+    fn pdf_dest_to_json_resolves_an_unresolved_outer_handle_once() {
+        // qpdf's `getJSON(..., true)` resolves the outer indirect handle, while
+        // the array writer keeps its own indirect child identity unchanged.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/qdf-contents-ref-array.pdf");
+        let mut pdf = Pdf::open(std::io::Cursor::new(
+            std::fs::read(fixture).expect("array fixture must exist"),
+        ))
+        .expect("array fixture must open");
+        let dest_ref = ObjectRef::new(5, 0);
+        let handle = pdf.get_object_handle(dest_ref);
         assert!(!handle.is_resolved(), "sanity: still unresolved");
         let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
-        assert_eq!(result, serde_json::Value::String("9 0 R".to_string()));
+        assert_eq!(
+            result,
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("6 0 R".to_string()),
+                serde_json::Value::String("7 0 R".to_string()),
+            ])
+        );
     }
 
     #[test]
-    fn pdf_dest_to_json_falls_back_to_the_reference_form_for_a_reserved_handle() {
-        // Same fallback as the unresolved case above, for the other state
-        // `dereference_indirect` cannot dispatch on: a Reserved sentinel
-        // (`Pdf::new_reserved`) has no real value yet, only a reserved
-        // indirect identity of its own.
+    fn pdf_dest_to_json_reports_qpdf_reserved_handle_error() {
+        // qpdf's true mode dispatches through dereference() before the
+        // type-specific writer. A Reserved sentinel has no value to dispatch
+        // on, so it is an error rather than a reference fallback.
         let pdf = empty_pdf();
         let handle = pdf.new_reserved().unwrap();
         assert!(handle.is_reserved(), "sanity: freshly reserved");
-        let object_ref = handle
-            .object_ref()
-            .expect("sanity: reserved handles are indirect");
-        let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
-        assert_eq!(result, serde_json::Value::String(format!("{object_ref}")));
+        let error = super::pdf_dest_to_json(&handle).expect_err("reserved must be rejected");
+        assert!(
+            matches!(error, ConvertError::PdfError(message) if message == "QPDFObjectHandle: attempting to get JSON from a reserved object")
+        );
     }
 
     #[test]

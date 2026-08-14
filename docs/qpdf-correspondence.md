@@ -277,6 +277,36 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFObjectHandle::getJSON` / `QPDFObjectHandle::writeJSON`（行数は §1 の `QPDFObjectHandle.cc` に計上済み。ここは所在の相互参照） | — | `object_handle.rs` の `ObjectHandle::get_json` / `ObjectHandle::write_json`（`QPDFObjectHandle.cc:1613-1647` の外側 dispatch と `qpdf/JSON_writer.hh:16-135` の pipeline 境界）、`json_inspect.rs` の `pdf_object_to_json`（getJSON false の consumer） | 🔀 canonical ObjectHandle writer は移送済み。`false` は間接 identity を先に検査して `"N G R"` を出力し、array/dictionary child は非再帰の reference dispatch、stream は `QPDF_Stream::writeJSON` と同じく dictionary のみを出力する。`true` の一段解決 primitive も writer に実装済みだが、document-level `QPDF::writeJSON` の object-map cutover は `flpdf-25kg.3.37`、historical stream payload/datafile は `flpdf-3yn9.9` の bounded follow-up に残す。`json_inspect.rs` の `ordered_qpdf_*` はこの残存 bridge と historical-view oracle のために保持する |
 | `QPDF_Stream::writeStreamJSON`（行数は §1 の `QPDF_Stream.cc` に計上済み。ここは所在の相互参照） | — | `json_inspect.rs` の `stream_payload_with_decode_status` / `normalized_emitted_stream_dict` + `document_json.rs` の object entry writer に inline された `"data"` / `"datafile"` / `"dict"` 出力 | 🔀 1 関数に対応する flpdf 実装が存在せず、payload/dict 導出と出力が別モジュールに分かれている。qpdf の `no_data_key` / `attempt` 二重試行は未移植 |
 
+### `flpdf-25kg.3.37` bounded consumer cutover (2026-08-15)
+
+`document_json.rs` の object-map enumeration は `Pdf::get_all_objects()` に、通常の
+`"value"` entry と trailer は `ObjectHandle::write_json(2, ..., true, depth)` に切り替えた。
+したがって `QPDFObjectHandle.cc:1613-1647` の outer-only dereference と、
+`QPDF_Array.cc:153-187` / `QPDF_Dictionary.cc:72-95` の nested indirect identity を同じ
+canonical writerで通る。`QPDF_Stream::writeStreamJSON` の payload/datafile、decode retry、
+historical stream view はこのPRの責務外であり、stream entryだけは
+`flpdf-3yn9.9` の後続cutoverへ残す。
+
+Oracle probe:
+
+```text
+qpdf --json=2 --json-key=qpdf --json-stream-data=none \
+  tests/fixtures/compat/qdf-contents-ref-array.pdf -
+```
+
+qpdf 11.9.0 の object 5 は `{"value": ["6 0 R", "7 0 R"]}` を返す。flpdf は同じ
+fixtureを `crates/flpdf/tests/document_json_tests.rs` の byte differential に追加し、
+`cargo test -p flpdf --test document_json_tests --quiet` で照合する。outline destination
+については、未解決 outer handleを同じfixtureから取得して
+`pdf_dest_to_json`へ渡し、`["6 0 R", "7 0 R"]` を確認する。reserved handleはqpdfの
+true-mode dispatchどおり `QPDFObjectHandle: attempting to get JSON from a reserved object`
+で失敗する。
+
+破損した遅延オブジェクトについても、qpdfの `QPDF::resolve` が診断をwarningへ送り、
+対象をnullへフォールバックしてJSON本体を完了する挙動を採用する。CLIの
+`lazy_object_failure_matches_qpdf_null_fallback` は、qpdf 11.9.0のstdoutとflpdfのstdoutを
+直接比較し、非ゼロ終了も確認する。
+
 ## 9. Job / CLI
 
 | qpdf | 行 | flpdf | 状態 |

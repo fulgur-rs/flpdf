@@ -121,6 +121,7 @@ const ORACLE_FIXTURES: &[&str] = &[
     "attachment-two-page.pdf",
     "linearized-one-page.pdf",
     "objstm-lin-firstpage-private-before-shared.pdf",
+    "qdf-contents-ref-array.pdf",
 ];
 
 #[test]

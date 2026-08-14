@@ -1067,6 +1067,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Collected under one short borrow, and deliberately *not* a
     /// predicate-taking variant: [`ObjectHandle::is_resolved`] cannot
     /// re-enter resolution, whereas a caller-supplied predicate could.
+    #[cfg(test)]
     pub(crate) fn resolved_object_refs(&self) -> Vec<ObjectRef> {
         self.core
             .borrow()
@@ -11989,7 +11990,7 @@ mod tests {
 
     #[test]
     fn get_object_count_prepares_every_effective_xref_object_and_is_idempotent() {
-        let pdf = Pdf::open(CountingReader::new(minimal_pdf_bytes())).expect("open");
+        let mut pdf = Pdf::open(CountingReader::new(minimal_pdf_bytes())).expect("open");
         let reads_before = pdf.resolver.with_reader_mut(|reader| reader.reads);
 
         assert_eq!(pdf.resolver.max_object_number(), None);
@@ -12040,7 +12041,7 @@ mod tests {
 
     #[test]
     fn get_object_count_rescans_after_xref_reconstruction() {
-        let pdf = Pdf::open_mem_owned_with_options(
+        let mut pdf = Pdf::open_mem_owned_with_options(
             synthetic_mismatch_discovers_unindexed_object_pdf(),
             crate::PdfOpenOptions {
                 repair: true,
@@ -12066,7 +12067,7 @@ mod tests {
 
     #[test]
     fn get_object_count_keeps_parser_discovered_dangling_reference_in_canonical_cache() {
-        let pdf = Pdf::open_mem_owned(dangling_reference_pdf_bytes()).expect("open");
+        let mut pdf = Pdf::open_mem_owned(dangling_reference_pdf_bytes()).expect("open");
 
         assert_eq!(
             pdf.get_object_count().expect("prepare dangling references"),
@@ -12081,7 +12082,7 @@ mod tests {
 
     #[test]
     fn get_object_count_keeps_a_referenced_free_objgen_as_dangling_only() {
-        let pdf = Pdf::open_mem_owned(free_reference_pdf_bytes()).expect("open");
+        let mut pdf = Pdf::open_mem_owned(free_reference_pdf_bytes()).expect("open");
 
         assert_eq!(pdf.get_object_count().expect("prepare free reference"), 4);
         let free = pdf
@@ -12125,7 +12126,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/compat/three-page-objstm.pdf"
         );
-        let pdf = Pdf::open_mem_owned(std::fs::read(fixture).expect("read ObjStm fixture"))
+        let mut pdf = Pdf::open_mem_owned(std::fs::read(fixture).expect("read ObjStm fixture"))
             .expect("open ObjStm fixture");
 
         // qpdf 11.9.0 --show-xref reports 1/0 through 13/0 for this fixture.
@@ -12142,7 +12143,7 @@ mod tests {
 
     #[test]
     fn get_object_count_keeps_an_objstm_decode_failure_on_qpdfs_null_path() {
-        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let member_ref = ObjectRef::new(7, 0);
         pdf.resolver.insert_xref_entry(
             member_ref,

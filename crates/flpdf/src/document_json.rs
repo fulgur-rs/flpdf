@@ -22,11 +22,12 @@
 
 use crate::json::Json;
 use crate::json_inspect::{
-    normalized_emitted_stream_dict, ordered_qpdf_dict, ordered_qpdf_object,
-    qpdf_resolve_top_level_object, side_file_io_error, stream_payload_with_decode_status,
-    ConvertError, DecodeLevel, JsonObjectSelector, JsonOutputError, StreamDataMode,
+    normalized_emitted_stream_dict, ordered_qpdf_dict, qpdf_resolve_top_level_object,
+    side_file_io_error, stream_payload_with_decode_status, ConvertError, DecodeLevel,
+    JsonObjectSelector, JsonOutputError, StreamDataMode,
 };
 use crate::object::{Object, ObjectRef, Stream};
+use crate::object_handle::ObjectHandle;
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PlStdioFile};
 use crate::Pdf;
@@ -147,23 +148,25 @@ pub fn write_json_key<R: Read + Seek>(
         3,
     )?;
     Json::write_dictionary_key(out, &mut metadata_first, b"maxobjectid", 3)?;
-    let prepared = pdf
-        .prepare_qpdf_json_objects()
-        .map_err(ConvertError::from)?;
-    Json::make_int(i64::from(prepared.max_object_id)).write(out, 3)?;
+    let max_object_id = pdf.get_object_count().map_err(ConvertError::from)?;
+    Json::make_int(i64::from(max_object_id)).write(out, 3)?;
     Json::write_dictionary_close(out, metadata_first, 2)?;
 
     Json::write_next(out, &mut qpdf_first, 2)?;
     let mut objects_first = true;
     Json::write_dictionary_open(out, &mut objects_first, 2)?;
-    for object_ref in prepared.refs {
+    let objects = pdf.get_all_objects().map_err(ConvertError::from)?;
+    for handle in objects {
+        let object_ref = handle
+            .object_ref()
+            .expect("qpdf object-map entries are indirect handles");
         if !object_selected(wanted_objects, object_ref) {
             continue;
         }
         let result = match stream_mode {
             StreamDataMode::None => write_non_file_mode_object_entry(
                 pdf,
-                object_ref,
+                &handle,
                 decode_level,
                 NonFileStreamDataMode::None,
                 out,
@@ -171,7 +174,7 @@ pub fn write_json_key<R: Read + Seek>(
             ),
             StreamDataMode::Inline => write_non_file_mode_object_entry(
                 pdf,
-                object_ref,
+                &handle,
                 decode_level,
                 NonFileStreamDataMode::Inline,
                 out,
@@ -179,7 +182,7 @@ pub fn write_json_key<R: Read + Seek>(
             ),
             StreamDataMode::File { prefix } => write_file_mode_object_entry(
                 pdf,
-                object_ref,
+                &handle,
                 decode_level,
                 prefix,
                 out,
@@ -190,12 +193,12 @@ pub fn write_json_key<R: Read + Seek>(
     }
 
     if trailer_selected(wanted_objects) {
-        let trailer = ordered_qpdf_dict(pdf, &pdf.trailer().clone())?;
+        let trailer = pdf.trailer_handle();
         Json::write_dictionary_key(out, &mut objects_first, b"trailer", 3)?;
         let mut trailer_first = true;
         Json::write_dictionary_open(out, &mut trailer_first, 3)?;
         Json::write_dictionary_key(out, &mut trailer_first, b"value", 4)?;
-        trailer.write(out, 4)?;
+        trailer.write_json(SUPPORTED_JSON_VERSION, out, true, 4)?;
         Json::write_dictionary_close(out, trailer_first, 3)?;
     }
     // qpdf keeps the raw object map expanded even when selectors match
@@ -236,17 +239,30 @@ pub(crate) enum NonFileStreamDataMode {
 
 fn write_non_file_mode_object_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
+    handle: &ObjectHandle,
     decode_level: DecodeLevel,
     stream_mode: NonFileStreamDataMode,
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
-    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
+    let object_ref = handle
+        .object_ref()
+        .expect("qpdf object-map entries are indirect handles");
     let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
 
-    match object {
-        Object::Stream(stream) => {
+    handle.try_dereference().map_err(ConvertError::from)?;
+    if handle.type_code() == 10 {
+        // Stream payload/retry behavior remains the QPDF_Stream::writeStreamJSON
+        // boundary owned by flpdf-3yn9.9. Keep that narrow legacy adapter until
+        // the stream consumer moves, while non-stream values use the canonical
+        // ObjectHandle writer below.
+        let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
+            return Err(ConvertError::PdfError(
+                "canonical stream handle has no legacy stream payload".to_string(),
+            )
+            .into());
+        };
+        {
             let (data, dict) = match stream_mode {
                 NonFileStreamDataMode::None => (None, ordered_qpdf_dict(pdf, &stream.dict)?),
                 NonFileStreamDataMode::Inline => {
@@ -275,32 +291,37 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
             Json::write_dictionary_close(out, stream_first, 4)?;
             Json::write_dictionary_close(out, object_first, 3)?;
         }
-        other => {
-            let value = ordered_qpdf_object(pdf, &other)?;
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
-            value.write(out, 4)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
+        return Ok(());
     }
+
+    write_non_stream_value_entry(handle, key.as_bytes(), out, objects_first)?;
     Ok(())
 }
 
 fn write_file_mode_object_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
+    handle: &ObjectHandle,
     decode_level: DecodeLevel,
     prefix: &str,
     out: &mut dyn Pipeline,
     objects_first: &mut bool,
 ) -> Result<(), JsonOutputError> {
-    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
+    let object_ref = handle
+        .object_ref()
+        .expect("qpdf object-map entries are indirect handles");
     let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
 
-    match object {
-        Object::Stream(stream) => {
+    handle.try_dereference().map_err(ConvertError::from)?;
+    if handle.type_code() == 10 {
+        // See the non-file writer: stream payload/datafile retry semantics are
+        // intentionally left to the following stream consumer slice.
+        let Object::Stream(stream) = qpdf_resolve_top_level_object(pdf, object_ref)? else {
+            return Err(ConvertError::PdfError(
+                "canonical stream handle has no legacy stream payload".to_string(),
+            )
+            .into());
+        };
+        {
             Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
             let mut object_first = true;
             Json::write_dictionary_open(out, &mut object_first, 3)?;
@@ -312,16 +333,25 @@ fn write_file_mode_object_entry<R: Read + Seek>(
             write_json_stream_file(pdf, &stream, decode_level, &side_path, &mut side_file, out)?;
             Json::write_dictionary_close(out, object_first, 3)?;
         }
-        other => {
-            let value = ordered_qpdf_object(pdf, &other)?;
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
-            value.write(out, 4)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
+        return Ok(());
     }
+
+    write_non_stream_value_entry(handle, key.as_bytes(), out, objects_first)?;
+    Ok(())
+}
+
+fn write_non_stream_value_entry(
+    handle: &ObjectHandle,
+    key: &[u8],
+    out: &mut dyn Pipeline,
+    objects_first: &mut bool,
+) -> Result<(), JsonOutputError> {
+    Json::write_dictionary_key(out, objects_first, key, 3)?;
+    let mut object_first = true;
+    Json::write_dictionary_open(out, &mut object_first, 3)?;
+    Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
+    handle.write_json(SUPPORTED_JSON_VERSION, out, true, 4)?;
+    Json::write_dictionary_close(out, object_first, 3)?;
     Ok(())
 }
 
@@ -377,8 +407,10 @@ fn write_file_mode_stream_value<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_handle::ObjectValue;
     use crate::pipeline::test_support::{RecordingSink, TraceCall};
     use crate::pipeline::PlString;
+    use std::rc::Rc;
 
     fn load_one_page_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -488,5 +520,52 @@ mod tests {
         assert!(matches!(result, Err(JsonOutputError::UnsupportedVersion)));
         assert!(bytes.is_empty());
         assert!(first_key, "a rejected version leaves the caller's state");
+    }
+
+    #[test]
+    fn stream_consumer_rejects_a_legacy_value_that_disagrees_with_the_canonical_stream() {
+        let mut pdf = load_one_page_pdf();
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.set_object(object_ref, Object::Integer(42));
+        let handle = pdf.get_object_handle(object_ref);
+        handle.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
+            stream_length: 0,
+        });
+
+        let mut bytes = Vec::new();
+        let mut out = PlString::new("json", None, &mut bytes);
+        let mut objects_first = true;
+        let non_file_error = write_non_file_mode_object_entry(
+            &mut pdf,
+            &handle,
+            DecodeLevel::None,
+            NonFileStreamDataMode::None,
+            &mut out,
+            &mut objects_first,
+        )
+        .expect_err("non-file stream bridge must reject the mismatched legacy value");
+        assert!(matches!(
+            non_file_error,
+            JsonOutputError::Convert(ConvertError::PdfError(message))
+                if message == "canonical stream handle has no legacy stream payload"
+        ));
+
+        let file_error = write_file_mode_object_entry(
+            &mut pdf,
+            &handle,
+            DecodeLevel::None,
+            "unused-prefix",
+            &mut out,
+            &mut objects_first,
+        )
+        .expect_err("file stream bridge must reject the mismatched legacy value");
+        assert!(matches!(
+            file_error,
+            JsonOutputError::Convert(ConvertError::PdfError(message))
+                if message == "canonical stream handle has no legacy stream payload"
+        ));
     }
 }
