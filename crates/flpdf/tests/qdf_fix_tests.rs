@@ -266,6 +266,28 @@ fn objstm_with_no_members_is_rejected() {
     );
 }
 
+/// The classic tail's `xref` keyword line is still recognized when the
+/// file ends immediately after `xref` with no trailing newline at all
+/// (the object-scanning stop check's own EOF boundary, mirroring
+/// `find_line_keyword_from`'s identical `None => true` end-of-input arm).
+/// The overall result is still a `Parse` error (no `trailer` follows), but
+/// it must be THAT error — not a bogus extra object swallowing the
+/// dangling `xref` text.
+#[test]
+fn xref_keyword_at_true_eof_with_no_trailing_byte_stops_object_scan() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"1 0 obj\n<<\n  /Type /Catalog\n>>\nendobj\n\n");
+    pdf.extend_from_slice(b"xref");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("no `trailer` keyword"),
+        "the dangling `xref` at true EOF must be recognized as the tail \
+         keyword (stopping object recognition there), not consumed as an \
+         object; got: {err}"
+    );
+}
+
 /// A top-level (non-stream) object with no `endobj` anywhere in the
 /// remainder of the file — e.g. a QDF truncated mid-object — is rejected.
 /// Unlike the `/Type /XRef` truncation case (`corrupt-xref-truncated`
