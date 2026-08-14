@@ -34,7 +34,7 @@
 use crate::linearization::renumber::RenumberMap;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
-    collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm,
+    collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
 };
 use crate::{Object, ObjectRef, Pdf, Result};
@@ -1274,8 +1274,8 @@ impl LinearizationPlan {
                     // plain pre-/O.  Oracle: qpdf --object-streams=generate places
                     // such a Form XObject at a lower object number than the OD
                     // ObjStm, physically before the hint stream.
-                    let obj = pdf.resolve_borrowed(r)?;
-                    if is_eligible_for_objstm(r, obj, ctx) {
+                    let obj = pdf.get_object_handle(r);
+                    if is_eligible_for_objstm_handle(r, &obj, ctx)? {
                         part4_rest.push(r);
                     } else {
                         part4_open_document_plain.push(r);
@@ -1999,7 +1999,8 @@ impl LinearizationPlan {
     /// * No page dictionary or Catalog ref appears in any batch.
     /// * Ineligible objects (streams, gen > 0, encryption dict, `/Type /ObjStm`,
     ///   `/Type /XRef`) are excluded via the
-    ///   shared [`is_eligible_for_objstm`] predicate.
+    ///   shared [`crate::writer::object_streams::is_eligible_for_objstm_handle`]
+    ///   predicate.
     /// * Generate uses qpdf's fixed even split; Preserve retains source
     ///   container boundaries regardless of the configured planner cap.
     ///
@@ -2190,11 +2191,11 @@ impl LinearizationPlan {
                     continue;
                 }
                 let eligible = {
-                    let obj = pdf.resolve_borrowed(obj_ref)?;
-                    is_eligible_for_objstm(obj_ref, obj, ctx)
+                    let obj = pdf.get_object_handle(obj_ref);
+                    is_eligible_for_objstm_handle(obj_ref, &obj, ctx)?
                 };
-                if eligible && !crate::writer::object_streams::is_qpdf_signature_dict(pdf, obj_ref)?
-                {
+                let obj = pdf.get_object_handle(obj_ref);
+                if eligible && !crate::writer::object_streams::is_qpdf_signature_dict(pdf, &obj)? {
                     surviving.push(obj_ref);
                 }
             }
@@ -5071,12 +5072,12 @@ mod tests {
         );
 
         // ── Invariant 8: Every batched ref is eligible ──────────────────────────
-        use crate::writer::object_streams::{eligibility_context, is_eligible_for_objstm};
+        use crate::writer::object_streams::{eligibility_context, is_eligible_for_objstm_handle};
         let ctx = eligibility_context(&mut pdf).unwrap();
         for r in all_part3_batched.iter().chain(all_part4_batched.iter()) {
-            let obj = pdf.resolve_borrowed(*r).unwrap();
+            let obj = pdf.get_object_handle(*r);
             assert!(
-                is_eligible_for_objstm(*r, obj, &ctx),
+                is_eligible_for_objstm_handle(*r, &obj, &ctx).unwrap(),
                 "batched object {r} must be eligible for ObjStm"
             );
         }

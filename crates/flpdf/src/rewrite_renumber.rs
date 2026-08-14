@@ -792,19 +792,23 @@ impl ObjectStreamRenumber {
             Vec::new()
         };
         seeds.push(root);
-        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
-        let trailer_entries = crate::qpdf_null::visible_entries(pdf, trailer_entries)?;
+        let trailer = pdf.trailer_handle();
+        let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
         for (key, value) in trailer_entries {
             if matches!(
                 key.as_slice(),
-                b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size"
+                b"/ID" | b"/Encrypt" | b"/Prev" | b"/Root" | b"/Size"
             ) {
+                continue;
+            }
+            if value.try_is_null()? {
                 continue;
             }
             // Recurse into direct dict/array trailer values so a nested indirect
             // ref is seeded, matching qpdf's recursive trailer enqueue. A bare
-            // reference yields exactly one seed as before.
-            collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+            // reference yields exactly one seed as before. The live handle
+            // graph applies qpdf's null-visible dictionary rule while walking.
+            collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
         }
         seeds.retain(|reference| !removed_refs.contains(reference));
 
@@ -825,9 +829,10 @@ impl ObjectStreamRenumber {
         while let Some(work) = queue.pop_front() {
             match work {
                 RenumberWork::Ordinary(cur) => {
-                    let obj = pdf.resolve(cur)?;
+                    let handle = pdf.get_object_handle(cur);
+                    pdf.resolve_object_handle(&handle)?;
                     let mut found = Vec::new();
-                    collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
+                    collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?;
                     found.retain(|reference| !removed_refs.contains(reference));
                     for reference in found {
                         enqueue_object_stream(
@@ -854,29 +859,30 @@ impl ObjectStreamRenumber {
                     if removed_refs.contains(&source) {
                         continue;
                     }
-                    let object = pdf.resolve(source)?;
-                    if matches!(object, Object::Null) {
+                    let handle = pdf.get_object_handle(source);
+                    pdf.resolve_object_handle(&handle)?;
+                    if handle.is_null() {
                         continue;
                     }
-                    let stream = object.as_stream().ok_or_else(|| {
+                    let stream_dict = handle.as_stream_dict().ok_or_else(|| {
                         Error::Unsupported(format!(
                             "object-stream renumber: source container {source} is not a stream"
                         ))
                     })?;
-                    if let Some(Object::Reference(extends)) = stream.dict.get("Extends") {
-                        if !removed_refs.contains(extends) {
-                            enqueue_object_stream(
-                                *extends,
-                                groups,
-                                &member_to_group,
-                                &source_to_group,
-                                &groups_sorted,
-                                &mut old_to_new,
-                                &mut container_new,
-                                &mut next,
-                                &mut queue,
-                            );
-                        }
+                    let extends = stream_dict.try_get_key(b"/Extends")?.object_ref();
+                    if let Some(extends) = extends.filter(|extends| !removed_refs.contains(extends))
+                    {
+                        enqueue_object_stream(
+                            extends,
+                            groups,
+                            &member_to_group,
+                            &source_to_group,
+                            &groups_sorted,
+                            &mut old_to_new,
+                            &mut container_new,
+                            &mut next,
+                            &mut queue,
+                        );
                     }
                 }
             }
@@ -1307,6 +1313,48 @@ mod tests {
             );
             assert_eq!(map.container_numbers(), vec![2]);
         }
+    }
+
+    #[test]
+    fn object_stream_renumber_follows_live_handle_edges() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+            (3, b"<< /Value 3 >>"),
+            (
+                4,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream",
+            ),
+            (7, b"<< /Value 7 >>"),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        root.try_dereference().unwrap();
+        root.replace_key(b"/First", pdf.get_object_handle(ObjectRef::new(7, 0)))
+            .unwrap();
+
+        let map = ObjectStreamRenumber::build(
+            &mut pdf,
+            &[source_group(4, &[2, 3])],
+            true,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(7, 0)),
+            Some(ObjectRef::new(2, 0)),
+            "renumbering must follow the live Catalog handle edge"
+        );
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(2, 0)),
+            None,
+            "a source member reachable only through the replaced edge must not be enqueued"
+        );
+        assert!(
+            map.container_numbers().is_empty(),
+            "the replaced edge must not activate the stale source ObjStm group"
+        );
     }
 
     #[test]
