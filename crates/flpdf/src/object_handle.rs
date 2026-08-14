@@ -1364,6 +1364,26 @@ impl ObjectHandle {
         }
     }
 
+    /// Validate the source-state contract for qpdf-shaped replacement.
+    ///
+    /// flpdf currently accepts only a direct handle with a resolved value at
+    /// this boundary. Keeping this check separate lets the resolver run it
+    /// before minting an absent target cache entry.
+    pub(crate) fn validate_replacement_source(&self) -> Result<()> {
+        if !self.is_direct() {
+            return Err(crate::Error::Unsupported(
+                "replacement ObjectHandle must be direct".to_string(),
+            ));
+        }
+        let source_state = self.0.borrow().state.clone();
+        if !matches!(&*source_state.borrow(), ObjectState::Resolved(_)) {
+            return Err(crate::Error::Unsupported(
+                "replacement ObjectHandle is not initialized".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Make `self` and a distinct direct replacement handle observe one
     /// shared payload, preserving the canonical target slot's identity.
     ///
@@ -1376,17 +1396,8 @@ impl ObjectHandle {
         if self.is_same_object_as(source) {
             return Ok(());
         }
-        if !source.is_direct() {
-            return Err(crate::Error::Unsupported(
-                "replacement ObjectHandle must be direct".to_string(),
-            ));
-        }
+        source.validate_replacement_source()?;
         let source_state = source.0.borrow().state.clone();
-        if !matches!(&*source_state.borrow(), ObjectState::Resolved(_)) {
-            return Err(crate::Error::Unsupported(
-                "replacement ObjectHandle is not initialized".to_string(),
-            ));
-        }
         let source_owners = source.0.borrow().state_owners.clone();
         let source_token_filters = source.0.borrow().stream_token_filters.clone();
         let old_state = {
