@@ -6925,6 +6925,19 @@ mod object_json_writer_tests {
     }
 
     #[test]
+    fn writer_key_uses_qpdf_name_normalization_for_json_v1() {
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+        let mut writer = ObjectJsonWriter::new(&mut output, 0);
+
+        writer
+            .write_key(b"Plain", 1)
+            .expect("JSON v1 keys use qpdf name normalization");
+
+        assert_eq!(bytes, b"\n\"/Plain\": ");
+    }
+
+    #[test]
     fn json_name_and_string_helpers_cover_empty_and_json_escape_forms() {
         assert_eq!(json_normalize_name(&[]), Vec::<u8>::new());
 
