@@ -9,6 +9,7 @@ use self::file_object::{
 use crate::cache::CacheEntry;
 use crate::encrypt_setup::CopyEncryptionSource;
 use crate::error::EncryptedError;
+#[cfg(test)]
 use crate::object::collect_qpdf_object_references;
 use crate::object_handle::ObjectValue;
 #[cfg(test)]
@@ -39,6 +40,7 @@ static NULL_OBJECT: Object = Object::Null;
 
 use crate::pdf::{CompressedMemberProvenance, Pdf};
 
+#[cfg(test)]
 pub(crate) struct QpdfPreparedObjects {
     pub(crate) refs: Vec<ObjectRef>,
     pub(crate) max_object_id: u32,
@@ -1539,6 +1541,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// object-cache preparation performed by qpdf's `fixDanglingReferences()`
     /// for JSON metadata without exposing placeholders through the public
     /// object enumeration APIs.
+    #[cfg(test)]
     pub(crate) fn prepare_qpdf_json_objects(&mut self) -> Result<QpdfPreparedObjects> {
         let live_snapshot = self.qpdf_json_live_object_refs();
         let mut discovered = self.qpdf_trailer_references.clone();
@@ -1599,6 +1602,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// solely in the canonical handle registry: including resolved cache-miss
     /// handles here preserves that visibility without cloning their stream
     /// payloads into the legacy `Object` cache.
+    #[cfg(test)]
     fn qpdf_json_live_object_refs(&self) -> Vec<ObjectRef> {
         let mut refs = self.live_object_refs();
         refs.extend(
@@ -1657,8 +1661,18 @@ impl<R: Read + Seek> Pdf<R> {
     /// intentionally separate from fresh-object allocation, which belongs to
     /// `flpdf-25kg.3.24`.
     #[allow(dead_code)]
-    pub(crate) fn get_object_count(&self) -> Result<u32> {
-        self.resolver.get_object_count()
+    pub(crate) fn get_object_count(&mut self) -> Result<u32> {
+        // qpdf's getObjectCount observes the same prepared object cache that
+        // getAllObjects later enumerates. The document facade also owns
+        // historical trailer/xref-stream registrations that are not part of
+        // ResolverHandle's source-xref table, so prepare through the canonical
+        // document route before deriving the largest visible object number.
+        let objects = self.get_all_objects()?;
+        Ok(objects
+            .into_iter()
+            .filter_map(|handle| handle.object_ref().map(|object_ref| object_ref.number))
+            .max()
+            .unwrap_or(0))
     }
 
     /// Return the next qpdf-shaped generation-zero object identity from the

@@ -408,7 +408,7 @@ fn json_fatal_preserves_partial_output_file() {
 }
 
 #[test]
-fn lazy_object_failure_keeps_qpdf_maxobjectid_value_prefix() {
+fn lazy_object_failure_matches_qpdf_null_fallback() {
     if !is_qpdf_available() {
         return;
     }
@@ -420,18 +420,7 @@ fn lazy_object_failure_keeps_qpdf_maxobjectid_value_prefix() {
         .arg(input.path())
         .output()
         .unwrap();
-    let marker = b"      \"maxobjectid\": ";
-    let marker_end = qpdf
-        .stdout
-        .windows(marker.len())
-        .position(|window| window == marker)
-        .expect("qpdf 11.9.0 must emit qpdf metadata before object preparation")
-        + marker.len();
-    let qpdf_prefix = &qpdf.stdout[..marker_end];
-    assert_eq!(
-        qpdf_prefix,
-        b"{\n  \"version\": 2,\n  \"parameters\": {\n    \"decodelevel\": \"generalized\"\n  },\n  \"qpdf\": [\n    {\n      \"jsonversion\": 2,\n      \"pdfversion\": \"1.7\",\n      \"pushedinheritedpageresources\": false,\n      \"calledgetallpages\": false,\n      \"maxobjectid\": "
-    );
+    assert!(!qpdf.status.success());
 
     let flpdf = Command::cargo_bin("flpdf")
         .unwrap()
@@ -441,7 +430,7 @@ fn lazy_object_failure_keeps_qpdf_maxobjectid_value_prefix() {
         .unwrap();
 
     assert!(!flpdf.status.success());
-    assert_eq!(flpdf.stdout, qpdf_prefix);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
 }
 
 fn assert_same_json_output_is_rejected_without_modifying_input(

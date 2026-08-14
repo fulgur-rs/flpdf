@@ -155,6 +155,7 @@ impl ObjectCache {
             .insert(object_ref, CacheEntry::Resolved(object));
     }
 
+    #[cfg(test)]
     pub(crate) fn set_missing(&mut self, object_ref: ObjectRef) {
         self.entries.insert(object_ref, CacheEntry::Missing);
     }
