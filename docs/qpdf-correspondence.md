@@ -176,6 +176,31 @@ AES `/Length` 調整を同時に平文化する。dictionary の string serializ
 layout 非対象のため旧 in-place bridge を維持し、canonical full-rewrite と ObjStm
 container は新しい pipeline route を使う。
 
+### ObjectHandle emission-time encryption surface (`flpdf-egzr.3.2.15`, 2026-08-15)
+
+qpdf の暗号化は Object tree を事前に書き換えない。`QPDFWriter.cc:842-847`
+の `setDataKey` が object number/generation ごとの data key を設定し、
+`QPDFWriter.cc:1761-1796` が非 ObjStm member の unparse 前後でその key を
+set/clear する。文字列は `QPDFWriter.cc:1567-1599` の unparse 時点でだけ
+暗号化し、AES は hex、RC4 は通常の string 表現を選ぶ。stream dictionary の
+metadata cleartext 例外と payload 用 encryption filter は
+`QPDFWriter.cc:1528-1557` / `:965-998` の責務であり、dictionary string と
+payload を同じ責務に混ぜない。
+
+flpdf はこの境界を `writer/encrypted_strings.rs` の additive API として
+`ObjectHandle` に接続した。`EncryptedStringEmitter::write_handle_object` は
+`ObjectHandle::{unparse_object_with_string_writer,unparse_object_qdf_with_string_writer}`
+を data-key scope 内で呼び、`write_handle_stream_dict` は同じ callback を
+stream dictionary にだけ適用する。`/Encrypt` object と ObjStm member は
+個別 key を持たず平文のままにし、stream payload は既存の canonical pipeline
+へ委譲する。`/Sig` の `/Contents` は例外で、qpdf の
+`f_hex_string | f_no_encryption` (`QPDFWriter.cc:1501`) に合わせて callback を
+迂回し、平文の hex string として出力する。`EncryptionContext::encrypt_dict_handle` と
+`write_encryption_dictionary_handle` は `QPDFWriter.cc:2244-2255` の直接
+Encrypt-map emission を handle tree で再現し、直接の `/O` `/U` `/OE` `/UE`
+`/Perms` だけを hex 化する。既存 consumer の切替は行わず、後続の
+`flpdf-egzr.3.2.5` writer cutover がこの surface を使用する。
+
 **renumber は重複していない**: `rewrite_renumber.rs` は `linearization/plan.rs` からも
 使われる共有機構で、`linearization/renumber.rs` はその上に載る最終採番層。qpdf の
 `obj_renumber` 1 本に対して 2 層構造だが、二重実装ではない。
