@@ -189,7 +189,7 @@ fn parse_page_contents_retains_qpdf_container_opening_offsets() {
 #[test]
 fn parse_page_contents_uses_default_callback_hooks_and_all_scalar_handles() {
     let page = page_with_contents(stream(
-        b"/Name (text) true false null .5 [42] << /A 3 >> cm",
+        b"/Name (text) true false null .5 1.5 [42] << /A 3 >> cm",
     ));
     let mut callbacks = DefaultCallbacks::default();
 
@@ -210,6 +210,7 @@ fn parse_page_contents_uses_default_callback_hooks_and_all_scalar_handles() {
         .any(|object| object.as_boolean() == Some(false)));
     assert!(callbacks.iter().any(ObjectHandle::is_null));
     assert!(callbacks.iter().any(|object| object.as_real() == Some(0.5)));
+    assert!(callbacks.iter().any(|object| object.as_real() == Some(1.5)));
     assert!(callbacks
         .iter()
         .any(|object| object.as_array().is_some_and(|values| values.len() == 1)));
