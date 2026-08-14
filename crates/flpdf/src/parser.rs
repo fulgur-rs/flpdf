@@ -2315,18 +2315,8 @@ impl ContentHandleResolver {
             None => ObjectHandle::from_value(value),
         }
     }
-}
 
-impl HandleResolver for ContentHandleResolver {
-    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        self.direct(ObjectValue::Reference(object_ref))
-    }
-
-    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
-        self.direct(value)
-    }
-
-    fn direct_handle_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+    fn direct_at(&self, value: ObjectValue, offset: i64) -> ObjectHandle {
         let handle = self.direct(value);
         if !handle.is_null() {
             handle.set_parsed_offset_if_unset(offset);
@@ -2446,10 +2436,11 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
                 Ok(self
                     .recover_content_null(&token, "unexpected dictionary close token".to_owned()))
             }
+            // cov:ignore-start: content parsing probes EOF before object dispatch and excludes ignorable tokenizer states
             TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
             TokenType::Space | TokenType::Comment | TokenType::InlineImage => {
                 Err(Error::parse(token.start, "expected PDF object"))
-            }
+            } // cov:ignore-end
         }
     }
 
@@ -2591,7 +2582,7 @@ impl<'tokenizer, 'input> ContentHandleParser<'tokenizer, 'input> {
     }
 
     fn direct_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
-        self.resolver.direct_handle_at(value, offset)
+        self.resolver.direct_at(value, offset)
     }
 
     fn next_token(&mut self) -> Result<Token> {

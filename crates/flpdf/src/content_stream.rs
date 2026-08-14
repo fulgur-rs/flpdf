@@ -127,6 +127,10 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 break;
             }
             let inline_offset = tokenizer.position();
+            // The shared tokenizer is reset by consume_one_byte, so this
+            // state failure is unreachable through this pull route. Keep the
+            // defensive mapping documented for callers that change tokenizer
+            // state handling. // cov:ignore-start: consume_one_byte resets the shared tokenizer; qpdf state errors are unreachable here
             tokenizer.expect_inline_image().map_err(|error| {
                 let message = match error {
                     TokenizerStateError::TokenWaiting => "tokenizer already has a token waiting",
@@ -136,6 +140,7 @@ pub(crate) fn parse_content_stream_handles<C: ObjectHandleParserCallbacks>(
                 };
                 Error::parse(inline_offset, message)
             })?;
+            // cov:ignore-end
             let image = tokenizer.read_token(true, 0)?;
             if image.token_type == TokenType::Bad {
                 // QPDFObjectHandle::parseContentStream_data warns and lets the

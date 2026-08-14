@@ -46,6 +46,29 @@ struct RecordingCallbacks {
     fail: bool,
 }
 
+#[derive(Default)]
+struct DefaultCallbacks {
+    objects: Vec<ObjectHandle>,
+    eof_calls: usize,
+}
+
+impl ObjectHandleParserCallbacks for DefaultCallbacks {
+    fn handle_object(
+        &mut self,
+        object: ObjectHandle,
+        _offset: usize,
+        _length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        self.objects.push(object);
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        self.eof_calls += 1;
+        Ok(())
+    }
+}
+
 impl ObjectHandleParserCallbacks for RecordingCallbacks {
     fn content_size(&mut self, size: usize) -> flpdf::Result<()> {
         self.size = Some(size);
@@ -139,6 +162,20 @@ fn parse_as_contents_recovers_inline_image_eof_before_normal_eof() {
 }
 
 #[test]
+fn parse_as_contents_recovers_id_at_eof_before_normal_eof() {
+    let form = stream(b"ID");
+    let mut callbacks = RecordingCallbacks::default();
+
+    form.parse_as_contents(&mut callbacks).unwrap();
+
+    assert_eq!(callbacks.eof_calls, 1);
+    assert_eq!(
+        callbacks.diagnostics,
+        vec![(2, "EOF found while reading inline image".to_owned())]
+    );
+}
+
+#[test]
 fn parse_page_contents_retains_qpdf_container_opening_offsets() {
     let page = page_with_contents(stream(b" [1] << /A 2 >>"));
     let mut callbacks = RecordingCallbacks::default();
@@ -147,6 +184,141 @@ fn parse_page_contents_retains_qpdf_container_opening_offsets() {
 
     assert_eq!(callbacks.objects[0].0.get_parsed_offset(), 1);
     assert_eq!(callbacks.objects[1].0.get_parsed_offset(), 5);
+}
+
+#[test]
+fn parse_page_contents_uses_default_callback_hooks_and_all_scalar_handles() {
+    let page = page_with_contents(stream(
+        b"/Name (text) true false null 1.5 [42] << /A 3 >> cm",
+    ));
+    let mut callbacks = DefaultCallbacks::default();
+
+    page.parse_page_contents(&mut callbacks).unwrap();
+
+    assert_eq!(callbacks.eof_calls, 1);
+    assert!(callbacks
+        .iter()
+        .any(|object| object.as_name() == Some(b"Name".to_vec())));
+    assert!(callbacks
+        .iter()
+        .any(|object| object.as_string() == Some(b"text".to_vec())));
+    assert!(callbacks
+        .iter()
+        .any(|object| object.as_boolean() == Some(true)));
+    assert!(callbacks
+        .iter()
+        .any(|object| object.as_boolean() == Some(false)));
+    assert!(callbacks.iter().any(ObjectHandle::is_null));
+    assert!(callbacks.iter().any(|object| object.as_real() == Some(1.5)));
+    assert!(callbacks
+        .iter()
+        .any(|object| object.as_array().is_some_and(|values| values.len() == 1)));
+    assert!(callbacks.iter().any(|object| object
+        .as_dictionary()
+        .is_some_and(|values| values.contains_key(b"/A".as_slice()))));
+}
+
+impl DefaultCallbacks {
+    fn iter(&self) -> impl Iterator<Item = &ObjectHandle> {
+        self.objects.iter()
+    }
+}
+
+#[test]
+fn parse_page_contents_preserves_document_context_for_direct_handles() {
+    let mut pdf = Pdf::open_mem_owned(indirect_content_shape_pdf()).unwrap();
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    let contents = pdf
+        .new_stream_with_data(Rc::new(b"1 2 cm".to_vec()))
+        .unwrap();
+    page.replace_key(b"/Contents", contents).unwrap();
+    let mut callbacks = RecordingCallbacks::default();
+
+    page.parse_page_contents(&mut callbacks).unwrap();
+
+    assert_eq!(callbacks.objects[0].0.as_integer(), Some(1));
+    assert_eq!(callbacks.objects[0].0.get_parsed_offset(), 0);
+}
+
+#[test]
+fn parse_page_contents_matches_qpdf_content_recovery_and_errors() {
+    let mut recovered = RecordingCallbacks::default();
+    page_with_contents(stream(b"q <0g> ] >>"))
+        .parse_page_contents(&mut recovered)
+        .unwrap();
+    assert!(recovered
+        .diagnostics
+        .iter()
+        .any(|(_, message)| message.contains("invalid character (g) in hexstring")));
+    assert!(recovered
+        .diagnostics
+        .iter()
+        .any(|(_, message)| message == "treating unexpected array close token as null"));
+    assert!(recovered
+        .diagnostics
+        .iter()
+        .any(|(_, message)| message == "unexpected dictionary close token"));
+
+    let mut dictionary = RecordingCallbacks::default();
+    page_with_contents(stream(b"<< /QPDFFake1 9 7 } /A >>"))
+        .parse_page_contents(&mut dictionary)
+        .unwrap();
+    assert!(dictionary.objects[0]
+        .0
+        .as_dictionary()
+        .is_some_and(|values| values.contains_key(b"/QPDFFake2".as_slice())));
+    assert!(dictionary
+        .diagnostics
+        .iter()
+        .any(|(_, message)| message.contains("inserting key /QPDFFake2")));
+
+    for input in [b"<< } } } } } } >>".as_slice(), b"<< /A [ } } } } } } ] >>"] {
+        let mut callbacks = RecordingCallbacks::default();
+        page_with_contents(stream(input))
+            .parse_page_contents(&mut callbacks)
+            .unwrap();
+        assert!(callbacks.objects[0].0.is_null());
+        assert_eq!(callbacks.eof_calls, 1);
+        assert!(callbacks
+            .diagnostics
+            .iter()
+            .any(|(_, message)| message == "too many errors; giving up on reading object"));
+    }
+
+    let mut streak = RecordingCallbacks::default();
+    page_with_contents(stream(b"[ } } } } } 1 2 3 4 } } } } } 6 ]"))
+        .parse_page_contents(&mut streak)
+        .unwrap();
+    assert!(!streak
+        .diagnostics
+        .iter()
+        .any(|(_, message)| message == "too many errors; giving up on reading object"));
+
+    for input in [b"<< /A 1".as_slice(), b"[1"] {
+        let error = page_with_contents(stream(input))
+            .parse_page_contents(&mut RecordingCallbacks::default())
+            .expect_err("unterminated content containers must fail");
+        assert!(error.to_string().contains("unexpected EOF"));
+    }
+}
+
+#[test]
+fn parse_page_contents_reports_non_bad_token_diagnostics_and_nesting_limit() {
+    let mut callbacks = RecordingCallbacks::default();
+    page_with_contents(stream(b"/a#1x"))
+        .parse_page_contents(&mut callbacks)
+        .unwrap();
+    assert!(callbacks
+        .diagnostics
+        .iter()
+        .any(|(_, message)| message.contains("name with stray #")));
+
+    let mut nested = vec![b'['; 501];
+    nested.extend(std::iter::repeat_n(b']', 501));
+    let error = page_with_contents(stream(&nested))
+        .parse_page_contents(&mut RecordingCallbacks::default())
+        .expect_err("qpdf content parser must bound nesting");
+    assert!(error.to_string().contains("object nesting too deep"));
 }
 
 #[test]
@@ -260,6 +432,38 @@ fn filter_as_contents_can_discard_tokens_and_add_content_filter_is_lazy() {
     assert_eq!(first.as_slice(), b"q");
     assert_eq!(second.as_slice(), b"q");
     assert_eq!(shared.borrow().eof_calls, 2);
+}
+
+#[test]
+fn parse_page_contents_can_stop_on_the_inline_image_event() {
+    let form = stream(b"BI /W 1 ID \0EI");
+    let mut callbacks = RecordingCallbacks {
+        stop_after: Some(5),
+        ..RecordingCallbacks::default()
+    };
+
+    form.parse_as_contents(&mut callbacks).unwrap();
+
+    assert_eq!(callbacks.objects.len(), 5);
+    assert!(callbacks.objects[4].0.as_inline_image().is_some());
+    assert_eq!(callbacks.eof_calls, 0);
+}
+
+#[test]
+fn filter_as_contents_reports_failed_stream_decoding() {
+    let pdf = Pdf::open_mem_owned(indirect_content_shape_pdf()).unwrap();
+    let failing = pdf.new_stream().unwrap();
+    failing
+        .replace_stream_data_with_retry_callback(|_, _, _| Ok(false), None, None)
+        .unwrap();
+    let mut filter = RecordingFilter::default();
+
+    let error = failing
+        .filter_as_contents(&mut filter, None)
+        .expect_err("qpdf must report an unsuccessful specialized stream pipe");
+    assert!(error
+        .to_string()
+        .contains("errors while decoding content stream"));
 }
 
 #[test]
