@@ -55,7 +55,7 @@ getrandom = "0.4"
 # to 1.89 to cover it. Exact-pinned so a future `cargo update` that raises
 # the requirement again fails loudly instead of silently breaking the MSRV
 # build.
-ar_archive_writer = "=0.5.2"
+ar_archive_writer = "=0.5.3"
 # Transparently grows the call stack for the parser's bounded recursive
 # descent (MAX_PARSE_DEPTH levels) when the current stack segment is nearly
 # exhausted, so recursion to that depth cannot abort the process on a
