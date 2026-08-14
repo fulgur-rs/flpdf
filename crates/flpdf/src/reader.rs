@@ -1015,13 +1015,18 @@ impl<R: Read + Seek> Pdf<R> {
     /// reconstruction or a table derived from resolved values. The returned
     /// map is a snapshot because the resolver owns the table behind interior
     /// mutability; resolution-time recovery is reflected in a subsequent
-    /// snapshot.
+    /// snapshot. Caller replacements that originated without a source row
+    /// stay in qpdf's object cache but do not manufacture an xref entry
+    /// (`QPDF.cc:1986-1993`).
     pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         let removed = &self.qpdf_removed_refs;
+        let replacement_only = &self.qpdf_replacement_only_refs;
         self.resolver
             .xref_entries()
             .into_iter()
-            .filter(|(object_ref, _)| !removed.contains(object_ref))
+            .filter(|(object_ref, _)| {
+                !removed.contains(object_ref) && !replacement_only.contains(object_ref)
+            })
             .collect()
     }
 
@@ -1206,6 +1211,9 @@ impl<R: Read + Seek> Pdf<R> {
         // legacy cache before using it to classify the replacement, or an old
         // object-stream entry can incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
+        if self.resolver.xref_entry(object_ref).is_none() {
+            self.qpdf_replacement_only_refs.insert(object_ref);
+        }
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1369,6 +1377,7 @@ impl<R: Read + Seek> Pdf<R> {
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
         }
+        self.qpdf_replacement_only_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
@@ -1742,7 +1751,11 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
+        let replacement_only = self.resolver.xref_entry(object_ref).is_none();
         let target = self.resolver.replace_object(object_ref, replacement)?;
+        if replacement_only {
+            self.qpdf_replacement_only_refs.insert(object_ref);
+        }
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1762,6 +1775,7 @@ impl<R: Read + Seek> Pdf<R> {
     #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         self.resolver.remove_object(object_ref)?;
+        self.qpdf_replacement_only_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
@@ -2942,11 +2956,14 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         let removed = &self.qpdf_removed_refs;
+        let replacement_only = &self.qpdf_replacement_only_refs;
         let entries = self
             .resolver
             .source_xref_entries()
             .into_iter()
-            .filter(|(object_ref, _)| !removed.contains(object_ref))
+            .filter(|(object_ref, _)| {
+                !removed.contains(object_ref) && !replacement_only.contains(object_ref)
+            })
             .collect();
         self.cache.synchronize_with_xref(&entries);
         // Keep the actual `/Extends`-resolved parent for a still-identical
@@ -8696,7 +8713,7 @@ mod tests {
     fn replace_object_handle_rejects_a_foreign_direct_value_without_mutation() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open target");
         let mut foreign_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open foreign");
-        let target_ref = ObjectRef::new(1, 0);
+        let target_ref = ObjectRef::new(99, 0);
         let target = pdf.get_object_handle(target_ref);
         let foreign_root = foreign_pdf.get_object_handle(ObjectRef::new(1, 0));
         foreign_root
@@ -8716,6 +8733,10 @@ mod tests {
         assert!(target.is_same_object_as(&pdf.get_object_handle(target_ref)));
         assert!(!target.is_resolved());
         assert!(!pdf.is_dirty(target_ref));
+        assert!(
+            !pdf.qpdf_replacement_only_refs.contains(&target_ref),
+            "a rejected replacement must not change the cache-only xref snapshot state"
+        );
     }
 
     #[test]

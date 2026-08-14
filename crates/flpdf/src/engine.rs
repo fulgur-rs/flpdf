@@ -170,6 +170,7 @@ impl<R: Read + Seek> Pdf<R> {
             qpdf_trailer_references: loaded_state.trailer_references,
             qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
             qpdf_removed_refs: BTreeSet::new(),
+            qpdf_replacement_only_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             encryption,
         };
