@@ -227,7 +227,8 @@ fn process(
         .map(|prepared| prepared.pages)
         .unwrap_or_default();
     for (pageno, page_ref) in page_refs.iter().enumerate() {
-        let content = canonical_page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
+        let content =
+            canonical_page_content_bytes(&mut pdf, *page_ref).map_err(|e| e.to_string())?;
         let label = format!("PAGE {}", pageno + 1);
         dump_tokens(
             &content,
@@ -329,6 +330,19 @@ fn canonical_page_content_bytes<R: Read + Seek>(
     }
 
     let contents = page.get_key(b"/Contents");
+    let contents_was_indirect = contents.object_ref().is_some();
+    let (contents, _) = pdf.resolve_object_handle_to_terminal_ref(&contents)?;
+    if contents.is_null() {
+        return Ok(Vec::new());
+    }
+    if contents_was_indirect && contents.as_array().is_none() && contents.as_stream_dict().is_none()
+    {
+        // qpdf's page helper warns and continues when a repaired indirect
+        // /Contents holder resolves to a non-stream scalar. Keep this narrow
+        // recovery boundary; a direct malformed scalar remains an error so
+        // callers do not regain the old blanket `unwrap_or_default()` path.
+        return Ok(Vec::new());
+    }
     let mut streams = Vec::new();
     collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams, true)?;
 

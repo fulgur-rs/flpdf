@@ -413,6 +413,40 @@ fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
     out
 }
 
+fn build_pdf_with_page_contents_value(value: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    let mut page = b"<< /Type /Page /Parent 2 0 R /Contents ".to_vec();
+    page.extend_from_slice(value);
+    page.extend_from_slice(b" /MediaBox [0 0 1 1] >>");
+    push_obj(&mut out, &mut offsets, &page);
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 fn build_pdf_with_page_contents_array_cycle() -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offsets: Vec<u64> = vec![0];
@@ -627,6 +661,57 @@ fn tokenizer_skips_nested_page_content_arrays() {
     assert!(
         !page.contains("word: Q"),
         "a nested array element must not be recursively flattened: {page}"
+    );
+}
+
+#[test]
+fn tokenizer_treats_null_page_contents_as_empty_without_fallback() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("null_contents.pdf"),
+        build_pdf_with_page_contents_value(b"null"),
+    )
+    .expect("write null_contents.pdf into tempdir");
+
+    let output = run(&["null_contents.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "explicit null /Contents is an empty page: status={:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--- BEGIN PAGE 1 ---"),
+        "expected page output: {stdout}"
+    );
+    assert!(
+        stdout.contains("--- END PAGE 1 ---"),
+        "expected empty page output: {stdout}"
+    );
+}
+
+#[test]
+fn tokenizer_propagates_non_null_page_contents_errors() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("scalar_contents.pdf"),
+        build_pdf_with_page_contents_value(b"17"),
+    )
+    .expect("write scalar_contents.pdf into tempdir");
+
+    let output = run(&["scalar_contents.pdf"], dir.path());
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "scalar /Contents must not be swallowed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a stream or array"),
+        "expected the page-content error, got: {stderr}"
     );
 }
 
