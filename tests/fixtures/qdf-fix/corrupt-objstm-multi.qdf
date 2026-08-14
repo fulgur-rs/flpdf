@@ -1,0 +1,90 @@
+%PDF-1.5
+%‚„œ”
+%QDF-1.0
+
+1 0 obj
+<<
+  /Type /ObjStm
+  /Length 0
+  /N 0
+  /First 0
+>>
+stream
+0 0
+0 0
+%% Object stream: object 2, index 0
+<<
+  /Pages 3 0 R
+  /Type /Catalog
+>>
+%% Object stream: object 3, index 1
+<<
+  /Count 0
+  /Kids [
+  ]
+  /Type /Pages
+>>
+endstream
+endobj
+
+4 0 obj
+<<
+  /Marker (between the two object streams)
+>>
+endobj
+
+5 0 obj
+<<
+  /Type /ObjStm
+  /Length 0
+  /N 0
+  /First 0
+  /Extends 1 0 R
+>>
+stream
+0 0
+0 0
+%% Object stream: object 6, index 0
+[
+  /PDF
+  /Text
+]
+%% Object stream: object 7, index 1
+<<
+  /BaseFont /Helvetica
+  /Subtype /Type1
+  /Type /Font
+>>
+endstream
+endobj
+
+8 0 obj
+<<
+  /Length 9 0 R
+>>
+stream
+BT /F1 24 Tf (hi) Tj ET
+endstream
+endobj
+
+9 0 obj
+0
+endobj
+
+10 0 obj
+<<
+  /Type /XRef
+  /Length 0
+  /W [ 0 0 0 ]
+  /Root 2 0 R
+  /Size 0
+  /ID [<00><00>]
+>>
+stream
+XXXXXXXXXX
+endstream
+endobj
+
+startxref
+0
+%%EOF

@@ -28,6 +28,17 @@ fn read(name: &str) -> Vec<u8> {
     fs::read(fixtures_dir().join(name)).unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
 }
 
+/// Cases involving an object stream (`/Type /ObjStm`) and/or a
+/// cross-reference stream (`/Type /XRef`) — qpdf `fix-qdf` accepts both
+/// (`qpdf/fix-qdf.cc`'s `st_in_ostream_*` / `st_in_xref_stream_dict`
+/// states), so these are part of the same byte-identical contract as the
+/// classic-xref-table cases above (flpdf-9hc.43).
+const OBJSTM_CASES: &[&str] = &[
+    "corrupt-objstm",
+    "corrupt-objstm-multi",
+    "corrupt-objstm-big",
+];
+
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
 /// oracle golden byte-for-byte.
 #[test]
@@ -38,7 +49,10 @@ fn matches_oracle_golden_byte_for_byte() {
         "corrupt-size",
         "corrupt-startxref",
         "corrupt-combo",
-    ] {
+    ]
+    .into_iter()
+    .chain(OBJSTM_CASES.iter().copied())
+    {
         let input = read(&format!("{case}.qdf"));
         let golden = read(&format!("{case}.golden.qdf"));
         let got = flpdf::fix_qdf(&input).unwrap_or_else(|e| panic!("{case}: fix_qdf: {e}"));
@@ -58,7 +72,11 @@ fn matches_oracle_golden_byte_for_byte() {
 /// file with streams and one without).
 #[test]
 fn no_op_on_clean_qdf() {
-    for clean in ["one-page-clean.qdf", "minimal-clean.qdf"] {
+    for clean in [
+        "one-page-clean.qdf",
+        "minimal-clean.qdf",
+        "objstm-clean.qdf",
+    ] {
         let data = read(clean);
         let got = flpdf::fix_qdf(&data).unwrap();
         assert_eq!(got, data, "{clean}: fix_qdf should be a no-op on clean QDF");
@@ -74,7 +92,10 @@ fn idempotent() {
         "corrupt-size",
         "corrupt-startxref",
         "corrupt-combo",
-    ] {
+    ]
+    .into_iter()
+    .chain(OBJSTM_CASES.iter().copied())
+    {
         let input = read(&format!("{case}.qdf"));
         let once = flpdf::fix_qdf(&input).unwrap();
         let twice = flpdf::fix_qdf(&once).unwrap();
@@ -94,12 +115,19 @@ fn repaired_output_passes_qpdf_check() {
     // parallel `cargo test` / concurrent CI jobs (flpdf-9hc.26).
     let dir = tempfile::tempdir().expect("temp dir");
     let tmp = dir.path().join("fix-check.pdf");
+    // `corrupt-objstm-big` is excluded: it is a synthetic 300-member ObjStm
+    // fixture (forcing the xref stream's 2-byte object-index field width)
+    // whose `/Root` deliberately does not resolve to a real `/Catalog` —
+    // it exists only to exercise `fix_qdf`'s own byte output, not to be a
+    // structurally valid PDF `qpdf --check` would accept.
     for case in [
         "corrupt-length",
         "corrupt-shift",
         "corrupt-size",
         "corrupt-startxref",
         "corrupt-combo",
+        "corrupt-objstm",
+        "corrupt-objstm-multi",
     ] {
         let input = read(&format!("{case}.qdf"));
         let fixed = flpdf::fix_qdf(&input).unwrap();
@@ -132,7 +160,10 @@ fn committed_goldens_still_match_live_oracle() {
         "corrupt-size",
         "corrupt-startxref",
         "corrupt-combo",
-    ] {
+    ]
+    .into_iter()
+    .chain(OBJSTM_CASES.iter().copied())
+    {
         use std::io::Write;
         let input = read(&format!("{case}.qdf"));
         let golden = read(&format!("{case}.golden.qdf"));
@@ -150,22 +181,86 @@ fn committed_goldens_still_match_live_oracle() {
     }
 }
 
-/// An object stream in the input is rejected with an `Unsupported` error
-/// (QDF mode disables ObjStm; this is the documented failure mode).
+/// Member object numbers inside an ObjStm continue the SAME sequential
+/// counter as top-level objects (qpdf `fix-qdf.cc`'s `checkObjId` increments
+/// one `last_obj` across both `st_top`'s `N 0 obj` matches and
+/// `st_in_ostream_offsets`/`st_in_ostream_obj`'s `%% Object stream: object N`
+/// matches) — a gap inside a stream's members is rejected exactly like a gap
+/// between top-level objects.
 #[test]
-fn objstm_input_is_unsupported() {
-    let mut data = read("one-page-clean.qdf");
-    // Inject a fake /ObjStm type into the first object's dictionary.
-    let pos = data
-        .windows(7)
-        .position(|w| w == b"/Type /")
-        .expect("a /Type entry to mutate");
-    data.splice(pos..pos, b"/Type /ObjStm ".iter().copied());
-    let err = flpdf::fix_qdf(&data).unwrap_err();
-    assert!(
-        matches!(err, flpdf::Error::Unsupported(_)),
-        "expected Unsupported for ObjStm input, got {err:?}"
+fn objstm_member_gap_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"1 0 obj\n<<\n  /Type /ObjStm\n  /Length 0\n  /N 0\n  /First 0\n>>\n");
+    // Container is object 1, so the first member must be object 2 — skip to
+    // 3 instead.
+    pdf.extend_from_slice(
+        b"stream\n0 0\n%% Object stream: object 3, index 0\n<<\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
     );
+    // A real `qpdf --qdf` always pairs object streams with a
+    // cross-reference-stream tail (a classic table has no compressed-object
+    // entry type), so the terminating object must be one too.
+    pdf.extend_from_slice(
+        b"4 0 obj\n<<\n  /Type /XRef\n  /Length 0\n  /W [ 0 0 0 ]\n  /Root 2 0 R\n  /Size 0\n>>\n\
+          stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
+    );
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        format!("{err}").contains("non-sequential object numbering"),
+        "a numbering gap spanning into an ObjStm's members must be rejected \
+         the same way as a top-level gap, got: {err}"
+    );
+}
+
+/// An `/Type /ObjStm` object whose stream body has zero
+/// `%% Object stream: object N` marker lines is malformed — real qpdf
+/// `--qdf --object-streams=generate` never emits an empty object stream —
+/// and must be a `Parse` error rather than silently producing an empty
+/// member table.
+#[test]
+fn objstm_with_no_members_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Type /ObjStm\n  /Length 0\n  /N 0\n  /First 0\n>>\n\
+          stream\nno markers here\nendstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000000 00000 n \n");
+    pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\nstartxref\n0\n%%EOF\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "an ObjStm with no members must be a Parse error, got: {err:?}"
+    );
+}
+
+/// Regression for roborev job 994 (now a POSITIVE case): a `/Type` value
+/// split across a comment (`/Type %comment\n/ObjStm`) must still be
+/// recognized as an object stream — `detect_objstm`'s comment-tolerant name
+/// token matching, exercised on the now-supported path instead of the
+/// formerly-Unsupported one.
+#[test]
+fn objstm_with_comment_between_type_and_objstm_is_processed() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Type %an inline comment\n  /ObjStm\n  /Length 0\n  /N 0\n  /First 0\n>>\n\
+          stream\n0 0\n%% Object stream: object 2, index 0\n<<\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"3 0 obj\n<<\n  /Type /XRef\n  /Length 0\n  /W [ 0 0 0 ]\n  /Root 2 0 R\n  /Size 0\n>>\n\
+          stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
+    );
+    let fixed = flpdf::fix_qdf(&pdf)
+        .expect("object stream with /Type %comment /ObjStm must be processed, not rejected");
+    assert!(
+        find(&fixed, b"/N 1").is_some(),
+        "regenerated /N must count the one member;\ngot:\n{}",
+        String::from_utf8_lossy(&fixed)
+    );
+    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
 /// Regression for roborev job 989 (qdf_fix.rs robustness):
