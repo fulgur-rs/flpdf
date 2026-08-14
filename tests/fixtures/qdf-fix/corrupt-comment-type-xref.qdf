@@ -1,0 +1,33 @@
+%PDF-1.7
+%¿÷¢þ
+%QDF-1.0
+
+1 0 obj
+<<
+  /Type /Stream
+  % decoy line containing /Type /XRef text
+  /Length 5
+>>
+stream
+hello
+endstream
+endobj
+
+2 0 obj
+<<
+  /Type /Catalog
+>>
+endobj
+
+xref
+0 3
+0000000000 65535 f 
+0000000000 00000 n 
+0000000000 00000 n 
+trailer <<
+  /Root 2 0 R
+  /Size 3
+>>
+startxref
+0
+%%EOF

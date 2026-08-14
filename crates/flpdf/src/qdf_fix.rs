@@ -198,16 +198,18 @@ fn find_next_obj(input: &[u8], from: usize) -> Option<(u32, u32, usize, usize)> 
 }
 
 /// Whether the line starting at `line_start` (already known to be a line
-/// start) is a top-level `xref` keyword line — the same at-line-start +
-/// trailing-boundary check as [`find_line_keyword_from`].
+/// start) is EXACTLY qpdf's `st_top` classic-tail `xref` keyword line: the
+/// line's entire content, including its trailing `\n`, must equal the
+/// literal 5-byte string `"xref\n"` — mirroring qpdf's own
+/// `line.compare("xref\n"sv) == 0` (`qpdf/fix-qdf.cc:130`), a full-line
+/// EQUALITY check, not a prefix or whitespace-tolerant one. A line like
+/// `xref stream\n` (confirmed against the live oracle: NOT recognized —
+/// `st_top` falls through to its default `std::cout << line;`, leaving
+/// object recognition active) or a bare `xref` with no trailing `\n` at
+/// all (the literal 5-byte string can never match a shorter one) does not
+/// match either, so this scan must not stop at either.
 fn is_xref_keyword_line(input: &[u8], line_start: usize) -> bool {
-    if !input[line_start..].starts_with(b"xref") {
-        return false;
-    }
-    match input.get(line_start + b"xref".len()) {
-        None => true,
-        Some(&c) => c == b'\n' || c == b'\r' || c == b' ' || c == b'\t',
-    }
+    input[line_start..].starts_with(b"xref\n")
 }
 
 /// Index of the next `\n` at or after `from`.
@@ -393,41 +395,39 @@ fn has_ignore_newline_marker(separator: &[u8]) -> bool {
         .any(|line| line == b"%QDF: ignore_newline\n")
 }
 
-/// Find a `/Type` *name token* whose *value* is the name token `value` —
-/// not merely any occurrence of `value` (it could be an unrelated name
-/// value like `/SomeKey /ObjStm`, and copies in strings/comments are
-/// skipped by `find_name_token_from`). Returns the position of the matched
-/// *value* token (not the `/Type` key) — callers use this to find where
-/// verbatim copy-through of the header should stop, and the value can sit
-/// on a different line than the key (`/Type %comment\n  /ObjStm`), so the
-/// line containing the value, not the key, is the one that must be kept
-/// whole. Used to classify a dict as an object stream (`/ObjStm`) or a
-/// cross-reference stream (`/XRef`).
-fn find_type_value(body: &[u8], value: &[u8]) -> Option<usize> {
-    let mut from = 0;
-    while let Some(tp) = find_name_token_from(body, b"/Type", from) {
-        let mut j = tp + b"/Type".len();
-        // Skip PDF whitespace AND `%...EOL` comments between the key and its
-        // value (comments are token separators too — `/Type %c\n /ObjStm`).
-        loop {
-            match body.get(j) {
-                Some(&b) if is_ws(b) => j += 1,
-                Some(&b'%') => {
-                    while body.get(j).is_some_and(|&c| c != b'\n' && c != b'\r') {
-                        j += 1;
-                    }
-                }
-                _ => break,
-            }
+/// Whether a dict's lines contain qpdf's exact, oracle-literal type marker
+/// text (`/Type /ObjStm` or `/Type /XRef`), scanned one line at a time —
+/// mirrors qpdf's own per-line `line.find("/Type /ObjStm"sv)` /
+/// `line.find("/Type /XRef"sv)` checks in `st_in_obj`
+/// (`qpdf/fix-qdf.cc:142,145`), which run against the raw text of ONE line
+/// while streaming an object's dictionary, with NO PDF parsing at all: no
+/// comment/string-literal skipping (unlike `find_name_token_from`, used
+/// elsewhere in this module for `/Length`/`/Size`) and no dictionary-
+/// nesting-depth awareness. Confirmed against the live `fix-qdf` binary
+/// that the SAME literal text inside a `%` comment or a `(...)` string
+/// literal on that line IS misclassified as a real `/Type /ObjStm`/
+/// `/Type /XRef` marker, exactly like a genuine nested sub-dictionary's
+/// `/Type /XRef` value already is (`corrupt-nested-type-xref` fixture) —
+/// because qpdf's check is a plain substring search, not a parse.
+/// Conversely, because qpdf's loop is strictly per-line, a value split
+/// across a line break (e.g. `/Type %comment\n/ObjStm`) never matches:
+/// confirmed against the live oracle that a comment-split `/Type`/
+/// `/ObjStm` pair is NOT recognized as an object stream at all (the
+/// object is treated as an ordinary, unclassified stream instead, with
+/// downstream effects that depend on what follows it in the file).
+///
+/// Returns the offset (within `dict`) of the start of the match on the
+/// first matching line, in file order.
+fn find_raw_type_line(dict: &[u8], needle: &[u8]) -> Option<usize> {
+    let mut line_start = 0;
+    while line_start < dict.len() {
+        let line_end = memchr_nl(dict, line_start)
+            .map(|p| p + 1)
+            .unwrap_or(dict.len());
+        if let Some(off) = find_subslice(&dict[line_start..line_end], needle) {
+            return Some(line_start + off);
         }
-        if body[j..].starts_with(value)
-            && body
-                .get(j + value.len())
-                .is_none_or(|&b| is_ws(b) || is_delimiter(b))
-        {
-            return Some(j);
-        }
-        from = tp + b"/Type".len();
+        line_start = line_end;
     }
     None
 }
@@ -761,7 +761,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                 // `stream` line (with no `endstream` anywhere) is therefore
                 // still fully repairable by the oracle, and must be here too.
                 let dict = &input[kw_end..stream_kw];
-                if let Some(type_pos) = find_type_value(dict, b"/XRef") {
+                if let Some(type_pos) = find_raw_type_line(dict, b"/Type /XRef") {
                     let type_line_end = line_end_after(input, kw_end + type_pos);
                     early_xref_body = Some((
                         ObjectBody::XRefStream {
@@ -812,7 +812,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             let body =
                 if let Some((stream_kw_abs, content_start_abs, endstream_kw_abs)) = stream_info {
                     let dict = &input[kw_end..stream_kw_abs];
-                    if let Some(type_pos) = find_type_value(dict, b"/ObjStm") {
+                    if let Some(type_pos) = find_raw_type_line(dict, b"/Type /ObjStm") {
                         let type_line_end = line_end_after(input, kw_end + type_pos);
                         let Some((first_marker_start, members)) =
                             scan_objstm_members(input, content_start_abs, endstream_kw_abs)
@@ -972,10 +972,40 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
     // state machine can never treat a compressed member as a length holder.
     // A holder number that resolves to one therefore correctly fails loud as
     // "missing" below.
-    let gen0_object_numbers: std::collections::HashSet<u32> = objects
+    //
+    // The holder's classified BODY must also be `Plain` (not `ObjStm`/
+    // `XRefStream`) — this is a real qpdf behavior, not an flpdf-invented
+    // restriction, though the underlying oracle mechanism is different from
+    // what this M-keyed lookup implements. qpdf's own `st_in_length` never
+    // reads the declared `/Length M G R` value at all: it is purely
+    // positional — whatever top-level object immediately follows a stream's
+    // `endobj` (skipping an optional `%QDF: ignore_newline` marker line) is
+    // unconditionally treated as ITS length holder via `checkObjId`, and
+    // `st_in_length` then requires that object's OWN second line to match
+    // `re_num` ("^\d+\n$", a bare integer) or fatals "expected integer"
+    // (`fix-qdf.cc:256-259`). An `/Type /ObjStm` or `/Type /XRef` object's
+    // second line is always a dict token (`<<`/a key), never a bare
+    // integer, so REAL qpdf fatals whenever the positionally-next object
+    // after a stream is one of these types — confirmed against the live
+    // `fix-qdf` binary: a stream immediately followed by an `/Type /ObjStm`
+    // object it declares as its `/Length` holder exits 2 with "expected
+    // integer" rather than producing a repaired file. This flpdf function
+    // is declared-M-keyed rather than positional, so it does not reproduce
+    // qpdf's mechanism when the declared M and "positionally next" diverge
+    // (confirmed separately: a declared `/Length 99 0 R` where object 99
+    // does not exist is silently ignored by the live oracle, which
+    // overwrites whatever plain-integer object actually sits next instead
+    // of erroring) — that gap is a pre-existing declared-M-vs-positional
+    // architecture difference outside this check's scope (tracked in
+    // flpdf-cvby). Rejecting an ObjStm/XRefStream-typed holder here
+    // fails loud instead of silently emitting `Ok` with an unresolved
+    // `/Length` reference, matching the oracle for the reported common
+    // shape and erring toward failure (like the `Error::Unsupported` block
+    // above) rather than toward silent corruption for the rest.
+    let gen0_bodies: std::collections::HashMap<u32, &ObjectBody> = objects
         .iter()
         .filter(|o| o.gen == 0)
-        .map(|o| o.num)
+        .map(|o| (o.num, &o.body))
         .collect();
     let mut new_len_body: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     for obj in &objects {
@@ -990,11 +1020,21 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
             } else {
                 *measured_len
             };
-            if !gen0_object_numbers.contains(holder) {
-                return Err(Error::parse(
-                    obj.obj_line_start,
-                    "fix_qdf: stream's indirect /Length holder object (M 0) is missing",
-                ));
+            match gen0_bodies.get(holder) {
+                None => {
+                    return Err(Error::parse(
+                        obj.obj_line_start,
+                        "fix_qdf: stream's indirect /Length holder object (M 0) is missing",
+                    ));
+                }
+                Some(ObjectBody::ObjStm { .. } | ObjectBody::XRefStream { .. }) => {
+                    return Err(Error::parse(
+                        obj.obj_line_start,
+                        "fix_qdf: stream's indirect /Length holder object (M 0) is an \
+                         object stream or cross-reference stream, not a plain integer",
+                    ));
+                }
+                Some(ObjectBody::Plain { .. }) => {}
             }
             if let Some(&prev) = new_len_body.get(holder) {
                 if prev != len {

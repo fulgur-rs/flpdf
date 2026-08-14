@@ -62,10 +62,32 @@ const OBJSTM_CASES: &[&str] = &[
 ///   substring search with no `<<`/`>>` nesting awareness, so it
 ///   misclassifies this object exactly like flpdf does — this fixture
 ///   pins that (buggy but byte-identical) shared behavior.
+/// * `corrupt-comment-type-xref` — a regular stream whose dictionary has a
+///   `%` comment line whose TEXT contains the literal substring
+///   `/Type /XRef`. Since the oracle's check is a raw per-line substring
+///   search with no comment awareness at all, it misclassifies this
+///   comment line as the real `/Type /XRef` marker (confirmed against the
+///   live `fix-qdf` binary) — this fixture pins that shared behavior.
+/// * `corrupt-string-type-xref` — the same misclassification, but the
+///   decoy `/Type /XRef` text sits inside a `(...)` literal string value
+///   instead of a comment; the oracle's substring search has no string-
+///   literal awareness either, so the result is identical (confirmed
+///   against the live oracle).
+/// * `corrupt-decoy-xref-line` — a `xref stream decoy, not the real tail`
+///   line sitting between two top-level objects (not the file's real
+///   tail `xref` keyword). The oracle's `st_top` transition requires the
+///   ENTIRE line to equal the literal `"xref\n"` (`line.compare("xref\n")
+///   == 0`), so a merely `xref`-prefixed line is just echoed as ordinary
+///   text and object recognition continues past it (confirmed against the
+///   live oracle: the second object is still found and included in the
+///   regenerated table).
 const SCANNER_EDGE_CASES: &[&str] = &[
     "corrupt-xref-truncated",
     "corrupt-trailing-garbage",
     "corrupt-nested-type-xref",
+    "corrupt-comment-type-xref",
+    "corrupt-string-type-xref",
+    "corrupt-decoy-xref-line",
 ];
 
 /// Each corrupted fixture, fixed by `flpdf::fix_qdf`, must equal the committed
@@ -266,13 +288,17 @@ fn objstm_with_no_members_is_rejected() {
     );
 }
 
-/// The classic tail's `xref` keyword line is still recognized when the
-/// file ends immediately after `xref` with no trailing newline at all
-/// (the object-scanning stop check's own EOF boundary, mirroring
-/// `find_line_keyword_from`'s identical `None => true` end-of-input arm).
-/// The overall result is still a `Parse` error (no `trailer` follows), but
-/// it must be THAT error — not a bogus extra object swallowing the
-/// dangling `xref` text.
+/// Object recognition still stops correctly when the file ends immediately
+/// after a bare `xref` with no trailing newline at all. `is_xref_keyword_line`
+/// requires an EXACT `"xref\n"` match (mirroring qpdf's
+/// `line.compare("xref\n"sv) == 0`, `qpdf/fix-qdf.cc:130`) and so does NOT
+/// itself recognize this truncated, newline-less line — but `find_next_obj`'s
+/// scan still halts there via its own end-of-input boundary (the current
+/// line's end reaches `input.len()`), so no bogus extra object swallows the
+/// dangling `xref` text either way. The overall result is still a `Parse`
+/// error: the SEPARATE tail-locating scan (`find_line_keyword_from`, used
+/// only after classic-tail mode is established) tolerates end-of-input right
+/// after the keyword and does find this `xref`, but no `trailer` follows it.
 #[test]
 fn xref_keyword_at_true_eof_with_no_trailing_byte_stops_object_scan() {
     let mut pdf = Vec::new();
@@ -309,13 +335,23 @@ fn object_without_endobj_is_rejected() {
     );
 }
 
-/// Regression for roborev job 994 (now a POSITIVE case): a `/Type` value
-/// split across a comment (`/Type %comment\n/ObjStm`) must still be
-/// recognized as an object stream — `detect_objstm`'s comment-tolerant name
-/// token matching, exercised on the now-supported path instead of the
-/// formerly-Unsupported one.
+/// A `/Type` value split across a comment (`/Type %comment\n/ObjStm`,
+/// each half on its own line) is NOT recognized as an object stream.
+/// qpdf's `/Type /ObjStm` check is a raw, per-LINE substring search
+/// (`line.find("/Type /ObjStm"sv)`, `qpdf/fix-qdf.cc:142`), evaluated
+/// once per line while streaming the dict; the literal 13-byte text never
+/// appears within a single line here, so it never matches on either line
+/// — confirmed against the live `fix-qdf` binary: this exact fixture is
+/// rejected with `"...: expected object 2"` (the un-classified object's
+/// would-be sole member, object 2, is never counted into the sequential
+/// `1..N` counter, so the next real top-level object — numbered 3 — is
+/// non-sequential). This supersedes the prior "roborev job 994" POSITIVE
+/// expectation for this fixture (never itself verified against the
+/// oracle, and predating this PR's `find_raw_type_line` fix, which
+/// replaced a comment/string-aware `/Type` scan with the oracle's raw
+/// per-line one — flpdf-9hc.43 round-2 review).
 #[test]
-fn objstm_with_comment_between_type_and_objstm_is_processed() {
+fn objstm_type_split_across_comment_line_is_not_recognized() {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
     pdf.extend_from_slice(
@@ -327,14 +363,16 @@ fn objstm_with_comment_between_type_and_objstm_is_processed() {
         b"3 0 obj\n<<\n  /Type /XRef\n  /Length 0\n  /W [ 0 0 0 ]\n  /Root 2 0 R\n  /Size 0\n>>\n\
           stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
     );
-    let fixed = flpdf::fix_qdf(&pdf)
-        .expect("object stream with /Type %comment /ObjStm must be processed, not rejected");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
-        find(&fixed, b"/N 1").is_some(),
-        "regenerated /N must count the one member;\ngot:\n{}",
-        String::from_utf8_lossy(&fixed)
+        matches!(err, flpdf::Error::Parse { .. }),
+        "comment-split /Type /ObjStm must not classify, leaving object 2's member \
+         uncounted and object 3 non-sequential; got: {err:?}"
     );
-    assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
+    assert!(
+        format!("{err}").contains("non-sequential"),
+        "unexpected error: {err}"
+    );
 }
 
 /// A line starting with the literal `%% Object stream: object ` prefix but
@@ -964,8 +1002,19 @@ fn trailer_close_ignores_brackets_in_string() {
     assert_eq!(flpdf::fix_qdf(&fixed).unwrap(), fixed, "idempotent");
 }
 
-/// Regression for roborev #193 (1): a real object stream with a `%comment`
-/// token-separator between `/Type` and `/ObjStm` must still be rejected.
+/// Regression for the historical roborev #193 comment-split-`/ObjStm`
+/// fixture. This fixture's FIRST top-level object is numbered `2` (not
+/// `1`) — a construction quirk independent of the comment split itself.
+/// Confirmed against the live `fix-qdf` binary that this exact fixture is
+/// rejected with `"...: expected object 1"`: the oracle fatals purely on
+/// non-sequential numbering, before any `/Type /ObjStm` classification
+/// question is ever reached. flpdf must reject it too, for the same
+/// reason — this supersedes the prior assertion that the error mentions
+/// "ObjStm" (that reasoning predates `find_raw_type_line`'s oracle-raw
+/// per-line scan; per `objstm_type_split_across_comment_line_is_not_recognized`,
+/// a comment-split `/Type`/`/ObjStm` is never classified as an object
+/// stream in the first place, so no "ObjStm"-specific error path is ever
+/// reached here either — flpdf-9hc.43 round-2 review).
 #[test]
 fn objstm_with_comment_between_type_and_objstm_is_rejected() {
     let mut pdf = Vec::new();
@@ -980,8 +1029,13 @@ fn objstm_with_comment_between_type_and_objstm_is_rejected() {
     pdf.extend_from_slice(b"trailer <<\n  /Root 1 0 R\n  /Size 3\n>>\nstartxref\n0\n%%EOF\n");
     let err = flpdf::fix_qdf(&pdf).unwrap_err();
     assert!(
-        format!("{err}").contains("ObjStm"),
-        "object stream with /Type %comment /ObjStm must be Unsupported, got: {err}"
+        matches!(err, flpdf::Error::Parse { .. }),
+        "non-sequential top-level numbering (starts at object 2) must be rejected, \
+         got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("non-sequential"),
+        "unexpected error: {err}"
     );
 }
 
@@ -1046,6 +1100,49 @@ fn missing_indirect_length_holder_is_rejected() {
     assert!(
         format!("{err}").contains("holder object (M 0) is missing"),
         "dangling indirect /Length holder must be an error, got: {err}"
+    );
+}
+
+/// A stream whose indirect `/Length M 0 R` points at an object classified
+/// as an object stream (`/Type /ObjStm`) must be rejected — not silently
+/// emitted with `/Length` left pointing at a dict/stream object instead of
+/// a resolved integer. Confirmed against the live `fix-qdf` binary: qpdf's
+/// `st_in_length` never actually reads the declared `M` value at all — it
+/// is purely positional, treating whatever top-level object immediately
+/// follows a stream's `endobj` as its length holder unconditionally
+/// (`qpdf/fix-qdf.cc:246-264`) — but when that object's own second line
+/// isn't a bare integer (`re_num`, `"^\d+\n$"`), which is always the case
+/// for an ObjStm's `<<` dict-open line, the oracle fatals with "expected
+/// integer" instead of producing a repaired file. This fixture's declared
+/// `M` genuinely is the positionally-next object (the shape this raw probe
+/// covers), so both the oracle and flpdf reject it. (flpdf's own holder
+/// resolution is declared-`M`-keyed rather than positional and does not
+/// reproduce the oracle's mechanism when the two diverge — a separate,
+/// pre-existing gap tracked outside this fixture's scope.)
+#[test]
+fn objstm_typed_length_holder_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(
+        b"1 0 obj\n<<\n  /Length 2 0 R\n>>\nstream\nhello\nendstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"2 0 obj\n<<\n  /Type /ObjStm\n  /N 1\n  /First 0\n>>\n\
+          stream\n0\n%% Object stream: object 3\n<<\n  /Type /Catalog\n>>\n\
+          endstream\nendobj\n\n",
+    );
+    pdf.extend_from_slice(
+        b"4 0 obj\n<<\n  /Type /XRef\n  /Root 3 0 R\n  /Size 0\n>>\n\
+          stream\nXXXXXXXXXX\nendstream\nendobj\n\nstartxref\n0\n%%EOF\n",
+    );
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "an ObjStm-typed /Length holder must be an error, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("object stream or cross-reference stream"),
+        "unexpected error: {err}"
     );
 }
 
