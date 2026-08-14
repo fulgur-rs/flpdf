@@ -4567,6 +4567,24 @@ mod tests {
     }
 
     #[test]
+    fn xref_registration_free_object_suppression_is_local_to_registration() {
+        let freed = ObjectRef::new(8, 0);
+        let later_generation = ObjectRef::new(8, 2);
+
+        let mut first_registration = XrefRegistration::default();
+        first_registration.insert_free_xref_entry(freed);
+        first_registration
+            .insert_xref_entry(later_generation, XrefEntry::Uncompressed { offset: 30 });
+        assert!(!first_registration.entries.contains_key(&later_generation));
+
+        let mut fresh_registration = XrefRegistration::default();
+        fresh_registration
+            .insert_xref_entry(later_generation, XrefEntry::Uncompressed { offset: 30 });
+        assert!(fresh_registration.entries.contains_key(&later_generation));
+        assert!(fresh_registration.deleted_objects.is_empty());
+    }
+
+    #[test]
     fn xref_size_warning_is_skipped_without_a_declared_size() {
         let mut loaded = LoadedXref {
             version: "1.7".to_string(),

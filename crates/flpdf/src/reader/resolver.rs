@@ -11323,7 +11323,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_does_not_reintroduce_a_removed_unindexed_object() {
+    fn reconstruction_does_not_reregister_privately_removed_unindexed_object() {
         let options = crate::PdfOpenOptions {
             repair: true,
             ..Default::default()
@@ -11337,21 +11337,102 @@ mod tests {
         pdf.remove_object_handle(removed_ref)
             .expect("remove the unindexed object before recovery");
 
-        // Resolving object 1 forces xref reconstruction. The recovery scan
-        // still sees object 3 in the bytes, but qpdf's deleted_objects set
-        // prevents that row from entering the effective xref/cache view.
+        // Resolving object 1 forces xref reconstruction. qpdf's private
+        // QPDF::removeObject erases the xref entry and cached object
+        // (QPDF.cc:1996-2006), so the stale source body must not be
+        // re-registered. The public probe separately observes documented
+        // replaceObject(..., newNull()) behavior; it cannot call this private
+        // method directly.
         pdf.get_object_handle(ObjectRef::new(1, 0))
             .try_dereference()
             .expect("the damaged header must recover object 1");
 
         assert!(pdf.reconstructed_xref());
-        assert!(pdf.resolver.xref_entry(removed_ref).is_none());
+        assert!(!pdf.get_xref_table().contains_key(&removed_ref));
         assert!(pdf.resolver.registered_handle(removed_ref).is_none());
         assert!(!pdf
             .get_all_objects()
             .expect("enumerate the recovered cache")
             .iter()
             .any(|handle| handle.object_ref() == Some(removed_ref)));
+    }
+
+    fn assert_generation_replacement_matches_qpdf_tombstone_lifetime(
+        mut replace: impl FnMut(&mut Pdf<std::io::Cursor<Vec<u8>>>, ObjectRef, i64),
+    ) {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_discovers_unindexed_object_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open recovery fixture");
+        let source_ref = ObjectRef::new(3, 0);
+        let replacement_ref = ObjectRef::new(3, 1);
+
+        pdf.remove_object_handle(source_ref)
+            .expect("remove source object before replacement");
+        replace(&mut pdf, source_ref, 70);
+        assert_eq!(
+            pdf.get_object_handle(source_ref).as_integer(),
+            Some(70),
+            "same-generation replacement must remain visible before recovery"
+        );
+        replace(&mut pdf, replacement_ref, 71);
+
+        pdf.get_object_handle(ObjectRef::new(1, 0))
+            .try_dereference()
+            .expect("damaged header must trigger xref reconstruction");
+
+        assert!(pdf.reconstructed_xref());
+        let xref = pdf.get_xref_table();
+        assert!(
+            !xref.contains_key(&source_ref) && !xref.contains_key(&replacement_ref),
+            "qpdf keeps replacement-only entries out of getXRefTable after recovery"
+        );
+
+        let all_objects = pdf.get_all_objects().expect("enumerate recovered objects");
+        for object_ref in [source_ref, replacement_ref] {
+            assert!(
+                all_objects
+                    .iter()
+                    .any(|handle| handle.object_ref() == Some(object_ref)),
+                "get_all_objects must retain {object_ref:?} after recovery"
+            );
+        }
+
+        let recovered_source = pdf.get_object_handle(source_ref);
+        recovered_source
+            .try_dereference()
+            .expect("same-generation replacement must keep a canonical handle");
+        assert_eq!(
+            recovered_source.as_integer(),
+            Some(70),
+            "qpdf keeps the same-generation replacement cached across recovery"
+        );
+        let replacement = pdf.get_object_handle(replacement_ref);
+        replacement
+            .try_dereference()
+            .expect("different-generation replacement must stay initialized");
+        assert_eq!(replacement.as_integer(), Some(71));
+        assert!(pdf.resolver.registered_handle(source_ref).is_some());
+        assert!(pdf.resolver.registered_handle(replacement_ref).is_some());
+    }
+
+    #[test]
+    fn set_object_generation_replacement_matches_qpdf_tombstone_lifetime() {
+        assert_generation_replacement_matches_qpdf_tombstone_lifetime(|pdf, object_ref, value| {
+            pdf.set_object(object_ref, crate::Object::Integer(value));
+        });
+    }
+
+    #[test]
+    fn replace_object_handle_generation_replacement_matches_qpdf_tombstone_lifetime() {
+        assert_generation_replacement_matches_qpdf_tombstone_lifetime(|pdf, object_ref, value| {
+            pdf.replace_object_handle(object_ref, ObjectHandle::integer(value))
+                .expect("replace canonical object");
+        });
     }
 
     #[test]
