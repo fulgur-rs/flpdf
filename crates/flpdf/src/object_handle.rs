@@ -48,6 +48,36 @@
 //! The `Rc` choice is an internal Rust ownership detail; qpdf's observable
 //! callback, identity, retry, error, and `/Length` contracts remain the
 //! authority.
+//!
+//! ## Page/Form content-family correspondence
+//!
+//! The content-family surface below is a direct qpdf 11.9.0 responsibility
+//! mapping. The qpdf declarations and implementation ranges are kept beside
+//! the Rust entry points so a later consumer cutover can verify that it uses
+//! one canonical route rather than adding a second parser or decoder.
+//!
+//! | qpdf 11.9.0 declaration/implementation | flpdf entry point | regression evidence |
+//! | --- | --- | --- |
+//! | `QPDFObjectHandle::TokenFilter`, `QPDFObjectHandle::ParserCallbacks` (`include/qpdf/QPDFObjectHandle.hh:129-227`) | [`crate::token_filter::TokenFilter`], [`crate::content_stream::ObjectHandleParserCallbacks`], [`crate::content_stream::ParseControl`] | `object_handle_content_parser_tests.rs`: token-filter output/discard/EOF and parser callback lifecycle tests |
+//! | `parseContentStream`, `pipeContentStreams`, `addTokenFilter`, `parsePageContents`, `filterPageContents`, `pipePageContents`, `addContentTokenFilter`, `filterAsContents`, `parseAsContents` (`include/qpdf/QPDFObjectHandle.hh:421-473`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`], [`ObjectHandle::add_token_filter`], [`ObjectHandle::add_content_token_filter`], `ObjectHandle::parse_content_stream_handles` (private orchestration for `parseContentStream`) | `object_handle_content_parser_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
+//! | `getUniqueResourceName` (`include/qpdf/QPDFObjectHandle.hh:837-850`) | [`ObjectHandle::get_unique_resource_name`] | `object_handle_content_shape_tests.rs::unique_resource_name_uses_the_supplied_prefix_and_suffix_cursor` and related shape tests |
+//! | `getPageContents`, `addPageContents`, `rotatePage`, `coalesceContentStreams` (`include/qpdf/QPDFObjectHandle.hh:1242-1254`) | [`ObjectHandle::get_page_contents`], [`ObjectHandle::add_page_contents`], [`ObjectHandle::rotate_page`], [`ObjectHandle::coalesce_content_streams`] | `object_handle_content_shape_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
+//! | `isFormXObject`, `isImage` (`include/qpdf/QPDFObjectHandle.hh:1328-1334`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | `object_handle_content_shape_tests.rs::form_and_image_classification_matches_qpdf` |
+//! | `CoalesceProvider` (`libqpdf/QPDFObjectHandle.cc:94-118`) | `CoalesceContentProvider` and [`ObjectHandle::coalesce_content_streams`] | `object_handle_page_content_pipeline_tests.rs::coalesce_content_streams_installs_a_lazy_document_owned_provider` |
+//! | `arrayOrStreamToStreamArray`, `getPageContents`, `addPageContents`, `rotatePage`, `coalesceContentStreams` (`libqpdf/QPDFObjectHandle.cc:1438-1572`) | `array_or_stream_to_stream_array`, [`ObjectHandle::get_page_contents`], [`ObjectHandle::add_page_contents`], [`ObjectHandle::rotate_page`], [`ObjectHandle::coalesce_content_streams`] | shape normalization, prepend/append, inherited rotation, malformed-array, and lazy-provider tests |
+//! | `pipePageContents`, `pipeContentStreams` (`libqpdf/QPDFObjectHandle.cc:1702-1737`) | [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`] | `object_handle_page_content_pipeline_tests.rs::pipe_page_contents_decodes_and_joins_streams_with_qpdf_newline_rules` and failure/description tests |
+//! | `parsePageContents`, `parseAsContents`, `filterPageContents`, `filterAsContents`, `parseContentStream_internal`, inline-image recovery, `addContentTokenFilter`, `addTokenFilter` (`libqpdf/QPDFObjectHandle.cc:1740-1859`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::add_content_token_filter`], [`ObjectHandle::add_token_filter`], [`crate::content_stream::parse_content_stream_handles`] | `object_handle_content_parser_tests.rs` callback identity/span/diagnostic/early-stop/inline-image/filter tests |
+//! | `isFormXObject`, `isImage` (`libqpdf/QPDFObjectHandle.cc:2340-2352`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | direct/indirect subtype and ImageMask exclusion tests |
+//!
+//! `QPDFParser::parseRemainder` and the tokenizer dispatch that backs the
+//! ObjectHandle callbacks remain in [`crate::parser`] and
+//! `crate::pipeline::qpdf_tokenizer::QpdfTokenizer`; their qpdf source
+//! correspondence is documented at
+//! `libqpdf/QPDFParser.cc:135-176,221-223,266-274,408-444,456-469` and
+//! `libqpdf/Pl_QPDFTokenizer.cc:36-65`. This module owns the handle identity,
+//! stream normalization, provider/filter dispatch, and public consumer
+//! boundary; PageObjectHelper and page-tree orchestration are intentionally
+//! outside this table and tracked separately.
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
