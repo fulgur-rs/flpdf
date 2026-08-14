@@ -1207,13 +1207,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
         // This is the canonical cache replacement boundary, not xref
-        // registration: reconstruction's `deleted_objects` is a transient
-        // free-row filter (`QPDF.cc:516-575`, `:1187-1210`) that qpdf clears
-        // after `/Size` validation (`:686-708`). It must neither be cleared
-        // nor extended here. Canonical xref/cache removal is separately
-        // `removeObject` (`QPDF.cc:1996-2005`). Refresh the legacy cache before
-        // classifying this replacement, or an old object-stream entry can
-        // incorrectly retain provenance.
+        // registration. Normal `read_xref` keeps its transient free-row
+        // `deleted_objects` through `/Size` then clears it (`QPDF.cc:686-708`),
+        // while `reconstruct_xref` clears its line-scan filter before any
+        // candidate re-read (`:516-575`, especially `:575`; `:576-607`). This
+        // method must neither clear nor extend either registration. Canonical
+        // xref/cache removal is separately `removeObject` (`:1996-2005`).
+        // Refresh the legacy cache before classifying this replacement, or an
+        // old object-stream entry can incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
         if !self.resolver.xref_entries().contains_key(&object_ref) {
             self.qpdf_replacement_only_refs.insert(object_ref);
@@ -1756,10 +1757,11 @@ impl<R: Read + Seek> Pdf<R> {
         replacement: ObjectHandle,
     ) -> Result<ObjectHandle> {
         // Like `set_object`, this is canonical cache replacement only. Keep it
-        // separate from the registration/recovery-only `deleted_objects`
-        // filter (`QPDF.cc:516-575`, `:1187-1210`), which is consumed after
-        // `/Size` validation (`:686-708`); never clear or add that set here.
-        // Exact xref/cache removal remains `removeObject` (`QPDF.cc:1996-2005`).
+        // separate from `deleted_objects`: normal `read_xref` clears after
+        // `/Size` (`QPDF.cc:686-708`), but `reconstruct_xref` clears its
+        // line-scan filter at `:575` before a candidate re-read (`:516-607`).
+        // Never clear or add either registration here. Exact xref/cache removal
+        // remains `removeObject` (`QPDF.cc:1996-2005`).
         let replacement_only = !self.resolver.xref_entries().contains_key(&object_ref);
         let target = self.resolver.replace_object(object_ref, replacement)?;
         if replacement_only {

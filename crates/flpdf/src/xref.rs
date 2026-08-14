@@ -75,12 +75,14 @@ enum ParsedXrefEntry {
 #[derive(Debug, Default)]
 struct XrefRegistration {
     entries: BTreeMap<ObjectRef, XrefEntry>,
-    /// A construction-only, object-number-wide free-row filter. qpdf builds
-    /// it while registering/reconstructing xref entries
-    /// (`QPDF.cc:516-575`, `:1187-1210`), uses it for `/Size`, then clears it
-    /// (`QPDF.cc:686-708`). It deliberately never crosses into `ResolverCore`:
-    /// canonical cache/xref replacement and removal are a separate `Pdf`
-    /// mutation boundary.
+    /// A construction-only, object-number-wide free-row filter. A normal
+    /// qpdf `read_xref` registration retains it through `/Size` validation,
+    /// then clears it (`QPDF.cc:686-708`). `reconstruct_xref` instead clears
+    /// its line-scan filter immediately at `QPDF.cc:575`, before the optional
+    /// candidate xref-stream re-read at `:576-607`; that re-read gets a fresh
+    /// registration with its own normal lifetime. It deliberately never
+    /// crosses into `ResolverCore`: canonical cache/xref replacement and
+    /// removal are a separate `Pdf` mutation boundary.
     deleted_objects: BTreeSet<u32>,
 }
 
@@ -876,11 +878,12 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         &registration.deleted_objects,
         &mut loaded.loaded.repair_diagnostics,
     );
-    // qpdf clears `m->deleted_objects` after `/Size` validation
-    // (`QPDF.cc:686-708`). This registration-local set implements only
-    // `insertFreeXrefEntry`/`insertReconstructedXrefEntry` suppression
-    // (`QPDF.cc:1187-1210`); it is deliberately not resolver or mutation
-    // history and must not cross the xref-loader boundary.
+    // This is the ordinary `read_xref` lifetime: qpdf keeps
+    // `m->deleted_objects` through `/Size` validation, then clears it
+    // (`QPDF.cc:686-708`). `reconstruct_xref` has a distinct line-scan
+    // lifetime and clears before candidate re-read (`:516-575`, `:576-607`).
+    // The set implements only registration suppression (`:1187-1210`), never
+    // resolver or mutation history, and must not cross the xref-loader boundary.
     registration.deleted_objects.clear();
 
     if let Some(error) = parse_errors.into_iter().next() {
@@ -1391,12 +1394,12 @@ fn merge_recovered_qpdf_state(
     // the already-successfully-parsed newest revision's real one, is always
     // the correct value here, not `recovered`'s `Table` placeholder.
     recovered.loaded.last_xref_form = accumulated.loaded.last_xref_form;
-    // qpdf `reconstruct_xref` (`QPDF.cc:516-575`) removes existing type-1
-    // entries before scanning, and `insertReconstructedXrefEntry`
-    // (`QPDF.cc:1194-1209`) refuses object numbers in the xref operation's
-    // local `deleted_objects`. The accumulated prefix's registration set is
-    // consumed only for this merge, then discarded at the xref-loader
-    // boundary after `/Size` handling (`QPDF.cc:686-708`); it is not
+    // qpdf `reconstruct_xref` removes existing type-1 entries before scanning,
+    // and `insertReconstructedXrefEntry` suppresses object numbers in that
+    // scan's local filter (`QPDF.cc:516-575`, `:1194-1210`). It clears the
+    // scan filter at `:575`, before any candidate xref-stream re-read
+    // (`:576-607`). Consume the accumulated filter only to apply that scan's
+    // merge effect; a candidate re-read owns a fresh registration. This is not
     // `replaceObject`/`removeObject` cache mutation history.
     recovered
         .loaded
@@ -1507,9 +1510,12 @@ const XREF_CANDIDATE_FALLBACK_SPAN: usize = 64;
 /// both key priority off the number alone). A candidate that fails to decode
 /// becomes "error decoding candidate xref stream while recovering damaged
 /// file"; no candidate at all becomes "unable to find trailer dictionary while
-/// recovering damaged file". The returned tombstone set is the candidate
-/// re-entry's object-number `deleted_objects`; matching line-scan entries are
-/// removed before the recovered table is used for `/Size` resolution.
+/// recovering damaged file". The candidate re-read uses its own fresh
+/// `XrefRegistration`: like normal `read_xref`, it uses its free-row filter
+/// for `/Size` before clear (`QPDF.cc:686-708`), while the reconstruction
+/// line-scan filter was already cleared at `:575`. The returned filter is
+/// consumed only by this immediate candidate merge; it is never resolver or
+/// mutation state.
 #[allow(clippy::too_many_arguments)]
 fn recover_trailer_from_xref_stream_candidate(
     bytes: &[u8],
