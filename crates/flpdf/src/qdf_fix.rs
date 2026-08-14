@@ -591,9 +591,13 @@ fn emit_xref_stream(
                 write_binary(out, u64::from(*stream), f1_nbytes);
                 write_binary(out, u64::from(*index), f2_nbytes);
             }
+            // Unreachable by construction: `entries` (built in `fix_qdf`)
+            // only ever pushes `Uncompressed`/`Compressed`; this arm exists
+            // solely to satisfy exhaustiveness against the crate's shared
+            // `XrefEntry` type.
             crate::XrefEntry::Free { .. } => {
                 unreachable!("qdf_fix's entries vector only ever holds Uncompressed/Compressed")
-            }
+            } // cov:ignore: unreachable by construction, see comment above
         }
     }
     out.extend_from_slice(b"\nendstream\nendobj\n\n");
