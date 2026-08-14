@@ -11323,7 +11323,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_does_not_reregister_privately_removed_unindexed_object() {
+    fn reconstruction_reregisters_privately_removed_unindexed_object_like_qpdf() {
         let options = crate::PdfOpenOptions {
             repair: true,
             ..Default::default()
@@ -11337,24 +11337,30 @@ mod tests {
         pdf.remove_object_handle(removed_ref)
             .expect("remove the unindexed object before recovery");
 
-        // Resolving object 1 forces xref reconstruction. qpdf's private
-        // QPDF::removeObject erases the xref entry and cached object
-        // (QPDF.cc:1996-2006), so the stale source body must not be
-        // re-registered. The public probe separately observes documented
-        // replaceObject(..., newNull()) behavior; it cannot call this private
-        // method directly.
+        // Resolving object 1 forces xref reconstruction. QPDF::removeObject
+        // erases only the exact xref/cache state (QPDF.cc:1996-2006); it does
+        // not add this object number to reconstruction's deleted_objects set.
+        // Reconstruction scans the stale body and registers it
+        // (QPDF.cc:516-575,1194-1210). This source-derived private-method
+        // contract is distinct from the public probe's removal_proxy, which
+        // observes replaceObject(..., newNull()).
         pdf.get_object_handle(ObjectRef::new(1, 0))
             .try_dereference()
             .expect("the damaged header must recover object 1");
 
         assert!(pdf.reconstructed_xref());
-        assert!(!pdf.get_xref_table().contains_key(&removed_ref));
-        assert!(pdf.resolver.registered_handle(removed_ref).is_none());
-        assert!(!pdf
+        assert!(pdf.get_xref_table().contains_key(&removed_ref));
+        assert!(pdf.resolver.registered_handle(removed_ref).is_some());
+        assert!(pdf
             .get_all_objects()
             .expect("enumerate the recovered cache")
             .iter()
             .any(|handle| handle.object_ref() == Some(removed_ref)));
+        let recovered = pdf.get_object_handle(removed_ref);
+        recovered
+            .try_dereference()
+            .expect("reconstruction must mint a canonical handle");
+        assert_eq!(recovered.as_integer(), Some(99));
     }
 
     fn assert_generation_replacement_matches_qpdf_tombstone_lifetime(
