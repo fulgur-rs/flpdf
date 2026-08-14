@@ -266,6 +266,27 @@ fn objstm_with_no_members_is_rejected() {
     );
 }
 
+/// A top-level (non-stream) object with no `endobj` anywhere in the
+/// remainder of the file — e.g. a QDF truncated mid-object — is rejected.
+/// Unlike the `/Type /XRef` truncation case (`corrupt-xref-truncated`
+/// fixture), a non-`/Type /XRef` object has no oracle-defined way to
+/// complete without its `endobj`, so this must stay a hard `Parse` error.
+#[test]
+fn object_without_endobj_is_rejected() {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n\n");
+    pdf.extend_from_slice(b"1 0 obj\n<<\n  /Type /Catalog\n>>\n");
+    let err = flpdf::fix_qdf(&pdf).unwrap_err();
+    assert!(
+        matches!(err, flpdf::Error::Parse { .. }),
+        "a truncated object with no `endobj` must be a Parse error, got: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("object without matching `endobj`"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Regression for roborev job 994 (now a POSITIVE case): a `/Type` value
 /// split across a comment (`/Type %comment\n/ObjStm`) must still be
 /// recognized as an object stream — `detect_objstm`'s comment-tolerant name

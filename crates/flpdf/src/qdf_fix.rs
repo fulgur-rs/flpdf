@@ -201,11 +201,13 @@ fn find_next_obj(input: &[u8], from: usize) -> Option<(u32, u32, usize, usize)> 
 /// start) is a top-level `xref` keyword line — the same at-line-start +
 /// trailing-boundary check as [`find_line_keyword_from`].
 fn is_xref_keyword_line(input: &[u8], line_start: usize) -> bool {
-    input[line_start..].starts_with(b"xref")
-        && matches!(
-            input.get(line_start + b"xref".len()),
-            None | Some(b'\n' | b'\r' | b' ' | b'\t')
-        )
+    if !input[line_start..].starts_with(b"xref") {
+        return false;
+    }
+    match input.get(line_start + b"xref".len()) {
+        None => true,
+        Some(&c) => c == b'\n' || c == b'\r' || c == b' ' || c == b'\t',
+    }
 }
 
 /// Index of the next `\n` at or after `from`.
