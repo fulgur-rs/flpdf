@@ -1759,6 +1759,49 @@ pub(crate) fn parse_qpdf_direct_object_handle_with_diagnostics(
     Ok((value.0, value.1, parsed.diagnostics))
 }
 
+/// The handle-native counterpart of [`ParsedDirectObject`] for an indirect
+/// file-object body. The returned top-level handle is still direct; the
+/// caller decides whether it is a plain object or a stream after it has
+/// inspected the bytes following the parsed value.
+#[derive(Debug)]
+pub(crate) struct ParsedFileObjectHandle {
+    pub(crate) value: ObjectHandle,
+    pub(crate) parsed_offset: i64,
+    pub(crate) next_offset: usize,
+    pub(crate) empty_offset: Option<usize>,
+    pub(crate) diagnostics: Vec<ParserDiagnostic>,
+}
+
+/// Parse one qpdf file-object body while retaining the live handle graph and
+/// the tokenizer position needed by stream framing. This keeps the
+/// `QPDFParser::parse` ownership boundary (`libqpdf/QPDFParser.cc:327-365`)
+/// intact: indirect references are minted as handles during tokenization and
+/// the caller, not this parser, decides how stream framing consumes the tail.
+pub(crate) fn parse_qpdf_file_object_handle_with_diagnostics(
+    input: &[u8],
+    base_offset: i64,
+    top_level_offset: Option<i64>,
+    resolver: &mut dyn HandleResolver,
+) -> Result<ParsedFileObjectHandle> {
+    let mut input_source = SliceLiveInput::new(input);
+    let mut rebasing_resolver = OffsetHandleResolver {
+        resolver,
+        base_offset,
+        top_level_offset,
+    };
+    let parsed = parse_live_file_object(&mut input_source, &mut rebasing_resolver)?;
+    let parsed_offset = parsed.value.get_parsed_offset();
+    Ok(ParsedFileObjectHandle {
+        value: parsed.value,
+        parsed_offset,
+        next_offset: input_source.position(),
+        empty_offset: parsed
+            .empty
+            .map(|offset| usize::try_from(offset).unwrap_or(usize::MAX)),
+        diagnostics: parsed.diagnostics,
+    })
+}
+
 struct OffsetHandleResolver<'a> {
     resolver: &'a mut dyn HandleResolver,
     base_offset: i64,
