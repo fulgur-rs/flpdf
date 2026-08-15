@@ -7316,6 +7316,25 @@ mod tests {
         historical_xref_stream_trailer_pdf_with_free_generation(1)
     }
 
+    #[test]
+    fn historical_xref_stream_is_resolved_in_the_canonical_cache_at_open() {
+        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
+            .expect("open mixed xref fixture");
+        let stream_ref = crate::ObjectRef::new(4, 0);
+
+        let handle = pdf.get_object_handle(stream_ref);
+
+        assert!(
+            handle.is_resolved(),
+            "qpdf reads the historical xref stream into obj_cache while loading /Prev"
+        );
+        assert_eq!(
+            handle.type_code(),
+            10,
+            "historical object must remain a stream"
+        );
+    }
+
     fn latest_xref_stream_pdf() -> Vec<u8> {
         let bytes = historical_xref_stream_trailer_pdf();
         let eof = bytes
@@ -7583,7 +7602,7 @@ mod tests {
         assert!(prepared.refs.contains(&crate::ObjectRef::new(88, 4)));
         let stream_ref = crate::ObjectRef::new(4, 0);
         assert!(prepared.refs.contains(&stream_ref));
-        assert!(!pdf.object_refs().contains(&stream_ref));
+        assert!(pdf.object_refs().contains(&stream_ref));
         assert!(!pdf.live_object_refs().contains(&stream_ref));
         assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
     }
@@ -7746,7 +7765,7 @@ mod tests {
             .expect("prepare qpdf objects");
 
         assert!(prepared.refs.contains(&stream_ref));
-        assert!(!pdf.object_refs().contains(&stream_ref));
+        assert!(pdf.object_refs().contains(&stream_ref));
         assert!(!pdf.live_object_refs().contains(&stream_ref));
     }
 

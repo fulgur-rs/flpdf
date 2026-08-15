@@ -177,10 +177,11 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// Valid indirect references parsed from every classic trailer and xref
     /// stream dictionary in the source `/Prev` chain.
     pub(crate) qpdf_trailer_references: BTreeSet<ObjectRef>,
-    /// Xref stream objects parsed while following the source `/Prev` chain.
-    /// Kept outside the public cache so superseded/free streams remain visible
-    /// only through qpdf's raw object view.
-    pub(crate) qpdf_parsed_xref_streams: BTreeMap<ObjectRef, Object>,
+    /// Historical xref-stream object identities promoted into the canonical
+    /// resolver cache while following the source `/Prev` chain. The parsed
+    /// values themselves live on their [`ObjectHandle`]s; this set only keeps
+    /// the qpdf JSON preparation/mutation boundary aware of cache-only refs.
+    pub(crate) qpdf_parsed_xref_stream_refs: BTreeSet<ObjectRef>,
     /// Objects removed through [`Self::delete_object`]. qpdf's object cache
     /// removal is persistent across repeated JSON preparation; keep this
     /// separate from immutable source/trailer discovery so those seeds cannot
