@@ -186,8 +186,13 @@ impl PlainWritePlan {
             .ok()
             .and_then(|size| size.checked_add(usize::from(form == XrefForm::Stream) + 1))
             .ok_or_else(|| {
+                // cov:ignore-start: ObjectRef numbers are u32 and fit usize on supported targets
+                // ObjectRef numbers are u32, so this overflow arm is unreachable on
+                // the supported 64-bit targets.
                 crate::Error::Unsupported("plain writer trailer /Size overflows usize".into())
-            })?;
+            })?
+            // cov:ignore-end
+            ;
         let trailer_handle = crate::writer::build_writer_trailer_handle(
             pdf,
             pdf.last_xref_form() == XrefForm::Stream,
@@ -198,7 +203,7 @@ impl PlainWritePlan {
             None,
             options.deterministic_id,
             generated_id.as_ref(),
-        )?;
+        )?; // cov:ignore: LLVM attributes this validated trailer-call continuation to the call setup
         let id = if options.deterministic_id {
             IdPlan::Deterministic {
                 source_id0,
