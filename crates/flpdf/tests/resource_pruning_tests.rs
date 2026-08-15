@@ -673,17 +673,41 @@ fn test_declared_but_uninvoked_form_xobject_is_still_recursed() {
 
 // The single-level test above discovers Fm0's declared children from
 // `scope.resources`, which is the *page's own* (never mutated by this walk)
-// /Resources — so it cannot catch a bug in how `recurse_form_xobject`'s own
-// tail loop discovers a Form's *own* declared children after that Form's own
-// dict was pruned in the same call. This nests one level deeper: a
+// /Resources — so it does not exercise how `recurse_form_xobject`'s own tail
+// loop discovers a Form's *own* declared children after that Form's own dict
+// was (or was not) pruned in the same call. This nests one level deeper: a
 // declared-but-uninvoked ChildForm inside a Do-invoked ParentForm's own
-// /XObject dictionary. ParentForm's own content (`q Q`) never invokes Child,
-// so ParentForm's own /XObject/Child entry is itself pruned away as unused —
-// but qpdf's forEachXObject discovery of ParentForm's declared children is
-// unconditional on Do usage, so ChildForm must still be recursed into and its
-// own unused /F2 pruned, exactly like the page-level case.
+// /XObject dictionary.
+//
+// Unlike the page-level case above, this does NOT mirror the page's
+// unconditional declared-key discovery. qpdf's `forEachXObject` BFS
+// (`QPDFPageObjectHelper.cc:313-345`) discovers a Form's *own* declared
+// children by reading its *current* `/XObject` dict when that Form reaches
+// the front of the traversal queue — but that Form's own filtering step
+// (`removeUnreferencedResourcesHelper`, `QPDFPageObjectHelper.cc:539-633`)
+// already ran earlier and synchronously, the moment it was *discovered* as
+// the page's declared child (as the `action` callback `forEachXObject`
+// invokes), strictly before it is later popped from the queue to have its own
+// children discovered. So when ParentForm's own content (`q Q`) never invokes
+// Child via `Do`, ParentForm's own filtering step removes /Child from
+// ParentForm's own /XObject dict *before* ParentForm's children are ever
+// enumerated — Child is never discovered, never visited, and its own
+// /Font dictionary is never pruned. The page itself is the sole exception,
+// since its own filtering is deferred until after the whole traversal
+// completes (`QPDFPageObjectHelper.cc:636-649`) — see this function's doc for
+// the full explanation and citations.
+//
+// Verified empirically against qpdf 11.9.0
+// (`--remove-unreferenced-resources=yes --pages ... --preserve-unreferenced`,
+// since plain rewrite never invokes `removeUnreferencedResources()`): a
+// declared-but-uninvoked child Form nested inside a `Do`-invoked parent ends
+// up completely absent from the live-reachable resource graph — its parent's
+// /XObject dict no longer references it at all — while a Do-invoked sibling
+// under the same setup is discovered and has its own unused resources pruned
+// normally (`test_declared_but_uninvoked_child_form_nested_inside_a_form_is_recursed_when_do_invoked`
+// below).
 #[test]
-fn test_declared_but_uninvoked_child_form_nested_inside_a_form_is_still_recursed() {
+fn test_declared_but_uninvoked_child_form_nested_inside_a_form_is_not_discovered() {
     let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
     let child_stream = {
         let header = format!(
@@ -720,14 +744,172 @@ fn test_declared_but_uninvoked_child_form_nested_inside_a_form_is_still_recursed
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
 
+    let parent_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert!(
+        parent_xobject_keys.is_empty(),
+        "ParentForm's own filtering step removes its declared-but-unused /Child \
+         entry before ParentForm's own children are ever enumerated, matching \
+         qpdf's forEachXObject reading ParentForm's post-filter /XObject dict: \
+         {parent_xobject_keys:?}"
+    );
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1", "F2"],
+        "ChildForm is never discovered once its declared entry is pruned from \
+         ParentForm's own /XObject dict, so its own /Font dictionary must be \
+         left completely untouched (not visited, not pruned): {keys:?}"
+    );
+}
+
+// Companion to the test above: same nesting, but ParentForm's own content
+// DOES `Do`-invoke Child. ParentForm's own filtering step then keeps /Child in
+// its own /XObject dict (it is actually used), so when ParentForm's children
+// are later enumerated, Child IS discovered and recursed into, and its own
+// unused /F2 is pruned — confirming the `pruning_ran` branch of
+// `recurse_form_xobject` (this Form's own filtering step ran) correctly uses
+// the post-filter snapshot. Verified against the same qpdf 11.9.0 probe setup
+// as the test above, with the parent's content additionally invoking
+// `/Child Do`.
+#[test]
+fn test_declared_and_invoked_child_form_nested_inside_a_form_is_recursed() {
+    let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
+    let child_stream = {
+        let header = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            child_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(child_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // ParentForm's own content DOES invoke /Child via Do this time.
+    let parent_content = b"/Child Do";
+    let parent_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /XObject << /Child 8 0 R >> >> >>\nstream\n",
+            parent_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(parent_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, parent_stream),
+        (8, child_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let parent_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert_eq!(
+        parent_xobject_keys,
+        vec!["Child"],
+        "ParentForm's own content uses /Child, so its own filtering step must \
+         keep it: {parent_xobject_keys:?}"
+    );
+
     let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
     assert_eq!(
         keys,
         vec!["F1"],
-        "a Form-owned declared-but-never-invoked child Form must still be \
-         recursed into and its own unused /Font entry pruned, even though the \
-         parent Form's own /XObject entry for it is separately pruned as \
-         unused: {keys:?}"
+        "a Do-invoked child Form must still be recursed into and its own \
+         unused /Font entry pruned: {keys:?}"
+    );
+}
+
+// qpdf's structural `forEachXObject` walk (`QPDFPageObjectHelper.cc:313-345`)
+// never decodes content — a Form's declared children are discovered by
+// reading its `/Resources/XObject` dictionary directly, independent of
+// whether that Form's own content stream can be decoded at all. Before this
+// fix, `recurse_form_xobject` returned early (`Ok(false)`) on a
+// `decode_stream_data` failure, before ever reaching the declared-children
+// discovery loop — so a Form whose own content failed to decode, but which
+// still declared a child Form with its own prunable resources, left that
+// child entirely unvisited.
+//
+// This is ParentForm's own content that fails to *decode* (corrupt
+// FlateDecode data), as opposed to `test_malformed_form_content_retains_form_and_page_resources`
+// above (which fails to *tokenise* already-decoded bytes). Both are qpdf
+// early-return-`false` sites in `removeUnreferencedResourcesHelper`
+// (`QPDFPageObjectHelper.cc:539-565`) that leave the Form's own /Resources
+// completely untouched — so ParentForm's own declared /XObject/Child entry
+// must survive unpruned, and ChildForm must still be discovered and have its
+// own unused /F2 pruned.
+#[test]
+fn test_declared_child_form_is_still_recursed_when_parent_decode_fails() {
+    let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
+    let child_stream = {
+        let header = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            child_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(child_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // ParentForm's own content is corrupt FlateDecode data — decoding fails
+    // before ParentForm's own content is ever tokenised.
+    let bad_parent_body = b"not valid flate data";
+    let parent_stream = {
+        let mut bytes = format!(
+            "7 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} /Resources << /XObject << /Child 8 0 R >> >> >>\nstream\n",
+            bad_parent_body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(bad_parent_body);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> /PageF2 << /Type /Font >> >> /XObject << /Fm0 7 0 R >> >>",
+            ),
+        ),
+        (7, parent_stream),
+        (8, child_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let parent_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert_eq!(
+        parent_xobject_keys,
+        vec!["Child"],
+        "ParentForm's own filtering step never ran (its content failed to \
+         decode), so its own /XObject dict must be left untouched: \
+         {parent_xobject_keys:?}"
+    );
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "ChildForm must still be discovered and have its own unused /Font \
+         entry pruned despite ParentForm's own decode failure, matching \
+         qpdf's structural forEachXObject walk which never decodes content: \
+         {keys:?}"
+    );
+
+    assert_eq!(
+        font_dict_keys(&mut pdf, ObjectRef::new(5, 0)),
+        vec!["PageF1", "PageF2"],
+        "ParentForm's own decode failure must still conservatively retain the \
+         page-level resources"
     );
 }
 
