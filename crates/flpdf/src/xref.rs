@@ -145,6 +145,25 @@ enum XrefReadContextSpec<'a> {
     },
 }
 
+/// The qpdf description passed to `readObjectAtOffset` for a bootstrap object.
+/// Ordinary resolution uses an empty description, while
+/// `QPDF::read_xrefStream` passes `"xref stream"` so file-object warnings carry
+/// the same prefix (`QPDF.cc:949-963,1298-1313`).
+#[derive(Debug, Clone, Copy)]
+enum XrefObjectDescription {
+    Ordinary,
+    XrefStream,
+}
+
+impl XrefObjectDescription {
+    fn warning_prefix(self) -> &'static str {
+        match self {
+            Self::Ordinary => "",
+            Self::XrefStream => "xref stream: ",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum XrefEntryLookup<'a> {
     Registration(&'a BTreeMap<ObjectRef, XrefEntry>),
@@ -293,12 +312,14 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         input: &[u8],
         absolute_offset: u64,
         policy: RecoveryPolicy,
+        description: XrefObjectDescription,
     ) -> Result<FileObjectRead> {
         let pending = parse_file_object_syntax(input)?;
         let resolved_length = self.resolve_stream_length(&pending);
         let completed = finish_file_object(input, pending, resolved_length, policy)?;
         for diagnostic in &completed.diagnostics {
             self.diagnostics.push(xref_file_object_diagnostic(
+                description,
                 completed.object_ref,
                 absolute_offset,
                 diagnostic.clone(),
@@ -344,7 +365,12 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         }
 
         let completed = self
-            .read_file_object(input, absolute_offset, policy)
+            .read_file_object(
+                input,
+                absolute_offset,
+                policy,
+                XrefObjectDescription::Ordinary,
+            )
             .map_err(|error| error.rebase_offset(absolute_base))?;
         if completed.object_ref != object_ref
             && (self.options.allow_repair || policy == RecoveryPolicy::Bounded)
@@ -2128,7 +2154,12 @@ fn parse_xref_stream(
     // cumulative registration receives these entries.
     let (build_result, reconstruction_trigger, bootstrap_cache) = {
         let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-        let mut completed = match context.read_file_object(tail, xref_pos as u64, policy) {
+        let mut completed = match context.read_file_object(
+            tail,
+            xref_pos as u64,
+            policy,
+            XrefObjectDescription::XrefStream,
+        ) {
             Ok(completed) => completed,
             Err(error) => {
                 context.append_diagnostics_to(&mut repair_diagnostics);
@@ -2258,13 +2289,15 @@ fn parse_xref_stream(
 }
 
 fn xref_file_object_diagnostic(
+    description: XrefObjectDescription,
     object_ref: ObjectRef,
     offset: u64,
     diagnostic: FileObjectDiagnostic,
 ) -> Diagnostic {
     Diagnostic::warning(
         format!(
-            "(object {} {}, offset {}): {}",
+            "({}object {} {}, offset {}): {}",
+            description.warning_prefix(),
             object_ref.number,
             object_ref.generation,
             offset.saturating_add(diagnostic.relative_offset as u64),
@@ -2629,8 +2662,8 @@ mod tests {
         merge_xref_stream_from_classic_trailer, parse_xref_index, parse_xref_stream,
         prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
         recover_xref_from_linear_scan, LoadedXref, LoadedXrefState, RecoveryPolicy,
-        XrefEntryLookup, XrefForm, XrefLoadOptions, XrefReadContext, XrefReadContextSpec,
-        XrefRegistration,
+        XrefEntryLookup, XrefForm, XrefLoadOptions, XrefObjectDescription, XrefReadContext,
+        XrefReadContextSpec, XrefRegistration,
     };
     use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, XrefEntry};
     use std::collections::{BTreeMap, BTreeSet};
@@ -4489,6 +4522,7 @@ mod tests {
                 &bytes[stream_offset as usize..],
                 stream_offset,
                 RecoveryPolicy::Bounded,
+                XrefObjectDescription::Ordinary,
             )
             .expect("invalid indirect length should recover by boundary");
         assert!(completed.object.as_stream().is_some());
