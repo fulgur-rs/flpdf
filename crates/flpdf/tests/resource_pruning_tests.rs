@@ -114,6 +114,27 @@ fn font_dict_keys(pdf: &mut Pdf<Cursor<Vec<u8>>>, res_ref: ObjectRef) -> Vec<Str
     }
 }
 
+/// Read a Form XObject's resource-category keys after pruning.
+fn form_resource_dict_keys(
+    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    form_ref: ObjectRef,
+    category: &str,
+) -> Vec<String> {
+    let Object::Stream(form) = pdf.resolve(form_ref).expect("resolve Form") else {
+        panic!("Form is not a stream");
+    };
+    let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
+        panic!("Form has no dictionary /Resources: {:?}", form.dict);
+    };
+    let Some(Object::Dictionary(entries)) = resources.get(category) else {
+        return vec![];
+    };
+    entries
+        .iter()
+        .map(|(name, _)| String::from_utf8(name.to_vec()).unwrap())
+        .collect()
+}
+
 // ── Test (a): single page, F1 used, F2 unused → F2 pruned ───────────────────
 
 #[test]
@@ -256,6 +277,69 @@ fn test_c_auto_shared_resources_not_pruned() {
     assert!(
         keys.contains(&"F2".to_string()),
         "Auto: F2 must remain in shared resources: {keys:?}"
+    );
+}
+
+// A Form XObject declared in a SHARED top-level /Resources (Auto mode skips
+// pruning the shared dict itself, per test (c) above) must still have its own
+// resources discovered and pruned: qpdf's structural Form discovery
+// (`QPDFPageObjectHelper.cc:313-345`) is independent of the Auto sharing skip,
+// matching `remove_unreferenced_resources_on_page`'s identical ordering.
+#[test]
+fn test_auto_shared_resources_still_prunes_a_declared_form() {
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+    let form_content = b"BT /FormF1 10 Tf ET";
+    let form_stream = {
+        let mut bytes = format!(
+            "9 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /FormF1 << /Type /Font >> /FormF2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        // Shared top-level /Resources declares a Form that neither page's
+        // content ever invokes via Do.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> \
+                 /XObject << /Fm0 9 0 R >> >>",
+            ),
+        ),
+        (7u32, stream_obj(7, content1)),
+        (8, stream_obj(8, content2)),
+        (9, form_stream),
+    ];
+
+    // Both pages reference the SAME resources object 5.
+    let page1_body = "/Contents 7 0 R /Resources 5 0 R";
+    let page2_body = "/Contents 8 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page1_body, page2_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Auto).expect("prune");
+
+    // The shared page-level /Resources itself must stay untouched (same as
+    // test_c_auto_shared_resources_not_pruned).
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
+        "Auto: shared page-level /Resources must remain untouched: {keys:?}"
+    );
+
+    // The declared Form's own resources ARE pruned, even though it is only
+    // reachable through the shared (Auto-skipped) page-level /Resources.
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(9, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["FormF1"],
+        "Auto: a Form declared in shared /Resources must still have its own \
+         unused resources pruned: {form_font_keys:?}"
     );
 }
 
@@ -495,11 +579,11 @@ fn test_f_indirect_category_subdict_pruned() {
 //   - Page /XObject/Fm0 is KEPT (page content invokes it via Do)
 #[test]
 fn test_h_form_own_resources_do_not_pollute_page_used() {
-    let form_content = b"BT /F2 10 Tf (inside form) Tj ET";
+    let form_content = b"BT /F2 10 Tf (inside form) Tj ET /Nested Do";
     // Form XObject with its own /Resources containing /Font/F2.
     let form_stream = {
         let header = format!(
-            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F2 << /Type /Font >> >> >> >>\nstream\n",
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F2 << /Type /Font >> /F3 << /Type /Font >> >> /XObject << /Nested 9 0 R /Unused 10 0 R >> >> >>\nstream\n",
             form_content.len()
         );
         let mut b = header.into_bytes();
@@ -523,6 +607,8 @@ fn test_h_form_own_resources_do_not_pollute_page_used() {
             ),
         ),
         (7, form_stream),
+        (9, obj_bytes(9, "<< /Type /XObject >>")),
+        (10, obj_bytes(10, "<< /Type /XObject >>")),
     ];
     let page_body = "/Contents 4 0 R /Resources 5 0 R";
     let pdf_bytes = build_pdf(&[page_body], &extra);
@@ -555,6 +641,338 @@ fn test_h_form_own_resources_do_not_pollute_page_used() {
     assert!(
         xobj_dict.get("Fm0").is_some(),
         "test_h: /XObject/Fm0 must remain: {xobj_dict:?}"
+    );
+
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["F2"],
+        "test_h: Form-owned /Font must be shallow-copied and pruned: {form_font_keys:?}"
+    );
+    let form_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert_eq!(
+        form_xobject_keys,
+        vec!["Nested"],
+        "test_h: Form-owned /XObject must be shallow-copied and pruned: {form_xobject_keys:?}"
+    );
+}
+
+#[test]
+fn test_form_own_resources_are_pruned_in_auto_mode() {
+    let form_content = b"BT /F1 10 Tf (inside form) Tj ET";
+    let form_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Auto).expect("prune");
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "Auto mode must prune an unshared Form-owned /Font dictionary: {keys:?}"
+    );
+}
+
+// qpdf discovers which Form XObjects to recurse into by iterating
+// `xobj_dict.getKeys()` on the *declared* `/XObject` resource-dictionary keys
+// (`QPDFPageObjectHelper::forEachXObject`, `QPDFPageObjectHelper.cc:313-345`)
+// — completely independent of whether that name is ever invoked by a `Do`
+// operator in the content stream. A Form declared but never invoked is still
+// queued and recursed into.
+//
+// Fm0 is declared in the page's /Resources/XObject but the page content
+// (`q Q`) never invokes it via `Do`. Fm0 has its own /Resources with an
+// unused /F2 alongside a used /F1. qpdf still walks into Fm0 (because it is
+// declared, not because it is invoked) and prunes /F2 from Fm0's own /Font
+// dictionary.
+#[test]
+fn test_declared_but_uninvoked_form_xobject_is_still_recursed() {
+    let form_content = b"BT /F1 10 Tf (inside form) Tj ET";
+    let form_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // Page content never invokes /Fm0 via Do — Fm0 is declared only.
+    let extra = vec![
+        (4, stream_obj(4, b"q Q")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "a declared-but-never-invoked Form XObject must still be recursed into and \
+         its own unused /Font entry pruned, matching qpdf's forEachXObject \
+         declared-key enumeration: {keys:?}"
+    );
+}
+
+// The single-level test above discovers Fm0's declared children from
+// `scope.resources`, which is the *page's own* (never mutated by this walk)
+// /Resources — so it does not exercise how `recurse_form_xobject`'s own tail
+// loop discovers a Form's *own* declared children after that Form's own dict
+// was (or was not) pruned in the same call. This nests one level deeper: a
+// declared-but-uninvoked ChildForm inside a Do-invoked ParentForm's own
+// /XObject dictionary.
+//
+// Unlike the page-level case above, this does NOT mirror the page's
+// unconditional declared-key discovery. qpdf's `forEachXObject` BFS
+// (`QPDFPageObjectHelper.cc:313-345`) discovers a Form's *own* declared
+// children by reading its *current* `/XObject` dict when that Form reaches
+// the front of the traversal queue — but that Form's own filtering step
+// (`removeUnreferencedResourcesHelper`, `QPDFPageObjectHelper.cc:539-633`)
+// already ran earlier and synchronously, the moment it was *discovered* as
+// the page's declared child (as the `action` callback `forEachXObject`
+// invokes), strictly before it is later popped from the queue to have its own
+// children discovered. So when ParentForm's own content (`q Q`) never invokes
+// Child via `Do`, ParentForm's own filtering step removes /Child from
+// ParentForm's own /XObject dict *before* ParentForm's children are ever
+// enumerated — Child is never discovered, never visited, and its own
+// /Font dictionary is never pruned. The page itself is the sole exception,
+// since its own filtering is deferred until after the whole traversal
+// completes (`QPDFPageObjectHelper.cc:636-649`) — see this function's doc for
+// the full explanation and citations.
+//
+// Verified empirically against qpdf 11.9.0
+// (`--remove-unreferenced-resources=yes --pages ... --preserve-unreferenced`,
+// since plain rewrite never invokes `removeUnreferencedResources()`): a
+// declared-but-uninvoked child Form nested inside a `Do`-invoked parent ends
+// up completely absent from the live-reachable resource graph — its parent's
+// /XObject dict no longer references it at all — while a Do-invoked sibling
+// under the same setup is discovered and has its own unused resources pruned
+// normally (`test_declared_but_uninvoked_child_form_nested_inside_a_form_is_recursed_when_do_invoked`
+// below).
+#[test]
+fn test_declared_but_uninvoked_child_form_nested_inside_a_form_is_not_discovered() {
+    let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
+    let child_stream = {
+        let header = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            child_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(child_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // ParentForm's own content never invokes /Child via Do — Child is
+    // declared only in ParentForm's own /XObject dictionary.
+    let parent_content = b"q Q";
+    let parent_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /XObject << /Child 8 0 R >> >> >>\nstream\n",
+            parent_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(parent_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // The page itself Do-invokes ParentForm.
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, parent_stream),
+        (8, child_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let parent_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert!(
+        parent_xobject_keys.is_empty(),
+        "ParentForm's own filtering step removes its declared-but-unused /Child \
+         entry before ParentForm's own children are ever enumerated, matching \
+         qpdf's forEachXObject reading ParentForm's post-filter /XObject dict: \
+         {parent_xobject_keys:?}"
+    );
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1", "F2"],
+        "ChildForm is never discovered once its declared entry is pruned from \
+         ParentForm's own /XObject dict, so its own /Font dictionary must be \
+         left completely untouched (not visited, not pruned): {keys:?}"
+    );
+}
+
+// Companion to the test above: same nesting, but ParentForm's own content
+// DOES `Do`-invoke Child. ParentForm's own filtering step then keeps /Child in
+// its own /XObject dict (it is actually used), so when ParentForm's children
+// are later enumerated, Child IS discovered and recursed into, and its own
+// unused /F2 is pruned — confirming the `pruning_ran` branch of
+// `recurse_form_xobject` (this Form's own filtering step ran) correctly uses
+// the post-filter snapshot. Verified against the same qpdf 11.9.0 probe setup
+// as the test above, with the parent's content additionally invoking
+// `/Child Do`.
+#[test]
+fn test_declared_and_invoked_child_form_nested_inside_a_form_is_recursed() {
+    let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
+    let child_stream = {
+        let header = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            child_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(child_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // ParentForm's own content DOES invoke /Child via Do this time.
+    let parent_content = b"/Child Do";
+    let parent_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /XObject << /Child 8 0 R >> >> >>\nstream\n",
+            parent_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(parent_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, parent_stream),
+        (8, child_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let parent_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert_eq!(
+        parent_xobject_keys,
+        vec!["Child"],
+        "ParentForm's own content uses /Child, so its own filtering step must \
+         keep it: {parent_xobject_keys:?}"
+    );
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "a Do-invoked child Form must still be recursed into and its own \
+         unused /Font entry pruned: {keys:?}"
+    );
+}
+
+// qpdf's structural `forEachXObject` walk (`QPDFPageObjectHelper.cc:313-345`)
+// never decodes content — a Form's declared children are discovered by
+// reading its `/Resources/XObject` dictionary directly, independent of
+// whether that Form's own content stream can be decoded at all. Before this
+// fix, `recurse_form_xobject` returned early (`Ok(false)`) on a
+// `decode_stream_data` failure, before ever reaching the declared-children
+// discovery loop — so a Form whose own content failed to decode, but which
+// still declared a child Form with its own prunable resources, left that
+// child entirely unvisited.
+//
+// This is ParentForm's own content that fails to *decode* (corrupt
+// FlateDecode data), as opposed to `test_malformed_form_content_retains_form_and_page_resources`
+// above (which fails to *tokenise* already-decoded bytes). Both are qpdf
+// early-return-`false` sites in `removeUnreferencedResourcesHelper`
+// (`QPDFPageObjectHelper.cc:539-565`) that leave the Form's own /Resources
+// completely untouched — so ParentForm's own declared /XObject/Child entry
+// must survive unpruned, and ChildForm must still be discovered and have its
+// own unused /F2 pruned.
+#[test]
+fn test_declared_child_form_is_still_recursed_when_parent_decode_fails() {
+    let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
+    let child_stream = {
+        let header = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            child_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(child_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // ParentForm's own content is corrupt FlateDecode data — decoding fails
+    // before ParentForm's own content is ever tokenised.
+    let bad_parent_body = b"not valid flate data";
+    let parent_stream = {
+        let mut bytes = format!(
+            "7 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} /Resources << /XObject << /Child 8 0 R >> >> >>\nstream\n",
+            bad_parent_body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(bad_parent_body);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> /PageF2 << /Type /Font >> >> /XObject << /Fm0 7 0 R >> >>",
+            ),
+        ),
+        (7, parent_stream),
+        (8, child_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let parent_xobject_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "XObject");
+    assert_eq!(
+        parent_xobject_keys,
+        vec!["Child"],
+        "ParentForm's own filtering step never ran (its content failed to \
+         decode), so its own /XObject dict must be left untouched: \
+         {parent_xobject_keys:?}"
+    );
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "ChildForm must still be discovered and have its own unused /Font \
+         entry pruned despite ParentForm's own decode failure, matching \
+         qpdf's structural forEachXObject walk which never decodes content: \
+         {keys:?}"
+    );
+
+    assert_eq!(
+        font_dict_keys(&mut pdf, ObjectRef::new(5, 0)),
+        vec!["PageF1", "PageF2"],
+        "ParentForm's own decode failure must still conservatively retain the \
+         page-level resources"
     );
 }
 
@@ -1420,7 +1838,7 @@ fn test_form_decode_failure_retains_page() {
     let bad_body = b"this is not valid flate data";
     let form_stream = {
         let mut b = format!(
-            "6 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} >>\nstream\n",
+            "6 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
             bad_body.len()
         )
         .into_bytes();
@@ -1466,6 +1884,148 @@ fn test_form_decode_failure_retains_page() {
     assert!(
         font_dict.get("F1").is_some(),
         "decode failure: page retained, /F1 kept: {font_dict:?}"
+    );
+
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["F1", "F2"],
+        "decode failure: Form-owned resources must remain untouched: {form_font_keys:?}"
+    );
+}
+
+#[test]
+fn test_form_unresolved_font_name_retains_form_and_page_resources() {
+    let form_content = b"BT /Missing 10 Tf (unresolved) Tj ET";
+    let form_stream = {
+        let mut bytes = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> /PageF2 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    assert_eq!(
+        form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font"),
+        vec!["F1", "F2"],
+        "an unresolved own Font name must disable Form pruning"
+    );
+    assert_eq!(
+        font_dict_keys(&mut pdf, ObjectRef::new(5, 0)),
+        vec!["PageF1", "PageF2"],
+        "an unresolved own Font name must conservatively retain the page resources"
+    );
+}
+
+#[test]
+fn test_malformed_form_content_retains_form_and_page_resources() {
+    let form_content = b"BT /F1 10 Tf ET 1 2 3";
+    let form_stream = {
+        let mut bytes = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> /PageF2 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    assert_eq!(
+        form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font"),
+        vec!["F1", "F2"],
+        "malformed Form content must leave its own resources untouched"
+    );
+    assert_eq!(
+        font_dict_keys(&mut pdf, ObjectRef::new(5, 0)),
+        vec!["PageF1", "PageF2"],
+        "malformed Form content must conservatively retain page resources"
+    );
+}
+
+#[test]
+fn test_parent_form_prunes_before_child_decode_failure() {
+    let parent_content = b"BT /F1 10 Tf ET /Child Do";
+    let parent_stream = {
+        let mut bytes = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> /XObject << /Child 7 0 R >> >> >>\nstream\n",
+            parent_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(parent_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let bad_child_body = b"not valid flate data";
+    let bad_child = {
+        let mut bytes = format!(
+            "7 0 obj\n<< /Subtype /Form /Filter /FlateDecode /Length {} >>\nstream\n",
+            bad_child_body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(bad_child_body);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (4, stream_obj(4, b"/Parent Do")),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> /PageF2 << /Type /Font >> >> /XObject << /Parent 6 0 R >> >>",
+            ),
+        ),
+        (6, parent_stream),
+        (7, bad_child),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    assert_eq!(
+        form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font"),
+        vec!["F1"],
+        "the valid parent Form must be pruned before its child failure"
+    );
+    assert_eq!(
+        font_dict_keys(&mut pdf, ObjectRef::new(5, 0)),
+        vec!["PageF1", "PageF2"],
+        "the child failure must still protect the page-level resources"
     );
 }
 
@@ -1636,14 +2196,23 @@ fn test_form_own_resources_indirect_reference_resolved() {
         // it must be pruned (the Form's /FA is scoped to the Form's own resources).
         (
             5,
-            obj_bytes(
-                5,
-                "<< /Font << /FA << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
-            ),
+            obj_bytes(5, "<< /Font 8 0 R /XObject << /Fm0 6 0 R >> >>"),
         ),
         (6, form_stream),
-        // Form's own /Resources (indirect): its own /FA font.
-        (7, obj_bytes(7, "<< /Font << /FA << /Type /Font >> >> >>")),
+        // Form's own /Resources (indirect): its own /FA font plus an unused
+        // sibling. The category object is also referenced by the page, so the
+        // Form must receive a shallow copy before page-level pruning mutates it.
+        (
+            7,
+            obj_bytes(
+                7,
+                "<< /Font 8 0 R >>",
+            ),
+        ),
+        (
+            8,
+            obj_bytes(8, "<< /FA << /Type /Font >> /FB << /Type /Font >> >>"),
+        ),
     ];
     let pdf_bytes = build_pdf_raw(&objects);
 
@@ -1659,6 +2228,13 @@ fn test_form_own_resources_indirect_reference_resolved() {
     assert!(
         res_dict.get("Font").is_none(),
         "page /Font must be pruned — the Form's /FA is scoped to its own (indirect) /Resources: {res_dict:?}"
+    );
+
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["FA"],
+        "the Form must retain a shallow copy of its used shared-category entry: {form_font_keys:?}"
     );
 }
 
@@ -2913,6 +3489,64 @@ fn corrupt_page_content_single_page_default_mode_does_not_abort() {
         keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
         "both fonts must be conservatively retained — the page content is \
          undecodable so no entry can be proven unused: {keys:?}"
+    );
+}
+
+// The page's own /Contents cannot be decoded, but its /Resources/XObject still
+// DECLARES a Form (unreachable via `Do` since the page's content can't even be
+// tokenised). qpdf's structural Form discovery (`QPDFPageObjectHelper.cc:313-345`)
+// is independent of content-stream decoding, so the declared Form must still be
+// found and pruned, mirroring `test_form_decode_failure_retains_page`'s inverse:
+// there the FORM fails to decode and the PAGE is retained; here the PAGE fails to
+// decode and the FORM (whose own content decodes fine) must still be pruned.
+#[test]
+fn corrupt_page_content_still_prunes_a_declared_but_unreached_form() {
+    let form_content = b"BT /F1 10 Tf ET";
+    let form_stream = {
+        let mut bytes = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (
+            4u32,
+            stream_obj_with_filter(4, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must degrade gracefully, not abort");
+
+    let page_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert_eq!(
+        page_keys,
+        vec!["PageF1"],
+        "the page's own content is undecodable, so its /Font must be \
+         conservatively retained: {page_keys:?}"
+    );
+
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["F1"],
+        "the declared Form's own content DOES decode: its unused /F2 must \
+         still be pruned even though the page content that would normally \
+         invoke it via Do could not be decoded: {form_font_keys:?}"
     );
 }
 

@@ -20,6 +20,11 @@
 //! (`/Font`, `/XObject`, `/ColorSpace`, `/Pattern`, `/Shading`, `/ExtGState`,
 //! `/Properties`). It does **not** garbage-collect unreachable PDF objects at
 //! the xref level — that is a separate concern.
+//!
+//! The extraction walk below follows qpdf 11.9.0's Form-before-page ordering
+//! (`QPDFPageObjectHelper.cc:636-649`). The separate `PageDocumentHelper`
+//! facade delegates to its own page-helper route and is intentionally not
+//! changed by this extraction-only responsibility.
 
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::filters::decode_stream_data;
@@ -501,7 +506,19 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
         };
 
         if mode == RemoveUnreferencedResources::Auto && is_shared {
-            // Auto: skip shared resources — we must not prune them.
+            // Auto: skip shared resources — we must not prune the shared
+            // page-level dictionary itself, and its own content would only be
+            // decoded/tokenised to compute used-names that get discarded
+            // regardless, so skip that (potentially expensive, and — with N
+            // pages sharing one /Resources — potentially N-times-repeated)
+            // work entirely. Still discover and prune every Form XObject
+            // declared in the page's /Resources/XObject: qpdf's structural
+            // Form discovery (`forEachXObject`, `QPDFPageObjectHelper.cc:
+            // 313-345`) is independent of page-level pruning decisions,
+            // matching the separate `remove_unreferenced_resources_on_page`
+            // route's identical ordering, so it must still run here even
+            // though the page's own resources are left untouched.
+            prune_declared_forms_for_page(pdf, page_ref)?;
             continue;
         }
 
@@ -509,10 +526,15 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
         // be fully understood — it failed to decode (corrupt FlateDecode) or to
         // tokenise part-way (malformed content syntax) — collection returns
         // `None` rather than aborting, degrading like the Form XObject path (see
-        // `recurse_form_xobject`). Mark the page's resources group as protected so
-        // its resources are conservatively retained rather than pruned against an
-        // incomplete used-name set. Genuine structural errors (resolving the
-        // inherited /Resources or a Form object reference) still propagate via `?`.
+        // `recurse_form_xobject`). Genuine structural errors (resolving the
+        // inherited /Resources or a Form object reference) still propagate via
+        // `?`. This call also discovers and prunes every Form XObject declared
+        // in the page's /Resources/XObject, matching the Auto-shared branch
+        // above.
+        //
+        // Mark the page's resources group as protected so its resources are
+        // conservatively retained rather than pruned against an incomplete
+        // used-name set.
         let used = match collect_used_names_for_page(pdf, page_ref)? {
             Some(used) => used,
             None => {
@@ -832,39 +854,90 @@ fn collect_used_names_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Option<UsedNames>> {
-    // A failure to *decode* the page's /Contents (corrupt filter) is a
-    // content-comprehension failure → conservatively retain (None), do not abort.
-    let content_bytes = match crate::pages::page_content_bytes(pdf, page_ref) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-
     // Resolving the inherited /Resources is a structural operation, not content
     // comprehension: propagate its errors rather than silently degrading.
     let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
 
     let mut used: UsedNames = BTreeMap::new();
+    let mut form_used: BTreeMap<ObjectRef, UsedNames> = BTreeMap::new();
     let mut visited_forms: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
 
     // `collect_from_stream` returns `false` when tokenisation stopped early on a
     // malformed token: the collected names are then incomplete → retain. The
-    // page records its own directly-referenced names (`record_direct = true`) and
-    // owns the initial scope (`owner = page_ref`).
+    // page records its own directly-referenced names and owns the initial scope
+    // (`owner = page_ref`). Form-owned names are kept separately so the Form's
+    // own `/Font` and `/XObject` dictionaries can be pruned after its complete
+    // content has been collected.
     let complete = {
         let mut ctx = CollectCtx {
             pdf,
             used: &mut used,
+            form_used: &mut form_used,
             visited: &mut visited_forms,
         };
         let page_scope = Scope {
             resources: page_resources.as_ref(),
-            record_direct: true,
+            target: UsedTarget::Page,
             owner: page_ref,
         };
-        collect_from_stream(&mut ctx, &content_bytes, page_scope, 0)?
+        // A failure to *decode* the page's /Contents (corrupt filter) is a
+        // content-comprehension failure -- the page's own resource usage is
+        // unknown, so its /Font,/XObject dictionaries must be conservatively
+        // retained. But qpdf's structural Form discovery (`forEachXObject`,
+        // `QPDFPageObjectHelper.cc:313-345`) is independent of content-stream
+        // decoding, so the page's declared Forms must still be discovered and
+        // recursed into so their own resources are pruned -- mirroring
+        // `recurse_form_xobject`'s identical decode-failure handling above
+        // (`Err(_) => complete = false` followed by unconditional declared-child
+        // discovery).
+        match crate::pages::page_content_bytes(ctx.pdf, page_ref) {
+            Ok(content_bytes) => collect_from_stream(&mut ctx, &content_bytes, page_scope, 0)?,
+            Err(_) => {
+                for (_, val) in declared_xobjects(ctx.pdf, page_scope.resources)? {
+                    recurse_form_xobject(&mut ctx, val, page_scope, 0)?;
+                }
+                false
+            }
+        }
     };
 
     Ok(complete.then_some(used))
+}
+
+/// Discover and prune every Form XObject declared in a page's own
+/// `/Resources/XObject`, without decoding or tokenising the page's own
+/// content stream.
+///
+/// This is the cheap half of [`collect_used_names_for_page`], split out for
+/// callers (Auto mode's shared-page skip) that need the page-content-independent
+/// structural Form-pruning side effect (qpdf's `forEachXObject`,
+/// `QPDFPageObjectHelper.cc:313-345`) but will discard the page's own
+/// used-names regardless, so decoding/tokenising its (potentially large)
+/// content stream would be pure waste.
+fn prune_declared_forms_for_page<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<()> {
+    let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
+
+    let mut used: UsedNames = BTreeMap::new();
+    let mut form_used: BTreeMap<ObjectRef, UsedNames> = BTreeMap::new();
+    let mut visited_forms: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
+    let mut ctx = CollectCtx {
+        pdf,
+        used: &mut used,
+        form_used: &mut form_used,
+        visited: &mut visited_forms,
+    };
+    let page_scope = Scope {
+        resources: page_resources.as_ref(),
+        target: UsedTarget::Page,
+        owner: page_ref,
+    };
+    for (_, val) in declared_xobjects(ctx.pdf, page_scope.resources)? {
+        recurse_form_xobject(&mut ctx, val, page_scope, 0)?;
+    }
+    Ok(())
 }
 
 /// Maximum recursion depth for Form XObject traversal.
@@ -891,6 +964,23 @@ struct CollectCtx<'a, R: Read + Seek + 'static> {
     /// Form reached under diverging scopes be explored once per scope. See the
     /// `recurse_form_xobject` "Traversal bound" doc for the full rationale.
     visited: &'a mut BTreeSet<(ObjectRef, ObjectRef)>,
+    /// Directly referenced names for each Form with its own `/Resources`.
+    /// qpdf 11.9.0's `removeUnreferencedResourcesHelper` shallow-copies and
+    /// prunes only `/Font` and `/XObject` in that Form's own scope
+    /// (`QPDFPageObjectHelper.cc:539-633`), so these names must not be merged
+    /// into the page accumulator.
+    form_used: &'a mut BTreeMap<ObjectRef, UsedNames>,
+}
+
+/// Where direct resource names discovered by the content walker belong.
+///
+/// qpdf distinguishes the page scope from a Form's own `/Resources` scope. A
+/// resource-less Form uses [`UsedTarget::Page`] and bubbles its names outward;
+/// an own-resources Form is pruned from its own accumulator.
+#[derive(Clone, Copy)]
+enum UsedTarget {
+    Page,
+    Form(ObjectRef),
 }
 
 /// The resource scope in force while walking a content stream.
@@ -898,10 +988,9 @@ struct CollectCtx<'a, R: Read + Seek + 'static> {
 struct Scope<'a> {
     /// The `/Resources` dict that names in this stream resolve against.
     resources: Option<&'a Dictionary>,
-    /// Whether this stream's *direct* names are page-relevant and recorded into
-    /// `ctx.used`. True for the page and resource-less Forms; false for a Form
-    /// with its own `/Resources` (its direct names are scoped to itself).
-    record_direct: bool,
+    /// The accumulator receiving this stream's direct names. Resource-less
+    /// Forms target the page; own-resources Forms target their own object.
+    target: UsedTarget,
     /// Identity of the scope for `visited` keying: the page, or the `ObjectRef`
     /// of the nearest Form with its own `/Resources`. A resource-less Form
     /// inherits its caller's `owner`; an own-`/Resources` Form becomes its own.
@@ -1014,17 +1103,110 @@ impl ParserCallbacks for ResourceCallbacks {
     }
 }
 
-/// Core recursive walker: tokenises `stream_bytes` and records every resource
-/// reference into `ctx.used`. `scope` is the resource scope in force for this
-/// stream (see [`Scope`]).
+/// Result of parsing a content stream before walking its referenced Forms.
 ///
-/// `scope.record_direct` controls whether names referenced *directly* by this
-/// stream are attributed to `ctx.used`. It is `true` for the page and for
-/// resource-less Form XObjects (whose names are page-relevant), and `false` for
-/// a Form with its own `/Resources` (whose direct names resolve against that
-/// Form's own scope and must not affect page-level pruning). Nested Form XObjects
-/// are still traversed regardless, so a resource-less Form nested inside an
-/// own-resources Form still contributes its names to the page.
+/// `ResourceCallbacks::valid_xobjects` (the `Do`-invoked names) is
+/// deliberately not surfaced here: the recursion-triggering walk uses the
+/// declared `/XObject` resource-dictionary keys instead (see
+/// [`declared_xobjects`]), matching qpdf's `forEachXObject`
+/// (`QPDFPageObjectHelper.cc:313-345`), which is a static structural walk over
+/// `xobj_dict.getKeys()` independent of content-stream parsing. Every name a
+/// `Do` operator could legally invoke is necessarily a declared key, so the
+/// declared set is a superset and `Do`-invoked names add nothing here.
+struct ParsedContent {
+    complete: bool,
+    names: ResourceNamesByType,
+}
+
+/// Tokenise `stream_bytes` and collect its direct resource events without
+/// resolving any child object yet.
+fn parse_resource_content(stream_bytes: &[u8]) -> ParsedContent {
+    let mut callbacks = ResourceCallbacks {
+        finder: ResourceFinder::default(),
+        inline_header: None,
+        valid_xobjects: BTreeMap::new(),
+        complete: true,
+    };
+    let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
+    let complete =
+        parse_result.is_ok() && !callbacks.finder.had_diagnostics() && callbacks.complete;
+    let names = callbacks.finder.names_by_resource_type().clone();
+    ParsedContent { complete, names }
+}
+
+/// Return the declared `/XObject` resource-dictionary entries in `resources`,
+/// each already resolved to its `(name, value)` pair.
+///
+/// Matches qpdf's `QPDFPageObjectHelper::forEachXObject`
+/// (`QPDFPageObjectHelper.cc:313-345`): `xobj_dict` is fetched once —
+/// `getAttribute("/Resources", false).getKeyIfDict("/XObject")` — and then
+/// `for (auto const& key: xobj_dict.getKeys()) { QPDFObjectHandle obj =
+/// xobj_dict.getKey(key); ... }` reads both the key and its value from that
+/// single resolved dict. Returning the value alongside the name here (rather
+/// than making the caller re-resolve the `/XObject` category per name) is the
+/// same "one held dict, per-key value from it" shape — resolving the category
+/// separately for each of its own N entries would make an O(N)-key dict cost
+/// O(N) full-dict resolves.
+///
+/// Every key declared in the current scope's `/XObject` category is a
+/// recursion candidate, independent of whether the content stream ever
+/// invokes it with a `Do` operator. A Form declared but never invoked is
+/// still queued and walked by qpdf's traversal, so it must be here too.
+///
+/// The `/XObject` category itself may be a direct dictionary or an indirect
+/// reference (resolved the same way `form_xobjects_in_resources` resolves the
+/// category for the sibling "Form-owned resources" pruning pass).
+fn declared_xobjects<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: Option<&Dictionary>,
+) -> Result<Vec<(Vec<u8>, Object)>> {
+    let xobj_dict = match resources.and_then(|res| res.get("XObject")) {
+        Some(Object::Dictionary(xobj_dict)) => Some(xobj_dict.clone()),
+        Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(pdf, cat_ref)?.0.into_dict(),
+        _ => None,
+    };
+    Ok(xobj_dict
+        .map(|dict| {
+            dict.iter()
+                .map(|(name, val)| (name.to_vec(), val.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Record direct resource names in the page or owning Form accumulator.
+fn record_names_for_target(
+    ctx: &mut CollectCtx<'_, impl Read + Seek + 'static>,
+    target: UsedTarget,
+    names: &ResourceNamesByType,
+) {
+    match target {
+        UsedTarget::Page => record_direct_names(ctx.used, names, true),
+        UsedTarget::Form(form_ref) => {
+            let used = ctx.form_used.entry(form_ref).or_default();
+            record_direct_names(used, names, true);
+        }
+    }
+}
+
+/// Core recursive walker: tokenises `stream_bytes` and records every resource
+/// reference into the accumulator selected by `scope` (see [`Scope`]). qpdf
+/// 11.9.0 parses a Form with its own `/Resources` in that local scope and
+/// shallow-copies `/Font` and `/XObject` before pruning them
+/// (`QPDFPageObjectHelper.cc:539-633`); resource-less descendants instead
+/// contribute unresolved names to the containing page's protection set. Nested
+/// Form XObjects are still traversed regardless, so a resource-less Form nested
+/// inside an own-resources Form still contributes names to the page.
+///
+/// Recursion targets are `scope`'s *declared* `/XObject` resource-dictionary
+/// keys (see [`declared_xobjects`]), not the `Do`-invoked names found
+/// while tokenising this stream — qpdf's `forEachXObject` walk
+/// (`QPDFPageObjectHelper.cc:313-345`) is independent of content-stream
+/// parsing. Every declared child is visited even after an earlier child comes
+/// back incomplete: qpdf's `forEachFormXObject` visits every queued Form
+/// unconditionally, and only the accumulated failure gates the final
+/// page-level prune (`QPDFPageObjectHelper.cc:636-649`), so this walk must not
+/// short-circuit either.
 ///
 /// Returns `Ok(true)` when the stream was tokenised to the end, `Ok(false)` when
 /// tokenisation stopped early on a malformed token (so `ctx.used` is incomplete
@@ -1036,27 +1218,16 @@ fn collect_from_stream<R: Read + Seek>(
     scope: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
-    let mut callbacks = ResourceCallbacks {
-        finder: ResourceFinder::default(),
-        inline_header: None,
-        valid_xobjects: BTreeMap::new(),
-        complete: true,
-    };
-    let parse_result = parse_content_stream_data(stream_bytes, &mut callbacks);
-    let mut complete =
-        parse_result.is_ok() && !callbacks.finder.had_diagnostics() && callbacks.complete;
+    let parsed = parse_resource_content(stream_bytes);
+    let mut complete = parsed.complete;
 
-    let names = callbacks.finder.names_by_resource_type();
-    if complete {
-        record_direct_names(ctx.used, names, scope.record_direct);
+    if parsed.complete {
+        record_names_for_target(ctx, scope.target, &parsed.names);
     }
 
-    let mut valid_xobjects = callbacks.valid_xobjects.iter().collect::<Vec<_>>();
-    valid_xobjects.sort_unstable_by_key(|(_, offset)| *offset);
-    for (name, _) in valid_xobjects {
-        if !recurse_form_xobject(ctx, name, scope, depth)? {
+    for (_, val) in declared_xobjects(ctx.pdf, scope.resources)? {
+        if !recurse_form_xobject(ctx, val, scope, depth)? {
             complete = false;
-            break;
         }
     }
     Ok(complete)
@@ -1089,7 +1260,8 @@ fn is_form_xobject(dict: &Dictionary) -> bool {
     matches!(dict.get("Subtype"), Some(Object::Name(n)) if n.as_slice() == b"Form")
 }
 
-/// If `xobject_name` resolves to a Form XObject, decode and recurse into its
+/// If `xobj_val` (the value of a declared `/XObject` entry — see
+/// [`declared_xobjects`]) is a Form XObject, decode and recurse into its
 /// content stream.
 ///
 /// Scoping rule (PDF spec §8.10.4):
@@ -1130,17 +1302,59 @@ fn is_form_xobject(dict: &Dictionary) -> bool {
 /// incomplete (`Ok(false)`), conservatively retaining its resources. This
 /// avoids both the DoS and dropping fonts the Form uses.
 ///
+/// # Discovery vs. pruning order for nested Forms
+///
+/// qpdf's `removeUnreferencedResourcesHelper` (`QPDFPageObjectHelper.cc:539-633`)
+/// parses a Form's own content and, only if that parse succeeds *and* leaves no
+/// unresolved `/Font`/`/XObject` name, shallow-copies and filters that Form's
+/// own `/Font`/`/XObject` dictionaries down to the names its content actually
+/// uses (`QPDFPageObjectHelper.cc:565-633`). Three cases return `false` *before*
+/// that filtering step runs — the content parse throws, the content parse
+/// records a new warning, or an unresolved name is present — and in every one
+/// of them the Form's own `/Resources` sub-dictionaries are left untouched.
+///
+/// `forEachXObject`'s BFS (`QPDFPageObjectHelper.cc:313-345`) discovers a
+/// Form's *own* declared children by reading its *current* `/XObject` dict when
+/// that Form reaches the front of the traversal queue. That Form's own
+/// filtering step (above) runs earlier and synchronously, the moment it is
+/// *discovered* as some ancestor's declared child (as the `action` callback
+/// `forEachXObject` invokes) — strictly before it is later popped from the
+/// queue to have its own children discovered. So whether a Form's children are
+/// discovered from its post-filter or pre-filter `/XObject` dict depends on
+/// whether that Form's own filtering step ran:
+/// - Ran (content parsed, no unresolved names): children are discovered from
+///   the **post-filter** dict — a declared-but-never-`Do`-invoked child's key
+///   is already gone, so it is never discovered or visited, and its own
+///   resources are never pruned. Verified empirically against qpdf 11.9.0
+///   (`--remove-unreferenced-resources=yes --pages ... --preserve-unreferenced`):
+///   a declared-but-uninvoked child Form nested inside a `Do`-invoked parent is
+///   completely absent from the live-reachable resource graph, orphaned
+///   alongside the parent's original, now-superseded `/Resources` object.
+/// - Did not run (this function's own `decode_stream_data`/
+///   `parse_resource_content` failed, or an unresolved name vetoed pruning):
+///   children are discovered from the **pre-filter** dict — every declared
+///   child, `Do`-invoked or not. Verified the same way with the parent's own
+///   content made unparseable: the child Form still has its own unused Font
+///   pruned, despite the parent's decode failure.
+///
+/// The page itself is the sole exception to "a Form's own filtering-ran state
+/// gates its children's discovery snapshot": the page is not reached via this
+/// function, and its own filtering is deferred to *after* the entire
+/// `forEachFormXObject` traversal completes (`QPDFPageObjectHelper.cc:636-649`),
+/// so the page's declared children (`collect_from_stream`'s top-level call)
+/// are always discovered from its pristine, unfiltered `/XObject` dict.
+///
 /// # Return value
 ///
 /// Returns `Ok(true)` when the referenced Form (if any) was tokenised completely
-/// or nothing page-relevant could be lost (non-Form / absent / already-visited /
+/// or nothing page-relevant could be lost (non-Form / already-visited /
 /// depth-limit). Returns `Ok(false)` when the page's `used` set may be
 /// incomplete — a decode/tokenise failure whose names feed the page, or a
 /// direct-stream Form — signalling the page must be conservatively retained.
 /// Structural resolution errors propagate as `Err`.
 fn recurse_form_xobject<R: Read + Seek>(
     ctx: &mut CollectCtx<'_, R>,
-    xobject_name: &[u8],
+    xobj_val: Object,
     caller: Scope<'_>,
     depth: usize,
 ) -> Result<bool> {
@@ -1155,25 +1369,6 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(false);
     }
 
-    // Locate the XObject entry in the current /Resources scope. The
-    // `/XObject` resource category itself may be a direct dictionary *or*
-    // an indirect reference (`/XObject 6 0 R`) — resolve the latter, the
-    // same way `apply_pruning` already treats indirect category dicts. The
-    // reference may itself be reached through more than one indirect hop
-    // (ref -> ref -> dict); follow the chain to its terminal dictionary.
-    let xobj_val: Option<Object> = match caller.resources.and_then(|res| res.get("XObject")) {
-        Some(Object::Dictionary(xobj_dict)) => xobj_dict.get(xobject_name).cloned(),
-        Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(ctx.pdf, cat_ref)?
-            .0
-            .into_dict()
-            .and_then(|xobj_dict| xobj_dict.get(xobject_name).cloned()),
-        _ => None,
-    };
-
-    let Some(xobj_val) = xobj_val else {
-        return Ok(true);
-    };
-
     // Resolve to a Stream. An indirect XObject may be reached through more than
     // one indirect hop (ref -> ref -> stream); follow the chain to its terminal.
     // A direct (inline) stream is handled separately: it has no `ObjectRef`
@@ -1182,7 +1377,7 @@ fn recurse_form_xobject<R: Read + Seek>(
     // prune (dropping fonts the Form uses), we report the page as incomplete so
     // its resources are conservatively retained. qpdf never parses an inline
     // stream as a Form, so there is no byte-identical target for this case.
-    let (stream, xobj_ref) = match xobj_val {
+    let (mut stream, xobj_ref) = match xobj_val {
         Object::Reference(r) => {
             // Key the `visited` set on the *terminal* ref, not the first hop, so a
             // Form reached via distinct reference chains (`r_a -> T`, `r_b -> T`)
@@ -1224,12 +1419,19 @@ fn recurse_form_xobject<R: Read + Seek>(
     // would walk the Form with `record_direct = false` and an empty scope, so a
     // page-inherited name it uses would never be recorded → over-prune. (Resolved
     // objects are cached, so re-resolving on a later visit is O(1).)
-    let form_resources: Option<Dictionary> = match stream.dict.get("Resources") {
+    let mut form_resources: Option<Dictionary> = match stream.dict.get("Resources") {
         Some(Object::Dictionary(d)) => Some(d.clone()),
         Some(res_ref @ Object::Reference(_)) => resolve_ref_chain(ctx.pdf, res_ref)?.0.into_dict(),
         _ => None,
     };
     let form_has_own_resources = form_resources.is_some();
+
+    // Snapshot this Form's own /Resources before its own filtering step
+    // (below) can prune it. Whichever of this snapshot or the (possibly
+    // filtered) `form_resources` drives discovery of this Form's own children
+    // depends on whether that filtering step actually ran — see "Discovery vs.
+    // pruning order for nested Forms" on this function's doc.
+    let declared_child_resources = form_resources.clone();
 
     // A Form with its own /Resources is scope-independent (owner = itself); a
     // resource-less Form inherits the caller's scope owner. (See "Traversal
@@ -1248,36 +1450,120 @@ fn recurse_form_xobject<R: Read + Seek>(
         return Ok(true); // already expanded under this scope
     }
 
-    // Decode the Form's content stream. On failure, the Form's resource usage is
-    // unknown: that makes the page incomplete when the Form (or a resource-less
-    // Form nested within it) feeds the page's `used` set.
-    let form_bytes = match decode_stream_data(&stream.dict, &stream.data) {
-        Ok(b) => b,
-        Err(_) => return Ok(false),
-    };
-
-    let child = if form_has_own_resources {
+    let child_target = if form_has_own_resources {
         // The Form owns its scope (`owner = scope_owner = xobj_ref`); its direct
-        // names are not page-relevant (`record_direct = false`), but nested
-        // resource-less Forms still bubble to the page.
-        Scope {
-            resources: form_resources.as_ref(),
-            record_direct: false,
-            owner: scope_owner,
-        }
+        // names are accumulated for local pruning, while nested resource-less
+        // Forms still bubble to the page.
+        UsedTarget::Form(xobj_ref)
     } else {
         // No own /Resources → the Form inherits the caller's scope and owner and
-        // attributes its names to the page's used set (`record_direct = true`).
-        Scope {
-            resources: caller.resources,
-            record_direct: true,
-            owner: scope_owner,
-        }
+        // attributes its names to the page's used set.
+        UsedTarget::Page
     };
-    // The child walk's completeness IS the page's completeness: an incomplete
-    // tokenisation may have missed a page-relevant (inherited or nested) name, so
-    // it propagates up and the page is conservatively retained.
-    collect_from_stream(ctx, &form_bytes, child, depth + 1)
+
+    // Decode this Form's content stream and, on success, parse it and (for a
+    // Form with its own /Resources) filter its own /Font,/XObject dictionaries
+    // down to the names it actually uses — mirroring qpdf's three
+    // early-return-`false` sites in `removeUnreferencedResourcesHelper` that
+    // all precede its filtering step (`QPDFPageObjectHelper.cc:539-633`): a
+    // decode failure here corresponds to qpdf's content-parse throwing; an
+    // incomplete tokenisation corresponds to qpdf's content-parse recording a
+    // new warning; an unresolved name is the same check qpdf makes.
+    // `pruning_ran` records which case this was: it decides whether `child`
+    // below reads the post-filter or pre-filter /XObject snapshot (see
+    // "Discovery vs. pruning order for nested Forms"). qpdf's structural
+    // `forEachXObject` walk never decodes content at all
+    // (`QPDFPageObjectHelper.cc:313-345`), so a decode/parse failure here still
+    // yields `complete = false` (the page must be conservatively retained) but
+    // must not skip discovering and recursing into this Form's declared
+    // children below.
+    let mut complete;
+    let mut pruning_ran = false;
+    match decode_stream_data(&stream.dict, &stream.data) {
+        Ok(form_bytes) => {
+            // Parse the current Form before visiting children. qpdf's
+            // `forEachFormXObject(true, ...)` invokes the parent Form action
+            // before its queued children (`QPDFPageObjectHelper.cc:318-343`),
+            // and a later child failure does not roll back a successful parent
+            // prune (`QPDFPageObjectHelper.cc:636-649`).
+            let parsed = parse_resource_content(&form_bytes);
+            complete = parsed.complete;
+            if parsed.complete {
+                record_names_for_target(ctx, child_target, &parsed.names);
+
+                // qpdf also refuses to prune a Form with an unresolved
+                // Font/XObject name in its own dictionary
+                // (`QPDFPageObjectHelper.cc:575-633`); mark the page walk
+                // incomplete so its resources remain conservative in that case.
+                if form_has_own_resources {
+                    let mut resources = form_resources
+                        .take()
+                        .expect("own Form resources were resolved");
+                    let local_used = ctx.form_used.remove(&xobj_ref).unwrap_or_default();
+                    if unresolved_resource_names(ctx.pdf, Some(&resources), &local_used)?.is_empty()
+                    {
+                        prune_font_and_xobject_dictionaries(ctx.pdf, &mut resources, &local_used)?;
+                        stream
+                            .dict
+                            .insert("Resources", Object::Dictionary(resources.clone()));
+                        ctx.pdf.set_object(xobj_ref, Object::Stream(stream));
+                        form_resources = Some(resources);
+                        pruning_ran = true;
+                    } else {
+                        complete = false;
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            // The Form's own content is unreadable, so its resource usage is
+            // unknown and the page (or Form) it feeds must be conservatively
+            // retained. `pruning_ran` stays `false`: this Form's own
+            // /Font,/XObject dictionaries were never touched, so its declared
+            // children are still discovered below from the pre-filter snapshot.
+            complete = false;
+        }
+    }
+
+    // `child.resources` drives discovery of this Form's own declared children
+    // below: the post-filter `form_resources` if this Form's own filtering
+    // step ran, the pre-filter `declared_child_resources` snapshot if it did
+    // not — see "Discovery vs. pruning order for nested Forms" above. This is
+    // unrelated to what gets *written* to `ctx.pdf`: any write-back above
+    // already used the filtered `resources`/`form_resources`; only the
+    // discovery scope changes here.
+    let child = Scope {
+        resources: if !form_has_own_resources {
+            caller.resources
+        } else if pruning_ran {
+            form_resources.as_ref()
+        } else {
+            declared_child_resources.as_ref()
+        },
+        target: child_target,
+        owner: scope_owner,
+    };
+
+    // The child walk's completeness is the page's completeness: an incomplete
+    // tokenisation or child resolution may have missed a page-relevant name, so
+    // it propagates up and the page is conservatively retained. Child traversal
+    // still runs after a malformed parent, matching qpdf's independent Form
+    // queue and allowing a valid child to be processed.
+    //
+    // Children are this Form's *declared* `/XObject` entries (see
+    // `declared_xobjects`), not just its `Do`-invoked names — qpdf's
+    // `forEachFormXObject` queues every declared Form regardless of `Do` usage
+    // (`QPDFPageObjectHelper.cc:313-345`). Every declared child is visited even
+    // after an earlier sibling comes back incomplete: qpdf's traversal never
+    // short-circuits on one Form's failure (`QPDFPageObjectHelper.cc:636-649`),
+    // it only accumulates `any_failures` for the final page-level prune.
+    for (_, val) in declared_xobjects(ctx.pdf, child.resources)? {
+        if !recurse_form_xobject(ctx, val, child, depth + 1)? {
+            complete = false;
+        }
+    }
+
+    Ok(complete)
 }
 
 /// Prune `res_ref` (an indirect /Resources object) in-place: remove every
@@ -1905,16 +2191,18 @@ mod tests {
         resources: Option<&Dictionary>,
     ) -> Result<(bool, UsedNames)> {
         let mut used = UsedNames::new();
+        let mut form_used = BTreeMap::new();
         let mut visited = BTreeSet::new();
         let complete = {
             let mut ctx = CollectCtx {
                 pdf,
                 used: &mut used,
+                form_used: &mut form_used,
                 visited: &mut visited,
             };
             let scope = Scope {
                 resources,
-                record_direct: true,
+                target: UsedTarget::Page,
                 owner: ObjectRef::new(3, 0),
             };
             collect_from_stream(&mut ctx, content, scope, 0)?
@@ -2020,31 +2308,53 @@ mod tests {
         assert!(matches!(error, Error::Parse { .. }));
     }
 
+    // The next two tests used to assert that a `Do` obscured by an earlier
+    // parser diagnostic, or absorbed into inline-image header parsing, never
+    // got recorded as a content-stream invocation and so never triggered
+    // recursion into the malformed `Fm0` Form. That distinction no longer
+    // matters: recursion is driven by the *declared* `/XObject` keys (see
+    // `declared_xobjects`), matching qpdf's `forEachXObject`
+    // (`QPDFPageObjectHelper.cc:313-345`), which walks every declared Form
+    // regardless of what (if anything) the content stream does with `Do`.
+    // `Fm0` is declared in both fixtures, so it is visited either way and its
+    // malformed target surfaces the same structural `Error::Parse` as a
+    // directly Do-invoked malformed Form (see
+    // `resource_callbacks_propagate_form_resolution_errors`).
     #[test]
-    fn parser_diagnostic_before_form_use_stops_later_traversal() {
+    fn parser_diagnostic_does_not_prevent_declared_form_traversal() {
         let (mut pdf, resources) = malformed_form_pdf_and_resources();
 
-        let (complete, _) = collect_test_content(&mut pdf, b"<0g> /Fm0 Do", Some(&resources))
-            .expect("the later Do is outside the valid parser-event prefix");
-        assert!(!complete);
+        let error = collect_test_content(&mut pdf, b"<0g> /Fm0 Do", Some(&resources))
+            .expect_err("a declared Form is still visited even when an earlier token is malformed");
+        assert!(matches!(error, Error::Parse { .. }));
     }
 
     #[test]
-    fn invalid_inline_header_do_does_not_trigger_form_traversal() {
+    fn invalid_inline_header_does_not_prevent_declared_form_traversal() {
         let (mut pdf, resources) = malformed_form_pdf_and_resources();
 
-        let (complete, _) = collect_test_content(&mut pdf, b"BI /Fm0 Do", Some(&resources))
-            .expect("an invalid inline-image header is incomplete, not a Form traversal");
-        assert!(!complete);
+        let error = collect_test_content(&mut pdf, b"BI /Fm0 Do", Some(&resources)).expect_err(
+            "a declared Form is still visited even though this Do is absorbed by inline-header parsing",
+        );
+        assert!(matches!(error, Error::Parse { .. }));
     }
 
+    // Inline-image payload bytes are opaque to the parser (`/Fm0 Do` inside
+    // `ID`...`EI` is never tokenised as a content operator), so it must not be
+    // recorded as a used name. This is a `parsed.names` bookkeeping claim,
+    // independent of declared-name-driven recursion, so `resources` omits
+    // `/XObject` entirely here to isolate it from the (unrelated, and now
+    // unconditional) declared-Form traversal covered by the two tests above.
     #[test]
-    fn inline_image_payload_do_is_opaque_to_form_traversal() {
-        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+    fn inline_image_payload_do_is_opaque_to_resource_name_detection() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
 
-        let (complete, used) =
-            collect_test_content(&mut pdf, b"BI /W 1 ID /Fm0 Do EI Q", Some(&resources))
-                .expect("inline-image payload bytes are opaque");
+        let (complete, used) = collect_test_content(&mut pdf, b"BI /W 1 ID /Fm0 Do EI Q", None)
+            .expect("inline-image payload bytes are opaque");
         assert!(complete);
         assert!(!used.contains_key(b"XObject".as_slice()));
     }
@@ -2063,20 +2373,26 @@ mod tests {
         assert!(used[b"ExtGState".as_slice()].contains(b"Shared".as_slice()));
     }
 
+    // Previously this asserted that the shared `last_name` correctly routed
+    // `Do` to a malformed declared Form, proving the *old* Do-invoked
+    // recursion trigger picked it up. Recursion is no longer Do-invoked (see
+    // `declared_xobjects`), so that no longer discriminates: `Fm0` would
+    // be visited regardless of whether `Do` ever routed it. Re-pointed at what
+    // the shared `last_name` claim actually is — `parsed.names` bookkeeping —
+    // by checking the *same* name is recorded under both `Font` (from `Tf`)
+    // and `XObject` (from `Do`) from one shared preceding name token.
     #[test]
-    fn pruning_recurses_each_shared_finder_xobject_name() {
+    fn shared_finder_last_name_recorded_for_font_and_xobject() {
         let bytes = build_page_with_resources_carrier_pdf(
             "<< /Type /Page /MediaBox [0 0 612 792] >>",
-            "<0g>",
+            "null",
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        let mut xobjects = Dictionary::new();
-        xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
-        let mut resources = Dictionary::new();
-        resources.insert("XObject", Object::Dictionary(xobjects));
 
-        let error = collect_test_content(&mut pdf, b"/Fm0 12 Tf 99 Do", Some(&resources))
-            .expect_err("retained last name must route Do to the malformed Form");
-        assert!(matches!(error, Error::Parse { .. }));
+        let (complete, used) = collect_test_content(&mut pdf, b"/Fm0 12 Tf 99 Do", None)
+            .expect("no /XObject is declared, so there is nothing to recurse into");
+        assert!(complete);
+        assert!(used[b"Font".as_slice()].contains(b"Fm0".as_slice()));
+        assert!(used[b"XObject".as_slice()].contains(b"Fm0".as_slice()));
     }
 }
