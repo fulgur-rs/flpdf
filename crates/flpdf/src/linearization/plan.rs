@@ -1026,7 +1026,7 @@ impl LinearizationPlan {
                 .object_ref()
                 .or_else(|| pages_handle.as_reference())
         } else {
-            None
+            None // cov:ignore: reachable_object_set rejects a rootless document before this successful-plan path
         };
 
         // ----------------------------------------------------------------
@@ -1507,7 +1507,7 @@ impl LinearizationPlan {
             let outlines = root_handle.try_get_key(b"/Outlines")?;
             outlines.object_ref().or_else(|| outlines.as_reference())
         } else {
-            None
+            None // cov:ignore: reachable_object_set rejects a rootless document before outline planning can succeed
         };
 
         let extract_outlines = |src: &[ObjectRef]| -> Vec<ObjectRef> {
@@ -2806,6 +2806,39 @@ mod tests {
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
+    #[test]
+    fn collect_direct_handle_refs_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_handle_refs(
+            &ObjectHandle::array(Vec::new()),
+            MAX_INLINE_DEPTH + 1,
+            &mut out,
+        );
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_direct_handle_refs_with_context_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_handle_refs_with_context(
+            &ObjectHandle::array(Vec::new()),
+            MAX_INLINE_DEPTH + 1,
+            false,
+            &mut out,
+        );
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_direct_handle_refs_tolerates_a_non_dictionary_stream_dict() {
+        let stream = ObjectHandle::stream(ObjectHandle::integer(1), std::rc::Rc::new(Vec::new()));
+        let mut out = Vec::new();
+
+        collect_direct_handle_refs(&stream, 0, &mut out).unwrap();
+
+        assert!(out.is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Fixture builders
     // -----------------------------------------------------------------------
@@ -3719,6 +3752,17 @@ mod tests {
 
         // Disjoint invariant must hold.
         assert!(plan.parts_are_disjoint());
+    }
+
+    #[test]
+    fn compute_closure_expands_indirect_resource_children() {
+        let mut pdf = open_two_page_shared_font();
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+        let closure = compute_closure(&mut pdf, ObjectRef::new(3, 0), &live, &BTreeSet::new())
+            .expect("first-page closure");
+
+        assert!(closure.contains(&ObjectRef::new(5, 0)));
+        assert!(closure.contains(&ObjectRef::new(8, 0)));
     }
 
     // -----------------------------------------------------------------------

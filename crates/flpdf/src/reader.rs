@@ -2927,7 +2927,7 @@ impl<R: Read + Seek> Pdf<R> {
             .registered_handle(object_ref)
             .filter(ObjectHandle::is_resolved)
         {
-            let value = self.materialize_handle_for_legacy(object_ref, &handle)?;
+            let value = self.materialize_handle_for_legacy(object_ref, &handle)?; // cov:ignore: every resolved registered handle is returned by the earlier compatibility branch
             self.legacy_materialized_memo.insert(object_ref, value);
             return Ok(self
                 .legacy_materialized_memo
@@ -7695,6 +7695,30 @@ mod tests {
             .materialize_canonical_compatibility_value(object_ref)
             .expect("canonical stream compatibility materialization"));
         assert_eq!(pdf.legacy_materialized_memo.get(&object_ref), Some(&legacy));
+    }
+
+    #[test]
+    fn legacy_materialization_tolerates_stale_stream_eol_for_non_stream_handles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let stream_ref = ObjectRef::new(91, 0);
+        pdf.recovered_stream_eols
+            .insert(stream_ref, crate::parser::RecoveredStreamEol::Lf);
+
+        let stream_handle = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: Some(Rc::new(b"abc\n".to_vec())),
+            stream_provider: None,
+            stream_length: 4,
+        });
+        let stream = pdf
+            .materialize_handle_for_legacy(stream_ref, &stream_handle)
+            .expect("stream compatibility materialization");
+        assert_eq!(stream.as_stream().expect("stream value").data, b"abc");
+
+        let scalar = pdf
+            .materialize_handle_for_legacy(stream_ref, &ObjectHandle::integer(42))
+            .expect("scalar compatibility materialization");
+        assert_eq!(scalar, Object::Integer(42));
     }
 
     fn top_level_bare_reference_pdf() -> Vec<u8> {
