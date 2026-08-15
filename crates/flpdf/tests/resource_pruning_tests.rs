@@ -280,6 +280,69 @@ fn test_c_auto_shared_resources_not_pruned() {
     );
 }
 
+// A Form XObject declared in a SHARED top-level /Resources (Auto mode skips
+// pruning the shared dict itself, per test (c) above) must still have its own
+// resources discovered and pruned: qpdf's structural Form discovery
+// (`QPDFPageObjectHelper.cc:313-345`) is independent of the Auto sharing skip,
+// matching `remove_unreferenced_resources_on_page`'s identical ordering.
+#[test]
+fn test_auto_shared_resources_still_prunes_a_declared_form() {
+    let content1 = b"BT /F1 12 Tf (p1) Tj ET";
+    let content2 = b"BT /F2 12 Tf (p2) Tj ET";
+    let form_content = b"BT /FormF1 10 Tf ET";
+    let form_stream = {
+        let mut bytes = format!(
+            "9 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /FormF1 << /Type /Font >> /FormF2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        // Shared top-level /Resources declares a Form that neither page's
+        // content ever invokes via Do.
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> \
+                 /XObject << /Fm0 9 0 R >> >>",
+            ),
+        ),
+        (7u32, stream_obj(7, content1)),
+        (8, stream_obj(8, content2)),
+        (9, form_stream),
+    ];
+
+    // Both pages reference the SAME resources object 5.
+    let page1_body = "/Contents 7 0 R /Resources 5 0 R";
+    let page2_body = "/Contents 8 0 R /Resources 5 0 R";
+    let pdf_bytes = build_pdf(&[page1_body, page2_body], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Auto).expect("prune");
+
+    // The shared page-level /Resources itself must stay untouched (same as
+    // test_c_auto_shared_resources_not_pruned).
+    let keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert!(
+        keys.contains(&"F1".to_string()) && keys.contains(&"F2".to_string()),
+        "Auto: shared page-level /Resources must remain untouched: {keys:?}"
+    );
+
+    // The declared Form's own resources ARE pruned, even though it is only
+    // reachable through the shared (Auto-skipped) page-level /Resources.
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(9, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["FormF1"],
+        "Auto: a Form declared in shared /Resources must still have its own \
+         unused resources pruned: {form_font_keys:?}"
+    );
+}
+
 // ── Test (d): Yes — shared /Resources pruned via union ───────────────────────
 
 #[test]

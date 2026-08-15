@@ -505,20 +505,35 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
             _ => false, // PageInline and None: always unshared
         };
 
-        if mode == RemoveUnreferencedResources::Auto && is_shared {
-            // Auto: skip shared resources — we must not prune them.
-            continue;
-        }
-
         // Collect the used names for this page. When the page's /Contents cannot
         // be fully understood — it failed to decode (corrupt FlateDecode) or to
         // tokenise part-way (malformed content syntax) — collection returns
         // `None` rather than aborting, degrading like the Form XObject path (see
-        // `recurse_form_xobject`). Mark the page's resources group as protected so
-        // its resources are conservatively retained rather than pruned against an
-        // incomplete used-name set. Genuine structural errors (resolving the
-        // inherited /Resources or a Form object reference) still propagate via `?`.
-        let used = match collect_used_names_for_page(pdf, page_ref)? {
+        // `recurse_form_xobject`). Genuine structural errors (resolving the
+        // inherited /Resources or a Form object reference) still propagate via
+        // `?`.
+        //
+        // This call also discovers and prunes every Form XObject declared in
+        // the page's /Resources/XObject, regardless of whether the *page's
+        // own* resources end up used below — qpdf's structural Form discovery
+        // (`forEachXObject`, `QPDFPageObjectHelper.cc:313-345`) is independent
+        // of page-level pruning decisions, matching the separate
+        // `remove_unreferenced_resources_on_page` route's identical ordering.
+        // It must therefore run unconditionally, before the Auto shared-page
+        // skip below, not be skipped along with it.
+        let used = collect_used_names_for_page(pdf, page_ref)?;
+
+        if mode == RemoveUnreferencedResources::Auto && is_shared {
+            // Auto: skip shared resources — we must not prune the shared
+            // page-level dictionary itself. `used` (or its absence) is
+            // discarded; only the Form-pruning side effect above matters here.
+            continue;
+        }
+
+        // Mark the page's resources group as protected so its resources are
+        // conservatively retained rather than pruned against an incomplete
+        // used-name set.
+        let used = match used {
             Some(used) => used,
             None => {
                 if let Some(key) = res_group_key(&page_res_loc[i], page_ref) {
