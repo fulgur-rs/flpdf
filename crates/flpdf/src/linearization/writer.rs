@@ -8815,6 +8815,188 @@ mod tests {
             .any(|w| w == b"linearized label"));
     }
 
+    #[test]
+    fn prepend_crypt_filter_to_handle_entries_preserves_qpdf_filter_shapes() -> Result<()> {
+        fn rewritten_dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Result<ObjectHandle> {
+            let mut entries = entries.into_iter().collect();
+            prepend_crypt_filter_to_handle_entries(&mut entries, b"Identity")?;
+            Ok(ObjectHandle::dictionary(entries.into_iter().collect()))
+        }
+
+        let no_filter = rewritten_dictionary(Vec::new())?;
+        assert_eq!(
+            no_filter.try_get_key(b"/Filter")?.try_as_name()?.as_deref(),
+            Some(b"Crypt".as_slice())
+        );
+
+        let array_without_decode_parms = rewritten_dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+                ObjectHandle::name(b"ASCII85Decode".to_vec()),
+            ]),
+        )])?;
+        let filters = array_without_decode_parms
+            .try_get_key(b"/Filter")?
+            .try_as_array()?
+            .expect("array filter chain");
+        assert_eq!(filters.len(), 3);
+        assert_eq!(
+            filters[0].try_as_name()?.as_deref(),
+            Some(b"Crypt".as_slice())
+        );
+        let decode_parms = array_without_decode_parms
+            .try_get_key(b"/DecodeParms")?
+            .try_as_array()?
+            .expect("array decode-parameter chain");
+        assert_eq!(decode_parms.len(), 3);
+        assert!(decode_parms[1].try_is_null()?);
+        assert!(decode_parms[2].try_is_null()?);
+
+        let existing_params =
+            ObjectHandle::dictionary(vec![(b"/Predictor".to_vec(), ObjectHandle::integer(12))]);
+        let array_with_array_decode_parms = rewritten_dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"ASCII85Decode".to_vec()),
+                ]),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::array(vec![existing_params.clone()]),
+            ),
+        ])?;
+        let decode_parms = array_with_array_decode_parms
+            .try_get_key(b"/DecodeParms")?
+            .try_as_array()?
+            .expect("array decode-parameter chain");
+        assert_eq!(decode_parms.len(), 3);
+        assert_eq!(
+            decode_parms[1].try_get_key(b"/Predictor")?.as_integer(),
+            Some(12)
+        );
+        assert!(decode_parms[2].try_is_null()?);
+
+        let array_with_scalar_decode_parms = rewritten_dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"ASCII85Decode".to_vec()),
+                ]),
+            ),
+            (b"/DecodeParms".to_vec(), existing_params),
+        ])?;
+        let decode_parms = array_with_scalar_decode_parms
+            .try_get_key(b"/DecodeParms")?
+            .try_as_array()?
+            .expect("array decode-parameter chain");
+        assert_eq!(decode_parms.len(), 3);
+        assert_eq!(
+            decode_parms[1].try_get_key(b"/Predictor")?.as_integer(),
+            Some(12)
+        );
+        assert!(decode_parms[2].try_is_null()?);
+
+        let malformed_filter =
+            rewritten_dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))])?;
+        assert_eq!(
+            malformed_filter
+                .try_get_key(b"/Filter")?
+                .try_as_name()?
+                .as_deref(),
+            Some(b"Crypt".as_slice())
+        );
+        assert_eq!(
+            malformed_filter
+                .try_get_key(b"/DecodeParms")?
+                .try_get_key(b"/Name")?
+                .try_as_name()?
+                .as_deref(),
+            Some(b"Identity".as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_body_object_emits_plain_stream_without_legacy_materialization() {
+        let mut donor = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut donor, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let original_ref = plan.root_ref.expect("tiny PDF catalog");
+        let new_ref = renumber
+            .new_for_original(original_ref)
+            .expect("catalog is in the linearization map");
+        let object = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Label".to_vec(),
+                    ObjectHandle::string(b"plain linearized label".to_vec()),
+                ),
+                (b"/Length".to_vec(), ObjectHandle::integer(7)),
+            ]),
+            std::rc::Rc::new(b"payload".to_vec()),
+        );
+        let options = WriterOptions {
+            compress_streams: crate::writer::CompressStreams::No,
+            ..WriterOptions::default()
+        };
+        let mut bytes = Vec::new();
+
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            original_ref,
+            &object,
+            &options,
+            None,
+            None,
+            &renumber,
+            &BTreeSet::new(),
+        )
+        .expect("linearized plain body stream");
+
+        assert_eq!(offset, 0);
+        assert!(bytes
+            .windows(b"/Label (plain linearized label)".len())
+            .any(|w| { w == b"/Label (plain linearized label)" }));
+        assert!(bytes
+            .windows(b"stream\npayloadendstream".len())
+            .any(|w| { w == b"stream\npayloadendstream" }));
+        assert!(bytes.ends_with(b"\nendobj\n"));
+    }
+
+    #[test]
+    fn append_body_object_reports_missing_reference_renumbering() {
+        let mut donor = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut donor, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let original_ref = plan.root_ref.expect("tiny PDF catalog");
+        let object = ObjectHandle::dictionary(vec![(
+            b"/Ref".to_vec(),
+            ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(
+                ObjectRef::new(999, 0),
+            )),
+        )]);
+        let error = append_body_object(
+            &mut Vec::new(),
+            renumber
+                .new_for_original(original_ref)
+                .expect("catalog is in the linearization map"),
+            original_ref,
+            &object,
+            &WriterOptions::default(),
+            None,
+            None,
+            &renumber,
+            &BTreeSet::new(),
+        )
+        .expect_err("missing reference must not be silently emitted");
+        assert!(error.to_string().contains("has no renumber entry"));
+    }
+
     /// Task 8: the hint stream is encrypted like any other stream payload —
     /// qpdf's `writeHintStream` calls `setDataKey(hint_id)` before writing
     /// the dict/payload (QPDFWriter.cc:2297), unlike the xref table/stream
