@@ -2,7 +2,9 @@
 use std::collections::BTreeMap;
 
 use crate::writer::{serialize::xref_stream, write_deterministic_id_inline};
-use crate::{Dictionary, Object, ObjectRef, XrefEntry, XrefForm};
+#[cfg(test)]
+use crate::{Dictionary, Object};
+use crate::{ObjectHandle, ObjectRef, XrefEntry, XrefForm};
 
 /// Location of an object encoded inside an object-stream container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +180,7 @@ fn append_xref_stream_and_trailer(
     written_xref_stream(layout, xref_ref, xref_offset)
 }
 
+#[cfg(test)]
 pub(crate) fn materialized_id(
     dictionary: &Dictionary,
 ) -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -193,6 +196,39 @@ pub(crate) fn materialized_id(
         },
         _ => Err(crate::Error::Unsupported(
             "plain writer materialized /ID must be an array".into(),
+        )),
+    }
+}
+
+/// Read the writer-owned `/ID` value from the canonical handle graph.
+///
+/// qpdf's trailer writer accepts an absent `/ID`, but when an identifier is
+/// present it must be exactly an array of two string values before the xref
+/// layer can emit it (`QPDFWriter.cc:1160-1236`). The handle is resolved
+/// lazily so indirect `/ID` values follow the same route as every other
+/// writer trailer entry.
+pub(crate) fn materialized_id_handle(
+    id: &ObjectHandle,
+) -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    if id.try_is_null()? {
+        return Ok(None);
+    }
+    let Some(values) = id.try_as_array()? else {
+        return Err(crate::Error::Unsupported(
+            "plain writer materialized /ID must be an array".into(),
+        ));
+    };
+    let [id0, id1] = values.as_slice() else {
+        return Err(crate::Error::Unsupported(
+            "plain writer materialized /ID must contain two strings".into(),
+        ));
+    };
+    id0.try_dereference()?;
+    id1.try_dereference()?;
+    match (id0.as_string(), id1.as_string()) {
+        (Some(id0), Some(id1)) => Ok(Some((id0, id1))),
+        _ => Err(crate::Error::Unsupported(
+            "plain writer materialized /ID must contain two strings".into(),
         )),
     }
 }
@@ -363,6 +399,7 @@ fn written_xref_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ObjectHandle;
 
     fn trailer(form: XrefForm) -> TrailerPlan {
         TrailerPlan {
@@ -521,6 +558,53 @@ mod tests {
             materialized_id(&dictionary).unwrap(),
             Some((b"first".to_vec(), b"second".to_vec()))
         );
+    }
+
+    #[test]
+    fn materialized_id_handle_accepts_exactly_two_strings() {
+        let handle = ObjectHandle::array(vec![
+            ObjectHandle::string(b"first".to_vec()),
+            ObjectHandle::string(b"second".to_vec()),
+        ]);
+
+        assert_eq!(
+            materialized_id_handle(&handle).unwrap(),
+            Some((b"first".to_vec(), b"second".to_vec()))
+        );
+    }
+
+    #[test]
+    fn materialized_id_handle_accepts_a_missing_id() {
+        assert_eq!(materialized_id_handle(&ObjectHandle::null()).unwrap(), None);
+    }
+
+    #[test]
+    fn materialized_id_handle_rejects_a_non_array() {
+        let error = materialized_id_handle(&ObjectHandle::integer(1)).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("must be an array")));
+    }
+
+    #[test]
+    fn materialized_id_handle_rejects_an_array_with_the_wrong_shape() {
+        let handle = ObjectHandle::array(vec![ObjectHandle::string(b"only".to_vec())]);
+        let error = materialized_id_handle(&handle).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("two strings")));
+    }
+
+    #[test]
+    fn materialized_id_handle_rejects_non_string_elements() {
+        let handle = ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::string(b"second".to_vec()),
+        ]);
+        let error = materialized_id_handle(&handle).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("two strings")));
     }
 
     #[test]

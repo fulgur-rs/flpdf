@@ -62,6 +62,7 @@ pub(crate) fn framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) 
 }
 
 /// Serialize an object-stream container with qpdf's fixed dictionary key order.
+#[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn write_objstm_stream(
     out: &mut Vec<u8>,
@@ -81,10 +82,10 @@ pub(crate) fn write_objstm_stream_with_extends(
     policy: NewlineBeforeEndstream,
     extends: Option<crate::ObjectRef>,
 ) -> crate::Result<()> {
-    let stream = object_streams::wrap_objstm_body(body, compress)?;
+    let (_, data) = object_streams::wrap_objstm_body_as_handle(body, compress, extends)?;
     out.extend_from_slice(b"<< /Type /ObjStm /Length ");
-    out.extend_from_slice(stream.data.len().to_string().as_bytes());
-    if stream.dict.get("Filter").is_some() {
+    out.extend_from_slice(data.len().to_string().as_bytes());
+    if matches!(compress, CompressStreams::Yes) {
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(
@@ -96,7 +97,7 @@ pub(crate) fn write_objstm_stream_with_extends(
         );
     }
     out.extend_from_slice(b" >>");
-    write_stream_payload(out, &stream.data, policy);
+    write_stream_payload(out, &data, policy);
     Ok(())
 }
 
