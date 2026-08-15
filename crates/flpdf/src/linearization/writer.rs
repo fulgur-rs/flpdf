@@ -1192,6 +1192,16 @@ struct FirstPageXrefPatch {
 /// this list so they cannot be duplicated. Values are serialized through the
 /// canonical handle graph and mapped into output-number space; only the xref
 /// dictionary's fixed framing and key order remain raw layout.
+///
+/// A value that is itself an indirect handle is never dereferenced here: qpdf's
+/// `writeTrailer` unparses each surviving key through `unparseChild`
+/// (`QPDFWriter.cc:1143-1155`), which branches solely on `child.isIndirect()`
+/// and, when true, writes the renumbered `"N 0 R"` token without ever
+/// inspecting what that reference resolves to -- an indirect stream target is
+/// no exception, so this mirrors that check before falling back to the
+/// generic handle-graph unparse used for direct values. Same split as the
+/// plain writer's sibling `canonical_trailer_entries`
+/// (`crates/flpdf/src/writer/plain/plan.rs`).
 fn canonical_linearization_trailer_entries(
     trailer: &ObjectHandle,
     map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
@@ -1231,7 +1241,12 @@ fn canonical_linearization_trailer_entries(
             continue;
         }
         let mut value_bytes = Vec::new();
-        value.unparse_object_with_ref_map_and_removed(&mut value_bytes, map, removed_refs)?;
+        if let Some(object_ref) = value.object_ref() {
+            let mapped = map(object_ref)?;
+            value_bytes.extend_from_slice(mapped.to_string().as_bytes());
+        } else {
+            value.unparse_object_with_ref_map_and_removed(&mut value_bytes, map, removed_refs)?;
+        }
         serialized.push((key, value_bytes));
     }
     Ok(serialized)
@@ -4641,6 +4656,65 @@ mod tests {
 
     fn open_tiny_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse")
+    }
+
+    // -----------------------------------------------------------------------
+    // Fixture: minimal single-page PDF whose trailer carries a custom,
+    // non-writer-owned entry (`/CustomTrailer`) that indirectly references a
+    // stream object otherwise unreachable from `/Root`. Probes qpdf's
+    // `unparseChild` rule for trailer values (`QPDFWriter.cc:1143-1155`):
+    // an indirect child is always written as `"N 0 R"`, never dereferenced.
+    //
+    // Object layout:
+    //   1 0 obj – Catalog  (/Root)
+    //   2 0 obj – Pages node
+    //   3 0 obj – Page dict (Kids[0])
+    //   4 0 obj – custom stream, reachable only via trailer /CustomTrailer
+    // -----------------------------------------------------------------------
+    fn tiny_pdf_with_custom_trailer_stream_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let off4 = pdf.len() as u64;
+        let stream_data = b"CUSTOM STREAM PAYLOAD";
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /CustomStream /Length {} >>\nstream\n",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3, off4,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size 5 /Root 1 0 R /CustomTrailer 4 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref_start,
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    fn open_tiny_pdf_with_custom_trailer_stream() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open(Cursor::new(tiny_pdf_with_custom_trailer_stream_bytes()))
+            .expect("custom-trailer-stream fixture should parse")
     }
 
     fn open_encrypted_three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
@@ -9280,6 +9354,47 @@ mod tests {
                 (b"/Foo".to_vec(), b"7".to_vec()),
                 (b"/Ref".to_vec(), b"12 0 R".to_vec()),
             ]
+        );
+    }
+
+    /// A live, non-writer-owned trailer entry that is itself an indirect
+    /// handle must serialize as the mapped `"N 0 R"` reference token, never
+    /// as the dereferenced object body. qpdf's `writeTrailer` unparses every
+    /// surviving trailer key through `unparseChild`
+    /// (`QPDFWriter.cc:1143-1155`), which branches only on
+    /// `child.isIndirect()` and never inspects what the reference resolves
+    /// to -- so a stream target must stay a bare reference, not collapse to
+    /// its stream dictionary (losing the stream body entirely, since the
+    /// generic handle-graph unparse used for *direct* values never emits
+    /// `stream`/`endstream` framing for an indirect child it did not take
+    /// this branch to reach). Confirmed against real qpdf 11.9.0
+    /// (`qpdf --linearize --object-streams=generate`), which emits
+    /// `/CustomTrailer 2 0 R` for the equivalent input, never an inlined
+    /// dictionary.
+    #[test]
+    fn canonical_linearization_trailer_entries_preserves_indirect_stream_reference() {
+        let mut pdf = open_tiny_pdf_with_custom_trailer_stream();
+        let trailer = pdf.trailer_handle();
+        let map = |object_ref: ObjectRef| {
+            Ok(ObjectRef::new(
+                object_ref.number + 100,
+                object_ref.generation,
+            ))
+        };
+
+        let entries = canonical_linearization_trailer_entries(&trailer, &map, &BTreeSet::new())
+            .expect("live trailer values should serialize");
+
+        let custom = entries
+            .iter()
+            .find(|(key, _)| key == b"/CustomTrailer")
+            .map(|(_, value)| value.clone())
+            .expect("/CustomTrailer entry must survive trimming");
+        assert_eq!(
+            custom, b"104 0 R",
+            "an indirect trailer value naming a stream must stay a mapped \
+             reference, matching qpdf's unparseChild rather than inlining \
+             the dereferenced stream dictionary"
         );
     }
 
