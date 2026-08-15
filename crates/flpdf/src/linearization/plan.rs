@@ -33,6 +33,7 @@
 
 use crate::linearization::renumber::RenumberMap;
 use crate::object::MAX_INLINE_DEPTH;
+use crate::object_handle::ObjectHandle;
 use crate::writer::object_streams::{
     collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
@@ -174,6 +175,7 @@ pub(crate) fn collect_direct_refs(
 /// dictionary-value null-resolving refs cause the key to be dropped entirely.
 /// `compute_closure` uses this to restrict resurrectable-null admission to refs
 /// actually reached via a surviving array edge rather than a dropped dict edge.
+#[cfg(test)]
 fn collect_direct_refs_with_context(
     obj: &Object,
     depth: usize,
@@ -210,14 +212,115 @@ fn collect_direct_refs_with_context(
     Ok(())
 }
 
-/// Returns whether a resolved object is a page-tree node we must not descend
-/// into during a subtree expansion (a `/Type /Page` leaf or `/Type /Pages`
-/// interior node). Used to stop a `/Resources` subtree walk from pulling in
-/// sibling pages if a resource value cross-links back into the page tree.
-fn is_page_tree_node(obj: &Object) -> bool {
-    matches!(obj, Object::Dictionary(d)
-        if matches!(d.get("Type"), Some(Object::Name(n))
-            if n.as_slice() == b"Pages" || n.as_slice() == b"Page"))
+/// Collect indirect references from a live qpdf-shaped handle graph without
+/// materializing the graph into the legacy [`Object`] enum.
+///
+/// An indirect child is recorded as one edge and expanded later by the
+/// closure queue. Direct arrays, dictionaries, and stream dictionaries are
+/// traversed in place. This mirrors qpdf's `QPDFObjectHandle` child access:
+/// the handle identity is retained at each indirect boundary, while only the
+/// current direct container is inspected.
+fn collect_direct_handle_refs(
+    handle: &ObjectHandle,
+    depth: usize,
+    out: &mut Vec<ObjectRef>,
+) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
+    let mut contextual = Vec::new();
+    collect_direct_handle_refs_with_context(handle, depth, false, &mut contextual)?;
+    out.extend(contextual.into_iter().map(|(object_ref, _)| object_ref));
+    Ok(())
+}
+
+/// Context-carrying form of [`collect_direct_handle_refs`]. The boolean is
+/// true only when the edge to the indirect child came from an array element;
+/// dictionary-value null references are removed by the qpdf writer and must
+/// not resurrect a body object in the linearization plan.
+fn collect_direct_handle_refs_with_context(
+    handle: &ObjectHandle,
+    depth: usize,
+    in_array: bool,
+    out: &mut Vec<(ObjectRef, bool)>,
+) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
+    if let Some(object_ref) = handle.object_ref().or_else(|| handle.as_reference()) {
+        out.push((object_ref, in_array));
+        return Ok(());
+    }
+    collect_direct_handle_children(
+        handle,
+        depth,
+        in_array,
+        &mut |child, child_depth, child_in_array| {
+            collect_direct_handle_refs_with_context(child, child_depth, child_in_array, out)
+        },
+    )
+}
+
+/// Walk the direct children of one handle. The closure receives each child,
+/// the incremented inline depth, and whether its edge came from an array.
+fn collect_direct_handle_children<F>(
+    handle: &ObjectHandle,
+    depth: usize,
+    _parent_in_array: bool,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&ObjectHandle, usize, bool) -> Result<()>,
+{
+    handle.try_dereference()?;
+    if let Some(stream_dict) = handle.as_stream_dict() {
+        let Some(entries) = stream_dict.try_as_dictionary()? else {
+            return Ok(());
+        };
+        for (key, child) in entries {
+            if key == b"/Length" {
+                continue;
+            }
+            visit(&child, depth + 1, false)?;
+        }
+        return Ok(());
+    }
+    if let Some(children) = handle.try_as_array()? {
+        for child in children {
+            visit(&child, depth + 1, true)?;
+        }
+        return Ok(());
+    }
+    if let Some(entries) = handle.try_as_dictionary()? {
+        for (_key, child) in entries {
+            visit(&child, depth + 1, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Collect the references contained by an already-selected indirect object.
+/// Unlike [`collect_direct_handle_refs_with_context`], this deliberately
+/// expands the handle's own value instead of recording the handle's identity
+/// as a new edge in the graph.
+fn collect_handle_children_with_context(
+    handle: &ObjectHandle,
+    depth: usize,
+    out: &mut Vec<(ObjectRef, bool)>,
+) -> Result<()> {
+    collect_direct_handle_children(handle, depth, false, &mut |child, child_depth, in_array| {
+        collect_direct_handle_refs_with_context(child, child_depth, in_array, out)
+    })
+}
+
+/// Returns whether a live handle is a page-tree interior or leaf node.
+fn is_page_tree_handle(handle: &ObjectHandle) -> Result<bool> {
+    Ok(handle.try_is_dictionary_of_type(b"Pages", b"")?
+        || handle.try_is_dictionary_of_type(b"Page", b"")?)
 }
 
 /// Compute the transitive closure of objects reachable from `root`.
@@ -312,17 +415,16 @@ fn compute_closure<R: Read + Seek>(
         }
         order.push(current);
 
-        let obj = pdf.resolve(current)?;
+        let current_handle = pdf.get_object_handle(current);
+        pdf.resolve_object_handle(&current_handle)?;
 
         // Determine whether this is a Pages node (intermediate page-tree node)
         // or a Page leaf node.
-        let is_pages_node = matches!(&obj, Object::Dictionary(d)
-            if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Pages"));
-        let is_page_leaf = matches!(&obj, Object::Dictionary(d)
-            if matches!(d.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"Page"));
+        let is_pages_node = current_handle.try_is_dictionary_of_type(b"Pages", b"")?;
+        let is_page_leaf = current_handle.try_is_dictionary_of_type(b"Page", b"")?;
 
         if is_pages_node || is_page_leaf {
-            if let Some(dict) = obj.as_dict() {
+            if let Some(dict) = current_handle.try_as_dictionary()? {
                 // For a page leaf, expand the `/Resources` subtree depth-first
                 // and append it to `order` *before* the generic key loop runs.
                 // flpdf's `Dictionary` is a `BTreeMap`, so a plain key walk
@@ -336,9 +438,10 @@ fn compute_closure<R: Read + Seek>(
                 // font hangs at depth 2 under `/Resources`; a breadth-first
                 // pass would otherwise emit the content stream first.
                 if is_page_leaf {
-                    if let Some(resources) = dict.get("Resources") {
+                    {
+                        let resources = current_handle.try_get_key(b"/Resources")?;
                         let mut seeds: Vec<(ObjectRef, bool)> = Vec::new();
-                        collect_direct_refs_with_context(resources, 0, false, &mut seeds)?;
+                        collect_direct_handle_refs_with_context(&resources, 0, false, &mut seeds)?;
                         for &(r, va) in &seeds {
                             if va {
                                 seen_as_array.insert(r); // cov:ignore: fires only when /Resources is an inline dict/array with array-element refs; normal PDFs use an indirect /Resources ref, so seeds come from collect_direct_refs_with_context on a Reference (va=false)
@@ -346,7 +449,7 @@ fn compute_closure<R: Read + Seek>(
                         }
                         // DFS via an explicit stack (no recursion) so deeply
                         // nested resource graphs cannot overflow the stack.
-                        // The visited set bounds cycles; `is_page_tree_node`
+                        // The visited set bounds cycles; `is_page_tree_handle`
                         // stops the walk if a resource value cross-links back
                         // into the page tree, so we never pull in sibling pages.
                         let mut stack: Vec<(ObjectRef, bool)> = seeds.into_iter().rev().collect();
@@ -372,7 +475,8 @@ fn compute_closure<R: Read + Seek>(
                                 // xref): no body object, same as the main loop.
                                 continue;
                             }
-                            let child = pdf.resolve(r)?;
+                            let child_handle = pdf.get_object_handle(r);
+                            pdf.resolve_object_handle(&child_handle)?;
                             // Stop at a page-tree boundary BEFORE adding `r` to
                             // the closure: a resource that malformedly cross-links
                             // to a sibling `/Page` or the `/Pages` node must be
@@ -381,12 +485,16 @@ fn compute_closure<R: Read + Seek>(
                             // the page-closure boundary rule, we neither descend
                             // into it nor pull the boundary node itself into
                             // Part 2/3.
-                            if is_page_tree_node(&child) {
+                            if is_page_tree_handle(&child_handle)? {
                                 continue;
                             }
                             order.push(r);
                             let mut child_refs: Vec<(ObjectRef, bool)> = Vec::new();
-                            collect_direct_refs_with_context(&child, 0, false, &mut child_refs)?;
+                            collect_handle_children_with_context(
+                                &child_handle,
+                                0,
+                                &mut child_refs,
+                            )?;
                             // Push in reverse so the first reference is popped
                             // first, preserving left-to-right discovery order.
                             for cr in child_refs.into_iter().rev() {
@@ -402,11 +510,11 @@ fn compute_closure<R: Read + Seek>(
                 } // cov:ignore: llvm-cov attributes 0 to this `if is_page_leaf` closing brace; the block body (the /Resources DFS) runs and is covered above.
                 let mut refs_raw: Vec<(ObjectRef, bool)> = Vec::new();
                 for (k, v) in dict.iter() {
-                    if k == b"Kids" {
+                    if k == b"/Kids" {
                         // Pages → sibling pages — never follow.
                         continue;
                     }
-                    if k == b"Thumb" {
+                    if k == b"/Thumb" {
                         // qpdf gives thumbnail objects the separate ou_thumb
                         // user (not a page user), so page closures never
                         // include /Thumb targets. Skipping here ensures
@@ -414,7 +522,7 @@ fn compute_closure<R: Read + Seek>(
                         // rather than the per-page private/shared sections.
                         continue;
                     }
-                    if k == b"Parent" {
+                    if k == b"/Parent" {
                         // Walk the /Parent chain up to the root Pages node so
                         // inherited /Resources, /MediaBox, /Rotate, etc. from
                         // any ancestor (not just the immediate parent) end up
@@ -434,7 +542,7 @@ fn compute_closure<R: Read + Seek>(
                         // the queue traverse into ref targets normally.
                         let mut to_visit: Vec<ObjectRef> = Vec::new();
                         let mut seen_parents: BTreeSet<ObjectRef> = BTreeSet::new();
-                        collect_direct_refs(v, 0, &mut to_visit)?;
+                        collect_direct_handle_refs(v, 0, &mut to_visit)?;
 
                         while let Some(parent_ref) = to_visit.pop() {
                             if !seen_parents.insert(parent_ref) {
@@ -444,34 +552,35 @@ fn compute_closure<R: Read + Seek>(
                             // (I/O or parse errors) propagate via `?` instead
                             // of silently degrading the closure — mirroring
                             // the main BFS loop's `pdf.resolve_borrowed(current)?`.
-                            let parent_dict = match pdf.resolve_borrowed(parent_ref)? {
-                                Object::Dictionary(dict) => dict,
-                                // A /Parent that indirects through a plain
-                                // reference object: follow the chain so the
-                                // real ancestor still joins the closure, as
-                                // the main BFS loop does via collect_direct_refs.
-                                // seen_parents bounds any reference cycle.
-                                Object::Reference(r) => {
-                                    to_visit.push(*r);
-                                    continue;
-                                }
+                            let parent_handle = pdf.get_object_handle(parent_ref);
+                            pdf.resolve_object_handle(&parent_handle)?;
+                            // A /Parent that indirects through a plain
+                            // reference object: follow the chain so the
+                            // real ancestor still joins the closure. The
+                            // canonical handle keeps the same lazy identity
+                            // at this boundary; seen_parents bounds cycles.
+                            if let Some(reference) = parent_handle.as_reference() {
+                                to_visit.push(reference);
+                                continue;
+                            }
+                            let Some(parent_dict) = parent_handle.try_as_dictionary()? else {
                                 // Any other non-dictionary parent (a free or
                                 // missing object resolving to Null, etc.) is
                                 // tolerated: the walk just climbs past it.
-                                _ => continue,
+                                continue;
                             };
                             for (pk, pv) in parent_dict.iter() {
-                                if pk == b"Kids" {
+                                if pk == b"/Kids" {
                                     continue;
                                 }
-                                if pk == b"Parent" {
+                                if pk == b"/Parent" {
                                     // Climb to the next ancestor instead of
                                     // stopping at one level.
-                                    collect_direct_refs(pv, 0, &mut to_visit)?;
+                                    collect_direct_handle_refs(pv, 0, &mut to_visit)?;
                                     continue;
                                 }
                                 let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
-                                collect_direct_refs_with_context(pv, 0, false, &mut refs)?;
+                                collect_direct_handle_refs_with_context(pv, 0, false, &mut refs)?;
                                 for (r, va) in refs {
                                     if va {
                                         seen_as_array.insert(r); // cov:ignore: fires when an ancestor /Pages node has a value with array-element refs (e.g. inherited /ColorSpace [X 0 R]); rare in practice and hard to construct as a minimal fixture
@@ -484,7 +593,7 @@ fn compute_closure<R: Read + Seek>(
                         }
                         continue;
                     }
-                    collect_direct_refs_with_context(v, 0, false, &mut refs_raw)?;
+                    collect_direct_handle_refs_with_context(v, 0, false, &mut refs_raw)?;
                 }
                 for &(r, va) in &refs_raw {
                     if va {
@@ -503,7 +612,7 @@ fn compute_closure<R: Read + Seek>(
             }
         } else {
             let mut refs: Vec<(ObjectRef, bool)> = Vec::new();
-            collect_direct_refs_with_context(&obj, 0, false, &mut refs)?;
+            collect_handle_children_with_context(&current_handle, 0, &mut refs)?;
             for &(r, va) in &refs {
                 if va {
                     seen_as_array.insert(r);
@@ -775,6 +884,26 @@ impl LinearizationPlan {
         // preparation, inherited-attribute push, and object-user traversal in
         // this order. It must run before object-ref capture because those
         // preparations may mint indirect objects.
+        //
+        // Warm the canonical qpdf object cache before the legacy Optimization
+        // compatibility consumer runs. qpdf has one object cache: if the
+        // malformed stream framing below is first parsed through the
+        // ObjectHandle route, Optimization observes that same cached value
+        // instead of reparsing the source and duplicating its recovery
+        // diagnostics. This is a temporary orchestration seam until the
+        // Optimization consumer itself completes its ObjectHandle cutover;
+        // the producer must not use a legacy-resolve/materialize bridge in
+        // the other direction.
+        if pdf.root_ref().is_some() {
+            pdf.with_writer_stream_recovery(|pdf| {
+                crate::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf(
+                    pdf,
+                    true,
+                    false,
+                    &BTreeSet::new(),
+                )
+            })?;
+        }
         let optimization =
             crate::optimization::Optimization::optimize(pdf, &BTreeMap::new(), true, |_| 1)?;
         if pdf.root_ref().is_some()
@@ -797,9 +926,9 @@ impl LinearizationPlan {
         // containers are never live body objects (their members survive as
         // individual objects via the compressed xref entries). Carrying them
         // through would shift every offset and make qpdf's linearization
-        // length-calc reject them ("found unknown object"). This mirrors the
-        // plain rewrite path's emission-time skip (see
-        // [`crate::writer::is_source_structural_container`]).
+        // length-calc reject them ("found unknown object"). This keeps the
+        // linearization universe aligned with the writer's structural-container
+        // emission rule.
         // qpdf garbage-collects objects unreachable from the trailer roots (it
         // only enqueues reachable objects). The plain full-rewrite path does this
         // via CatalogFirstRenumber's trailer-seeded BFS; the linearize universe
@@ -820,7 +949,19 @@ impl LinearizationPlan {
             if r.number == 0 {
                 continue;
             }
-            if crate::writer::is_source_structural_container(pdf.resolve_borrowed(r)?) {
+            let object_handle = pdf.get_object_handle(r);
+            pdf.resolve_object_handle(&object_handle)?;
+            // Both `/Type /XRef` and `/Type /ObjStm` objects are required to
+            // carry stream data (ISO 32000-1 §7.5.7/§7.5.8), so the genuine
+            // article is always `ObjectValue::Stream`, never a plain
+            // dictionary. `try_is_dictionary_of_type` only matches
+            // `ObjectValue::Dictionary` (mirroring qpdf's own
+            // `isDictionaryOfType`, `libqpdf/QPDFObjectHandle.cc:461-466`),
+            // so it can never match here; `try_is_stream_of_type` mirrors
+            // qpdf's dedicated `isStreamOfType` (`:468-471`) instead.
+            if object_handle.try_is_stream_of_type(b"XRef", b"")?
+                || object_handle.try_is_stream_of_type(b"ObjStm", b"")?
+            {
                 continue;
             }
             if !reachable.contains(&r) {
@@ -881,13 +1022,20 @@ impl LinearizationPlan {
 
         let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();
-        let info_ref = pdf.trailer().get_ref("Info");
-        let pages_tree_ref = root_ref
-            .and_then(|r| pdf.resolve_borrowed(r).ok())
-            .and_then(|obj| match obj {
-                Object::Dictionary(d) => d.get_ref("Pages"),
-                _ => None,
-            });
+        let info_handle = pdf.trailer_handle().try_get_key(b"/Info")?;
+        let info_ref = info_handle
+            .object_ref()
+            .or_else(|| info_handle.as_reference());
+        let pages_tree_ref = if let Some(root_ref) = root_ref {
+            let root_handle = pdf.get_object_handle(root_ref);
+            pdf.resolve_object_handle(&root_handle)?;
+            let pages_handle = root_handle.try_get_key(b"/Pages")?;
+            pages_handle
+                .object_ref()
+                .or_else(|| pages_handle.as_reference())
+        } else {
+            None // cov:ignore: reachable_object_set rejects a rootless document before this successful-plan path
+        };
 
         // ----------------------------------------------------------------
         // Step 2: collect page references.
@@ -1361,9 +1509,14 @@ impl LinearizationPlan {
         // renumber map assigns it the lowest new unit among outline objects,
         // matching qpdf's lc_outlines traversal-from-root order (used by
         // compute_outline_hint_info's first_object).
-        let outline_root_ref: Option<ObjectRef> = pdf
-            .root_ref()
-            .and_then(|r| pdf.resolve_borrowed(r).ok()?.as_dict()?.get_ref("Outlines"));
+        let outline_root_ref: Option<ObjectRef> = if let Some(root_ref) = pdf.root_ref() {
+            let root_handle = pdf.get_object_handle(root_ref);
+            pdf.resolve_object_handle(&root_handle)?;
+            let outlines = root_handle.try_get_key(b"/Outlines")?;
+            outlines.object_ref().or_else(|| outlines.as_reference())
+        } else {
+            None // cov:ignore: reachable_object_set rejects a rootless document before outline planning can succeed
+        };
 
         let extract_outlines = |src: &[ObjectRef]| -> Vec<ObjectRef> {
             let mut v: Vec<ObjectRef> = src
@@ -2461,23 +2614,15 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
     let Some(root) = pdf.root_ref() else {
         return Ok(false); // cov:ignore: root_ref None ⇒ from_pdf fails earlier via catalog()?
     };
-    let Object::Dictionary(cat) = pdf.resolve(root)? else {
-        return Ok(false); // cov:ignore: non-dictionary catalog unreachable on valid linearizable PDF
-    };
-    if cat.get("Outlines").is_none() {
+    let root_handle = pdf.get_object_handle(root);
+    pdf.resolve_object_handle(&root_handle)?;
+    if !root_handle.try_has_key(b"/Outlines")? {
         return Ok(false);
     }
-    match cat.get("PageMode") {
-        Some(Object::Name(n)) => Ok(n == b"UseOutlines"),
-        // cov:ignore-start: /PageMode as indirect reference; structurally identical to
-        // the direct-name arm; exercising requires a dedicated fixture with indirect PageMode
-        Some(Object::Reference(r)) => {
-            let r = *r;
-            Ok(matches!(pdf.resolve(r)?, Object::Name(n) if n == b"UseOutlines"))
-        }
-        // cov:ignore-end
-        _ => Ok(false),
-    }
+    Ok(root_handle
+        .try_get_key(b"/PageMode")?
+        .try_as_name()?
+        .is_some_and(|name| name == b"UseOutlines"))
 }
 
 /// Route each ObjStm container to a linearization part by the union of its
@@ -2667,6 +2812,39 @@ mod tests {
             &mut out,
         );
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_direct_handle_refs_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_handle_refs(
+            &ObjectHandle::array(Vec::new()),
+            MAX_INLINE_DEPTH + 1,
+            &mut out,
+        );
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_direct_handle_refs_with_context_errors_on_excessive_nesting() {
+        let mut out = Vec::new();
+        let err = collect_direct_handle_refs_with_context(
+            &ObjectHandle::array(Vec::new()),
+            MAX_INLINE_DEPTH + 1,
+            false,
+            &mut out,
+        );
+        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn collect_direct_handle_refs_tolerates_a_non_dictionary_stream_dict() {
+        let stream = ObjectHandle::stream(ObjectHandle::integer(1), std::rc::Rc::new(Vec::new()));
+        let mut out = Vec::new();
+
+        collect_direct_handle_refs(&stream, 0, &mut out).unwrap();
+
+        assert!(out.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3584,6 +3762,38 @@ mod tests {
         assert!(plan.parts_are_disjoint());
     }
 
+    #[test]
+    fn compute_closure_expands_indirect_resource_children() {
+        let mut pdf = open_two_page_shared_font();
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+        let closure = compute_closure(&mut pdf, ObjectRef::new(3, 0), &live, &BTreeSet::new())
+            .expect("first-page closure");
+
+        assert!(closure.contains(&ObjectRef::new(5, 0)));
+        assert!(closure.contains(&ObjectRef::new(8, 0)));
+    }
+
+    #[test]
+    fn compute_closure_propagates_resource_child_depth_errors() {
+        let mut pdf = open_two_page_shared_font();
+        let mut nested = ObjectHandle::integer(0);
+        for _ in 0..=MAX_INLINE_DEPTH {
+            nested = ObjectHandle::array(vec![nested]);
+        }
+        let resource = pdf.get_object_handle(ObjectRef::new(5, 0));
+        resource.set_resolved(crate::object_handle::ObjectValue::Dictionary(
+            BTreeMap::from([(b"/Nested".to_vec(), nested)]),
+        ));
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+
+        let error = compute_closure(&mut pdf, ObjectRef::new(3, 0), &live, &BTreeSet::new())
+            .expect_err("over-deep canonical resource graph must be rejected");
+
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("inline object nesting exceeds maximum"))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 6b. Outline-referenced shared font: in_outlines outranks in_first_page,
     //     so a font referenced by BOTH pages AND an outline item is lc_outlines
@@ -4152,7 +4362,15 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .all(|entry| entry.severity == crate::Severity::Warning && entry.offset.is_none()));
+            .all(|entry| entry.severity == crate::Severity::Warning));
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.offset)
+                .collect::<Vec<_>>(),
+            vec![Some(226), Some(217), Some(217)]
+        );
     }
 
     /// Build a single-page PDF whose page `/Parent` indirects through a plain
@@ -4947,6 +5165,35 @@ mod tests {
                 .all(|batch| !batch.contains(&pages_node)),
             "the cross-linked /Pages node must not be routed to the second half"
         );
+    }
+
+    /// The source document's own structural containers (`/Type /ObjStm`,
+    /// `/Type /XRef`) must never surface as ordinary body objects in the
+    /// plan: qpdf regenerates fresh containers, so the source ones are never
+    /// live body objects (their members survive individually).
+    ///
+    /// Both are always streams (ISO 32000-1 §7.5.7/§7.5.8), never plain
+    /// dictionaries, so this exercises `try_is_stream_of_type`'s matching
+    /// arm at the call site in `from_pdf` -- `try_is_dictionary_of_type`
+    /// (which only matches `ObjectValue::Dictionary`) can never match a
+    /// stream and would silently fail to identify either container.
+    #[test]
+    fn from_pdf_excludes_source_structural_objstm_and_xref_stream_objects() {
+        let bytes = resources_crosslink_page_tree_objstm_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("crosslink ObjStm PDF should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+
+        let objstm_ref = ObjectRef::new(4, 0);
+        let xref_stream_ref = ObjectRef::new(5, 0);
+        for r in [objstm_ref, xref_stream_ref] {
+            assert!(
+                !plan.part1_objects.contains(&r)
+                    && !plan.part2_objects.contains(&r)
+                    && !plan.part3_objects.contains(&r)
+                    && !plan.part4_objects().contains(&r),
+                "source structural container {r} must not appear in any linearization part"
+            );
+        }
     }
 
     /// Preserve mode keeps each source ObjStm intact after qpdf-compatible

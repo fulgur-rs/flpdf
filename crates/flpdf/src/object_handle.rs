@@ -2343,6 +2343,29 @@ impl ObjectHandle {
         Ok(true)
     }
 
+    /// True when this handle lazily resolves to a stream whose own
+    /// dictionary's optional `/Type` and `/Subtype` names equal the
+    /// requested decoded bytes.
+    ///
+    /// Ports `QPDFObjectHandle::isStreamOfType`
+    /// (`libqpdf/QPDFObjectHandle.cc:468-471`): `isStream() &&
+    /// getDict().isDictionaryOfType(type, subtype)`. Unlike
+    /// [`Self::try_is_dictionary_of_type`], which only matches a plain
+    /// dictionary value, this matches a stream's *nested* dictionary --
+    /// the shape every `/Type /ObjStm` or `/Type /XRef` object actually
+    /// has, since both are required to carry stream data.
+    pub(crate) fn try_is_stream_of_type(
+        &self,
+        type_name: &[u8],
+        subtype_name: &[u8],
+    ) -> Result<bool> {
+        self.try_dereference()?;
+        let Some(stream_dict) = self.as_stream_dict() else {
+            return Ok(false);
+        };
+        stream_dict.try_is_dictionary_of_type(type_name, subtype_name)
+    }
+
     /// qpdf-compatible array inspection with lazy dereference. Only the array
     /// itself is resolved; each returned child keeps its own identity.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
@@ -11096,6 +11119,46 @@ pub(crate) mod identity_tests {
         assert!(!ObjectHandle::integer(1)
             .try_is_dictionary_of_type(b"", b"")
             .unwrap());
+    }
+
+    #[test]
+    fn try_is_stream_of_type_matches_only_a_stream_with_the_requested_dict_type() {
+        // Arm 1: a plain (non-stream) dictionary never matches, even when its
+        // own /Type says the right thing -- `try_is_stream_of_type` requires
+        // `isStream()`, matching `QPDFObjectHandle::isStreamOfType`
+        // (`libqpdf/QPDFObjectHandle.cc:468-471`).
+        let plain_dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"XRef".to_vec()),
+        )]);
+        assert!(!plain_dict.try_is_stream_of_type(b"XRef", b"").unwrap());
+
+        // Arm 2: a stream whose nested dictionary has the wrong /Type.
+        let wrong_type_dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"ObjStm".to_vec()),
+        )]);
+        let wrong_type_stream = ObjectHandle::stream(wrong_type_dict, std::rc::Rc::new(Vec::new()));
+        assert!(!wrong_type_stream
+            .try_is_stream_of_type(b"XRef", b"")
+            .unwrap());
+
+        // Arm 3: a stream whose nested dictionary has the requested /Type --
+        // the shape every real `/Type /XRef` or `/Type /ObjStm` object has,
+        // since both are required to carry stream data.
+        let xref_dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"XRef".to_vec()),
+        )]);
+        let xref_stream = ObjectHandle::stream(xref_dict, std::rc::Rc::new(Vec::new()));
+        assert!(xref_stream.try_is_stream_of_type(b"XRef", b"").unwrap());
+
+        let objstm_dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"ObjStm".to_vec()),
+        )]);
+        let objstm_stream = ObjectHandle::stream(objstm_dict, std::rc::Rc::new(Vec::new()));
+        assert!(objstm_stream.try_is_stream_of_type(b"ObjStm", b"").unwrap());
     }
 
     #[test]

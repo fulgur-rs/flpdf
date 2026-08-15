@@ -2929,6 +2929,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .map_or(0, |eol| eol.as_bytes().len())
     }
 
+    pub(crate) fn recovered_stream_eol(
+        &self,
+        object_ref: ObjectRef,
+    ) -> Option<crate::parser::RecoveredStreamEol> {
+        self.recovered_stream_eols
+            .borrow()
+            .get(&object_ref)
+            .copied()
+    }
+
+    /// Whether the canonical `decryptStream` route treats a recovered source
+    /// line ending as ciphertext framing for this stream. This intentionally
+    /// performs only qpdf's method classification; the stateful unknown-filter
+    /// warning/rewrite remains in `pipe_stream_data_from_input`.
+    pub(crate) fn recovered_stream_eol_is_transformed(
+        &self,
+        stream_dict: &ObjectHandle,
+    ) -> Result<bool> {
+        let encryption = self.encryption_parameters().borrow().as_ref().cloned();
+        let Some(encryption) = encryption else {
+            return Ok(false);
+        };
+        let inspection = inspect_stream_encryption(&encryption, stream_dict)?;
+        Ok(!inspection.is_xref && encryption.stream_method_transforms(inspection.method))
+    }
+
     /// qpdf's `damagedPDF(input, offset, message)` warning carries the
     /// resolved object's `QPDFObjGen` in the rendered message while leaving
     /// the logger's input-source prefix separate (`QPDF.cc:1482-1529`). Keep
