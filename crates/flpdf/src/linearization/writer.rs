@@ -757,6 +757,7 @@ fn append_body_object(
     Ok(offset)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_body_object_for_ref<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     pdf: &mut Pdf<R>,

@@ -42,17 +42,6 @@ pub(crate) fn write_stream_with_id_writer(
     write_stream_payload(out, &stream.data, policy);
 }
 
-/// Write a stream using qpdf's `/Length`-last dictionary ordering.
-pub(crate) fn write_qpdf_stream(
-    out: &mut Vec<u8>,
-    stream: &crate::Stream,
-    policy: NewlineBeforeEndstream,
-    refiltered: bool,
-) {
-    stream.dict.write_pdf_stream(out, refiltered);
-    write_stream_payload(out, &stream.data, policy);
-}
-
 /// Emit stream framing after its dictionary has already been written.
 pub(crate) fn write_stream_payload(out: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEndstream) {
     out.extend_from_slice(b"\nstream\n");
