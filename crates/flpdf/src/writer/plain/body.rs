@@ -1,6 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc plain object-body emission split from planning and xref output.
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
-#[cfg(test)]
 use std::rc::Rc;
 
 use crate::writer::object_streams;
@@ -8,7 +8,7 @@ use crate::writer::plain::plan::{PlainWritePlan, PlannedIndirectObject};
 use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
 use crate::writer::WriterOptions;
 use crate::writer::{serialize, CompressStreams, QPDF_BINARY_MARKER};
-use crate::{ObjectHandle, Pdf};
+use crate::{ObjectHandle, ObjectRef, Pdf};
 
 /// Emit every body placement already chosen by `plan`.
 ///
@@ -187,6 +187,335 @@ pub(crate) fn canonical_stream_output_for_rewrite(
     normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
     canonical_stream_output_with_rewrite_policy(handle, options, true, normalize_content)
+}
+
+/// Emit a page or indirect `/Contents` array holder that owns direct stream
+/// values. qpdf's stream branch still applies to those nested streams even
+/// though the enclosing object is a page dictionary or array, while the
+/// ordinary ObjectHandle serializer deliberately emits only a stream's
+/// dictionary in a child position. Keep this exceptional framing in the
+/// writer consumer rather than changing the generic ObjectHandle contract.
+pub(crate) fn emit_content_container_from_handle_with_ref_map(
+    container: &ObjectHandle,
+    options: &WriterOptions,
+    out: &mut Vec<u8>,
+    map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> crate::Result<()> {
+    let mut write_string = |out: &mut Vec<u8>, value: &[u8]| {
+        crate::object::write_string_value(out, value);
+        Ok(())
+    };
+    emit_content_container_from_handle_with_ref_map_and_string_writer(
+        container,
+        options,
+        out,
+        map,
+        removed_refs,
+        &mut write_string,
+    )
+}
+
+/// Encrypted-string sibling of
+/// [`emit_content_container_from_handle_with_ref_map`]. The callback is kept
+/// at the same boundary as ObjectHandle's canonical writer methods so direct
+/// stream dictionaries do not need a legacy `Object` materialization bridge.
+pub(crate) fn emit_content_container_from_handle_with_ref_map_and_string_writer<F>(
+    container: &ObjectHandle,
+    options: &WriterOptions,
+    out: &mut Vec<u8>,
+    map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> crate::Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+{
+    let container = if options.content_normalization {
+        normalize_content_container(container, options)?
+    } else {
+        container.clone()
+    };
+    let mut emitter = ContentEmitter {
+        qdf: options.qdf,
+        out,
+        map,
+        removed_refs,
+        write_string,
+    };
+    emitter.emit_value(&container, true, false, 0)
+}
+
+/// Replace only direct stream values in a page's `/Contents` value or an
+/// indirect array holder. Indirect children retain identity and are never
+/// chased: their terminal streams remain ordinary planned objects, exactly as
+/// in the shared page-content resolver.
+fn normalize_content_container(
+    container: &ObjectHandle,
+    options: &WriterOptions,
+) -> crate::Result<ObjectHandle> {
+    container.try_dereference()?;
+    if let Some(entries) = container.as_dictionary() {
+        let entries = entries
+            .into_iter()
+            .map(|(key, value)| {
+                if key.as_slice() == b"/Contents" {
+                    Ok((key, normalize_content_value(&value, options)?))
+                } else {
+                    Ok((key, value))
+                }
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        return Ok(ObjectHandle::dictionary(entries));
+    }
+    if let Some(items) = container.as_array() {
+        let items = items
+            .into_iter()
+            .map(|item| normalize_content_value(&item, options))
+            .collect::<crate::Result<Vec<_>>>()?;
+        return Ok(ObjectHandle::array(items));
+    }
+    Ok(container.clone())
+}
+
+fn normalize_content_value(
+    value: &ObjectHandle,
+    options: &WriterOptions,
+) -> crate::Result<ObjectHandle> {
+    if value.is_indirect() {
+        return Ok(value.clone());
+    }
+    value.try_dereference()?;
+    if value.as_stream_dict().is_some() {
+        let (dict, data, _) = canonical_stream_output_for_rewrite(value, options, true)?;
+        return Ok(ObjectHandle::stream(dict, Rc::new(data)));
+    }
+    if let Some(items) = value.as_array() {
+        let items = items
+            .into_iter()
+            .map(|item| normalize_content_value(&item, options))
+            .collect::<crate::Result<Vec<_>>>()?;
+        return Ok(ObjectHandle::array(items));
+    }
+    Ok(value.clone())
+}
+
+struct ContentEmitter<'a, F>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+{
+    qdf: bool,
+    out: &'a mut Vec<u8>,
+    map: &'a dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+    removed_refs: &'a BTreeSet<ObjectRef>,
+    write_string: &'a mut F,
+}
+
+impl<F> ContentEmitter<'_, F>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+{
+    fn emit_value(
+        &mut self,
+        value: &ObjectHandle,
+        root: bool,
+        content_scope: bool,
+        indent: usize,
+    ) -> crate::Result<()> {
+        if !root {
+            if let Some(object_ref) = value.object_ref() {
+                if object_ref.number == 0 || self.removed_refs.contains(&object_ref) {
+                    self.out.extend_from_slice(b"null");
+                } else {
+                    self.out
+                        .extend_from_slice((self.map)(object_ref)?.to_string().as_bytes());
+                }
+                return Ok(());
+            }
+        }
+
+        value.try_dereference()?;
+        if content_scope && value.as_stream_dict().is_some() {
+            return self.emit_direct_stream(value, indent);
+        }
+
+        if root {
+            if value.as_array().is_some() && has_direct_stream_in_value(value)? {
+                let items = value.as_array().ok_or_else(|| {
+                    crate::Error::Internal("content array disappeared during emission".into())
+                })?;
+                return self.emit_array(&items, indent);
+            }
+            if let Some(entries) = value.as_dictionary() {
+                let has_contents_stream = entries
+                    .get(b"/Contents".as_slice())
+                    .map(has_direct_stream_in_value)
+                    .transpose()?
+                    .unwrap_or(false);
+                if has_contents_stream {
+                    return self.emit_dictionary(&entries, true, indent);
+                }
+            }
+        } else if content_scope && has_direct_stream_in_value(value)? {
+            if let Some(items) = value.as_array() {
+                return self.emit_array(&items, indent);
+            }
+            if let Some(entries) = value.as_dictionary() {
+                return self.emit_dictionary(&entries, false, indent);
+            }
+        }
+
+        if self.qdf {
+            value.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                self.out,
+                indent,
+                self.map,
+                self.removed_refs,
+                self.write_string,
+            )
+        } else {
+            value.unparse_object_with_ref_map_and_removed_with_string_writer(
+                self.out,
+                self.map,
+                self.removed_refs,
+                self.write_string,
+            )
+        }
+    }
+
+    fn emit_array(&mut self, items: &[ObjectHandle], indent: usize) -> crate::Result<()> {
+        if self.qdf {
+            self.out.extend_from_slice(b"[\n");
+            for item in items {
+                push_spaces(self.out, indent + 2);
+                self.emit_value(item, false, true, indent + 2)?;
+                self.out.push(b'\n');
+            }
+            push_spaces(self.out, indent);
+            self.out.push(b']');
+        } else {
+            self.out.push(b'[');
+            for item in items {
+                self.out.push(b' ');
+                self.emit_value(item, false, true, indent)?;
+            }
+            self.out.extend_from_slice(b" ]");
+        }
+        Ok(())
+    }
+
+    fn emit_dictionary(
+        &mut self,
+        entries: &BTreeMap<Vec<u8>, ObjectHandle>,
+        root_page: bool,
+        indent: usize,
+    ) -> crate::Result<()> {
+        if self.qdf {
+            self.out.extend_from_slice(b"<<\n");
+        } else {
+            self.out.extend_from_slice(b"<<");
+        }
+
+        for (key, value) in entries {
+            if value.try_is_null()? || is_removed_content_reference(value, self.removed_refs) {
+                continue;
+            }
+            if self.qdf {
+                push_spaces(self.out, indent + 2);
+            } else {
+                self.out.push(b' ');
+            }
+            write_content_key(self.out, key);
+            self.out.push(b' ');
+            self.emit_value(
+                value,
+                false,
+                !root_page || key.as_slice() == b"/Contents",
+                indent + 2,
+            )?;
+            if self.qdf {
+                self.out.push(b'\n');
+            }
+        }
+
+        if self.qdf {
+            push_spaces(self.out, indent);
+            self.out.extend_from_slice(b">>");
+        } else {
+            self.out.extend_from_slice(b" >>");
+        }
+        Ok(())
+    }
+
+    fn emit_direct_stream(&mut self, stream: &ObjectHandle, indent: usize) -> crate::Result<()> {
+        let dict = stream.as_stream_dict().ok_or_else(|| {
+            crate::Error::Internal("direct content stream dictionary is missing".into())
+        })?;
+        if self.qdf {
+            dict.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                self.out,
+                indent,
+                self.map,
+                self.removed_refs,
+                self.write_string,
+            )?;
+        } else {
+            dict.unparse_object_with_ref_map_and_removed_with_string_writer(
+                self.out,
+                self.map,
+                self.removed_refs,
+                self.write_string,
+            )?;
+        }
+        self.out.extend_from_slice(b"\nstream\n");
+        self.out
+            .extend_from_slice(stream.get_raw_stream_data()?.as_ref());
+        self.out.extend_from_slice(b"\nendstream");
+        Ok(())
+    }
+}
+
+fn has_direct_stream_in_value(value: &ObjectHandle) -> crate::Result<bool> {
+    if value.is_indirect() {
+        return Ok(false);
+    }
+    value.try_dereference()?;
+    if value.as_stream_dict().is_some() {
+        return Ok(true);
+    }
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if has_direct_stream_in_value(&item)? {
+                return Ok(true);
+            }
+        }
+    } else if let Some(entries) = value.as_dictionary() {
+        for (_, child) in entries {
+            if has_direct_stream_in_value(&child)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn is_removed_content_reference(value: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef>) -> bool {
+    value
+        .object_ref()
+        .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+        || value
+            .as_reference()
+            .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+}
+
+fn write_content_key(out: &mut Vec<u8>, key: &[u8]) {
+    out.push(b'/');
+    let key = key.strip_prefix(b"/").unwrap_or(key);
+    crate::object::write_name_escaped(out, key);
+}
+
+fn push_spaces(out: &mut Vec<u8>, count: usize) {
+    out.resize(out.len().saturating_add(count), b' ');
 }
 
 /// Canonical stream output for qpdf's linearized body route.

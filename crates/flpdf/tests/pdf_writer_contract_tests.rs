@@ -288,6 +288,26 @@ fn direct_content_stream(payload: &[u8]) -> Stream {
     Stream::new(dict, payload.to_vec())
 }
 
+fn direct_content_stream_with_null_key(payload: &[u8]) -> Stream {
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(payload.len()).expect("small direct content stream")),
+    );
+    dict.insert("Metadata", Object::Null);
+    Stream::new(dict, payload.to_vec())
+}
+
+fn direct_content_stream_with_null_reference(payload: &[u8], object_ref: ObjectRef) -> Stream {
+    let mut dict = Dictionary::new();
+    dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(payload.len()).expect("small direct content stream")),
+    );
+    dict.insert("Metadata", Object::Reference(object_ref));
+    Stream::new(dict, payload.to_vec())
+}
+
 fn page_object(contents: Object) -> Object {
     let mut dict = Dictionary::new();
     dict.insert("Type", Object::Name(b"Page".to_vec()));
@@ -997,6 +1017,106 @@ fn pdf_writer_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
     let (filter, data) = runlength_contents_snapshot(output);
     assert_eq!(filter, None);
     assert_eq!(data, b"A\nB");
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_qdf_suppresses_null_keys_in_direct_content_streams() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_content_stream_with_null_key(b"AB"))),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"AB"));
+    assert!(!contains_bytes(&output, b"/Metadata null"));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_suppresses_null_keys_in_direct_content_streams() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_content_stream_with_null_key(b"AB"))),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        content_normalization: true,
+        compress_streams: CompressStreams::No,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"AB"));
+    assert!(!contains_bytes(&output, b"/Metadata null"));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_qdf_suppresses_resolved_null_keys_in_direct_content_streams() -> flpdf::Result<()> {
+    let null_ref = ObjectRef::new(4, 0);
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(null_ref, Object::Null);
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_content_stream_with_null_reference(
+            b"A\rB", null_ref,
+        ))),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"A\nB"));
+    assert!(!contains_bytes(&output, b"/Metadata null"));
+    assert!(!contains_bytes(&output, b"4 0 obj"));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_encrypted_direct_content_streams_use_handle_string_encryption() -> flpdf::Result<()> {
+    let password = b"direct-content-password".to_vec();
+    let mut params = EncryptParams::v4_aes128(password.clone(), password);
+    params.encrypt_metadata = true;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_content_stream_with_null_key(b"AB"))),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Disable,
+        static_aes_iv: true,
+        static_id: true,
+        encrypt: Some(params),
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"stream"));
+    assert!(contains_bytes(&output, b"endstream"));
+    assert!(!contains_bytes(&output, b"/Metadata null"));
     Ok(())
 }
 

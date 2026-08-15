@@ -4,7 +4,7 @@ use crate::object::{write_hex_string, write_name_escaped, write_string_value};
 use crate::object_handle::ObjectHandle;
 use crate::security::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::writer::encryption_state::WriterEncryptionState;
-use crate::writer::{EncryptionContext, WriteCipher};
+use crate::writer::{EncryptionContext, WriteCipher, WriterOptions};
 use crate::{Dictionary, Object, ObjectRef};
 
 type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
@@ -189,6 +189,52 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 }
+            })
+    }
+
+    /// Emit a page or `/Contents` array holder that owns direct streams while
+    /// keeping qpdf's per-object string data key active. The stream payload is
+    /// deliberately handled by the content-container helper's raw-stream
+    /// route; only dictionary strings use this callback, matching the legacy
+    /// direct-stream writer's encryption boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_handle_content_container_with_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        options: &WriterOptions,
+        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                crate::writer::plain::body::emit_content_container_from_handle_with_ref_map_and_string_writer(
+                    object,
+                    options,
+                    out,
+                    map,
+                    removed_refs,
+                    &mut write_string,
+                )
             })
     }
 

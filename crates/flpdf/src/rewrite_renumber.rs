@@ -1055,6 +1055,7 @@ fn collect_refs(
 /// inline structural nesting exceeds [`MAX_INLINE_DEPTH`] (leaving an over-deep
 /// reference un-rewritten would point it at the wrong renumbered object, so we
 /// refuse rather than emit a corrupt PDF).
+#[cfg(test)]
 pub(crate) fn renumber_refs_in_place<M: NewNumberLookup>(
     obj: &mut Object,
     map: &M,
@@ -1151,6 +1152,7 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
     Ok(())
 }
 
+#[cfg(test)]
 fn rewrite<M: NewNumberLookup>(obj: &mut Object, depth: usize, map: &M) -> crate::Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
