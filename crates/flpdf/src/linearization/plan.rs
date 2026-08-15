@@ -3765,6 +3765,27 @@ mod tests {
         assert!(closure.contains(&ObjectRef::new(8, 0)));
     }
 
+    #[test]
+    fn compute_closure_propagates_resource_child_depth_errors() {
+        let mut pdf = open_two_page_shared_font();
+        let mut nested = ObjectHandle::integer(0);
+        for _ in 0..=MAX_INLINE_DEPTH {
+            nested = ObjectHandle::array(vec![nested]);
+        }
+        let resource = pdf.get_object_handle(ObjectRef::new(5, 0));
+        resource.set_resolved(crate::object_handle::ObjectValue::Dictionary(
+            BTreeMap::from([(b"/Nested".to_vec(), nested)]),
+        ));
+        let live: BTreeSet<ObjectRef> = pdf.live_object_refs().into_iter().collect();
+
+        let error = compute_closure(&mut pdf, ObjectRef::new(3, 0), &live, &BTreeSet::new())
+            .expect_err("over-deep canonical resource graph must be rejected");
+
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("inline object nesting exceeds maximum"))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 6b. Outline-referenced shared font: in_outlines outranks in_first_page,
     //     so a font referenced by BOTH pages AND an outline item is lc_outlines
