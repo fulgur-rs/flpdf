@@ -3700,10 +3700,16 @@ impl ObjectHandle {
             }
             *min_suffix += 1;
         }
-        // qpdf treats this as an internal coding error. The loop tests one
-        // more candidate than there are entries in `names`, so this is
-        // unreachable unless the invariant above is broken.
-        unreachable!("unable to find unconflicting resource name") // cov:ignore: qpdf invariant
+        // qpdf treats this as an internal coding error and throws
+        // std::logic_error (`libqpdf/QPDFObjectHandle.cc:1188-1191`); this
+        // maps to `Error::Internal` like every other logic_error in this
+        // file. The loop tests one more candidate than there are entries in
+        // `names`, so by pigeonhole this is unreachable for any input.
+        // cov:ignore-start: unreachable by the pigeonhole argument above for any input
+        Err(Error::Internal(
+            "unable to find unconflicting resource name".to_owned(),
+        ))
+        // cov:ignore-end
     }
 
     /// Whether this handle is a Form XObject.
@@ -8669,7 +8675,7 @@ fn merge_resource_subdict(
                     .insert(key, existing_key);
             }
         } else {
-            let new_key = unique_resource_name(&key, &mut min_suffix, &rnames);
+            let new_key = unique_resource_name(&key, &mut min_suffix, &rnames)?;
             conflicts_map
                 .entry(rtype.to_vec())
                 .or_default()
@@ -8800,7 +8806,7 @@ fn unique_resource_name(
     key: &[u8],
     min_suffix: &mut usize,
     names: &std::collections::BTreeSet<Vec<u8>>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut prefix = key.to_vec();
     prefix.push(b'_');
     let max_suffix = *min_suffix + names.len();
@@ -8808,17 +8814,21 @@ fn unique_resource_name(
         let mut candidate = prefix.clone();
         candidate.extend(min_suffix.to_string().into_bytes());
         if !names.contains(&candidate) {
-            return candidate;
+            return Ok(candidate);
         }
         *min_suffix += 1;
     }
     // Unreachable per qpdf's own invariant: this loop tests strictly more
     // candidates (names.len() + 1) than there are names to conflict with,
     // so by pigeonhole one must be free. qpdf itself treats reaching this
-    // point as a coding error (throws std::logic_error); this crate has no
-    // exception channel to mirror that with, so panic the same way an
-    // internal invariant violation elsewhere in this crate would.
-    unreachable!("no unconflicting resource name found") // cov:ignore: unreachable, see comment above
+    // point as a coding error and throws std::logic_error
+    // (`libqpdf/QPDFObjectHandle.cc:1188-1191`); this maps to `Error::Internal`
+    // like every other logic_error in this file.
+    // cov:ignore-start: unreachable by the pigeonhole argument above for any input
+    Err(Error::Internal(
+        "unable to find unconflicting resource name".to_owned(),
+    ))
+    // cov:ignore-end
 }
 
 // True if `handle`'s value is already known (no resolution performed here)
