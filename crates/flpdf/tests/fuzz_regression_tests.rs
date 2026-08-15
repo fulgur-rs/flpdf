@@ -1,11 +1,12 @@
 //! Regression gate for inputs discovered by the `fuzz/` cargo-fuzz harness.
 //!
 //! When the fuzzer finds an input that panics, aborts, or hangs, minimize it
-//! and drop the bytes into `tests/fixtures/fuzz_regressions/`. This test replays
-//! every file there through the same `open -> check -> write` pipeline as
-//! `fuzz/fuzz_targets/roundtrip.rs`, so a fixed crash stays fixed. It runs on
-//! stable (`cargo test -p flpdf`) with no nightly/libFuzzer dependency, making
-//! it a durable gate independent of the fuzzer itself.
+//! and drop the bytes into `tests/fixtures/fuzz_regressions/`. These tests
+//! replay every file there through the same pipelines as
+//! `fuzz/fuzz_targets/roundtrip.rs` and `fuzz/fuzz_targets/xref.rs`, so a fixed
+//! crash stays fixed. They run on stable (`cargo test -p flpdf`) with no
+//! nightly/libFuzzer dependency, making them durable gates independent of the
+//! fuzzer itself.
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -31,6 +32,17 @@ fn roundtrip(data: &[u8]) {
     }
 }
 
+/// Same strict and repair pipeline as the `xref` fuzz target. A panic here
+/// fails the test; `Err` results are the expected outcome for malformed input
+/// and are ignored.
+fn xref(data: &[u8]) {
+    let mut strict = Cursor::new(data);
+    let _ = flpdf::load_xref_and_trailer(&mut strict);
+
+    let mut repair = Cursor::new(data);
+    let _ = flpdf::load_xref_and_trailer_with_repair(&mut repair, true);
+}
+
 fn regressions_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/fuzz_regressions")
 }
@@ -53,6 +65,7 @@ fn fuzz_regressions_do_not_panic() {
         let data = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("read fuzz regression fixture {}: {e}", path.display()));
         roundtrip(&data);
+        xref(&data);
         replayed += 1;
     }
 

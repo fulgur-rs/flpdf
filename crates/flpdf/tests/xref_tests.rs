@@ -2615,6 +2615,31 @@ fn rejects_xref_stream_zero_widths() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
+/// `parse_xref_widths`: qpdf 11.9.0 rejects each `/W` value wider than its
+/// `qpdf_offset_t` before calculating the entry size. The flpdf boundary must
+/// make the same decision before decoding stream bytes.
+#[test]
+fn rejects_xref_stream_w_above_qpdf_offset_width() {
+    let data = [0u8; 9];
+    let xref_obj = format!(
+        "3 0 obj\n<< /Type /XRef /Size 1 /Root 1 0 R /W [9 0 0] /Index [0 1] /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    let mut xref_obj = xref_obj;
+    xref_obj.extend_from_slice(&data);
+    xref_obj.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(pdf_with_xref_object(&xref_obj)))
+        .expect_err("/W values wider than qpdf offset fields should fail");
+    let message = format!("{err}");
+    assert!(
+        message.contains("Cross-reference stream's /W contains impossibly large values"),
+        "got {message}"
+    );
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
 /// `parse_xref_entries`: when the entry width implied by `/W` requires more
 /// bytes than the decoded stream provides, the `cursor.pos + entry_width >
 /// len` guard returns `Error::Parse("xref stream data truncated")`. Here `/W
