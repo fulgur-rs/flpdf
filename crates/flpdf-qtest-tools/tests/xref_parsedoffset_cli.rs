@@ -26,6 +26,11 @@ fn qpdf_error_message(path: &Path) -> Option<Vec<u8>> {
     if !version.stdout.starts_with(b"qpdf version 11.9.0\n")
         && !version.stdout.starts_with(b"qpdf version 11.9.0\r\n")
     {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "qpdf 11.9.0 is required for metadata differential tests, got {:?}",
+            String::from_utf8_lossy(&version.stdout)
+        );
         eprintln!(
             "skipping metadata differential test: expected qpdf 11.9.0, got {:?}",
             String::from_utf8_lossy(&version.stdout)
