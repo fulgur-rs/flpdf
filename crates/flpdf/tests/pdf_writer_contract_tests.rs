@@ -1138,7 +1138,6 @@ fn pdf_writer_qdf_direct_content_container_can_skip_normalization() -> flpdf::Re
         page_object(Object::Stream(direct_content_stream_with_null_key(b"A\rB"))),
     );
 
-    let output;
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
@@ -1146,7 +1145,7 @@ fn pdf_writer_qdf_direct_content_container_can_skip_normalization() -> flpdf::Re
     writer.set_static_id(true);
     writer.set_output_memory()?;
     writer.write()?;
-    output = writer.get_buffer()?;
+    let output = writer.get_buffer()?;
 
     assert!(contains_bytes(&output, b"A\rB"));
     assert!(!contains_bytes(&output, b"/Metadata null"));
