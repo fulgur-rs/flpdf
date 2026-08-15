@@ -685,7 +685,7 @@ fn append_body_object(
         false,
         false,
         None,
-    );
+    )?; // cov:ignore: token_filtered_source: None makes this call infallible; unreachable by any injectable linearized-writer input
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.

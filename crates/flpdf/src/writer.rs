@@ -2316,6 +2316,14 @@ pub(crate) fn encrypt_stream_payload_with_iv(
 /// The returned bool feeds [`write_reencoded_object`], which only appends a
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
 /// already a lone `/FlateDecode`.
+///
+/// # Errors
+///
+/// Propagates a genuine pipeline failure surfaced through
+/// `token_filtered_source`'s canonical handle (a token filter, warning
+/// sink, or retry-aware `StreamDataProvider` returning a hard error) — see
+/// [`decode_token_filtered_stream`]'s own `# Errors`. A caller that always
+/// passes `None` can never observe this `Err`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reencode_stream_for_compress(
     mut stream: crate::Stream,
@@ -2326,7 +2334,7 @@ pub(crate) fn reencode_stream_for_compress(
     normalize_content: bool,
     apply_full_rewrite_metadata_policy: bool,
     token_filtered_source: Option<&ObjectHandle>,
-) -> (Object, bool) {
+) -> Result<(Object, bool)> {
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
     }
@@ -2400,7 +2408,7 @@ pub(crate) fn reencode_stream_for_compress(
             stream_decode_level,
             stream_normalization,
             token_filtered_source,
-        ),
+        )?,
         // Preserve mode: keep the raw bytes verbatim (no decode/re-encode), but
         // still normalize /Length to a direct integer of the raw byte count.
         // qpdf direct-izes EVERY stream's /Length even under --stream-data=preserve
@@ -2433,7 +2441,7 @@ pub(crate) fn reencode_stream_for_compress(
             reencoded_stream.dict.insert("Length", Object::Integer(0));
         }
     }
-    (reencoded, source_filter_is_lone_flate)
+    Ok((reencoded, source_filter_is_lone_flate))
 }
 
 /// Append a re-encoded object's body to `bytes` in qpdf's **non-qdf**
@@ -2659,18 +2667,19 @@ fn write_pclm<R: Read + Seek, W: Write>(
                         // token filter (AcroForm appearance regeneration is
                         // the only producer), so `is_data_modified` is always
                         // false here.
-                        let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
-                            stream,
-                            options,
-                            false,
-                            true,
-                            pdf.recovered_stream_eol(source),
-                            false,
-                            false,
-                            None,
-                        );
-                        // cov:ignore-start: PCLm supplies a Vec sink and no encrypted
-                        // string emitter, so this in-memory serializer has no error edge.
+                        let (reencoded, source_filter_is_lone_flate) =
+                            reencode_stream_for_compress(
+                                stream,
+                                options,
+                                false,
+                                true,
+                                pdf.recovered_stream_eol(source),
+                                false,
+                                false,
+                                None,
+                            )?; // cov:ignore: token_filtered_source: None makes this call infallible; unreachable by any injectable PCLm input
+                                // cov:ignore-start: PCLm supplies a Vec sink and no encrypted
+                                // string emitter, so this in-memory serializer has no error edge.
                         write_reencoded_object(
                             &mut bytes,
                             &reencoded,
@@ -3535,7 +3544,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 options.content_normalization && contents_seq.contains_key(old_ref),
                 true,
                 is_data_modified.then_some(&handle),
-            );
+            )?;
 
             // qpdf obtains the filtered/raw buffer first, then decides whether
             // the current stream is encrypted immediately before dictionary
@@ -4156,8 +4165,30 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
     // private PdfWriter bridge applies the configured qpdf decode-level gate.
     // No canonical handle is available to this legacy entry point, so it
     // always decodes from the materialized `stream` (no token filter can be
-    // observed here).
+    // observed here) -- `token_filtered_source: None` makes this call
+    // provably infallible, since every failure `apply_stream_compress_
+    // policy_with_decode_level`'s `Result` can carry originates from that
+    // path alone.
     apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All, false, None)
+        .expect("token_filtered_source: None makes this call infallible")
+}
+
+/// Outcome of decoding a stream's declared filter chain (and, for a
+/// token-filtered stream, any registered [`crate::token_filter::TokenFilter`])
+/// for [`apply_stream_compress_policy_with_decode_level`]'s re-encode step.
+#[derive(Debug)]
+enum StreamDecodeOutcome {
+    /// The declared chain actually ran; `Vec<u8>` is genuine decoded content
+    /// ready to re-encode per the caller's policy.
+    Decoded(Vec<u8>),
+    /// qpdf's own gate declined to filter this stream at all -- either its
+    /// declared chain was rejected (e.g. a `/DecodeParms` shape mismatch or
+    /// an unsupported codec) or, for a token-filtered stream reached only
+    /// via [`decode_token_filtered_stream`], `pipeStreamData`'s
+    /// `encode_flags != 0 || decode_level != none` gate stayed shut. The
+    /// `Vec<u8>` is the raw, undecoded bytes to preserve verbatim alongside
+    /// the stream's original filter declaration.
+    Declined(Vec<u8>),
 }
 
 /// Decode a token-filtered stream's declared filter chain through its
@@ -4165,38 +4196,104 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
 /// ([`crate::ObjectHandle::add_token_filter`]) actually transforms the
 /// content before the caller re-encodes it — mirroring
 /// `QPDF_Stream::pipeStreamData`'s decode-filters-then-token-filters order
-/// (`libqpdf/QPDF_Stream.cc:488-620`).
+/// (`libqpdf/QPDF_Stream.cc:488-620`) and the two-attempt retry protocol
+/// `QPDFWriter::willFilterStream` runs around it (`QPDFWriter.cc:1234-1245`,
+/// `:1287-1314`) — the same shape `writer/plain/body.rs`'s
+/// `canonical_stream_output` already uses for the plain writer.
 ///
-/// The caller ([`apply_stream_compress_policy_with_decode_level`]) has
-/// already confirmed via [`filter_chain_is_decodable`], using its own
-/// configured decode level, that decoding this stream's declared chain is
-/// permitted. `DecodeLevel::All` is passed here regardless of that
-/// configured level purely so `ObjectHandle::pipe_stream_data`'s own
-/// `encode_flags != 0 || decode_level != None` gate
-/// (`libqpdf/QPDF_Stream.cc:502`) constructs the decode/token-filter
-/// pipeline even when the configured level is `None` and decodability was
-/// granted solely by the compress or content-normalization override — the
-/// same unconditional `DecodeLevel::All` [`apply_stream_compress_policy`]'s
-/// public wrapper already uses. This cannot decode a filter the caller's own
-/// gate would have rejected, because that gate has already run by the time
-/// this is called.
-fn decode_token_filtered_stream(handle: &ObjectHandle) -> Result<Vec<u8>> {
-    let mut buffer = crate::pipeline::buffer::Buffer::new("token-filtered reencode", None);
-    let mut filtering_attempted = false;
-    let success = handle.pipe_stream_data(
-        &mut buffer,
-        &mut filtering_attempted,
-        0,
-        DecodeLevel::All,
-        false,
-        false,
-    )?; // cov:ignore: llvm-cov attributes this call continuation to the decline arm; both the success and the mismatch tests exercise this call.
-    if !success || !filtering_attempted {
-        return Err(crate::Error::Unsupported(
-            "token-filtered stream declined filtering".to_string(),
-        ));
+/// `has_declared_filter` distinguishes [`StreamDecodeOutcome::Declined`]'s
+/// two qpdf-faithful causes: a stream with NO declared `/Filter` has
+/// nothing to decode, so a declined `pipeStreamData` call's raw bytes
+/// already ARE the decoded content ([`StreamDecodeOutcome::Decoded`]); a
+/// stream that DOES declare a filter but was declined anyway has raw,
+/// still-encoded bytes that must be preserved verbatim, not treated as
+/// decoded content.
+///
+/// `policy`/`decode_level`/`normalize_content` are the same effective
+/// values the caller's own `filter_chain_is_decodable` gate already used to
+/// decide decoding this stream was worth attempting at all. Because this
+/// function only ever decodes -- compression, when requested, is the
+/// caller's own later, separate step, unlike qpdf's single fused
+/// `pipeStreamData` call, which can decode and compress in the same pass --
+/// `encode_flags` here is always `0`. qpdf's `ef_compress`/`ef_normalize`
+/// inputs to `pipeStreamData`'s own `encode_flags != 0 || decode_level !=
+/// none` gate (`libqpdf/QPDF_Stream.cc:502`) are instead translated as a
+/// decode-level floor: when the configured `decode_level` is `None` but the
+/// chain was admitted solely via the compress-policy or
+/// content-normalization override, the floor is raised to `Generalized` --
+/// enough to open that gate, but no more than `filter_chain_is_decodable`
+/// itself already granted (a chain admitted only through that override
+/// cannot contain `RunLengthDecode`, whose own arm ignores the override and
+/// requires the configured level to already be `Specialized`/`All`).
+///
+/// # Errors
+///
+/// Propagates a genuine pipeline failure (a token filter's own error, a
+/// warning-sink error, or a retry-aware `StreamDataProvider` returning a
+/// hard error) via `?` on [`crate::ObjectHandle::pipe_stream_data`], exactly
+/// as `canonical_stream_output` does. This must never be swallowed into a
+/// successful write with stale bytes.
+fn decode_token_filtered_stream(
+    handle: &ObjectHandle,
+    has_declared_filter: bool,
+    policy: CompressStreams,
+    decode_level: DecodeLevel,
+    normalize_content: bool,
+) -> Result<StreamDecodeOutcome> {
+    let effective_decode_level = if matches!(decode_level, DecodeLevel::None)
+        && (matches!(policy, CompressStreams::Yes) || normalize_content)
+    {
+        DecodeLevel::Generalized
+    } else {
+        decode_level
+    };
+
+    let mut attempt = 1_u8;
+    let (data, filtering_attempted) = loop {
+        let mut buffer = crate::pipeline::buffer::Buffer::new("token-filtered reencode", None);
+        let mut filtering_attempted = false;
+        let attempt_decode_level = if attempt == 1 {
+            effective_decode_level
+        } else {
+            DecodeLevel::None
+        };
+        let success = handle.pipe_stream_data(
+            &mut buffer,
+            &mut filtering_attempted,
+            0,
+            attempt_decode_level,
+            false,
+            attempt == 1,
+        )?; // cov:ignore: a hard pipeline error is exercised at the pipeline boundary (the erroring-filter regression test), not by this validated call site
+        if success || attempt == 2 {
+            // qpdf retries a failed filter pipeline against a fresh raw pipe
+            // (`QPDFWriter.cc:1287-1314`). The second attempt's buffer is
+            // authoritative even when the provider reports that no
+            // filtering branch was used.
+            break (buffer.take_buffer()?, filtering_attempted && success);
+        }
+        attempt = 2;
+    };
+
+    if filtering_attempted || !has_declared_filter {
+        Ok(StreamDecodeOutcome::Decoded(data))
+    } else {
+        Ok(StreamDecodeOutcome::Declined(data))
     }
-    Ok(buffer.take_buffer()?)
+}
+
+/// Clone `stream`'s dict, normalize `/Length` to `data`'s byte count, and
+/// pair it with `data` verbatim. Shared by every raw-preservation arm of
+/// [`apply_stream_compress_policy_with_decode_level`]: an undecodable
+/// chain, a legacy decode failure, and a token-filtered stream qpdf's own
+/// gate declined to filter.
+fn raw_preserve_stream(stream: &crate::Stream, data: Vec<u8>) -> Object {
+    let mut dict = stream.dict.clone();
+    dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+    );
+    Object::Stream(crate::Stream::new(dict, data))
 }
 
 fn apply_stream_compress_policy_with_decode_level(
@@ -4205,7 +4302,7 @@ fn apply_stream_compress_policy_with_decode_level(
     decode_level: DecodeLevel,
     normalize_content: bool,
     token_filtered_source: Option<&ObjectHandle>,
-) -> Object {
+) -> Result<Object> {
     if !filter_chain_is_decodable(
         stream.dict.get("Filter"),
         policy,
@@ -4217,13 +4314,10 @@ fn apply_stream_compress_policy_with_decode_level(
         // no decode/token-filter/normalize/compress stage is built), so a
         // registered token filter is correctly skipped here too — the
         // caller's `stream.data` is qpdf's own verbatim-original output.
-        let mut dict = stream.dict.clone();
-        dict.insert(
-            "Length",
-            Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
-        );
-        return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
+        return Ok(raw_preserve_stream(stream, stream.data.clone()));
     }
+
+    let has_declared_filter = !matches!(stream.dict.get("Filter"), None | Some(Object::Null));
 
     // A filter above the selected level has already returned through the raw
     // chain-preservation branch above, matching qpdf's all-or-nothing gate.
@@ -4235,40 +4329,48 @@ fn apply_stream_compress_policy_with_decode_level(
     //
     // When `token_filtered_source` is `Some`, decode through the canonical
     // handle's pipe instead so a registered token filter actually runs (see
-    // `decode_token_filtered_stream`); a decode failure there takes the same
-    // raw-preservation fallback as `decode_stream_data`'s Err.
-    let decode_result = match token_filtered_source {
-        Some(handle) => decode_token_filtered_stream(handle),
-        None => filters::decode_stream_data(&stream.dict, &stream.data),
+    // `decode_token_filtered_stream`), reusing its own qpdf-faithful
+    // decline/decode outcome instead of `filters::decode_stream_data`'s
+    // simpler Result. A genuine pipeline error propagates via `?` here —
+    // never caught and swallowed into a stale-but-"successful" write.
+    let outcome = match token_filtered_source {
+        Some(handle) => decode_token_filtered_stream(
+            handle,
+            has_declared_filter,
+            policy,
+            decode_level,
+            normalize_content,
+        )?,
+        None => match filters::decode_stream_data(&stream.dict, &stream.data) {
+            Ok(d) => StreamDecodeOutcome::Decoded(d),
+            Err(_) => StreamDecodeOutcome::Declined(stream.data.clone()),
+        },
     };
-    let decoded = match decode_result {
-        Ok(d) => d,
-        Err(_) => {
-            // Decode failure (unsupported codec or corrupt data): emit the data
-            // and /Filter chain verbatim so downstream readers (e.g. image
-            // renderers) can still interpret the stream correctly. qpdf, however,
-            // writes EVERY emitted stream's /Length as a direct integer, never an
-            // indirect reference; directize it here so a source carrying
-            // `/Length M G R` does not leak an indirect /Length (and a renumbered
-            // holder reference) into the output — a byte divergence from qpdf for
-            // passthrough/non-decodable streams whose length holder is kept live
-            // by another reference (flpdf-q1j2). The data bytes are untouched, so
-            // /Length equals stream.data.len().
+    let decoded = match outcome {
+        StreamDecodeOutcome::Decoded(d) => d,
+        StreamDecodeOutcome::Declined(raw) => {
+            // Decode failure (unsupported codec or corrupt data) or a
+            // token-filtered stream qpdf's own gate declined to filter:
+            // emit the data and /Filter chain verbatim so downstream
+            // readers (e.g. image renderers) can still interpret the stream
+            // correctly, and so a registered token filter qpdf itself would
+            // not have invoked here is correctly not reflected in the
+            // output. qpdf, however, writes EVERY emitted stream's /Length
+            // as a direct integer, never an indirect reference; directize
+            // it here so a source carrying `/Length M G R` does not leak an
+            // indirect /Length (and a renumbered holder reference) into the
+            // output — a byte divergence from qpdf for
+            // passthrough/non-decodable streams whose length holder is kept
+            // live by another reference (flpdf-q1j2).
             //
-            // This also covers a `token_filtered_source` decode failure: qpdf
-            // does not run a stream's token filter at all when its declared
-            // chain cannot be filtered (`QPDF_Stream::pipeStreamData` never
-            // constructs the token-filter pipeline stage when `filter` is
-            // false), so falling back to `stream.data` — the caller's
-            // already-materialized bytes, with any recovered-`endstream` EOL
-            // already restored by `reencode_stream_for_compress` — reproduces
-            // that same "emit the original bytes verbatim" outcome.
-            let mut dict = stream.dict.clone();
-            dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
-            );
-            return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
+            // `raw` is `stream.data` (with any recovered-`endstream` EOL
+            // already restored by `reencode_stream_for_compress`) for the
+            // legacy, non-token-filtered decoder, but the canonical
+            // handle's own raw pipe output for a token-filtered stream's
+            // decline — honoring a retry-aware `StreamDataProvider`'s final
+            // attempt rather than discarding it in favor of a separately
+            // materialized snapshot.
+            return Ok(raw_preserve_stream(stream, raw));
         }
     };
     let decoded = if normalize_content {
@@ -4288,7 +4390,7 @@ fn apply_stream_compress_policy_with_decode_level(
     new_dict.remove("FFilter");
     new_dict.remove("FDecodeParms");
 
-    match policy {
+    Ok(match policy {
         CompressStreams::Yes => {
             // Re-encode with a minimal FlateDecode dict.  If encoding fails
             // (vanishingly rare for in-memory zlib), keep the original stream
@@ -4298,7 +4400,7 @@ fn apply_stream_compress_policy_with_decode_level(
             encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
             let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
                 Ok(e) => e,
-                Err(_) => return Object::Stream(stream.clone()), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
+                Err(_) => return Ok(Object::Stream(stream.clone())), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
             };
 
             // Always apply FlateDecode — even if the encoded result is larger
@@ -4319,7 +4421,7 @@ fn apply_stream_compress_policy_with_decode_level(
             );
             Object::Stream(crate::Stream::new(new_dict, decoded))
         }
-    }
+    })
 }
 
 /// Apply qpdf's decode-level gate to the entire filter chain. qpdf does not
@@ -4496,7 +4598,8 @@ fn normalize_direct_content_value(value: &mut Object, options: &WriterOptions) {
                 true,
                 false,
                 None,
-            );
+            )
+            .expect("token_filtered_source: None makes this call infallible");
             let Object::Stream(normalized) = normalized else {
                 unreachable!("stream compression always returns a stream") // cov:ignore: stream normalization always returns a stream object
             };
@@ -6082,6 +6185,67 @@ mod tests {
         );
     }
 
+    /// A token filter that always fails, for exercising hard pipeline-error
+    /// propagation (as opposed to the ordinary "codec not decodable, fall
+    /// back to raw bytes" case).
+    struct ErroringTokenFilter;
+
+    impl crate::token_filter::TokenFilter for ErroringTokenFilter {
+        fn handle_token(
+            &mut self,
+            _token: &crate::tokenizer::Token,
+            _output: &mut crate::token_filter::TokenFilterOutput<'_>,
+        ) -> crate::pipeline::PipelineResult<()> {
+            Err(crate::pipeline::PipelineError::runtime(
+                "token filter deliberately failed",
+            ))
+        }
+    }
+
+    #[test]
+    fn plain_writer_fallback_propagates_a_token_filters_hard_error_instead_of_writing_stale_bytes()
+    {
+        // A source-backed (parsed_offset) stream's decode/token-filter
+        // failure is caught by `pipe_stream_data_to_pipeline_for_input`
+        // (`reader/resolver.rs`) and converted to a SOFT `Ok(false)`
+        // (`PipeFailure::Decoding`), which `decode_token_filtered_stream`'s
+        // retry loop recovers from gracefully -- exactly as it should
+        // (that's the ordinary "codec not decodable" case the other tests
+        // in this module already cover). A hard `Err` only propagates from
+        // `ObjectHandle::pipe_stream_data` for the OTHER stream-data
+        // sources: replaced data (`replace_stream_data`) and a
+        // `StreamDataProvider`, whose `pipe_stream_source` branches call
+        // `?` directly with no such catch. This test uses replaced data so
+        // the registered token filter's own error actually reaches
+        // `decode_token_filtered_stream`'s `?` uncaught.
+        let raw = build_pdf_with_reachable_stored_flate_stream();
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+        let handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve source stream");
+        // Clearing /Filter (rather than leaving the source's /FlateDecode
+        // declared over un-encoded replacement bytes) keeps this test
+        // focused purely on the token filter's own error, not a decode
+        // mismatch between the declared filter and the replaced content.
+        handle.replace_stream_data(Rc::new(b"q Q".to_vec()), Some(ObjectHandle::null()), None);
+        pdf.mark_object_dirty(stream_ref);
+        handle
+            .add_token_filter(Rc::new(RefCell::new(ErroringTokenFilter)))
+            .expect("register token filter");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_extra_header_text("% flpdf-vkka regression\n");
+        let result = writer.write();
+        assert!(
+            result.is_err(),
+            "a token filter's hard pipeline error must propagate from the \
+             whole write operation, not be silently swallowed into a \
+             successful write with stale bytes -- got {result:?}"
+        );
+    }
+
     #[test]
     fn decode_token_filtered_stream_matches_the_legacy_decoder_for_a_passthrough_filter() {
         // Decoder-substitution soundness check. `decode_token_filtered_stream`
@@ -6114,8 +6278,23 @@ mod tests {
         handle
             .add_token_filter(Rc::new(RefCell::new(PassthroughTokenFilter)))
             .expect("register token filter");
-        let token_filtered_decoded =
-            decode_token_filtered_stream(&handle).expect("token-filtered decode must succeed");
+        // `decode_level=Generalized` (not `None`) keeps this test focused on
+        // decoder equivalence: it exercises `filtering_attempted=true`
+        // directly, without depending on the `None`+`policy==Yes` bump
+        // covered by the primary regression test above.
+        let outcome = decode_token_filtered_stream(
+            &handle,
+            true,
+            CompressStreams::No,
+            DecodeLevel::Generalized,
+            false,
+        )
+        .expect("token-filtered decode must succeed");
+        let StreamDecodeOutcome::Decoded(token_filtered_decoded) = outcome else {
+            panic!(
+                "a lone /FlateDecode stream at decode_level=Generalized must decode: {outcome:?}"
+            ) // cov:ignore: test-shape guard
+        };
 
         assert_eq!(
             token_filtered_decoded, legacy_decoded,
@@ -6126,7 +6305,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_token_filtered_stream_reports_failure_on_a_decode_parms_length_mismatch() {
+    fn decode_token_filtered_stream_declines_on_a_decode_parms_length_mismatch() {
         // A `/DecodeParms` array shorter than `/Filter`'s is a shape
         // mismatch `ObjectHandle::pipe_stream_data`'s own
         // `prepare_stream_filter_plan` rejects (its `count !=
@@ -6136,10 +6315,12 @@ mod tests {
         // check -- does not see, so
         // `apply_stream_compress_policy_with_decode_level`'s decode step is
         // still reached for a stream like this one.
-        // `decode_token_filtered_stream` must treat `filtering_attempted ==
-        // false` the same as any other decode failure and report `Err`, so
-        // the caller's existing raw-preservation fallback runs instead of
-        // silently returning unfiltered/partial bytes.
+        // `decode_token_filtered_stream` must report this stream (which DOES
+        // declare a filter) as `StreamDecodeOutcome::Declined` -- carrying
+        // the raw, still-undecoded bytes -- rather than
+        // `StreamDecodeOutcome::Decoded`, so the caller's raw-preservation
+        // fallback runs instead of treating undecoded bytes as decoded
+        // content.
         let mut raw: Vec<u8> = Vec::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
         let off1 = raw.len() as u64;
@@ -6173,11 +6354,19 @@ mod tests {
             .add_token_filter(Rc::new(RefCell::new(PassthroughTokenFilter)))
             .expect("register token filter");
 
-        let result = decode_token_filtered_stream(&handle);
+        let outcome = decode_token_filtered_stream(
+            &handle,
+            true,
+            CompressStreams::No,
+            DecodeLevel::Generalized,
+            false,
+        )
+        .expect("a shape rejection is not a hard pipeline error");
         assert!(
-            result.is_err(),
-            "a /DecodeParms length mismatch must make decode_token_filtered_stream \
-             report failure, not silently return unfiltered/partial bytes"
+            matches!(outcome, StreamDecodeOutcome::Declined(_)),
+            "a /DecodeParms length mismatch on a stream that DOES declare a \
+             filter must report StreamDecodeOutcome::Declined (raw, \
+             undecoded bytes), not Decoded -- got {outcome:?}"
         );
     }
 
@@ -6188,20 +6377,25 @@ mod tests {
         // policy (`writer.rs`'s `let Some(filter) = filter else { return
         // true }`), so `apply_stream_compress_policy_with_decode_level`'s
         // decode step is reached the same way it is for a declared chain.
-        // `decode_token_filtered_stream` always requests `DecodeLevel::All`
-        // from `ObjectHandle::pipe_stream_data` specifically so that its own
-        // `encode_flags != 0 || decode_level != None` gate
-        // (`QPDF_Stream::pipeStreamData`, `libqpdf/QPDF_Stream.cc:502`)
-        // still constructs the token-filter pipeline stage in this
-        // no-declared-filter case, rather than short-circuiting to an
-        // unfiltered pipe because no encode/decode work was requested.
+        // `PdfWriter`'s defaults give this test `policy=CompressStreams::Yes`
+        // (`compress_streams` defaults `true`), so
+        // `decode_token_filtered_stream`'s `None`+`policy==Yes` floor raises
+        // the effective decode level to `Generalized`, opening
+        // `pipe_stream_data`'s own `encode_flags != 0 || decode_level !=
+        // None` gate (`QPDF_Stream::pipeStreamData`,
+        // `libqpdf/QPDF_Stream.cc:502`) and constructing the token-filter
+        // pipeline stage even though the configured level is `None` --
+        // mirroring qpdf's own `compress_streams` forcing `ef_compress` into
+        // `pipeStreamData`'s `encode_flags` regardless of
+        // `stream_decode_level` (`QPDFWriter.cc:1234-1245`).
         // `set_decode_level(DecodeLevel::None)` is what makes this test
-        // actually discriminate that: `--decode-level`'s default
-        // (`DecodeLevel::Generalized`, non-`None`) would already force
-        // `pipe_stream_data`'s gate open on its own, so a `decode_level`
-        // that *stayed* `None` would pass through unnoticed under the
-        // default and hide a regression that hardcodes the configured level
-        // instead of `DecodeLevel::All`.
+        // actually discriminate that floor: the writer's true default is
+        // ALSO `DecodeLevel::None` (`WriterSettings::default()`), so this
+        // call is not strictly required for the fixture to reach that
+        // state, but keeps the combination explicit rather than incidental.
+        // See `plain_writer_fallback_declines_a_token_filter_under_compress_streams_no_and_decode_level_none`
+        // below for the companion `policy=No` case, where this same
+        // no-declared-filter stream's token filter must NOT run.
         let raw = build_pdf_with_reachable_unfiltered_stream();
         let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
         let stream_ref = ObjectRef::new(3, 0);
@@ -6235,7 +6429,66 @@ mod tests {
             decoded.as_ref().as_slice(),
             b"1 0 0 RG",
             "a token filter registered on a stream with no declared /Filter \
-             must still run through the fallback path's re-encode"
+             must still run through the fallback path's re-encode when \
+             policy=Yes forces it, even at decode_level=None"
+        );
+    }
+
+    #[test]
+    fn plain_writer_fallback_declines_a_token_filter_under_compress_streams_no_and_decode_level_none(
+    ) {
+        // qpdf's own `pipeStreamData` gate
+        // (`encode_flags != 0 || decode_level != none`,
+        // `libqpdf/QPDF_Stream.cc:502`) stays SHUT for a token-filtered
+        // stream when `compress_streams=false` AND `stream_decode_level=
+        // none`: `isDataModified()` alone makes `QPDFWriter::willFilterStream`'s
+        // outer `filter` bool true (`QPDFWriter.cc:1234-1245`), but neither
+        // `compress_stream` nor `normalize` becomes true without
+        // `compress_streams`, so the decode level and encode flags actually
+        // passed to `pipeStreamData` end up `(m->stream_decode_level, 0)` =
+        // `(none, 0)` regardless -- the SAME flags as an unmodified stream.
+        // The token filter is therefore correctly NOT invoked, and qpdf
+        // emits the stream's original content verbatim. This is the
+        // `CompressStreams::No` + `DecodeLevel::None` combination a Codex
+        // review flagged as silently over-triggered by an earlier revision
+        // of this fix (which hardcoded `DecodeLevel::All` regardless of the
+        // configured policy/level).
+        let raw = build_pdf_with_reachable_unfiltered_stream();
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+        let source_handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve_object_handle(&source_handle)
+            .expect("resolve source stream");
+        source_handle
+            .add_token_filter(Rc::new(RefCell::new(RewritingTokenFilter)))
+            .expect("register token filter");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_extra_header_text("% flpdf-vkka regression\n");
+        writer.set_decode_level(DecodeLevel::None);
+        writer.set_compress_streams(false);
+        writer.write().expect("write");
+        let renumbered = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("stream mapping")
+            .expect("stream is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        let mut reparsed = crate::Pdf::open_mem_owned(output).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written stream");
+        let decoded = written
+            .get_stream_data(DecodeLevel::Generalized)
+            .expect("decode written stream");
+        assert_eq!(
+            decoded.as_ref().as_slice(),
+            b"q Q",
+            "under CompressStreams::No + DecodeLevel::None, qpdf's own gate \
+             keeps a token filter from running at all -- the source content \
+             must survive unchanged, not the filter's replacement text"
         );
     }
 
