@@ -186,7 +186,9 @@ pub use acroform_field_prune::{
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use annotation_helper::AnnotationObjectHelper;
-pub use attachment_list::{format_attachment_list, list_attachment_info, AttachmentInfo};
+pub use attachment_list::{
+    format_attachment_list, format_attachment_list_with_sink, list_attachment_info, AttachmentInfo,
+};
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{
     check_reader, check_reader_strict, check_reader_with_options,

@@ -236,6 +236,26 @@ pub fn format_attachment_list<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     verbose: bool,
 ) -> Result<Option<Vec<u8>>> {
+    format_attachment_list_with_sink(pdf, verbose, |_| Ok(()))
+}
+
+/// Format the attachment list while forwarding each emitted fragment to a
+/// caller-owned sink.
+///
+/// qpdf writes attachment output directly to its info pipeline.  Keeping the
+/// sink boundary here lets the CLI preserve output already written when a
+/// later verbose metadata accessor throws (for example, the `creation date:`
+/// prefix before `getDict()` rejects a non-stream `/EF` value), while the
+/// ordinary [`format_attachment_list`] API continues to return one buffer.
+pub fn format_attachment_list_with_sink<R, F>(
+    pdf: &mut Pdf<R>,
+    verbose: bool,
+    mut sink: F,
+) -> Result<Option<Vec<u8>>>
+where
+    R: Read + Seek,
+    F: FnMut(&[u8]) -> Result<()>,
+{
     let mut helper = pdf.embedded_files();
     if !helper.has_embedded_files()? {
         return Ok(None);
@@ -244,15 +264,15 @@ pub fn format_attachment_list<R: Read + Seek>(
     // the map is keyed and ordered by the converted bytes, as qpdf's is.
     let entries = helper.get_embedded_files()?;
 
-    let mut out = Vec::new();
+    let mut out = ListingOutput::new(&mut sink);
     for (key, filespec) in entries {
-        let ef = {
+        let ef_entries = {
             let mut file_spec = FileSpec::new(filespec, pdf)?;
             let stream = file_spec.get_embedded_file_stream("")?;
-            out.extend_from_slice(&key);
-            out.extend_from_slice(b" -> ");
-            out.extend_from_slice(object_generation(&stream).as_bytes());
-            out.push(b'\n');
+            out.extend_from_slice(&key)?;
+            out.extend_from_slice(b" -> ")?;
+            out.extend_from_slice(object_generation(&stream).as_bytes())?;
+            out.push(b'\n')?;
 
             if !verbose {
                 continue;
@@ -260,61 +280,89 @@ pub fn format_attachment_list<R: Read + Seek>(
 
             let description = file_spec.get_description()?;
             if !description.is_empty() {
-                push_labelled(&mut out, b"  description: ", &description);
+                out.push_labelled(b"  description: ", &description)?;
             }
-            push_labelled(&mut out, b"  preferred name: ", &file_spec.get_filename()?);
-            out.extend_from_slice(b"  all names:\n");
+            let filename = file_spec.get_filename()?;
+            out.push_labelled(b"  preferred name: ", &filename)?;
+            out.extend_from_slice(b"  all names:\n")?;
             for (name_key, name) in file_spec.get_filenames()? {
-                out.extend_from_slice(b"    ");
-                out.extend_from_slice(name_key.as_bytes());
-                out.extend_from_slice(b" -> ");
-                out.extend_from_slice(&name);
-                out.push(b'\n');
+                out.extend_from_slice(b"    ")?;
+                out.extend_from_slice(name_key.as_bytes())?;
+                out.extend_from_slice(b" -> ")?;
+                out.extend_from_slice(&name)?;
+                out.push(b'\n')?;
             }
-            out.extend_from_slice(b"  all data streams:\n");
-            file_spec.get_embedded_file_streams()?
+            out.extend_from_slice(b"  all data streams:\n")?;
+            file_spec.get_embedded_file_stream_entries()?
         };
 
         // qpdf walks the raw /EF dictionary, so an entry under a key outside
         // the recognized name keys is listed too; keys whose value is null are
         // skipped, as they are by QPDFObjectHandle::getKeys.
-        let ef = pdf.resolve_object_handle_to_terminal(&ef)?;
-        let Some(streams) = ef.as_dictionary() else {
-            continue;
-        };
-        for (stream_key, stream) in streams {
+        for (stream_key, stream) in ef_entries {
             if pdf.resolve_object_handle_to_terminal(&stream)?.is_null() {
                 continue;
             }
-            out.extend_from_slice(b"    ");
-            out.extend_from_slice(&stream_key);
-            out.extend_from_slice(b" -> ");
-            out.extend_from_slice(object_generation(&stream).as_bytes());
-            out.push(b'\n');
+            out.extend_from_slice(b"    ")?;
+            out.extend_from_slice(&stream_key)?;
+            out.extend_from_slice(b" -> ")?;
+            out.extend_from_slice(object_generation(&stream).as_bytes())?;
+            out.push(b'\n')?;
 
             let embedded_file = EmbeddedFileStream::new(stream, pdf)?;
-            let creation_date = embedded_file.get_creation_date()?;
-            let modification_date = embedded_file.get_mod_date()?;
-            let subtype = embedded_file.get_subtype()?;
-            let checksum = embedded_file.get_checksum()?;
-            push_labelled(&mut out, b"      creation date: ", &creation_date);
-            push_labelled(&mut out, b"      modification date: ", &modification_date);
-            push_labelled(&mut out, b"      mime type: ", &subtype);
-            push_labelled(
-                &mut out,
-                b"      checksum: ",
-                checksum_to_hex(&checksum).as_bytes(),
-            );
+            out.extend_from_slice(b"      creation date: ")?;
+            out.extend_from_slice(&embedded_file.get_creation_date()?)?;
+            out.push(b'\n')?;
+            out.extend_from_slice(b"      modification date: ")?;
+            out.extend_from_slice(&embedded_file.get_mod_date()?)?;
+            out.push(b'\n')?;
+            out.extend_from_slice(b"      mime type: ")?;
+            out.extend_from_slice(&embedded_file.get_subtype()?)?;
+            out.push(b'\n')?;
+            out.extend_from_slice(b"      checksum: ")?;
+            out.extend_from_slice(checksum_to_hex(&embedded_file.get_checksum()?).as_bytes())?;
+            out.push(b'\n')?;
         }
     }
-    Ok(Some(out))
+    Ok(Some(out.finish()))
 }
 
-/// Append `label` followed by `value` and a newline.
-fn push_labelled(out: &mut Vec<u8>, label: &[u8], value: &[u8]) {
-    out.extend_from_slice(label);
-    out.extend_from_slice(value);
-    out.push(b'\n');
+struct ListingOutput<'a, F> {
+    bytes: Vec<u8>,
+    sink: &'a mut F,
+}
+
+impl<'a, F> ListingOutput<'a, F>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    fn new(sink: &'a mut F) -> Self {
+        Self {
+            bytes: Vec::new(),
+            sink,
+        }
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) -> Result<()> {
+        self.bytes.extend_from_slice(data);
+        (self.sink)(data)
+    }
+
+    fn push(&mut self, byte: u8) -> Result<()> {
+        self.bytes.push(byte);
+        (self.sink)(&[byte])
+    }
+
+    /// Append `label`, `value`, and a newline in qpdf's expression order.
+    fn push_labelled(&mut self, label: &[u8], value: &[u8]) -> Result<()> {
+        self.extend_from_slice(label)?;
+        self.extend_from_slice(value)?;
+        self.push(b'\n')
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 /// Render a handle's object and generation the way `QPDFObjGen::unparse(',')`
@@ -693,10 +741,29 @@ mod tests {
              all data streams:\n",
             "a missing /EF still prints the header and both section labels"
         );
+
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("operation for dictionary attempted on object of type null")
+            })
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "qpdf ditems() asks the missing /EF null for keys at begin and end"
+        );
+        assert!(warnings
+            .iter()
+            .all(|diagnostic| diagnostic.message.contains("treating as empty")));
     }
 
     #[test]
-    fn ef_value_that_is_not_a_stream_is_not_preferred() {
+    fn ef_value_that_is_not_a_stream_fails_when_metadata_is_read() {
         let mut pdf = open_minimal();
         let dict_ref = next_ref(&mut pdf);
         let mut not_a_stream = Dictionary::new();
@@ -709,15 +776,13 @@ mod tests {
         filespec.insert("EF", Object::Dictionary(ef));
         attach(&mut pdf, b"g.txt", filespec);
 
-        let out = as_text(&listing(&mut pdf, true));
-        assert!(
-            out.starts_with("g.txt -> 0,0\n"),
-            "the header skips a non-stream /EF value: {out:?}"
+        let error = format_attachment_list(&mut pdf, true)
+            .expect_err("qpdf reads stream metadata after listing a raw non-stream /EF value");
+        assert_eq!(
+            error.to_string(),
+            "operation for stream attempted on object of type dictionary"
         );
-        assert!(
-            out.contains(&format!("    /F -> {},0\n", dict_ref.number)),
-            "`all data streams` reports the raw /EF value: {out:?}"
-        );
+        assert_eq!(dict_ref.generation, 0);
     }
 
     // ── Name tree presence decides the "no embedded files" branch ─────────────
@@ -823,6 +888,14 @@ mod tests {
             assert_eq!(
                 as_text(&listing(&mut pdf, true)),
                 "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+            );
+            assert!(
+                pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("Embedded file object is not a dictionary")
+                }),
+                "QPDFFileSpecObjectHelper must warn for a non-dictionary Filespec"
             );
         }
     }

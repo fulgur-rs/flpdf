@@ -32,7 +32,7 @@ use flpdf::{
     RemoveUnreferencedResources, Severity, Stream, StreamDataMode,
 };
 use flpdf::{
-    copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
+    copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list_with_sink,
     insert_embedded_file, list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
 };
 use std::collections::HashSet;
@@ -5896,8 +5896,8 @@ fn run_list_attachments(
     // qpdf reports the absence of an /EmbeddedFiles name tree with the input
     // file name (QPDFJob::doListAttachments), so that branch stays with the
     // caller that knows the name.
-    match format_attachment_list(&mut pdf, verbose)? {
-        Some(listing) => logger_info(listing)?,
+    match format_attachment_list_with_sink(&mut pdf, verbose, |data| cli_logger().info(data))? {
+        Some(_) => {}
         None => logger_info(format!("{} has no embedded files\n", input.display()))?,
     }
     finish_operation_warnings(&pdf, false)
