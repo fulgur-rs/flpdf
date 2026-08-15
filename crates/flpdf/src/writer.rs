@@ -6026,6 +6026,50 @@ mod tests {
         pdf
     }
 
+    /// A stream declaring `/Filter /FlateDecode` — a supported, recognized
+    /// name, so `filter_chain_is_decodable` admits it — whose payload is
+    /// NOT valid zlib data. `filters::decode_stream_data` (the legacy
+    /// decoder) and `ObjectHandle::pipe_stream_data`'s Flate decode stage
+    /// (the canonical decoder) must both fail on this content, exercising
+    /// the "declared filter, but decode genuinely fails" raw-preservation
+    /// path — as opposed to `build_pdf_with_reachable_unfiltered_stream`'s
+    /// "no filter to begin with" case, or an unsupported codec name like
+    /// `/DCTDecode`, which `filter_chain_is_decodable` rejects before any
+    /// decode is even attempted.
+    const CORRUPT_FLATE_PAYLOAD: &[u8] = b"not valid zlib data at all";
+
+    fn build_pdf_with_reachable_corrupt_flate_stream() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /Extras 3 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+                  /BBox [0 0 1 1] /Filter /FlateDecode /Length {}>>\nstream\n",
+                CORRUPT_FLATE_PAYLOAD.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(CORRUPT_FLATE_PAYLOAD);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
     #[test]
     fn plain_writer_fallback_recompresses_a_token_filtered_lone_flate_stream_instead_of_preserving_it_verbatim(
     ) {
@@ -6243,6 +6287,110 @@ mod tests {
             "a token filter's hard pipeline error must propagate from the \
              whole write operation, not be silently swallowed into a \
              successful write with stale bytes -- got {result:?}"
+        );
+    }
+
+    #[test]
+    fn plain_writer_fallback_preserves_a_corrupt_flate_stream_verbatim_without_a_token_filter() {
+        // No token filter is registered here (`is_data_modified` stays
+        // false), so this exercises `apply_stream_compress_policy_with_
+        // decode_level`'s LEGACY (`token_filtered_source: None`) decode
+        // path: `filters::decode_stream_data` fails on the corrupt payload,
+        // taking `StreamDecodeOutcome::Declined(stream.data.clone())`.
+        let raw = build_pdf_with_reachable_corrupt_flate_stream();
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_extra_header_text("% flpdf-vkka regression\n");
+        writer
+            .write()
+            .expect("a decode failure must fall back to raw preservation, not error the write");
+        let renumbered = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("stream mapping")
+            .expect("stream is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        let mut reparsed = crate::Pdf::open_mem_owned(output).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written stream");
+        let raw_written = written
+            .get_raw_stream_data()
+            .expect("written raw stream bytes");
+        assert_eq!(
+            raw_written.as_ref().as_slice(),
+            CORRUPT_FLATE_PAYLOAD,
+            "an undecodable declared filter's payload must be preserved \
+             byte-for-byte verbatim"
+        );
+        let filter = written
+            .as_stream_dict()
+            .expect("written object must be a stream")
+            .try_get_key(b"/Filter")
+            .expect("read /Filter");
+        assert!(
+            filter
+                .try_is_name_and_equals(b"FlateDecode")
+                .unwrap_or(false),
+            "the original /Filter declaration must survive a decode failure \
+             so readers that CAN decode it still can"
+        );
+    }
+
+    #[test]
+    fn plain_writer_fallback_preserves_a_corrupt_flate_stream_verbatim_even_with_a_token_filter_registered(
+    ) {
+        // A registered token filter makes `is_data_modified` true, routing
+        // through `decode_token_filtered_stream`. The corrupt payload makes
+        // attempt 1's decode fail mid-pipe on a SOURCE-backed (parsed_offset)
+        // stream -- caught by `pipe_stream_data_to_pipeline_for_input` as a
+        // soft `Ok(false)` -- so the retry loop's attempt 2 (encode_flags=0,
+        // decode_level=None) recovers with an unfiltered raw copy, matching
+        // qpdf's own two-attempt `willFilterStream` retry
+        // (`QPDFWriter.cc:1287-1314`). The declared filter survives this
+        // decline exactly as it does without a token filter registered at
+        // all, proving the retry protocol -- not just the decode-level
+        // fidelity -- reaches the correct qpdf-faithful outcome.
+        let raw = build_pdf_with_reachable_corrupt_flate_stream();
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+        let handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve source stream");
+        handle
+            .add_token_filter(Rc::new(RefCell::new(PassthroughTokenFilter)))
+            .expect("register token filter");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_extra_header_text("% flpdf-vkka regression\n");
+        writer
+            .write()
+            .expect("a decode failure must fall back to raw preservation, not error the write");
+        let renumbered = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("stream mapping")
+            .expect("stream is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        let mut reparsed = crate::Pdf::open_mem_owned(output).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written stream");
+        let raw_written = written
+            .get_raw_stream_data()
+            .expect("written raw stream bytes");
+        assert_eq!(
+            raw_written.as_ref().as_slice(),
+            CORRUPT_FLATE_PAYLOAD,
+            "a token-filtered stream's undecodable payload must still be \
+             preserved byte-for-byte verbatim via the retry loop's second \
+             attempt, not lost or corrupted"
         );
     }
 
