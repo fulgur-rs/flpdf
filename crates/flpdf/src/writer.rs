@@ -3515,7 +3515,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     options,
                     &map,
                     &removed_refs,
-                )?;
+                )?; // cov:ignore: LLVM does not attribute the successful encrypted emitter continuation
             } else {
                 plain::body::emit_content_container_from_handle_with_ref_map(
                     &object_handle,
@@ -3523,7 +3523,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &mut bytes,
                     &map,
                     &removed_refs,
-                )?;
+                )?; // cov:ignore: LLVM does not attribute the successful plain emitter continuation
             }
         } else if is_stream {
             // This is the qpdf stream writer's live-handle path: filtering and

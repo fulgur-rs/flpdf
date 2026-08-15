@@ -275,7 +275,7 @@ fn normalize_content_container(
             .collect::<crate::Result<Vec<_>>>()?;
         return Ok(ObjectHandle::array(items));
     }
-    Ok(container.clone())
+    Ok(container.clone()) // cov:ignore: the pre-scan records only page dictionaries and array holders
 }
 
 fn normalize_content_value(
@@ -342,8 +342,10 @@ where
         if root {
             if value.as_array().is_some() && has_direct_stream_in_value(value)? {
                 let items = value.as_array().ok_or_else(|| {
+                    // cov:ignore-start: the handle cannot change between the shape probe and this read
                     crate::Error::Internal("content array disappeared during emission".into())
-                })?;
+                    // cov:ignore-end
+                })?; // cov:ignore: the preceding shape probe makes this defensive error unreachable
                 return self.emit_array(&items, indent);
             }
             if let Some(entries) = value.as_dictionary() {
@@ -432,7 +434,7 @@ where
                 false,
                 !root_page || key.as_slice() == b"/Contents",
                 indent + 2,
-            )?;
+            )?; // cov:ignore: LLVM does not attribute the successful nested emitter continuation
             if self.qdf {
                 self.out.push(b'\n');
             }
@@ -449,8 +451,11 @@ where
 
     fn emit_direct_stream(&mut self, stream: &ObjectHandle, indent: usize) -> crate::Result<()> {
         let dict = stream.as_stream_dict().ok_or_else(|| {
-            crate::Error::Internal("direct content stream dictionary is missing".into())
-        })?;
+            // cov:ignore-start: emit_direct_stream is called only after the stream shape probe
+            crate::Error::Internal(
+                "direct content stream dictionary is missing".into(), // cov:ignore-end
+            )
+        })?; // cov:ignore: the preceding stream shape probe makes this defensive error unreachable
         if self.qdf {
             dict.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
                 self.out,
@@ -458,14 +463,14 @@ where
                 self.map,
                 self.removed_refs,
                 self.write_string,
-            )?;
+            )?; // cov:ignore: LLVM does not attribute the successful QDF dictionary continuation
         } else {
             dict.unparse_object_with_ref_map_and_removed_with_string_writer(
                 self.out,
                 self.map,
                 self.removed_refs,
                 self.write_string,
-            )?;
+            )?; // cov:ignore: LLVM does not attribute the successful compact dictionary continuation
         }
         self.out.extend_from_slice(b"\nstream\n");
         self.out

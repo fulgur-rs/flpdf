@@ -295,6 +295,7 @@ fn direct_content_stream_with_null_key(payload: &[u8]) -> Stream {
         Object::Integer(i64::try_from(payload.len()).expect("small direct content stream")),
     );
     dict.insert("Metadata", Object::Null);
+    dict.insert("Note", Object::String(b"stream-note".to_vec()));
     Stream::new(dict, payload.to_vec())
 }
 
@@ -324,6 +325,14 @@ fn page_object(contents: Object) -> Object {
     dict.insert("Resources", Object::Dictionary(Dictionary::new()));
     dict.insert("Contents", contents);
     Object::Dictionary(dict)
+}
+
+fn page_object_with_null_key(contents: Object) -> Object {
+    let mut page = page_object(contents);
+    page.as_dict_mut()
+        .expect("page dictionary")
+        .insert("NullEntry", Object::Null);
+    page
 }
 
 fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
@@ -1025,7 +1034,7 @@ fn pdf_writer_qdf_suppresses_null_keys_in_direct_content_streams() -> flpdf::Res
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     pdf.set_object(
         ObjectRef::new(3, 0),
-        page_object(Object::Stream(direct_content_stream_with_null_key(b"AB"))),
+        page_object_with_null_key(Object::Stream(direct_content_stream_with_null_key(b"AB"))),
     );
 
     let mut output = Vec::new();
@@ -1117,6 +1126,62 @@ fn pdf_writer_encrypted_direct_content_streams_use_handle_string_encryption() ->
     assert!(contains_bytes(&output, b"stream"));
     assert!(contains_bytes(&output, b"endstream"));
     assert!(!contains_bytes(&output, b"/Metadata null"));
+    assert!(!contains_bytes(&output, b"stream-note"));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_qdf_direct_content_container_can_skip_normalization() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_content_stream_with_null_key(b"A\rB"))),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        qdf: true,
+        content_normalization: false,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"A\nB"));
+    assert!(!contains_bytes(&output, b"/Metadata null"));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_compact_direct_content_arrays_use_handle_children() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut nested = Dictionary::new();
+    nested.insert("Nested", Object::Stream(direct_content_stream(b"N\rD")));
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Array(vec![
+            Object::Stream(direct_content_stream(b"A\rB")),
+            Object::Reference(ObjectRef::new(4, 0)),
+            Object::Dictionary(nested),
+            Object::Reference(ObjectRef::new(0, 0)),
+        ])),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        content_normalization: true,
+        compress_streams: CompressStreams::No,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"A\nB"));
+    assert!(contains_bytes(&output, b"N\rD"));
+    assert!(contains_bytes(&output, b"ABC"));
+    assert!(contains_bytes(&output, b"null"));
     Ok(())
 }
 
