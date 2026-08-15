@@ -2162,7 +2162,7 @@ fn writer_has_current_data_key(ctx: &EncryptionContext) -> bool {
     }
 }
 
-fn adjust_aes_stream_length(
+pub(crate) fn adjust_aes_stream_length(
     length: &mut usize,
     ctx: &EncryptionContext,
     encrypt_stream: bool,
@@ -2267,7 +2267,7 @@ fn pipe_writer_stream_payload(
 
 /// Write a stream payload through the qpdf-shaped writer pipeline, including
 /// the final `endstream` framing decision based on the pipeline's last byte.
-fn write_stream_payload_with_pipeline(
+pub(crate) fn write_stream_payload_with_pipeline(
     out: &mut Vec<u8>,
     data: &[u8],
     policy: NewlineBeforeEndstream,

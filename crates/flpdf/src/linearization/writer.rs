@@ -75,12 +75,11 @@ use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
 use crate::writer::{
-    effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension, is_lone_flate,
-    reencode_stream_for_compress, report_progress_event,
-    serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order, serialize::xref_stream,
-    strip_adbe_extension, CompressStreams, NewlineBeforeEndstream, WriterOptions, WriterResult,
+    effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension,
+    report_progress_event, serialize::xref_stream, strip_adbe_extension, CompressStreams,
+    NewlineBeforeEndstream, WriterOptions, WriterResult,
 };
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result, Stream};
 
 const EBADF_ERRNO: i32 = 9;
 
@@ -572,184 +571,216 @@ fn renumber_object_with_removed<R: Read + Seek>(
 fn append_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
-    object: Object,
+    object: &ObjectHandle,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
 ) -> Result<usize> {
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_object(bytes, new_ref, None, &object, false)?;
+        emitter.write_handle_object_with_ref_map(
+            bytes,
+            new_ref,
+            None,
+            object,
+            false,
+            map,
+            removed_refs,
+        )?;
     } else {
-        object.write_pdf(bytes);
+        object.unparse_object_with_ref_map_and_removed(bytes, map, removed_refs)?;
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
 }
 
-/// Query `r`'s canonical-handle `is_data_modified()` bit
-/// (`QPDF_Stream::isDataModified`, `QPDF_Stream.cc:321-324`) for
-/// [`append_body_object`]'s stream-compression-policy decision.
-///
-/// `ObjectHandle::is_data_modified` reports `false` for an unresolved
-/// handle, so this resolves `r` through the canonical handle explicitly
-/// rather than relying on a caller's separate `pdf.resolve(r)` (the
-/// legacy-`Object` resolver `append_body_object`'s callers already use,
-/// which does not touch the canonical handle as a side effect).
-fn stream_is_data_modified<R: Read + Seek>(pdf: &mut Pdf<R>, r: ObjectRef) -> Result<bool> {
-    let handle = pdf.get_object_handle(r);
-    pdf.resolve_object_handle(&handle)?;
-    Ok(handle.is_data_modified())
+/// Prepend a qpdf Crypt filter to a live stream dictionary without
+/// materializing a legacy dictionary.
+fn prepend_crypt_filter_to_handle_entries(
+    entries: &mut BTreeMap<Vec<u8>, ObjectHandle>,
+    cf_name: &[u8],
+) -> Result<()> {
+    let crypt_decode_parms = ObjectHandle::dictionary(vec![
+        (
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+        ),
+        (b"/Name".to_vec(), ObjectHandle::name(cf_name.to_vec())),
+    ]);
+    let existing_filter = entries.remove(b"/Filter".as_slice());
+    let existing_decode_parms = entries.remove(b"/DecodeParms".as_slice());
+
+    match existing_filter {
+        None => {
+            entries.insert(b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec()));
+            entries.insert(b"/DecodeParms".to_vec(), crypt_decode_parms);
+        }
+        Some(filter) => {
+            if let Some(name) = filter.try_as_name()? {
+                entries.insert(
+                    b"/Filter".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::name(b"Crypt".to_vec()),
+                        ObjectHandle::name(name),
+                    ]),
+                );
+                entries.insert(
+                    b"/DecodeParms".to_vec(),
+                    ObjectHandle::array(vec![
+                        crypt_decode_parms,
+                        existing_decode_parms.unwrap_or_else(ObjectHandle::null),
+                    ]),
+                );
+            } else if let Some(mut filters) = filter.try_as_array()? {
+                let chain_len = filters.len();
+                let mut new_filters = Vec::with_capacity(chain_len + 1);
+                new_filters.push(ObjectHandle::name(b"Crypt".to_vec()));
+                new_filters.append(&mut filters);
+
+                let mut new_decode_parms = Vec::with_capacity(chain_len + 1);
+                new_decode_parms.push(crypt_decode_parms);
+                match existing_decode_parms {
+                    None => new_decode_parms.extend((0..chain_len).map(|_| ObjectHandle::null())),
+                    Some(params) => {
+                        if let Some(params) = params.try_as_array()? {
+                            new_decode_parms.extend(
+                                params
+                                    .into_iter()
+                                    .chain(std::iter::repeat_with(ObjectHandle::null))
+                                    .take(chain_len),
+                            );
+                        } else {
+                            new_decode_parms.push(params);
+                            new_decode_parms.extend((1..chain_len).map(|_| ObjectHandle::null()));
+                        }
+                    }
+                }
+                entries.insert(b"/Filter".to_vec(), ObjectHandle::array(new_filters));
+                entries.insert(
+                    b"/DecodeParms".to_vec(),
+                    ObjectHandle::array(new_decode_parms),
+                );
+            } else {
+                entries.insert(b"/Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec()));
+                entries.insert(b"/DecodeParms".to_vec(), crypt_decode_parms);
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Append a renumbered body object, routing `Object::Stream` payloads through
-/// the same [`CompressStreams`] re-encoding the flat full-rewrite path applies
-/// so a linearized file's body content streams are byte-identical to qpdf's
-/// (see [`crate::writer::apply_stream_compress_policy`]).
-///
-/// The flat writer (`crate::writer`, the `Object::Stream` branch of
-/// `emit_canonical_pdf`) decodes each declared filter chain and, under
-/// [`CompressStreams::Yes`] (the default), re-encodes to a single
-/// `/FlateDecode`. The plain [`append_object`] path instead clones the source
-/// stream's dict + raw data verbatim — preserving e.g. an
-/// `[/ASCII85Decode /FlateDecode]` source chain — which diverges from qpdf's
-/// output. This helper closes that gap for plain-indirect body objects only;
-/// ObjStm containers and the hint stream are emitted by their own dedicated
-/// writers and are not routed here.
-///
-/// Serialization mirrors the flat path exactly: a re-filtered stream (decode +
-/// re-encode under `CompressStreams::Yes`, when the source was *not* already a
-/// lone `/FlateDecode`) is written with qpdf's stream-dict key order
-/// (`/Length` pulled out, then a regenerated `/Filter /FlateDecode` — see
-/// [`crate::object::Dictionary::write_pdf_stream`]); otherwise the existing
-/// (sorted) order is kept. The `/Length` value is the re-encoded byte count,
-/// and the `newline_before_endstream` policy is honoured so the framing matches
-/// the option the caller passed.
-///
-/// Non-stream objects are delegated to [`append_object`] unchanged, which uses
-/// `encrypted_string_emitter` for scalar emission when encryption is active.
-///
-/// When encryption is active, `encrypted_string_emitter` encrypts stream
-/// dictionary strings during final serialization while `encrypt_ctx` retains
-/// ownership of stream-payload encryption after re-encoding (so `/Length` is
-/// set from the ciphertext, not the plaintext, byte count).
-///
-/// `original_ref` is the object's PRE-renumber ref (matching `crate::writer`'s
-/// `old_ref`), used only to check it against `ctx.metadata_ref` (also an
-/// original ref — see [`crate::writer::resolve_metadata_stream_ref`]) for the
-/// `--cleartext-metadata` exemption below. `new_ref` must not be substituted
-/// here: `metadata_ref` is populated before renumbering, so comparing against
-/// the renumbered ref would never match.
-///
-/// `is_data_modified` is `original_ref`'s canonical-handle
-/// `is_data_modified()` bit (see [`stream_is_data_modified`]), queried by the
-/// caller before `object` was materialized. It defeats
-/// [`crate::writer::reencode_stream_for_compress`]'s lone-`/FlateDecode`
-/// verbatim shortcut, mirroring `QPDFWriter::willFilterStream`
-/// (`QPDFWriter.cc:1234-1245`): qpdf never takes that shortcut for a stream
-/// carrying a registered token filter, even though — because
-/// `QPDF_Stream::pipeStreamData` runs that filter a second time during
-/// `QPDF::optimize`'s linearization pre-pass and the filter's qpdf-ported
-/// state (`AppearanceTokenFilter`) does not reset between pipes — the
-/// content the *real* write pass re-encodes is whatever the exhausted
-/// filter passes through unchanged, not the fresh replacement. This
-/// function does not run the token filter at all (`object` is already
-/// materialized from the pre-filter source), which reproduces that same
-/// observed qpdf output byte-for-byte without modeling the double pipe.
+/// Append one live-handle body object in output-number space.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
     original_ref: ObjectRef,
-    object: Object,
+    object: &ObjectHandle,
     options: &WriterOptions,
-    recovered_stream_eol: Option<&[u8]>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
-    is_data_modified: bool,
+    renumber: &RenumberMap,
+    removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
-    let Object::Stream(stream) = object else {
-        return append_object(bytes, new_ref, object, encrypted_string_emitter);
+    let map = |object_ref| {
+        renumber.new_for_original(object_ref).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "linearization writer: reference {object_ref} has no renumber entry"
+            ))
+        })
     };
 
-    let policy = effective_stream_policy(options);
-    let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
-        stream,
-        options,
-        is_data_modified,
-        true,
-        recovered_stream_eol,
-        false,
-        false,
-    );
-
-    // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
-    // constructs one), so this destructuring never fails.
-    // cov:ignore-start: unreachable — apply_stream_compress_policy always
-    // returns Object::Stream, so the else arm is dead.
-    let Object::Stream(mut s) = reencoded else {
-        unreachable!("apply_stream_compress_policy always returns Object::Stream")
-    };
-    // cov:ignore-end
-
-    // Encrypt the stream payload AFTER re-encoding, so the encryption operates
-    // on the on-disk bytes; updates /Length to the encrypted byte count (AES
-    // adds a 16-byte IV prefix plus PKCS#7 padding).
-    //
-    // `--cleartext-metadata` exemption (mirrors crate::writer's
-    // emit_canonical_pdf loop, writer.rs's Object::Stream branch): when
-    // `ctx.metadata_ref` is this object's original ref, leave the payload in
-    // the clear and prepend /Crypt /Identity so a reader knows not to decrypt
-    // it, instead of running it through the cipher. /Length stays the
-    // un-encrypted byte count. Every OTHER stream (metadata_ref is None, or
-    // this isn't it) takes the normal encrypt_stream_payload_for_writer path.
-    if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
-        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref) {
-            crate::security::standard::prepend_crypt_filter_to_stream_dict(
-                &mut s.dict,
-                b"Identity",
-            );
-        } else {
-            crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut s, ctx)?;
-        }
+    if object.as_stream_dict().is_none() {
+        return append_object(
+            bytes,
+            new_ref,
+            object,
+            &map,
+            removed_refs,
+            encrypted_string_emitter,
+        );
     }
+
+    let (dict, data, refiltered) =
+        crate::writer::plain::body::canonical_stream_output_for_rewrite(object, options, false)?;
+    let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
+    let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
+    let cleartext_metadata = payload_ctx
+        .is_some_and(|ctx| !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref));
+
+    if cleartext_metadata {
+        prepend_crypt_filter_to_handle_entries(&mut entries, b"Identity")?;
+    }
+
+    let mut payload_length = data.len();
+    if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
+        crate::writer::adjust_aes_stream_length(&mut payload_length, ctx, true)?;
+    }
+    entries.insert(
+        b"/Length".to_vec(),
+        ObjectHandle::integer(i64::try_from(payload_length).unwrap_or(i64::MAX)),
+    );
+    let dict = ObjectHandle::dictionary(entries.into_iter().collect());
 
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
-    // Emit qpdf's re-filtered stream-dict order only when all hold:
-    //  - the compress policy re-encodes (`CompressStreams::Yes`),
-    //  - the source was NOT already a lone `/FlateDecode`, and
-    //  - the *final* dict carries a lone `/FlateDecode` (so a decode/encode
-    //    failure that kept a fallback filter is not silently re-filtered).
-    let refiltered = matches!(policy, Some(CompressStreams::Yes))
-        && !source_filter_is_lone_flate
-        && is_lone_flate(s.dict.get("Filter"));
-    // The linearized writer targets byte-identical qpdf output.  qpdf writes
-    // policy-driven body streams with no newline before `endstream` (exactly
-    // `/Length` bytes between `stream` and `endstream`), regardless of its
-    // `--newline-before-endstream` flag, which only governs qpdf's plain
-    // rewrite.  `options.newline_before_endstream` therefore must not leak into
-    // this path (the CLI flag is documented as full-rewrite-only and has no
-    // route to `Never`); force `Never` so the framing matches qpdf.  The
-    // primary hint stream keeps its newline via the separate
-    // `append_hint_stream_object`, matching qpdf's hint-stream framing.
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_stream_dict(
+        emitter.write_handle_stream_dict_with_ref_map(
             bytes,
             new_ref,
             None,
-            &s.dict,
+            &dict,
             crate::writer::encrypted_strings::StreamDictOptions::new(false, refiltered, true),
-        )?; // cov:ignore: the encrypted-dictionary route executes; this call continuation has no counter.
-        crate::writer::serialize::write_stream_payload(
-            bytes,
-            &s.data,
-            NewlineBeforeEndstream::Never,
-        );
+            &map,
+            removed_refs,
+            None,
+        )?;
     } else {
-        write_stream_to_buf_qpdf_order(bytes, &s, NewlineBeforeEndstream::Never, refiltered);
+        dict.unparse_stream_body_with_ref_map_and_removed(bytes, refiltered, &map, removed_refs)?;
+    }
+
+    if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
+        crate::writer::write_stream_payload_with_pipeline(
+            bytes,
+            &data,
+            NewlineBeforeEndstream::Never,
+            new_ref,
+            ctx,
+            true,
+            None,
+        )?;
+    } else {
+        crate::writer::serialize::write_stream_payload(bytes, &data, NewlineBeforeEndstream::Never);
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
+}
+
+fn append_body_object_for_ref<R: Read + Seek>(
+    bytes: &mut Vec<u8>,
+    pdf: &mut Pdf<R>,
+    new_ref: ObjectRef,
+    original_ref: ObjectRef,
+    options: &WriterOptions,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    renumber: &RenumberMap,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<usize> {
+    let object = pdf.get_object_handle(original_ref);
+    pdf.resolve_object_handle(&object)?;
+    append_body_object(
+        bytes,
+        new_ref,
+        original_ref,
+        &object,
+        options,
+        encrypt_ctx,
+        encrypted_string_emitter,
+        renumber,
+        removed_refs,
+    )
 }
 
 /// Byte width of a single classic cross-reference entry:
@@ -2152,23 +2183,17 @@ fn do_write_pass<R: Read + Seek>(
                 .contains_key(&catalog_orig),
             "planner invariant: /Catalog is never an ObjStm member"
         );
-        let object = pdf.resolve(catalog_orig)?;
-        let recovered_eol = pdf.recovered_stream_eol(catalog_orig);
-        let is_data_modified = stream_is_data_modified(pdf, catalog_orig)?;
-        let renumbered =
-            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let appended = append_body_object(
+        let offset = append_body_object_for_ref(
             &mut bytes,
+            pdf,
             catalog_new_ref,
             catalog_orig,
-            renumbered,
             options,
-            recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-            is_data_modified,
-        );
-        let offset = appended?;
+            renumber,
+            &plan.removed_refs,
+        )?;
         xref_offsets.insert(catalog_new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
         catalog_emitted_early = true;
@@ -2193,23 +2218,17 @@ fn do_write_pass<R: Read + Seek>(
             ));
         };
         // cov:ignore-end
-        let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
-        let renumbered =
-            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let appended = append_body_object(
+        let offset = append_body_object_for_ref(
             &mut bytes,
+            pdf,
             new_ref,
             *original_ref,
-            renumbered,
             options,
-            recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-            is_data_modified,
-        );
-        let offset = appended?;
+            renumber,
+            &plan.removed_refs,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
     }
@@ -2303,23 +2322,17 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
-        let renumbered =
-            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let appended = append_body_object(
+        let offset = append_body_object_for_ref(
             &mut bytes,
+            pdf,
             new_ref,
             *original_ref,
-            renumbered,
             options,
-            recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-            is_data_modified,
-        );
-        let offset = appended?;
+            renumber,
+            &plan.removed_refs,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
     }
@@ -2347,23 +2360,17 @@ fn do_write_pass<R: Read + Seek>(
                 original_ref
             )));
         };
-        let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
-        let renumbered =
-            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let appended = append_body_object(
+        let offset = append_body_object_for_ref(
             &mut bytes,
+            pdf,
             new_ref,
             *original_ref,
-            renumbered,
             options,
-            recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-            is_data_modified,
-        );
-        let offset = appended?;
+            renumber,
+            &plan.removed_refs,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
     }
@@ -2407,23 +2414,17 @@ fn do_write_pass<R: Read + Seek>(
             )));
             // cov:ignore-end
         };
-        let object = pdf.resolve(*original_ref)?;
-        let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
-        let renumbered =
-            renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let appended = append_body_object(
+        let offset = append_body_object_for_ref(
             &mut bytes,
+            pdf,
             new_ref,
             *original_ref,
-            renumbered,
             options,
-            recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-            is_data_modified,
-        );
-        let offset = appended?;
+            renumber,
+            &plan.removed_refs,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2485,23 +2486,17 @@ fn do_write_pass<R: Read + Seek>(
                 let new_ref = renumber
                     .new_for_original(*original_ref)
                     .expect("part4 plain object renumber entry checked above");
-                let object = pdf.resolve(*original_ref)?;
-                let recovered_eol = pdf.recovered_stream_eol(*original_ref);
-                let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
-                let renumbered =
-                    renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-                let appended = append_body_object(
+                let offset = append_body_object_for_ref(
                     &mut bytes,
+                    pdf,
                     new_ref,
                     *original_ref,
-                    renumbered,
                     options,
-                    recovered_eol,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
-                    is_data_modified,
-                );
-                let offset = appended?;
+                    renumber,
+                    &plan.removed_refs,
+                )?;
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options, progress_events, progress_expected);
             }
@@ -6487,7 +6482,7 @@ mod tests {
             );
         }
         assert!(
-            is_lone_flate(stream.dict.get("Filter")),
+            crate::writer::is_lone_flate(stream.dict.get("Filter")),
             "re-encoded external-file stream must declare a lone /FlateDecode filter"
         );
     }
@@ -8769,10 +8764,23 @@ mod tests {
             encrypt_metadata: true,
             metadata_ref: None,
         };
-        let mut dict = Dictionary::new();
-        dict.insert("Label", Object::String(b"linearized label".to_vec()));
-        dict.insert("Length", Object::Integer(7));
-        let object = Object::Stream(crate::Stream::new(dict, b"payload".to_vec()));
+        let mut donor = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut donor, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let original_ref = plan.root_ref.expect("tiny PDF catalog");
+        let new_ref = renumber
+            .new_for_original(original_ref)
+            .expect("catalog is in the linearization map");
+        let object = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Label".to_vec(),
+                    ObjectHandle::string(b"linearized label".to_vec()),
+                ),
+                (b"/Length".to_vec(), ObjectHandle::integer(7)),
+            ]),
+            std::rc::Rc::new(b"payload".to_vec()),
+        );
         let options = WriterOptions {
             compress_streams: crate::writer::CompressStreams::No,
             ..WriterOptions::default()
@@ -8782,14 +8790,14 @@ mod tests {
 
         let offset = append_body_object(
             &mut bytes,
-            ObjectRef::new(7, 0),
-            ObjectRef::new(7, 0),
-            object,
+            new_ref,
+            original_ref,
+            &object,
             &options,
-            None,
             Some(&context),
             Some(&mut emitter),
-            false,
+            &renumber,
+            &BTreeSet::new(),
         )
         .expect("linearized encrypted body stream");
 
