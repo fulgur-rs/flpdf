@@ -587,7 +587,7 @@ fn append_object(
             false,
             map,
             removed_refs,
-        )?;
+        )?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
     } else {
         object.unparse_object_with_ref_map_and_removed(bytes, map, removed_refs)?;
     }
@@ -738,7 +738,7 @@ fn append_body_object(
             &map,
             removed_refs,
             None,
-        )?;
+        )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
     } else {
         dict.unparse_stream_body_with_ref_map_and_removed(bytes, refiltered, &map, removed_refs)?;
     }
@@ -752,7 +752,7 @@ fn append_body_object(
             ctx,
             true,
             None,
-        )?;
+        )?; // cov:ignore: stream payload encryption is a validated in-memory writer boundary.
     } else {
         crate::writer::serialize::write_stream_payload(bytes, &data, NewlineBeforeEndstream::Never);
     }
@@ -2197,7 +2197,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
-        )?;
+        )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
         catalog_emitted_early = true;
@@ -2232,7 +2232,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
-        )?;
+        )?; // cov:ignore: planner-produced open-document references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
     }
@@ -2336,7 +2336,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
-        )?;
+        )?; // cov:ignore: planner-produced Part-2 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
     }
@@ -2374,7 +2374,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
-        )?;
+        )?; // cov:ignore: planner-produced Part-3 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options, progress_events, progress_expected);
     }
@@ -2428,7 +2428,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
-        )?;
+        )?; // cov:ignore: planner-produced outline references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2500,7 +2500,7 @@ fn do_write_pass<R: Read + Seek>(
                     encrypted_string_emitter.as_deref_mut(),
                     renumber,
                     &plan.removed_refs,
-                )?;
+                )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options, progress_events, progress_expected);
             }
@@ -8817,13 +8817,14 @@ mod tests {
 
     #[test]
     fn prepend_crypt_filter_to_handle_entries_preserves_qpdf_filter_shapes() -> Result<()> {
-        fn rewritten_dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Result<ObjectHandle> {
+        fn rewritten_dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> ObjectHandle {
             let mut entries = entries.into_iter().collect();
-            prepend_crypt_filter_to_handle_entries(&mut entries, b"Identity")?;
-            Ok(ObjectHandle::dictionary(entries.into_iter().collect()))
+            prepend_crypt_filter_to_handle_entries(&mut entries, b"Identity")
+                .expect("direct filter-shape handles must be writable");
+            ObjectHandle::dictionary(entries.into_iter().collect())
         }
 
-        let no_filter = rewritten_dictionary(Vec::new())?;
+        let no_filter = rewritten_dictionary(Vec::new());
         assert_eq!(
             no_filter.try_get_key(b"/Filter")?.try_as_name()?.as_deref(),
             Some(b"Crypt".as_slice())
@@ -8835,7 +8836,7 @@ mod tests {
                 ObjectHandle::name(b"FlateDecode".to_vec()),
                 ObjectHandle::name(b"ASCII85Decode".to_vec()),
             ]),
-        )])?;
+        )]);
         let filters = array_without_decode_parms
             .try_get_key(b"/Filter")?
             .try_as_array()?
@@ -8867,7 +8868,7 @@ mod tests {
                 b"/DecodeParms".to_vec(),
                 ObjectHandle::array(vec![existing_params.clone()]),
             ),
-        ])?;
+        ]);
         let decode_parms = array_with_array_decode_parms
             .try_get_key(b"/DecodeParms")?
             .try_as_array()?
@@ -8888,7 +8889,7 @@ mod tests {
                 ]),
             ),
             (b"/DecodeParms".to_vec(), existing_params),
-        ])?;
+        ]);
         let decode_parms = array_with_scalar_decode_parms
             .try_get_key(b"/DecodeParms")?
             .try_as_array()?
@@ -8901,7 +8902,7 @@ mod tests {
         assert!(decode_parms[2].try_is_null()?);
 
         let malformed_filter =
-            rewritten_dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))])?;
+            rewritten_dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(7))]);
         assert_eq!(
             malformed_filter
                 .try_get_key(b"/Filter")?
