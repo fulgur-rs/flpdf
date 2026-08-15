@@ -9438,6 +9438,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn append_hint_stream_object_propagates_encryption_pipeline_errors() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 31],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(2, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        let error = append_hint_stream_object(
+            &mut Vec::new(),
+            ObjectRef::new(9, 0),
+            b"hint payload",
+            46,
+            None,
+            false,
+            Some(&context),
+            crate::pipeline::aes::static_initialization_vector(),
+        )
+        .expect_err("invalid AES key material must propagate from the pipeline");
+        assert!(error.to_string().contains("AES"));
+    }
+
     /// Proves the mechanism the PR-review-flagged bug depends on: encrypting
     /// the SAME plaintext hint-stream payload with two DIFFERENT AES IVs can
     /// produce hint-stream *objects* of different total byte length, because
