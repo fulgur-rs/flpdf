@@ -702,15 +702,18 @@ fn append_body_object(
         );
     }
 
-    let (dict, data, refiltered) =
-        crate::writer::plain::body::canonical_stream_output_for_rewrite(object, options, false)?;
+    let (dict, data, mut refiltered) =
+        crate::writer::plain::body::canonical_stream_output_for_linearization(object, options)?;
     let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
     let cleartext_metadata = payload_ctx
         .is_some_and(|ctx| !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref));
-
     if cleartext_metadata {
         prepend_crypt_filter_to_handle_entries(&mut entries, b"Identity")?;
+        // The final dictionary now carries an explicit `/Crypt` stage, so it
+        // is no longer the lone `/FlateDecode` shape that selects qpdf's
+        // refiltered key ordering.
+        refiltered = false;
     }
 
     let mut payload_length = data.len();
