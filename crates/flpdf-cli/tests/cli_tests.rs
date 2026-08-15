@@ -5664,6 +5664,42 @@ fn minimal_pdf_temp() -> tempfile::NamedTempFile {
     f
 }
 
+/// Build a valid-xref attachment fixture whose Filespec/name-tree value can
+/// deliberately exercise qpdf's malformed-object paths.
+fn malformed_attachment_pdf(key: &str, filespec_value: &str, stream_value: &str) -> Vec<u8> {
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R /Names 4 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+        b"<< /EmbeddedFiles 6 0 R >>".to_vec(),
+        filespec_value.as_bytes().to_vec(),
+        format!("<< /Names [({key}) 5 0 R] >>").into_bytes(),
+        stream_value.as_bytes().to_vec(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (number, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", number + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 #[test]
 fn add_attachment_default_key_is_basename() {
     let temp = tempfile::tempdir().unwrap();
@@ -6135,6 +6171,99 @@ fn list_attachments_verbose_shows_extra_info() {
         String::from_utf8_lossy(&verbose_out).contains("verbose"),
         "verbose output should contain the key"
     );
+}
+
+#[test]
+fn list_attachments_missing_ef_exits_three_with_two_type_warnings() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("missing-ef.pdf");
+    std::fs::write(
+        &input,
+        malformed_attachment_pdf(
+            "c.txt",
+            "<< /Type /Filespec /F (c.txt) >>",
+            "<< /Unused true >>",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.stdout,
+        b"c.txt -> 0,0\n  preferred name: c.txt\n  all names:\n    /F -> c.txt\n  all data streams:\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("operation for dictionary attempted on object of type null")
+            .count(),
+        2,
+        "qpdf ditems() emits begin/end warnings for missing /EF: {stderr}"
+    );
+    assert!(stderr.contains("flpdf: operation succeeded with warnings"));
+}
+
+#[test]
+fn list_attachments_non_dictionary_filespec_exits_three_with_constructor_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("non-dictionary-filespec.pdf");
+    std::fs::write(
+        &input,
+        malformed_attachment_pdf("k.txt", "(not-a-filespec)", "<< /Unused true >>"),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.stdout,
+        b"k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Embedded file object is not a dictionary"));
+    assert!(stderr.contains("operation for dictionary attempted on object of type string"));
+    assert!(stderr.contains("flpdf: operation succeeded with warnings"));
+}
+
+#[test]
+fn list_attachments_non_stream_ef_exits_two_with_stream_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("non-stream-ef.pdf");
+    std::fs::write(
+        &input,
+        malformed_attachment_pdf(
+            "g.txt",
+            "<< /Type /Filespec /F (g.txt) /EF << /F 7 0 R >> >>",
+            "<< /Type /EmbeddedFile >>",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", "--verbose"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        output.stdout,
+        b"g.txt -> 0,0\n  preferred name: g.txt\n  all names:\n    /F -> g.txt\n  all data streams:\n    /F -> 7,0\n      creation date: "
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("operation for stream attempted on object of type dictionary"));
+    assert!(!stderr.contains("operation succeeded with warnings"));
 }
 
 #[test]

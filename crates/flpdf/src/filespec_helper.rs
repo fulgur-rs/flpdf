@@ -302,6 +302,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     fn resolved_stream(&self) -> Result<Option<(ObjectHandle, ObjectHandle, Option<ObjectRef>)>> {
+        // QPDFEFStreamObjectHelper::getParam calls QPDFObjectHandle::getDict
+        // (libqpdf/QPDFEFStreamObjectHelper.cc:20-28), whose
+        // asStreamWithAssert/assertType path raises this runtime error for a
+        // non-stream object (libqpdf/QPDFObjectHandle.cc:319-324, 2215-2223).
         let (stream, terminal_ref) = self
             .pdf
             .borrow_mut()
@@ -315,9 +319,16 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             }
             None => stream,
         };
-        Ok(stream
-            .as_stream_dict()
-            .map(|dictionary| (stream, dictionary, terminal_ref)))
+        if let Some(dictionary) = stream.as_stream_dict() {
+            return Ok(Some((stream, dictionary, terminal_ref)));
+        }
+        if stream.is_null() {
+            return Ok(None);
+        }
+        Err(Error::System(format!(
+            "operation for stream attempted on object of type {}",
+            stream.type_name()
+        )))
     }
 
     fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
@@ -641,21 +652,50 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// [`Pdf`], preventing a same-number object in `pdf` from being selected.
     pub fn new(filespec: ObjectHandle, pdf: &'a mut Pdf<R>) -> Result<Self> {
         ensure_indirect_handle_belongs_to_pdf(&filespec, pdf, "Filespec")?;
+        // QPDFFileSpecObjectHelper.cc:10-18 warns at construction time for a
+        // non-dictionary value or a dictionary with the wrong /Type.
+        let resolved = pdf.resolve_object_handle_to_terminal(&filespec)?;
+        if resolved.try_as_dictionary()?.is_none() {
+            resolved.warn_if_possible("Embedded file object is not a dictionary")?;
+        } else if !resolved.try_is_dictionary_of_type(b"Filespec", b"")? {
+            resolved.warn_if_possible("Embedded file object's type is not /Filespec")?;
+        }
         Ok(Self { filespec, pdf })
     }
 
-    fn filespec_dict(&mut self) -> Result<Option<ObjectHandle>> {
+    /// Resolve the helper's object in place and retain its qpdf description.
+    /// Accessors use this handle directly so `try_get_key` can emit the same
+    /// `typeWarning` that qpdf's `QPDFObjectHandle::getKey` emits for a
+    /// non-dictionary Filespec.
+    fn filespec_handle(&mut self) -> Result<ObjectHandle> {
         let (filespec, terminal_ref) = self
             .pdf
             .resolve_object_handle_to_terminal_ref(&self.filespec)?;
-        let filespec = match terminal_ref {
+        Ok(match terminal_ref {
             Some(object_ref) => {
                 let filespec = self.pdf.get_object_handle(object_ref);
                 self.pdf.resolve_object_handle(&filespec)?;
                 filespec
             }
             None => filespec,
-        };
+        })
+    }
+
+    fn filespec_value(&mut self, key: &[u8]) -> Result<ObjectHandle> {
+        let filespec = self.filespec_handle()?;
+        if filespec.is_null() && filespec.context().is_none() {
+            return Ok(ObjectHandle::null());
+        }
+        filespec.try_get_key(key)
+    }
+
+    fn resolved_string_value_handle(&mut self, value: ObjectHandle) -> Result<Option<Vec<u8>>> {
+        let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+        Ok(value.as_string())
+    }
+
+    fn filespec_dict(&mut self) -> Result<Option<ObjectHandle>> {
+        let filespec = self.filespec_handle()?;
         Ok(filespec.as_dictionary().map(|_| filespec))
     }
 
@@ -671,14 +711,6 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             .into_dict()
             .expect("dictionary handle must materialize as a dictionary");
         Ok(Some(dict))
-    }
-
-    fn resolved_string_value(&mut self, value: Option<&Object>) -> Result<Option<Vec<u8>>> {
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        let (value, _) = resolve_ref_chain(self.pdf, value)?;
-        Ok(value.as_string().map(ToOwned::to_owned))
     }
 
     /// Set `/Desc` with qpdf's `newUnicodeString` storage semantics.
@@ -784,11 +816,9 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
     /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
     pub fn get_description(&mut self) -> Result<Vec<u8>> {
-        let Some(dict) = self.resolve_dict()? else {
-            return Ok(Vec::new());
-        };
+        let value = self.filespec_value(b"/Desc")?;
         Ok(self
-            .resolved_string_value(dict.get("Desc"))?
+            .resolved_string_value_handle(value)?
             .map(|value| utf8_value(&value))
             .unwrap_or_default())
     }
@@ -796,11 +826,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Return the preferred file name using qpdf's `/UF`, `/F`, `/Unix`,
     /// `/DOS`, `/Mac` priority order and UTF-8 value conversion.
     pub fn get_filename(&mut self) -> Result<Vec<u8>> {
-        let Some(dict) = self.resolve_dict()? else {
-            return Ok(Vec::new());
-        };
         for key in NAME_KEYS {
-            if let Some(value) = self.resolved_string_value(dict.get(key))? {
+            let key = canonical_dictionary_key(key.as_bytes());
+            let value = self.filespec_value(&key)?;
+            if let Some(value) = self.resolved_string_value_handle(value)? {
                 return Ok(utf8_value(&value));
             }
         }
@@ -811,13 +840,12 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// Keys retain qpdf's leading slash, e.g. `"/UF"`.
     pub fn get_filenames(&mut self) -> Result<BTreeMap<String, Vec<u8>>> {
-        let Some(dict) = self.resolve_dict()? else {
-            return Ok(BTreeMap::new());
-        };
         let mut filenames = BTreeMap::new();
-        for key in NAME_KEYS {
-            if let Some(value) = self.resolved_string_value(dict.get(key))? {
-                filenames.insert(format!("/{key}"), utf8_value(&value));
+        for name_key in NAME_KEYS {
+            let key = canonical_dictionary_key(name_key.as_bytes());
+            let value = self.filespec_value(&key)?;
+            if let Some(value) = self.resolved_string_value_handle(value)? {
+                filenames.insert(format!("/{name_key}"), utf8_value(&value));
             }
         }
         Ok(filenames)
@@ -832,13 +860,13 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     pub fn get_embedded_file_stream(&mut self, key: &str) -> Result<ObjectHandle> {
         let ef = self.get_embedded_file_streams()?;
         let ef = self.pdf.resolve_object_handle_to_terminal(&ef)?;
-        let Some(entries) = ef.as_dictionary() else {
+        let Some(entries) = ef.try_as_dictionary()? else {
             return Ok(ObjectHandle::null());
         };
 
         if !key.is_empty() {
             let key = canonical_dictionary_key(key.as_bytes());
-            return Ok(ef.get_key(&key));
+            return ef.try_get_key(&key);
         }
 
         for key in NAME_KEYS {
@@ -857,10 +885,27 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Return the raw `/EF` dictionary, or qpdf's null-object equivalent when
     /// the key is absent.
     pub fn get_embedded_file_streams(&mut self) -> Result<ObjectHandle> {
-        let Some(filespec) = self.filespec_dict()? else {
-            return Ok(ObjectHandle::null());
-        };
-        Ok(filespec.get_key(b"/EF"))
+        self.filespec_value(b"/EF")
+    }
+
+    /// Return the raw `/EF` dictionary items in qpdf's `ditems()` order.
+    ///
+    /// `QPDF_Dictionary::ditems()` asks the receiver for its key set at both
+    /// iterator construction and end comparison.  Retaining both calls is
+    /// observable for a missing `/EF`: qpdf emits two `typeWarning`s while
+    /// treating its null object as an empty dictionary.
+    pub(crate) fn get_embedded_file_stream_entries(
+        &mut self,
+    ) -> Result<Vec<(Vec<u8>, ObjectHandle)>> {
+        let ef = self.get_embedded_file_streams()?;
+        if ef.is_null() && ef.context().is_none() {
+            return Ok(Vec::new());
+        }
+        let keys = ef.try_get_keys()?;
+        let _end_keys = ef.try_get_keys()?;
+        keys.into_iter()
+            .map(|key| Ok((key.clone(), ef.try_get_key(&key)?)))
+            .collect()
     }
 
     /// Resolve and return the embedded file stream.
@@ -1842,6 +1887,17 @@ mod tests {
             filespec.get("Desc"),
             Some(&Object::String(b"terminal description".to_vec()))
         );
+    }
+
+    #[test]
+    fn direct_null_filespec_stream_entries_are_empty() {
+        let mut pdf = open_minimal();
+        let mut helper = FileSpec::new(ObjectHandle::null(), &mut pdf).unwrap();
+
+        assert!(helper
+            .get_embedded_file_stream_entries()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
