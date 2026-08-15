@@ -672,6 +672,10 @@ fn append_body_object(
     };
 
     let policy = effective_stream_policy(options);
+    // `token_filtered_source: None` is deliberate here, not an oversight: see
+    // this function's doc above for why the linearized writer must decode
+    // from the already-materialized `object` rather than running the token
+    // filter through a canonical handle.
     let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
         stream,
         options,
@@ -680,6 +684,7 @@ fn append_body_object(
         recovered_stream_eol,
         false,
         false,
+        None,
     );
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
