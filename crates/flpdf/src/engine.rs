@@ -113,6 +113,10 @@ impl<R: Read + Seek> Pdf<R> {
                 return Err(error);
             }
         };
+        let parsed_xref_streams = loaded_state.parsed_xref_streams;
+        let trailer_references = loaded_state.trailer_references;
+        let header_offset = loaded_state.header_offset;
+        let already_reconstructed = loaded_state.already_reconstructed;
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
         let mut sorted_object_offsets: Vec<u64> = loaded
@@ -133,10 +137,10 @@ impl<R: Read + Seek> Pdf<R> {
         let initial_diagnostics = loaded.repair_diagnostics.clone();
         let resolver = ResolverHandle::new_shared(
             reader,
-            loaded_state.header_offset,
+            header_offset,
             source_xref_entries,
             options.repair,
-            loaded_state.already_reconstructed,
+            already_reconstructed,
             loaded.repair_diagnostics,
             warning_options,
             unique_id,
@@ -160,19 +164,20 @@ impl<R: Read + Seek> Pdf<R> {
             legacy_materialized_replacement_refs: BTreeSet::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
-            legacy_resolution_state_synced: loaded_state.already_reconstructed,
+            legacy_resolution_state_synced: already_reconstructed,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             recovered_stream_eols: BTreeMap::new(),
             transformed_stream_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
-            qpdf_trailer_references: loaded_state.trailer_references,
-            qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
+            qpdf_trailer_references: trailer_references,
+            qpdf_parsed_xref_stream_refs: BTreeSet::new(),
             qpdf_removed_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
             encryption,
         };
+        pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
         if let Err(error) = pdf.authenticate_if_encrypted(&options) {
             // qpdf reconstructs and records warnings before
             // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises

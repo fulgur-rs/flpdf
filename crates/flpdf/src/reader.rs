@@ -1234,7 +1234,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.promote_resolved_object_stream_members(object_ref)
             .expect("a parsed ObjStm member must be representable as an ObjectHandle");
         self.qpdf_removed_refs.remove(&object_ref);
-        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
@@ -1487,7 +1487,7 @@ impl<R: Read + Seek> Pdf<R> {
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
         }
-        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
@@ -1633,6 +1633,13 @@ impl<R: Read + Seek> Pdf<R> {
                 if handle.is_missing() || matches!(cache_entry, Some(CacheEntry::Missing)) {
                     return None;
                 }
+                if live_only && self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
+                    // A historical xref stream is in qpdf's object cache but
+                    // its effective xref row is free/superseded. It belongs
+                    // to getAllObjects/JSON cache visibility, not the
+                    // effective live-xref view.
+                    return None;
+                }
                 if live_only
                     && (matches!(
                         cache_entry,
@@ -1655,7 +1662,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn prepare_qpdf_json_objects(&mut self) -> Result<QpdfPreparedObjects> {
         let live_snapshot = self.qpdf_json_live_object_refs();
         let mut discovered = self.qpdf_trailer_references.clone();
-        discovered.extend(self.qpdf_parsed_xref_streams.keys().copied());
+        discovered.extend(self.qpdf_parsed_xref_stream_refs.iter().copied());
 
         for object_ref in live_snapshot {
             let object = self.resolve_qpdf_json_object(object_ref)?;
@@ -1691,6 +1698,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         let mut refs = self.qpdf_json_live_object_refs();
+        refs.extend(self.qpdf_parsed_xref_stream_refs.iter().copied());
         refs.extend(self.qpdf_dangling_refs.iter().copied());
         refs.retain(|object_ref| !self.qpdf_removed_refs.contains(object_ref));
         refs.sort_unstable();
@@ -1925,7 +1933,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.promote_resolved_object_stream_members(object_ref)?;
         let target = self.resolver.replace_object(object_ref, replacement)?;
         self.qpdf_removed_refs.remove(&object_ref);
-        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
@@ -1943,7 +1951,7 @@ impl<R: Read + Seek> Pdf<R> {
     #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         self.resolver.remove_object(object_ref)?;
-        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
@@ -2284,9 +2292,19 @@ impl<R: Read + Seek> Pdf<R> {
         })
     }
 
-    fn register_parsed_xref_stream_handles(&mut self) -> Result<()> {
-        let pending: Vec<ObjectRef> = self.qpdf_parsed_xref_streams.keys().copied().collect();
-        for object_ref in pending {
+    /// Promote xref-stream objects parsed from the source `/Prev` chain into
+    /// the canonical resolver cache. qpdf reads each xref stream before it
+    /// merges the next xref section (`QPDF.cc:626-710`, `:1640-1716`), so a
+    /// superseded or freed xref-stream object remains observable through
+    /// `m->obj_cache` even when it has no effective xref row. Keep the raw
+    /// bootstrap map on `LoadedXrefState` only; the live `Pdf` must expose the
+    /// value through the same `ObjectHandle` identity as every other cached
+    /// object.
+    pub(crate) fn install_parsed_xref_stream_handles(
+        &mut self,
+        parsed_xref_streams: BTreeMap<ObjectRef, Object>,
+    ) -> Result<()> {
+        for (object_ref, object) in parsed_xref_streams {
             if object_ref.number == 0
                 || object_ref.generation == u16::MAX
                 || self.qpdf_removed_refs.contains(&object_ref)
@@ -2295,14 +2313,22 @@ impl<R: Read + Seek> Pdf<R> {
                 continue;
             }
             let handle = self.get_object_handle(object_ref);
-            if handle.is_resolved() && !handle.is_missing() {
-                continue;
+            if !handle.is_resolved() || handle.is_missing() {
+                let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
+                handle.set_resolved(value);
             }
-            let object = self.qpdf_parsed_xref_streams[&object_ref].clone();
-            let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
-            handle.set_resolved(value);
+            self.qpdf_parsed_xref_stream_refs.insert(object_ref);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn install_test_parsed_xref_stream_handle(
+        &mut self,
+        object_ref: ObjectRef,
+        object: Object,
+    ) -> Result<()> {
+        self.install_parsed_xref_stream_handles(BTreeMap::from([(object_ref, object)]))
     }
 
     fn register_trailer_references(&mut self) -> Vec<ObjectRef> {
@@ -2359,7 +2385,6 @@ impl<R: Read + Seek> Pdf<R> {
         // value can register references that the replacement no longer owns.
         self.reconcile_legacy_materialized_memos()?;
         let trailer_refs = self.register_trailer_references();
-        self.register_parsed_xref_stream_handles()?;
         self.resolver.fix_dangling_references()?;
 
         // qpdf's parser creates trailer-reference cache entries before
@@ -2901,7 +2926,9 @@ impl<R: Read + Seek> Pdf<R> {
         // consumers parse the same malformed source twice and duplicate its
         // recovery diagnostics. This is a read-only compatibility snapshot;
         // canonical resolution itself still never populates the legacy cache.
-        if !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_))) {
+        if !self.qpdf_parsed_xref_stream_refs.contains(&object_ref)
+            && !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_)))
+        {
             if let Some(handle) = self
                 .resolver
                 .registered_handle(object_ref)
@@ -2952,18 +2979,22 @@ impl<R: Read + Seek> Pdf<R> {
         // populating the raw cache. Expose that value only as an explicit
         // compatibility read; it does not route canonical resolution back
         // through the legacy engine.
-        if let Some(handle) = self
-            .resolver
-            .registered_handle(object_ref)
-            .filter(ObjectHandle::is_resolved)
-        {
-            let value = self.materialize_handle_for_legacy(object_ref, &handle)?; // cov:ignore: every resolved registered handle is returned by the earlier compatibility branch
-            self.legacy_materialized_memo.insert(object_ref, value);
-            return Ok(self
-                .legacy_materialized_memo
-                .get(&object_ref)
-                .expect("inserted materialized ObjectHandle value"));
+        // cov:ignore-start: the canonical handle branch above or a recovery branch returns immediately whenever a handle becomes resolved; this is the defensive single-Pdf fallback
+        if !self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
+            if let Some(handle) = self
+                .resolver
+                .registered_handle(object_ref)
+                .filter(ObjectHandle::is_resolved)
+            {
+                let value = self.materialize_handle_for_legacy(object_ref, &handle)?; // cov:ignore: every resolved registered handle is returned by the earlier compatibility branch
+                self.legacy_materialized_memo.insert(object_ref, value);
+                return Ok(self
+                    .legacy_materialized_memo
+                    .get(&object_ref)
+                    .expect("inserted materialized ObjectHandle value"));
+            }
         }
+        // cov:ignore-end
 
         Ok(&NULL_OBJECT)
     }
@@ -3209,18 +3240,15 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
 
-        Ok(self
-            .qpdf_parsed_xref_streams
-            .get(&object_ref)
-            .cloned()
-            .unwrap_or(Object::Null))
+        Ok(Object::Null)
     }
 
     /// Resolve a qpdf-visible object without cloning its cached value.
     ///
     /// Unlike [`Self::resolve_borrowed`], this retains the historical xref-stream
-    /// fallback used by qpdf JSON preparation when the object is absent from the
-    /// live object cache.
+    /// compatibility view used by qpdf JSON preparation when the object is
+    /// absent from the legacy object cache. The value still comes from the
+    /// canonical `ObjectHandle`; no raw xref-stream side table is consulted.
     pub(crate) fn resolve_qpdf_json_object_borrowed(
         &mut self,
         object_ref: ObjectRef,
@@ -3254,10 +3282,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
         match self.cache.entry(object_ref) {
             Some(CacheEntry::Resolved(object)) => Ok(object),
-            _ => Ok(self
-                .qpdf_parsed_xref_streams
-                .get(&object_ref)
-                .unwrap_or(&NULL_OBJECT)),
+            _ => Ok(&NULL_OBJECT),
         }
     }
 
@@ -7625,7 +7650,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone() {
+    fn borrowed_qpdf_resolution_uses_the_canonical_historical_stream() {
         let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
         let live_ref = ObjectRef::new(8, 0);
         pdf.set_object(
@@ -7652,24 +7677,26 @@ mod tests {
         );
 
         let historical_ref = ObjectRef::new(9, 0);
-        pdf.qpdf_parsed_xref_streams.insert(
+        pdf.install_test_parsed_xref_stream_handle(
             historical_ref,
             Object::Stream(Stream::new(Dictionary::new(), vec![0x5a; 1024 * 1024])),
-        );
-        let payload_ptr = pdf
-            .qpdf_parsed_xref_streams
-            .get(&historical_ref)
-            .and_then(Object::as_stream)
-            .expect("seeded historical stream")
-            .data
-            .as_ptr();
+        )
+        .expect("install canonical historical stream");
+        let canonical_payload = pdf
+            .get_object_handle(historical_ref)
+            .as_stream_data()
+            .expect("canonical historical stream payload");
+        let repeated_payload = pdf
+            .get_object_handle(historical_ref)
+            .as_stream_data()
+            .expect("repeated canonical historical stream payload");
+        assert!(std::rc::Rc::ptr_eq(&canonical_payload, &repeated_payload));
 
         let resolved = pdf
             .resolve_qpdf_json_object_borrowed(historical_ref)
             .expect("resolve historical stream");
         let stream = resolved.as_stream().expect("historical object is a stream");
 
-        assert_eq!(stream.data.as_ptr(), payload_ptr);
         assert_eq!(stream.data.len(), 1024 * 1024);
     }
 
@@ -9246,8 +9273,7 @@ mod tests {
         pdf.recovered_stream_eols
             .insert(object_ref, crate::parser::RecoveredStreamEol::Lf);
         pdf.transformed_stream_refs.insert(object_ref);
-        pdf.qpdf_parsed_xref_streams
-            .insert(object_ref, Object::Null);
+        pdf.qpdf_parsed_xref_stream_refs.insert(object_ref);
         pdf.qpdf_dangling_refs.insert(object_ref);
 
         pdf.replace_object_handle(object_ref, ObjectHandle::integer(7))
@@ -9255,7 +9281,7 @@ mod tests {
 
         assert!(!pdf.recovered_stream_eols.contains_key(&object_ref));
         assert!(!pdf.transformed_stream_refs.contains(&object_ref));
-        assert!(!pdf.qpdf_parsed_xref_streams.contains_key(&object_ref));
+        assert!(!pdf.qpdf_parsed_xref_stream_refs.contains(&object_ref));
         assert!(!pdf.qpdf_dangling_refs.contains(&object_ref));
     }
 
@@ -9980,14 +10006,14 @@ mod tests {
     }
 
     #[test]
-    fn get_all_objects_registers_parsed_xref_stream_handles() {
+    fn install_parsed_xref_stream_handles_registers_canonical_objects() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let historical_ref = ObjectRef::new(99, 0);
         let mut historical_dict = Dictionary::new();
         historical_dict.insert("Value", Object::Integer(7));
         let historical = Object::Dictionary(historical_dict);
-        pdf.qpdf_parsed_xref_streams
-            .insert(historical_ref, historical.clone());
+        pdf.install_test_parsed_xref_stream_handle(historical_ref, historical.clone())
+            .expect("install canonical historical entry");
 
         let found = pdf
             .get_all_objects()
@@ -10002,40 +10028,59 @@ mod tests {
     }
 
     #[test]
-    fn get_all_objects_skips_invalid_or_stateful_parsed_xref_stream_handles() {
+    fn install_parsed_xref_stream_handles_skips_invalid_or_stateful_entries() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let historical = Object::Integer(7);
 
         for object_ref in [ObjectRef::new(0, 0), ObjectRef::new(99, u16::MAX)] {
-            pdf.qpdf_parsed_xref_streams
-                .insert(object_ref, historical.clone());
+            pdf.install_test_parsed_xref_stream_handle(object_ref, historical.clone())
+                .expect("skip invalid historical entry");
         }
 
         let removed_ref = ObjectRef::new(100, 0);
         pdf.qpdf_removed_refs.insert(removed_ref);
-        pdf.qpdf_parsed_xref_streams
-            .insert(removed_ref, historical.clone());
+        pdf.install_test_parsed_xref_stream_handle(removed_ref, historical.clone())
+            .expect("skip removed historical entry");
 
         let xref_ref = ObjectRef::new(1, 0);
-        pdf.qpdf_parsed_xref_streams
-            .insert(xref_ref, historical.clone());
+        pdf.install_test_parsed_xref_stream_handle(xref_ref, historical.clone())
+            .expect("skip effective xref entry");
 
         let resolved_ref = ObjectRef::new(101, 0);
         let resolved = pdf.get_object_handle(resolved_ref);
         resolved.set_resolved(ObjectValue::Integer(42));
-        pdf.qpdf_parsed_xref_streams
-            .insert(resolved_ref, historical.clone());
+        pdf.install_test_parsed_xref_stream_handle(resolved_ref, historical.clone())
+            .expect("retain already-resolved historical entry");
 
         let missing_ref = ObjectRef::new(102, 0);
         let missing = pdf.get_object_handle(missing_ref);
         missing.set_missing();
-        pdf.qpdf_parsed_xref_streams.insert(missing_ref, historical);
+        pdf.install_test_parsed_xref_stream_handle(missing_ref, historical)
+            .expect("restore missing historical entry");
 
         pdf.get_all_objects()
-            .expect("skip invalid and restore missing parsed entries");
+            .expect("enumerate canonical historical entries");
 
         assert_eq!(resolved.as_integer(), Some(42));
         assert_eq!(missing.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn qpdf_json_historical_unresolved_fallback_is_null_without_a_canonical_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let historical_ref = ObjectRef::new(103, 0);
+        pdf.qpdf_parsed_xref_stream_refs.insert(historical_ref);
+
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(historical_ref)
+                .expect("unresolved qpdf historical lookup"),
+            Object::Null
+        );
+        assert!(matches!(
+            pdf.resolve_qpdf_json_object_borrowed(historical_ref)
+                .expect("borrowed unresolved qpdf historical lookup"),
+            Object::Null
+        ));
     }
 
     #[test]
