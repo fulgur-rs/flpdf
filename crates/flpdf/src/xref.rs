@@ -2385,6 +2385,12 @@ fn xref_file_object_diagnostic(
 
 type XrefWidths = (usize, usize, usize);
 
+// qpdf 11.9.0's QPDF::processXRefStream rejects each /W value above
+// sizeof(qpdf_offset_t) before summing the entry size (libqpdf/QPDF.cc:986-1003).
+// qpdf_offset_t is a long long (include/qpdf/Types.h:31), so use the
+// corresponding fixed-width Rust type rather than a platform-sized usize.
+const MAX_XREF_FIELD_WIDTH: usize = std::mem::size_of::<i64>();
+
 fn parse_xref_widths(
     context: &mut XrefReadContext<'_, '_>,
     trailer: &Dictionary,
@@ -2406,6 +2412,13 @@ fn parse_xref_widths(
     let w0 = parse_usize(parse_non_negative_u64(&values[0], "/W[0]")?, "/W[0]")?;
     let w1 = parse_usize(parse_non_negative_u64(&values[1], "/W[1]")?, "/W[1]")?;
     let w2 = parse_usize(parse_non_negative_u64(&values[2], "/W[2]")?, "/W[2]")?;
+
+    if w0 > MAX_XREF_FIELD_WIDTH || w1 > MAX_XREF_FIELD_WIDTH || w2 > MAX_XREF_FIELD_WIDTH {
+        return Err(Error::parse(
+            0,
+            "Cross-reference stream's /W contains impossibly large values",
+        ));
+    }
 
     Ok((w0, w1, w2))
 }

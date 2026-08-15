@@ -30,3 +30,13 @@ path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+# Xref/trailer safety harness: exercise both strict parsing and qpdf-style
+# repair without changing the production parser or treating parse errors as
+# fuzz failures.
+[[bin]]
+name = "xref"
+path = "fuzz_targets/xref.rs"
+test = false
+doc = false
+bench = false
