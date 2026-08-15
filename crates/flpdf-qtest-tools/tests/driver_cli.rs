@@ -270,6 +270,104 @@ fn missing_input_prefixes_the_native_open_error() {
         .stderr(expected);
 }
 
+fn test_driver_fixture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/test_driver"
+    ))
+}
+
+/// Regression for the P2 review finding on test 45's open-failure path
+/// (`crates/flpdf-qtest-tools/src/driver/mod.rs`): qpdf's own test 45 reads
+/// `"<filename1>.obfuscated"` through `QUtil::read_file_into_memory` /
+/// `QUtil::safe_fopen` (`libqpdf/QUtil.cc:1139`, `:490-518`) and only
+/// fabricates the `"<filename1>.pdf"` name *after* that read succeeds, to
+/// pass as the description for later parser diagnostics
+/// (`test_driver.cc:3519`). An open/read failure on the real `.obfuscated`
+/// path must report that real path, never the fabricated `.pdf` name.
+#[test]
+fn obfuscated_open_failure_reports_the_real_obfuscated_path_not_the_fabricated_pdf_name() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let base = directory.path().join("missing_obfuscated_source");
+    let mut obfuscated_path = base.clone().into_os_string();
+    obfuscated_path.push(".obfuscated");
+    let native_error = fs::read(&obfuscated_path).expect_err(".obfuscated fixture must not exist");
+    let error_code = native_error.raw_os_error().expect("native error code");
+    let native_message = unsafe { CStr::from_ptr(libc::strerror(error_code)) }
+        .to_string_lossy()
+        .into_owned();
+    let obfuscated_display = std::path::Path::new(&obfuscated_path).display().to_string();
+    let expected = format!("open {obfuscated_display}: {native_message}\n");
+
+    let assertion = driver()
+        .args(["45", base.to_str().expect("utf-8 temp path")])
+        .assert()
+        .code(2)
+        .stdout("");
+    let stderr = assertion.get_output().stderr.as_slice();
+    assert_eq!(stderr, expected.as_bytes());
+    assert!(
+        !stderr
+            .windows(b".pdf".len())
+            .any(|window| window == b".pdf"),
+        "open failure must not mention the fabricated .pdf name: {}",
+        String::from_utf8_lossy(stderr)
+    );
+}
+
+/// Regression for the P2 review finding on tests 26/27/29/30's secondary
+/// `arg2` open (`crates/flpdf-qtest-tools/src/driver/test_26_33.rs`): qpdf's
+/// `QPDF::processFile` opens `arg2` through `FileInputSource`, which uses
+/// `QUtil::safe_fopen` (`libqpdf/FileInputSource.cc:14-18`), whose failure
+/// message is `"open " + path + ": " + strerror(errno)`
+/// (`QPDFSystemError::createWhat`, `libqpdf/QPDFSystemError.cc:12-28`) --
+/// not a bare `std::io::Error` `Display` with no operation or path.
+#[test]
+fn secondary_open_failure_uses_the_qpdf_open_wording_not_a_bare_io_error() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let missing_arg2 = directory.path().join("missing_secondary.pdf");
+    let native_error = fs::read(&missing_arg2).expect_err("arg2 fixture must not exist");
+    let error_code = native_error.raw_os_error().expect("native error code");
+    let native_message = unsafe { CStr::from_ptr(libc::strerror(error_code)) }
+        .to_string_lossy()
+        .into_owned();
+    let expected = format!("open {}: {native_message}\n", missing_arg2.display());
+
+    driver()
+        .args([
+            "26",
+            minimal_pdf(),
+            missing_arg2.to_str().expect("utf-8 temp path"),
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(expected);
+}
+
+/// Regression for the P2 review finding on test 91
+/// (`crates/flpdf-qtest-tools/src/driver/test_88_98.rs`): `QPDF::writeJSON`
+/// dereferences every object it serializes via `getAllObjects()`
+/// (`libqpdf/QPDF_json.cc:900-925`), and a malformed object resolved lazily
+/// there still goes through the ordinary `QPDF::warn` path
+/// (`libqpdf/QPDF.cc:487-493`), which writes straight to the real process's
+/// warn logger. `document_json::write_json` raises the same lazy-resolution
+/// warning through this crate's own diagnostics collection, so it must be
+/// drained after the call, or the warning silently never reaches stderr.
+#[test]
+fn json_write_drains_a_lazy_resolution_warning_triggered_during_serialization() {
+    let assertion = driver()
+        .args(["91", "dict_indirect_value_warning.pdf"])
+        .current_dir(test_driver_fixture_dir())
+        .assert()
+        .code(0);
+    let stderr = assertion.get_output().stderr.as_slice();
+    assert_eq!(
+        stderr,
+        b"WARNING: dict_indirect_value_warning.pdf (object 7 0, offset 154): expected endobj\n"
+    );
+}
+
 // macOS rejects invalid UTF-8 filenames before the driver can open them.
 // The missing-path diagnostic below still exercises raw argv bytes there.
 #[cfg(all(unix, not(target_os = "macos")))]
