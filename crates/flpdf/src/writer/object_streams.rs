@@ -2395,6 +2395,27 @@ mod tests {
     }
 
     #[test]
+    fn wrap_objstm_body_as_handle_preserves_raw_payload_and_extends() {
+        let body = ObjStmBody {
+            bytes: b"1 0\n42\n".to_vec(),
+            first_offset: 4,
+            n_members: 1,
+        };
+        let extends = ObjectRef::new(17, 0);
+        let (handle, data) =
+            wrap_objstm_body_as_handle(&body, crate::writer::CompressStreams::No, Some(extends))
+                .unwrap();
+
+        assert_eq!(data, body.bytes);
+        assert_eq!(handle.as_stream_data().as_deref(), Some(&body.bytes));
+        let dict = handle.as_stream_dict().expect("ObjStm stream dictionary");
+        assert_eq!(dict.get_key(b"/Type").as_name(), Some(b"ObjStm".to_vec()));
+        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(7));
+        assert_eq!(dict.get_key(b"/Filter").as_name(), None);
+        assert_eq!(dict.get_key(b"/Extends").as_reference(), Some(extends));
+    }
+
+    #[test]
     fn wrap_objstm_body_empty_members_still_valid() {
         let body = ObjStmBody {
             bytes: vec![],

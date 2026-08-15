@@ -6773,6 +6773,15 @@ mod tests {
         literal.as_bytes().to_vec()
     }
 
+    #[test]
+    fn qpdf_contents_bytes_accepts_hex_and_literal_forms() {
+        assert_eq!(
+            qpdf_contents_bytes("<< /Contents <000102ff> >>"),
+            vec![0, 1, 2, 255]
+        );
+        assert_eq!(qpdf_contents_bytes("<< /Contents (literal) >>"), b"literal");
+    }
+
     fn aes128_encryption_state() -> crate::reader::EncryptionState {
         let encrypted = encrypted_info_fixture(
             b"<< /Title (TopSecretTitle) >>",

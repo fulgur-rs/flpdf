@@ -906,6 +906,21 @@ mod tests {
             .expect("/Encrypt object must remain cleartext");
         assert_eq!(encrypt_output, b"<< /O <7072696e7461626c65> >>");
 
+        let identity_map = |object_ref: ObjectRef| Ok(object_ref);
+        let mut mapped_encrypt_output = Vec::new();
+        emitter
+            .write_handle_object_with_ref_map(
+                &mut mapped_encrypt_output,
+                context.encrypt_ref,
+                None,
+                &encrypt_object,
+                false,
+                &identity_map,
+                &std::collections::BTreeSet::new(),
+            )
+            .expect("mapped /Encrypt object must remain cleartext");
+        assert_eq!(mapped_encrypt_output, encrypt_output);
+
         let mut member_output = Vec::new();
         emitter
             .write_handle_object(
@@ -964,6 +979,22 @@ mod tests {
                 b"metadata-dictionary-secret"
             );
         }
+
+        let identity_map = |object_ref: ObjectRef| Ok(object_ref);
+        let mut mapped_cleartext = Vec::new();
+        EncryptedStringEmitter::from_context(&context)
+            .write_handle_stream_dict_with_ref_map(
+                &mut mapped_cleartext,
+                emitted_ref,
+                None,
+                &dict,
+                StreamDictOptions::new(true, false, false),
+                &identity_map,
+                &std::collections::BTreeSet::new(),
+                None,
+            )
+            .expect("mapped cleartext metadata dictionary emission");
+        assert!(mapped_cleartext.starts_with(b"<<\n"));
     }
 
     #[test]

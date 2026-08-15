@@ -451,6 +451,33 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn unfiltered_crypt_cleanup_handles_missing_and_scalar_decode_parms() {
+        for decode_parms in [None, Some(ObjectHandle::integer(7))] {
+            let mut entries = std::collections::BTreeMap::new();
+            entries.insert(
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"Crypt".to_vec()),
+                ]),
+            );
+            if let Some(decode_parms) = decode_parms {
+                entries.insert(b"/DecodeParms".to_vec(), decode_parms);
+            }
+
+            remove_crypt_filter_for_unfiltered_stream(&mut entries).unwrap();
+
+            assert_eq!(
+                entries
+                    .get(b"/Filter".as_slice())
+                    .and_then(|filter| filter.as_array())
+                    .map(|filters| filters.len()),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
     fn disable_emission_records_every_planned_source_offset() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
