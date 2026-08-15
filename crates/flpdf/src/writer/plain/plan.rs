@@ -9,7 +9,7 @@ use crate::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber,
 };
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
-use crate::writer::plain::xref::{IdPlan, TrailerPlan};
+use crate::writer::plain::xref::{materialized_id, IdPlan, TrailerPlan};
 use crate::writer::WriterOptions;
 use crate::{CompressStreams, Object, ObjectRef, Pdf, XrefEntry, XrefForm};
 
@@ -66,7 +66,7 @@ impl PlainWritePlan {
                     options.preserve_unreferenced_objects,
                     &explicitly_removed,
                 )?;
-                let mut placement = build_sources_from_pairs(renumber.pairs(), true);
+                let mut placement = build_sources_from_pairs(renumber.pairs());
                 placement.removed_refs = explicitly_removed;
                 placement
             }
@@ -78,7 +78,7 @@ impl PlainWritePlan {
                         options.preserve_unreferenced_objects,
                         &explicitly_removed,
                     )?; // cov:ignore: malformed canonical source graphs are rejected before placement
-                    let mut placement = build_sources_from_pairs(renumber.pairs(), true);
+                    let mut placement = build_sources_from_pairs(renumber.pairs());
                     placement.removed_refs = explicitly_removed;
                     placement
                 } else {
@@ -164,28 +164,16 @@ impl PlainWritePlan {
             version = "1.5".to_string();
         }
 
+        let source_id0 = live_source_id0(pdf)?;
+        let source_id_object = source_id0
+            .as_ref()
+            .map(|id0| Object::Array(vec![Object::String(id0.clone())]));
         let mut dictionary = pdf.trailer().clone();
-        crate::writer::strip_writer_trailer_history_keys(&mut dictionary);
-        if placement.canonical {
-            crate::writer::remap_trailer_refs(
-                &mut dictionary,
-                &placement.old_to_new,
-                &placement.removed_refs.iter().copied().collect::<Vec<_>>(),
-            )?; // cov:ignore: malformed trailer references are rejected before canonical planning
-        } else {
-            crate::writer::remap_qpdf_trailer_refs_with_removed(
-                pdf,
-                &mut dictionary,
-                &placement.old_to_new,
-                &placement.removed_refs,
-            )?; // cov:ignore: remap failure requires a malformed trailer rejected before plain planning
-        }
-        dictionary.insert("Root", Object::Reference(root));
         let generated_id = if options.deterministic_id || options.copy_encryption.is_some() {
             None
         } else {
             Some(crate::writer::generate_id_array(
-                pdf.trailer().get("ID"),
+                source_id_object.as_ref(),
                 options.static_id,
             ))
         };
@@ -199,28 +187,29 @@ impl PlainWritePlan {
         );
         let id = if options.deterministic_id {
             IdPlan::Deterministic {
-                source_id0: crate::writer::source_permanent_id(pdf.trailer()),
+                source_id0,
                 info_suffix: crate::writer::deterministic_id_info_suffix(pdf),
             }
         } else {
-            IdPlan::Materialized
+            IdPlan::Materialized {
+                value: materialized_id(&dictionary)?,
+            }
         };
+        let encrypt = dictionary.get_ref("Encrypt");
         let structural_filtered = matches!(
             crate::writer::effective_stream_policy(options),
             Some(CompressStreams::Yes)
         );
         let trailer = TrailerPlan {
             form,
-            dictionary,
-            canonical_entries: if placement.canonical {
-                Some(
-                    canonical_trailer_entries(pdf, &placement.old_to_new, &placement.removed_refs)?, // cov:ignore: malformed live trailer graphs are rejected at the helper boundary
-                )
-            } else {
-                None
-            },
+            canonical_entries: canonical_trailer_entries(
+                pdf,
+                &placement.old_to_new,
+                &placement.removed_refs,
+            )?, // cov:ignore: malformed live trailer graphs are rejected at the helper boundary
             root,
             id,
+            encrypt,
             structural_filtered,
         };
 
@@ -361,7 +350,18 @@ struct PlacementPlan {
     objects: Vec<PlannedIndirectObject>,
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     removed_refs: BTreeSet<ObjectRef>,
-    pub(crate) canonical: bool,
+}
+
+fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec<u8>>> {
+    let id = pdf.trailer_handle().try_get_key(b"/ID")?;
+    let Some(values) = id.try_as_array()? else {
+        return Ok(None);
+    };
+    let Some(first) = values.first() else {
+        return Ok(None);
+    };
+    first.try_dereference()?;
+    Ok(first.as_string().filter(|bytes| !bytes.is_empty()))
 }
 
 /// Snapshot the writer-owned trailer entries from qpdf's live canonical
@@ -452,7 +452,6 @@ fn is_writer_owned_trailer_key(key: &[u8]) -> bool {
 
 fn build_sources_from_pairs(
     pairs: impl IntoIterator<Item = (ObjectRef, ObjectRef)>,
-    canonical: bool,
 ) -> PlacementPlan {
     let pairs: Vec<(ObjectRef, ObjectRef)> = pairs.into_iter().collect();
     let old_to_new = pairs
@@ -467,7 +466,6 @@ fn build_sources_from_pairs(
         objects,
         old_to_new,
         removed_refs: BTreeSet::new(),
-        canonical,
     }
 }
 
@@ -562,7 +560,6 @@ fn build_container_aware(
         objects,
         old_to_new,
         removed_refs,
-        canonical: false,
     })
 }
 
@@ -649,9 +646,7 @@ mod tests {
     use crate::writer::object_streams::ObjectStreamMode;
     use crate::writer::plain::xref::{append_xref_and_trailer, BodyLayout, IdPlan, TrailerPlan};
     use crate::writer::WriterOptions;
-    use crate::{
-        Dictionary, NewlineBeforeEndstream, ObjectHandle, ObjectRef, Pdf, PdfWriter, XrefForm,
-    };
+    use crate::{NewlineBeforeEndstream, ObjectHandle, ObjectRef, Pdf, PdfWriter, XrefForm};
 
     fn fixture_path(fixture: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -704,10 +699,10 @@ mod tests {
             removed_refs: BTreeSet::new(),
             trailer: TrailerPlan {
                 form: XrefForm::Table,
-                dictionary: Dictionary::new(),
-                canonical_entries: None,
+                canonical_entries: Vec::new(),
                 root: root_output,
-                id: IdPlan::Materialized,
+                id: IdPlan::Materialized { value: None },
+                encrypt: None,
                 structural_filtered: false,
             },
         }
@@ -873,6 +868,84 @@ mod tests {
         assert!(!text.contains("/Gone"));
         assert!(!text.contains("/Zero"));
         assert!(!text.contains("/Removed"));
+    }
+
+    #[test]
+    fn generated_xref_stream_uses_live_trailer_entries() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        pdf.trailer_handle()
+            .replace_key(
+                b"/Added",
+                ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]),
+            )
+            .unwrap();
+
+        let output = {
+            let mut writer = PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(ObjectStreamMode::Generate);
+            writer.set_output_memory().unwrap();
+            writer.write().unwrap();
+            writer.get_buffer().unwrap()
+        };
+        let text = String::from_utf8_lossy(&output);
+
+        assert!(
+            text.contains("/Added << /Value 7 >>"),
+            "generated xref stream must serialize the live trailer handle: {text}"
+        );
+    }
+
+    #[test]
+    fn live_source_id0_reads_existing_trailer_id() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("one-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+
+        assert!(pdf.trailer().get("ID").is_some());
+        let id0 = live_source_id0(&mut pdf).unwrap();
+        assert!(
+            id0.is_some(),
+            "live trailer /ID[0] must be visible to the planner"
+        );
+    }
+
+    #[test]
+    fn live_source_id0_reads_mutated_trailer_handle_id() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("one-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        pdf.trailer_handle()
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"mutated-permanent".to_vec()),
+                    ObjectHandle::string(b"mutated-changing".to_vec()),
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            live_source_id0(&mut pdf).unwrap(),
+            Some(b"mutated-permanent".to_vec())
+        );
+    }
+
+    #[test]
+    fn live_source_id0_returns_none_for_empty_id_array() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("one-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        pdf.trailer_handle()
+            .replace_key(b"/ID", ObjectHandle::array(Vec::new()))
+            .unwrap();
+
+        assert_eq!(live_source_id0(&mut pdf).unwrap(), None);
     }
 
     #[test]

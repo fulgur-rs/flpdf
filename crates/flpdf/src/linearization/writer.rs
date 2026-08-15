@@ -1358,6 +1358,7 @@ fn write_first_page_xref_stream(
             size: final_size,
             prev: Some(0),
             trailer: None,
+            canonical_entries: None,
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
             encrypt,
         };
@@ -1483,6 +1484,7 @@ fn patch_first_page_xref(
         size: patch.size,
         prev: Some(prev),
         trailer: None,
+        canonical_entries: None,
         id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         encrypt: patch.encrypt,
     };
@@ -1585,6 +1587,7 @@ fn write_main_xref_stream_and_trailer(
         size: main_count,
         prev: None,
         trailer: None,
+        canonical_entries: None,
         id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         encrypt: None,
     };
@@ -1605,6 +1608,7 @@ fn write_main_xref_stream_and_trailer(
             size: main_count,
             prev: None,
             trailer: None,
+            canonical_entries: None,
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
             encrypt: None,
         };

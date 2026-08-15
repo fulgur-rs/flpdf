@@ -43,7 +43,9 @@ impl BodyLayout {
 /// How the trailer `/ID` is provided while its bytes are assembled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IdPlan {
-    Materialized,
+    Materialized {
+        value: Option<(Vec<u8>, Vec<u8>)>,
+    },
     Deterministic {
         source_id0: Option<Vec<u8>>,
         info_suffix: Vec<u8>,
@@ -54,15 +56,12 @@ pub(crate) enum IdPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct TrailerPlan {
     pub(crate) form: XrefForm,
-    pub(crate) dictionary: Dictionary,
     /// Canonical trailer entries from the live ObjectHandle graph. Keys remain
     /// decoded until emission so qpdf's raw-name sort is preserved.
-    /// The legacy dictionary remains for non-canonical writer routes and for
-    /// writer-owned `/ID` materialization; canonical plain writes must not
-    /// reconstruct their extension entries from that stale snapshot.
-    pub(crate) canonical_entries: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    pub(crate) canonical_entries: Vec<(Vec<u8>, Vec<u8>)>,
     pub(crate) root: ObjectRef,
     pub(crate) id: IdPlan,
+    pub(crate) encrypt: Option<ObjectRef>,
     pub(crate) structural_filtered: bool,
 }
 
@@ -137,27 +136,6 @@ fn append_xref_stream_and_trailer(
         xref_stream::encode_payload_raw(&entries, widths)?
     };
 
-    let mut dictionary = trailer.dictionary.clone();
-    for key in [
-        "Root",
-        "Size",
-        "ID",
-        "Encrypt",
-        "Prev",
-        "Type",
-        "F",
-        "FFilter",
-        "FDecodeParms",
-        "W",
-        "Index",
-        "Length",
-        "Filter",
-        "DecodeParms",
-        "XRefStm",
-    ] {
-        dictionary.remove(key);
-    }
-
     let dictionary = xref_stream::XrefStreamDict {
         filtered: trailer.structural_filtered,
         widths,
@@ -166,15 +144,15 @@ fn append_xref_stream_and_trailer(
         root: Some(trailer.root),
         size,
         prev: None,
-        trailer: Some(&dictionary),
+        trailer: None,
+        canonical_entries: Some(&trailer.canonical_entries),
         id: None,
-        encrypt: None,
+        encrypt: trailer.encrypt,
     };
     let xref_ref = ObjectRef::new(xref_number, 0);
     match &trailer.id {
-        IdPlan::Materialized => {
-            let materialized_id = materialized_id(&trailer.dictionary)?;
-            let id = materialized_id
+        IdPlan::Materialized { value } => {
+            let id = value
                 .as_ref()
                 .map(|(id0, id1)| (id0.as_slice(), id1.as_slice()));
             let dictionary = xref_stream::XrefStreamDict { id, ..dictionary };
@@ -200,7 +178,9 @@ fn append_xref_stream_and_trailer(
     written_xref_stream(layout, xref_ref, xref_offset)
 }
 
-fn materialized_id(dictionary: &Dictionary) -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
+pub(crate) fn materialized_id(
+    dictionary: &Dictionary,
+) -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let Some(id) = dictionary.get("ID") else {
         return Ok(None);
     };
@@ -248,30 +228,7 @@ fn append_classic_xref_and_trailer(
     }
 
     bytes.extend_from_slice(b"trailer ");
-    if let Some(canonical) = trailer.canonical_entries.as_deref() {
-        write_canonical_classic_trailer(bytes, trailer, size, canonical);
-    } else {
-        let mut dictionary = trailer.dictionary.clone();
-        dictionary.insert("Root", Object::Reference(trailer.root));
-        dictionary.insert("Size", Object::Integer(i64::from(size)));
-        if matches!(&trailer.id, IdPlan::Deterministic { .. }) {
-            // `write_pdf_trailer` calls its ID writer only when this key exists.
-            // The inline writer replaces the placeholder with the real array.
-            dictionary.insert("ID", Object::Array(Vec::new()));
-        }
-        match &trailer.id {
-            IdPlan::Materialized => dictionary.write_pdf_trailer(bytes, None),
-            IdPlan::Deterministic {
-                source_id0,
-                info_suffix,
-            } => {
-                let mut id_writer = |out: &mut Vec<u8>| {
-                    write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
-                };
-                dictionary.write_pdf_trailer(bytes, Some(&mut id_writer));
-            }
-        }
-    }
+    write_canonical_classic_trailer(bytes, trailer, size, &trailer.canonical_entries);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     written_xref_table(layout, size)
 }
@@ -299,11 +256,15 @@ fn write_canonical_classic_trailer(
         bytes.extend_from_slice(&value);
     }
 
-    if matches!(&trailer.id, IdPlan::Materialized) {
-        if let Some(id) = trailer.dictionary.get("ID") {
-            bytes.extend_from_slice(b" /ID ");
-            crate::object::write_id_style_value(bytes, id);
-        }
+    if let IdPlan::Materialized {
+        value: Some((id0, id1)),
+    } = &trailer.id
+    {
+        bytes.extend_from_slice(b" /ID [<");
+        write_hex(bytes, id0);
+        bytes.extend_from_slice(b"><");
+        write_hex(bytes, id1);
+        bytes.extend_from_slice(b">]");
     } else if let IdPlan::Deterministic {
         source_id0,
         info_suffix,
@@ -313,11 +274,19 @@ fn write_canonical_classic_trailer(
         write_deterministic_id_inline(bytes, info_suffix, source_id0.as_deref());
     }
 
-    if let Some(encrypt) = trailer.dictionary.get("Encrypt") {
+    if let Some(encrypt) = trailer.encrypt {
         bytes.extend_from_slice(b" /Encrypt ");
-        encrypt.write_pdf(bytes);
+        bytes.extend_from_slice(format!("{} {} R", encrypt.number, encrypt.generation).as_bytes());
     }
     bytes.extend_from_slice(b" >>");
+}
+
+fn write_hex(out: &mut Vec<u8>, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize]);
+        out.push(HEX[(byte & 0x0f) as usize]);
+    }
 }
 
 fn written_xref_table(
@@ -398,10 +367,10 @@ mod tests {
     fn trailer(form: XrefForm) -> TrailerPlan {
         TrailerPlan {
             form,
-            dictionary: Dictionary::new(),
-            canonical_entries: None,
+            canonical_entries: Vec::new(),
             root: ObjectRef::new(1, 0),
-            id: IdPlan::Materialized,
+            id: IdPlan::Materialized { value: None },
+            encrypt: None,
             structural_filtered: false,
         }
     }
@@ -427,17 +396,15 @@ mod tests {
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(1, (0, 0));
-        let mut dictionary = Dictionary::new();
-        dictionary.insert("Encrypt", Object::Reference(ObjectRef::new(8, 0)));
         let trailer = TrailerPlan {
             form: XrefForm::Table,
-            dictionary,
-            canonical_entries: Some(vec![(b"/Added".to_vec(), b"true".to_vec())]),
+            canonical_entries: vec![(b"/Added".to_vec(), b"true".to_vec())],
             root: ObjectRef::new(1, 0),
             id: IdPlan::Deterministic {
                 source_id0: Some(vec![0x01, 0x02]),
                 info_suffix: vec![0x03, 0x04],
             },
+            encrypt: Some(ObjectRef::new(8, 0)),
             structural_filtered: false,
         };
 
@@ -646,6 +613,27 @@ mod tests {
     }
 
     #[test]
+    fn xref_stream_emits_encrypt_after_materialized_id() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        let mut trailer = trailer(XrefForm::Stream);
+        trailer.id = IdPlan::Materialized {
+            value: Some((b"first".to_vec(), b"second".to_vec())),
+        };
+        trailer.encrypt = Some(ObjectRef::new(8, 0));
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let id = text.find("/ID [<").expect("xref stream ID");
+        let encrypt = text.find("/Encrypt 8 0 R").expect("xref stream Encrypt");
+        assert!(
+            encrypt > id,
+            "xref stream must write /Encrypt after /ID: {text}"
+        );
+    }
+
+    #[test]
     fn classic_xref_emits_free_entries_for_layout_holes() {
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();
@@ -661,12 +649,14 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_xref_stream_ignores_materialized_id_shape() {
+    fn deterministic_xref_stream_uses_id_writer_independent_of_canonical_entries() {
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();
         layout.uncompressed.insert(1, (0, 0));
         let mut trailer = trailer(XrefForm::Stream);
-        trailer.dictionary.insert("ID", Object::Integer(1));
+        trailer
+            .canonical_entries
+            .push((b"/Added".to_vec(), b"1".to_vec()));
         trailer.id = IdPlan::Deterministic {
             source_id0: None,
             info_suffix: Vec::new(),
@@ -674,7 +664,9 @@ mod tests {
 
         append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
 
-        assert!(String::from_utf8_lossy(&bytes).contains("/ID [<"));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/Added 1"));
+        assert!(text.contains("/ID [<"));
     }
 
     #[test]
