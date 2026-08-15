@@ -343,17 +343,21 @@ fn xref_stream_unavailable_indirect_length_uses_bounded_recovery_diagnostics() {
             .collect::<Vec<_>>(),
         vec![
             (
-                format!("(object 1 0, offset {xref_offset}): stream dictionary lacks /Length key"),
+                format!(
+                    "(xref stream: object 1 0, offset {xref_offset}): stream dictionary lacks /Length key"
+                ),
                 Some(xref_offset as u64),
             ),
             (
                 format!(
-                    "(object 1 0, offset {payload_offset}): attempting to recover stream length"
+                    "(xref stream: object 1 0, offset {payload_offset}): attempting to recover stream length"
                 ),
                 Some(payload_offset as u64),
             ),
             (
-                format!("(object 1 0, offset {payload_offset}): recovered stream length: 4"),
+                format!(
+                    "(xref stream: object 1 0, offset {payload_offset}): recovered stream length: 4"
+                ),
                 Some(payload_offset as u64),
             ),
         ]
@@ -684,7 +688,8 @@ fn preserves_recovery_diagnostics_from_previous_xref_streams() {
 
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
     assert!(loaded.repair_diagnostics.entries().iter().any(|entry| {
-        entry.message.contains("recovered stream length") && entry.message.contains("(object 2 0,")
+        entry.message.contains("recovered stream length")
+            && entry.message.contains("(xref stream: object 2 0,")
     }));
 }
 
@@ -1460,15 +1465,15 @@ fn best_effort_candidate_discovery_and_reentry_recover_mismatched_indirect_xref_
             candidate_offset + candidate_header.len() as u64
         ),
         format!(
-            "(object 1 0, offset {}): expected endstream",
+            "(xref stream: object 1 0, offset {}): expected endstream",
             candidate_offset + candidate_header.len() as u64 + 3
         ),
         format!(
-            "(object 1 0, offset {}): attempting to recover stream length",
+            "(xref stream: object 1 0, offset {}): attempting to recover stream length",
             candidate_offset + candidate_header.len() as u64
         ),
         format!(
-            "(object 1 0, offset {}): recovered stream length: 29",
+            "(xref stream: object 1 0, offset {}): recovered stream length: 29",
             candidate_offset + candidate_header.len() as u64
         ),
     ];
@@ -3498,7 +3503,7 @@ fn classic_xref_table_preserves_recovery_diagnostics_from_its_xrefstm() {
         .iter()
         .any(|diagnostic| {
             diagnostic.message.contains("recovered stream length")
-                && diagnostic.message.contains("(object 2 0,")
+                && diagnostic.message.contains("(xref stream: object 2 0,")
         }));
 }
 
