@@ -1900,6 +1900,19 @@ impl<R: Read + Seek> Pdf<R> {
         // line-scan filter at `:575` before a candidate re-read (`:516-607`).
         // Never clear or add either registration here. Exact xref/cache removal
         // remains `removeObject` (`QPDF.cc:1996-2005`).
+        //
+        // Refresh the legacy cache before replacing the canonical value, or
+        // an old object-stream entry can incorrectly retain provenance
+        // (mirrors `set_object`'s identical precondition above).
+        // Refresh the legacy cache before replacing the canonical value, or
+        // an old object-stream entry can incorrectly retain provenance
+        // (mirrors `set_object`'s identical precondition above).
+        self.synchronize_legacy_resolution_state();
+        // qpdf's replaceObject changes only the requested cache slot; already
+        // resolved members of an ObjStm remain live in their own cache slots.
+        // Promote those compatibility-cache values before the replacement
+        // overwrites the source container.
+        self.promote_resolved_object_stream_members(object_ref)?;
         let target = self.resolver.replace_object(object_ref, replacement)?;
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
@@ -11141,6 +11154,40 @@ mod tests {
         assert!(
             member.as_dictionary().is_some(),
             "replacing the source ObjStm must not turn an already-resolved member into null"
+        );
+    }
+
+    #[test]
+    fn replace_object_handle_promotes_resolved_objstm_members_before_replacing_container() {
+        // Same qpdf invariant as `replacing_an_objstm_container_promotes_resolved_members_to_canonical_handles`
+        // above (`set_object`), exercised through the handle-shaped setter:
+        // `QPDF::replaceObject` only changes the requested cache slot, so an
+        // already-resolved ObjStm member must be promoted to its own live
+        // handle before the source container's canonical value is replaced.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(path).expect("open ObjStm fixture"),
+        ))
+        .expect("open ObjStm fixture");
+        let member_ref = ObjectRef::new(7, 0);
+
+        assert!(matches!(
+            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            Object::Dictionary(_)
+        ));
+
+        pdf.replace_object_handle(ObjectRef::new(1, 0), ObjectHandle::null())
+            .expect("replace canonical object");
+
+        let member = pdf.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("cached ObjStm member must survive source-container replacement");
+        assert!(
+            member.as_dictionary().is_some(),
+            "replacing the source ObjStm via the handle-shaped setter must not turn an \
+             already-resolved member into null"
         );
     }
 
