@@ -2141,8 +2141,7 @@ fn build_writer_trailer_handle<R: Read + Seek>(
 /// AES variants (V=4 AESV2 `PerObject(Aes)` and V=5 AESV3 `FileKeyAes256`),
 /// `false` for RC4 (a stream cipher with no IV concept).
 ///
-/// Shared by [`encrypt_stream_payload_for_writer`] (which draws its own IV
-/// only when this is `true`) and
+/// Shared by the canonical encrypted-string and stream pipeline stages and
 /// `crate::linearization::writer::write_linearized` (which draws the hint
 /// stream's single per-invocation IV under the same condition).
 pub(crate) fn cipher_needs_aes_iv(cipher: WriteCipher) -> bool {
@@ -2289,109 +2288,6 @@ pub(crate) fn write_stream_payload_with_pipeline(
     }
     out.extend_from_slice(b"endstream");
     Ok(add_newline)
-}
-
-/// Legacy in-place stream encryption bridge retained until the linearized
-/// writer's `.5.3` cleanup removes its remaining test/oracle seam. The
-/// canonical full-rewrite stream path uses [`pipe_writer_stream_payload`] so
-/// encryption remains a qpdf-shaped pipeline stage instead of materializing a
-/// replacement buffer.
-///
-/// This bridge draws a fresh AES IV internally on every call (or the fixed
-/// test vector under `ctx.static_aes_iv`) and delegates to
-/// [`encrypt_stream_payload_with_iv`]. The linearized hint-stream emitter uses
-/// the latter directly with one IV per `write_linearized` invocation so its
-/// repeated convergence passes see identical ciphertext.
-#[allow(dead_code)] // flpdf-3yn9.5.3 removes this legacy bridge after the cutover.
-pub(crate) fn encrypt_stream_payload_for_writer(
-    object_ref: ObjectRef,
-    stream: &mut crate::Stream,
-    ctx: &EncryptionContext,
-) -> Result<()> {
-    // AES (V=4 AESV2 or V=5 AESV3) prefixes a random 16-byte CBC IV; RC4 does
-    // not. Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
-    // entropy in a chroot at boot) as `Unsupported` instead of panicking.
-    let needs_aes_iv = cipher_needs_aes_iv(ctx.cipher);
-    let mut iv = if ctx.static_aes_iv {
-        crate::pipeline::aes::static_initialization_vector()
-    } else {
-        [0u8; 16]
-    };
-    if needs_aes_iv && !ctx.static_aes_iv {
-        getrandom::fill(&mut iv).map_err(|e| {
-            crate::Error::Unsupported(format!(
-                "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
-            ))
-        })?;
-    }
-
-    encrypt_stream_payload_with_iv(object_ref, stream, ctx, iv)
-}
-
-/// Core of [`encrypt_stream_payload_for_writer`]: encrypt `stream.data` in
-/// place with an explicit IV and update `/Length` to the on-disk (encrypted)
-/// byte count. `iv` is used verbatim for AES ciphers; RC4 has no IV concept
-/// and ignores it.
-///
-/// Exposed as a separate legacy primitive so a caller that needs the *same*
-/// ciphertext across repeated calls (the linearized writer's hint stream,
-/// re-emitted once per convergence-loop pass) can supply one IV instead of
-/// getting a fresh random draw every call. The canonical full-rewrite path
-/// does not use this buffer-replacement route.
-pub(crate) fn encrypt_stream_payload_with_iv(
-    object_ref: ObjectRef,
-    stream: &mut crate::Stream,
-    ctx: &EncryptionContext,
-    iv: [u8; 16],
-) -> Result<()> {
-    use crate::pipeline::rc4::PlRc4;
-    use crate::security::standard::{
-        encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
-    };
-
-    match ctx.cipher {
-        WriteCipher::PerObject(alg) => {
-            let per_obj_key = per_object_key(
-                &ctx.file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                alg,
-            );
-            match alg {
-                ObjectKeyAlg::Aes => {
-                    let key_bytes: [u8; 16] = per_obj_key
-                        .as_slice()
-                        .try_into()
-                        .expect("V=4 AES per-object key is exactly 16 bytes");
-                    let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
-                    encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
-                }
-                ObjectKeyAlg::Rc4 => {
-                    PlRc4::transform_in_place(
-                        "rc4 stream encryption",
-                        &mut stream.data,
-                        per_obj_key.as_slice(),
-                    )
-                    .expect("Algorithm 1 always derives a non-empty RC4 key");
-                }
-            }
-        }
-        WriteCipher::FileKeyAes256 => {
-            // V=5: the 32-byte file key is used directly with AES-256-CBC.
-            let key_bytes: [u8; 32] = ctx.file_key.as_slice().try_into().map_err(|_| {
-                crate::Error::Unsupported("V=5 AES-256 file key is not 32 bytes".to_string())
-            })?;
-            let cipher = StringEncryptCipher::Aes256 { key: &key_bytes };
-            encrypt_cipher_bytes(&mut stream.data, cipher, &iv)?;
-        }
-    }
-
-    // /Length reflects the encrypted on-disk byte count.
-    let new_len = i64::try_from(stream.data.len()).map_err(|_| {
-        crate::Error::Unsupported("encrypted stream /Length overflows i64".to_string())
-    })?;
-    stream.dict.insert("Length", Object::Integer(new_len));
-    Ok(())
 }
 
 /// Re-encode a resolved stream object per the effective compression policy,
@@ -3071,9 +2967,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
 
     // ── Step 1: run the ObjStm planner ───────────────────────────────────────
     // For --encrypt: ObjStm containers encrypt as a single blob per PDF 1.7
-    // §7.5.7; the container stream is encrypted via encrypt_stream_payload_for_writer
-    // (Step 5 below). Per-member string encryption is skipped because members
-    // are not emitted in the main loop.
+    // §7.5.7; the container stream is encrypted through the canonical writer
+    // pipeline in the emission loop. Per-member string encryption is skipped
+    // because members are not emitted in the main loop.
     // For --copy-encryption-from: keep ObjStm off (the copy path doesn't yet
     // allocate container numbers above the /Encrypt slot).
     let planner_options;
@@ -7071,46 +6967,6 @@ mod tests {
                 "V=5 R=5 stream must round-trip via reader for {label:?}"
             );
         }
-    }
-
-    /// Each RC4 writer method (V=1 RC4-40, V=2 RC4-128,
-    /// V=4 RC4-128) round-trips. Encrypt a string+stream fixture, then re-open
-    /// with flpdf under EACH password and confirm `/Title` and the stream
-    /// decrypt to plaintext. The reader gates RC4 behind weak-crypto, so the
-    /// re-open sets `allow_weak_crypto = true`.
-    #[test]
-    fn rc4_stream_encryption_preserves_payload_allocation() {
-        let object_ref = ObjectRef::new(7, 0);
-        let ctx = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
-            cipher: WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4),
-            encryption_v: 1,
-            encryption_r: 2,
-            encrypt_ref: ObjectRef::new(99, 0),
-            id0: Vec::new(),
-            static_aes_iv: false,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let plaintext = vec![0x42; crate::pipeline::rc4::DEFAULT_OUT_BUFFER_SIZE + 17];
-        let mut stream = crate::Stream::new(Dictionary::new(), plaintext.clone());
-        let original_ptr = stream.data.as_ptr();
-        let original_capacity = stream.data.capacity();
-
-        encrypt_stream_payload_for_writer(object_ref, &mut stream, &ctx).expect("RC4 transform");
-        assert_eq!(stream.data.as_ptr(), original_ptr);
-        assert_eq!(stream.data.capacity(), original_capacity);
-        assert_ne!(stream.data, plaintext);
-        assert_eq!(
-            stream.dict.get("Length"),
-            Some(&Object::Integer(stream.data.len() as i64))
-        );
-
-        encrypt_stream_payload_for_writer(object_ref, &mut stream, &ctx)
-            .expect("RC4 inverse transform");
-        assert_eq!(stream.data.as_ptr(), original_ptr);
-        assert_eq!(stream.data, plaintext);
     }
 
     #[test]
