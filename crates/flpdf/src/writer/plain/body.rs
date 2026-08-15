@@ -189,6 +189,20 @@ pub(crate) fn canonical_stream_output_for_rewrite(
     canonical_stream_output_with_rewrite_policy(handle, options, true, normalize_content)
 }
 
+/// Canonical stream output for qpdf's linearized body route.
+///
+/// `QPDFWriter::writeLinearized` applies the stream compression decision before
+/// its encryption-stage cleartext-metadata exemption. The full-rewrite route's
+/// metadata suppression therefore must not run here: a metadata stream can be
+/// re-filtered to `/FlateDecode` first, after which the linearization writer
+/// prepends `/Crypt /Identity` (`QPDFWriter.cc:1234-1314`).
+pub(crate) fn canonical_stream_output_for_linearization(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
+    canonical_stream_output_with_rewrite_policy(handle, options, false, false)
+}
+
 fn canonical_stream_output_with_rewrite_policy(
     handle: &ObjectHandle,
     options: &WriterOptions,
