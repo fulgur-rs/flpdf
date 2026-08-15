@@ -122,6 +122,12 @@ thin consumers of `Pdf::get_xref_table`, `Pdf::get_all_objects`, and
 sorting, formatting, and qpdf-shaped diagnostics; parsing, xref construction,
 resolution, and provenance stay in `flpdf`.
 
+The initial file-open boundary also preserves the platform CRT diagnostic via
+`driver::crt_open_error_message`, matching qpdf's `QUtil::safe_fopen`
+(`libqpdf/QUtil.cc:453-518`) and `QPDFSystemError::createWhat`
+(`libqpdf/QPDFSystemError.cc:13-29`). The differential tests cover missing
+paths and Windows directory-open failures for both metadata helpers.
+
 ## 1. オブジェクトモデル
 
 | qpdf | 行 | flpdf | 状態 |

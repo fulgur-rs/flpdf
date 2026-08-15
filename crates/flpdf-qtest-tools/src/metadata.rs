@@ -6,7 +6,10 @@
 //! [`flpdf::Pdf`] / [`flpdf::ObjectHandle`] API and formats the result.
 //!
 //! Oracle sources: `qpdf/test_xref.cc:7-44` and
-//! `qpdf/test_parsedoffset.cc:13-140` from the pinned qpdf 11.9.0 tree.
+//! `qpdf/test_parsedoffset.cc:13-140` from the pinned qpdf 11.9.0 tree. The
+//! initial file-open diagnostic follows qpdf's `QUtil::safe_fopen`
+//! (`libqpdf/QUtil.cc:453-518`) and `QPDFSystemError::createWhat`
+//! (`libqpdf/QPDFSystemError.cc:13-29`) by retaining the platform CRT text.
 
 use flpdf::{
     Diagnostics, EncryptedError, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
@@ -23,6 +26,10 @@ use std::path::Path;
 #[derive(Debug)]
 pub enum MetadataError {
     Flpdf(Error),
+    Open {
+        source: Error,
+        crt_message: Option<Vec<u8>>,
+    },
     PostEnumeration {
         source: Error,
         diagnostics: Diagnostics,
@@ -39,10 +46,13 @@ impl From<Error> for MetadataError {
 }
 
 fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
-    let file = std::fs::File::open(path).map_err(|source| Error::FileIo {
-        operation: "open",
-        path: path.to_path_buf(),
-        source,
+    let file = std::fs::File::open(path).map_err(|source| MetadataError::Open {
+        source: Error::FileIo {
+            operation: "open",
+            path: path.to_path_buf(),
+            source,
+        },
+        crt_message: crate::driver::crt_open_error_message(path.as_os_str()),
     })?;
     Ok(Pdf::open_with_options(
         file,
@@ -60,7 +70,11 @@ fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
 pub fn display_error(path: &Path, error: &MetadataError) -> Vec<u8> {
     let mut message = Vec::new();
     match error {
-        MetadataError::Flpdf(error) => display_flpdf_error(&mut message, path, error),
+        MetadataError::Flpdf(error) => display_flpdf_error(&mut message, path, error, None),
+        MetadataError::Open {
+            source,
+            crt_message,
+        } => display_flpdf_error(&mut message, path, source, crt_message.as_deref()),
         MetadataError::PostEnumeration {
             source,
             diagnostics,
@@ -77,22 +91,31 @@ pub fn display_error(path: &Path, error: &MetadataError) -> Vec<u8> {
     message
 }
 
-fn display_flpdf_error(message: &mut Vec<u8>, path: &Path, error: &Error) {
+fn display_flpdf_error(
+    message: &mut Vec<u8>,
+    path: &Path,
+    error: &Error,
+    crt_message: Option<&[u8]>,
+) {
     match error {
         Error::FileIo {
             operation,
             path,
             source,
         } => {
-            let source_message = source
-                .to_string()
-                .split_once(" (os error ")
-                .map_or_else(|| source.to_string(), |(message, _)| message.to_owned());
             message.extend_from_slice(operation.as_bytes());
             message.push(b' ');
             append_path(message, path);
             message.extend_from_slice(b": ");
-            message.extend_from_slice(source_message.as_bytes());
+            if let Some(crt_message) = crt_message {
+                message.extend_from_slice(crt_message);
+            } else {
+                let source_message = source
+                    .to_string()
+                    .split_once(" (os error ")
+                    .map_or_else(|| source.to_string(), |(message, _)| message.to_owned());
+                message.extend_from_slice(source_message.as_bytes());
+            }
         }
         Error::OpenFailure {
             source,
@@ -432,6 +455,24 @@ mod tests {
         assert_eq!(
             display_error(Path::new("directory.pdf"), &MetadataError::from(error),),
             b"directory.pdf: read 1024 bytes"
+        );
+    }
+
+    #[test]
+    fn open_errors_prefer_the_platform_crt_message() {
+        let path = Path::new("missing.pdf");
+        let error = MetadataError::Open {
+            source: Error::FileIo {
+                operation: "open",
+                path: path.to_path_buf(),
+                source: std::io::Error::other("Rust Win32 wording"),
+            },
+            crt_message: Some(b"The system cannot find the path specified.".to_vec()),
+        };
+
+        assert_eq!(
+            display_error(path, &error),
+            b"open missing.pdf: The system cannot find the path specified."
         );
     }
 

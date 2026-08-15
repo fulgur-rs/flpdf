@@ -1,11 +1,91 @@
 use assert_cmd::Command;
 use std::fs;
 use std::path::Path;
+use std::process::Command as ProcessCommand;
 #[cfg(unix)]
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Stdio;
 
 fn fixture_path(name: &str) -> String {
     format!("{}/../../tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn qpdf_error_message(path: &Path) -> Option<Vec<u8>> {
+    let qpdf = std::env::var_os("QPDF").unwrap_or_else(|| "qpdf".into());
+    let version = match ProcessCommand::new(&qpdf).arg("--version").output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if std::env::var_os("CI").is_some() {
+                panic!("qpdf 11.9.0 is required for metadata differential tests");
+            }
+            eprintln!("skipping metadata differential test: qpdf is not available");
+            return None;
+        }
+        Err(error) => panic!("run qpdf --version: {error}"),
+    };
+    assert!(version.status.success(), "qpdf --version failed");
+    if !version.stdout.starts_with(b"qpdf version 11.9.0\n")
+        && !version.stdout.starts_with(b"qpdf version 11.9.0\r\n")
+    {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "qpdf 11.9.0 is required for metadata differential tests, got {:?}",
+            String::from_utf8_lossy(&version.stdout)
+        );
+        eprintln!(
+            "skipping metadata differential test: expected qpdf 11.9.0, got {:?}",
+            String::from_utf8_lossy(&version.stdout)
+        );
+        return None;
+    }
+
+    let output = ProcessCommand::new(qpdf)
+        .arg("--check")
+        .arg(path)
+        .output()
+        .expect("run qpdf --check");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "qpdf --check must reject input"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "qpdf --check must not write stdout"
+    );
+
+    let open_marker = b"open ";
+    let start = output
+        .stderr
+        .windows(open_marker.len())
+        .position(|window| window == open_marker)
+        .expect("qpdf open failure must contain the open operation");
+    let qpdf_stderr = &output.stderr[start..];
+    let mut normalized = Vec::with_capacity(qpdf_stderr.len());
+    let mut index = 0;
+    while index < qpdf_stderr.len() {
+        if qpdf_stderr[index] == b'\r' && qpdf_stderr.get(index + 1) == Some(&b'\n') {
+            index += 1;
+        }
+        normalized.push(qpdf_stderr[index]);
+        index += 1;
+    }
+    Some(normalized)
+}
+
+fn assert_metadata_helpers_match_qpdf(path: &Path, expected_stderr: &[u8]) {
+    for binary in ["test_xref", "test_parsedoffset"] {
+        let output = Command::cargo_bin(binary)
+            .expect("metadata helper binary")
+            .arg(path)
+            .output()
+            .expect("run metadata helper");
+        assert_eq!(output.status.code(), Some(2), "{binary} must reject input");
+        assert!(output.stdout.is_empty(), "{binary} must not write stdout");
+        assert_eq!(
+            output.stderr, expected_stderr,
+            "{binary} must match qpdf's open diagnostic"
+        );
+    }
 }
 
 #[test]
@@ -160,49 +240,37 @@ fn metadata_usage_write_failures_do_not_panic() {
 }
 
 #[test]
-fn test_xref_reports_missing_input_with_qpdf_open_wording() {
-    let assertion = Command::cargo_bin("test_xref")
-        .expect("test_xref binary")
-        .arg("/definitely/missing/flpdf-metadata.pdf")
-        .assert()
-        .code(2)
-        .stdout("");
-
-    #[cfg(unix)]
-    assertion.stderr("open /definitely/missing/flpdf-metadata.pdf: No such file or directory\n");
-    #[cfg(windows)]
-    assertion.stderr(
-        "open /definitely/missing/flpdf-metadata.pdf: The system cannot find the path specified.\n",
-    );
+fn metadata_helpers_report_missing_input_with_qpdf_open_wording() {
+    let path = Path::new("/definitely/missing/flpdf-metadata.pdf");
+    let Some(expected_stderr) = qpdf_error_message(path) else {
+        return;
+    };
+    assert_metadata_helpers_match_qpdf(path, &expected_stderr);
 }
 
 #[cfg(unix)]
 #[test]
-fn test_xref_reports_read_failures_with_qpdf_file_input_wording() {
+fn metadata_helpers_report_read_failures_with_qpdf_file_input_wording() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    Command::cargo_bin("test_xref")
-        .expect("test_xref binary")
-        .arg(directory.path())
-        .assert()
-        .code(2)
-        .stdout("")
-        .stderr(format!("{}: read 1024 bytes\n", directory.path().display()));
+    for binary in ["test_xref", "test_parsedoffset"] {
+        Command::cargo_bin(binary)
+            .expect("metadata helper binary")
+            .arg(directory.path())
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(format!("{}: read 1024 bytes\n", directory.path().display()));
+    }
 }
 
 #[cfg(windows)]
 #[test]
-fn test_xref_reports_directory_open_failures_with_native_wording() {
+fn metadata_helpers_report_directory_open_failures_with_native_wording() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    Command::cargo_bin("test_xref")
-        .expect("test_xref binary")
-        .arg(directory.path())
-        .assert()
-        .code(2)
-        .stdout("")
-        .stderr(format!(
-            "open {}: Access is denied.\n",
-            directory.path().display()
-        ));
+    let Some(expected_stderr) = qpdf_error_message(directory.path()) else {
+        return;
+    };
+    assert_metadata_helpers_match_qpdf(directory.path(), &expected_stderr);
 }
 
 #[test]
