@@ -698,6 +698,49 @@ pub(crate) fn emit_objstm_body_from_resolved_with_writer<F>(
 where
     F: FnMut(&mut Vec<u8>, u32, ObjectRef, &Object) -> crate::Result<()>,
 {
+    emit_objstm_body_from_members(members, write_member)
+}
+
+/// Serialise ObjStm members directly from the canonical ObjectHandle graph.
+///
+/// The member pair table is still supplied in output-number order by the
+/// planner, but each body is emitted from its live handle. This is the qpdf
+/// writer boundary: arrays and dictionaries retain indirect child identity,
+/// dictionary nulls are suppressed by the handle unparser, and no temporary
+/// [`Object`] tree is materialised merely to calculate the body offsets.
+pub(crate) fn emit_objstm_body_from_handles(
+    members: &[(ObjectRef, ObjectHandle)],
+) -> crate::Result<ObjStmBody> {
+    emit_objstm_body_from_handles_with_writer(
+        members,
+        &mut |out, _member_index, _object_ref, handle| handle.unparse_object(out),
+    )
+}
+
+/// Handle-backed ObjStm body emission with a caller-owned member serializer.
+///
+/// The callback is used for the encrypted full-rewrite route, where qpdf's
+/// per-object data-key scope is applied while the ObjectHandle walker writes
+/// strings. The callback receives the same two-pass member index used by the
+/// ObjStm pair table and may therefore preserve qpdf's encryption boundary
+/// without materialising a legacy [`Object`].
+pub(crate) fn emit_objstm_body_from_handles_with_writer<F>(
+    members: &[(ObjectRef, ObjectHandle)],
+    write_member: &mut F,
+) -> crate::Result<ObjStmBody>
+where
+    F: FnMut(&mut Vec<u8>, u32, ObjectRef, &ObjectHandle) -> crate::Result<()>,
+{
+    emit_objstm_body_from_members(members, write_member)
+}
+
+fn emit_objstm_body_from_members<T, F>(
+    members: &[(ObjectRef, T)],
+    write_member: &mut F,
+) -> crate::Result<ObjStmBody>
+where
+    F: FnMut(&mut Vec<u8>, u32, ObjectRef, &T) -> crate::Result<()>,
+{
     if members.is_empty() {
         return Ok(ObjStmBody {
             bytes: vec![],
@@ -2131,6 +2174,68 @@ mod tests {
                 "round-trip mismatch at index {index}"
             );
         }
+    }
+
+    #[test]
+    fn emit_objstm_body_from_handles_uses_live_qpdf_unparse_rules() {
+        let members = vec![
+            (
+                ObjectRef::new(10, 0),
+                ObjectHandle::dictionary(vec![
+                    (b"Drop".to_vec(), ObjectHandle::null()),
+                    (
+                        b"Array".to_vec(),
+                        ObjectHandle::array(vec![ObjectHandle::null(), ObjectHandle::integer(7)]),
+                    ),
+                    (
+                        b"Nested".to_vec(),
+                        ObjectHandle::dictionary(vec![
+                            (b"DropNested".to_vec(), ObjectHandle::null()),
+                            (b"Value".to_vec(), ObjectHandle::integer(3)),
+                        ]),
+                    ),
+                ]),
+            ),
+            (
+                ObjectRef::new(11, 0),
+                ObjectHandle::dictionary(vec![
+                    (b"Contents".to_vec(), ObjectHandle::string(b"sig".to_vec())),
+                    (
+                        b"ByteRange".to_vec(),
+                        ObjectHandle::array(vec![
+                            ObjectHandle::integer(0),
+                            ObjectHandle::integer(1),
+                        ]),
+                    ),
+                    (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+                ]),
+            ),
+        ];
+
+        let body = emit_objstm_body_from_handles(&members).unwrap();
+        let first = b"<< /Array [ null 7 ] /Nested << /Value 3 >> >>";
+        let second = b"<< /ByteRange [ 0 1 ] /Contents <736967> /Type /Sig >>";
+        let expected_pair_table = format!("10 0 11 {}\n", first.len() + 1);
+
+        assert_eq!(body.first_offset, expected_pair_table.len());
+        assert!(body.bytes.starts_with(expected_pair_table.as_bytes()));
+        assert_eq!(
+            &body.bytes[body.first_offset..body.first_offset + first.len()],
+            first
+        );
+        assert_eq!(
+            &body.bytes[body.first_offset + first.len() + 1
+                ..body.first_offset + first.len() + 1 + second.len()],
+            second
+        );
+        assert!(!body
+            .bytes
+            .windows(b"/Drop".len())
+            .any(|window| window == b"/Drop"));
+        assert!(!body
+            .bytes
+            .windows(b"/DropNested".len())
+            .any(|window| window == b"/DropNested"));
     }
 
     // ── wrap_objstm_body tests ────────────────────────────────────────────────

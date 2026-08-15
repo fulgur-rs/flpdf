@@ -45,7 +45,6 @@ pub(crate) struct PlainWritePlan {
     pub(crate) root: ObjectRef,
     pub(crate) old_to_new: HashMap<ObjectRef, ObjectRef>,
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
-    pub(crate) canonical: bool,
     pub(crate) trailer: TrailerPlan,
 }
 
@@ -231,7 +230,6 @@ impl PlainWritePlan {
             root,
             old_to_new: placement.old_to_new,
             removed_refs: placement.removed_refs,
-            canonical: placement.canonical,
             trailer,
         };
         plan.validate()?;
@@ -704,7 +702,6 @@ mod tests {
             root: root_output,
             old_to_new: HashMap::from([(root_source, root_output)]),
             removed_refs: BTreeSet::new(),
-            canonical: false,
             trailer: TrailerPlan {
                 form: XrefForm::Table,
                 dictionary: Dictionary::new(),

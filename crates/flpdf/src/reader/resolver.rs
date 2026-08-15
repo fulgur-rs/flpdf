@@ -1813,6 +1813,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 continue;
             }
 
+            // A caller replacement is already the effective value for this
+            // member. Keep it authoritative when another unresolved member
+            // causes the source stream to be decoded; otherwise this pass
+            // would overwrite the live cache slot with the stale source
+            // bytes before the writer can consume the ObjectHandle. This is
+            // the same cache authority that makes qpdf's resolved object
+            // handles independent of the source container once materialized.
+            let member_handle = self.get_object_handle(object_ref);
+            if member_handle.is_resolved() {
+                continue;
+            }
+
             let member_start = first
                 .checked_add(object_offset)
                 .ok_or_else(|| Error::parse(0, "object stream member offset overflow"))?;
@@ -1863,7 +1875,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .map_err(ObjectStreamResolutionError::WarningDelivery)?;
             }
 
-            let member_handle = self.get_object_handle(object_ref);
             if malformed {
                 member_handle.set_missing();
             } else {
