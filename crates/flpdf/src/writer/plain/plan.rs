@@ -936,6 +936,19 @@ mod tests {
     }
 
     #[test]
+    fn live_source_id0_returns_none_for_empty_id_array() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("one-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        pdf.trailer_handle()
+            .replace_key(b"/ID", ObjectHandle::array(Vec::new()))
+            .unwrap();
+
+        assert_eq!(live_source_id0(&mut pdf).unwrap(), None);
+    }
+
+    #[test]
     fn canonical_deterministic_id_uses_the_live_info_entry() {
         let mut pdf = Pdf::open(std::io::BufReader::new(
             std::fs::File::open(fixture_path("no-stream-one-page.pdf")).unwrap(),

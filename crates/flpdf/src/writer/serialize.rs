@@ -1113,6 +1113,33 @@ pub(crate) mod xref_stream {
             );
         }
 
+        #[test]
+        fn canonical_trailer_entries_write_info_root_and_prev() {
+            let canonical_entries = [(b"/Foo".to_vec(), b"7".to_vec())];
+            let mut out = Vec::new();
+            write_object(
+                &mut out,
+                ObjectRef::new(8, 0),
+                &XrefStreamDict {
+                    filtered: false,
+                    widths: [1, 1, 1],
+                    index: None,
+                    info: Some(ObjectRef::new(2, 0)),
+                    root: Some(ObjectRef::new(1, 0)),
+                    size: 8,
+                    prev: Some(123),
+                    trailer: None,
+                    canonical_entries: Some(&canonical_entries),
+                    id: None,
+                    encrypt: None,
+                },
+                &[0],
+            );
+            let text = String::from_utf8(out).unwrap();
+
+            assert!(text.contains("/Foo 7 /Info 2 0 R /Root 1 0 R /Size 8 /Prev 123"));
+        }
+
         /// The main xref stream omits /Index, /Info, /Root, and /Prev.
         #[test]
         fn main_xref_dict_omits_chain_and_root_keys() {
