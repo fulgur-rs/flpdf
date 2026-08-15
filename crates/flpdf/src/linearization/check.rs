@@ -427,7 +427,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
                  — does not look like a Page object"
             );
         } // cov:ignore: qpdf's malformed no-Type failure returns before this brace
-    }
+    } // cov:ignore: llvm maps this completed conditional cleanup to an unhit brace
 
     // qpdf records this as a linearization warning in
     // `checkLinearizationInternal` (`QPDF_linearization.cc:419-427`).  The
@@ -1697,7 +1697,7 @@ mod tests {
         let inherited_result = check_linearization_bytes(&inherited);
         assert!(!matches!(
             inherited_result,
-            Err(LinearizationCheckError::NotLinearized)
+            Err(LinearizationCheckError::NotLinearized) // cov:ignore: this negative assertion intentionally proves the arm is not matched
         ));
     }
 

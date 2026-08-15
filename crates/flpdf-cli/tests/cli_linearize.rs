@@ -126,14 +126,16 @@ fn check_linearization_tampered_l_exits_1() {
     let tampered_path = outdir.path().join("tampered.pdf");
     std::fs::write(&tampered_path, &bytes).unwrap();
 
-    // check-linearization must exit 1 with an actionable message.
+    // qpdf's isLinearized predicate rejects an incorrect integer /L before
+    // deeper structural checks, so check-linearization reports the file as
+    // not linearized.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["check-linearization", tampered_path.to_str().unwrap()])
         .assert()
         .failure()
         .code(1)
-        .stderr(predicate::str::contains("linearization check failed"));
+        .stderr(predicate::str::contains("not a linearized PDF"));
 }
 
 // ---------------------------------------------------------------------------
