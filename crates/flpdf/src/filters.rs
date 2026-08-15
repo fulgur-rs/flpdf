@@ -3144,6 +3144,50 @@ mod tests {
         );
     }
 
+    /// The whole-buffer DCT route's decode-bomb guard
+    /// (`crates/flpdf/src/pipeline/dct.rs`, `PlDct::finish`) must classify
+    /// the same way every other filter's `OutputBuffer::write` cap does —
+    /// as [`is_decode_output_limit_error`] — all the way through
+    /// `map_stage_error` -> `map_pipeline_error` -> `Error::Unsupported` at
+    /// this public entry point. `check.rs`'s content-stream pass relies on
+    /// that exact classification to downgrade a cap trip to a warning
+    /// instead of a stream-encoding error; a stray identifier prefix on the
+    /// message (this sentinel intentionally carries none, see
+    /// [`DECODE_OUTPUT_LIMIT_PREFIX`]) would silently break that.
+    #[test]
+    fn dct_output_limit_is_classified_as_decode_output_limit_error() {
+        let pixels = [0u8, 32, 64, 96, 128, 160, 192, 224, 255, 240, 120, 8];
+        let jpeg = libjpeg_turbo_rs::compress(
+            &pixels,
+            2,
+            2,
+            libjpeg_turbo_rs::PixelFormat::Rgb,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("test JPEG must encode");
+
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"DCTDecode".to_vec()));
+
+        let full = decode_stream_data(&dict, &jpeg).expect("unbounded DCT decode must succeed");
+        assert_eq!(full.len(), 12); // 2x2 RGB, 3 bytes/pixel
+
+        let err = decode_stream_data_with_limits(
+            &dict,
+            &jpeg,
+            DecodeLimits {
+                max_output: Some(full.len() - 1),
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            is_decode_output_limit_error(&err),
+            "DCT output-limit rejection must classify as the decode-bomb guard, not a generic stream error; got: {err}"
+        );
+    }
+
     /// LZWEncode is not supported: encode_stream_data with /LZWDecode filter must Err.
     #[test]
     fn lzw_encode_unsupported_returns_err() {

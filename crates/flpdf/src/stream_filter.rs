@@ -1952,7 +1952,7 @@ impl StreamFilter for DctStreamFilter {
         let finish_phase = sink.finish_phase();
         let output_position = sink.output_position();
         let error = {
-            let mut stage = PlDct::new("DCT decode", &mut sink);
+            let mut stage = PlDct::new("DCT decode", &mut sink).with_max_output(max_output);
             write_and_finish(
                 &mut stage,
                 data,
@@ -5375,20 +5375,58 @@ pub(crate) mod tests {
             .pipe_decode_recovering(&jpeg, None, &mut ignore_warning)
             .expect("whole-buffer DCT route must construct");
         assert!(decoded.error.is_none());
-        assert_eq!(decoded.data, canonical_dct_bytes(&jpeg));
+        let canonical = canonical_dct_bytes(&jpeg);
+        assert_eq!(decoded.data, canonical);
         assert_eq!(decoded.cleanup_data_start, 0);
 
+        // Exactly the full decoded size must still succeed: the guard below
+        // rejects only output that would *exceed* the cap, matching every
+        // other filter's `OutputBuffer` enforcement (`data.len() > remaining`).
+        let mut exact = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(exact.set_decode_params(&DecodeParams::Absent));
+        let exact = exact
+            .pipe_decode_recovering(&jpeg, Some(canonical.len()), &mut ignore_warning)
+            .expect("DCT route at the exact output size must construct");
+        assert!(exact.error.is_none());
+        assert_eq!(exact.data, canonical);
+
+        // One byte under the full decoded size must trip flpdf's decode-bomb
+        // guard.
         let mut limited = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
         assert!(limited.set_decode_params(&DecodeParams::Absent));
         let limited = limited
-            .pipe_decode_recovering(&jpeg, Some(1), &mut ignore_warning)
+            .pipe_decode_recovering(&jpeg, Some(canonical.len() - 1), &mut ignore_warning)
             .expect("limited whole-buffer DCT route must construct");
         let error = limited.error.expect("DCT output limit must be reported");
         assert!(!error.during_write);
-        assert_eq!(error.output_offset, 1);
-        assert_eq!(limited.data.len(), 1);
-        assert_eq!(limited.cleanup_data_start, 0);
         assert!(error.error.to_string().contains(DECODE_OUTPUT_LIMIT_PREFIX));
+
+        // The two backends enforce the cap at different points, and this is
+        // the deliberate divergence Finding 1 introduces, not an oversight:
+        #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+        {
+            // The default backend rejects in `PlDct::finish`
+            // (`crates/flpdf/src/pipeline/dct.rs`) *before* decoding any
+            // pixels: the declared header dimensions already exceed the
+            // cap, so `ScanlineDecoder::read_scanline` (whose first call
+            // eagerly decodes the whole image on this backend) is never
+            // reached and no bytes reach the downstream sink.
+            assert_eq!(error.output_offset, 0);
+            assert_eq!(limited.data.len(), 0);
+            assert_eq!(limited.cleanup_data_start, 0);
+        }
+        #[cfg(feature = "qpdf-libjpeg-compat")]
+        {
+            // Real libjpeg decodes one scanline at a time
+            // (`flpdf-libjpeg-compat/csrc/jpeg_compat.c`'s
+            // `jpeg_read_scanlines` loop), so the sink's ordinary
+            // per-write cap enforcement already sees each row as it's
+            // produced and fills up to (not past) the limit before
+            // erroring, like every other filter's `OutputBuffer`.
+            assert_eq!(error.output_offset, canonical.len() - 1);
+            assert_eq!(limited.data.len(), canonical.len() - 1);
+            assert_eq!(limited.cleanup_data_start, 0);
+        }
     }
 
     /// The oracle is qpdf 11.9.0. On Linux the resolver prefers the pinned
@@ -5661,6 +5699,15 @@ pub(crate) mod tests {
     /// `{identifier}: {error}` diagnostic, not the `UnexpectedEof`-specific
     /// "invalid jpeg data reading from buffer" wording reserved for
     /// qpdf's whole-buffer `fill_buffer_input_buffer` over-read case.
+    ///
+    /// This still diverges from qpdf's own wording (`Unsupported marker
+    /// type 0x02`, `/usr/include/jerror.h:132`): `libjpeg-turbo-rs` 0.8.0's
+    /// `InvalidMarker` payload is structurally always `0`, not the reserved
+    /// marker byte, and the crate accepts (skips) reserved markers that real
+    /// libjpeg rejects immediately, so the byte the crate reports isn't the
+    /// byte real libjpeg would report — a text remap here would render the
+    /// wrong hex value. Confirmed genuine `libjpeg-turbo-rs` capability gap
+    /// and deferred, not fixed, tracked as flpdf-69n1.
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     #[test]
     fn dct_stage_preserves_non_eof_libjpeg_diagnostic() {
@@ -5843,12 +5890,10 @@ pub(crate) mod tests {
             stage.finish().expect_err("12-bit JPEG must be rejected")
         };
         assert!(matches!(error, PipelineError::Runtime(_)));
-        #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-        assert_eq!(
-            error.to_string(),
-            "DCT decode: sample precision 12 (only 8-bit supported)"
-        );
-        #[cfg(feature = "qpdf-libjpeg-compat")]
+        // Both backends now report libjpeg's own JERR_BAD_PRECISION wording
+        // ("Unsupported JPEG data precision %d", `/usr/include/jerror.h:70`):
+        // the default backend's own precision gate is worded to match it,
+        // and the compatibility backend gets it for free from real libjpeg.
         assert_eq!(
             error.to_string(),
             "DCT decode: Unsupported JPEG data precision 12"

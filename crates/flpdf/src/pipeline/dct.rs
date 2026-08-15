@@ -2,6 +2,8 @@
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
+#[cfg(not(feature = "qpdf-libjpeg-compat"))]
+use crate::stream_filter::DECODE_OUTPUT_LIMIT_PREFIX;
 
 #[cfg(feature = "qpdf-libjpeg-compat")]
 use flpdf_libjpeg_compat::DecodeError;
@@ -11,6 +13,7 @@ pub(crate) struct PlDct<'a> {
     identifier: String,
     next: PipelineRef<'a>,
     buffer: Buffer<'static>,
+    max_output: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -20,7 +23,28 @@ impl<'a> PlDct<'a> {
             identifier: identifier.into(),
             next: next.into(),
             buffer: Buffer::new("DCT buffer", None),
+            max_output: None,
         }
+    }
+
+    /// Opt into flpdf's [`crate::filters::DecodeLimits::max_output`] guard.
+    ///
+    /// qpdf's own `Pl_DCT` has no such cap — this is flpdf's own
+    /// decode-bomb protection, applied only by the whole-buffer decode
+    /// route (`DctStreamFilter::pipe_decode_recovering`) that already
+    /// buffers the caller's cap; the streaming `pipeStreamData` route
+    /// leaves this `None` to match qpdf exactly.
+    ///
+    /// On the default (non-`qpdf-libjpeg-compat`) backend, the underlying
+    /// `libjpeg_turbo_rs::ScanlineDecoder` decodes the *entire* image on
+    /// its first scanline read rather than incrementally, so the ordinary
+    /// per-write enforcement on the downstream sink would only reject the
+    /// output after that full, potentially huge, allocation already
+    /// happened. `finish` below instead checks the declared header
+    /// dimensions against this cap before triggering that decode.
+    pub(crate) fn with_max_output(mut self, max_output: Option<usize>) -> Self {
+        self.max_output = max_output;
+        self
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
@@ -110,9 +134,9 @@ impl Pipeline for PlDct<'_> {
             };
 
             if precision != 8 {
-                return Err(self.runtime_error(format!(
-                    "sample precision {precision} (only 8-bit supported)"
-                )));
+                return Err(
+                    self.runtime_error(format!("Unsupported JPEG data precision {precision}"))
+                );
             }
 
             let bytes_per_pixel = match components {
@@ -129,6 +153,27 @@ impl Pipeline for PlDct<'_> {
                 self.runtime_error(format!("scanline byte length overflow for width {width}"))
             })?;
             // cov:ignore-end
+
+            // Reject before `ScanlineDecoder::read_scanline` below triggers
+            // its lazy full-image decode (`ensure_decoded` in
+            // `libjpeg-turbo-rs` 0.8.0's `api/scanline.rs`): that call
+            // allocates and decodes every remaining scanline up front, so
+            // enforcing the cap only on the downstream sink's writes (as
+            // every other filter's `OutputBuffer` does) would let an
+            // attacker-sized JPEG exhaust memory before the first byte is
+            // ever rejected. `saturating_mul` is deliberate, not
+            // `checked_mul`: on overflow the true byte count exceeds any
+            // representable `usize` limit, so saturating to `usize::MAX`
+            // and comparing `> limit` rejects exactly the same inputs a
+            // `None`-on-overflow branch would, without an unreachable arm.
+            if let Some(limit) = self.max_output {
+                if row_length.saturating_mul(height) > limit {
+                    return Err(PipelineError::runtime(format!(
+                        "{DECODE_OUTPUT_LIMIT_PREFIX} {limit} bytes"
+                    )));
+                }
+            }
+
             let mut row = vec![0u8; row_length];
 
             for _ in 0..height {
