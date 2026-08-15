@@ -837,13 +837,6 @@ fn collect_used_names_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Option<UsedNames>> {
-    // A failure to *decode* the page's /Contents (corrupt filter) is a
-    // content-comprehension failure → conservatively retain (None), do not abort.
-    let content_bytes = match crate::pages::page_content_bytes(pdf, page_ref) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
-    };
-
     // Resolving the inherited /Resources is a structural operation, not content
     // comprehension: propagate its errors rather than silently degrading.
     let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
@@ -870,7 +863,25 @@ fn collect_used_names_for_page<R: Read + Seek>(
             target: UsedTarget::Page,
             owner: page_ref,
         };
-        collect_from_stream(&mut ctx, &content_bytes, page_scope, 0)?
+        // A failure to *decode* the page's /Contents (corrupt filter) is a
+        // content-comprehension failure -- the page's own resource usage is
+        // unknown, so its /Font,/XObject dictionaries must be conservatively
+        // retained. But qpdf's structural Form discovery (`forEachXObject`,
+        // `QPDFPageObjectHelper.cc:313-345`) is independent of content-stream
+        // decoding, so the page's declared Forms must still be discovered and
+        // recursed into so their own resources are pruned -- mirroring
+        // `recurse_form_xobject`'s identical decode-failure handling above
+        // (`Err(_) => complete = false` followed by unconditional declared-child
+        // discovery).
+        match crate::pages::page_content_bytes(ctx.pdf, page_ref) {
+            Ok(content_bytes) => collect_from_stream(&mut ctx, &content_bytes, page_scope, 0)?,
+            Err(_) => {
+                for (_, val) in declared_xobjects(ctx.pdf, page_scope.resources)? {
+                    recurse_form_xobject(&mut ctx, val, page_scope, 0)?;
+                }
+                false
+            }
+        }
     };
 
     Ok(complete.then_some(used))

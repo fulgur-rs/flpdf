@@ -3429,6 +3429,64 @@ fn corrupt_page_content_single_page_default_mode_does_not_abort() {
     );
 }
 
+// The page's own /Contents cannot be decoded, but its /Resources/XObject still
+// DECLARES a Form (unreachable via `Do` since the page's content can't even be
+// tokenised). qpdf's structural Form discovery (`QPDFPageObjectHelper.cc:313-345`)
+// is independent of content-stream decoding, so the declared Form must still be
+// found and pruned, mirroring `test_form_decode_failure_retains_page`'s inverse:
+// there the FORM fails to decode and the PAGE is retained; here the PAGE fails to
+// decode and the FORM (whose own content decodes fine) must still be pruned.
+#[test]
+fn corrupt_page_content_still_prunes_a_declared_but_unreached_form() {
+    let form_content = b"BT /F1 10 Tf ET";
+    let form_stream = {
+        let mut bytes = format!(
+            "6 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    let extra = vec![
+        (
+            4u32,
+            stream_obj_with_filter(4, "/FlateDecode", b"not-zlib-garbage!!"),
+        ),
+        (
+            5,
+            obj_bytes(
+                5,
+                "<< /Font << /PageF1 << /Type /Font >> >> /XObject << /Fm0 6 0 R >> >>",
+            ),
+        ),
+        (6, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
+        .expect("prune must degrade gracefully, not abort");
+
+    let page_keys = font_dict_keys(&mut pdf, ObjectRef::new(5, 0));
+    assert_eq!(
+        page_keys,
+        vec!["PageF1"],
+        "the page's own content is undecodable, so its /Font must be \
+         conservatively retained: {page_keys:?}"
+    );
+
+    let form_font_keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(6, 0), "Font");
+    assert_eq!(
+        form_font_keys,
+        vec!["F1"],
+        "the declared Form's own content DOES decode: its unused /F2 must \
+         still be pruned even though the page content that would normally \
+         invoke it via Do could not be decoded: {form_font_keys:?}"
+    );
+}
+
 // A page whose /Contents DECODES fine (no filter) but is malformed PART-WAY:
 // `BT /F1 Tf ... ` collects /F1, then trailing dangling operands make the
 // content-stream tokeniser error mid-stream. The pre-fix code `break`-ed and
