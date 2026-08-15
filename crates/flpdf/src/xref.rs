@@ -928,7 +928,7 @@ fn parse_xref_from_start(
     version: &str,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
-    error_diagnostics_sink: Option<&mut Diagnostics>,
+    mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
 ) -> Result<LoadedXrefState> {
     if bytes
@@ -936,7 +936,8 @@ fn parse_xref_from_start(
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
-        let (entries, trailer, trailer_diagnostics) = parse_xref_table(&mut cursor, bytes)?;
+        let (entries, trailer, trailer_diagnostics) =
+            parse_xref_table(&mut cursor, bytes, error_diagnostics_sink.as_deref_mut())?;
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
@@ -2113,6 +2114,7 @@ fn scan_object_header_after_first_token(
 fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
+    error_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<(Vec<ParsedXrefEntry>, Dictionary, Vec<Diagnostic>)> {
     let mut entries = Vec::new();
     loop {
@@ -2152,11 +2154,36 @@ fn parse_xref_table(
     let trailer_start = cursor.pos;
     let mut tokenizer = Tokenizer::new(&bytes[cursor.pos..]);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
-    let parsed = parser.object()?;
+    // qpdf's `QPDFParser::warn` dispatches synchronously to `QPDF::warn`
+    // (`libqpdf/QPDFParser.cc:488-497`) the moment it fires, independent of
+    // whether the surrounding parse ultimately succeeds. A warning already
+    // raised while building this trailer (e.g. a duplicated key) therefore
+    // survives even when a later token in the same dictionary is fatal, or
+    // the parsed result turns out not to be a dictionary. Extract
+    // diagnostics before every early return so a failing `parse_xref_table`
+    // call still forwards them, mirroring `parse_trailer_candidate`'s
+    // handling of the analogous reconstruction-path case above.
+    let object_result = parser.object();
     let diagnostics = trailer_diagnostics(trailer_start, parser.take_diagnostics());
+    let parsed = match object_result {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Some(sink) = error_diagnostics_sink {
+                for diagnostic in diagnostics {
+                    sink.push(diagnostic);
+                }
+            }
+            return Err(error);
+        }
+    };
     let trailer = match parsed {
         Object::Dictionary(dict) => dict,
         _ => {
+            if let Some(sink) = error_diagnostics_sink {
+                for diagnostic in diagnostics {
+                    sink.push(diagnostic);
+                }
+            }
             return Err(Error::parse(
                 cursor.pos + parser.position(),
                 "trailer is not a dictionary",
@@ -6415,7 +6442,7 @@ mod tests {
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Foo 1 /Foo 2 >>\n";
         let mut cursor = ByteCursor::new(bytes, 4);
         let (entries, trailer, diagnostics) =
-            parse_xref_table(&mut cursor, bytes).expect("valid classic xref section");
+            parse_xref_table(&mut cursor, bytes, None).expect("valid classic xref section");
         assert_eq!(entries.len(), 1);
         assert_eq!(
             trailer.get("Foo"),
@@ -6433,6 +6460,71 @@ mod tests {
             vec![Diagnostic::warning(
                 format!(
                     "(trailer, offset {dict_open_end}): dictionary has duplicated key /Foo; \
+                     last occurrence overrides earlier ones"
+                ),
+                Some(dict_open_end as u64),
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_xref_table_forwards_diagnostics_to_the_sink_when_the_trailer_parse_fails() {
+        // qpdf's `QPDFParser::warn` dispatches synchronously to `QPDF::warn`
+        // (`libqpdf/QPDFParser.cc:488-497`) at the moment `warnDuplicateKey`
+        // fires, independent of whether the rest of the dictionary parses
+        // successfully. A truncated trailer that hits EOF right after a
+        // duplicate key must still forward that already-recorded warning to
+        // the caller's diagnostics sink, even though `parse_xref_table`
+        // itself returns `Err`.
+        let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Foo 1 /Foo 2";
+        let mut cursor = ByteCursor::new(bytes, 4);
+        let mut sink = Diagnostics::default();
+        let result = parse_xref_table(&mut cursor, bytes, Some(&mut sink));
+        assert!(result.is_err(), "truncated trailer dictionary must fail");
+
+        let dict_open_end = bytes
+            .windows(2)
+            .position(|window| window == b"<<")
+            .expect("trailer dict open")
+            + 2;
+        assert_eq!(
+            sink.entries(),
+            [Diagnostic::warning(
+                format!(
+                    "(trailer, offset {dict_open_end}): dictionary has duplicated key /Foo; \
+                     last occurrence overrides earlier ones"
+                ),
+                Some(dict_open_end as u64),
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_xref_table_forwards_diagnostics_to_the_sink_when_the_trailer_is_not_a_dictionary() {
+        // Mirrors `parse_trailer_candidate_surfaces_warnings_even_when_the_candidate_is_rejected`
+        // above, but through `parse_xref_table`'s ordinary xref-table path:
+        // qpdf's `readTrailer()` shares the same `QPDFParser` (`QPDF.cc:1313-1317`),
+        // so a warning raised while parsing a rejected (non-dictionary)
+        // trailer candidate still reaches `m->warnings`.
+        let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n[ 1 0 << /x 1 /x 2 >> ]";
+        let mut cursor = ByteCursor::new(bytes, 4);
+        let mut sink = Diagnostics::default();
+        let result = parse_xref_table(&mut cursor, bytes, Some(&mut sink));
+        assert!(
+            result.is_err(),
+            "a non-dictionary trailer candidate must be rejected"
+        );
+
+        let dict_open_end = bytes
+            .windows(2)
+            .position(|window| window == b"<<")
+            .expect("nested dict open")
+            + 2;
+        assert_eq!(
+            sink.entries(),
+            [Diagnostic::warning(
+                format!(
+                    "(trailer, offset {dict_open_end}): dictionary has duplicated key /x; \
                      last occurrence overrides earlier ones"
                 ),
                 Some(dict_open_end as u64),
