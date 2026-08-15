@@ -327,6 +327,16 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
 ///
 /// Returns [`LinearizationCheckError::Io`] when resolving an object via `pdf`
 /// or enumerating the page references fails.
+///
+/// # Side effects
+///
+/// Computing the part-6 (first page) source extent runs the same object
+/// classification pass qpdf performs before checking
+/// (`QPDF_linearization.cc:495`, `optimize(object_stream_data, false)`),
+/// which mutates `pdf`: a direct `/Outlines` dictionary is made indirect and
+/// the page tree's inherited attributes may be pushed down. A `pdf` checked
+/// this way is not guaranteed to produce identical bytes to an unchecked
+/// `pdf` on a subsequent write, matching qpdf's own behavior.
 pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) -> CheckResult {
     let file_len = file_bytes.len() as u64;
 
@@ -513,6 +523,14 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         check_hint_stream_at_offset(pdf, file_bytes, offset, length)
     };
 
+    // Each call below only proves the referenced hint stream is present and
+    // decodable; the decoded bytes are discarded rather than concatenated
+    // (unlike show.rs's load_hint_stream, which pipes primary and overflow
+    // into one buffer matching qpdf's shared `Pl_Buffer`,
+    // `QPDF_linearization.cc:241-245`). This is fine while check_linearization
+    // does not parse the hint tables themselves; a future pass that does
+    // (Page/Shared/Outline offset validation, flpdf-1quo) must reproduce
+    // that concatenation the way show.rs's finding-#4 fix already does.
     let h_offset = as_u64(&h_items[0], "H[0]")?;
     let h_length = as_u64(&h_items[1], "H[1]")?;
     check_hint(0, h_offset, h_length)?;

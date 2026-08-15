@@ -747,13 +747,19 @@ fn show_with_pdf(
     // independently re-raised as hard failures by this function's own reads
     // below), and `NotLinearized` cannot occur here since `is_linearized`
     // already passed above.
-    // cov:ignore-start: public show entry points use Cursor<Vec<u8>>; the
-    // canonical resolver catches parse/unsupported failures and this
-    // in-memory source cannot produce a read I/O error.
+    //
+    // Deviation: qpdf's soft-check path also emits a `WARNING: ...` line to
+    // stderr and drives the CLI exit code to EXIT_WARNING (3) instead of 0
+    // (`linearizationWarning`, `QPDF_linearization.cc:61-67`; the
+    // `getWarnings()`-driven exit code, `QPDFJob.cc:1689-1691`). Neither the
+    // warning text nor the exit code is reproduced here — tracked separately
+    // (flpdf-pky8) rather than folded into this fix.
     if let Err(LinearizationCheckError::Io(error)) = check_linearization(pdf, file_bytes) {
-        return Err(ShowLinearizationError::Io(error));
+        // public show entry points use Cursor<Vec<u8>>; the canonical
+        // resolver catches parse/unsupported failures and this in-memory
+        // source cannot produce a read I/O error.
+        return Err(ShowLinearizationError::Io(error)); // cov:ignore: see comment above
     }
-    // cov:ignore-end
 
     // 3. Locate, resolve, and decompress the hint stream object at /H[0].
     //
@@ -1860,7 +1866,9 @@ mod tests {
                 // widens the writer's `groups` pre-pass
                 // (`encode_shared_object_groups`, `hint_stream.rs:373-385`),
                 // which qpdf's `readHSharedObject` has no matching read step
-                // for — misaligning every subsequent bit read.
+                // for — misaligning every subsequent bit read. Tracked
+                // separately (flpdf-pars); production always passes 0 here
+                // (`hint_shared.rs:242,347`) so this is currently dormant.
                 bits_group_object_count: 0,
                 least_length: 10,
                 bits_length_delta: 8,
