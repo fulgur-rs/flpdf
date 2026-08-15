@@ -68,18 +68,18 @@ use crate::linearization::plan::{
     collect_direct_refs, ContainerPart, LinearizationPlan, RoutedObjStmBatch,
 };
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
-use crate::object::MAX_INLINE_DEPTH;
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::writer::encrypted_strings::EncryptedStringEmitter;
 use crate::writer::object_streams::{
-    emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
+    emit_objstm_body_from_handles_with_writer, planner_config_from_options,
+    wrap_objstm_body_as_handle,
 };
 use crate::writer::{
     effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension,
     report_progress_event, serialize::xref_stream, strip_adbe_extension, CompressStreams,
     NewlineBeforeEndstream, WriterOptions, WriterResult,
 };
-use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result};
 
 const EBADF_ERRNO: i32 = 9;
 
@@ -294,9 +294,9 @@ impl ObjStmLayout {
     }
 }
 
-/// Build the ObjStm container stream object for one scheduled container,
-/// resolving + renumbering each member from `pdf` and applying qpdf's global
-/// structural-stream compression policy.
+/// Build the ObjStm container stream object for one scheduled container from
+/// the live member handles and apply qpdf's global structural-stream
+/// compression policy.
 fn append_objstm_container_object<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     container: &ObjStmContainer,
@@ -306,61 +306,91 @@ fn append_objstm_container_object<R: Read + Seek>(
     filtered: bool,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<usize> {
-    let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
+    let map = |object_ref| {
+        renumber.new_for_original(object_ref).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "linearization writer: ObjStm member reference {object_ref} has no renumber entry"
+            ))
+        })
+    };
+    let mut members: Vec<(ObjectRef, ObjectHandle)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
-        let object = pdf.resolve(orig)?;
-        let renumbered = renumber_object_with_removed(pdf, &object, 0, renumber, removed_refs)?;
-        resolved.push((new_ref, renumbered));
+        let handle = pdf.get_object_handle(orig);
+        pdf.resolve_object_handle(&handle)?;
+        // qpdf warns and writes null when a malformed source stream is routed
+        // into an object stream (`QPDFWriter.cc:1714-1721`). Keep that edge at
+        // the canonical handle boundary rather than materializing a legacy
+        // `Object::Stream` that cannot be a valid ObjStm member.
+        let handle = if handle.as_stream_dict().is_some() {
+            ObjectHandle::null()
+        } else {
+            handle
+        };
+        members.push((new_ref, handle));
     }
-    let body = emit_objstm_body_from_resolved(&resolved)?;
+    let body = emit_objstm_body_from_handles_with_writer(
+        &members,
+        &mut |out, _member_index, _object_ref, handle| {
+            handle.unparse_object_with_ref_map_and_removed(out, &map, removed_refs)
+        },
+    )?;
     let compress = if filtered {
         CompressStreams::Yes
     } else {
         CompressStreams::No
     };
-    let mut stream = wrap_objstm_body(&body, compress)?;
+    let (stream_handle, data) = wrap_objstm_body_as_handle(&body, compress, None)?;
+    let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
+        // cov:ignore-start: wrap_objstm_body_as_handle always returns a stream handle.
+        crate::Error::Internal("linearization ObjStm wrapper produced a non-stream handle".into())
+        // cov:ignore-end
+    })?; // cov:ignore: wrap_objstm_body_as_handle always returns a stream handle.
+    let object_ref = ObjectRef::new(container.container_new_num, 0);
     // PDF encryption applies to the ObjStm container stream as one stream
     // object. The member objects remain plaintext inside that encrypted
     // payload; encrypting them individually would not match qpdf or the PDF
-    // object-stream encryption rules.
-    // cov:ignore-start: the linearization encryption context is validated before
-    // emission; its in-memory AES/ObjStm payload cannot produce a distinct error edge.
+    // object-stream encryption rules (`QPDFWriter.cc:1782-1800`).
     if let Some(ctx) = encrypt_ctx {
-        crate::writer::encrypt_stream_payload_for_writer(
-            ObjectRef::new(container.container_new_num, 0),
-            &mut stream,
-            ctx,
+        let mut payload_length = data.len();
+        crate::writer::adjust_aes_stream_length(&mut payload_length, ctx, true)?;
+        stream_dict.replace_key(
+            b"/Length",
+            ObjectHandle::integer(i64::try_from(payload_length).unwrap_or(i64::MAX)),
         )?;
     }
-    // cov:ignore-end
 
-    // Emit the container dict in qpdf 11.9.0's fixed key order
-    // (`/Type /ObjStm /Length /Filter /N /First`); the generic `BTreeMap`-backed
-    // [`Object::Stream`] serializer would alphabetise the keys instead. Framing
-    // mirrors [`append_hint_stream_object`].
+    // qpdf writes ObjStm keys in the fixed order Type/Length/Filter/N/First.
+    // The values themselves are emitted by the canonical handle serializer;
+    // only the surrounding order and object-stream framing remain raw layout.
     let offset = bytes.len();
-    // Write the header directly into `bytes` to avoid temporary `String`
-    // allocations from `format!`.
-    use std::io::Write as _;
-    let filter_key = if filtered {
-        " /Filter /FlateDecode"
+    bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
+    bytes.extend_from_slice(b"<< /Type ");
+    stream_dict.get_key(b"/Type").unparse_object(bytes)?;
+    bytes.extend_from_slice(b" /Length ");
+    stream_dict.get_key(b"/Length").unparse_object(bytes)?;
+    if filtered {
+        bytes.extend_from_slice(b" /Filter ");
+        stream_dict.get_key(b"/Filter").unparse_object(bytes)?;
+    }
+    bytes.extend_from_slice(b" /N ");
+    stream_dict.get_key(b"/N").unparse_object(bytes)?;
+    bytes.extend_from_slice(b" /First ");
+    stream_dict.get_key(b"/First").unparse_object(bytes)?;
+    bytes.extend_from_slice(b" >>");
+    if let Some(ctx) = encrypt_ctx {
+        crate::writer::write_stream_payload_with_pipeline(
+            bytes,
+            &data,
+            NewlineBeforeEndstream::Never,
+            object_ref,
+            ctx,
+            true,
+            None,
+        )?;
     } else {
-        ""
-    };
-    let _ = write!(
-        bytes,
-        "{} 0 obj\n<< /Type /ObjStm /Length {}{} /N {} /First {} >>\nstream\n",
-        container.container_new_num,
-        stream.data.len(),
-        filter_key,
-        body.n_members,
-        body.first_offset,
-    );
-    bytes.extend_from_slice(&stream.data);
-    // No newline before `endstream` — qpdf's default (NewlineBeforeEndstream is
-    // Never on this path); the ObjStm body's own trailing newline is inside the
-    // compressed data.
-    bytes.extend_from_slice(b"endstream\nendobj\n");
+        crate::writer::serialize::write_stream_payload(bytes, &data, NewlineBeforeEndstream::Never);
+    }
+    bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
 }
 
@@ -476,6 +506,7 @@ fn renumber_object<R: Read + Seek>(
     renumber_object_with_removed(pdf, object, depth, renumber, &BTreeSet::new())
 }
 
+#[cfg(test)]
 fn renumber_object_with_removed<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
@@ -483,6 +514,9 @@ fn renumber_object_with_removed<R: Read + Seek>(
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<Object> {
+    use crate::object::MAX_INLINE_DEPTH;
+    use crate::Stream;
+
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization writer: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
@@ -855,10 +889,13 @@ fn write_part1_xref_and_trailer(
     first_page_count: u32,
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
-    source_trailer: &Dictionary,
+    source_trailer: &ObjectHandle,
+    canonical_entries: &[(Vec<u8>, Vec<u8>)],
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
     id_writer: Option<crate::object::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
-) -> (usize, std::ops::Range<usize>, Part1XrefPatch) {
+) -> Result<(usize, std::ops::Range<usize>, Part1XrefPatch)> {
     // The param-dict object's trailing pad (reserved by `Part1Bytes::build`)
     // ends with spaces; qpdf starts the first-page `xref` on a fresh line, so
     // emit the line-break separator here.  This lands the `xref` keyword at
@@ -888,68 +925,61 @@ fn write_part1_xref_and_trailer(
         data_range: data_start..data_end,
     };
 
-    // First-page trailer for Part 1.  qpdf emits keys in this order:
-    //   /Info /Root /Size /Prev /ID
-    // We write the dict as raw bytes (not via Dictionary::write_pdf) to:
-    //   (a) preserve qpdf's key order (BTreeMap would alphabetise),
-    //   (b) reserve a fixed-width space-padded field for /Prev back-patching.
+    // First-page trailer for Part 1. qpdf emits the live trimmed trailer keys
+    // in decoded-name order, inserts `/Prev` immediately after `/Size`, and
+    // appends `/ID` and `/Encrypt` after the ordinary keys. The values in
+    // `canonical_entries` came from the live ObjectHandle graph; raw bytes are
+    // limited to this fixed linearization framing and its back-patch field.
     bytes.extend_from_slice(b"trailer << ");
 
-    // /Info (omit when absent — qpdf also omits it when the source has none)
+    let mut entries = canonical_entries.to_vec();
     if let Some(info_ref) = info_new_ref {
-        bytes.extend_from_slice(
-            format!("/Info {} {} R ", info_ref.number, info_ref.generation).as_bytes(),
-        );
+        entries.push((
+            b"/Info".to_vec(),
+            format!("{} {} R", info_ref.number, info_ref.generation).into_bytes(),
+        ));
     }
-
-    // /Root
-    bytes.extend_from_slice(
+    entries.push((
+        b"/Root".to_vec(),
         format!(
-            "/Root {} {} R ",
+            "{} {} R",
             catalog_new_ref.number, catalog_new_ref.generation
         )
-        .as_bytes(),
-    );
+        .into_bytes(),
+    ));
+    entries.push((
+        b"/Size".to_vec(),
+        total_object_count.to_string().into_bytes(),
+    ));
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    // /Size
-    bytes.extend_from_slice(format!("/Size {} ", total_object_count).as_bytes());
-
-    // /Prev — placeholder: left-justified 0, space-padded to PREV_PLACEHOLDER_WIDTH bytes.
-    bytes.extend_from_slice(b"/Prev ");
-    let prev_value_start = bytes.len();
-    // Write placeholder: "0" left-justified, padded to PREV_PLACEHOLDER_WIDTH with spaces.
-    let placeholder = format!("{:<PREV_PLACEHOLDER_WIDTH$}", 0);
-    bytes.extend_from_slice(placeholder.as_bytes());
-    let prev_value_end = bytes.len();
-
-    // /ID — emit the file identifier verbatim.
-    //
-    // `write_linearized` finalizes the /ID exactly once per save (via
-    // `finalize_linearized_id`) and stores it on `source_trailer["ID"]`, so
-    // the Part-1 trailer and every split xref/trailer in the same output all
-    // emit the *same* identifier.  A PDF file identifier is file-scoped, so
-    // regenerating a fresh random /ID here (as before) produced inconsistent
-    // identifiers across trailers within one linearized file.
-    if let Some(id_obj) = source_trailer.get("ID") {
-        // No separator space before `/ID`: the fixed-width `/Prev`
-        // placeholder above is right-padded with spaces, so its trailing pad
-        // already separates the value from `/ID`.  qpdf writes `/ID` directly
-        // after that pad (field width 22), so adding a leading space here
-        // would make the Part-1 trailer one byte wider than qpdf's.
-        bytes.extend_from_slice(b"/ID ");
-        // When `id_writer` is `Some` (the classic deterministic-`/ID` final
-        // pass), produce the `/ID` value from the closure — qpdf's content-
-        // derived identifier in the fixed-width hex form — instead of the
-        // stored placeholder. The closure emits exactly the same byte width as
-        // the placeholder, so every downstream offset is unchanged. When
-        // `id_writer` is `None`, the stored value is routed through
-        // `write_id_style_value` so the trailer's `/ID` output is compact
-        // `[<hex1><hex2>]` (matches qpdf's hand-rolled `writeTrailer`; the
-        // generic array serializer would otherwise insert separating spaces).
-        match id_writer {
-            Some(write_id) => write_id(bytes),
-            None => crate::object::write_id_style_value(bytes, id_obj),
+    let mut prev_value_range = None;
+    for (key, value) in entries {
+        bytes.push(b'/');
+        crate::object::write_name_escaped(bytes, key.strip_prefix(b"/").unwrap_or(&key));
+        bytes.push(b' ');
+        bytes.extend_from_slice(&value);
+        if key == b"/Size" {
+            // `/Prev` placeholder: left-justified 0, space-padded to the
+            // fixed qpdf field width so the final xref offset is patched in
+            // place without shifting any body bytes.
+            bytes.extend_from_slice(b" /Prev ");
+            let prev_value_start = bytes.len();
+            let placeholder = format!("{:<PREV_PLACEHOLDER_WIDTH$}", 0);
+            bytes.extend_from_slice(placeholder.as_bytes());
+            prev_value_range = Some(prev_value_start..bytes.len());
+        } else {
+            bytes.push(b' ');
         }
+    }
+
+    // No separator space before `/ID`: the fixed-width `/Prev` placeholder's
+    // trailing pad already separates the value, exactly as qpdf writes it.
+    bytes.extend_from_slice(b"/ID ");
+    let id_value = source_trailer.try_get_key(b"/ID")?;
+    match id_writer {
+        Some(write_id) => write_id(bytes),
+        None => id_value.unparse_id_value_with_ref_map(bytes, map, removed_refs)?,
     }
 
     // /Encrypt — reference to the `/Encrypt` dictionary object, written right
@@ -978,7 +1008,14 @@ fn write_part1_xref_and_trailer(
     // linearized file"; we adopt the same convention for byte-identical output.
     bytes.extend_from_slice(b"\nstartxref\n0\n%%EOF\n");
 
-    (xref_offset, prev_value_start..prev_value_end, patch)
+    let prev_value_range = prev_value_range.ok_or_else(|| {
+        // cov:ignore-start: /Size is inserted unconditionally above.
+        crate::Error::Unsupported(
+            "linearization first trailer has no /Size entry for /Prev patch".to_string(),
+        )
+        // cov:ignore-end
+    })?; // cov:ignore: /Size is inserted unconditionally above.
+    Ok((xref_offset, prev_value_range, patch))
 }
 
 /// Overwrite the classic first-page xref subsection's placeholder entry block
@@ -1055,14 +1092,17 @@ fn patch_part1_xref(
 /// - `xref_first_entry_offset` is the byte offset of the first xref entry
 ///   (after the `xref\n0 N\n` header), which is the correct `/T` value per
 ///   qpdf's linearization checker.
+#[allow(clippy::too_many_arguments)]
 fn write_main_xref_and_trailer(
     bytes: &mut Vec<u8>,
     xref_offsets: &BTreeMap<u32, usize>,
     param_slot: u32, // /Size of the main subsection — covers objects [0, param_slot)
     first_page_xref_offset: usize,
-    source_trailer: &Dictionary,
+    source_trailer: &ObjectHandle,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
     id_writer: Option<crate::object::ReborrowableIdWriter>,
-) -> (usize, usize) {
+) -> Result<(usize, usize)> {
     let xref_start = bytes.len();
 
     // Dense table: objects 0 .. param_slot (the low-numbered "rest" objects).
@@ -1088,24 +1128,17 @@ fn write_main_xref_and_trailer(
     // /ID — emit the file-scoped identifier verbatim (the same value the
     // Part-1 trailer carries), so the trailer a reader resolves via the
     // trailing `startxref` advertises the identifier.
-    if let Some(id_obj) = source_trailer.get("ID") {
-        bytes.extend_from_slice(b"/ID ");
-        // See `write_part1_xref_and_trailer`: the classic deterministic-`/ID`
-        // final pass supplies a closure that emits qpdf's content-derived
-        // identifier (same fixed-width hex form as the placeholder), so the
-        // main trailer carries the same `/ID` as the Part-1 trailer. On the
-        // `None` fallback, route the stored value through
-        // `write_id_style_value` for the compact `[<hex1><hex2>]` shape.
-        match id_writer {
-            Some(write_id) => write_id(bytes),
-            None => crate::object::write_id_style_value(bytes, id_obj),
-        }
-        bytes.extend_from_slice(b" ");
+    bytes.extend_from_slice(b"/ID ");
+    let id_value = source_trailer.try_get_key(b"/ID")?;
+    match id_writer {
+        Some(write_id) => write_id(bytes),
+        None => id_value.unparse_id_value_with_ref_map(bytes, map, removed_refs)?,
     }
+    bytes.extend_from_slice(b" ");
     bytes.extend_from_slice(b">>");
     bytes.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", first_page_xref_offset).as_bytes());
 
-    (xref_start, xref_first_entry_offset)
+    Ok((xref_start, xref_first_entry_offset))
 }
 
 /// Byte ranges (inside the writer's `bytes` buffer) the first-page xref stream
@@ -1136,6 +1169,9 @@ struct FirstPageXrefPatch {
     /// Trailer `/ID` placeholder bytes `(id0, id1)`, written into the rebuilt
     /// dict so the deterministic-`/ID` back-patch finds them afterwards.
     id: Option<(Vec<u8>, Vec<u8>)>,
+    /// Live trailer entries serialized through the canonical ObjectHandle
+    /// graph. Writer-owned keys are added separately by the xref serializer.
+    canonical_entries: Vec<(Vec<u8>, Vec<u8>)>,
     /// Trailer `/Encrypt` reference on the first-page xref stream. The main
     /// linearization xref stream intentionally omits this (`t_lin_second`).
     encrypt: Option<ObjectRef>,
@@ -1145,6 +1181,60 @@ struct FirstPageXrefPatch {
     max_ostream_index: u64,
     /// Whether the generated xref stream uses predictor + Flate filtering.
     filtered: bool,
+}
+
+/// Return the live trailer entries that the linearization xref dictionary may
+/// carry in addition to its writer-owned structural fields.
+///
+/// qpdf's `getTrimmedTrailer` walks the live trailer handle, while the
+/// linearization writer supplies `/Info`, `/Root`, `/Size`, `/Prev`, `/ID`, and
+/// `/Encrypt` at the xref/trailer boundary. Keep those generated keys out of
+/// this list so they cannot be duplicated. Values are serialized through the
+/// canonical handle graph and mapped into output-number space; only the xref
+/// dictionary's fixed framing and key order remain raw layout.
+fn canonical_linearization_trailer_entries(
+    trailer: &ObjectHandle,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let entries = trailer.try_as_dictionary()?.unwrap_or_default();
+    let mut serialized = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if matches!(
+            key.as_slice(),
+            b"/ID"
+                | b"/Encrypt"
+                | b"/Info"
+                | b"/Prev"
+                | b"/Root"
+                | b"/Size"
+                | b"/Type"
+                | b"/F"
+                | b"/FFilter"
+                | b"/FDecodeParms"
+                | b"/W"
+                | b"/Index"
+                | b"/Length"
+                | b"/Filter"
+                | b"/DecodeParms"
+                | b"/XRefStm"
+        ) {
+            continue;
+        }
+        let removed = value
+            .object_ref()
+            .is_some_and(|object_ref| object_ref.number == 0 || removed_refs.contains(&object_ref))
+            || value.as_reference().is_some_and(|object_ref| {
+                object_ref.number == 0 || removed_refs.contains(&object_ref)
+            });
+        if removed || value.try_is_null()? {
+            continue;
+        }
+        let mut value_bytes = Vec::new();
+        value.unparse_object_with_ref_map_and_removed(&mut value_bytes, map, removed_refs)?;
+        serialized.push((key, value_bytes));
+    }
+    Ok(serialized)
 }
 
 /// Compute the linearized output's `/ID` **once per save**.
@@ -1234,8 +1324,32 @@ fn linearization_pass1_id(source_trailer: &Dictionary) -> Object {
 /// identifier that `write_linearized` already finalized onto `source_trailer`
 /// (see [`finalize_linearized_id`]) so it stays consistent with the Part-1
 /// trailer.
-fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
-    source_trailer.get("ID").cloned()
+/// Lift the writer-owned two-string `/ID` value into the canonical handle
+/// graph. Linearization still keeps the legacy `Object` only for the existing
+/// two-pass ID computation; all xref/trailer emission consumes this handle.
+fn id_object_to_handle(object: &Object) -> Result<ObjectHandle> {
+    let values = object.as_array().ok_or_else(|| {
+        crate::Error::Unsupported("linearization writer: /ID is not an array".to_string())
+    })?;
+    if values.len() != 2 {
+        return Err(crate::Error::Unsupported(
+            "linearization writer: /ID must contain two strings".to_string(),
+        ));
+    }
+    let ids = values
+        .iter()
+        .map(|value| {
+            value
+                .as_string()
+                .map(|bytes| ObjectHandle::string(bytes.to_vec()))
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(
+                        "linearization writer: /ID entries must be strings".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ObjectHandle::array(ids))
 }
 
 /// Overwrite every all-zero deterministic `/ID` placeholder in the finished
@@ -1352,7 +1466,8 @@ fn write_first_page_xref_stream(
     total_count: u32, // /Size (relocated renumber.len() + 1) — already final
     catalog_new_ref: ObjectRef,
     info_new_ref: Option<ObjectRef>,
-    source_trailer: &Dictionary,
+    source_trailer: &ObjectHandle,
+    canonical_entries: &[(Vec<u8>, Vec<u8>)],
     max_ostream_index: u64,
     filtered: bool,
     encrypt: Option<ObjectRef>,
@@ -1372,7 +1487,7 @@ fn write_first_page_xref_stream(
     })?;
     // cov:ignore-end
     let max_id = final_size.saturating_sub(1);
-    let id = xref_id_bytes(source_trailer);
+    let id = xref_id_bytes(source_trailer)?;
     let obj_ref = ObjectRef::new(first_xref_num, 0);
 
     // Reserve the fixed pass-1 region (qpdf's writePad length-stabilisation):
@@ -1393,7 +1508,7 @@ fn write_first_page_xref_stream(
             size: final_size,
             prev: Some(0),
             trailer: None,
-            canonical_entries: None,
+            canonical_entries: Some(canonical_entries),
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
             encrypt,
         };
@@ -1422,6 +1537,7 @@ fn write_first_page_xref_stream(
         info_new_ref,
         size: final_size,
         id,
+        canonical_entries: canonical_entries.to_vec(),
         encrypt,
         max_id,
         max_ostream_index,
@@ -1432,14 +1548,19 @@ fn write_first_page_xref_stream(
 /// Extract the trailer `/ID`'s two byte strings — the deterministic-`/ID`
 /// all-zero placeholder while writing — for the rebuilt xref-stream dicts. The
 /// real identifier is patched in afterwards by [`patch_linearized_deterministic_id`].
-fn xref_id_bytes(source_trailer: &Dictionary) -> Option<(Vec<u8>, Vec<u8>)> {
-    match split_xref_common_id(source_trailer)? {
-        Object::Array(a) if a.len() == 2 => match (&a[0], &a[1]) {
-            (Object::String(s0), Object::String(s1)) => Some((s0.clone(), s1.clone())),
-            _ => None, // cov:ignore: defensive — the deterministic /ID is always a 2-string array.
-        },
-        _ => None, // cov:ignore: defensive — /ID is always a 2-element array here.
+fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let id = source_trailer.try_get_key(b"/ID")?;
+    let Some(values) = id.try_as_array()? else {
+        return Ok(None);
+    };
+    if values.len() != 2 {
+        return Ok(None);
     }
+    let (first, second) = (&values[0], &values[1]);
+    Ok(match (first.as_string(), second.as_string()) {
+        (Some(first), Some(second)) => Some((first, second)),
+        _ => None,
+    })
 }
 
 /// Overwrite the first-page xref stream's reserved region with the real encoded
@@ -1519,7 +1640,7 @@ fn patch_first_page_xref(
         size: patch.size,
         prev: Some(prev),
         trailer: None,
-        canonical_entries: None,
+        canonical_entries: Some(&patch.canonical_entries),
         id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
         encrypt: patch.encrypt,
     };
@@ -1568,7 +1689,7 @@ fn write_main_xref_stream_and_trailer(
     member_new: &BTreeMap<u32, (u32, u32)>,
     relocation: &ObjStmRelocation,
     total_count: u32, // /Size (placed renumber.len() + 1) — already final
-    source_trailer: &Dictionary,
+    source_trailer: &ObjectHandle,
     first_page_obj_offset: usize,
     max_ostream_index: u64,
     pass1: bool,
@@ -1578,7 +1699,7 @@ fn write_main_xref_stream_and_trailer(
     let first_xref_num = relocation.first_xref_slot;
     let main_xref_num = relocation.main_xref_slot;
     let max_id = final_size.saturating_sub(1);
-    let id = xref_id_bytes(source_trailer);
+    let id = xref_id_bytes(source_trailer)?;
 
     // Second-half range: objects `[0, second_half_count)`.
     let main_count = relocation.second_half_count;
@@ -2026,7 +2147,7 @@ fn do_write_pass<R: Read + Seek>(
     _first_page_object_new_num: u32,
     hint_stream_object: Option<&[u8]>,
     structural_streams_filtered: bool,
-    source_trailer: &Dictionary,
+    source_trailer: &ObjectHandle,
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
     options: &WriterOptions,
@@ -2080,6 +2201,18 @@ fn do_write_pass<R: Read + Seek>(
         .map(|&(_, idx)| u64::from(idx))
         .max()
         .unwrap_or(0);
+
+    let trailer_map = |object_ref| {
+        // cov:ignore-start: planner reachability and renumber placement cover every live trailer reference.
+        renumber.new_for_original(object_ref).ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "linearization writer: trailer reference {object_ref} has no renumber entry"
+            ))
+        })
+        // cov:ignore-end
+    }; // cov:ignore: planner-produced trailer map is complete by construction.
+    let canonical_entries =
+        canonical_linearization_trailer_entries(source_trailer, &trailer_map, &plan.removed_refs)?;
 
     // The classic Part-1 mini-xref + first trailer is only emitted on the
     // non-ObjStm path.  For ObjStm-bearing output the first-page (Part-1)
@@ -2137,9 +2270,12 @@ fn do_write_pass<R: Read + Seek>(
             catalog_new_ref,
             info_new_ref,
             source_trailer,
+            &canonical_entries,
+            &trailer_map,
+            &plan.removed_refs,
             id_writer.as_deref_mut(),
             encrypt_ctx,
-        );
+        )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         part1_classic_xref_offset = p1_xref_offset;
         part1_xref_patch = Some(patch);
         // Part-1 first-page trailer `/ID` site.  The main (Part-6) trailer
@@ -2157,6 +2293,7 @@ fn do_write_pass<R: Read + Seek>(
             catalog_new_ref,
             info_new_ref,
             source_trailer,
+            &canonical_entries,
             max_ostream_index,
             structural_streams_filtered,
             encrypt_ctx.map(|ctx| ctx.encrypt_ref),
@@ -2549,9 +2686,11 @@ fn do_write_pass<R: Read + Seek>(
             param_dict_obj_number,
             part1_classic_xref_offset,
             source_trailer,
+            &trailer_map,
+            &plan.removed_refs,
             // Last use of `id_writer` — move it (no reborrow needed).
             id_writer,
-        );
+        )?; // cov:ignore: the validated linearization plan makes this serializer error path defensive.
         id_ranges.push(main_section_start..bytes.len());
 
         // Every first-page object offset is now known, so back-patch the
@@ -3206,7 +3345,8 @@ fn write_linearized_impl<R: Read + Seek>(
     // preserved permanent identifier and the `/Info`-derived suffix feeds the
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    let mut source_trailer = pdf.trailer().clone();
+    let source_trailer = pdf.trailer().clone();
+    let source_trailer_handle = pdf.trailer_handle().shallow_copy()?;
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
             let id0 = crate::writer::source_permanent_id(&source_trailer);
@@ -3256,10 +3396,11 @@ fn write_linearized_impl<R: Read + Seek>(
                     .to_string(),
             )
         })?; // cov:ignore-end
-    source_trailer.insert("ID", finalized_id);
-    let source_trailer = source_trailer;
-    let mut pass1_source_trailer = source_trailer.clone();
-    pass1_source_trailer.insert("ID", pass1_id);
+    let finalized_id_handle = id_object_to_handle(&finalized_id)?;
+    let pass1_id_handle = id_object_to_handle(&pass1_id)?;
+    source_trailer_handle.replace_key(b"/ID", finalized_id_handle)?;
+    let pass1_source_trailer = source_trailer_handle.shallow_copy()?;
+    pass1_source_trailer.replace_key(b"/ID", pass1_id_handle)?;
 
     // This guard mirrors a real qpdf restriction, not a blanket rejection of
     // linearize+encrypt — verified empirically against qpdf 11.9.0: `qpdf
@@ -4251,7 +4392,7 @@ fn write_linearized_impl<R: Read + Seek>(
         first_page_object_new_num,
         Some(&hint_stream_object),
         structural_streams_filtered,
-        &source_trailer,
+        &source_trailer_handle,
         &objstm_layout,
         &relocation,
         options,
@@ -8996,6 +9137,183 @@ mod tests {
         )
         .expect_err("missing reference must not be silently emitted");
         assert!(error.to_string().contains("has no renumber entry"));
+    }
+
+    #[test]
+    fn append_objstm_container_reports_missing_reference_renumbering() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        pdf.get_object_handle(ObjectRef::new(1, 0))
+            .replace_key(
+                b"/Ghost",
+                ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(
+                    ObjectRef::new(999, 0),
+                )),
+            )
+            .expect("test-only catalog mutation");
+        let container = ObjStmContainer {
+            container_new_num: 10,
+            members: vec![(ObjectRef::new(1, 0), ObjectRef::new(1, 0))],
+        };
+        let error = append_objstm_container_object(
+            &mut Vec::new(),
+            &container,
+            &renumber,
+            &mut pdf,
+            &BTreeSet::new(),
+            false,
+            None,
+        )
+        .expect_err("missing nested reference must not be silently emitted");
+        assert!(error.to_string().contains("has no renumber entry"));
+    }
+
+    #[test]
+    fn append_objstm_container_converts_stream_members_to_null() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+        ))
+        .expect("three-page fixture should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let original_ref = ObjectRef::new(9, 0);
+        let new_ref = renumber
+            .new_for_original(original_ref)
+            .expect("page-1 content stream must be reachable");
+        let container = ObjStmContainer {
+            container_new_num: 20,
+            members: vec![(original_ref, new_ref)],
+        };
+        let mut bytes = Vec::new();
+
+        append_objstm_container_object(
+            &mut bytes,
+            &container,
+            &renumber,
+            &mut pdf,
+            &BTreeSet::new(),
+            false,
+            None,
+        )
+        .expect("stream members must be represented as null in ObjStm bodies");
+
+        assert!(
+            bytes.windows(b"null".len()).any(|window| window == b"null"),
+            "a malformed ObjStm stream member must be emitted as null"
+        );
+    }
+
+    #[test]
+    fn append_objstm_container_propagates_encryption_pipeline_errors() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let original_ref = plan.root_ref.expect("tiny PDF catalog");
+        let new_ref = renumber
+            .new_for_original(original_ref)
+            .expect("catalog must be reachable");
+        let container = ObjStmContainer {
+            container_new_num: 20,
+            members: vec![(original_ref, new_ref)],
+        };
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 31],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        let error = append_objstm_container_object(
+            &mut Vec::new(),
+            &container,
+            &renumber,
+            &mut pdf,
+            &BTreeSet::new(),
+            false,
+            Some(&context),
+        )
+        .expect_err("invalid AES key material must propagate from the pipeline");
+        assert!(error.to_string().contains("AES"));
+    }
+
+    #[test]
+    fn canonical_linearization_trailer_entries_uses_live_values_and_filters_removed() {
+        let removed_ref = ObjectRef::new(3, 0);
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/Foo".to_vec(), ObjectHandle::integer(7)),
+            (
+                b"/Ref".to_vec(),
+                ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(
+                    ObjectRef::new(2, 0),
+                )),
+            ),
+            (
+                b"/Removed".to_vec(),
+                ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(removed_ref)),
+            ),
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/Size".to_vec(), ObjectHandle::integer(99)),
+        ]);
+        let map = |object_ref: ObjectRef| {
+            Ok(ObjectRef::new(
+                object_ref.number + 10,
+                object_ref.generation,
+            ))
+        };
+
+        let entries =
+            canonical_linearization_trailer_entries(&trailer, &map, &BTreeSet::from([removed_ref]))
+                .expect("live trailer values should serialize");
+
+        assert_eq!(
+            entries,
+            vec![
+                (b"/Foo".to_vec(), b"7".to_vec()),
+                (b"/Ref".to_vec(), b"12 0 R".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn id_helpers_reject_noncanonical_shapes() {
+        assert!(id_object_to_handle(&Object::Null).is_err());
+        assert!(id_object_to_handle(&Object::Array(vec![Object::Null])).is_err());
+        assert!(id_object_to_handle(&Object::Array(vec![
+            Object::String(b"id".to_vec()),
+            Object::Integer(7),
+        ]))
+        .is_err());
+
+        let missing = ObjectHandle::dictionary(Vec::new());
+        assert!(xref_id_bytes(&missing)
+            .expect("missing ID is a valid optional shape")
+            .is_none());
+        let one = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::string(b"id".to_vec())]),
+        )]);
+        assert!(xref_id_bytes(&one)
+            .expect("short ID array is an optional shape")
+            .is_none());
+        let wrong_type = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(b"id".to_vec()),
+                ObjectHandle::integer(7),
+            ]),
+        )]);
+        assert!(xref_id_bytes(&wrong_type)
+            .expect("wrong ID element types are an optional shape")
+            .is_none());
     }
 
     /// Task 8: the hint stream is encrypted like any other stream payload —

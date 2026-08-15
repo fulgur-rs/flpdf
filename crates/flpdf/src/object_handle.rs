@@ -9546,6 +9546,20 @@ impl ObjectHandle {
             )
         })
     }
+
+    /// Serialize a trailer `/ID` value in qpdf's compact
+    /// `[<hex0><hex1>]` form while retaining the live handle and reference-map
+    /// boundary. Linearized classic trailers keep their fixed-width `/Prev`
+    /// field outside the generic trailer primitive, but still use this helper
+    /// for the identifier itself (`QPDFWriter.cc:1194-1222`).
+    pub(crate) fn unparse_id_value_with_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        write_id_style_value_handle_with_ref_map(self, out, map, removed_refs)
+    }
 }
 
 // `unparse_trailer`'s sole callee. Writes the (already-trimmed,
