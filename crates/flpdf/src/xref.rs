@@ -24,7 +24,7 @@ use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{
     filters, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry,
 };
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
@@ -376,8 +376,14 @@ impl BootstrapHandleDocument {
                 Some(offset),
             );
         }
-        let mut completed =
-            self.read_file_object(input, offset, policy, XrefObjectDescription::Ordinary)?;
+        // Rebase by `start`, matching the header parse immediately above:
+        // `input` is already the offset-relative tail slice, so an error
+        // surfaced from parsing its body (e.g. "trailing bytes after
+        // object") reports an offset relative to `input`, not the file,
+        // unless rebased here.
+        let mut completed = self
+            .read_file_object(input, offset, policy, XrefObjectDescription::Ordinary)
+            .map_err(|error| error.rebase_offset(start))?;
         let parsed_offset = completed.object.get_parsed_offset();
         let _ = completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
@@ -545,13 +551,26 @@ impl DocumentResolver for BootstrapHandleDocument {
                 self.push_warning("object has offset 0", Some(0));
                 Ok((ObjectValue::Null, -1))
             }
+            // qpdf's `resolve` wraps `resolveObjectsInStream` in the same
+            // try/catch as the type-1 branch above (`QPDF.cc:1719-1734`): a
+            // malformed object stream (e.g. non-integer `/N` or `/First`,
+            // `QPDF.cc:1782-1784`) is caught and warned, then falls through
+            // to `updateCache(og, QPDF_Null::create(), -1, -1)`
+            // (`QPDF.cc:1744-1747`) instead of aborting resolution. Route
+            // through `result`/the `Err` arm below rather than `?` so that
+            // catch-and-null fallback, and the `resolving` guard removal
+            // just past this match, both still run on this path.
             Some(XrefEntry::Compressed { stream, .. }) => {
-                self.resolve_object_stream(stream)?;
-                if handle.is_resolved() {
-                    self.resolving.borrow_mut().remove(&object_ref);
-                    return Ok(());
+                match self.resolve_object_stream(stream) {
+                    Ok(()) => {
+                        if handle.is_resolved() {
+                            self.resolving.borrow_mut().remove(&object_ref);
+                            return Ok(());
+                        }
+                        Ok((ObjectValue::Null, -1))
+                    }
+                    Err(error) => Err(error),
                 }
-                Ok((ObjectValue::Null, -1))
             }
             Some(XrefEntry::Free { .. }) | None => Ok((ObjectValue::Null, -1)),
         };
@@ -638,7 +657,16 @@ struct XrefReadContext<'bytes, 'entries> {
     diagnostics: Diagnostics,
     handle_diagnostics_len: usize,
     reconstruction_trigger: Option<(u64, String)>,
-    handle_document: Rc<BootstrapHandleDocument>,
+    /// Built lazily: constructing a [`BootstrapHandleDocument`] copies the
+    /// whole input into a fresh `Rc<[u8]>` (needed so `ObjectHandle`'s
+    /// `'static` resolver can outlive this context). Most contexts -- e.g.
+    /// every `/Prev` hop whose value is the ordinary direct integer, per ISO
+    /// 32000-2 7.5.8.4 -- never touch handle-native resolution at all, so
+    /// deferring construction until [`Self::handle_document`] is actually
+    /// called (from real handle-native work, not from the unconditional
+    /// diagnostics/trigger sync below) avoids that copy entirely instead of
+    /// merely amortizing it.
+    handle_document: OnceCell<Rc<BootstrapHandleDocument>>,
 }
 
 impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
@@ -675,7 +703,6 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                 Rc::clone(bootstrap_cache),
             ),
         };
-        let handle_document = BootstrapHandleDocument::new(bytes, entry_lookup, options);
         Self {
             bytes,
             entry_lookup,
@@ -685,8 +712,21 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
             diagnostics: Diagnostics::default(),
             handle_diagnostics_len: 0,
             reconstruction_trigger: None,
-            handle_document,
+            handle_document: OnceCell::new(),
         }
+    }
+
+    /// Returns this context's [`BootstrapHandleDocument`], constructing it on
+    /// first use. Call sites that only need to observe whether handle-native
+    /// work already happened (diagnostics sync, reconstruction-trigger
+    /// draining) must use `self.handle_document.get()` instead so an
+    /// unrelated lookup does not force the deferred copy.
+    fn handle_document(&self) -> &Rc<BootstrapHandleDocument> {
+        let bytes = self.bytes;
+        let entry_lookup = self.entry_lookup;
+        let options = self.options;
+        self.handle_document
+            .get_or_init(|| BootstrapHandleDocument::new(bytes, entry_lookup, options))
     }
 
     fn object_policy(&self) -> RecoveryPolicy {
@@ -720,7 +760,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
 
     #[cfg(test)]
     fn handle_for_reference(&self, object_ref: ObjectRef) -> Option<ObjectHandle> {
-        Some(self.handle_document.handle_for_reference(object_ref))
+        Some(self.handle_document().handle_for_reference(object_ref))
     }
 
     fn read_file_object_handle(
@@ -731,14 +771,20 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         description: XrefObjectDescription,
     ) -> Result<HandleFileObjectRead> {
         let result =
-            self.handle_document
+            self.handle_document()
                 .read_file_object(input, absolute_offset, policy, description);
         self.sync_handle_diagnostics();
         result
     }
 
     fn sync_handle_diagnostics(&mut self) {
-        let handle_diagnostics = self.handle_document.diagnostics.borrow();
+        // Peek only: a context that never performed handle-native work has no
+        // diagnostics to sync, and must not force the deferred construction
+        // in `Self::handle_document` just to discover that.
+        let Some(handle_document) = self.handle_document.get() else {
+            return;
+        };
+        let handle_diagnostics = handle_document.diagnostics.borrow();
         for diagnostic in handle_diagnostics
             .entries()
             .iter()
@@ -842,7 +888,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         }
 
         let stream_handle = self
-            .handle_document
+            .handle_document()
             .handle_for_reference(ObjectRef::new(stream_number, 0));
         let dereference_result = stream_handle.try_dereference();
         self.sync_handle_diagnostics();
@@ -861,11 +907,13 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         }
 
         let object_count =
-            self.handle_document
+            self.handle_document()
                 .handle_integer(&stream_dict, b"/N", "object stream /N")?;
-        let first =
-            self.handle_document
-                .handle_integer(&stream_dict, b"/First", "object stream /First")?;
+        let first = self.handle_document().handle_integer(
+            &stream_dict,
+            b"/First",
+            "object stream /First",
+        )?;
         let stream_data = stream_handle
             .as_stream_data()
             .ok_or_else(|| Error::parse(0, "supposed object stream has no data"))?;
@@ -1060,12 +1108,30 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
     }
 
     fn take_reconstruction_trigger(&mut self) -> Option<Error> {
-        if let Some(error) = self.handle_document.take_reconstruction_trigger() {
-            return Some(error);
-        }
-        self.reconstruction_trigger
+        // The raw framing pass (e.g. an indirect stream `/Length`, read via
+        // `read_file_object_for_reference`) always runs, and can set
+        // `self.reconstruction_trigger`, before the handle-native metadata
+        // pass (e.g. `/Size`, `/W`, `/Index`) that can set
+        // `handle_document`'s own trigger -- see `parse_xref_stream`'s raw
+        // `read_file_object` call ahead of its `read_file_object_handle` and
+        // `build()` calls. Prefer the raw trigger so the reported
+        // reconstruction cause and offset are the first one qpdf's own
+        // single-pass `readObject` would have hit, matching the
+        // first-trigger-wins rule each field already applies on its own.
+        // Still drain both unconditionally, matching the prior behavior of
+        // always consuming the handle document's trigger on every call. A
+        // context that never performed handle-native work has no trigger to
+        // drain, so peek with `get()` instead of forcing construction via
+        // `Self::handle_document`.
+        let self_trigger = self
+            .reconstruction_trigger
             .take()
-            .map(|(offset, message)| Error::parse(offset as usize, message))
+            .map(|(offset, message)| Error::parse(offset as usize, message));
+        let handle_trigger = self
+            .handle_document
+            .get()
+            .and_then(|handle_document| handle_document.take_reconstruction_trigger());
+        self_trigger.or(handle_trigger)
     }
 }
 
@@ -3422,6 +3488,72 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_document_rebases_a_body_parse_error_to_the_absolute_file_offset() {
+        // The header parse a few lines above already rebases its own error by
+        // `start` (`parse_file_object_header(input).map_err(|error|
+        // error.rebase_offset(start))`); the body parse must too, or an
+        // indirect bootstrap object at a nonzero offset reports a byte
+        // position relative to its own tail slice instead of the file.
+        //
+        // A direct (non-indirect) `/Length` that does not actually reach
+        // "endstream" is a hard `Err` from `complete_handle_stream`
+        // (`reader/file_object.rs`) under the strict, non-repair policy --
+        // unlike `check_endobj`'s softer diagnostic -- so it exercises the
+        // rebase on `Self::read_uncompressed_object`'s body-parse call.
+        let prefix = b"%PDF-1.7\n";
+        let header = b"2 0 obj\n<< /Length 5 >>\n";
+        let stream_keyword = b"stream\n";
+        let data = b"abcde";
+        let mut bytes = prefix.to_vec();
+        let object_offset = bytes.len() as u64;
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(stream_keyword);
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(b"\nNOPE\n");
+        // `complete_handle_stream` reports the hard "expected endstream"
+        // error at `data_start + length`, relative to the object's own tail
+        // slice (`input`), before any rebasing.
+        let relative_error_offset = (header.len() + stream_keyword.len() + data.len()) as u64;
+        let expected_absolute_offset = object_offset + relative_error_offset;
+
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Uncompressed {
+                offset: object_offset,
+            },
+        );
+        let document = BootstrapHandleDocument::new(
+            &bytes,
+            XrefEntryLookup::Registration(&registration.entries),
+            XrefLoadOptions::default(),
+        );
+        let handle = document.handle_for_reference(ObjectRef::new(2, 0));
+        handle.try_dereference().expect(
+            "resolve_indirect degrades a body parse failure to a warning, matching qpdf's \
+             QPDF::resolve catch-and-null fallback, not a hard Err",
+        );
+        assert!(handle.is_null());
+
+        let diagnostics = document.diagnostics.borrow();
+        let message = diagnostics
+            .entries()
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("expected endstream"))
+            .expect("body parse error must be reported as a warning")
+            .message
+            .clone();
+        assert!(
+            message.contains(&format!("byte {expected_absolute_offset}")),
+            "offset must be absolute (object offset + relative), got: {message}"
+        );
+        assert!(
+            !message.contains(&format!("byte {relative_error_offset}: ")),
+            "offset must not be left relative to the object's own tail slice, got: {message}"
+        );
+    }
+
+    #[test]
     fn bootstrap_document_repair_and_object_stream_paths_follow_qpdf_cache_rules() {
         let mut repair_bytes = b"%PDF-1.7\n".to_vec();
         let repair_offset = repair_bytes.len() as u64;
@@ -3662,13 +3794,24 @@ mod tests {
             XrefEntryLookup::Registration(&malformed_member_registration.entries),
             XrefLoadOptions::default(),
         );
+        // qpdf's `resolve` wraps the whole `resolveObjectsInStream` call in a
+        // try/catch that warns and resolves to null (`QPDF.cc:1715-1747`);
+        // `readObjectInStream`'s member loop has no inner catch of its own
+        // (`QPDF.cc:1815-1826`), so a malformed member does not abort
+        // resolution of the *referencing* handle -- it degrades to a warning
+        // and a null value, the same as the missing-member and wrong-type
+        // cases above.
         let malformed_member = malformed_member_document.handle_for_reference(ObjectRef::new(2, 0));
-        let malformed_member_error = malformed_member
+        malformed_member
             .try_dereference()
-            .expect_err("malformed member parser error must be reported");
-        assert!(malformed_member_error
-            .to_string()
-            .contains("integer out of range"));
+            .expect("malformed member parse error resolves to null with a warning");
+        assert!(malformed_member.is_null());
+        assert!(malformed_member_document
+            .diagnostics
+            .borrow()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("integer out of range")));
 
         let mut skipped_member_bytes = b" \n".to_vec();
         let skipped_member_offset = skipped_member_bytes.len() as u64;
@@ -3698,6 +3841,58 @@ mod tests {
             .resolve_object_stream(8)
             .expect("already-resolved member is skipped");
         assert!(skipped_member.is_null());
+    }
+
+    #[test]
+    fn resolve_indirect_degrades_a_malformed_object_stream_n_to_null_with_a_warning() {
+        // qpdf's `resolve` wraps the whole `case 2:
+        // resolveObjectsInStream(...)` call in a try/catch
+        // (`QPDF.cc:1715-1734`); a non-integer `/N` throws `damagedPDF`
+        // inside `resolveObjectsInStream` (`QPDF.cc:1782-1784`), which that
+        // catch converts to a warning before falling through to
+        // `updateCache(og, QPDF_Null::create(), -1, -1)`
+        // (`QPDF.cc:1744-1747`). Resolving a reference into such a stream
+        // must degrade to null with a warning, not propagate a hard `Err`
+        // that aborts the rest of xref bootstrap loading.
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"8 0 obj\n<< /Type /ObjStm /N /NotAnInteger /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        );
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let document = BootstrapHandleDocument::new(
+            &bytes,
+            XrefEntryLookup::Registration(&registration.entries),
+            XrefLoadOptions::default(),
+        );
+        let handle = document.handle_for_reference(ObjectRef::new(2, 0));
+        handle
+            .try_dereference()
+            .expect("a malformed object-stream /N degrades to a warning and a null value, not Err");
+        assert!(handle.is_null());
+        assert!(document
+            .diagnostics
+            .borrow()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("/N is not an integer")));
+        // The recursion guard must not leak on this path: `resolve_indirect`
+        // must remove `object_ref` from `resolving` even when
+        // `resolve_object_stream` returns `Err`.
+        assert!(!document.resolving.borrow().contains(&ObjectRef::new(2, 0)));
     }
 
     #[test]
@@ -6243,6 +6438,51 @@ mod tests {
             no_sink_error.to_string(),
             "parse error at byte 1: expected 2 0 obj"
         );
+    }
+
+    #[test]
+    fn take_reconstruction_trigger_prefers_the_earlier_raw_trigger_over_the_later_handle_trigger() {
+        // The raw framing pass (e.g. an indirect stream `/Length`, recorded
+        // by `read_file_object_for_reference`) always runs, and can record
+        // `context.reconstruction_trigger`, before the handle-native
+        // metadata pass (e.g. `/Size`, `/W`, `/Index`, recorded by
+        // `BootstrapHandleDocument::read_uncompressed_object`) that can
+        // record a second, later mismatch under `handle_document`'s own
+        // trigger -- see `parse_xref_stream`'s raw `read_file_object` call
+        // ahead of its `read_file_object_handle`/`build()` calls. When both
+        // are set in the same context lifetime, `take_reconstruction_trigger`
+        // must report the earlier (raw) one, matching qpdf's own read
+        // reporting the first structural problem it hits, not the last.
+        let bytes = b"";
+        let registration = XrefRegistration::default();
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        context.reconstruction_trigger = Some((5, "expected 5 0 obj".to_string()));
+        context
+            .handle_document()
+            .reconstruction_trigger
+            .replace(Some((9, "expected 9 0 obj".to_string())));
+
+        let trigger = context
+            .take_reconstruction_trigger()
+            .expect("a trigger recorded by either pass must be returned");
+        assert_eq!(
+            trigger.to_string(),
+            "parse error at byte 5: expected 5 0 obj",
+            "the raw pass's earlier trigger must win over the handle pass's later one"
+        );
+        // A single call drains both fields, matching the pre-existing
+        // always-drain-the-handle-trigger behavior (now made symmetric).
+        assert!(context.reconstruction_trigger.is_none());
+        assert!(context
+            .handle_document()
+            .reconstruction_trigger
+            .borrow()
+            .is_none());
     }
 
     #[test]
