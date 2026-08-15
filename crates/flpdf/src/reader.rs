@@ -164,6 +164,16 @@ impl EncryptionState {
         Self::select_method(method, &mut self.cf_stream, encryption_v)
     }
 
+    /// Whether qpdf's `decryptStream` would prepend a decryption stage for
+    /// this stream method, without applying the unknown-filter state rewrite.
+    /// The compatibility boundary uses this read-only form while deciding
+    /// whether recovered source framing belongs to plaintext or ciphertext;
+    /// warning/state mutation remains owned by the actual pipe operation.
+    pub(crate) fn stream_method_transforms(&self, method: Option<EncryptionMode>) -> bool {
+        let method = method.unwrap_or(self.cf_stream);
+        self.encryption_v < 4 || !matches!(method, EncryptionMode::Identity)
+    }
+
     /// qpdf `QPDF::compute_data_key` (`libqpdf/QPDF_encryption.cc:325-357`),
     /// Algorithm 3.1 from the PDF 1.7 Reference Manual.
     ///
@@ -325,7 +335,7 @@ impl Permissions {
 /// [`EncryptionState::with_object_cipher`], which carry qpdf's `use_aes` for
 /// exactly this reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncryptionMode {
+pub(crate) enum EncryptionMode {
     Rc4,
     Aes128,
     Identity,
@@ -2839,6 +2849,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// An unknown, freed, or compressed-but-broken reference is **not** an error;
     /// it resolves to [`Object::Null`].
     pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
+        self.synchronize_canonical_recovered_stream_eol(object_ref)?;
         // This is intentionally the raw-Object compatibility boundary. The
         // canonical ObjectHandle API above owns qpdf-shaped lazy resolution;
         // the legacy reader still owns stream-length recovery, transformed
@@ -2934,6 +2945,7 @@ impl<R: Read + Seek> Pdf<R> {
     fn materialize_canonical_compatibility_value(&mut self, object_ref: ObjectRef) -> Result<bool> {
         let handle = self.get_object_handle(object_ref);
         self.resolve_object_handle(&handle)?;
+        self.synchronize_canonical_recovered_stream_eol(object_ref)?;
         self.synchronize_legacy_resolution_state();
         if !handle.is_resolved() {
             return Ok(false); // cov:ignore: the canonical resolver resolves or errors for every indirect handle
@@ -2967,15 +2979,50 @@ impl<R: Read + Seek> Pdf<R> {
     /// compatibility boundary only: the live `ObjectHandle` remains the
     /// qpdf-shaped source of truth and continues to pipe the full recovered
     /// source span.
+    fn synchronize_canonical_recovered_stream_eol(&mut self, object_ref: ObjectRef) -> Result<()> {
+        if self.transformed_stream_refs.contains(&object_ref)
+            || self.recovered_stream_eols.contains_key(&object_ref)
+        {
+            return Ok(());
+        }
+        // After qpdf-style xref reconstruction, the canonical raw stream view
+        // is the public compatibility value itself; do not create a second
+        // legacy-side framing marker that would make that raw byte look like a
+        // writer-only payload suffix.
+        if self.resolver.reconstructed_xref() {
+            return Ok(());
+        }
+        let Some(handle) = self
+            .resolver
+            .registered_handle(object_ref)
+            .filter(ObjectHandle::is_resolved)
+        else {
+            return Ok(());
+        };
+        let Some(stream_dict) = handle.as_stream_dict() else {
+            return Ok(());
+        };
+        if handle.as_stream_data().is_some()
+            || handle.has_stream_data_provider()
+            || self
+                .resolver
+                .recovered_stream_eol_is_transformed(&stream_dict)?
+        {
+            return Ok(());
+        }
+        if let Some(eol) = self.resolver.recovered_stream_eol(object_ref) {
+            self.recovered_stream_eols.insert(object_ref, eol);
+        }
+        Ok(())
+    }
+
     fn materialize_handle_for_legacy(
         &self,
         object_ref: ObjectRef,
         handle: &ObjectHandle,
     ) -> Result<Object> {
         let mut value = handle.materialize()?;
-        let eol = self
-            .recovered_stream_eol(object_ref)
-            .or_else(|| self.resolver.recovered_stream_eol(object_ref));
+        let eol = self.recovered_stream_eol(object_ref);
         if let Some(eol) = eol {
             if let Object::Stream(stream) = &mut value {
                 if handle.stream_source_length() == Some(stream.data.len())

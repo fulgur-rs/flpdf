@@ -894,14 +894,16 @@ impl LinearizationPlan {
         // Optimization consumer itself completes its ObjectHandle cutover;
         // the producer must not use a legacy-resolve/materialize bridge in
         // the other direction.
-        pdf.with_writer_stream_recovery(|pdf| {
-            crate::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf(
-                pdf,
-                true,
-                false,
-                &BTreeSet::new(),
-            )
-        })?;
+        if pdf.root_ref().is_some() {
+            pdf.with_writer_stream_recovery(|pdf| {
+                crate::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf(
+                    pdf,
+                    true,
+                    false,
+                    &BTreeSet::new(),
+                )
+            })?;
+        }
         let optimization =
             crate::optimization::Optimization::optimize(pdf, &BTreeMap::new(), true, |_| 1)?;
         if pdf.root_ref().is_some()
