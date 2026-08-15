@@ -10,6 +10,7 @@ use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs_from_handle, decode_filter_specs_from_object,
     decode_filter_specs_from_object_with_resolver, encode_flate, encode_run_length,
+    is_decoded_filter as stream_is_decoded_filter,
     passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
     undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
     FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
@@ -66,18 +67,34 @@ pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
     validate_filter_chain_count(filters.len(), Some(MAX_FILTER_CHAIN_LEN))
 }
 
-/// Return a human-readable codec label if `filter_name` is an image/binary
-/// passthrough codec that flpdf does not decode.
+/// Return a human-readable codec label if `filter_name` is one of the four
+/// image/binary codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`,
+/// `CCITTFaxDecode`) that the writer always emits verbatim rather than
+/// re-encoding.
 ///
-/// The four codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
-/// are always emitted verbatim by the writer.  Callers (e.g. `show-stream`) can
-/// use this function to distinguish "known-but-passthrough" filters from
-/// genuinely unsupported ones.
+/// This is an **encode-side** classification: it does not indicate whether
+/// [`decode_stream_data`] can decode the codec. `DCTDecode` streams, for
+/// example, are still reported here (the writer never re-encodes JPEG data)
+/// even though `decode_stream_data` decodes them. Callers that need to know
+/// whether a filter is decodable should use [`is_decoded_filter`] instead.
 ///
 /// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
 /// Returns `None` for any other filter name.
 pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
     stream_passthrough_codec_label(filter_name)
+}
+
+/// Return whether [`decode_stream_data`] can decode a single-stage `/Filter`
+/// of `filter_name`.
+///
+/// Comparison is **byte-exact** (PDF names are case-sensitive per spec) and
+/// this function performs no filter-name normalization, so a qpdf
+/// abbreviation such as `DCT` returns `false` even though the expanded name
+/// `DCTDecode` returns `true`. [`decode_stream_data`] normalizes internally
+/// and decodes either spelling; this function is for callers that need to
+/// know decodability in advance without decoding.
+pub fn is_decoded_filter(filter_name: &[u8]) -> bool {
+    stream_is_decoded_filter(filter_name)
 }
 
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
@@ -3001,6 +3018,47 @@ mod tests {
         assert_eq!(passthrough_codec_label(b"RunLengthDecode"), None);
         assert_eq!(passthrough_codec_label(b"UnknownFilter"), None);
         assert_eq!(passthrough_codec_label(b""), None);
+    }
+
+    // ----- is_decoded_filter tests -----
+
+    #[test]
+    fn is_decoded_filter_is_true_for_every_registered_decode_factory() {
+        assert!(
+            is_decoded_filter(b"DCTDecode"),
+            "DCTDecode decodes via DctStreamFilter"
+        );
+        assert!(is_decoded_filter(b"FlateDecode"));
+        assert!(is_decoded_filter(b"LZWDecode"));
+        assert!(is_decoded_filter(b"ASCII85Decode"));
+        assert!(is_decoded_filter(b"ASCIIHexDecode"));
+        assert!(is_decoded_filter(b"RunLengthDecode"));
+    }
+
+    #[test]
+    fn is_decoded_filter_is_false_for_crypt_despite_its_registered_factory() {
+        // stream_filter_for(b"Crypt") returns Some(CryptStreamFilter), but
+        // prepare_decode_filters always routes Crypt to the crypt provider
+        // before consulting the registry — see the module doc's
+        // "SF_Crypt::setDecodeParms... unreached" section. is_decoded_filter
+        // must not claim Crypt is decodable through this path.
+        assert!(!is_decoded_filter(b"Crypt"));
+    }
+
+    #[test]
+    fn is_decoded_filter_is_false_for_the_remaining_undecoded_passthrough_codecs() {
+        assert!(!is_decoded_filter(b"JBIG2Decode"));
+        assert!(!is_decoded_filter(b"JPXDecode"));
+        assert!(!is_decoded_filter(b"CCITTFaxDecode"));
+    }
+
+    #[test]
+    fn is_decoded_filter_is_false_for_unknown_and_unnormalized_names() {
+        assert!(!is_decoded_filter(b"UnknownFilter"));
+        assert!(!is_decoded_filter(b""));
+        // No normalization: the qpdf abbreviation does not match the
+        // registry, which is keyed on the expanded name.
+        assert!(!is_decoded_filter(b"DCT"));
     }
 
     // ----- flpdf-9hc.7.5: dispatch coverage tests -----

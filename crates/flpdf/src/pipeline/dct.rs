@@ -32,6 +32,18 @@ impl<'a> PlDct<'a> {
                 ));
             }
         }
+        // qpdf's whole-buffer `jpeg_source_mgr` (`Pl_DCT.cc:199-206`,
+        // `fill_buffer_input_buffer`) throws exactly this message whenever
+        // libjpeg asks for more bytes than the supplied buffer holds — for a
+        // buffer too short to even read the SOI marker (0 or 1 bytes, so the
+        // check above never runs) and for a buffer that starts with a valid
+        // SOI but runs out mid-header or mid-scan. `libjpeg-turbo-rs` reports
+        // both as `JpegError::UnexpectedEof`, so normalize both to match
+        // qpdf's observed diagnostic (verified against `qpdf --show-object
+        // --filtered-stream-data` on a 1-byte `/DCTDecode` stream).
+        if matches!(error, libjpeg_turbo_rs::JpegError::UnexpectedEof) {
+            return self.runtime_error("invalid jpeg data reading from buffer");
+        }
         PipelineError::runtime(format!("{}: {error}", self.identifier))
     }
 

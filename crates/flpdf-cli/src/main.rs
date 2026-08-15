@@ -4759,24 +4759,33 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
             return Ok(());
         }
 
-        // For a single passthrough codec (DCTDecode, JBIG2Decode, JPXDecode,
-        // CCITTFaxDecode) emit a human-readable marker instead of dumping binary.
-        // The codec may be stored either as a direct name (`/Filter /DCTDecode`) or
-        // as a single-element array (`/Filter [/DCTDecode]`); both are equivalent
-        // per PDF spec. Multi-element filter chains fall through to the decode path
-        // (scope: flpdf-9hc.7.5).
+        // For a single passthrough codec that flpdf's decode path cannot
+        // decode (currently JBIG2Decode, JPXDecode, CCITTFaxDecode) emit a
+        // human-readable marker instead of dumping binary. DCTDecode is a
+        // passthrough codec on the *write* side (the writer never
+        // re-encodes JPEG data) but is decodable, so it falls through to the
+        // decode path below like any other decodable filter. The codec may
+        // be stored either as a direct name (`/Filter /JBIG2Decode`) or as a
+        // single-element array (`/Filter [/JBIG2Decode]`); both are
+        // equivalent per PDF spec. Multi-element filter chains fall through
+        // to the decode path (scope: flpdf-9hc.7.5).
         let passthrough_label = stream.dict.get("Filter").and_then(|filter| {
             let name = filter.as_name().or_else(|| match filter.as_array() {
                 Some([single]) => single.as_name(),
                 _ => None,
             })?;
-            filters::passthrough_codec_label(name)
+            if filters::is_decoded_filter(name) {
+                None
+            } else {
+                filters::passthrough_codec_label(name)
+            }
         });
         if let Some(label) = passthrough_label {
             // These codecs are not decodable. With `--out`, write the raw stored
-            // bytes (the only available representation — e.g. the embedded JPEG for
-            // DCTDecode) and report the marker on stderr. Without `--out`, print the
-            // marker to stdout instead of dumping binary to the terminal.
+            // bytes (the only available representation — e.g. the embedded JBIG2
+            // data for JBIG2Decode) and report the marker on stderr. Without
+            // `--out`, print the marker to stdout instead of dumping binary to
+            // the terminal.
             if let Some(path) = cmd.out.as_ref() {
                 std::fs::write(path, &stream.data)?;
                 eprintln!("<binary, {} bytes, codec {}>", stream.data.len(), label);

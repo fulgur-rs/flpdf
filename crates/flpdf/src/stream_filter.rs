@@ -197,13 +197,17 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
-/// Return a human-readable codec label if `filter_name` is an image/binary
-/// passthrough codec that flpdf does not decode.
+/// Return a human-readable codec label if `filter_name` is one of the four
+/// image/binary codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`,
+/// `CCITTFaxDecode`) that the writer always emits verbatim rather than
+/// re-encoding.
 ///
-/// The four codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
-/// are always emitted verbatim by the writer.  Keeping this classification
-/// beside the filter registry lets the qpdf-shaped factory check use the same
-/// diagnostic that the later decode stage would have produced.
+/// This is an **encode-side** classification, independent of whether flpdf's
+/// decode path can currently decode the codec — see [`is_decoded_filter`] for
+/// that question. Keeping this classification beside the filter registry lets
+/// the qpdf-shaped factory check use the same diagnostic that the later
+/// decode stage would have produced for a codec with no decode factory at
+/// all.
 pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
     match filter_name {
         b"DCTDecode" => Some("DCTDecode"),
@@ -212,6 +216,18 @@ pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str
         b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
         _ => None,
     }
+}
+
+/// Return whether flpdf's decode path can actually decode `filter_name`.
+///
+/// [`stream_filter_for`] registers a factory for `Crypt` too, but
+/// `filters::prepare_decode_filters` always routes a `Crypt` spec to the
+/// installed crypt provider before consulting the registry (see the module
+/// doc's "`SF_Crypt::setDecodeParms`... unreached" section), so `Crypt` is
+/// excluded here to keep this predicate honest about what a caller like
+/// `show-stream` will actually observe.
+pub(crate) fn is_decoded_filter(filter_name: &[u8]) -> bool {
+    filter_name != b"Crypt" && stream_filter_for(filter_name).is_some()
 }
 
 /// Report why a filter name has no decode factory.
@@ -5600,9 +5616,6 @@ pub(crate) mod tests {
             };
 
             assert!(matches!(error, PipelineError::Runtime(_)));
-            #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-            assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
-            #[cfg(feature = "qpdf-libjpeg-compat")]
             assert_eq!(
                 error.to_string(),
                 "DCT decode: invalid jpeg data reading from buffer"
@@ -5613,7 +5626,6 @@ pub(crate) mod tests {
             assert_eq!(sink.finish_attempts, 0);
         }
 
-        #[cfg(not(feature = "qpdf-libjpeg-compat"))]
         {
             let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
             assert!(filter.set_decode_params(&DecodeParams::Absent));
@@ -5632,7 +5644,10 @@ pub(crate) mod tests {
             };
 
             assert!(matches!(error, PipelineError::Runtime(_)));
-            assert!(error.to_string().starts_with("DCT decode: "));
+            assert_eq!(
+                error.to_string(),
+                "DCT decode: invalid jpeg data reading from buffer"
+            );
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);

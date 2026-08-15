@@ -12,12 +12,14 @@
 //!
 //! flpdf-9hc.7.6 additions:
 //!   - ASCII85Decode + LZWDecode chain: decode → correct payload.
-//!   - DCTDecode standalone: passthrough marker + byte-identical after rewrite.
+//!   - DCTDecode standalone: decode error on non-JPEG bytes + write-side
+//!     passthrough stays byte-identical after rewrite regardless.
 //!   - CCITTFaxDecode standalone: passthrough marker + byte-identical after rewrite.
 //!   - JBIG2Decode with /JBIG2Globals indirect ref: passthrough + ref preserved.
 
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf};
+use predicates::prelude::*;
 use std::io::Cursor;
 use std::process::Command as ShellCommand;
 use tempfile::tempdir;
@@ -424,13 +426,18 @@ fn cli_show_stream_ascii85_lzw_chain() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: DCTDecode standalone — passthrough marker + byte-identical after rewrite
-// (flpdf-9hc.7.6)
+// Test: DCTDecode standalone — decode error on non-JPEG bytes, and
+// write-side passthrough stays byte-identical after rewrite regardless
+// (flpdf-9hc.7.6; DCTDecode's decode capability landed later, PR #836)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_show_stream_dct_passthrough_marker_and_rewrite() {
-    // Fake JPEG-like bytes (arbitrary binary — DCTDecode is a passthrough codec).
+fn cli_show_stream_dct_decode_error_and_rewrite_byte_identical() {
+    // Fake JPEG-like bytes: starts with a valid SOI/APP0 marker but is not a
+    // complete, decodable JPEG. DCTDecode decodes real JPEGs (unlike
+    // JBIG2Decode/JPXDecode/CCITTFaxDecode below, which have no decode
+    // factory at all), so show-stream must report a decode error here
+    // rather than a passthrough marker or a silent success.
     let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0xAA, 0xBB, 0xCC, 0xDD];
 
     let pdf_bytes = build_pdf_with_prefiltered_stream(fake_jpeg, "/DCTDecode", None);
@@ -440,27 +447,22 @@ fn cli_show_stream_dct_passthrough_marker_and_rewrite() {
     std::fs::write(&pdf_path, &pdf_bytes).unwrap();
     let pdf_path_str = pdf_path.to_str().unwrap();
 
-    // (a) show-stream must emit the passthrough marker (not raw binary).
-    let stdout = Command::cargo_bin("flpdf")
+    // (a) show-stream must report a decode error, not fall back to the
+    // passthrough marker used for genuinely undecodable codecs.
+    Command::cargo_bin("flpdf")
         .unwrap()
         .args(["show-stream", "4 0", pdf_path_str])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let marker_str = String::from_utf8_lossy(&stdout);
-    let expected_marker = format!("<binary, {} bytes, codec DCTDecode>", fake_jpeg.len());
-    assert_eq!(
-        marker_str.trim(),
-        expected_marker,
-        "show-stream DCTDecode must emit passthrough marker"
-    );
+        .failure()
+        .stderr(predicate::str::contains("DCT decode:"));
 
-    // (b) After full-rewrite, stream data must be byte-identical.
+    // (b) After full-rewrite, stream data must still be byte-identical: the
+    // writer never re-encodes DCTDecode data regardless of whether flpdf's
+    // decode path can decode it.
     // Use --remove-unreferenced-resources=no to prevent the resources scanner
-    // from attempting to decode the passthrough codec content stream, which
-    // would fail because DCTDecode is a passthrough codec (not decoded by flpdf).
+    // from attempting to decode this content stream: it carries non-JPEG
+    // bytes under /Filter /DCTDecode purely to exercise write-side
+    // passthrough, so a real decode attempt fails on it either way.
     let (_tmp2, out_path) = rewrite_pdf(pdf_path_str, &["--remove-unreferenced-resources=no"]);
     let out_bytes = std::fs::read(&out_path).unwrap();
     let mut pdf = Pdf::open(Cursor::new(out_bytes)).unwrap();
