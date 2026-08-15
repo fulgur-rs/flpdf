@@ -3937,9 +3937,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         XrefForm::Stream => {
             // Cross-reference stream emission is delegated to the canonical
             // plain-writer xref layer below.
+            // cov:ignore-start: object_count is bounded by the u32 object-number
+            // space before this branch, so this usize overflow requires an
+            // unallocatable PDF-sized object universe.
             let xref_size = object_count.checked_add(1).ok_or_else(|| {
                 crate::Error::Unsupported("full-rewrite: xref-stream /Size overflows usize".into())
             })?;
+            // cov:ignore-end
             let old_to_new: HashMap<ObjectRef, ObjectRef> = renumbered
                 .iter()
                 .map(|(new_ref, old_ref)| (*old_ref, *new_ref))
@@ -3964,17 +3968,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 options.deterministic_id,
                 generated_id_handle.as_ref(),
             )?; // cov:ignore: validated xref trailer construction; LLVM maps this continuation to the call setup
-            let id = if options.deterministic_id {
-                plain::xref::IdPlan::Deterministic {
-                    source_id0: det_id_source_id0.clone(),
-                    info_suffix: det_id_info_suffix.clone(),
-                }
-            } else {
-                plain::xref::IdPlan::Materialized {
-                    value: plain::xref::materialized_id_handle(
-                        &trailer_handle.try_get_key(b"/ID")?,
-                    )?,
-                }
+            let id = plain::xref::IdPlan::Materialized {
+                value: plain::xref::materialized_id_handle(&trailer_handle.try_get_key(b"/ID")?)?, // cov:ignore: build_writer_trailer_handle constructs the writer-owned /ID in the validated two-string shape
             };
             let trailer = plain::xref::TrailerPlan {
                 form: XrefForm::Stream,
