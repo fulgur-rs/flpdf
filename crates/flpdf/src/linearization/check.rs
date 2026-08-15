@@ -27,8 +27,9 @@
 //! - `Err(LinearizationCheckError::InvalidParam { … })` — a param-dict invariant failed
 //! - `Err(LinearizationCheckError::Io(…))` — I/O failure reading the file
 
-use crate::{DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
-use std::collections::{BTreeSet, VecDeque};
+use crate::optimization::{ObjectUser, Optimization};
+use crate::{DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result, XrefEntry};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufReader, Read, Seek};
 use std::rc::Rc;
@@ -181,72 +182,104 @@ fn is_pdf_whitespace(b: u8) -> bool {
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
 }
 
-/// Enqueue indirect references reachable from a canonical direct value.
-///
-/// This is the ObjectHandle equivalent of the object-user walk that qpdf's
-/// `optimize(false)` performs before `calculateLinearizationData`: direct
-/// arrays/dictionaries are traversed in place, while an indirect handle is a
-/// source-object boundary and is queued for extent capture by the caller.
-fn enqueue_references(value: &ObjectHandle, pending: &mut VecDeque<ObjectRef>) -> Result<()> {
-    if let Some(object_ref) = value.object_ref() {
-        pending.push_back(object_ref);
-        return Ok(());
-    }
+/// The root keys `calculateLinearizationData` routes to part 4 (open
+/// document), not part 6, even when also reachable from the first page
+/// (`QPDF_linearization.cc:1046-1050,1089-1097`). `/Encrypt` is a trailer
+/// key, checked separately in [`is_open_document_user`].
+const OPEN_DOCUMENT_ROOT_KEYS: [&[u8]; 5] = [
+    b"ViewerPreferences",
+    b"PageMode",
+    b"Threads",
+    b"OpenAction",
+    b"AcroForm",
+];
 
-    value.try_dereference()?;
-    if let Some(items) = value.as_array() {
-        for item in items {
-            enqueue_references(&item, pending)?;
-        }
-    } else if let Some(entries) = value.try_as_dictionary()? {
-        for (_key, child) in entries {
-            enqueue_references(&child, pending)?;
-        }
-    } else if let Some(stream_dict) = value.as_stream_dict() {
-        enqueue_references(&stream_dict, pending)?;
+/// `QPDF_linearization.cc:1077-1097`'s `in_open_document` predicate.
+fn is_open_document_user(user: &ObjectUser) -> bool {
+    match user {
+        ObjectUser::TrailerKey(key) => key == b"Encrypt",
+        ObjectUser::RootKey(key) => OPEN_DOCUMENT_ROOT_KEYS.contains(&key.as_slice()),
+        _ => false,
     }
-    Ok(())
 }
 
 /// Return qpdf's source-extent envelope for the objects assigned to part 6.
 ///
-/// qpdf's `checkLinearizationInternal` compares `/E` with the maximum
-/// `end_before_space`/`end_after_space` of `m->part6` after its non-mutating
-/// optimization pass (`QPDF_linearization.cc:480-522`). For the consumer path,
-/// the canonical page closure is the same object-user boundary: the first page
-/// and its direct resource/content graph, with `/Parent` page-tree edges
-/// excluded. `/Outlines` is added when `/PageMode /UseOutlines` makes qpdf put
-/// that graph in part 6.
-fn first_page_source_extent<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<(i64, i64)> {
-    let mut pending = VecDeque::from([page_ref]);
-    let mut visited = BTreeSet::new();
+/// qpdf's `checkLinearizationInternal` does not walk the first page's
+/// reachability graph directly: it runs the *same* `optimize(object_stream_data,
+/// false)` and `calculateLinearizationData()` machinery the writer uses
+/// (`QPDF_linearization.cc:483-497`), then measures `m->part6`'s objects'
+/// `end_before_space`/`end_after_space` (`:507-521`). Part 6 membership is an
+/// object-user classification, not plain reachability: an object reachable
+/// from the first page is still routed elsewhere when it is also reachable
+/// through `/Outlines` (part 6 only under `/PageMode /UseOutlines`, otherwise
+/// part 9 — `in_outlines` outranks `in_first_page`,
+/// `QPDF_linearization.cc:1120,1124-1127`) or through one of the open-document
+/// root/trailer keys (always part 4, `:1089-1097,1122-1123`).
+///
+/// This reuses [`crate::optimization::Optimization`], the ported
+/// `QPDF_optimization.cc` object-user primitive that already drives the
+/// linearization writer (`linearization/plan.rs`), instead of re-deriving a
+/// bespoke reachability walk here — the consumer and producer share qpdf's
+/// exact classification rules.
+fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i64)> {
+    let mut object_stream_data = BTreeMap::new();
+    for (object_ref, entry) in pdf.get_xref_table() {
+        if let XrefEntry::Compressed { stream, .. } = entry {
+            object_stream_data.insert(object_ref.number, stream);
+        }
+    }
+    // qpdf's checkLinearizationInternal calls `optimize(object_stream_data,
+    // false)` with no `skip_stream_parameters` override, i.e. it always
+    // preserves every stream dictionary key while traversing.
+    let optimization = Optimization::optimize(pdf, &object_stream_data, false, |_stream| 0u8)?;
+
+    let outlines_in_first_page = {
+        let mut use_outlines_with_outlines = false;
+        if let Some(root_ref) = pdf.root_ref() {
+            let root = pdf.get_object_handle(root_ref);
+            root.try_dereference()?;
+            if let Some(root_dict) = root.try_as_dictionary()? {
+                let page_mode = root_dict.get(b"/PageMode" as &[u8]).cloned();
+                let use_outlines = if let Some(page_mode) = page_mode {
+                    page_mode.try_dereference()?;
+                    page_mode.as_name().as_deref() == Some(b"UseOutlines")
+                } else {
+                    false
+                };
+                if use_outlines {
+                    use_outlines_with_outlines = root_dict.contains_key(b"/Outlines" as &[u8]);
+                }
+            } // cov:ignore: llvm maps the root-dictionary cleanup to this brace
+        } // cov:ignore: llvm maps the optional root-ref cleanup to this brace
+        use_outlines_with_outlines
+    };
+
     let mut max_end_before_space = -1_i64;
     let mut max_end_after_space = -1_i64;
 
-    if let Some(root_ref) = pdf.root_ref() {
-        let root = pdf.get_object_handle(root_ref);
-        root.try_dereference()?;
-        if let Some(root_dict) = root.try_as_dictionary()? {
-            let page_mode = root_dict.get(b"/PageMode" as &[u8]).cloned();
-            let use_outlines = if let Some(page_mode) = page_mode {
-                page_mode.try_dereference()?;
-                page_mode.as_name().as_deref() == Some(b"UseOutlines")
-            } else {
-                false
-            };
-            if use_outlines {
-                if let Some(outlines) = root_dict.get(b"/Outlines" as &[u8]).cloned() {
-                    enqueue_references(&outlines, &mut pending)?;
-                } // cov:ignore: llvm maps the nested optional-branch cleanup to this brace
-            }
-        } // cov:ignore: llvm maps the root-dictionary cleanup to this brace
-    } // cov:ignore: llvm maps the optional root-ref cleanup to this brace
+    for (object_ref, users) in optimization.object_users() {
+        let is_root = users.contains(&ObjectUser::Root);
+        let in_outlines = users
+            .iter()
+            .any(|user| matches!(user, ObjectUser::RootKey(key) if key == b"Outlines"));
+        let in_open_document = users.iter().any(is_open_document_user);
+        let in_first_page = users.contains(&ObjectUser::Page(0));
 
-    while let Some(object_ref) = pending.pop_front() {
-        if !visited.insert(object_ref) {
+        // `QPDF_linearization.cc:1118-1127`'s priority-ordered classification:
+        // is_root > in_outlines > in_open_document > in_first_page. Both
+        // `lc_first_page_private` and `lc_first_page_shared` land in part 6,
+        // so a plain `in_first_page` boolean captures membership here.
+        let in_part6 = if is_root {
+            false
+        } else if in_outlines {
+            outlines_in_first_page
+        } else if in_open_document {
+            false
+        } else {
+            in_first_page
+        };
+        if !in_part6 {
             continue;
         }
 
@@ -260,32 +293,6 @@ fn first_page_source_extent<R: Read + Seek>(
         }
         max_end_before_space = max_end_before_space.max(end_before_space);
         max_end_after_space = max_end_after_space.max(end_after_space);
-
-        let Some(entries) = object.try_as_dictionary()? else {
-            if let Some(stream_dict) = object.as_stream_dict() {
-                enqueue_references(&stream_dict, &mut pending)?;
-            }
-            continue;
-        };
-
-        let type_name = entries.get(b"/Type" as &[u8]).cloned();
-        let is_page = if let Some(type_name) = type_name {
-            type_name.try_dereference()?;
-            type_name.as_name().as_deref() == Some(b"Page")
-        } else {
-            false
-        };
-        // qpdf treats nested Page objects as graph boundaries in the
-        // object-user walk; the first page itself is the one exception.
-        if object_ref != page_ref && is_page {
-            continue;
-        }
-        for (key, child) in entries {
-            if is_page && key == b"/Parent" {
-                continue;
-            }
-            enqueue_references(&child, &mut pending)?;
-        }
     }
 
     Ok((max_end_before_space, max_end_after_space))
@@ -528,8 +535,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     if e_val >= file_len {
         fail!("/E ({e_val}) must be less than file length ({file_len})");
     }
-    let (min_e, max_e) =
-        first_page_source_extent(pdf, first_page_ref).map_err(LinearizationCheckError::from)?;
+    let (min_e, max_e) = first_page_source_extent(pdf).map_err(LinearizationCheckError::from)?;
     // cov:ignore-start: source extents are rejected as negative in the canonical
     // object walk before this conversion; parsed PDF integers are i64-backed.
     let min_e = u64::try_from(min_e).map_err(|_| LinearizationCheckError::InvalidParam {
@@ -1378,6 +1384,97 @@ mod tests {
         doc.bytes
     }
 
+    /// Classic-mode (no object streams) linearize of a real
+    /// `tests/fixtures/compat/` fixture, exercised entirely through the
+    /// library's own plan/renumber/write/back_patch pipeline — the same
+    /// machinery `flpdf rewrite --linearize` drives, verified byte-identical
+    /// to `qpdf --linearize` for these fixtures.
+    fn linearize_classic_fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat")
+            .join(name);
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        let mut pdf =
+            Pdf::open(Cursor::new(raw.clone())).unwrap_or_else(|e| panic!("open {name}: {e}"));
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false)
+            .unwrap_or_else(|e| panic!("plan {name}: {e}"));
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut pdf2 = Pdf::open(Cursor::new(raw)).unwrap_or_else(|e| panic!("reopen {name}: {e}"));
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
+            .unwrap_or_else(|e| panic!("write {name}: {e}"));
+        doc.back_patch()
+            .unwrap_or_else(|e| panic!("back_patch {name}: {e}"));
+        doc.bytes
+    }
+
+    // Regression coverage for the P1 finding on the part-6 extent walk
+    // (`first_page_source_extent`): a hand-rolled first-page reachability
+    // walk is not qpdf's actual part-6 object-user classification
+    // (`QPDF_linearization.cc:1063-1139`). Confirmed empirically: `qpdf
+    // --check-linearization` reports "no linearization errors" on qpdf's own
+    // (byte-identical to flpdf's) linearized output for each fixture below,
+    // while the walk this replaces rejected them with a computed /E range
+    // that excluded the real /E.
+    #[test]
+    fn check_linearization_passes_for_outlines_shared_page_fixture() {
+        // objstm-lin-outlines-shared-page-80-80.pdf: one font is referenced
+        // by both the first page and an /Outlines item. qpdf's `in_outlines`
+        // classification outranks `in_first_page`
+        // (`QPDF_linearization.cc:1120`), so without /PageMode /UseOutlines
+        // that font is NOT part 6. The former graph walk had no notion of
+        // this priority and pulled the font (and everything after it) into
+        // its part-6 extent, producing a range that excluded the real /E.
+        let bytes = linearize_classic_fixture("objstm-lin-outlines-shared-page-80-80.pdf");
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "qpdf-faithful linearized output must pass check_linearization: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_linearization_passes_for_thumb_first_edge_wins_fixture() {
+        // objstm-lin-thumb-first-edge-wins.pdf: an object reachable from the
+        // first page is also a page thumbnail; qpdf's classification still
+        // routes it through in_first_page once thumbs are counted, but the
+        // former graph walk's ad hoc /Thumb handling diverged.
+        let bytes = linearize_classic_fixture("objstm-lin-thumb-first-edge-wins.pdf");
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "qpdf-faithful linearized output must pass check_linearization: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_linearization_passes_for_null_visible_thumb_first_edge_fixture() {
+        let bytes = linearize_classic_fixture("null-visible-thumb-first-edge.pdf");
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "qpdf-faithful linearized output must pass check_linearization: {result:?}"
+        );
+    }
+
+    // Regression coverage for the P1 finding on `enqueue_references`'s
+    // caller (check.rs:268 in the pre-fix code): when the first page's
+    // /Contents is an INDIRECT reference to an array of further indirect
+    // content streams, the array branch was never reached because
+    // `object.try_as_dictionary()` returns `None` for arrays too, and the
+    // fallback only handled streams. Reusing `crate::optimization::
+    // Optimization` (whose traversal already threads through `Object::Array`
+    // regardless of how it was reached, `optimization.rs:271-281`) fixes
+    // this as a side effect of fixing the classification itself.
+    #[test]
+    fn check_linearization_passes_for_indirect_contents_array_fixture() {
+        let bytes = linearize_classic_fixture("qdf-contents-ref-array.pdf");
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "qpdf-faithful linearized output must pass check_linearization: {result:?}"
+        );
+    }
+
     fn linearized_fixture_bytes() -> Vec<u8> {
         std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1550,7 +1647,7 @@ mod tests {
         let bytes = source_extent_graph_fixture();
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open extent graph");
         let (end_before_space, end_after_space) =
-            first_page_source_extent(&mut pdf, ObjectRef::new(3, 0)).expect("source extent");
+            first_page_source_extent(&mut pdf).expect("source extent");
         assert!(end_before_space > 0);
         assert!(end_after_space >= end_before_space);
     }
@@ -1559,22 +1656,30 @@ mod tests {
     fn extent_walk_rejects_a_missing_object_source_extent() {
         let bytes = source_extent_graph_fixture();
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open extent graph");
-        let error = first_page_source_extent(&mut pdf, ObjectRef::new(99, 0))
-            .expect_err("missing object has no source extent");
+        // Materialize a fresh object with no physical source extent and route
+        // it into part 6 through /Outlines (the fixture already carries
+        // /PageMode /UseOutlines). This mirrors how qpdf's own optimize() can
+        // hand calculateLinearizationData an object with no parsed byte
+        // position at all — e.g. a non-indirect /Outlines dictionary qpdf
+        // forces indirect before classification (`QPDF_optimization.cc:67-76`).
+        let injected_ref = ObjectRef::new(50, 0);
+        pdf.set_object(
+            injected_ref,
+            crate::Object::Dictionary(crate::Dictionary::new()),
+        );
+        let root_ref = ObjectRef::new(1, 0);
+        let mut root = match pdf.resolve(root_ref).expect("resolve root") {
+            crate::Object::Dictionary(dict) => dict,
+            other => panic!("expected root dictionary, got {other:?}"),
+        };
+        root.insert("Outlines", crate::Object::Reference(injected_ref));
+        pdf.set_object(root_ref, crate::Object::Dictionary(root));
+
+        let error = first_page_source_extent(&mut pdf)
+            .expect_err("materialized object has no source extent");
         assert!(
             matches!(error, crate::Error::Unsupported(message) if message.contains("no source extent"))
         );
-    }
-
-    #[test]
-    fn enqueue_references_traverses_a_direct_stream_dictionary() {
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(0))]),
-            Rc::new(Vec::new()),
-        );
-        let mut pending = VecDeque::new();
-        enqueue_references(&stream, &mut pending).expect("direct stream dictionary");
-        assert!(pending.is_empty());
     }
 
     #[test]
