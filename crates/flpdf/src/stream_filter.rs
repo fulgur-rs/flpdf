@@ -368,106 +368,6 @@ pub(crate) fn decode_filter_specs_from_object(
         .collect())
 }
 
-/// Read filter metadata from an `Object` dictionary while resolving each
-/// object position that qpdf inspects during `QPDF_Stream::filterable`.
-///
-/// This is the bootstrap counterpart of [`decode_filter_specs_from_handle`].
-/// It keeps the `Object` shape, because xref-stream decoding happens before
-/// the live `ObjectHandle` resolver is available, and injects only the
-/// read-time resolver needed by that bootstrap context. `/Filter`, its array
-/// items, `/DecodeParms`, and its array items are always resolved. Values
-/// inside a `/DecodeParms` dictionary are resolved only for filters whose
-/// qpdf implementation consumes those entries (`QPDF_Stream.cc:386-482`,
-/// `SF_FlateLzwDecode.cc:21-72`).
-pub(crate) fn decode_filter_specs_from_object_with_resolver(
-    filter: Option<&Object>,
-    decode_params: Option<&Object>,
-    max_filter_chain: Option<usize>,
-    resolve: &mut dyn FnMut(&Object) -> Object,
-) -> Result<Vec<FilterSpec>> {
-    let names: Vec<Vec<u8>> = match filter {
-        None | Some(Object::Null) => return Ok(Vec::new()),
-        Some(value) => match resolve(value) {
-            Object::Null => return Ok(Vec::new()),
-            Object::Name(name) => vec![name],
-            Object::Array(items) => {
-                // Counted on the resolved array before its children are
-                // inspected, matching qpdf's getArrayNItems ordering.
-                validate_filter_chain_count(items.len(), max_filter_chain)?;
-                items
-                    .iter()
-                    .map(|item| {
-                        let item = resolve(item);
-                        item.as_name()
-                            .map(ToOwned::to_owned)
-                            .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
-                    })
-                    .collect::<Result<_>>()?
-            }
-            _ => return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string())),
-        },
-    };
-
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    validate_filter_factories(names.iter().map(Vec::as_slice))?;
-
-    let params: Vec<Option<Object>> = match decode_params {
-        None | Some(Object::Null) => vec![None; names.len()],
-        Some(value) => match resolve(value) {
-            Object::Null => vec![None; names.len()],
-            Object::Array(items) if items.is_empty() => vec![None; names.len()],
-            Object::Array(items) => {
-                if items.len() != names.len() {
-                    return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
-                }
-                items
-                    .iter()
-                    .map(|item| {
-                        let item = resolve(item);
-                        (!matches!(item, Object::Null)).then_some(item)
-                    })
-                    .collect()
-            }
-            item => {
-                // Keep one resolved scalar object alive while each stage
-                // reduces it to its bounded DecodeParams view. Replicating
-                // the owned Object first would deep-clone a large dictionary
-                // once per filter stage.
-                validate_filter_chain_count(names.len(), max_filter_chain)?;
-                return Ok(names
-                    .into_iter()
-                    .map(|name| FilterSpec {
-                        decode_params: decode_params_from_object_with_resolver(
-                            Some(&item),
-                            &name,
-                            resolve,
-                        ),
-                        name,
-                    })
-                    .collect());
-            }
-        },
-    };
-
-    validate_filter_chain_count(names.len(), max_filter_chain)?;
-
-    Ok(names
-        .into_iter()
-        .zip(params)
-        .map(|(name, decode_params)| FilterSpec {
-            decode_params: decode_params_from_object_with_resolver(
-                decode_params.as_ref(),
-                &name,
-                resolve,
-            ),
-            name,
-        })
-        .collect())
-}
-
 /// The same read as [`decode_filter_specs_from_object`], entered through the
 /// resolving `try_*` accessors.
 ///
@@ -917,44 +817,6 @@ fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> Dec
                 .map(|(key, value)| {
                     let keeps_name = keeps_crypt_name_payload(key, crypt_stage);
                     (key.to_vec(), param_value_from_object(value, keeps_name))
-                })
-                .collect(),
-            None => Vec::new(),
-        }),
-    }
-}
-
-fn decode_params_from_object_with_resolver(
-    params: Option<&Object>,
-    filter_name: &[u8],
-    resolve: &mut dyn FnMut(&Object) -> Object,
-) -> DecodeParams {
-    let omits_null_values = filter_reads_decode_params(filter_name);
-    let crypt_stage = is_crypt_filter(filter_name);
-    match params {
-        None | Some(Object::Null) => DecodeParams::Absent,
-        Some(object) => DecodeParams::Present(match object.as_dict() {
-            Some(dict) => dict
-                .iter()
-                .filter_map(|(key, value)| {
-                    // qpdf's consuming filters enumerate with getKeys(),
-                    // which resolves every dictionary value before selecting
-                    // the parameter keys it reads. Non-consuming filters
-                    // retain the direct-object behavior and never inspect
-                    // child values.
-                    let value = if omits_null_values {
-                        resolve(value)
-                    } else {
-                        value.clone()
-                    };
-                    if omits_null_values && matches!(value, Object::Null) {
-                        return None;
-                    }
-                    if !retains_decode_param_key(key, crypt_stage) {
-                        return None;
-                    }
-                    let keeps_name = keeps_crypt_name_payload(key, crypt_stage);
-                    Some((key.to_vec(), param_value_from_object(&value, keeps_name)))
                 })
                 .collect(),
             None => Vec::new(),
@@ -2422,14 +2284,13 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 pub(crate) mod tests {
     use super::{
         consumes_integer_decode_param_key, decode_filter_specs_from_handle,
-        decode_filter_specs_from_object, decode_filter_specs_from_object_with_resolver,
-        decode_flate, decode_flate_chunks, decode_params_from_handle, decode_params_from_object,
-        encode_flate, encode_run_length, ignore_codec_warning, ignore_warning,
-        keeps_crypt_name_payload, normalize_filter_name, param_value_from_handle,
-        stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter,
-        DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
-        Pipeline, PipelineError, PipelineResult, RunLengthStreamFilter, StreamFilter,
-        DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
+        decode_filter_specs_from_object, decode_flate, decode_flate_chunks,
+        decode_params_from_handle, decode_params_from_object, encode_flate, encode_run_length,
+        ignore_codec_warning, ignore_warning, keeps_crypt_name_payload, normalize_filter_name,
+        param_value_from_handle, stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter,
+        CryptStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle,
+        OutputBuffer, ParamValue, Pipeline, PipelineError, PipelineResult, RunLengthStreamFilter,
+        StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
@@ -3077,117 +2938,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resolver_treats_indirect_null_filter_and_decode_parms_as_absent() {
-        let filter_ref = Object::Reference(ObjectRef::new(10, 0));
-        let decode_parms_ref = Object::Reference(ObjectRef::new(11, 0));
-        let flate = Object::Name(b"FlateDecode".to_vec());
-        let mut resolve = |value: &Object| match value {
-            Object::Reference(ObjectRef { number: 10, .. })
-            | Object::Reference(ObjectRef { number: 11, .. }) => Object::Null,
-            _ => value.clone(),
-        };
-
-        let no_filters = decode_filter_specs_from_object_with_resolver(
-            Some(&filter_ref),
-            None,
-            None,
-            &mut resolve,
-        )
-        .unwrap();
-        assert!(no_filters.is_empty());
-
-        let specs = decode_filter_specs_from_object_with_resolver(
-            Some(&flate),
-            Some(&decode_parms_ref),
-            None,
-            &mut resolve,
-        )
-        .unwrap();
-        assert_eq!(specs.len(), 1);
-        assert!(specs[0].decode_params.is_absent());
-    }
-
-    #[test]
-    fn resolver_reader_covers_object_array_and_decode_param_shapes() {
-        let empty_filter = Object::Array(Vec::new());
-        let mut resolve = |value: &Object| value.clone();
-        let specs = decode_filter_specs_from_object_with_resolver(
-            Some(&empty_filter),
-            None,
-            None,
-            &mut resolve,
-        )
-        .unwrap();
-        assert!(specs.is_empty());
-
-        let invalid_filter = Object::Integer(1);
-        let mut resolve = |value: &Object| value.clone();
-        let error = decode_filter_specs_from_object_with_resolver(
-            Some(&invalid_filter),
-            None,
-            None,
-            &mut resolve,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: stream filter type is not name or array"
-        );
-
-        let filter = Object::Array(vec![
-            Object::Name(b"FlateDecode".to_vec()),
-            Object::Name(b"ASCIIHexDecode".to_vec()),
-        ]);
-        let decode_parms = Object::Array(vec![
-            params(&[
-                ("Ignored", Object::Integer(2)),
-                ("Predictor", Object::Reference(ObjectRef::new(20, 0))),
-            ]),
-            params(&[("Ignored", Object::Null)]),
-        ]);
-        let mut resolve = |value: &Object| match value {
-            Object::Reference(reference) if *reference == ObjectRef::new(20, 0) => Object::Null,
-            _ => value.clone(),
-        };
-        let specs = decode_filter_specs_from_object_with_resolver(
-            Some(&filter),
-            Some(&decode_parms),
-            None,
-            &mut resolve,
-        )
-        .unwrap();
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
-        assert_eq!(specs[1].decode_params, DecodeParams::Present(Vec::new()));
-
-        let mismatched = Object::Array(vec![Object::Null, Object::Null]);
-        let scalar_filter = Object::Name(b"FlateDecode".to_vec());
-        let mut resolve = |value: &Object| value.clone();
-        let error = decode_filter_specs_from_object_with_resolver(
-            Some(&scalar_filter),
-            Some(&mismatched),
-            None,
-            &mut resolve,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
-        );
-
-        let non_dictionary = Object::Integer(1);
-        let mut resolve = |value: &Object| value.clone();
-        let specs = decode_filter_specs_from_object_with_resolver(
-            Some(&scalar_filter),
-            Some(&non_dictionary),
-            None,
-            &mut resolve,
-        )
-        .unwrap();
-        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
-    }
-
-    #[test]
     fn decode_parms_array_must_align_with_filter_array() {
         let filter = Object::Array(vec![
             Object::Name(b"FlateDecode".to_vec()),
@@ -3218,19 +2968,6 @@ pub(crate) mod tests {
             decode_filter_specs_from_object(Some(&filter), Some(&params), None)
                 .unwrap_err()
                 .to_string(),
-            expected
-        );
-
-        let mut resolve = |value: &Object| value.clone();
-        assert_eq!(
-            decode_filter_specs_from_object_with_resolver(
-                Some(&filter),
-                Some(&params),
-                None,
-                &mut resolve,
-            )
-            .unwrap_err()
-            .to_string(),
             expected
         );
 

@@ -8,9 +8,8 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs_from_handle, decode_filter_specs_from_object,
-    decode_filter_specs_from_object_with_resolver, encode_flate, encode_run_length,
-    is_decoded_filter as stream_is_decoded_filter,
+    decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
+    encode_run_length, is_decoded_filter as stream_is_decoded_filter,
     passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
     undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
     FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
@@ -127,37 +126,6 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
         DecodeLimits::default(),
         &mut reject_decode_warning,
     )
-}
-
-/// Decode xref-stream bytes after reading filter metadata through the xref
-/// bootstrap resolver.
-///
-/// The xref stream is parsed before the normal `ObjectHandle` graph is live,
-/// so this route uses the same `Object`-shape codec engine as
-/// [`decode_stream_data`] while supplying the xref reader's reference
-/// resolver only to filter metadata. This mirrors qpdf's
-/// `QPDF_Stream::filterable` metadata reads (`libqpdf/QPDF_Stream.cc:386-482`)
-/// without creating a second decode pipeline.
-pub(crate) fn decode_stream_data_from_xref_context(
-    dict: &Dictionary,
-    stream_data: &[u8],
-    resolve: &mut dyn FnMut(&Object) -> Object,
-) -> Result<Vec<u8>> {
-    let limits = DecodeLimits::default();
-    let specs = decode_filter_specs_from_object_with_resolver(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
-        limits.max_filter_chain,
-        resolve,
-    )?;
-    let outcome = decode_prepared_specs(
-        specs,
-        stream_data,
-        limits,
-        DataEventMode::Suppress,
-        &mut reject_crypt_stage,
-    )?;
-    replay_strict_decode_outcome(outcome, &mut reject_decode_warning)
 }
 
 /// A non-fatal warning emitted while decoding a stream codec.
@@ -1131,66 +1099,6 @@ mod tests {
         dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
 
         let error = decode_stream_data(&dict, b"not zlib").unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
-        );
-    }
-
-    #[test]
-    fn unknown_filter_precedes_misaligned_decode_parms_on_all_decode_entry_points() {
-        let filter = Object::Array(vec![
-            Object::Name(b"BogusDecode".to_vec()),
-            Object::Name(b"FlateDecode".to_vec()),
-        ]);
-        let params = Object::Array(vec![Object::Null]);
-        let expected = "unsupported PDF feature: unsupported stream filter: BogusDecode";
-
-        let mut legacy = Dictionary::new();
-        legacy.insert("Filter", filter.clone());
-        legacy.insert("DecodeParms", params.clone());
-        assert_eq!(
-            decode_stream_data(&legacy, b"payload")
-                .unwrap_err()
-                .to_string(),
-            expected
-        );
-
-        let mut resolve = |value: &Object| value.clone();
-        assert_eq!(
-            decode_stream_data_from_xref_context(&legacy, b"payload", &mut resolve)
-                .unwrap_err()
-                .to_string(),
-            expected
-        );
-
-        let native = ObjectHandle::dictionary(vec![
-            (b"Filter".to_vec(), handle_from_object(Some(&filter))),
-            (b"DecodeParms".to_vec(), handle_from_object(Some(&params))),
-        ]);
-        assert_eq!(
-            decode_stream_data_from_handle(&native, b"payload", DecodeLimits::default())
-                .unwrap_err()
-                .to_string(),
-            expected
-        );
-    }
-
-    #[test]
-    fn xref_decode_propagates_filter_metadata_errors() {
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"FlateDecode".to_vec()),
-                Object::Name(b"ASCII85Decode".to_vec()),
-            ]),
-        );
-        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
-        let mut resolve = |value: &Object| value.clone();
-
-        let error = decode_stream_data_from_xref_context(&dict, b"", &mut resolve).unwrap_err();
 
         assert_eq!(
             error.to_string(),
