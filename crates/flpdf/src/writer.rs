@@ -893,8 +893,8 @@ pub(crate) fn effective_pdf_version_and_ext<'a>(
 /// # Errors
 ///
 /// - [`crate::Error::Missing`] if the input has no `/Root` in its trailer.
-/// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
-///   indirect `/Extensions` value.
+/// - Propagates canonical-handle resolution errors when materialising the
+///   Catalog or an indirect `/Extensions` value.
 pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: &str,
@@ -908,44 +908,35 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     // `has_adbe: false, orphans_indirect_object: false` rather than
     // erroring, so this is that caller's actual root check) -- unreachable
     // in every fixture in either test module.
-    let Some(root_ref) = pdf.root_ref() else {
-        return Err(crate::Error::Missing("/Root"));
-    };
+    let (root_ref, catalog) = writer_catalog_copy(pdf)?;
     // cov:ignore-end
 
-    // resolve() returns an owned Object (cloned from the cache); into_dict
-    // moves the inner Dictionary out without a further clone. A non-Dict
-    // Catalog would fail every downstream write path, so bail rather than
-    // silently mutate nothing.
-    let catalog_obj = pdf.resolve(root_ref)?;
-    // cov:ignore-start: defensive non-Dict Catalog guard. Every downstream
-    // write path (both callers) rejects a non-dict Catalog before reaching
-    // this helper.
-    let Some(mut catalog) = catalog_obj.into_dict() else {
-        return Err(crate::Error::Unsupported(
-            "Catalog is not a dictionary".to_string(),
-        ));
-    };
-    // cov:ignore-end
-
-    // If Catalog had /Extensions, materialise it into an owned Dictionary
-    // regardless of whether it was a direct dict or an indirect reference —
-    // matching qpdf, which always inlines the resulting Extensions on the
-    // Catalog. remove() moves the value out so no extra clone is taken.
-    let mut extensions = match catalog.remove("Extensions") {
-        Some(Object::Dictionary(d)) => d,
-        Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
-        _ => Dictionary::new(),
+    // qpdf's unparse path works on an unsafe top-level dictionary copy and
+    // makes the `/Extensions` value direct before changing `/ADBE`. Copy only
+    // the immediate entries here so a direct stream elsewhere in the Catalog
+    // remains accepted, matching qpdf's `unsafeShallowCopy` boundary.
+    let raw_extensions = catalog.try_get_key(b"/Extensions")?;
+    let extensions = if let Some(entries) = raw_extensions.try_as_dictionary()? {
+        ObjectHandle::dictionary(entries.into_iter().collect())
+    } else {
+        ObjectHandle::dictionary(Vec::new())
     };
 
     // Overwrite /ADBE wholesale, leaving any other developer prefix keys alone.
-    let mut adbe = Dictionary::new();
-    adbe.insert("BaseVersion", Object::Name(version.as_bytes().to_vec()));
-    adbe.insert("ExtensionLevel", Object::Integer(extension_level));
-    extensions.insert("ADBE", Object::Dictionary(adbe));
+    let adbe = ObjectHandle::dictionary(vec![
+        (
+            b"/BaseVersion".to_vec(),
+            ObjectHandle::name(version.as_bytes().to_vec()),
+        ),
+        (
+            b"/ExtensionLevel".to_vec(),
+            ObjectHandle::integer(extension_level),
+        ),
+    ]);
+    extensions.replace_key(b"/ADBE", adbe)?;
 
-    catalog.insert("Extensions", Object::Dictionary(extensions));
-    pdf.set_object(root_ref, Object::Dictionary(catalog));
+    catalog.replace_key(b"/Extensions", extensions)?;
+    pdf.set_object_handle(root_ref, catalog)?;
     Ok(())
 }
 
@@ -972,41 +963,48 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(
     // cov:ignore-start: defensive /Root guard, mirroring
     // inject_adbe_extension's identical comment (same two callers:
     // emit_canonical_pdf and crate::linearization::writer::write_linearized).
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(());
-    };
+    let (root_ref, catalog) = writer_catalog_copy(pdf)?;
     // cov:ignore-end
-    let catalog_obj = pdf.resolve(root_ref)?;
-    // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
-    // inject_adbe_extension. Every downstream write path (both callers)
-    // rejects a non-dict Catalog before reaching this helper.
-    let Some(mut catalog) = catalog_obj.into_dict() else {
+    let raw_extensions = catalog.try_get_key(b"/Extensions")?;
+    let Some(entries) = raw_extensions.try_as_dictionary()? else {
         return Ok(());
     };
-    // cov:ignore-end
-    let mut extensions = match catalog.remove("Extensions") {
-        Some(Object::Dictionary(d)) => d,
-        Some(Object::Reference(r)) => pdf.resolve(r)?.into_dict().unwrap_or_default(),
-        // cov:ignore-start: unreachable — catalog_has_extensions_adbe (the sole
-        // caller-side gate) already verified /Extensions resolves to a
-        // Dictionary and pdf is not mutated between the check and this match.
-        _ => return Ok(()),
-        // cov:ignore-end
-    };
-    if extensions.remove("ADBE").is_none() {
-        // cov:ignore-start: unreachable — catalog_has_extensions_adbe verified
-        // /ADBE was present in the resolved /Extensions dict and pdf is not
-        // mutated between the check and this remove().
-        catalog.insert("Extensions", Object::Dictionary(extensions));
-        pdf.set_object(root_ref, Object::Dictionary(catalog));
+    let extensions = ObjectHandle::dictionary(entries.into_iter().collect());
+    if !extensions.try_get_keys()?.contains(b"/ADBE".as_slice()) {
         return Ok(());
-        // cov:ignore-end
     }
-    if extensions.iter().next().is_some() {
-        catalog.insert("Extensions", Object::Dictionary(extensions));
+
+    extensions.remove_key(b"/ADBE");
+    if extensions.try_get_keys()?.is_empty() {
+        catalog.remove_key(b"/Extensions");
+    } else {
+        catalog.replace_key(b"/Extensions", extensions)?;
     }
-    pdf.set_object(root_ref, Object::Dictionary(catalog));
+    pdf.set_object_handle(root_ref, catalog)?;
     Ok(())
+}
+
+/// Resolve and copy the live Catalog's immediate entries for writer-owned
+/// output mutations.
+///
+/// The legacy writer used `Pdf::resolve`, which can return a stale materialized
+/// cache entry after a canonical ObjectHandle mutation. qpdf's writer operates
+/// on a live `QPDFObjectHandle::unsafeShallowCopy` instead, so this boundary
+/// resolves the canonical root slot, makes a direct top-level dictionary copy,
+/// and leaves the final replacement to `Pdf::set_object_handle`. The immediate
+/// entries stay shared; callers replace only top-level keys, so nested direct
+/// values—including streams—are not cloned or rejected.
+fn writer_catalog_copy<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(ObjectRef, ObjectHandle)> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Err(crate::Error::Missing("/Root"));
+    };
+    let source = pdf.get_object_handle(root_ref);
+    pdf.resolve_object_handle(&source)?;
+    let entries = source
+        .try_as_dictionary()?
+        .ok_or_else(|| crate::Error::Unsupported("Catalog is not a dictionary".to_string()))?;
+    let catalog = ObjectHandle::dictionary(entries.into_iter().collect());
+    Ok((root_ref, catalog))
 }
 
 /// Detect whether the destination Catalog carries `/Extensions /ADBE` in any
@@ -1023,8 +1021,8 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(
 ///
 /// # Errors
 ///
-/// - Propagates [`Pdf::resolve_borrowed`] errors when materialising the Catalog
-///   or an indirect `/Extensions` value.
+/// - Propagates canonical-handle resolution errors when materialising the
+///   Catalog or an indirect `/Extensions` value.
 fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     // cov:ignore-start: defensive /Root guard. catalog_has_extensions_adbe is
     // only reached after emit_canonical_pdf passes its own root_ref check
@@ -1033,29 +1031,16 @@ fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool>
         return Ok(false);
     };
     // cov:ignore-end
-    let extensions_ref = {
-        let catalog = pdf.resolve_borrowed(root_ref)?;
-        // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
-        // strip_adbe_extension. Every downstream write path rejects a non-dict
-        // Catalog before reaching this helper.
-        let Some(catalog_dict) = catalog.as_dict() else {
-            return Ok(false);
-        };
-        // cov:ignore-end
-        match catalog_dict.get("Extensions") {
-            Some(Object::Dictionary(d)) => return Ok(d.get("ADBE").is_some()),
-            Some(Object::Reference(r)) => *r,
-            None => return Ok(false),
-            // cov:ignore-start: /Extensions present but neither Dict nor Ref is
-            // structurally malformed input; no test-fixture path produces it.
-            Some(_) => return Ok(false),
-            // cov:ignore-end
-        }
-    };
-    let extensions = pdf.resolve_borrowed(extensions_ref)?;
-    Ok(extensions
-        .as_dict()
-        .is_some_and(|d| d.get("ADBE").is_some()))
+    let catalog = pdf.get_object_handle(root_ref);
+    pdf.resolve_object_handle(&catalog)?;
+    if !catalog.try_has_key(b"/Extensions")? {
+        return Ok(false);
+    }
+    let extensions = catalog.try_get_key(b"/Extensions")?;
+    if extensions.try_as_dictionary()?.is_none() {
+        return Ok(false);
+    }
+    Ok(extensions.try_get_keys()?.contains(b"/ADBE".as_slice()))
 }
 
 /// Binary header marker emitted by qpdf on the second line of every output
@@ -7687,6 +7672,119 @@ mod tests {
     // /Extensions /ADBE dict when WriterOptions::min_extension_level requests
     // it. They use static_id for a stable output and inspect the emitted
     // bytes for the expected keys and header.
+
+    #[test]
+    fn inject_adbe_extension_reads_the_live_catalog_handle() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+
+        // Seed the legacy cache, then mutate only the canonical handle graph.
+        // The writer consumer must not rebuild the Catalog from that stale
+        // materialized snapshot.
+        pdf.resolve(root).expect("catalog must resolve");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve_object_handle(&catalog)
+            .expect("canonical catalog must resolve");
+        catalog
+            .replace_key(
+                b"/Extensions",
+                ObjectHandle::dictionary(vec![(
+                    b"/XYZW".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(7))]),
+                )]),
+            )
+            .expect("live Catalog mutation must succeed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("canonical Catalog must belong to this PDF");
+        let before = catalog
+            .try_get_key(b"/Extensions")
+            .expect("live Extensions lookup must succeed")
+            .try_get_keys()
+            .expect("live Extensions must be a dictionary");
+        assert!(before.contains(b"/XYZW".as_slice()));
+
+        inject_adbe_extension(&mut pdf, "1.7", 8).expect("injection must succeed");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve_object_handle(&catalog)
+            .expect("mutated Catalog must resolve");
+        let extensions = catalog
+            .try_get_key(b"/Extensions")
+            .expect("Extensions lookup must succeed");
+        let keys = extensions
+            .try_get_keys()
+            .expect("Extensions must remain a dictionary");
+        assert!(keys.contains(b"/XYZW".as_slice()));
+        assert!(keys.contains(b"/ADBE".as_slice()));
+    }
+
+    #[test]
+    fn inject_adbe_extension_accepts_a_direct_catalog_stream() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve_object_handle(&catalog)
+            .expect("canonical catalog must resolve");
+        catalog
+            .replace_key(
+                b"/Metadata",
+                ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![(
+                        b"/Type".to_vec(),
+                        ObjectHandle::name(b"Metadata".to_vec()),
+                    )]),
+                    Rc::new(b"<xmp/>".to_vec()),
+                ),
+            )
+            .expect("direct Catalog stream mutation must succeed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("canonical Catalog must belong to this PDF");
+
+        inject_adbe_extension(&mut pdf, "1.7", 8)
+            .expect("a direct stream sibling must not block Catalog mutation");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve_object_handle(&catalog)
+            .expect("mutated Catalog must resolve");
+        assert_eq!(
+            catalog
+                .try_get_key(b"/Metadata")
+                .expect("Metadata lookup must succeed")
+                .type_name(),
+            "stream"
+        );
+    }
+
+    #[test]
+    fn writer_catalog_copy_requires_a_root() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(
+            b"%PDF-1.3\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n\
+              startxref\n9\n%%EOF\n" as &[u8],
+        ))
+        .expect("rootless fixture must open");
+
+        let error = inject_adbe_extension(&mut pdf, "1.7", 8).expect_err("root is required");
+        assert!(matches!(error, crate::Error::Missing("/Root")));
+    }
+
+    #[test]
+    fn catalog_adbe_probe_ignores_a_non_dictionary_extensions_value() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve_object_handle(&catalog)
+            .expect("canonical catalog must resolve");
+        catalog
+            .replace_key(b"/Extensions", ObjectHandle::integer(7))
+            .expect("Catalog mutation must succeed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("canonical Catalog must belong to this PDF");
+
+        assert!(!catalog_has_extensions_adbe(&mut pdf).expect("probe must succeed"));
+    }
 
     /// Build a minimal single-page-less classic 1.3 PDF with only a Catalog
     /// and empty Pages tree — the shape shared with the existing
