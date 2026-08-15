@@ -6070,6 +6070,100 @@ mod tests {
         pdf
     }
 
+    /// Same corrupt payload as [`build_pdf_with_reachable_corrupt_flate_stream`],
+    /// but `/Filter` is a single-element array `[/FlateDecode]` rather than
+    /// the bare name `/FlateDecode`. [`is_lone_flate`] only recognizes the
+    /// bare-name form (matching `QPDFWriter.cc:1265-1269`'s own fast-path
+    /// check), so this fixture -- unlike the bare-name one -- does NOT
+    /// qualify for `reencode_stream_for_compress`'s lone-Flate
+    /// verbatim-preserve shortcut even when no token filter is registered
+    /// (`is_data_modified == false`). That is required to actually reach
+    /// `apply_stream_compress_policy_with_decode_level`'s decode attempt
+    /// (and, on this corrupt payload, its `filters::decode_stream_data`
+    /// `Err` arm) instead of short-circuiting past it, which the bare-name
+    /// fixture does whenever no token filter is registered.
+    fn build_pdf_with_reachable_corrupt_flate_array_filter_stream() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /Extras 3 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+                  /BBox [0 0 1 1] /Filter [/FlateDecode] /Length {}>>\nstream\n",
+                CORRUPT_FLATE_PAYLOAD.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(CORRUPT_FLATE_PAYLOAD);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn plain_writer_fallback_preserves_a_corrupt_flate_stream_verbatim_when_the_legacy_decoder_itself_fails(
+    ) {
+        // The bare-name `/Filter /FlateDecode` corrupt fixture never reaches
+        // `apply_stream_compress_policy_with_decode_level`'s decode attempt
+        // at all when no token filter is registered: `is_lone_flate`
+        // recognizes the bare name, so `reencode_stream_for_compress`'s
+        // verbatim-preserve shortcut (`!is_data_modified &&
+        // source_filter_is_lone_flate`) fires first and the corrupt payload
+        // is never even handed to a decoder. This fixture's array-form
+        // `/Filter [/FlateDecode]` is NOT lone-Flate, so with no token
+        // filter registered (`token_filtered_source: None`) it actually
+        // reaches `filters::decode_stream_data`, which fails on the corrupt
+        // payload -- exercising that legacy decoder's own `Err` arm inside
+        // `apply_stream_compress_policy_with_decode_level` (as opposed to
+        // the retry loop inside `decode_token_filtered_stream`, which the
+        // sibling token-filter-registered test below exercises instead).
+        let raw = build_pdf_with_reachable_corrupt_flate_array_filter_stream();
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_extra_header_text("% flpdf-vkka regression\n");
+        writer
+            .write()
+            .expect("a decode failure must fall back to raw preservation, not error the write");
+        let renumbered = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("stream mapping")
+            .expect("stream is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        let mut reparsed = crate::Pdf::open_mem_owned(output).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written stream");
+        let raw_written = written
+            .get_raw_stream_data()
+            .expect("written raw stream bytes");
+        assert_eq!(
+            raw_written.as_ref().as_slice(),
+            CORRUPT_FLATE_PAYLOAD,
+            "an undecodable declared filter's payload must be preserved \
+             byte-for-byte verbatim even when the legacy (non-token-filtered) \
+             decoder is the one that fails"
+        );
+    }
+
     #[test]
     fn plain_writer_fallback_recompresses_a_token_filtered_lone_flate_stream_instead_of_preserving_it_verbatim(
     ) {
@@ -6439,9 +6533,7 @@ mod tests {
         )
         .expect("token-filtered decode must succeed");
         let StreamDecodeOutcome::Decoded(token_filtered_decoded) = outcome else {
-            panic!(
-                "a lone /FlateDecode stream at decode_level=Generalized must decode: {outcome:?}"
-            ) // cov:ignore: test-shape guard
+            panic!("expected Decoded, got {outcome:?}") // cov:ignore: test-shape guard
         };
 
         assert_eq!(
