@@ -1854,6 +1854,36 @@ impl<R: Read + Seek> Pdf<R> {
         crate::object_copy::copy_foreign_object(self, foreign)
     }
 
+    /// Replace an indirect object's canonical value from an [`ObjectHandle`].
+    ///
+    /// This is the handle-shaped counterpart of [`Self::set_object`]. qpdf's
+    /// `QPDF::replaceObject` accepts a direct, initialized handle and routes it
+    /// through `updateCache`, whose existing cache slot adopts the replacement
+    /// `QPDFValue` (`libqpdf/QPDF.cc:1986-1993,1843-1857`;
+    /// `libqpdf/qpdf/QPDFObject_private.hh:117-120`). The canonical
+    /// [`Self::replace_object_handle`] primitive performs that same slot
+    /// replacement while retaining the target handle identity.
+    ///
+    /// qpdf records the shared value transition itself rather than exposing a
+    /// separate dirty bit. flpdf's writer still tracks dirty object references,
+    /// so this setter deliberately delegates to the primitive that calls
+    /// [`Self::mark_object_handle_mutated`] after a successful replacement. As
+    /// with [`Self::set_object`], every successful write-back marks the target
+    /// dirty; callers that temporarily restore a previously clean value must
+    /// explicitly call [`Self::clear_dirty`] after the restore.
+    ///
+    /// The legacy [`Self::set_object`] API remains unchanged for consumers that
+    /// still provide a materialized [`Object`].
+    #[allow(dead_code)] // writer consumer cutover is flpdf-egzr.3.2.5
+    pub(crate) fn set_object_handle(
+        &mut self,
+        object_ref: ObjectRef,
+        replacement: ObjectHandle,
+    ) -> Result<()> {
+        self.replace_object_handle(object_ref, replacement)
+            .map(|_| ())
+    }
+
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
     /// raw [`Object`] materialization and writer traversal remain outside this
@@ -8869,6 +8899,157 @@ mod tests {
         assert!(replacement_alias.is_direct());
         replacement_alias.replace_direct_value(ObjectValue::Integer(9));
         assert_eq!(target.as_integer(), Some(9));
+    }
+
+    #[test]
+    fn set_object_handle_is_the_dirty_marking_handle_form_of_set_object() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let target = pdf.get_object_handle(object_ref);
+        target.try_dereference().expect("resolve target");
+        let replacement = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"Catalog".to_vec()),
+        )]);
+        let replacement_alias = replacement.clone();
+
+        pdf.set_object_handle(object_ref, replacement)
+            .expect("replace canonical object through setter");
+
+        let current = pdf.get_object_handle(object_ref);
+        assert!(current.is_same_object_as(&target));
+        assert_eq!(
+            current.get_key(b"/Type").as_name(),
+            Some(b"Catalog".to_vec())
+        );
+        assert!(pdf.is_dirty(object_ref));
+
+        replacement_alias.replace_direct_value(ObjectValue::Integer(9));
+        assert_eq!(current.as_integer(), Some(9));
+    }
+
+    #[test]
+    fn set_object_handle_preserves_clean_and_dirty_restore_writer_snapshots() {
+        let source = String::from_utf8(minimal_pdf_bytes())
+            .expect("minimal fixture is UTF-8")
+            .replace(
+                "trailer\n<< /Size 4 /Root 1 0 R >>",
+                "trailer\n<< /Size 4 /Root 1 0 R /ID [<0123456789abcdef0123456789abcdef><0123456789abcdef0123456789abcdef>] >>",
+            )
+            .into_bytes();
+        let object_ref = ObjectRef::new(1, 0);
+
+        let snapshot = |pdf: &mut Pdf<Cursor<Vec<u8>>>| {
+            let bytes =
+                crate::writer::write_qpdf_to_memory(pdf, |_| {}).expect("write setter output");
+            let id_start = bytes
+                .windows(b"/ID [".len())
+                .position(|window| window == b"/ID [")
+                .expect("writer output has an ID");
+            let id_end = id_start
+                + bytes[id_start..]
+                    .iter()
+                    .position(|byte| *byte == b']')
+                    .expect("writer output closes the ID array");
+            let mut normalized = bytes.clone();
+            normalized.splice(id_start..=id_end, b"/ID []".iter().copied());
+            let xref_start = bytes
+                .windows(b"xref\n".len())
+                .position(|window| window == b"xref\n")
+                .expect("writer output has a classic xref");
+            let trailer_start = bytes
+                .windows(b"trailer ".len())
+                .position(|window| window == b"trailer ")
+                .expect("writer output has a trailer");
+            (normalized, bytes[xref_start..trailer_start].to_vec())
+        };
+
+        for leave_dirty in [false, true] {
+            let mut legacy = Pdf::open_mem_owned(source.clone()).expect("open legacy");
+            let mut canonical = Pdf::open_mem_owned(source.clone()).expect("open canonical");
+
+            let original_object = legacy.resolve(object_ref).expect("resolve legacy catalog");
+            let mut legacy_modified = original_object.clone();
+            legacy_modified
+                .as_dict_mut()
+                .expect("legacy catalog is a dictionary")
+                .insert("Marker", Object::Integer(7));
+
+            let original_handle = canonical.get_object_handle(object_ref);
+            original_handle
+                .try_dereference()
+                .expect("resolve canonical catalog");
+            let original_handle_value = original_handle
+                .shallow_copy()
+                .expect("copy canonical catalog");
+            let handle_modified = original_handle_value
+                .shallow_copy()
+                .expect("copy canonical replacement");
+            handle_modified
+                .replace_key(b"/Marker", ObjectHandle::integer(7))
+                .expect("mark canonical replacement");
+
+            legacy.set_object(object_ref, legacy_modified);
+            canonical
+                .set_object_handle(object_ref, handle_modified)
+                .expect("replace canonical catalog");
+            assert!(legacy.is_dirty(object_ref));
+            assert!(canonical.is_dirty(object_ref));
+            assert_eq!(
+                legacy
+                    .resolve(object_ref)
+                    .expect("resolve modified legacy catalog")
+                    .as_dict()
+                    .and_then(|dict| dict.get("Marker"))
+                    .and_then(Object::as_integer),
+                Some(7)
+            );
+            assert_eq!(
+                canonical
+                    .get_object_handle(object_ref)
+                    .get_key(b"/Marker")
+                    .as_integer(),
+                Some(7)
+            );
+
+            legacy.set_object(object_ref, original_object);
+            canonical
+                .set_object_handle(
+                    object_ref,
+                    original_handle_value
+                        .shallow_copy()
+                        .expect("copy canonical original value"),
+                )
+                .expect("restore canonical catalog");
+            assert!(legacy
+                .resolve(object_ref)
+                .expect("resolve restored catalog")
+                .as_dict()
+                .unwrap()
+                .get("Marker")
+                .is_none());
+            assert!(!canonical.get_object_handle(object_ref).has_key(b"/Marker"));
+            assert!(legacy.is_dirty(object_ref));
+            assert!(canonical.is_dirty(object_ref));
+
+            if !leave_dirty {
+                legacy.clear_dirty(object_ref);
+                canonical.clear_dirty(object_ref);
+            }
+            assert_eq!(legacy.is_dirty(object_ref), leave_dirty);
+            assert_eq!(canonical.is_dirty(object_ref), leave_dirty);
+
+            let (legacy_output, legacy_xref) = snapshot(&mut legacy);
+            let (canonical_output, canonical_xref) = snapshot(&mut canonical);
+            assert_eq!(
+                legacy_output, canonical_output,
+                "handle write-back must preserve the {leave_dirty:?} restore output snapshot"
+            );
+            assert_eq!(
+                legacy_xref, canonical_xref,
+                "handle write-back must preserve the {leave_dirty:?} restore xref bytes"
+            );
+        }
     }
 
     #[test]
