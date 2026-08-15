@@ -505,35 +505,37 @@ pub fn remove_unreferenced_resources<R: Read + Seek>(
             _ => false, // PageInline and None: always unshared
         };
 
+        if mode == RemoveUnreferencedResources::Auto && is_shared {
+            // Auto: skip shared resources — we must not prune the shared
+            // page-level dictionary itself, and its own content would only be
+            // decoded/tokenised to compute used-names that get discarded
+            // regardless, so skip that (potentially expensive, and — with N
+            // pages sharing one /Resources — potentially N-times-repeated)
+            // work entirely. Still discover and prune every Form XObject
+            // declared in the page's /Resources/XObject: qpdf's structural
+            // Form discovery (`forEachXObject`, `QPDFPageObjectHelper.cc:
+            // 313-345`) is independent of page-level pruning decisions,
+            // matching the separate `remove_unreferenced_resources_on_page`
+            // route's identical ordering, so it must still run here even
+            // though the page's own resources are left untouched.
+            prune_declared_forms_for_page(pdf, page_ref)?;
+            continue;
+        }
+
         // Collect the used names for this page. When the page's /Contents cannot
         // be fully understood — it failed to decode (corrupt FlateDecode) or to
         // tokenise part-way (malformed content syntax) — collection returns
         // `None` rather than aborting, degrading like the Form XObject path (see
         // `recurse_form_xobject`). Genuine structural errors (resolving the
         // inherited /Resources or a Form object reference) still propagate via
-        // `?`.
+        // `?`. This call also discovers and prunes every Form XObject declared
+        // in the page's /Resources/XObject, matching the Auto-shared branch
+        // above.
         //
-        // This call also discovers and prunes every Form XObject declared in
-        // the page's /Resources/XObject, regardless of whether the *page's
-        // own* resources end up used below — qpdf's structural Form discovery
-        // (`forEachXObject`, `QPDFPageObjectHelper.cc:313-345`) is independent
-        // of page-level pruning decisions, matching the separate
-        // `remove_unreferenced_resources_on_page` route's identical ordering.
-        // It must therefore run unconditionally, before the Auto shared-page
-        // skip below, not be skipped along with it.
-        let used = collect_used_names_for_page(pdf, page_ref)?;
-
-        if mode == RemoveUnreferencedResources::Auto && is_shared {
-            // Auto: skip shared resources — we must not prune the shared
-            // page-level dictionary itself. `used` (or its absence) is
-            // discarded; only the Form-pruning side effect above matters here.
-            continue;
-        }
-
         // Mark the page's resources group as protected so its resources are
         // conservatively retained rather than pruned against an incomplete
         // used-name set.
-        let used = match used {
+        let used = match collect_used_names_for_page(pdf, page_ref)? {
             Some(used) => used,
             None => {
                 if let Some(key) = res_group_key(&page_res_loc[i], page_ref) {
@@ -900,6 +902,42 @@ fn collect_used_names_for_page<R: Read + Seek>(
     };
 
     Ok(complete.then_some(used))
+}
+
+/// Discover and prune every Form XObject declared in a page's own
+/// `/Resources/XObject`, without decoding or tokenising the page's own
+/// content stream.
+///
+/// This is the cheap half of [`collect_used_names_for_page`], split out for
+/// callers (Auto mode's shared-page skip) that need the page-content-independent
+/// structural Form-pruning side effect (qpdf's `forEachXObject`,
+/// `QPDFPageObjectHelper.cc:313-345`) but will discard the page's own
+/// used-names regardless, so decoding/tokenising its (potentially large)
+/// content stream would be pure waste.
+fn prune_declared_forms_for_page<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<()> {
+    let page_resources = crate::pages::resolve_inherited_resources(pdf, page_ref)?;
+
+    let mut used: UsedNames = BTreeMap::new();
+    let mut form_used: BTreeMap<ObjectRef, UsedNames> = BTreeMap::new();
+    let mut visited_forms: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
+    let mut ctx = CollectCtx {
+        pdf,
+        used: &mut used,
+        form_used: &mut form_used,
+        visited: &mut visited_forms,
+    };
+    let page_scope = Scope {
+        resources: page_resources.as_ref(),
+        target: UsedTarget::Page,
+        owner: page_ref,
+    };
+    for (_, val) in declared_xobjects(ctx.pdf, page_scope.resources)? {
+        recurse_form_xobject(&mut ctx, val, page_scope, 0)?;
+    }
+    Ok(())
 }
 
 /// Maximum recursion depth for Form XObject traversal.
