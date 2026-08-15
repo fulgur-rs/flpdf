@@ -17,16 +17,17 @@
 //! - flatten=print: two annotations — one with Print bit (0x4 in /F), one
 //!   without — only the Print-bit one is removed.
 //!
-//! All rewrite calls use `--compress-streams=n` so that page content and
-//! appearance streams can be inspected as raw bytes without a FlateDecode
-//! decoding step.
+//! Tests that inspect raw page or appearance bytes use `--compress-streams=n`.
+//! The existing-appearance reuse test intentionally uses `--compress-streams=y`
+//! and decodes through the canonical `ObjectHandle` API so the token-filter
+//! writer path is exercised.
 //!
 //! # qpdf divergence
 //!
 //! See `docs/qpdf-compat-decisions.md` §AcroForm & annotation transforms.
 
 use assert_cmd::Command;
-use flpdf::{AnnotationObjectHelper, Object, Pdf};
+use flpdf::{AnnotationObjectHelper, DecodeLevel, Object, Pdf};
 use std::fs::File;
 use std::io::BufReader;
 
@@ -125,10 +126,27 @@ fn tx_widget_with_null_ap_n_needing_appearances() -> Vec<u8> {
 /// `/AP/N` Form XObject containing the literal value bytes.
 /// Objects: 1=Catalog, 2=Pages, 3=Page, 4=Widget, 5=Contents, 6=AP/N XObject
 fn tx_widget_with_ap() -> Vec<u8> {
-    assemble_pdf(&[
+    tx_widget_with_ap_needing(false)
+}
+
+/// Same existing-appearance fixture, with `/NeedAppearances true` so the
+/// input also exercises qpdf's outer appearance-generation gate.
+fn tx_widget_with_ap_needing_appearances() -> Vec<u8> {
+    tx_widget_with_ap_needing(true)
+}
+
+fn tx_widget_with_ap_needing(need_appearances: bool) -> Vec<u8> {
+    let acroform = if need_appearances {
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec()
+    } else {
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
           /AcroForm << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
-            .to_vec(),
+            .to_vec()
+    };
+    assemble_pdf(&[
+        acroform,
         b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
         b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
           /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
@@ -342,26 +360,25 @@ fn generate_appearances_tx_ap_n_contains_tj() {
     );
 }
 
-/// `--generate-appearances` does **not** overwrite a widget that already has
-/// `/AP/N` — the original XObject is preserved (observable: existing appearance
-/// is not discarded).
+/// `--generate-appearances` updates a non-button widget that already has
+/// `/AP/N`, matching qpdf's `ValueSetter` reuse path.
 #[test]
-fn generate_appearances_tx_skips_existing_ap() {
+fn generate_appearances_tx_reuses_existing_ap() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("tx_ap.pdf");
     let output = temp.path().join("out.pdf");
-    std::fs::write(&input, tx_widget_with_ap()).unwrap();
+    std::fs::write(&input, tx_widget_with_ap_needing_appearances()).unwrap();
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .args(["rewrite", "--generate-appearances", "--compress-streams=y"])
         .arg(&input)
         .arg(&output)
         .assert()
         .success();
 
-    // /AP/N must still be present; the existing stream content must contain the
-    // original literal "(Hello) Tj ET" — not overwritten with a newly generated one.
+    // /AP/N must still be present and must have gone through the canonical
+    // renderer's existing-stream token-filter path.
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
     let n_val = {
@@ -373,31 +390,34 @@ fn generate_appearances_tx_skips_existing_ap() {
         ap.get("N").cloned().expect("/AP/N must be present")
     };
 
-    let n_obj = resolve_one(&mut pdf, n_val).unwrap();
-    let stream = n_obj.as_stream().expect("/AP/N must be a stream");
-    let data = &stream.data;
-    let as_str = std::str::from_utf8(data).unwrap_or("<non-utf8>");
+    let n_ref = match n_val {
+        Object::Reference(object_ref) => object_ref,
+        other => panic!("/AP/N must remain an indirect stream reference, got {other:?}"),
+    };
+    let n_handle = pdf.get_object_handle(n_ref);
+    pdf.resolve_object_handle(&n_handle).unwrap();
+    assert!(
+        n_handle.as_stream_dict().is_some(),
+        "/AP/N must be a stream"
+    );
+    let data = n_handle.get_stream_data(DecodeLevel::Generalized).unwrap();
+    let as_str = std::str::from_utf8(data.as_slice()).unwrap_or("<non-utf8>");
 
-    // The widget arrived with a hand-authored appearance `BT (Hello) Tj ET`.
-    // --generate-appearances must NOT overwrite it. A regenerated appearance
-    // would (a) drop the original byte sequence and (b) carry the generator's
-    // distinctive markers — a `/Tx BMC` marked-content wrapper and a `Tf`
-    // font-selection operator — neither of which the original fixture has.
-    // (Asserting "(Hello) Tj" alone is insufficient: a regenerated appearance
-    // for the value "Hello" would also contain it.)
+    assert!(
+        data.windows(7).any(|w| w == b"/Tx BMC"),
+        "existing /AP/N must be updated through the generated-appearance path; data={as_str:?}"
+    );
+    assert!(
+        data.windows(2).any(|w| w == b"Tf"),
+        "generated /AP/N must carry the default-appearance font selection; data={as_str:?}"
+    );
+    // This fixture has no `/Tx BMC` wrapper. qpdf's ValueSetter therefore
+    // keeps the source tokens and appends a generated marked-content block at
+    // EOF (`QPDFFormFieldObjectHelper.cc:524-570`), rather than discarding the
+    // original bytes.
     assert!(
         data.windows(16).any(|w| w == b"BT (Hello) Tj ET"),
-        "original /AP/N content must be preserved verbatim; data={as_str:?}"
-    );
-    assert!(
-        !data.windows(7).any(|w| w == b"/Tx BMC"),
-        "original /AP/N must not be replaced by a generated appearance \
-         (found /Tx BMC marker); data={as_str:?}"
-    );
-    assert!(
-        !data.windows(2).any(|w| w == b"Tf"),
-        "original /AP/N must not be replaced by a generated appearance \
-         (found Tf operator); data={as_str:?}"
+        "qpdf's no-wrapper fallback must preserve source appearance content; data={as_str:?}"
     );
 }
 

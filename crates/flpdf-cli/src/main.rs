@@ -25,9 +25,9 @@ use flpdf::{
     },
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
-    parse_pdf_version, AnnotationObjectHelper, CompressStreams, CopyEncryptionSource, Dictionary,
-    EncryptMethod, EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object,
-    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
+    parse_pdf_version, CompressStreams, CopyEncryptionSource, Dictionary, EncryptMethod,
+    EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectHandle,
+    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
     PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, Severity, Stream, StreamDataMode,
 };
@@ -3385,18 +3385,18 @@ fn run_rewrite(
     Ok(())
 }
 
-/// Generate `/AP` `/N` appearance streams for widget annotations that lack one
+/// Generate or update `/AP` `/N` appearance streams for widget annotations
 /// (`--generate-appearances`).
 ///
 /// Walks every page's `/Annots`. Every button field re-applies its current
 /// value so `/AS` stays synchronized with `/V`; non-button widgets whose
-/// `/AP` `/N` is missing render from the terminal field's `/FT` (`Tx` → text,
-/// `Ch` → choice). Existing non-button `/AP` `/N` streams stay untouched.
+/// `/FT` is `Tx` or `Ch` render through the canonical helper, which creates a
+/// missing `/AP` `/N` or updates an existing stream.
 ///
 /// Review-pattern compliance:
-/// - #2 (indirect references): `/FT` is read via [`FormFieldObjectHelper::field_type`]
-///   and `/AP` via [`AnnotationObjectHelper::appearance`], both of which resolve
-///   references and the inheritable field tree internally.
+/// - #2 (indirect references): `/FT` is read via
+///   [`FormFieldObjectHelper::field_type`], which resolves references and the
+///   inheritable field tree internally.
 /// - #4 (graph traversal): targets are limited to the known `/Annots` positions
 ///   surfaced by [`enumerate_document_annotations`] rather than a brute-force
 ///   scan of all live objects.
@@ -3429,23 +3429,6 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             continue;
         }
 
-        // Skip non-button widgets that already have a normal appearance
-        // (/AP /N). qpdf only synthesizes Tx/Ch appearances when missing.
-        let has_normal = {
-            let mut helper = AnnotationObjectHelper::new(widget_ref, pdf);
-            // Treat /AP/N == null the same as absent. The flattening pass
-            // (resolve_ap_n) skips a null /N, so counting it as "has normal"
-            // here would skip generation too — silently dropping the widget's
-            // value from both passes.
-            match helper.appearance()?.and_then(|ap| ap.get("N").cloned()) {
-                Some(normal) => !matches!(resolve_reference_chain(pdf, normal)?.0, Object::Null),
-                None => false,
-            }
-        };
-        if has_normal {
-            continue;
-        }
-
         FormFieldObjectHelper::new(field_ref, pdf).generate_appearance_for(widget_ref)?;
     }
 
@@ -3458,23 +3441,6 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
 fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
     FormFieldObjectHelper::clear_need_appearances_after_generation(pdf)?;
     Ok(())
-}
-
-/// Follow an indirect-object holder chain without exposing flpdf's internal
-/// generic reference-chain module through the CLI crate boundary.
-fn resolve_reference_chain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    mut object: Object,
-) -> CliResult<(Object, Option<ObjectRef>)> {
-    let mut terminal_ref = None;
-    for _ in 0..64 {
-        let Object::Reference(reference) = object else {
-            break;
-        };
-        terminal_ref = Some(reference);
-        object = pdf.resolve(reference)?;
-    }
-    Ok((object, terminal_ref))
 }
 
 // ===========================================================================
