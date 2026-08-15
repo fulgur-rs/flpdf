@@ -41,7 +41,7 @@ use crate::Pdf;
 ///
 /// Implemented by both renumber schemes ([`CatalogFirstRenumber`] for plain
 /// rewrite, [`ObjectStreamRenumber`] for object-stream output) so that
-/// [`renumber_refs_in_place`] can rewrite an object's internal references under
+/// `renumber_refs_in_place` can rewrite an object's internal references under
 /// either numbering without duplication.
 pub(crate) trait NewNumberLookup {
     /// Return the new reference assigned to `original`, if it was reachable.
