@@ -2184,18 +2184,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // qpdf exits 3 after successful JSON output when either opening or later
     // processing warned. The document logger has already delivered every
     // warning; the snapshots here control only exit status and the summary.
-    if had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start {
-        logger_warn(format!(
-            "{}: operation succeeded with warnings\n",
-            progname()
-        ))?; // cov:ignore: exercised by json warning subprocess integration tests
-        return Err(Box::new(CliExitError {
-            code: ExitCode::Warnings,
-            message: String::new(),
-        }));
-    }
-
-    Ok(())
+    finish_warning_state(
+        had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start,
+        cli.json_output.is_some(),
+    )
 }
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
@@ -3146,7 +3138,6 @@ fn run_rewrite(
 
     if linearize {
         let mut pdf = open_pdf(&input, repair, password)?;
-        let diagnostics_start = pdf.repair_diagnostics().entries().len();
         // --remove-restrictions must strip signatures before the linearization
         // plan is computed: removing signature objects changes the reachable
         // first-page graph. qpdf applies this transformation before planning.
@@ -3183,15 +3174,9 @@ fn run_rewrite(
         }
         // On an encrypted input, `--decrypt`/`--remove-restrictions` has
         // already disabled source-encryption preservation above.
-        // Preserve the pre-existing no-normalization linearize behavior:
-        // warning finalization is part of this content-mutation consumer,
-        // rather than a broad change to all repaired linearized rewrites.
-        if normalize_content {
-            finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
-        }
+        finish_rewrite_warnings(&input, &pdf, &normalization_last_bad, announce_file)?;
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
-        let diagnostics_start = pdf.repair_diagnostics().entries().len();
         // Capture encryption state before the write for the qpdf-compatible
         // restriction diagnostic.
         let was_encrypted = pdf.is_encrypted();
@@ -3382,7 +3367,7 @@ fn run_rewrite(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_rewrite_warnings(&input, &pdf, diagnostics_start, &normalization_last_bad)?;
+        finish_rewrite_warnings(&input, &pdf, &normalization_last_bad, announce_file)?;
     }
     Ok(())
 }
@@ -4102,6 +4087,7 @@ fn run_page_extraction(
     verbose: bool,
 ) -> CliResult<()> {
     let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
+    let creates_output = standard_output.is_none();
     if page_ops.empty {
         // qpdf accepts `--empty`; ignoring it would silently change which
         // document supplies the catalog/outlines. Fail loudly instead.
@@ -4387,7 +4373,7 @@ fn run_page_extraction(
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
-    Ok(())
+    finish_operation_warnings(&pdf, creates_output)
 }
 
 /// Apply each `--rotate` spec (in order) to `target_pages`, resolving each
@@ -4445,6 +4431,7 @@ fn run_rewrite_with_page_ops(
     verbose: bool,
 ) -> CliResult<()> {
     let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
+    let creates_output = standard_output.is_none();
     if page_ops.empty {
         return Err(
             "--empty is accepted by qpdf but not implemented in flpdf at this layer \
@@ -4493,7 +4480,7 @@ fn run_rewrite_with_page_ops(
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
-    Ok(())
+    finish_operation_warnings(&pdf, creates_output)
 }
 
 /// True when any page-operation flag that requires the page-op code paths is
@@ -4587,8 +4574,8 @@ fn run_qdf(
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let creates_output = standard_output.is_none();
     let mut pdf = open_pdf(&input, repair, password)?;
-    let diagnostics_start = pdf.repair_diagnostics().entries().len();
 
     // The `qdf` subcommand is the canonical PdfWriter QDF mode.
     let options = WriterOptions {
@@ -4603,7 +4590,7 @@ fn run_qdf(
         false,
         None,
     )?;
-    finish_lazy_warnings(&input, &pdf, diagnostics_start)
+    finish_operation_warnings(&pdf, creates_output)
 }
 
 /// `qdf-fix` (qpdf `fix-qdf` equivalent): repair stream `/Length`, xref
@@ -4706,7 +4693,6 @@ fn run_dump_object(
     let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
-    let diagnostics_start = pdf.repair_diagnostics().entries().len();
     {
         let object = pdf.resolve_borrowed(object_ref)?;
 
@@ -4724,13 +4710,12 @@ fn run_dump_object(
         logger_info(out)?;
     }
 
-    finish_lazy_warnings(&input, &pdf, diagnostics_start)
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     let object_ref = ObjectRef::parse(&cmd.object_ref)?;
     let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
-    let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let operation = (|| -> CliResult<()> {
         let object = pdf.resolve_borrowed(object_ref)?;
 
@@ -4795,7 +4780,7 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
         Ok(())
     })();
     operation?;
-    finish_lazy_warnings(&cmd.input, &pdf, diagnostics_start)
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_info(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
@@ -4816,7 +4801,7 @@ fn run_show_info(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) 
         let key = String::from_utf8_lossy(key);
         println!("  {} = {}", key, object_to_pdf(value));
     }
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_catalog(
@@ -4829,7 +4814,7 @@ fn run_show_catalog(
     let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
     let catalog = pdf.resolve_borrowed(catalog_ref)?;
     println!("Catalog: {}", object_to_pdf(catalog));
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_metadata(
@@ -4887,7 +4872,7 @@ fn run_show_metadata(
         None => println!("Metadata: <missing>"),
     }
 
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_outline(
@@ -4904,20 +4889,20 @@ fn run_show_outline(
             eprintln!("Warning: {error}");
             println!("Outline:");
             println!("  <empty>");
-            return Ok(());
+            return finish_operation_warnings(&pdf, false);
         }
     };
 
     println!("Outline:");
     if tree.roots().is_empty() {
         println!("  <empty>");
-        return Ok(());
+        return finish_operation_warnings(&pdf, false);
     }
 
     for (index, (depth, _id, item)) in tree.preorder().enumerate() {
         println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, item.title);
     }
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_fonts(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
@@ -4935,7 +4920,7 @@ fn run_show_fonts(input: Option<PathBuf>, repair: bool, password: &PasswordArgs)
     println!("Fonts:");
     if font_refs.is_empty() {
         println!("  <none>");
-        return Ok(());
+        return finish_operation_warnings(&pdf, false);
     }
 
     for (name, font_obj) in font_refs {
@@ -4959,20 +4944,22 @@ fn run_show_fonts(input: Option<PathBuf>, repair: bool, password: &PasswordArgs)
         }
     }
 
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let pages = pages::page_refs(&mut pdf)?;
-    logger_info(format!("{}\n", pages.len()))
+    logger_info(format!("{}\n", pages.len()))?;
+    finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    write_page_descriptions(&mut pdf, &cli_logger())
+    write_page_descriptions(&mut pdf, &cli_logger())?;
+    finish_operation_warnings(&pdf, false)
 }
 
 fn write_page_descriptions<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &QPDFLogger) -> CliResult<()> {
@@ -5170,7 +5157,10 @@ fn run_show_encryption_key(
 ) -> CliResult<()> {
     let pdf = open_pdf_for_inspection(input, repair, password)?;
     match pdf.encryption_file_key() {
-        Some(key) => logger_info(format!("{}\n", hex_lower(&key))),
+        Some(key) => {
+            logger_info(format!("{}\n", hex_lower(&key)))?;
+            finish_operation_warnings(&pdf, false)
+        }
         None => {
             // qpdf --show-encryption-key requires an encrypted file; exit 2.
             Err("file is not encrypted; no encryption key to show".into())
@@ -5191,7 +5181,8 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
     // case first.
     let mut pdf = open_pdf_for_inspection(input, repair, password)?;
     let Some(info) = pdf.encryption_info()? else {
-        return logger_info("File is not encrypted\n");
+        logger_info("File is not encrypted\n")?;
+        return finish_operation_warnings(&pdf, false);
     };
 
     let mut output = String::new();
@@ -5287,7 +5278,8 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
         // to the stream method happens where `cf_file` is resolved, not here.
         output.push_str(&format!("file encryption method: {}\n", info.eff_method));
     }
-    logger_info(output)
+    logger_info(output)?;
+    finish_operation_warnings(&pdf, false)
 }
 
 /// Lowercase hex encoding (qpdf `--show-encryption-key` format).
@@ -5502,21 +5494,29 @@ fn check_diagnostic_location(input: &Path, diagnostic: &flpdf::Diagnostic) -> St
     }
 }
 
-/// Finish a successful operation that accumulated lazy object-recovery
-/// warnings. Any requested output has already been emitted before this is
-/// called; qpdf likewise leaves the output in place and reports exit 3.
-fn finish_lazy_warnings<R: Read + Seek>(
-    _input: &Path,
-    pdf: &Pdf<R>,
-    diagnostics_start: usize,
-) -> CliResult<()> {
-    if pdf.repair_diagnostics().entries().len() == diagnostics_start {
+/// Finish a successful operation after all requested output has been emitted.
+/// qpdf aggregates warnings from both open-time and lazy object resolution;
+/// the summary shape depends on whether this route created a PDF output.
+fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>, creates_output: bool) -> CliResult<()> {
+    finish_warning_state(
+        !pdf.repair_diagnostics().entries().is_empty(),
+        creates_output,
+    )
+}
+
+fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<()> {
+    if !has_warnings {
         return Ok(());
     }
+    let suffix = if creates_output {
+        "; resulting file may have some problems"
+    } else {
+        ""
+    };
     logger_warn(format!(
-        "{}: operation succeeded with warnings\n",
+        "{}: operation succeeded with warnings{suffix}\n",
         progname()
-    ))?; // cov:ignore: exercised by lazy-warning subprocess integration tests
+    ))?; // cov:ignore: exercised by warning-summary subprocess integration tests
     Err(Box::new(CliExitError {
         code: ExitCode::Warnings,
         message: String::new(),
@@ -5546,23 +5546,27 @@ fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) -
 fn finish_rewrite_warnings<R: Read + Seek>(
     input: &Path,
     pdf: &Pdf<R>,
-    diagnostics_start: usize,
     normalization_last_bad: &[bool],
+    creates_output: bool,
 ) -> CliResult<()> {
-    let has_lazy = pdf.repair_diagnostics().entries().len() != diagnostics_start;
+    // qpdf retains open-time warnings in the document warning collection and
+    // emits the final summary after the output writer completes. Include the
+    // full collection here, not only warnings added after this route opened
+    // the document.
+    let has_repair_warnings = !pdf.repair_diagnostics().entries().is_empty();
     for &last_bad in normalization_last_bad {
         emit_content_normalization_warnings(input, last_bad)?;
     }
-    if !normalization_last_bad.is_empty() {
+    if !normalization_last_bad.is_empty() || has_repair_warnings {
+        let suffix = if creates_output {
+            "; resulting file may have some problems"
+        } else {
+            ""
+        };
         logger_warn(format!(
-            "{}: operation succeeded with warnings; resulting file may have some problems\n",
+            "{}: operation succeeded with warnings{suffix}\n",
             progname()
         ))?; // cov:ignore: exercised by normalization-warning subprocess integration tests
-    } else if has_lazy {
-        logger_warn(format!(
-            "{}: operation succeeded with warnings\n",
-            progname()
-        ))?; // cov:ignore: exercised by lazy rewrite-warning subprocess integration tests
     } else {
         return Ok(());
     }
@@ -5842,7 +5846,7 @@ fn run_add_attachment(
         false,
         None,
     )?;
-    Ok(())
+    finish_operation_warnings(&pdf, true)
 }
 
 /// `--remove-attachment KEY [input] [output]`
@@ -5877,7 +5881,7 @@ fn run_remove_attachment(
         false,
         None,
     )?;
-    Ok(())
+    finish_operation_warnings(&pdf, true)
 }
 
 /// `--list-attachments [--verbose] input`
@@ -5896,7 +5900,7 @@ fn run_list_attachments(
         Some(listing) => logger_info(listing)?,
         None => logger_info(format!("{} has no embedded files\n", input.display()))?,
     }
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 /// `--show-attachment KEY [-o PATH] input`
@@ -5929,7 +5933,7 @@ fn run_show_attachment(
             .expect("stdout writer prepared for attachment output")
             .write_all(&bytes)?;
     }
-    Ok(())
+    finish_operation_warnings(&pdf, false)
 }
 
 /// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- input output`
@@ -5976,7 +5980,11 @@ fn run_copy_attachments_from(
         false,
         None,
     )?;
-    Ok(())
+    finish_warning_state(
+        !target.repair_diagnostics().entries().is_empty()
+            || !src.repair_diagnostics().entries().is_empty(),
+        true,
+    )
 }
 
 #[cfg(test)]
