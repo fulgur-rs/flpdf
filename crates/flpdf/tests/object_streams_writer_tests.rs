@@ -951,7 +951,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
 
 // flpdf-zbf9: a plain (non-linearized) full rewrite of an ObjStm-bearing input
 // must drop the source's /Type /ObjStm and /Type /XRef containers rather than
-// re-emit them (emit_canonical_pdf's is_source_structural_container skip).
+// re-emit them (the writer's structural-container filtering).
 // The output is rebuilt cleanly: members are repacked into a fresh container and
 // the xref is regenerated. Default features — no qpdf/zlib required.
 #[test]
