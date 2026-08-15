@@ -3,16 +3,12 @@ use std::io::{Read, Seek};
 #[cfg(test)]
 use std::rc::Rc;
 
-use crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed;
 use crate::writer::object_streams;
 use crate::writer::plain::plan::{PlainWritePlan, PlannedIndirectObject};
 use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
 use crate::writer::WriterOptions;
-use crate::writer::{
-    reencode_stream_for_compress, serialize, write_reencoded_object, CompressStreams,
-    StreamEncryptionOptions, QPDF_BINARY_MARKER,
-};
-use crate::{Object, ObjectHandle, Pdf};
+use crate::writer::{serialize, CompressStreams, QPDF_BINARY_MARKER};
+use crate::{ObjectHandle, Pdf};
 
 /// Emit every body placement already chosen by `plan`.
 ///
@@ -40,53 +36,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 bytes.extend_from_slice(
                     format!("{} {} obj\n", output.number, output.generation).as_bytes(),
                 );
-                if plan.canonical {
-                    emit_canonical_source(pdf, options, plan, *source, &mut bytes)?;
-                } else {
-                    let mut object = pdf.resolve(*source)?;
-                    renumber_qpdf_refs_in_place_with_removed(
-                        pdf,
-                        &mut object,
-                        plan,
-                        &plan.removed_refs,
-                    )?; // cov:ignore: validated source placements have already passed the reference-map invariant
-                    match object {
-                        Object::Stream(stream) => {
-                            // `is_data_modified` is hardcoded false here:
-                            // this `!plan.canonical` branch (Preserve mode
-                            // with a source that already has ObjStm
-                            // containers, or Generate mode) only has the
-                            // already-materialized `object`, with no
-                            // canonical handle to query `is_data_modified()`
-                            // from. A token-filtered lone-Flate stream
-                            // written through this branch keeps today's
-                            // verbatim-preserve shortcut instead of qpdf's
-                            // forced re-encode; tracked as a follow-up,
-                            // parallel to the linearized-writer fix this
-                            // parameter exists for.
-                            let (reencoded, source_filter_is_lone_flate) =
-                                reencode_stream_for_compress(
-                                    stream,
-                                    options,
-                                    false,
-                                    true,
-                                    pdf.recovered_stream_eol(*source),
-                                    false,
-                                    false,
-                                );
-                            write_reencoded_object(
-                                &mut bytes,
-                                &reencoded,
-                                source_filter_is_lone_flate,
-                                options,
-                                None,
-                                *output,
-                                StreamEncryptionOptions::new(None, true),
-                            )?; // cov:ignore: no emitter means this validated stream serializer is infallible
-                        }
-                        other => other.write_pdf(&mut bytes),
-                    }
-                }
+                emit_source_from_handle(pdf, options, plan, *source, &mut bytes)?;
                 bytes.extend_from_slice(b"\nendobj\n");
                 layout
                     .uncompressed
@@ -97,18 +47,30 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 output,
                 members,
             } => {
-                let mut resolved = Vec::with_capacity(members.len());
+                let mut handles = Vec::with_capacity(members.len());
                 for member in members {
-                    let mut object = pdf.resolve(member.source)?;
-                    renumber_qpdf_refs_in_place_with_removed(
-                        pdf,
-                        &mut object,
-                        plan,
-                        &plan.removed_refs,
-                    )?;
-                    resolved.push((member.output, object));
+                    let handle = pdf.get_object_handle(member.source);
+                    pdf.resolve_object_handle(&handle)?;
+                    handles.push((member.output, handle));
                 }
-                let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
+                let map = |object_ref| {
+                    plan.new_for_original(object_ref).ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "plain writer: reference {} {} R absent from renumber map",
+                            object_ref.number, object_ref.generation
+                        ))
+                    })
+                };
+                let body = object_streams::emit_objstm_body_from_handles_with_writer(
+                    &handles,
+                    &mut |out, _member_index, _member_ref, handle| {
+                        handle.unparse_object_with_ref_map_and_removed(
+                            out,
+                            &map,
+                            &plan.removed_refs,
+                        )
+                    },
+                )?;
                 let offset = bytes.len();
                 bytes.extend_from_slice(
                     format!("{} {} obj\n", output.number, output.generation).as_bytes(),
@@ -120,11 +82,13 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 };
                 let extends = match origin {
                     crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
-                        let object = pdf.resolve(*source)?;
-                        match object.as_stream() {
-                            Some(stream) => match stream.dict.get("Extends") {
-                                Some(Object::Reference(extends)) => Some(
-                                    plan.old_to_new.get(extends).copied().ok_or_else(|| {
+                        let source_handle = pdf.get_object_handle(*source);
+                        pdf.resolve_object_handle(&source_handle)?;
+                        if let Some(source_dict) = source_handle.as_stream_dict() {
+                            let extends = source_dict.try_get_key(b"/Extends")?;
+                            match extends.object_ref() {
+                                Some(extends) => Some(
+                                    plan.old_to_new.get(&extends).copied().ok_or_else(|| {
                                         crate::Error::Unsupported(format!(
                                             "plain writer: source ObjStm /Extends {} {} R is absent from renumber map",
                                             extends.number, extends.generation
@@ -132,12 +96,13 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                                     })?,
                                 ),
                                 _ => None,
-                            },
+                            }
+                        } else {
                             // qpdf permits a null or otherwise non-stream source
                             // identity here as a placeholder for a reconstructed
                             // object stream. The rebuilt container still carries
                             // the surviving members, but has no /Extends key.
-                            None => None,
+                            None
                         }
                     }
                     crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
@@ -170,7 +135,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     Ok((bytes, layout))
 }
 
-fn emit_canonical_source<R: Read + Seek>(
+fn emit_source_from_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &WriterOptions,
     plan: &PlainWritePlan,
@@ -238,40 +203,51 @@ fn canonical_stream_output(
     // considers the user compression policy (`QPDFWriter.cc:1234-1245`). A
     // token-filtered stream must therefore take the pipe path even under
     // Preserve mode; only an unmodified stream may be emitted verbatim.
-    let (data, filtering_attempted) =
-        if !handle.is_data_modified() && (policy.is_none() || preserve_lone_flate) {
-            (
-                source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
-                false,
-            )
+    let (data, filtering_attempted) = if !handle.is_data_modified()
+        && (policy.is_none() || preserve_lone_flate)
+    {
+        (
+            source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
+            false,
+        )
+    } else {
+        let encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
+            crate::object_handle::STREAM_ENCODE_COMPRESS
         } else {
+            0
+        };
+        let mut attempt = 1_u8;
+        let (data, filtering_attempted) = loop {
             let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
             let mut filtering_attempted = false;
-            let encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
-                crate::object_handle::STREAM_ENCODE_COMPRESS
+            let (attempt_encode_flags, attempt_decode_level) = if attempt == 1 {
+                (encode_flags, decode_level)
             } else {
-                0
+                (0, crate::writer::DecodeLevel::None)
             };
             let success = source_for_pipe.pipe_stream_data(
                 &mut buffer,
                 &mut filtering_attempted,
-                encode_flags,
-                decode_level,
-                true,
-                true,
+                attempt_encode_flags,
+                attempt_decode_level,
+                false,
+                attempt == 1,
             )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
-            let data = if !success {
-                // QPDFWriter retries a failed filter pipeline against a fresh raw
-                // source (QPDFWriter.cc:1287-1314). The first pipeline may have
-                // consumed or partially filled its destination, so do not emit
-                // that buffer when filtering fails.
-                filtering_attempted = false;
-                source_for_pipe.get_raw_stream_data()?.as_ref().clone()
-            } else {
-                buffer.take_buffer()?.to_vec()
-            };
-            (data, filtering_attempted)
+
+            if success || attempt == 2 {
+                // QPDFWriter retries a failed filter pipeline against a
+                // fresh raw pipe (`QPDFWriter.cc:1287-1314`). The second
+                // attempt's buffer is authoritative even when the
+                // provider reports that no filtering branch was used.
+                break (
+                    buffer.take_buffer()?.to_vec(),
+                    filtering_attempted && success,
+                );
+            }
+            attempt = 2;
         };
+        (data, filtering_attempted)
+    };
 
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
     entries.remove(b"/Length".as_slice());
@@ -328,11 +304,14 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
         };
         for member in members {
             let member_handle = pdf.get_object_handle(member.source);
+            pdf.resolve_object_handle(&member_handle)?;
             let is_signature = object_streams::is_qpdf_signature_dict(pdf, &member_handle)?;
-            let violation = {
-                let object = pdf.resolve_borrowed(member.source)?;
-                planned_member_body_violation(member.source, member.output, object, &context)
-            }
+            let violation = planned_member_body_violation(
+                member.source,
+                member.output,
+                &member_handle,
+                &context,
+            )? // cov:ignore: trailing `)?` on a multi-line validation call — llvm-cov attributes the validated continuation to the Err path
             .or(is_signature.then_some("signature dictionary"));
             if let Some(kind) = violation {
                 return Err(crate::Error::Unsupported(format!(
@@ -349,38 +328,33 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
 fn planned_member_body_violation(
     source: crate::ObjectRef,
     output: crate::ObjectRef,
-    object: &Object,
+    object: &ObjectHandle,
     context: &object_streams::EligibilityContext,
-) -> Option<&'static str> {
+) -> crate::Result<Option<&'static str>> {
     if output.generation != 0 {
-        return Some("nonzero output generation");
+        return Ok(Some("nonzero output generation"));
     }
-    if matches!(object, Object::Stream(_)) {
-        return Some("stream body");
+    if object.as_stream_dict().is_some() {
+        return Ok(Some("stream body"));
     }
-    if let Some(dict) = object.as_dict() {
-        match dict.get("Type") {
-            Some(Object::Name(name)) if name.as_slice() == b"XRef" => {
-                return Some("/Type /XRef dictionary");
-            }
-            Some(Object::Name(name)) if name.as_slice() == b"ObjStm" => {
-                return Some("/Type /ObjStm dictionary");
-            }
-            _ => {}
-        }
+    if object.try_is_dictionary_of_type(b"XRef", b"")? {
+        return Ok(Some("/Type /XRef dictionary"));
+    }
+    if object.try_is_dictionary_of_type(b"ObjStm", b"")? {
+        return Ok(Some("/Type /ObjStm dictionary"));
     }
     if context.encryption_ref == Some(source) {
-        return Some("encryption dictionary");
+        return Ok(Some("encryption dictionary"));
     }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::writer::plain::plan::PlannedIndirectObject;
-    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, ObjectStreamMode, Stream};
-    use std::cell::Cell;
+    use crate::{Dictionary, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Stream};
+    use std::cell::RefCell;
     use std::io::Cursor;
 
     #[test]
@@ -652,21 +626,27 @@ mod tests {
     }
 
     #[test]
-    fn canonical_stream_output_marks_the_first_provider_attempt_retryable() {
+    fn canonical_stream_output_retries_provider_with_qpdf_attempt_flags() {
         let pdf = Pdf::empty().unwrap();
         let stream = pdf.new_stream().unwrap();
-        let retry_seen = Rc::new(Cell::new(false));
-        let retry_seen_in_callback = Rc::clone(&retry_seen);
+        let attempts = Rc::new(RefCell::new(Vec::new()));
+        let attempts_in_callback = Rc::clone(&attempts);
 
         stream
             .replace_stream_data_with_retry_callback(
-                move |pipeline, _suppress_warnings, will_retry| {
-                    retry_seen_in_callback.set(will_retry);
+                move |pipeline, suppress_warnings, will_retry| {
+                    attempts_in_callback
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
                     pipeline
-                        .write(b"provider bytes")
+                        .write(if will_retry {
+                            b"filtered provider bytes"
+                        } else {
+                            b"raw provider bytes"
+                        })
                         .map_err(crate::Error::from)?;
                     pipeline.finish().map_err(crate::Error::from)?;
-                    Ok(true)
+                    Ok(!will_retry)
                 },
                 None,
                 None,
@@ -679,9 +659,69 @@ mod tests {
         };
         let (_, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
 
-        assert!(retry_seen.get());
-        assert!(refiltered);
-        assert!(!data.is_empty());
+        assert_eq!(*attempts.borrow(), vec![(false, true), (false, false)]);
+        assert_eq!(data, b"raw provider bytes");
+        assert!(!refiltered);
+    }
+
+    #[test]
+    fn body_emission_retries_a_provider_with_qpdf_attempt_flags() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            compress_streams: CompressStreams::Yes,
+            static_id: true,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterOptions::default()
+        };
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let source = plan
+            .objects
+            .iter()
+            .find_map(|planned| {
+                let PlannedIndirectObject::Source { source, .. } = planned else {
+                    return None; // cov:ignore: ObjectStreamMode::Disable plans contain only source placements; defensive future-plan arm
+                };
+                let handle = pdf.get_object_handle(*source);
+                pdf.resolve_object_handle(&handle).ok()?;
+                handle.as_stream_dict().map(|_| *source)
+            })
+            .expect("three-page fixture must contain a source stream");
+        let stream = pdf.get_object_handle(source);
+        let attempts = Rc::new(RefCell::new(Vec::new()));
+        let attempts_in_callback = Rc::clone(&attempts);
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    attempts_in_callback
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline
+                        .write(if will_retry {
+                            b"filtered provider bytes"
+                        } else {
+                            b"raw provider bytes"
+                        })
+                        .map_err(crate::Error::from)?;
+                    pipeline.finish().map_err(crate::Error::from)?;
+                    Ok(!will_retry)
+                },
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            )
+            .unwrap();
+        pdf.mark_object_handle_dirty(&stream).unwrap();
+
+        let (bytes, _) = emit_bodies(&mut pdf, &options, &plan).unwrap();
+
+        assert_eq!(*attempts.borrow(), vec![(false, true), (false, false)]);
+        assert!(bytes
+            .windows(b"raw provider bytes".len())
+            .any(|window| window == b"raw provider bytes"));
+        assert!(!bytes
+            .windows(b"filtered provider bytes".len())
+            .any(|window| window == b"filtered provider bytes"));
     }
 
     #[test]
@@ -866,12 +906,13 @@ mod tests {
     #[test]
     fn planned_member_identity_invariants_are_classified() {
         let source = crate::ObjectRef::new(7, 0);
-        let object = Object::Null;
+        let object = ObjectHandle::null();
         let ordinary = object_streams::EligibilityContext {
             encryption_ref: None,
         };
         assert_eq!(
-            planned_member_body_violation(source, crate::ObjectRef::new(2, 1), &object, &ordinary,),
+            planned_member_body_violation(source, crate::ObjectRef::new(2, 1), &object, &ordinary,)
+                .unwrap(),
             Some("nonzero output generation")
         );
 
@@ -879,7 +920,8 @@ mod tests {
             encryption_ref: Some(source),
         };
         assert_eq!(
-            planned_member_body_violation(source, crate::ObjectRef::new(2, 0), &object, &encrypted,),
+            planned_member_body_violation(source, crate::ObjectRef::new(2, 0), &object, &encrypted)
+                .unwrap(),
             Some("encryption dictionary")
         );
     }

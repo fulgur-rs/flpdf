@@ -822,7 +822,10 @@ fn pdf_writer_preserves_extends_when_rewriting_extension_stream_member() {
     assert_eq!(members[1].0, mapped_member_3.number);
     assert_eq!(
         parse_objstm_member(&decoded, first, &members, 0),
-        Object::Integer(42)
+        // qpdf resolves only the extension stream's own header entries;
+        // `/Extends` is preserved on output but does not make the inherited
+        // member a live value during writer emission.
+        Object::Null
     );
     assert_eq!(
         parse_objstm_member(&decoded, first, &members, 1),
