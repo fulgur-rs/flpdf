@@ -28,6 +28,7 @@
 //! - `Err(LinearizationCheckError::Io(…))` — I/O failure reading the file
 
 use crate::{DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{BufReader, Read, Seek};
 use std::rc::Rc;
@@ -100,17 +101,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// The deeper `/N`, `/O`, `/H`, `/T`, and `/P` checks belong to this
     /// module's [`check_linearization`] analogue.
     pub fn is_linearized(&mut self) -> Result<bool> {
-        let Some(object_number) = self.resolver.linearization_candidate()? else {
+        let Some(object_ref) = self.linearization_candidate_ref()? else {
             return Ok(false);
         };
-        let Ok(object_number) = u32::try_from(object_number) else {
-            return Ok(false);
-        };
-        if object_number == 0 {
-            return Ok(false);
-        }
 
-        let candidate = self.get_object_handle(ObjectRef::new(object_number, 0));
+        let candidate = self.get_object_handle(object_ref);
         let Some(dictionary) = candidate.try_as_dictionary().ok().flatten() else {
             return Ok(false);
         };
@@ -186,6 +181,119 @@ fn is_pdf_whitespace(b: u8) -> bool {
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
 }
 
+/// Enqueue indirect references reachable from a canonical direct value.
+///
+/// This is the ObjectHandle equivalent of the object-user walk that qpdf's
+/// `optimize(false)` performs before `calculateLinearizationData`: direct
+/// arrays/dictionaries are traversed in place, while an indirect handle is a
+/// source-object boundary and is queued for extent capture by the caller.
+fn enqueue_references(
+    value: &ObjectHandle,
+    pending: &mut VecDeque<ObjectRef>,
+) -> Result<()> {
+    if let Some(object_ref) = value.object_ref() {
+        pending.push_back(object_ref);
+        return Ok(());
+    }
+
+    value.try_dereference()?;
+    if let Some(items) = value.as_array() {
+        for item in items {
+            enqueue_references(&item, pending)?;
+        }
+    } else if let Some(entries) = value.try_as_dictionary()? {
+        for (_key, child) in entries {
+            enqueue_references(&child, pending)?;
+        }
+    } else if let Some(stream_dict) = value.as_stream_dict() {
+        enqueue_references(&stream_dict, pending)?;
+    }
+    Ok(())
+}
+
+/// Return qpdf's source-extent envelope for the objects assigned to part 6.
+///
+/// qpdf's `checkLinearizationInternal` compares `/E` with the maximum
+/// `end_before_space`/`end_after_space` of `m->part6` after its non-mutating
+/// optimization pass (`QPDF_linearization.cc:480-522`). For the consumer path,
+/// the canonical page closure is the same object-user boundary: the first page
+/// and its direct resource/content graph, with `/Parent` page-tree edges
+/// excluded. `/Outlines` is added when `/PageMode /UseOutlines` makes qpdf put
+/// that graph in part 6.
+fn first_page_source_extent<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<(i64, i64)> {
+    let mut pending = VecDeque::from([page_ref]);
+    let mut visited = BTreeSet::new();
+    let mut max_end_before_space = -1_i64;
+    let mut max_end_after_space = -1_i64;
+
+    if let Some(root_ref) = pdf.root_ref() {
+        let root = pdf.get_object_handle(root_ref);
+        root.try_dereference()?;
+        if let Some(root_dict) = root.try_as_dictionary()? {
+            let page_mode = root_dict.get(b"/PageMode" as &[u8]).cloned();
+            let use_outlines = if let Some(page_mode) = page_mode {
+                page_mode.try_dereference()?;
+                page_mode.as_name().as_deref() == Some(b"UseOutlines")
+            } else {
+                false
+            };
+            if use_outlines {
+                if let Some(outlines) = root_dict.get(b"/Outlines" as &[u8]).cloned() {
+                enqueue_references(&outlines, &mut pending)?;
+                }
+            }
+        }
+    }
+
+    while let Some(object_ref) = pending.pop_front() {
+        if !visited.insert(object_ref) {
+            continue;
+        }
+
+        let object = pdf.get_object_handle(object_ref);
+        object.try_dereference()?;
+        let (end_before_space, end_after_space) = object.end_offsets();
+        if end_before_space < 0 || end_after_space < 0 {
+            return Err(crate::Error::Unsupported(format!(
+                "linearization part-6 object {object_ref:?} has no source extent"
+            )));
+        }
+        max_end_before_space = max_end_before_space.max(end_before_space);
+        max_end_after_space = max_end_after_space.max(end_after_space);
+
+        let Some(entries) = object.try_as_dictionary()? else {
+            if let Some(stream_dict) = object.as_stream_dict() {
+                enqueue_references(&stream_dict, &mut pending)?;
+            }
+            continue;
+        };
+
+        let type_name = entries.get(b"/Type" as &[u8]).cloned();
+        let is_page = if let Some(type_name) = type_name {
+            type_name.try_dereference()?;
+            type_name.as_name().as_deref() == Some(b"Page")
+        } else {
+            false
+        };
+        // qpdf treats nested Page objects as graph boundaries in the
+        // object-user walk; the first page itself is the one exception.
+        if object_ref != page_ref && is_page {
+            continue;
+        }
+        for (key, child) in entries {
+            if is_page && key == b"/Parent" {
+                continue;
+            }
+            enqueue_references(&child, &mut pending)?;
+        }
+    }
+
+    Ok((max_end_before_space, max_end_after_space))
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -219,14 +327,18 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     let file_len = file_bytes.len() as u64;
 
     // -----------------------------------------------------------------------
-    // 1. The first object in the file must have /Linearized with a positive
-    //    value. PDF 1.7 Annex F.2.2.1 specifies "the first object" by
-    //    physical position, not by object number — qpdf places the param
-    //    dict at an obj number determined by its renumber pass, so we have
-    //    to identify it from the file header's first object token.
+    // 1. Reuse qpdf's isLinearized candidate boundary. It scans only the
+    //    first 1024 bytes and resolves the candidate through the generation-
+    //    zero canonical handle; a full-file byte scan would accept a late
+    //    object that qpdf rejects.
     // -----------------------------------------------------------------------
-    let first_obj_ref =
-        find_first_object_ref(file_bytes).ok_or(LinearizationCheckError::NotLinearized)?;
+    if !pdf.is_linearized().map_err(LinearizationCheckError::from)? {
+        return Err(LinearizationCheckError::NotLinearized);
+    }
+    let first_obj_ref = pdf
+        .linearization_candidate_ref()
+        .map_err(LinearizationCheckError::from)?
+        .ok_or(LinearizationCheckError::NotLinearized)?;
     let first_obj = pdf.get_object_handle(first_obj_ref);
     let Some(_) = first_obj
         .try_as_dictionary()
@@ -235,48 +347,26 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         return Err(LinearizationCheckError::NotLinearized);
     };
 
-    let linearized_val = first_obj
-        .try_get_key(b"/Linearized")
-        .map_err(LinearizationCheckError::from)?;
-    linearized_val
-        .try_dereference()
-        .map_err(LinearizationCheckError::from)?;
-    let linearized_value = linearized_val
-        .as_integer()
-        .map(|value| value as f64)
-        .or_else(|| linearized_val.as_real());
-    if !linearized_value.is_some_and(|value| value.is_finite() && value.floor() == 1.0) {
-        return Err(LinearizationCheckError::NotLinearized);
-    }
+    // `is_linearized` owns qpdf's `/L` rule: an integer `/L` must match the
+    // file size, while a missing or non-integer `/L` is not rejected here.
 
     // -----------------------------------------------------------------------
-    // 2. /L must equal file length
-    // -----------------------------------------------------------------------
-    let l_obj = first_obj
-        .try_get_key(b"/L")
-        .map_err(LinearizationCheckError::from)?;
-    let l_val = as_u64(&l_obj, "L")?;
-    if l_val != file_len {
-        fail!("/L ({l_val}) does not match file length ({file_len})");
-    }
-
-    // -----------------------------------------------------------------------
-    // 3. /N must equal the page count
+    // 2. /N must equal the page count
     // -----------------------------------------------------------------------
     let n_obj = first_obj
         .try_get_key(b"/N")
         .map_err(LinearizationCheckError::from)?;
     let n_val = as_u64(&n_obj, "N")?;
-    let page_count = PageDocumentHelper::new(pdf)
+    let pages = PageDocumentHelper::new(pdf)
         .get_all_pages()
-        .map_err(|e| LinearizationCheckError::Io(Box::new(e)))?
-        .len() as u64;
+        .map_err(|e| LinearizationCheckError::Io(Box::new(e)))?;
+    let page_count = pages.len() as u64;
     if n_val != page_count {
         fail!("/N ({n_val}) does not match page count ({page_count})");
     }
 
     // -----------------------------------------------------------------------
-    // 4. /O must point to an existing Page object
+    // 3. /O must point to the first page object
     // -----------------------------------------------------------------------
     let o_obj = first_obj
         .try_get_key(b"/O")
@@ -342,8 +432,37 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         }
     }
 
+    // qpdf records this as a linearization warning in
+    // `checkLinearizationInternal` (`QPDF_linearization.cc:419-427`).  The
+    // flpdf checker has a boolean-equivalent error result rather than qpdf's
+    // warning accumulator, so surface the same failed-check condition after
+    // validating the referenced object itself.  Keeping the object validation
+    // first preserves the useful malformed-object diagnostics for a bad /O.
+    let Some(first_page_ref) = pages.first() else {
+        fail!("/O ({o_num}) cannot be checked because the document has no pages");
+    };
+    if first_page_ref.number as u64 != o_num {
+        fail!(
+            "/O ({o_num}) does not match the first page object ({})",
+            first_page_ref.number
+        );
+    }
+
+    // qpdf accepts an omitted or null `/P`, and accepts any integer (including
+    // a negative first-page number); only other resolved types are malformed.
+    let p_obj = first_obj
+        .try_get_key(b"/P")
+        .map_err(LinearizationCheckError::from)?;
+    p_obj
+        .try_dereference()
+        .map_err(LinearizationCheckError::from)?;
+    if !p_obj.try_is_null().map_err(LinearizationCheckError::from)? && p_obj.as_integer().is_none()
+    {
+        fail!("/P is present but is neither an integer nor null");
+    }
+
     // -----------------------------------------------------------------------
-    // 5. /H — hint stream at H[0] must be FlateDecode-decodable
+    // 4. /H — primary and optional overflow hint streams must be readable
     // -----------------------------------------------------------------------
     let h_obj = first_obj
         .try_get_key(b"/H")
@@ -363,24 +482,42 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     for (index, item) in h_items.iter().enumerate() {
         let _ = as_u64(item, &format!("H[{index}]"))?;
     }
+    let mut check_hint = |index: usize, offset: u64, length: u64| -> CheckResult {
+        if offset >= file_len {
+            fail!("/H[{index}] offset ({offset}) is beyond file length ({file_len})");
+        }
+        let end =
+            offset
+                .checked_add(length)
+                .ok_or_else(|| LinearizationCheckError::InvalidParam {
+                    message: format!("/H[{index}] offset plus length overflows"),
+                })?;
+        if end > file_len {
+            fail!(
+                "/H[{index}] offset plus length ({offset}+{length}) extends beyond file length ({file_len})"
+            );
+        }
+        let offset =
+            usize::try_from(offset).map_err(|_| LinearizationCheckError::InvalidParam {
+                message: format!("/H[{index}] offset ({offset}) does not fit in platform usize"),
+            })?;
+        check_hint_stream_at_offset(pdf, file_bytes, offset, length)
+    };
+
     let h_offset = as_u64(&h_items[0], "H[0]")?;
     let h_length = as_u64(&h_items[1], "H[1]")?;
-
-    // Bounds: H[0] within file, H[0]+H[1] within file.
-    if h_offset >= file_len {
-        fail!("/H[0] offset ({h_offset}) is beyond file length ({file_len})");
+    check_hint(0, h_offset, h_length)?;
+    if h_items.len() == 4 {
+        let overflow_offset = as_u64(&h_items[2], "H[2]")?;
+        let overflow_length = as_u64(&h_items[3], "H[3]")?;
+        if overflow_offset != 0 {
+            check_hint(2, overflow_offset, overflow_length)?;
+        }
     }
-    if h_offset.saturating_add(h_length) > file_len {
-        fail!("/H[0]+/H[1] ({h_offset}+{h_length}) extends beyond file length ({file_len})");
-    }
-
-    // Verify the hint stream is decodable AND that /H[1] equals the byte
-    // length the parsed stream actually occupies.  Without this check, a
-    // back-patcher that miscomputes /H[1] silently passes here.
-    check_hint_stream_at_offset(pdf, file_bytes, h_offset as usize, h_length)?;
 
     // -----------------------------------------------------------------------
-    // 6. /E must be less than file length
+    // 5. /E must match the source extent envelope of qpdf's part 6, not merely
+    //    be smaller than EOF.
     // -----------------------------------------------------------------------
     let e_obj = first_obj
         .try_get_key(b"/E")
@@ -389,9 +526,23 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     if e_val >= file_len {
         fail!("/E ({e_val}) must be less than file length ({file_len})");
     }
+    let Some(first_page_ref) = pages.first().copied() else {
+        fail!("/E ({e_val}) cannot be checked because the document has no pages");
+    };
+    let (min_e, max_e) =
+        first_page_source_extent(pdf, first_page_ref).map_err(LinearizationCheckError::from)?;
+    let min_e = u64::try_from(min_e).map_err(|_| LinearizationCheckError::InvalidParam {
+        message: format!("computed part-6 end offset {min_e} is negative"),
+    })?;
+    let max_e = u64::try_from(max_e).map_err(|_| LinearizationCheckError::InvalidParam {
+        message: format!("computed part-6 end offset {max_e} is negative"),
+    })?;
+    if e_val < min_e || e_val > max_e {
+        fail!("/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})");
+    }
 
     // -----------------------------------------------------------------------
-    // 7. /T must be within the last cross-reference *section*.
+    // 6. /T must be within the last cross-reference *section*.
     //
     // Different PDF producers use slightly different /T conventions:
     // - ISO 32000-1 Annex F: /T = byte offset of the xref keyword itself
@@ -519,6 +670,23 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         );
     }
 
+    // qpdf seeks to /T and consumes only PDF whitespace before comparing the
+    // resulting position with its exact `first_xref_item_offset`
+    // (`QPDF_linearization.cc:452-470`, populated by `QPDF.cc:845-869`).  A
+    // backscan that merely finds an earlier `xref` keyword would accept a
+    // header position qpdf rejects, so reproduce that cursor movement here.
+    let mut first_entry_cursor = t_usize;
+    while first_entry_cursor < first_entry_pos && is_pdf_whitespace(file_bytes[first_entry_cursor])
+    {
+        first_entry_cursor += 1;
+    }
+    if first_entry_cursor != first_entry_pos {
+        fail!(
+            "/T ({t_val}) does not point at the whitespace immediately before the \
+             first xref item ({first_entry_pos})"
+        );
+    }
+
     Ok(())
 }
 
@@ -587,7 +755,13 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
     // sit near another object header — which is precisely the kind of
     // corruption we want to detect.
     const SCAN_WINDOW: usize = 64;
-    let scan_end = (offset + SCAN_WINDOW).min(file_bytes.len());
+    if offset >= file_bytes.len() {
+        return Err(crate::Error::Unsupported(format!(
+            "/H[0] offset ({offset}) is beyond file length ({})",
+            file_bytes.len()
+        )));
+    }
+    let scan_end = offset.saturating_add(SCAN_WINDOW).min(file_bytes.len());
     let window = &file_bytes[offset..scan_end];
 
     let Some((obj_num, obj_gen)) = parse_obj_header_at(window) else {
@@ -601,8 +775,7 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
     // hint stream with a non-zero generation (e.g. after incremental update)
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
-    let hint_obj = pdf.get_object_handle(hint_ref);
-    hint_obj.try_dereference()?;
+    let hint_obj = pdf.resolve_object_handle_at_offset(offset as u64, hint_ref)?;
     let Some(hint_dict) = hint_obj.as_stream_dict() else {
         if hint_obj.is_null() {
             return Err(crate::Error::Unsupported(format!(
@@ -623,17 +796,24 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
         length_obj.try_dereference()?;
         (end_before_space, end_after_space) = length_obj.end_offsets();
     }
-    let computed_end = offset
-        .checked_add(usize::try_from(expected_h_length).map_err(|_| {
-            crate::Error::Unsupported(format!(
-                "/H[1] ({expected_h_length}) does not fit in platform usize"
-            ))
-        })?)
-        .ok_or_else(|| {
-            crate::Error::Unsupported(format!(
-                "/H[0] ({offset}) plus /H[1] ({expected_h_length}) overflows"
-            ))
-        })?;
+    if end_before_space < 0 || end_after_space < 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "hint stream object {obj_num} {obj_gen} has no source extent"
+        )));
+    }
+    // cov:ignore-start: u64 -> usize conversion can fail only on 32-bit
+    // targets for a value above usize::MAX; the supported CI target is 64-bit.
+    let expected_h_length_usize = usize::try_from(expected_h_length).map_err(|_| {
+        crate::Error::Unsupported(format!(
+            "/H[1] ({expected_h_length}) does not fit in platform usize"
+        ))
+    })?;
+    // cov:ignore-end
+    let computed_end = offset.checked_add(expected_h_length_usize).ok_or_else(|| {
+        crate::Error::Unsupported(format!(
+            "/H[0] ({offset}) plus /H[1] ({expected_h_length}) overflows"
+        ))
+    })?;
     if end_before_space >= 0
         && end_after_space >= 0
         && (i64::try_from(computed_end).unwrap_or(i64::MAX) < end_before_space
@@ -682,6 +862,7 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
 ///
 /// Returns `None` if no object header is found (e.g. truncated or
 /// non-PDF input).
+#[cfg(test)]
 pub(crate) fn find_first_object_ref(file_bytes: &[u8]) -> Option<ObjectRef> {
     // Scan for "<num><ws+><gen><ws+>obj" anchored at a real line start.
     //
@@ -794,6 +975,77 @@ fn parse_obj_header_at(window: &[u8]) -> Option<(u32, u16)> {
     }
 
     Some((obj_num, obj_gen))
+}
+
+/// Test-only fixture transform for qpdf's otherwise rarely emitted four-item
+/// `/H` form. The linearization writer reserves whitespace after the parameter
+/// dictionary; consume that padding while inserting a second copy of the
+/// primary stream's offset/length, so every existing object and xref offset
+/// remains unchanged.
+#[cfg(test)]
+pub(crate) fn add_overflow_hint_items_for_test(mut bytes: Vec<u8>) -> Vec<u8> {
+    fn token_range(bytes: &[u8], mut cursor: usize) -> (usize, usize) {
+        while cursor < bytes.len() && is_pdf_whitespace(bytes[cursor]) {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && !is_pdf_whitespace(bytes[cursor]) && bytes[cursor] != b']' {
+            cursor += 1;
+        }
+        (start, cursor)
+    }
+
+    let h_key = b"/H [";
+    let h_key_start = bytes
+        .windows(h_key.len())
+        .position(|window| window == h_key)
+        .expect("linearization parameter dictionary has /H array");
+    let h_values_start = h_key_start + h_key.len();
+    let (h0_start, h0_end) = token_range(&bytes, h_values_start);
+    let (h1_start, h1_end) = token_range(&bytes, h0_end);
+    let close = h1_end
+        + bytes[h1_end..]
+            .iter()
+            .position(|&byte| byte == b']')
+            .expect("linearization /H array terminator");
+    let param_end = close
+        + bytes[close..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .expect("linearization parameter endobj")
+        + b"endobj".len();
+
+    let insertion = {
+        let mut value = Vec::with_capacity(2 + h0_end - h0_start + h1_end - h1_start);
+        value.push(b' ');
+        value.extend_from_slice(&bytes[h0_start..h0_end]);
+        value.push(b' ');
+        value.extend_from_slice(&bytes[h1_start..h1_end]);
+        value
+    };
+    let delta = insertion.len();
+    let padding_boundary = param_end
+        + bytes[param_end..]
+            .iter()
+            .position(|&byte| !is_pdf_whitespace(byte))
+            .expect("non-whitespace after the parameter dictionary");
+    assert!(padding_boundary >= delta, "parameter padding is too short");
+    assert!(
+        bytes[padding_boundary - delta..padding_boundary]
+            .iter()
+            .all(|&byte| is_pdf_whitespace(byte)),
+        "parameter dictionary has no trailing padding for /H overflow fixture"
+    );
+
+    bytes.splice(close..close, insertion);
+    assert!(
+        bytes[padding_boundary..padding_boundary + delta]
+            .iter()
+            .all(|&byte| is_pdf_whitespace(byte)),
+        "inserted /H overflow fixture did not land in parameter padding"
+    );
+    bytes.drain(padding_boundary..padding_boundary + delta);
+    bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1371,106 @@ mod tests {
         doc.bytes
     }
 
+    fn linearized_fixture_bytes() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat/linearized-one-page.pdf"),
+        )
+        .expect("linearized fixture")
+    }
+
+    /// Replace a parameter value without moving any later PDF offsets. PDF
+    /// whitespace after a scalar or array is insignificant, so short test
+    /// values are padded to the original byte span.
+    fn replace_parameter_value(bytes: &mut [u8], key: &[u8], replacement: &[u8]) {
+        let key_start = bytes
+            .windows(key.len())
+            .position(|window| window == key)
+            .expect("parameter key");
+        let mut start = key_start + key.len();
+        while start < bytes.len() && is_pdf_whitespace(bytes[start]) {
+            start += 1;
+        }
+        let end = if bytes[start] == b'[' {
+            start
+                + bytes[start..]
+                    .iter()
+                    .position(|&byte| byte == b']')
+                    .expect("array terminator")
+                + 1
+        } else {
+            start
+                + bytes[start..]
+                    .iter()
+                    .position(|&byte| is_pdf_whitespace(byte))
+                    .expect("scalar terminator")
+        };
+        assert!(replacement.len() <= end - start);
+        let mut padded = vec![b' '; end - start];
+        padded[..replacement.len()].copy_from_slice(replacement);
+        bytes[start..end].copy_from_slice(&padded);
+    }
+
+    fn replace_parameter_number(bytes: &mut [u8], key: &[u8], value: usize) {
+        let key_start = bytes
+            .windows(key.len())
+            .position(|window| window == key)
+            .expect("numeric parameter key");
+        let mut start = key_start + key.len();
+        while start < bytes.len() && is_pdf_whitespace(bytes[start]) {
+            start += 1;
+        }
+        let end = start
+            + bytes[start..]
+                .iter()
+                .position(|&byte| is_pdf_whitespace(byte))
+                .expect("numeric parameter terminator");
+        let width = end - start;
+        let digits = value.to_string();
+        assert!(
+            digits.len() <= width,
+            "replacement {value} does not fit parameter {key:?} width {width}"
+        );
+        let mut padded = vec![b'0'; width];
+        padded[width - digits.len()..].copy_from_slice(digits.as_bytes());
+        bytes[start..end].copy_from_slice(&padded);
+    }
+
+    fn object_offset(bytes: &[u8], object_number: u32) -> usize {
+        let header = format!("{object_number} 0 obj");
+        bytes
+            .windows(header.len())
+            .position(|window| window == header.as_bytes())
+            .expect("object header")
+    }
+
+    fn indirect_length_hint_fixture() -> (Vec<u8>, usize, u64) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let stream_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n");
+        let length_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n3\nendobj\n");
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"3 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_offset = bytes.len();
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{stream_offset:010} 00000 n \n{length_offset:010} 00000 n \n{catalog_offset:010} 00000 n \n"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 3 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let length_end = bytes
+            .windows(b"2 0 obj\n3\nendobj".len())
+            .position(|window| window == b"2 0 obj\n3\nendobj")
+            .expect("length object")
+            + b"2 0 obj\n3\nendobj".len();
+        let expected_length = (length_end + 1 - stream_offset) as u64;
+        (bytes, stream_offset, expected_length)
+    }
+
     #[test]
     fn check_linearized_bytes_passes() {
         let bytes = build_linearized_bytes();
@@ -1127,6 +1479,228 @@ mod tests {
             result.is_ok(),
             "check should pass on well-formed linearized output: {result:?}"
         );
+    }
+
+    #[test]
+    fn check_reads_the_four_item_overflow_hint_stream() {
+        let bytes = add_overflow_hint_items_for_test(linearized_fixture_bytes());
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "check should load a non-zero overflow hint stream: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_null_and_non_dictionary_first_page_objects() {
+        let mut missing = linearized_fixture_bytes();
+        replace_parameter_value(&mut missing, b"/O ", b"0");
+        assert!(matches!(
+            check_linearization_bytes(&missing),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("non-existent object")
+        ));
+
+        let mut stream = linearized_fixture_bytes();
+        replace_parameter_value(&mut stream, b"/O ", b"5");
+        assert!(matches!(
+            check_linearization_bytes(&stream),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("does not refer to a dictionary")
+        ));
+    }
+
+    #[test]
+    fn check_rejects_wrong_page_type_and_unstructured_page_dictionary() {
+        let mut wrong_type = linearized_fixture_bytes();
+        replace_parameter_value(&mut wrong_type, b"/O ", b"4");
+        assert!(matches!(
+            check_linearization_bytes(&wrong_type),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("instead of /Page")
+        ));
+
+        let mut unstructured = linearized_fixture_bytes();
+        replace_parameter_value(&mut unstructured, b"/O ", b"2");
+        assert!(matches!(
+            check_linearization_bytes(&unstructured),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("does not look like a Page object")
+        ));
+    }
+
+    #[test]
+    fn check_rejects_bad_hint_shape_and_offset() {
+        let mut not_array = linearized_fixture_bytes();
+        replace_parameter_value(&mut not_array, b"/H ", b"0");
+        assert!(matches!(
+            check_linearization_bytes(&not_array),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("/H is missing or has unexpected format")
+        ));
+
+        let mut wrong_cardinality = linearized_fixture_bytes();
+        replace_parameter_value(&mut wrong_cardinality, b"/H ", b"[0 0 0]");
+        assert!(matches!(
+            check_linearization_bytes(&wrong_cardinality),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("wrong number of items")
+        ));
+
+        let mut bad_offset = linearized_fixture_bytes();
+        replace_parameter_number(&mut bad_offset, b"/H [", 0);
+        assert!(matches!(
+            check_linearization_bytes(&bad_offset),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("does not point at an indirect object header")
+        ));
+    }
+
+    #[test]
+    fn check_rejects_a_non_stream_hint_object_and_non_xref_t_object() {
+        let bytes = linearized_fixture_bytes();
+        let mut non_stream_hint = bytes.clone();
+        replace_parameter_number(&mut non_stream_hint, b"/H [", object_offset(&bytes, 4));
+        assert!(matches!(
+            check_linearization_bytes(&non_stream_hint),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("is not a stream")
+        ));
+
+        let mut non_xref = bytes;
+        let non_xref_target = object_offset(&non_xref, 4);
+        replace_parameter_number(&mut non_xref, b"/T ", non_xref_target);
+        assert!(matches!(
+            check_linearization_bytes(&non_xref),
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("cross-reference stream")
+        ));
+    }
+
+    #[test]
+    fn check_rejects_an_e_value_outside_the_part6_source_extent() {
+        let mut bytes = linearized_fixture_bytes();
+        let beyond_part6 = bytes.len() - 1;
+        replace_parameter_number(&mut bytes, b"/E ", beyond_part6);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("does not match the part-6 source extent range")
+            ),
+            "an /E outside qpdf's source extent must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_a_classic_t_value_that_is_not_the_pre_entry_whitespace() {
+        let mut bytes = linearized_fixture_bytes();
+        let xref_offset = bytes
+            .windows(b"xref\n0".len())
+            .rposition(|window| window == b"xref\n0")
+            .expect("classic xref section");
+        replace_parameter_number(&mut bytes, b"/T ", xref_offset);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("does not point at the whitespace immediately before")
+            ),
+            "qpdf rejects /T at the xref keyword itself: {result:?}"
+        );
+    }
+
+    #[test]
+    fn load_hint_stream_rejects_bad_offsets_and_checks_indirect_length_extent() {
+        let bytes = linearized_fixture_bytes();
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
+        assert!(matches!(
+            load_hint_stream(&mut pdf, &bytes, 0, 0),
+            Err(crate::Error::Unsupported(message))
+                if message.contains("does not point at an indirect object header")
+        ));
+
+        let mut bytes_with_missing = bytes.clone();
+        bytes_with_missing.extend_from_slice(b"% 99 0 obj\n");
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
+        assert!(matches!(
+            load_hint_stream(&mut pdf, &bytes_with_missing, bytes_with_missing.len(), 0),
+            Err(crate::Error::Unsupported(message))
+                if message.contains("beyond file length")
+        ));
+
+        let (indirect_length, offset, expected_length) = indirect_length_hint_fixture();
+        let mut pdf = Pdf::open_mem_owned(indirect_length.clone()).expect("open length fixture");
+        let (dict, decoded) = load_hint_stream(&mut pdf, &indirect_length, offset, expected_length)
+            .expect("indirect /Length hint stream");
+        assert!(dict.try_get_key(b"/Length").unwrap().object_ref().is_some());
+        assert_eq!(decoded.as_slice(), b"abc");
+
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
+        let mismatch = load_hint_stream(&mut pdf, &bytes, object_offset(&bytes, 5), 116);
+        assert!(
+            matches!(
+                mismatch,
+                Err(crate::Error::Unsupported(ref message))
+                    if message.contains("does not match hint stream object span")
+            ),
+            "unexpected hint span result: {mismatch:?}"
+        );
+
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
+        let overflow = load_hint_stream(&mut pdf, &bytes, object_offset(&bytes, 5), u64::MAX);
+        assert!(
+            matches!(
+                overflow,
+                Err(crate::Error::Unsupported(ref message))
+                    if message.contains("overflows")
+            ),
+            "unexpected hint offset overflow result: {overflow:?}"
+        );
+
+        // The physical header is authoritative for qpdf's readObjectAtOffset
+        // path.  Deliberately point the effective xref row for object 5 at the
+        // catalog while leaving its real header at /H[0]; the canonical
+        // physical resolver must still load the Flate hint stream.
+        let mut xref_mismatch = bytes.clone();
+        let hint_offset = object_offset(&xref_mismatch, 5);
+        let old_entry = format!("{hint_offset:010} 00000 n ");
+        let wrong_entry = format!("{:010} 00000 n ", object_offset(&xref_mismatch, 4));
+        let entry_start = xref_mismatch
+            .windows(old_entry.len())
+            .position(|window| window == old_entry.as_bytes())
+            .expect("object 5 xref entry");
+        xref_mismatch[entry_start..entry_start + old_entry.len()]
+            .copy_from_slice(wrong_entry.as_bytes());
+        let mut pdf = Pdf::open_mem_owned(xref_mismatch.clone()).expect("open mismatched xref");
+        let (_, decoded) = load_hint_stream(&mut pdf, &xref_mismatch, hint_offset, 118)
+            .expect("physical hint header must win over the stale xref row");
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn check_maps_hint_stream_failures_to_invalid_param_and_io() {
+        let bytes = linearized_fixture_bytes();
+        let mut invalid_offset = bytes.clone();
+        replace_parameter_number(&mut invalid_offset, b"/H [", 0);
+        let mut pdf = Pdf::open_mem_owned(invalid_offset.clone()).expect("open invalid fixture");
+        assert!(matches!(
+            check_hint_stream_at_offset(&mut pdf, &invalid_offset, 0, 0),
+            Err(LinearizationCheckError::InvalidParam { .. })
+        ));
+
+        let failure_offset = object_offset(&bytes, 5) as u64;
+        let reader = FailingObjectReader {
+            inner: Cursor::new(bytes.clone()),
+            failure_offset,
+        };
+        let mut pdf = Pdf::open(reader).expect("open lazy fixture");
+        assert!(matches!(
+            check_hint_stream_at_offset(&mut pdf, &bytes, failure_offset as usize, 118),
+            Err(LinearizationCheckError::Io(_))
+        ));
     }
 
     #[test]
@@ -1166,8 +1740,32 @@ mod tests {
 
         let result = check_linearization_bytes(&bytes);
         assert!(
-            matches!(result, Err(LinearizationCheckError::InvalidParam { .. })),
-            "tampered /L must yield InvalidParam, got {result:?}"
+            matches!(result, Err(LinearizationCheckError::NotLinearized)),
+            "tampered /L must yield NotLinearized, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_a_non_integer_p_parameter() {
+        let mut bytes = build_linearized_bytes();
+        // qpdf permits a missing /P, but readLinearizationData rejects a
+        // present value that is neither an integer nor null. Reuse the
+        // fixed-width /L slot so no later physical offsets need repair.
+        let key_start = bytes
+            .windows(b"/L ".len())
+            .position(|window| window == b"/L ")
+            .expect("linearized output must contain /L");
+        bytes[key_start + 1] = b'P';
+        replace_parameter_value(&mut bytes, b"/P ", b"/X");
+
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("/P is present but is neither an integer nor null")
+            ),
+            "non-integer /P must be invalid, got {result:?}"
         );
     }
 

@@ -2429,6 +2429,36 @@ impl<R: Read + Seek> Pdf<R> {
         handle.try_dereference()
     }
 
+    /// Read and cache an indirect object from its physical source offset.
+    ///
+    /// This is the canonical equivalent of qpdf's `readObjectAtOffset`: the
+    /// header at `offset`, rather than the effective xref row, determines the
+    /// returned [`ObjectHandle`] identity. It is used by linearization hint
+    /// streams, whose `/H[0]` value is a physical byte location.
+    pub(crate) fn resolve_object_handle_at_offset(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+    ) -> Result<ObjectHandle> {
+        self.resolver
+            .resolve_object_handle_at_offset(offset, expected)
+    }
+
+    /// Return qpdf's first-1024-byte linearization candidate as an exact
+    /// generation-zero object reference.
+    pub(crate) fn linearization_candidate_ref(&self) -> Result<Option<ObjectRef>> {
+        let Some(number) = self.resolver.linearization_candidate()? else {
+            return Ok(None);
+        };
+        let Ok(number) = u32::try_from(number) else {
+            return Ok(None);
+        };
+        if number == 0 {
+            return Ok(None);
+        }
+        Ok(Some(ObjectRef::new(number, 0)))
+    }
+
     /// Run an operation with qpdf's default stream-framing recovery enabled.
     ///
     /// This is the recovery scope used by full rewrites. It is also available
