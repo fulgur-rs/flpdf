@@ -1227,18 +1227,6 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
     }
 }
 
-/// Return whether an object is a source-owned structural container that must
-/// be regenerated rather than copied into a fresh qpdf-style output.
-pub(crate) fn is_source_structural_container(obj: &Object) -> bool {
-    let Object::Stream(stream) = obj else {
-        return false;
-    };
-    matches!(
-        stream.dict.get("Type"),
-        Some(Object::Name(name)) if name.as_slice() == b"XRef" || name.as_slice() == b"ObjStm"
-    )
-}
-
 fn build_xref_stream_bytes(
     offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     ranges: &[(u32, u32)],

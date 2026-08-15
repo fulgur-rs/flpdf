@@ -2853,6 +2853,28 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(&NULL_OBJECT); // cov:ignore: a successful canonical resolve always leaves a missing handle resolved
         }
 
+        // qpdf has one object cache. A canonical producer may have resolved a
+        // source object while the legacy compatibility cache still contains
+        // only its initial xref entry. Prefer that live canonical value before
+        // reading the unresolved legacy entry, otherwise the two staged
+        // consumers parse the same malformed source twice and duplicate its
+        // recovery diagnostics. This is a read-only compatibility snapshot;
+        // canonical resolution itself still never populates the legacy cache.
+        if !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_))) {
+            if let Some(handle) = self
+                .resolver
+                .registered_handle(object_ref)
+                .filter(ObjectHandle::is_resolved)
+            {
+                let value = self.materialize_handle_for_legacy(object_ref, &handle)?;
+                self.legacy_materialized_memo.insert(object_ref, value);
+                return Ok(self
+                    .legacy_materialized_memo
+                    .get(&object_ref)
+                    .expect("inserted canonical compatibility value"));
+            }
+        }
+
         match self.resolve_to_cache(object_ref) {
             Ok(true) => {
                 if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
@@ -2894,7 +2916,7 @@ impl<R: Read + Seek> Pdf<R> {
             .registered_handle(object_ref)
             .filter(ObjectHandle::is_resolved)
         {
-            let value = handle.materialize()?;
+            let value = self.materialize_handle_for_legacy(object_ref, &handle)?;
             self.legacy_materialized_memo.insert(object_ref, value);
             return Ok(self
                 .legacy_materialized_memo
@@ -2928,9 +2950,42 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
 
-        self.legacy_materialized_memo
-            .insert(object_ref, handle.materialize()?);
+        self.legacy_materialized_memo.insert(
+            object_ref,
+            self.materialize_handle_for_legacy(object_ref, &handle)?,
+        );
         Ok(true)
+    }
+
+    /// Materialize a canonical value for a legacy `Object` consumer without
+    /// exposing source framing that the legacy reader stores separately.
+    ///
+    /// qpdf's canonical `QPDF_Stream` keeps the recovered line ending inside
+    /// its validated source length; the old flpdf `Stream` snapshot removes
+    /// that framing and lets the writer restore it from
+    /// [`Self::recovered_stream_eol`]. Keep this normalization at the
+    /// compatibility boundary only: the live `ObjectHandle` remains the
+    /// qpdf-shaped source of truth and continues to pipe the full recovered
+    /// source span.
+    fn materialize_handle_for_legacy(
+        &self,
+        object_ref: ObjectRef,
+        handle: &ObjectHandle,
+    ) -> Result<Object> {
+        let mut value = handle.materialize()?;
+        let eol = self
+            .recovered_stream_eol(object_ref)
+            .or_else(|| self.resolver.recovered_stream_eol(object_ref));
+        if let Some(eol) = eol {
+            if let Object::Stream(stream) = &mut value {
+                if handle.stream_source_length() == Some(stream.data.len())
+                    && stream.data.ends_with(eol)
+                {
+                    stream.data.truncate(stream.data.len() - eol.len());
+                }
+            }
+        }
+        Ok(value)
     }
 
     /// Read and parse the indirect object stored at `offset`, returning the read
@@ -3055,7 +3110,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
-        if self.cache.entry(object_ref).is_none() {
+        if self.handle_mutated_object_refs.contains(&object_ref)
+            || !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_)))
+        {
             if let Some(handle) = self
                 .resolver
                 .registered_handle(object_ref)
@@ -3091,6 +3148,22 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         object_ref: ObjectRef,
     ) -> Result<&Object> {
+        if self.handle_mutated_object_refs.contains(&object_ref)
+            || !matches!(self.cache.entry(object_ref), Some(CacheEntry::Resolved(_)))
+        {
+            if let Some(handle) = self
+                .resolver
+                .registered_handle(object_ref)
+                .filter(ObjectHandle::is_resolved)
+            {
+                self.legacy_materialized_memo
+                    .insert(object_ref, handle.materialize()?);
+                return Ok(self
+                    .legacy_materialized_memo
+                    .get(&object_ref)
+                    .expect("inserted canonical qpdf-json value"));
+            }
+        }
         self.resolve_to_cache(object_ref)?;
         if self.handle_mutated_object_refs.contains(&object_ref) {
             let handle = self.get_object_handle(object_ref);

@@ -2929,6 +2929,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .map_or(0, |eol| eol.as_bytes().len())
     }
 
+    pub(crate) fn recovered_stream_eol(&self, object_ref: ObjectRef) -> Option<&'static [u8]> {
+        self.recovered_stream_eols
+            .borrow()
+            .get(&object_ref)
+            .copied()
+            .map(crate::parser::RecoveredStreamEol::as_bytes)
+    }
+
     /// qpdf's `damagedPDF(input, offset, message)` warning carries the
     /// resolved object's `QPDFObjGen` in the rendered message while leaving
     /// the logger's input-source prefix separate (`QPDF.cc:1482-1529`). Keep
