@@ -489,110 +489,6 @@ pub(crate) const PREV_PLACEHOLDER_WIDTH: usize = 22;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Deep-clone `object`, replacing every `Reference(r)` with the renumbered
-/// equivalent from `renumber`.  Returns an error if a reference cannot be
-/// mapped — leaving an un-renumbered reference in a renumbered file would
-/// produce a mixed old/new object number that the generated xref does not
-/// describe, silently corrupting the linearized output.
-///
-/// Stream data bytes are **not** inspected — they are opaque binary blobs.
-#[cfg(test)]
-fn renumber_object<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object: &Object,
-    depth: usize,
-    renumber: &RenumberMap,
-) -> Result<Object> {
-    renumber_object_with_removed(pdf, object, depth, renumber, &BTreeSet::new())
-}
-
-#[cfg(test)]
-fn renumber_object_with_removed<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object: &Object,
-    depth: usize,
-    renumber: &RenumberMap,
-    removed_refs: &BTreeSet<ObjectRef>,
-) -> Result<Object> {
-    use crate::object::MAX_INLINE_DEPTH;
-    use crate::Stream;
-
-    if depth > MAX_INLINE_DEPTH {
-        return Err(crate::Error::Unsupported(format!(
-            "linearization writer: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
-        )));
-    }
-    match object {
-        Object::Reference(r) if removed_refs.contains(r) => Ok(Object::Null),
-        Object::Reference(r) => match renumber.new_for_original(*r) {
-            Some(new_ref) => Ok(Object::Reference(new_ref)),
-            None if crate::qpdf_null::value_is_null(pdf, object)? => {
-                // A reference to object 0 (free-list head / null singleton,
-                // ISO 32000-1 §7.3.10) or another unmapped qpdf-null object
-                // resolves to null and receives no body object. Reached here as
-                // an array element (or a bare-ref body), qpdf inlines `null` in
-                // that position. Dict/stream values are dropped one level up.
-                Ok(Object::Null)
-            }
-            None => Err(crate::Error::Unsupported(format!(
-                "linearization writer: reference {r} has no entry in RenumberMap \
-                 (planner / renumber inconsistency — would emit mixed old/new \
-                 object numbers)"
-            ))),
-        },
-        Object::Array(elements) => {
-            let mut renumbered = Vec::with_capacity(elements.len());
-            for e in elements {
-                renumbered.push(renumber_object_with_removed(
-                    pdf,
-                    e,
-                    depth + 1,
-                    renumber,
-                    removed_refs,
-                )?);
-            }
-            Ok(Object::Array(renumbered))
-        }
-        Object::Dictionary(dict) => {
-            let mut new_dict = Dictionary::new();
-            let entries = crate::qpdf_null::snapshot_entries(dict, false);
-            for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                let value =
-                    renumber_object_with_removed(pdf, &value, depth + 1, renumber, removed_refs)?;
-                if !matches!(value, Object::Null) {
-                    new_dict.insert(&key, value);
-                }
-            }
-            Ok(Object::Dictionary(new_dict))
-        }
-        Object::Stream(stream) => {
-            // Renumber the dictionary; leave the stream data bytes alone.
-            // `/Length` is a writer-owned stream parameter: qpdf removes the
-            // source key before ordinary null-filtered dictionary traversal and
-            // appends the raw on-disk byte count as a direct integer. Excluding
-            // it from visibility first is essential when an indirect holder
-            // resolves to null — the replacement must not disappear with the
-            // source key.
-            let mut new_dict = Dictionary::new();
-            let entries = crate::qpdf_null::snapshot_entries(&stream.dict, true);
-            for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                let value =
-                    renumber_object_with_removed(pdf, &value, depth + 1, renumber, removed_refs)?;
-                if !matches!(value, Object::Null) {
-                    new_dict.insert(&key, value);
-                }
-            }
-            new_dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
-            );
-            Ok(Object::Stream(Stream::new(new_dict, stream.data.clone())))
-        }
-        // Scalar types contain no references — clone unchanged.
-        _ => Ok(object.clone()),
-    }
-}
-
 /// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
 /// `N G obj` header (i.e. the start of the object).
 ///
@@ -1849,7 +1745,8 @@ fn write_main_xref_stream_and_trailer(
 /// uncompressed hint stream).
 ///
 /// Used by [`append_hint_stream_object`] so the hand-written dictionary keeps
-/// qpdf's key order and framing.
+/// qpdf's key order. Stream framing is emitted by the canonical writer
+/// pipeline immediately after this prefix.
 fn hint_stream_dict_prefix(
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
@@ -1865,9 +1762,7 @@ fn hint_stream_dict_prefix(
         Some(o) => format!(" /O {o}"),
         None => String::new(),
     };
-    format!(
-        "<< {filter_key}/S {shared_section_offset}{outline_key} /Length {payload_len} >>\nstream\n"
-    )
+    format!("<< {filter_key}/S {shared_section_offset}{outline_key} /Length {payload_len} >>")
 }
 
 #[cfg(test)]
@@ -1944,25 +1839,14 @@ fn append_hint_stream_object(
     #[cfg(test)]
     let hint_stream_aes_iv = next_test_hint_stream_aes_iv(hint_stream_aes_iv);
 
-    // Encrypt the payload BEFORE computing the dict prefix, so `/Length`
-    // reflects the on-disk (encrypted) byte count — mirrors qpdf's
-    // `adjustAESStreamLength` call between `setDataKey` and writing `/Length`.
-    let encrypted_payload;
-    let payload: &[u8] = match encrypt_ctx {
-        Some(ctx) => {
-            let mut stream = crate::Stream::new(Dictionary::new(), payload.to_vec());
-            let encryption = crate::writer::encrypt_stream_payload_with_iv(
-                new_ref,
-                &mut stream,
-                ctx,
-                hint_stream_aes_iv,
-            );
-            encryption?;
-            encrypted_payload = stream.data;
-            &encrypted_payload
-        }
-        None => payload,
-    };
+    // qpdf calls `adjustAESStreamLength` after selecting the hint object's data
+    // key and before writing its dictionary (`QPDFWriter.cc:2296-2314`). The
+    // canonical writer pipeline emits the IV and ciphertext later, but this
+    // fixed-width length is needed now for the hand-ordered dictionary.
+    let mut payload_len = payload.len();
+    if let Some(ctx) = encrypt_ctx {
+        crate::writer::adjust_aes_stream_length(&mut payload_len, ctx, true)?;
+    }
 
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
@@ -1970,23 +1854,29 @@ fn append_hint_stream_object(
         hint_stream_dict_prefix(
             shared_section_offset,
             outline_section_offset,
-            payload.len(),
+            payload_len,
             filtered,
         )
         .as_bytes(),
     );
-    bytes.extend_from_slice(payload);
-    // qpdf writes the newline before `endstream` only when the stream payload
-    // does not already end in one (QPDFWriter.cc:2327: `if (last_char != '\n')`).
-    // The hint payload is FlateDecode output, whose final byte is data-dependent;
-    // when it happens to be `\n` (e.g. with an Outlines hint table present) the
-    // unconditional newline would add a spurious byte and diverge from qpdf.
-    // The same holds for encrypted output: AES-CBC ciphertext bytes are
-    // effectively random, so the same data-dependent check applies unchanged.
-    if payload.last() != Some(&b'\n') {
-        bytes.extend_from_slice(b"\n");
+    if let Some(ctx) = encrypt_ctx {
+        // qpdf's `writeHintStream` selects the hint object's data key and
+        // writes the payload through the encryption pipeline exactly once.
+        // Pass 2 receives this complete framed object unchanged, so the
+        // explicit IV preserves the same ciphertext across both passes.
+        crate::writer::write_stream_payload_with_pipeline(
+            bytes,
+            payload,
+            NewlineBeforeEndstream::No,
+            new_ref,
+            ctx,
+            true,
+            Some(hint_stream_aes_iv),
+        )?;
+    } else {
+        crate::writer::serialize::write_stream_payload(bytes, payload, NewlineBeforeEndstream::No);
     }
-    bytes.extend_from_slice(b"endstream\nendobj\n");
+    bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
 }
 
@@ -3806,8 +3696,8 @@ fn write_linearized_impl<R: Read + Seek>(
             let mut iv = [0u8; 16];
             // cov:ignore-start: defensive — the OS CSPRNG does not fail on
             // any platform this crate's test suite runs on; mirrors the
-            // same untested-in-practice getrandom failure arm in
-            // `crate::writer::encrypt_stream_payload_for_writer`.
+            // same untested-in-practice getrandom failure arm in the writer's
+            // canonical stream pipeline.
             getrandom::fill(&mut iv).map_err(|e| {
                 crate::Error::Unsupported(format!(
                     "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
@@ -4639,7 +4529,6 @@ fn write_linearized_impl<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
-    use crate::object::MAX_INLINE_DEPTH;
     use crate::writer::{WriterOptions, DETERMINISTIC_ID_ARRAY_LEN};
     use crate::Pdf;
     use std::io::Cursor;
@@ -6977,107 +6866,6 @@ mod tests {
         assert_eq!(lengths.get(&1).copied(), Some(100));
         // Obj 6 runs from offset 200 to last_xref_offset 400.
         assert_eq!(lengths.get(&6).copied(), Some(200));
-    }
-
-    // -----------------------------------------------------------------------
-    // renumber_object bounds inline structural nesting depth
-    // -----------------------------------------------------------------------
-    fn nested_arrays(depth: usize) -> Object {
-        let mut o = Object::Null;
-        for _ in 0..depth {
-            o = Object::Array(vec![o]);
-        }
-        o
-    }
-
-    #[test]
-    fn renumber_object_errors_on_excessive_nesting() {
-        // The deep object contains no Reference, so the RenumberMap is never
-        // consulted — the inline-depth guard must fire before the Null leaf.
-        let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-
-        let err = renumber_object(&mut pdf, &nested_arrays(MAX_INLINE_DEPTH + 5), 0, &renumber);
-        assert!(matches!(err, Err(crate::Error::Unsupported(_))));
-    }
-
-    #[test]
-    fn renumber_object_accepts_nesting_up_to_the_limit() {
-        let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-
-        // The catalog (1 0 R) is in the plan, so it has a renumber entry.
-        let original = ObjectRef::new(1, 0);
-        let expected = renumber
-            .new_for_original(original)
-            .expect("catalog must have a renumber entry");
-
-        // Bury that Reference so it is visited at exactly inline depth
-        // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
-        // guard); it must be remapped, not errored.
-        let mut obj = Object::Array(vec![Object::Reference(original)]);
-        for _ in 0..(MAX_INLINE_DEPTH - 1) {
-            obj = Object::Array(vec![obj]);
-        }
-        // The buried reference (1 0 R) is in the plan, so it is renumbered via
-        // the map before null resolution is consulted.
-        let out =
-            renumber_object(&mut pdf, &obj, 0, &renumber).expect("in-limit nesting must succeed");
-
-        // Unwrap the nested arrays down to the deepest element and confirm the
-        // in-limit Reference was renumbered to its mapped target.
-        let mut cur = &out;
-        loop {
-            match cur {
-                Object::Array(items) if items.len() == 1 => cur = &items[0],
-                other => {
-                    assert_eq!(other, &Object::Reference(expected));
-                    break;
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn renumber_object_errors_on_non_null_ref_absent_from_map() {
-        // Safety net: a reference to a non-null object that the planner failed
-        // to map is a real inconsistency (it would emit a mixed old/new number),
-        // so it must error — NOT be silently dropped like a qpdf-null ref.
-        let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-
-        let ghost = ObjectRef::new(99, 0);
-        assert!(
-            renumber.new_for_original(ghost).is_none(),
-            "test premise: ghost is not in the map"
-        );
-        pdf.set_object(ghost, Object::Integer(99));
-        let obj = Object::Array(vec![Object::Reference(ghost)]);
-        let err = renumber_object(&mut pdf, &obj, 0, &renumber);
-        assert!(
-            matches!(err, Err(crate::Error::Unsupported(_))),
-            "a non-null, unmapped reference must error, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn renumber_object_inlines_null_for_missing_ref_in_array() {
-        // Boundary opposite the safety net: a missing-xref reference in an
-        // array becomes inline `null` rather than erroring.
-        let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-
-        let missing = ObjectRef::new(99, 0);
-        let obj = Object::Array(vec![Object::Reference(missing)]);
-        let out = renumber_object(&mut pdf, &obj, 0, &renumber);
-        assert!(
-            matches!(&out, Ok(Object::Array(items)) if matches!(items.as_slice(), [Object::Null])),
-            "missing-xref array element must inline null, got {out:?}"
-        );
     }
 
     /// Linearize `source_bytes` in the given write mode with the supplied
@@ -9588,13 +9376,32 @@ mod tests {
             metadata_ref: None,
         };
 
-        // Independently compute the ciphertext encrypt_stream_payload_for_writer
-        // produces for this object ref + key material — the oracle for what
-        // append_hint_stream_object must embed.
-        let mut expected_stream = crate::Stream::new(Dictionary::new(), payload.clone());
-        crate::writer::encrypt_stream_payload_for_writer(object_ref, &mut expected_stream, &ctx)
-            .expect("compute expected ciphertext");
-        let expected_ciphertext = expected_stream.data;
+        // Independently run the canonical writer pipeline with the same
+        // explicit IV. This is the oracle for what append_hint_stream_object
+        // must embed, without routing the test through the legacy buffer
+        // replacement helper.
+        let mut expected_object = Vec::new();
+        crate::writer::write_stream_payload_with_pipeline(
+            &mut expected_object,
+            &payload,
+            NewlineBeforeEndstream::No,
+            object_ref,
+            &ctx,
+            true,
+            Some(crate::pipeline::aes::static_initialization_vector()),
+        )
+        .expect("compute expected ciphertext");
+        let stream_marker = b"\nstream\n";
+        let payload_start = expected_object
+            .windows(stream_marker.len())
+            .position(|window| window == stream_marker)
+            .expect("canonical pipeline must emit stream framing")
+            + stream_marker.len();
+        let mut expected_payload_len = payload.len();
+        crate::writer::adjust_aes_stream_length(&mut expected_payload_len, &ctx, true)
+            .expect("expected encrypted length must fit");
+        let expected_ciphertext =
+            expected_object[payload_start..payload_start + expected_payload_len].to_vec();
 
         let mut bytes = Vec::new();
         let offset = append_hint_stream_object(
@@ -9620,8 +9427,8 @@ mod tests {
             bytes
                 .windows(expected_ciphertext.len())
                 .any(|w| w == expected_ciphertext.as_slice()),
-            "hint stream must embed the same ciphertext encrypt_stream_payload_for_writer \
-             produces for this object ref + key material"
+            "hint stream must embed the same ciphertext the canonical writer \
+             pipeline produces for this object ref + key material"
         );
 
         let length_marker = format!("/Length {}", expected_ciphertext.len());
@@ -9698,11 +9505,18 @@ mod tests {
         // object-length assertion below (a passing length assertion for the
         // wrong reason would be worse than no test).
         let payload_len_from = |ctx: &EncryptionContext, iv: [u8; 16]| -> usize {
-            let mut stream = crate::Stream::new(Dictionary::new(), payload.clone());
-            crate::writer::encrypt_stream_payload_with_iv(object_ref, &mut stream, ctx, iv)
-                .unwrap();
-            let ends_in_newline = stream.data.last() == Some(&b'\n');
-            stream.data.len() + usize::from(!ends_in_newline)
+            let mut object = Vec::new();
+            crate::writer::write_stream_payload_with_pipeline(
+                &mut object,
+                &payload,
+                NewlineBeforeEndstream::No,
+                object_ref,
+                ctx,
+                true,
+                Some(iv),
+            )
+            .unwrap();
+            object.len()
         };
         assert_ne!(
             payload_len_from(&ctx, IV_NO_NEWLINE),

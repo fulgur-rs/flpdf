@@ -793,8 +793,9 @@ fn js_stream_length(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
 /// `--stream-data=preserve` + `--encrypt` (the Codex PR #401 NOTES case): the
 /// orphan-/Length-holder drop must still fire under encryption. Before
 /// flpdf-3g8o the preserve gate (`effective_stream_policy().is_some()`) was false
-/// for preserve, so the holder survived; `encrypt_stream_payload_for_writer` then
-/// direct-ized `/Length` anyway, leaving a stale orphan emitted as a real object.
+/// for preserve, so the holder survived; the old in-place stream encryption
+/// path then direct-ized `/Length` anyway, leaving a stale orphan emitted as a
+/// real object.
 /// The gate now keys on `!options.qdf`, so the holder is dropped and `/Length` is
 /// direct.
 ///

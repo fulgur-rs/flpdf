@@ -33,6 +33,18 @@ fn objstm_production_slice() -> &'static str {
     &WRITER_SOURCE[start..end]
 }
 
+fn hint_production_slice() -> &'static str {
+    let start_marker = "fn append_hint_stream_object";
+    let end_marker = "struct OutlineHintInfo";
+    let start = WRITER_SOURCE
+        .find(start_marker)
+        .expect("linearization hint-stream marker must remain present");
+    let end = WRITER_SOURCE
+        .find(end_marker)
+        .expect("linearization outline-hint marker must remain present");
+    &WRITER_SOURCE[start..end]
+}
+
 #[test]
 fn linearization_body_stream_route_has_no_legacy_object_bridge() {
     let production = body_and_stream_production_slice();
@@ -69,6 +81,25 @@ fn linearization_objstm_route_uses_live_handles() {
         assert!(
             !production.contains(forbidden),
             "canonical linearization ObjStm route still contains legacy token {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn linearization_hint_route_uses_canonical_pipeline() {
+    let production = hint_production_slice();
+    assert!(
+        production.contains("write_stream_payload_with_pipeline"),
+        "hint payloads must use the canonical writer pipeline"
+    );
+    for forbidden in [
+        "encrypt_stream_payload_for_writer",
+        "encrypt_stream_payload_with_iv",
+        "crate::Stream::new",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "canonical linearization hint route still contains legacy token {forbidden:?}"
         );
     }
 }
