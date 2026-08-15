@@ -42,6 +42,11 @@ dictionary-child diagnostic boundary. The leading-material fixture keeps xref
 offsets relative to the valid header and pins qpdf's first-1024-byte search plus
 logical input origin.
 
+`dict_duplicate_key` repeats a dictionary key and pins qpdf's
+`dictionary has duplicated key` warning: the offset is the parser's dictionary
+frame offset (right after `<<`), not the repeated key token's own offset, and
+the last occurrence's value wins.
+
 `stream_asciihex_odd_nibble_recovery` decodes `4G ` through `/AHx`. ASCIIHex
 reports the invalid `G` during `write`, then its cleanup flushes the pending
 odd nibble as `@`; the golden fixes the warning-before-cleanup-byte order.

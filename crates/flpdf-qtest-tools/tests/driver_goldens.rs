@@ -63,7 +63,7 @@ fn test_0_1_fixtures_match_committed_qpdf_merged_output() {
 #[test]
 fn fixture_inventories_match_manifest_exactly() {
     let names = fixture_names();
-    assert_eq!(names.len(), 51, "unexpected manifest fixture count");
+    assert_eq!(names.len(), 52, "unexpected manifest fixture count");
     assert!(names.iter().all(|name| {
         !name.is_empty()
             && name

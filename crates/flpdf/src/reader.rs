@@ -5729,6 +5729,50 @@ mod tests {
         pdf
     }
 
+    /// End-to-end: resolving an indirect object whose dictionary repeats a
+    /// key surfaces qpdf's `dictionary has duplicated key` warning through
+    /// [`Pdf::repair_diagnostics`], matching `/usr/bin/qpdf --check`'s
+    /// observed `WARNING: <file> (object 3 0, offset 125): dictionary has
+    /// duplicated key /Foo; last occurrence overrides earlier ones` on an
+    /// equivalent fixture.
+    #[test]
+    fn resolving_an_object_with_a_duplicate_dictionary_key_warns_through_open_mem() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Foo 1 /Foo 2 >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+
+        let mut pdf = Pdf::open_mem(Arc::from(&pdf[..])).expect("open_mem");
+        let value = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve object 3");
+        let dict = value.as_dict().expect("dictionary");
+        assert_eq!(
+            dict.get("Foo"),
+            Some(&Object::Integer(2)),
+            "last write wins"
+        );
+
+        let diags = pdf.repair_diagnostics();
+        let messages: Vec<&str> = diags.entries().iter().map(|d| d.message.as_str()).collect();
+        let expected_offset = off3 + "3 0 obj\n<<".len() as u64;
+        let expected_message = format!(
+            "(object 3 0, offset {expected_offset}): dictionary has duplicated key /Foo; last occurrence overrides earlier ones"
+        );
+        assert_eq!(messages, vec![expected_message.as_str()]);
+    }
+
     fn pdf_with_one_stream(stream_data: &[u8]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let off1 = pdf.len() as u64;

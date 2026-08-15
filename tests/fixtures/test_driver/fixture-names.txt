@@ -20,6 +20,7 @@ dict_keys
 dict_dangling_value
 dict_escaped_key
 dict_indirect_value_warning
+dict_duplicate_key
 stream_flate
 stream_indirect_filter
 stream_chained_filter

@@ -2063,6 +2063,16 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     }
 
     fn dictionary(&mut self) -> Result<Object> {
+        // qpdf's `StackFrame::offset` is captured once, at the frame's
+        // construction right after the `<<` token, and every
+        // `warnDuplicateKey` in this dictionary reuses that single offset
+        // rather than the individual key token's own offset
+        // (`libqpdf/QPDFParser.cc:296-299,500-506`,
+        // `libqpdf/qpdf/QPDFParser.hh:38-44`). `self.position()` here is
+        // exactly that point: `object_inner` has just consumed the `<<`
+        // token via `next_token()` and calls this function with no
+        // intervening token reads.
+        let frame_offset = self.position();
         let mut dict = Dictionary::new();
         loop {
             let token = self.next_token()?;
@@ -2074,7 +2084,16 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             }
             let key = token.value[1..].to_vec();
             let value = self.object()?;
-            dict.insert(key, value);
+            if dict.get(&key).is_some() {
+                self.diagnostics.push(ParserDiagnostic {
+                    relative_offset: frame_offset,
+                    message: format!(
+                        "dictionary has duplicated key /{}; last occurrence overrides earlier ones",
+                        String::from_utf8_lossy(&key)
+                    ),
+                });
+            }
+            dict.insert(&key, value);
         }
     }
 
@@ -2955,7 +2974,7 @@ mod stream_length_tests {
     use super::dictionary_value_source_offset;
     use super::{
         keyword_token_end, parse_indirect_object, parse_object, parse_qpdf_direct_object,
-        RecoveredStreamEol,
+        ParserDiagnostic, RecoveredStreamEol,
     };
     use crate::reader::file_object::{
         finish_file_object, parse_file_object_syntax, FileObjectDiagnosticKind, FileObjectRead,
@@ -3316,6 +3335,52 @@ mod stream_length_tests {
             &input[parsed.next_offset..parsed.next_offset + 6],
             b"endobj"
         );
+    }
+
+    #[test]
+    fn qpdf_direct_object_warns_once_per_duplicate_key_reoccurrence() {
+        // qpdf's QPDFParser::add uses std::map::insert_or_assign and calls
+        // warnDuplicateKey on every failed insert, so a key repeated 3 times
+        // warns twice (libqpdf/QPDFParser.cc:379-390,500-506). The offset is
+        // `frame->offset`, captured once at `StackFrame` construction right
+        // after the `<<` token (libqpdf/QPDFParser.cc:296-299,
+        // QPDFParser.hh:38-44) -- the same value for every warning in this
+        // dictionary, not the individual key token's own offset. Verified
+        // against /usr/bin/qpdf 11.9.0 on an equivalent fixture: two
+        // identical "(object 3 0, offset 125): dictionary has duplicated key
+        // /Foo; ..." warnings, both at the offset immediately after "<<".
+        let input = b"<< /Foo 1 /Foo 2 /Foo 3 >>\nendobj";
+        let parsed = parse_qpdf_direct_object(input).unwrap();
+        let dict = parsed.object.into_dict().expect("dictionary");
+        assert_eq!(
+            dict.get("Foo"),
+            Some(&Object::Integer(3)),
+            "last write wins"
+        );
+
+        let dict_open_end = 2; // byte right after "<<"
+        let expected_message =
+            "dictionary has duplicated key /Foo; last occurrence overrides earlier ones";
+        assert_eq!(
+            parsed.diagnostics,
+            vec![
+                ParserDiagnostic {
+                    relative_offset: dict_open_end,
+                    message: expected_message.to_string(),
+                },
+                ParserDiagnostic {
+                    relative_offset: dict_open_end,
+                    message: expected_message.to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn qpdf_direct_object_does_not_warn_for_distinct_keys() {
+        let input = b"<< /Foo 1 /Bar 2 >>\nendobj";
+        let parsed = parse_qpdf_direct_object(input).unwrap();
+        assert!(parsed.diagnostics.is_empty());
     }
 
     #[test]

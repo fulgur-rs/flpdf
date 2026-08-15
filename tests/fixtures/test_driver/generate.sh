@@ -157,6 +157,10 @@ write(
         },
     ),
 )
+write(
+    "dict_duplicate_key",
+    build_pdf(b"6 0 R", {6: b"<< /a 1 /a 2 >>"}),
+)
 
 flate_abc = zlib.compress(b"abc")
 write(
