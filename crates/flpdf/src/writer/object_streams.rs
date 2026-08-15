@@ -13,7 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 
-use crate::object::{Dictionary, Object, ObjectRef};
+use crate::object::ObjectRef;
+#[cfg(test)]
+use crate::object::{Dictionary, Object};
 use crate::writer::WriterOptions;
 use crate::ObjectHandle;
 use crate::XrefEntry;
@@ -672,6 +674,7 @@ pub(crate) struct ObjStmBody {
 ///
 /// This inner function does the real work without touching a `Pdf` reader; it
 /// exists primarily to make unit-testing Pdf-free.
+#[cfg(test)]
 pub(crate) fn emit_objstm_body_from_resolved(
     members: &[(ObjectRef, Object)],
 ) -> crate::Result<ObjStmBody> {
@@ -691,6 +694,7 @@ pub(crate) fn emit_objstm_body_from_resolved(
 /// encrypted full-rewrite writer passes it to `EncryptedStringEmitter` so the
 /// callback serializer runs without installing an individual object data key;
 /// the enclosing ObjStm stream remains the sole encryption boundary.
+#[cfg(test)]
 pub(crate) fn emit_objstm_body_from_resolved_with_writer<F>(
     members: &[(ObjectRef, Object)],
     write_member: &mut F,
@@ -807,6 +811,7 @@ where
 
 /// Resolve each member reference from `pdf` then call
 /// [`emit_objstm_body_from_resolved`].
+#[cfg(test)]
 pub(crate) fn emit_objstm_body<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     members: &[ObjectRef],
@@ -831,6 +836,7 @@ pub(crate) fn emit_objstm_body<R: std::io::Read + std::io::Seek>(
 /// (`CompressStreams::No`).  Passing the same [`crate::writer::CompressStreams`]
 /// value that drives the surrounding full-rewrite loop ensures the ObjStm
 /// container uses the same policy as every other stream in the document.
+#[cfg(test)]
 pub(crate) fn wrap_objstm_body(
     body: &ObjStmBody,
     compress: crate::writer::CompressStreams,
@@ -887,10 +893,12 @@ pub(crate) fn wrap_objstm_body_as_handle(
 ) -> crate::Result<(ObjectHandle, Vec<u8>)> {
     let (data, filter) = match compress {
         crate::writer::CompressStreams::Yes => {
-            let mut encode_dict = Dictionary::new();
-            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            let encode_dict = ObjectHandle::dictionary(vec![(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            )]);
             (
-                crate::filters::encode_stream_data(&encode_dict, &body.bytes)?,
+                crate::filters::encode_stream_data_from_handle(&encode_dict, &body.bytes)?,
                 true,
             )
         }

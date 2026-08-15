@@ -9,9 +9,9 @@ use crate::rewrite_renumber::{
     CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber,
 };
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
-use crate::writer::plain::xref::{materialized_id, IdPlan, TrailerPlan};
+use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
 use crate::writer::WriterOptions;
-use crate::{CompressStreams, Object, ObjectRef, Pdf, XrefEntry, XrefForm};
+use crate::{CompressStreams, ObjectRef, Pdf, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -165,26 +165,40 @@ impl PlainWritePlan {
         }
 
         let source_id0 = live_source_id0(pdf)?;
-        let source_id_object = source_id0
-            .as_ref()
-            .map(|id0| Object::Array(vec![Object::String(id0.clone())]));
-        let mut dictionary = pdf.trailer().clone();
         let generated_id = if options.deterministic_id || options.copy_encryption.is_some() {
             None
         } else {
-            Some(crate::writer::generate_id_array(
-                source_id_object.as_ref(),
+            Some(crate::writer::generate_id_handle(
+                source_id0.as_deref(),
                 options.static_id,
             ))
         };
-        crate::writer::apply_encrypt_trailer_entries(
-            &mut dictionary,
+        let max_output = placement
+            .objects
+            .iter()
+            .map(|object| match object {
+                PlannedIndirectObject::Source { output, .. }
+                | PlannedIndirectObject::ObjectStream { output, .. } => output.number,
+            })
+            .max()
+            .unwrap_or(0);
+        let trailer_size = usize::try_from(max_output)
+            .ok()
+            .and_then(|size| size.checked_add(usize::from(form == XrefForm::Stream) + 1))
+            .ok_or_else(|| {
+                crate::Error::Unsupported("plain writer trailer /Size overflows usize".into())
+            })?;
+        let trailer_handle = crate::writer::build_writer_trailer_handle(
             pdf,
+            pdf.last_xref_form() == XrefForm::Stream,
+            form == XrefForm::Stream,
+            trailer_size,
+            root,
             options,
             None,
             options.deterministic_id,
             generated_id.as_ref(),
-        );
+        )?;
         let id = if options.deterministic_id {
             IdPlan::Deterministic {
                 source_id0,
@@ -192,10 +206,10 @@ impl PlainWritePlan {
             }
         } else {
             IdPlan::Materialized {
-                value: materialized_id(&dictionary)?,
+                value: materialized_id_handle(&trailer_handle.try_get_key(b"/ID")?)?,
             }
         };
-        let encrypt = dictionary.get_ref("Encrypt");
+        let encrypt = trailer_handle.try_get_key(b"/Encrypt")?.object_ref();
         let structural_filtered = matches!(
             crate::writer::effective_stream_policy(options),
             Some(CompressStreams::Yes)

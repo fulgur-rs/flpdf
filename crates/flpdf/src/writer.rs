@@ -1121,7 +1121,7 @@ fn strip_writer_trailer_history_keys(trailer: &mut Dictionary) {
 /// (new) numbers.
 ///
 /// `/Root` is overwritten by the caller with the new root ref and `/Encrypt`
-/// is written by [`apply_encrypt_trailer_entries`], so both are left untouched
+/// is written by [`apply_encrypt_trailer_handle_entries`], so both are left untouched
 /// here. Every other indirect value (notably `/Info`, which the renumber walk
 /// always seeds) is rewritten through `map`; a value absent from the map is an
 /// error rather than a stale number leaking into the output.
@@ -1834,6 +1834,25 @@ pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> 
     ])
 }
 
+/// Generate qpdf's ordinary/static two-element `/ID` array as a canonical
+/// handle, preserving the same source-permanent-id and changing-id rules as
+/// [`generate_id_array`] without crossing back through `Object`.
+pub(crate) fn generate_id_handle(source_id0: Option<&[u8]>, static_id: bool) -> ObjectHandle {
+    let changing_id = if static_id {
+        QPDF_STATIC_ID.to_vec()
+    } else {
+        fresh_id_bytes().to_vec()
+    };
+    let permanent_id = source_id0
+        .filter(|id0| !id0.is_empty())
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| changing_id.clone());
+    ObjectHandle::array(vec![
+        ObjectHandle::string(permanent_id),
+        ObjectHandle::string(changing_id),
+    ])
+}
+
 /// Build the `/Info`-derived suffix of qpdf's deterministic `/ID` seed.
 ///
 /// qpdf (`QPDFWriter::generateID`) appends, for every `/Info` entry whose value
@@ -1944,61 +1963,6 @@ pub(crate) fn write_deterministic_id_inline(
         out.push(b'>');
     }
     out.push(b']');
-}
-
-/// Fill the trailer's `/Encrypt` and `/ID` entries appropriately for both
-/// the plaintext and encrypted output paths.
-fn apply_encrypt_trailer_entries<R: Read + Seek>(
-    trailer: &mut Dictionary,
-    pdf: &Pdf<R>,
-    options: &WriterOptions,
-    encrypt_ctx: Option<&EncryptionContext>,
-    deterministic_id: bool,
-    generated_id: Option<&Object>,
-) {
-    if let Some(ctx) = encrypt_ctx {
-        // Reference the freshly-emitted /Encrypt object. For ordinary/static
-        // encryption, `generated_id` is the complete array selected before
-        // key derivation, so inserting it unchanged keeps both the emitted
-        // /ID[0] and /ID[1] tied to the same qpdf decision. The fallback is
-        // retained for copy-encryption, whose donor supplies /ID[0] and whose
-        // changing /ID[1] follows the existing donor route.
-        trailer.insert("Encrypt", Object::Reference(ctx.encrypt_ref));
-        if let Some(id) = generated_id {
-            trailer.insert("ID", id.clone());
-        } else {
-            let id1 = if options.static_id {
-                QPDF_STATIC_ID.to_vec()
-            } else {
-                fresh_id_bytes().to_vec()
-            };
-            trailer.insert(
-                "ID",
-                Object::Array(vec![Object::String(ctx.id0.clone()), Object::String(id1)]),
-            );
-        }
-    } else {
-        if pdf.is_encrypted() {
-            trailer.remove("Encrypt");
-        }
-        // deterministic_id is mutually exclusive with static_id and rejected for
-        // encrypted output (both guarded earlier in emit_canonical_pdf), so
-        // it only reaches this non-encrypted arm and takes precedence. The
-        // placeholder is overwritten in place after the output bytes (and thus
-        // the content digest) are known; see compute_deterministic_id.
-        if deterministic_id {
-            apply_deterministic_id_placeholder(trailer);
-        } else if let Some(id) = generated_id {
-            trailer.insert("ID", id.clone());
-        } else {
-            // cov:ignore-start: ordinary/static full-rewrite callers precompute generated_id; deterministic and copy routes are handled above
-            trailer.insert(
-                "ID",
-                generate_id_array(pdf.trailer().get("ID"), options.static_id),
-            );
-            // cov:ignore-end
-        }
-    }
 }
 
 fn generated_id_handle(value: &Object) -> Result<ObjectHandle> {
