@@ -23,7 +23,7 @@
 
 - Read: `crates/flpdf/src/linearization/writer.rs`
 - Read: `docs/qpdf-correspondence.md`
-- Read: `/home/ubuntu/.cache/flpdf/qpdf-11.9.0/libqpdf/QPDFWriter.cc`
+- Read: `libqpdf/QPDFWriter.cc` under the path printed by `scripts/fetch-qpdf-source.sh --print-path`
 - Modify: Beads children under `flpdf-3yn9.5`
 
 **Interfaces:**
@@ -101,10 +101,17 @@
 
   ```bash
   cargo test -p flpdf --test cmp_linearize_tests canonical_linearized_body --features qpdf-zlib-compat
-  qpdf --check-linearization /tmp/flpdf-linearized-body.pdf
   rg -n 'resolve_borrowed|Object::|decode_stream_data|encode_stream_data' \
     crates/flpdf/src/linearization/writer.rs
   ```
+
+  The canonical RED test should assert `qpdf --check-linearization` against
+  its own `tempfile::tempdir()` output from inside the test process (the
+  established pattern in this crate — see
+  `pdf_writer_linearization_is_a_canonical_output_route` in
+  `crates/flpdf/tests/pdf_writer_contract_tests.rs`), rather than relying on a
+  separate shell step against a fixed path that no step in this plan
+  creates.
 
   Expected: the canonical test passes; remaining matches are limited to explicitly unmigrated xref/ID code documented in the child issue.
 
@@ -199,7 +206,7 @@
 - [ ] **Step 2: Run the tests and confirm the existing mixed route fails at the canonical assertions.**
 
   ```bash
-  cargo test -p flpdf --test encrypted_linearize_tests --features qpdf-zlib-compat
+  cargo test -p flpdf-cli --test encrypted_linearize_tests --features qpdf-zlib-compat
   cargo test -p flpdf --test deterministic_id_qpdf_parity_tests --features qpdf-zlib-compat
   ```
 
@@ -248,12 +255,19 @@
 - [ ] **Step 1: Run the full local quality gates on each layer head.**
 
   ```bash
+  PARENT=origin/main  # layer 1; layers 2-3: the previous layer's branch
   cargo fmt --all -- --check
   cargo clippy --workspace --all-targets --all-features -- -D warnings
   cargo test --workspace --features qpdf-zlib-compat
-  scripts/patch-coverage.sh --base origin/main
-  git diff --check
+  scripts/patch-coverage.sh --base "$PARENT"
+  git diff --check "$PARENT"...HEAD
   ```
+
+  `$PARENT` is the same branch used as the PR base in Step 2, and matches the
+  convention `scripts/patch-coverage.sh` documents for stacked PRs
+  (`scripts/patch-coverage.sh:21-22`). Scoping `git diff --check` to that
+  range (rather than the bare working-tree-vs-index form) is required once
+  the layer is already committed.
 
 - [ ] **Step 2: Push the layer branch and create/update its stacked PR.**
 
