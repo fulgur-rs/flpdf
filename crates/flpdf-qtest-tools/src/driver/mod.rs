@@ -12,7 +12,19 @@ use flpdf::{Diagnostic, Error, Pdf, PdfOpenOptions};
 use crate::common::test_driver_program_name_bytes;
 
 pub(crate) mod handle;
+pub(crate) mod test_02_09;
 pub(crate) mod test_0_1;
+pub(crate) mod test_10_17;
+pub(crate) mod test_18_25;
+pub(crate) mod test_26_33;
+pub(crate) mod test_34_41;
+pub(crate) mod test_42_49;
+pub(crate) mod test_50_55;
+pub(crate) mod test_56_63;
+pub(crate) mod test_64_71;
+pub(crate) mod test_72_79;
+pub(crate) mod test_80_87;
+pub(crate) mod test_88_98;
 
 pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     let whoami = args
@@ -33,27 +45,105 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         Ok(n) => n,
         Err(error) => return write_error_bytes(stdout, stderr, &error),
     };
+    // qpdf's test 89 builds `pdf` from a JSON export via
+    // QPDF::createFromJSON(filename1) (test_driver.cc:3522-3523) instead of
+    // parsing a PDF at all -- filename1 is a .json file for this test
+    // number, so the ordinary open path below cannot be used.
+    // GAP(QPDF::createFromJSON): flpdf has no constructor for building a Pdf
+    // from a QPDF JSON export (`document_json.rs`'s own module doc: the
+    // input side "has no counterpart here"). `test_88_98::run_test_89`
+    // exists, assuming an already-open `pdf`, for when this primitive
+    // lands.
+    if n == 89 {
+        return write_error(
+            stdout,
+            stderr,
+            "test 89 requires QPDF::createFromJSON, which is not implemented in flpdf",
+        );
+    }
+
     let filename = args[2].as_os_str();
-    let filename_diagnostic = os_str_diagnostic_bytes(filename);
-    let bytes = match std::fs::read(filename) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let crt_message = crt_open_error_message(filename);
-            return write_error_bytes(
-                stdout,
-                stderr,
-                &open_error_bytes(&filename_diagnostic, crt_message.as_deref(), &error),
-            );
-        }
+    let arg2 = args.get(3).map(OsString::as_os_str);
+
+    // qpdf's runtest() (test_driver.cc:3463-3538) picks how to load
+    // filename1 based on n:
+    //  - n==0: setAttemptRecovery(false) -- already handled below via
+    //    `repair: n != 0`.
+    //  - (n==35 || n==36) && arg2 present: arg2 is a password, not an
+    //    unused second argument -- handled below via `options.password`.
+    //  - n==45: handled in the `open_bytes`/`filename_diagnostic` match
+    //    below (obfuscated-file XOR decode).
+    //  - n in {61,81,83,84,85,86,87,92,95,96}: qpdf never opens filename1 at
+    //    all there -- each such test body ignores its `pdf` argument (and
+    //    opens its own file(s) via arg2 where relevant) instead.
+    //    GAP: this driver still performs the ordinary open below for these
+    //    numbers rather than skipping it (restructuring the shared open
+    //    path to defer opening is out of scope for this scaffolding pass);
+    //    this only diverges from qpdf's own observable output if filename1
+    //    fails to open cleanly or produces spurious repair diagnostics,
+    //    which the fixtures these numbers are actually invoked against do
+    //    not trigger.
+    //  - n==89: QPDF::createFromJSON -- handled above, before this point.
+    //  - everything else: read filename1 into memory. qpdf's n%2/n%4
+    //    branching there (processFile(name) vs processFile(FILE*) vs
+    //    processMemoryFile) only selects which overload to exercise for its
+    //    own internal QTC::TC coverage tracing; all three parse the same
+    //    bytes identically, so it has no observable effect and is
+    //    intentionally not reproduced here.
+    let (open_bytes, filename_diagnostic): (Vec<u8>, Vec<u8>) = if n == 45 {
+        // qpdf's test 45 (test_driver.cc:3497-3519) decodes
+        // "<filename1>.obfuscated" by XOR-ing every byte with 0xcc and
+        // processes the result AS IF it were "<filename1>.pdf" -- that
+        // fabricated name, not the real .obfuscated path, is what appears
+        // in this test's diagnostics.
+        let mut obfuscated_path = filename.to_os_string();
+        obfuscated_path.push(".obfuscated");
+        let mut pdf_name = filename.to_os_string();
+        pdf_name.push(".pdf");
+        let pdf_name_diagnostic = os_str_diagnostic_bytes(&pdf_name).into_owned();
+        let raw = match std::fs::read(&obfuscated_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                let crt_message = crt_open_error_message(&obfuscated_path);
+                return write_error_bytes(
+                    stdout,
+                    stderr,
+                    &open_error_bytes(&pdf_name_diagnostic, crt_message.as_deref(), &error),
+                );
+            }
+        };
+        let decoded = raw.into_iter().map(|byte| byte ^ 0xcc).collect();
+        (decoded, pdf_name_diagnostic)
+    } else {
+        let filename_diagnostic = os_str_diagnostic_bytes(filename).into_owned();
+        let bytes = match std::fs::read(filename) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let crt_message = crt_open_error_message(filename);
+                return write_error_bytes(
+                    stdout,
+                    stderr,
+                    &open_error_bytes(&filename_diagnostic, crt_message.as_deref(), &error),
+                );
+            }
+        };
+        (bytes, filename_diagnostic)
     };
-    let options = PdfOpenOptions {
+
+    let mut options = PdfOpenOptions {
         repair: n != 0,
         // The compatibility driver owns byte-exact warning formatting and
         // routes it through the caller-supplied stdout/stderr writers below.
         suppress_warnings: true,
         ..PdfOpenOptions::default()
     };
-    let mut pdf = match Pdf::open_mem_owned_with_options(bytes, options) {
+    if let (true, Some(password)) = (n == 35 || n == 36, arg2) {
+        // qpdf's test_driver.cc:3494-3496: for these two numbers only, when
+        // a second argument is supplied, it is a password, not an unused
+        // `arg2` value.
+        options.password = os_str_diagnostic_bytes(password).into_owned();
+    }
+    let mut pdf = match Pdf::open_mem_owned_with_options(open_bytes, options) {
         Ok(pdf) => pdf,
         Err(error) => {
             return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);
@@ -73,16 +163,785 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         return 2;
     }
 
-    if n != 0 && n != 1 {
-        return write_error(stdout, stderr, &format!("invalid test {n}"));
-    }
-    if let Err(error) = test_0_1::run_test_0_1(
-        &mut pdf,
-        &filename_diagnostic,
-        stdout,
-        stderr,
-        &mut diagnostics_written,
-    ) {
+    let result = match n {
+        0 | 1 => test_0_1::run_test_0_1(
+            &mut pdf,
+            &filename_diagnostic,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        2 => test_02_09::run_test_2(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        3 => test_02_09::run_test_3(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        4 => test_02_09::run_test_4(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        5 => test_02_09::run_test_5(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        6 => test_02_09::run_test_6(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        7 => test_02_09::run_test_7(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        8 => test_02_09::run_test_8(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        9 => test_02_09::run_test_9(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        10 => test_10_17::run_test_10(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        11 => test_10_17::run_test_11(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        12 => test_10_17::run_test_12(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        13 => test_10_17::run_test_13(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        14 => test_10_17::run_test_14(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        15 => test_10_17::run_test_15(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        16 => test_10_17::run_test_16(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        17 => test_10_17::run_test_17(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        18 => test_18_25::run_test_18(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        19 => test_18_25::run_test_19(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        20 => test_18_25::run_test_20(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        21 => test_18_25::run_test_21(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        22 => test_18_25::run_test_22(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        23 => test_18_25::run_test_23(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        24 => test_18_25::run_test_24(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        25 => test_18_25::run_test_25(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        26 => test_26_33::run_test_26(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        27 => test_26_33::run_test_27(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        28 => test_26_33::run_test_28(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        29 => test_26_33::run_test_29(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        30 => test_26_33::run_test_30(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        31 => test_26_33::run_test_31(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        32 => test_26_33::run_test_32(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        33 => test_26_33::run_test_33(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        34 => test_34_41::run_test_34(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        35 => test_34_41::run_test_35(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        36 => test_34_41::run_test_36(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        37 => test_34_41::run_test_37(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        38 => test_34_41::run_test_38(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        39 => test_34_41::run_test_39(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        40 => test_34_41::run_test_40(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        41 => test_34_41::run_test_41(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        42 => test_42_49::run_test_42(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        43 => test_42_49::run_test_43(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        44 => test_42_49::run_test_44(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        45 => test_42_49::run_test_45(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        46 => test_42_49::run_test_46(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        47 => test_42_49::run_test_47(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        48 => test_42_49::run_test_48(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        49 => test_42_49::run_test_49(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        50 => test_50_55::run_test_50(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        51 => test_50_55::run_test_51(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        52 => test_50_55::run_test_52(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        53 => test_50_55::run_test_53(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        54 => test_50_55::run_test_54(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        55 => test_50_55::run_test_55(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        56 => test_56_63::run_test_56(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        57 => test_56_63::run_test_57(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        58 => test_56_63::run_test_58(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        59 => test_56_63::run_test_59(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        60 => test_56_63::run_test_60(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        61 => test_56_63::run_test_61(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        62 => test_56_63::run_test_62(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        63 => test_56_63::run_test_63(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        64 => test_64_71::run_test_64(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        65 => test_64_71::run_test_65(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        66 => test_64_71::run_test_66(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        67 => test_64_71::run_test_67(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        68 => test_64_71::run_test_68(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        69 => test_64_71::run_test_69(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        70 => test_64_71::run_test_70(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        71 => test_64_71::run_test_71(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        72 => test_72_79::run_test_72(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        73 => test_72_79::run_test_73(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        74 => test_72_79::run_test_74(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        75 => test_72_79::run_test_75(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        76 => test_72_79::run_test_76(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        77 => test_72_79::run_test_77(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        78 => test_72_79::run_test_78(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        79 => test_72_79::run_test_79(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        80 => test_80_87::run_test_80(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        81 => test_80_87::run_test_81(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        82 => test_80_87::run_test_82(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        83 => test_80_87::run_test_83(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        84 => test_80_87::run_test_84(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        85 => test_80_87::run_test_85(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        86 => test_80_87::run_test_86(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        87 => test_80_87::run_test_87(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        88 => test_88_98::run_test_88(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        90 => test_88_98::run_test_90(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        91 => test_88_98::run_test_91(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        92 => test_88_98::run_test_92(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        93 => test_88_98::run_test_93(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        94 => test_88_98::run_test_94(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        95 => test_88_98::run_test_95(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        96 => test_88_98::run_test_96(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        97 => test_88_98::run_test_97(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        98 => test_88_98::run_test_98(
+            &mut pdf,
+            &filename_diagnostic,
+            arg2,
+            stdout,
+            stderr,
+            &mut diagnostics_written,
+        ),
+        _ => return write_error(stdout, stderr, &format!("invalid test {n}")),
+    };
+    if let Err(error) = result {
         return write_error(stdout, stderr, &error.to_string());
     }
     if writeln!(stdout, "test {n} done").is_err() {

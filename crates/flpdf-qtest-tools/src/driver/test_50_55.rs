@@ -1,0 +1,425 @@
+use std::ffi::OsStr;
+use std::io::{Read, Seek, Write};
+
+use flpdf::form_field_object_helper::FormFieldObjectHelper;
+use flpdf::json_inspect::pdf_object_to_json;
+use flpdf::page_document_helper::PageDocumentHelper;
+use flpdf::writer::{ObjectStreamMode, PdfWriter};
+use flpdf::{Error, ObjectHandle, Pdf};
+
+use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
+
+/// Text of the "form field object must be indirect" internal error used by
+/// [`run_test_51`]/[`run_test_52`] below.
+///
+/// qpdf's `QPDFFormFieldObjectHelper` wraps a `QPDFObjectHandle` directly and
+/// tolerates a direct (non-indirect) field object -- `setFieldAttribute`'s
+/// underlying `replaceKey` is simply a no-op on a null/malformed handle
+/// (`QPDFObjectHandle::replaceKey`, `libqpdf/QPDFObjectHandle.cc:1199-1209`).
+/// flpdf's `FormFieldObjectHelper::new` instead requires a real
+/// [`flpdf::ObjectRef`] identity, so a direct field object (never produced by
+/// a well-formed `/Fields`/`/Kids` array, which the PDF spec requires to hold
+/// indirect references) has no faithful path here.
+const FIELD_MUST_BE_INDIRECT: &str = "form field object must be indirect";
+
+/// test_driver.cc:1939-1953 (`test_50`). Dictionary merge test crafted to
+/// work with `merge-dict.pdf`.
+pub(crate) fn run_test_50<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
+    _arg2: Option<&OsStr>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<()> {
+    let d1_handle = pdf.trailer_key_handle(b"Dict1");
+    let d2_handle = pdf.trailer_key_handle(b"Dict2");
+
+    // `ObjectHandle::merge_resources` requires both operands already
+    // resolved ("a no-op unless both `self` and `other` are dictionaries",
+    // checked via `as_dictionary`, which "never performs resolution
+    // itself") -- unlike qpdf's `mergeResources`, whose `isDictionary()`/
+    // `getKey()` calls dereference implicitly. Resolving into separate
+    // handles here does not change *which* object gets mutated:
+    // `resolve_object_handle_to_terminal_ref` returns the pdf's own
+    // canonical, shared handle for an indirect value, so mutating it
+    // through `d1`/`d2` mutates the exact same object `d1_handle`/
+    // `d2_handle` still refer to (and, for a *direct* `/Dict1`/`/Dict2`,
+    // the "resolved" handle is a plain clone of the same shared state).
+    let (d1, _) = pdf.resolve_object_handle_to_terminal_ref(&d1_handle)?;
+    let (d2, _) = pdf.resolve_object_handle_to_terminal_ref(&d2_handle)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+
+    d1.merge_resources(&d2, None)?;
+    pdf.mark_object_handle_dirty(&d1)?;
+
+    // `d1.getJSON(JSON::LATEST)` uses qpdf's default
+    // `dereference_indirect = false` (`include/qpdf/QPDFObjectHandle.hh`):
+    // if `/Dict1` is stored as an indirect reference, this still prints only
+    // its own "N G R" unparse as a JSON string
+    // (`QPDFObjectHandle::getJSON`, `libqpdf/QPDFObjectHandle.cc:1613-1627`)
+    // even though `merge_resources` above already mutated the object it
+    // points to. `pdf_object_to_json` implements the identical
+    // never-resolve-the-top-level contract, so passing the *original*
+    // `d1_handle` here (not the resolved `d1`) is what reproduces that; for
+    // a direct `/Dict1` the two handles share the same state, so this still
+    // shows the merged dictionary.
+    let json = pdf_object_to_json(&d1_handle).map_err(|error| Error::System(error.to_string()))?;
+    let unparsed = json.unparse()?;
+    stdout.write_all(&unparsed)?;
+    writeln!(stdout)?;
+
+    // Top-level type mismatch: `d2.getKey("/k1")` need not itself be a
+    // dictionary (deliberately mismatched by this test). qpdf's
+    // `mergeResources` call happens unconditionally regardless of that
+    // value's type; whether it turns out to be a no-op depends on the
+    // resolved type, matching `merge_resources`'s own no-op contract for a
+    // non-dictionary `other`.
+    let d2_k1_handle = d2.get_key(b"/k1");
+    let (d2_k1, _) = pdf.resolve_object_handle_to_terminal_ref(&d2_k1_handle)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    d1.merge_resources(&d2_k1, None)?;
+    pdf.mark_object_handle_dirty(&d1)?;
+
+    // GAP(QPDFObjectHandle::getResourceNames): qpdf iterates `d1`'s
+    // top-level keys whose already-merged value is itself a dictionary,
+    // printing each name (`for (auto const& name: d1.getResourceNames())
+    // std::cout << name << std::endl;`,
+    // `libqpdf/QPDFObjectHandle.cc:1156-1174`). flpdf's equivalent,
+    // `get_resource_names` in `object_handle.rs`, is a private `fn` with no
+    // public accessor -- there is nothing this driver can call to reproduce
+    // the printed name list.
+    Ok(())
+}
+
+/// Resolve one array item that qpdf would traverse via `getArrayItem`,
+/// draining any repair diagnostics the resolution itself surfaces before
+/// the caller reads the resolved value -- matching `test_0_1.rs`'s own
+/// resolve-then-drain pattern.
+fn resolve_and_drain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+    filename: &[u8],
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<(ObjectHandle, Option<flpdf::ObjectRef>)> {
+    let resolved = pdf.resolve_object_handle_to_terminal_ref(handle)?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    Ok(resolved)
+}
+
+/// test_driver.cc:1955-1997 (`test_51`). Radio button and checkbox field
+/// setting; the input files must have radio buttons named `r1`/`r2` and
+/// checkboxes named `checkbox1`/`checkbox2` (`button-set*.pdf`).
+pub(crate) fn run_test_51<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
+    _arg2: Option<&OsStr>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<()> {
+    let root_handle = pdf.trailer_key_handle(b"Root");
+    let (root, _) = resolve_and_drain(
+        pdf,
+        &root_handle,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+    )?;
+
+    let acroform_handle = root.get_key(b"/AcroForm");
+    let (acroform, _) = resolve_and_drain(
+        pdf,
+        &acroform_handle,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+    )?;
+
+    let fields_handle = acroform.get_key(b"/Fields");
+    let (fields, _) = resolve_and_drain(
+        pdf,
+        &fields_handle,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+    )?;
+
+    // qpdf's `getArrayNItems`/`getArrayItem` on a non-array both warn and
+    // behave as an empty array; `as_array().unwrap_or_default()` matches
+    // that fallback.
+    for item in fields.as_array().unwrap_or_default() {
+        let (field, field_ref) =
+            resolve_and_drain(pdf, &item, filename, stdout, stderr, diagnostics_written)?;
+
+        let t_handle = field.get_key(b"/T");
+        let (t, _) = resolve_and_drain(
+            pdf,
+            &t_handle,
+            filename,
+            stdout,
+            stderr,
+            diagnostics_written,
+        )?;
+        let Some(raw) = t.as_string() else {
+            continue;
+        };
+        let utf8 = flpdf::pdf_string::utf8_value(&raw);
+
+        if utf8 == b"r1" {
+            writeln!(stdout, "setting r1 via parent")?;
+            let field_ref =
+                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
+            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+            foh.set_value(ObjectHandle::name(b"2".to_vec()), true)?;
+        } else if utf8 == b"r2" {
+            writeln!(stdout, "setting r2 via child")?;
+            let kids_handle = field.get_key(b"/Kids");
+            let (kids, _) = resolve_and_drain(
+                pdf,
+                &kids_handle,
+                filename,
+                stdout,
+                stderr,
+                diagnostics_written,
+            )?;
+            // qpdf's `getArrayItem(1)` on a too-short array warns and
+            // returns null rather than crashing; a null "field" then makes
+            // `QPDFFormFieldObjectHelper::setV`'s underlying `replaceKey`
+            // a silent no-op. flpdf's `FormFieldObjectHelper::new` requires
+            // a real `ObjectRef`, so that specific out-of-range case has no
+            // faithful path here and instead surfaces as an internal error
+            // below -- the fixtures this test is written against always
+            // provide a real second `/Kids` entry.
+            let kid_handle = kids
+                .as_array()
+                .unwrap_or_default()
+                .into_iter()
+                .nth(1)
+                .unwrap_or_else(ObjectHandle::null);
+            let (_kid, kid_ref) = resolve_and_drain(
+                pdf,
+                &kid_handle,
+                filename,
+                stdout,
+                stderr,
+                diagnostics_written,
+            )?;
+            let kid_ref =
+                kid_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
+            let mut foh = FormFieldObjectHelper::new(kid_ref, pdf);
+            foh.set_value(ObjectHandle::name(b"3".to_vec()), true)?;
+        } else if utf8 == b"checkbox1" {
+            writeln!(stdout, "turning checkbox1 on")?;
+            let field_ref =
+                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
+            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+            // The value that eventually gets set is based on what's allowed
+            // in /N and may not match this value (matches qpdf's own
+            // comment: `set_value` maps any non-`/Off` name to "checked").
+            foh.set_value(ObjectHandle::name(b"Sure".to_vec()), true)?;
+        } else if utf8 == b"checkbox2" {
+            writeln!(stdout, "turning checkbox2 off")?;
+            let field_ref =
+                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
+            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+            foh.set_value(ObjectHandle::name(b"Off".to_vec()), true)?;
+        }
+    }
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.write()?;
+    Ok(())
+}
+
+/// test_driver.cc:1999-2022 (`test_52`). Sets a field value for
+/// appearance-stream generation testing.
+pub(crate) fn run_test_52<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
+    arg2: Option<&OsStr>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<()> {
+    // qpdf dereferences `arg2` (a `char const*`) without a null check --
+    // undefined behavior in the C++ original if the caller omits it.
+    // `expect` is the closest controlled stand-in for that same
+    // missing-argument case, rather than silently substituting empty bytes.
+    let arg2 = arg2.expect("qpdf's test_52 dereferences arg2 without checking for null");
+
+    let root_handle = pdf.trailer_key_handle(b"Root");
+    let (root, _) = resolve_and_drain(
+        pdf,
+        &root_handle,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+    )?;
+
+    let acroform_handle = root.get_key(b"/AcroForm");
+    let (acroform, _) = resolve_and_drain(
+        pdf,
+        &acroform_handle,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+    )?;
+
+    let fields_handle = acroform.get_key(b"/Fields");
+    let (fields, _) = resolve_and_drain(
+        pdf,
+        &fields_handle,
+        filename,
+        stdout,
+        stderr,
+        diagnostics_written,
+    )?;
+
+    for item in fields.as_array().unwrap_or_default() {
+        let (field, field_ref) =
+            resolve_and_drain(pdf, &item, filename, stdout, stderr, diagnostics_written)?;
+
+        let t_handle = field.get_key(b"/T");
+        let (t, _) = resolve_and_drain(
+            pdf,
+            &t_handle,
+            filename,
+            stdout,
+            stderr,
+            diagnostics_written,
+        )?;
+        let Some(raw) = t.as_string() else {
+            continue;
+        };
+        let utf8 = flpdf::pdf_string::utf8_value(&raw);
+
+        if utf8 == b"list1" {
+            writeln!(stdout, "setting list1 value")?;
+            let field_ref =
+                field_ref.ok_or_else(|| Error::System(FIELD_MUST_BE_INDIRECT.to_string()))?;
+            // `newString` stores `arg2`'s raw bytes as-is -- unlike
+            // `newUnicodeString`, this is qpdf's literal-string
+            // constructor, not a UTF-8-to-UTF-16 conversion. (`set_value`
+            // below still re-encodes it as a Unicode string for a text
+            // field, matching `QPDFFormFieldObjectHelper::setV`'s own
+            // `value.isString()` branch.)
+            let value = ObjectHandle::string(os_str_diagnostic_bytes(arg2).into_owned());
+            let mut foh = FormFieldObjectHelper::new(field_ref, pdf);
+            foh.set_value(value, true)?;
+        }
+    }
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    writer.write()?;
+    Ok(())
+}
+
+/// test_driver.cc:2024-2041 (`test_53`). Get-all-objects and dangling-ref
+/// handling.
+pub(crate) fn run_test_53<R: Read + Seek>(
+    _pdf: &mut Pdf<R>,
+    _filename: &[u8],
+    _arg2: Option<&OsStr>,
+    _stdout: &mut dyn Write,
+    _stderr: &mut dyn Write,
+    _diagnostics_written: &mut usize,
+) -> flpdf::Result<()> {
+    // GAP(QPDF::makeIndirectObject): the entire body depends on it for its
+    // very first printed line (`"new object: " << new_obj.unparse() <<
+    // std::endl`) -- qpdf allocates a fresh object number from its own
+    // internal object cache (`libqpdf/QPDF.cc`), not from the trailer
+    // `/Size` or any other document-visible counter, so it cannot be
+    // emulated by picking an unused number and calling `Pdf::set_object`.
+    // flpdf's `Pdf` exposes no public equivalent (only `version`/
+    // `trailer`/`trailer_handle`/`trailer_key_handle`/`root_ref`; the
+    // private `next_object_ref` helper in `page_form_xobject.rs` is
+    // crate-internal and unreachable here). The subsequent
+    // `pdf.getAllObjects()` loop (`QPDF::getAllObjects`) has no public
+    // equivalent either, so nothing in this test can produce real output.
+    Ok(())
+}
+
+/// test_driver.cc:2043-2054 (`test_54`). Tests `getFinalVersion`; must be
+/// invoked with a file whose final version is not 1.5.
+pub(crate) fn run_test_54<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    _filename: &[u8],
+    _arg2: Option<&OsStr>,
+    stdout: &mut dyn Write,
+    _stderr: &mut dyn Write,
+    _diagnostics_written: &mut usize,
+) -> flpdf::Result<()> {
+    // qpdf constructs `QPDFWriter w(pdf, "a.pdf")` (opening/truncating
+    // "a.pdf" at construction) before the assert below. `PdfWriter::new`
+    // borrows `pdf` mutably for its own lifetime, so `pdf.version()` can no
+    // longer be called once the writer exists; reading it first instead of
+    // after construction does not change any printed byte -- the assert
+    // has no observable success-path output, and the writer's file-open
+    // side effect on disk is not part of this driver's stdout/stderr
+    // contract.
+    let version = pdf.version().to_string();
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_output_file("a.pdf")?;
+    assert_ne!(version, "1.5");
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    // qpdf calls `getFinalVersion()` twice: once for the `if` condition,
+    // once again to print it.
+    let final_version = writer.get_final_version()?;
+    if final_version != "1.5" {
+        let final_version_again = writer.get_final_version()?;
+        writeln!(stdout, "oops: {final_version_again}")?;
+    }
+    Ok(())
+}
+
+/// test_driver.cc:2056-2071 (`test_55`). Form XObjects.
+pub(crate) fn run_test_55<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filename: &[u8],
+    _arg2: Option<&OsStr>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
+) -> flpdf::Result<()> {
+    let mut helper = PageDocumentHelper::new(pdf);
+    let _pages = helper.get_all_pages()?;
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    // qpdf builds the empty `/QTest` array before its per-page loop
+    // (`QPDFObjectHandle qtest = QPDFObjectHandle::newArray();`); kept here
+    // for the same order of operations even though nothing below can
+    // populate or use it.
+    let _qtest = ObjectHandle::array(Vec::new());
+
+    // GAP(QPDFPageObjectHelper::getFormXObjectForPage): for each page, qpdf
+    // appends `ph.getFormXObjectForPage()` (default
+    // `handle_from_transformation = true`) and
+    // `ph.getFormXObjectForPage(false)` to `/QTest`, replaces the
+    // trailer's `/QTest` with the finished array, then writes `a.pdf` in
+    // QDF/static-ID mode (`libqpdf/QPDFPageObjectHelper.cc`). flpdf's
+    // page-to-Form-XObject conversion exists (`page_form_xobject.rs`,
+    // `page_to_form_xobject`) but that module is declared
+    // `pub(crate) mod page_form_xobject` (`lib.rs:136`), so it is
+    // unreachable from this crate. Since the array this test's entire
+    // output depends on can never be built, nothing below this point --
+    // including the QDF/static-ID `a.pdf` write, which would otherwise
+    // fabricate a trailer without the array qpdf actually produces -- is
+    // emitted. The `get_all_pages()` call above is real, not gapped: it is
+    // qpdf's own repair pass over `/Pages` (`QPDFPageDocumentHelper::
+    // getAllPages`), so any repair diagnostics it surfaces still reach
+    // stderr through `emit_new_diagnostics` even though -- unlike a full
+    // qpdf run -- no `a.pdf` capturing the repaired tree is ever written.
+    Ok(())
+}
