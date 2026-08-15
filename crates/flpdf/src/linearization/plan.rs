@@ -951,8 +951,16 @@ impl LinearizationPlan {
             }
             let object_handle = pdf.get_object_handle(r);
             pdf.resolve_object_handle(&object_handle)?;
-            if object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?
+            // Both `/Type /XRef` and `/Type /ObjStm` objects are required to
+            // carry stream data (ISO 32000-1 §7.5.7/§7.5.8), so the genuine
+            // article is always `ObjectValue::Stream`, never a plain
+            // dictionary. `try_is_dictionary_of_type` only matches
+            // `ObjectValue::Dictionary` (mirroring qpdf's own
+            // `isDictionaryOfType`, `libqpdf/QPDFObjectHandle.cc:461-466`),
+            // so it can never match here; `try_is_stream_of_type` mirrors
+            // qpdf's dedicated `isStreamOfType` (`:468-471`) instead.
+            if object_handle.try_is_stream_of_type(b"XRef", b"")?
+                || object_handle.try_is_stream_of_type(b"ObjStm", b"")?
             {
                 continue;
             }
@@ -5157,6 +5165,35 @@ mod tests {
                 .all(|batch| !batch.contains(&pages_node)),
             "the cross-linked /Pages node must not be routed to the second half"
         );
+    }
+
+    /// The source document's own structural containers (`/Type /ObjStm`,
+    /// `/Type /XRef`) must never surface as ordinary body objects in the
+    /// plan: qpdf regenerates fresh containers, so the source ones are never
+    /// live body objects (their members survive individually).
+    ///
+    /// Both are always streams (ISO 32000-1 §7.5.7/§7.5.8), never plain
+    /// dictionaries, so this exercises `try_is_stream_of_type`'s matching
+    /// arm at the call site in `from_pdf` -- `try_is_dictionary_of_type`
+    /// (which only matches `ObjectValue::Dictionary`) can never match a
+    /// stream and would silently fail to identify either container.
+    #[test]
+    fn from_pdf_excludes_source_structural_objstm_and_xref_stream_objects() {
+        let bytes = resources_crosslink_page_tree_objstm_pdf_bytes();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("crosslink ObjStm PDF should parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+
+        let objstm_ref = ObjectRef::new(4, 0);
+        let xref_stream_ref = ObjectRef::new(5, 0);
+        for r in [objstm_ref, xref_stream_ref] {
+            assert!(
+                !plan.part1_objects.contains(&r)
+                    && !plan.part2_objects.contains(&r)
+                    && !plan.part3_objects.contains(&r)
+                    && !plan.part4_objects().contains(&r),
+                "source structural container {r} must not appear in any linearization part"
+            );
+        }
     }
 
     /// Preserve mode keeps each source ObjStm intact after qpdf-compatible
