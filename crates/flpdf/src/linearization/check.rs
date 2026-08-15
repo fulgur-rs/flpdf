@@ -187,10 +187,7 @@ fn is_pdf_whitespace(b: u8) -> bool {
 /// `optimize(false)` performs before `calculateLinearizationData`: direct
 /// arrays/dictionaries are traversed in place, while an indirect handle is a
 /// source-object boundary and is queued for extent capture by the caller.
-fn enqueue_references(
-    value: &ObjectHandle,
-    pending: &mut VecDeque<ObjectRef>,
-) -> Result<()> {
+fn enqueue_references(value: &ObjectHandle, pending: &mut VecDeque<ObjectRef>) -> Result<()> {
     if let Some(object_ref) = value.object_ref() {
         pending.push_back(object_ref);
         return Ok(());
@@ -242,7 +239,7 @@ fn first_page_source_extent<R: Read + Seek>(
             };
             if use_outlines {
                 if let Some(outlines) = root_dict.get(b"/Outlines" as &[u8]).cloned() {
-                enqueue_references(&outlines, &mut pending)?;
+                    enqueue_references(&outlines, &mut pending)?;
                 }
             }
         }
@@ -438,7 +435,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // warning accumulator, so surface the same failed-check condition after
     // validating the referenced object itself.  Keeping the object validation
     // first preserves the useful malformed-object diagnostics for a bad /O.
-    let Some(first_page_ref) = pages.first() else {
+    let Some(first_page_ref) = pages.first().copied() else {
         fail!("/O ({o_num}) cannot be checked because the document has no pages");
     };
     if first_page_ref.number as u64 != o_num {
@@ -486,21 +483,26 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         if offset >= file_len {
             fail!("/H[{index}] offset ({offset}) is beyond file length ({file_len})");
         }
-        let end =
-            offset
-                .checked_add(length)
-                .ok_or_else(|| LinearizationCheckError::InvalidParam {
-                    message: format!("/H[{index}] offset plus length overflows"),
-                })?;
+        let end = offset
+            .checked_add(length)
+            // cov:ignore-start: parsed PDF integers are i64-backed, so two
+            // non-negative values cannot overflow a u64 sum.
+            .ok_or_else(|| LinearizationCheckError::InvalidParam {
+                message: format!("/H[{index}] offset plus length overflows"),
+            })?;
+        // cov:ignore-end
         if end > file_len {
             fail!(
                 "/H[{index}] offset plus length ({offset}+{length}) extends beyond file length ({file_len})"
             );
         }
-        let offset =
-            usize::try_from(offset).map_err(|_| LinearizationCheckError::InvalidParam {
+        let offset = usize::try_from(offset)
+            // cov:ignore-start: only a 32-bit target can reject a parsed u64
+            // offset here; the supported CI target is 64-bit.
+            .map_err(|_| LinearizationCheckError::InvalidParam {
                 message: format!("/H[{index}] offset ({offset}) does not fit in platform usize"),
             })?;
+        // cov:ignore-end
         check_hint_stream_at_offset(pdf, file_bytes, offset, length)
     };
 
@@ -526,17 +528,17 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     if e_val >= file_len {
         fail!("/E ({e_val}) must be less than file length ({file_len})");
     }
-    let Some(first_page_ref) = pages.first().copied() else {
-        fail!("/E ({e_val}) cannot be checked because the document has no pages");
-    };
     let (min_e, max_e) =
         first_page_source_extent(pdf, first_page_ref).map_err(LinearizationCheckError::from)?;
+    // cov:ignore-start: source extents are rejected as negative in the canonical
+    // object walk before this conversion; parsed PDF integers are i64-backed.
     let min_e = u64::try_from(min_e).map_err(|_| LinearizationCheckError::InvalidParam {
         message: format!("computed part-6 end offset {min_e} is negative"),
     })?;
     let max_e = u64::try_from(max_e).map_err(|_| LinearizationCheckError::InvalidParam {
         message: format!("computed part-6 end offset {max_e} is negative"),
     })?;
+    // cov:ignore-end
     if e_val < min_e || e_val > max_e {
         fail!("/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})");
     }
@@ -796,11 +798,14 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
         length_obj.try_dereference()?;
         (end_before_space, end_after_space) = length_obj.end_offsets();
     }
+    // cov:ignore-start: the canonical resolver rejects an unresolved indirect
+    // `/Length` while parsing the stream, so a parsed stream always has extents.
     if end_before_space < 0 || end_after_space < 0 {
         return Err(crate::Error::Unsupported(format!(
             "hint stream object {obj_num} {obj_gen} has no source extent"
         )));
     }
+    // cov:ignore-end
     // cov:ignore-start: u64 -> usize conversion can fail only on 32-bit
     // targets for a value above usize::MAX; the supported CI target is 64-bit.
     let expected_h_length_usize = usize::try_from(expected_h_length).map_err(|_| {
@@ -1146,7 +1151,9 @@ mod tests {
             pdf.extend_from_slice(b" /L ");
             pdf.extend_from_slice(l_literal);
         }
-        pdf.extend_from_slice(b" /N 0 /O 0 /H [0 0] /T 0 /P 0 >>\nendobj\n");
+        pdf.extend_from_slice(
+            b" /N 0 /O 0 /H [00000000000000000000 00000000000000000000] /T 0 /P 0 >>\nendobj\n",
+        );
         let off1 = pdf.len() as u64;
         pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
         let off2 = pdf.len() as u64;
@@ -1163,7 +1170,7 @@ mod tests {
         );
         pdf.extend_from_slice(xref.as_bytes());
         let trailer =
-            format!("trailer\n<< /Size 6 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -1471,6 +1478,63 @@ mod tests {
         (bytes, stream_offset, expected_length)
     }
 
+    /// Build a small object graph that exercises qpdf's part-6 object-user
+    /// boundary: `/PageMode /UseOutlines` adds the outline graph, while a
+    /// nested `/Type /Page` object is counted but not traversed further.
+    fn source_extent_graph_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let objects = [
+            (
+                1,
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /PageMode /UseOutlines /Outlines 6 0 R >>\nendobj\n"
+                    .as_slice(),
+            ),
+            (
+                2,
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".as_slice(),
+            ),
+            (
+                3,
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Extra 4 0 R >>\nendobj\n"
+                    .as_slice(),
+            ),
+            (
+                4,
+                b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Leaf 7 0 R >>\nendobj\n"
+                    .as_slice(),
+            ),
+            (
+                5,
+                b"5 0 obj\n<< /Type /Example /Leaf 7 0 R >>\nendobj\n".as_slice(),
+            ),
+            (
+                6,
+                b"6 0 obj\n<< /Type /Outlines /First 7 0 R >>\nendobj\n".as_slice(),
+            ),
+            (7, b"7 0 obj\n(leaf)\nendobj\n".as_slice()),
+        ];
+        let mut offsets = [0_u64; 8];
+        for (number, object) in objects {
+            offsets[number] = bytes.len() as u64;
+            bytes.extend_from_slice(object);
+        }
+        let xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    fn replace_h_values(bytes: &mut [u8], offset: u64, length: u64) {
+        let replacement = format!("[{offset:020} {length:020}]");
+        replace_parameter_value(bytes, b"/H ", replacement.as_bytes());
+    }
+
     #[test]
     fn check_linearized_bytes_passes() {
         let bytes = build_linearized_bytes();
@@ -1479,6 +1543,99 @@ mod tests {
             result.is_ok(),
             "check should pass on well-formed linearized output: {result:?}"
         );
+    }
+
+    #[test]
+    fn extent_walk_follows_outlines_and_stops_at_nested_pages() {
+        let bytes = source_extent_graph_fixture();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open extent graph");
+        let (end_before_space, end_after_space) =
+            first_page_source_extent(&mut pdf, ObjectRef::new(3, 0)).expect("source extent");
+        assert!(end_before_space > 0);
+        assert!(end_after_space >= end_before_space);
+    }
+
+    #[test]
+    fn extent_walk_rejects_a_missing_object_source_extent() {
+        let bytes = source_extent_graph_fixture();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open extent graph");
+        let error = first_page_source_extent(&mut pdf, ObjectRef::new(99, 0))
+            .expect_err("missing object has no source extent");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("no source extent"))
+        );
+    }
+
+    #[test]
+    fn enqueue_references_traverses_a_direct_stream_dictionary() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(0))]),
+            Rc::new(Vec::new()),
+        );
+        let mut pending = VecDeque::new();
+        enqueue_references(&stream, &mut pending).expect("direct stream dictionary");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn check_rejects_an_empty_page_tree_and_a_mismatched_page_object() {
+        let mut empty_pages = linearized_like_pdf_bytes(b"1", None, &[]);
+        replace_parameter_value(&mut empty_pages, b"/O", b"4");
+        let page_tree = b"/Kids [4 0 R] /Count 1";
+        let empty_page_tree = b"/Kids [] /Count 0";
+        let page_tree_start = empty_pages
+            .windows(page_tree.len())
+            .position(|window| window == page_tree)
+            .expect("page tree");
+        let mut padded = vec![b' '; page_tree.len()];
+        padded[..empty_page_tree.len()].copy_from_slice(empty_page_tree);
+        empty_pages[page_tree_start..page_tree_start + page_tree.len()].copy_from_slice(&padded);
+        let empty_result = check_linearization_bytes(&empty_pages);
+        assert!(matches!(
+            empty_result,
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("document has no pages")
+        ));
+
+        let mut mismatch = linearized_fixture_bytes();
+        replace_parameter_value(&mut mismatch, b"/O ", b"8");
+        let type_marker = b"/Type /Font";
+        let type_start = mismatch
+            .windows(type_marker.len())
+            .rposition(|window| window == type_marker)
+            .expect("font type");
+        mismatch[type_start..type_start + type_marker.len()].copy_from_slice(b"/Type /Page");
+        let mismatch_result = check_linearization_bytes(&mismatch);
+        assert!(matches!(
+            mismatch_result,
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("does not match the first page object")
+        ));
+    }
+
+    #[test]
+    fn check_rejects_hint_offsets_outside_the_file() {
+        let mut beyond = linearized_like_pdf_bytes(b"1", None, &[]);
+        replace_parameter_value(&mut beyond, b"/N ", b"1");
+        replace_parameter_value(&mut beyond, b"/O ", b"4");
+        replace_h_values(&mut beyond, i64::MAX as u64, 0);
+        let beyond_result = check_linearization_bytes(&beyond);
+        assert!(matches!(
+            beyond_result,
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("is beyond file length")
+        ));
+
+        let mut extends = linearized_like_pdf_bytes(b"1", None, &[]);
+        replace_parameter_value(&mut extends, b"/N ", b"1");
+        replace_parameter_value(&mut extends, b"/O ", b"4");
+        replace_h_values(&mut extends, 1, i64::MAX as u64);
+        let extends_result = check_linearization_bytes(&extends);
+        assert!(matches!(
+            extends_result,
+            Err(LinearizationCheckError::InvalidParam { ref message })
+                if message.contains("extends beyond file length")
+        ));
     }
 
     #[test]
@@ -1637,6 +1794,28 @@ mod tests {
             .expect("indirect /Length hint stream");
         assert!(dict.try_get_key(b"/Length").unwrap().object_ref().is_some());
         assert_eq!(decoded.as_slice(), b"abc");
+
+        let mut null_object = indirect_length.clone();
+        let object_header = b"1 0 obj\n";
+        let object_start = null_object
+            .windows(object_header.len())
+            .position(|window| window == object_header)
+            .expect("hint object header");
+        let body_start = object_start + object_header.len();
+        let endobj_start = null_object[body_start..]
+            .windows(b"endobj".len())
+            .position(|window| window == b"endobj")
+            .map(|relative| body_start + relative)
+            .expect("hint object endobj");
+        null_object[body_start..endobj_start].fill(b' ');
+        null_object[body_start..body_start + b"null".len()].copy_from_slice(b"null");
+        let mut pdf = Pdf::open_mem_owned(null_object.clone()).expect("open null hint object");
+        let null_result = load_hint_stream(&mut pdf, &null_object, offset, expected_length);
+        assert!(matches!(
+            null_result,
+            Err(crate::Error::Unsupported(ref message))
+                if message.contains("does not exist")
+        ));
 
         let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
         let mismatch = load_hint_stream(&mut pdf, &bytes, object_offset(&bytes, 5), 116);

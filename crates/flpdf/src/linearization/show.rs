@@ -731,11 +731,14 @@ fn show_with_pdf(
     // both physical hint-stream spans are validated before any table bytes are
     // rendered.
     check_linearization(pdf, file_bytes).map_err(|error| match error {
+        // cov:ignore-start: the immutable Cursor input cannot change between
+        // the identical is_linearized checks; this arm is a defensive mapping.
         LinearizationCheckError::NotLinearized => {
             malformed!("linearization candidate became non-linearized")
         }
         LinearizationCheckError::InvalidParam { message } => malformed!("{message}"),
         LinearizationCheckError::Io(error) => ShowLinearizationError::Io(error),
+        // cov:ignore-end
     })?;
 
     // 3. Locate, resolve, and decompress the hint stream object at /H[0].
@@ -754,11 +757,14 @@ fn show_with_pdf(
         .map_err(|_| malformed!("/H[0] does not fit in platform usize"))?;
     let (hint_dict, decompressed) = load_hint_stream(pdf, file_bytes, h_usize, params.h_length)
         .map_err(|error| match error {
+            // cov:ignore-start: the canonical check immediately above rejects
+            // the same Unsupported path before this duplicate mapping runs.
             crate::Error::Unsupported(message) => malformed!("{message}"),
             // cov:ignore: public show entry points use Cursor<Vec<u8>>; the
             // canonical resolver catches parse/unsupported failures and this
             // in-memory source cannot produce a read I/O error.
             error => ShowLinearizationError::from(error),
+            // cov:ignore-end
         })?;
 
     if params.h_overflow_offset != 0 {
@@ -767,11 +773,14 @@ fn show_with_pdf(
             // offset always fits; this only fires on 32-bit targets.
             .map_err(|_| malformed!("/H[2] does not fit in platform usize"))?;
         load_hint_stream(pdf, file_bytes, overflow_offset, params.h_overflow_length).map_err(
+            // cov:ignore-start: the canonical check immediately above rejects
+            // an invalid overflow stream before this duplicate mapping runs.
             |error| match error {
                 crate::Error::Unsupported(message) => malformed!("{message}"),
                 // cov:ignore: see the primary hint-stream error arm above.
                 error => ShowLinearizationError::from(error),
             },
+            // cov:ignore-end
         )?;
     }
 
