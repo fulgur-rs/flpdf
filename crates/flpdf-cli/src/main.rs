@@ -2506,7 +2506,9 @@ fn run_check(
         let location = check_diagnostic_location(&input, diagnostic);
         match diagnostic.severity {
             Severity::Warning => {
-                let separator = if diagnostic.message.starts_with("(object ") {
+                let separator = if diagnostic.message.starts_with("(object ")
+                    || diagnostic.message.starts_with("(trailer,")
+                {
                     " "
                 } else {
                     ": "
@@ -5487,12 +5489,13 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
 }
 
 fn check_diagnostic_location(input: &Path, diagnostic: &flpdf::Diagnostic) -> String {
-    // Object-prefixed messages already carry qpdf's `(object N G, offset M)`
-    // context. Passing their structured offset to `diagnostic_location` would
-    // duplicate it as `file (offset M) (object N G, offset M)`. qpdf's
-    // `damagedPDF(input, offset, message)` keeps the object context in the
-    // message while the input path remains the sole outer location.
-    if diagnostic.message.starts_with("(object ") {
+    // Object- and trailer-prefixed messages already carry qpdf's
+    // `(object N G, offset M)` or `(trailer, offset M)` context. Passing
+    // their structured offset to `diagnostic_location` would duplicate it as
+    // `file (offset M) (object N G, offset M)`. qpdf's
+    // `damagedPDF(input, offset, message)` keeps that context in the message
+    // while the input path remains the sole outer location.
+    if diagnostic.message.starts_with("(object ") || diagnostic.message.starts_with("(trailer,") {
         diagnostic_location(input, None)
     } else {
         diagnostic_location(input, diagnostic.offset)
@@ -6081,6 +6084,19 @@ mod tests {
         assert_eq!(
             check_diagnostic_location(Path::new("input.pdf"), &ordinary_warning),
             "input.pdf (offset 12)"
+        );
+    }
+
+    #[test]
+    fn check_diagnostic_location_does_not_duplicate_trailer_offset() {
+        let trailer_warning = flpdf::Diagnostic::warning(
+            "(trailer, offset 190): dictionary has duplicated key /Foo; \
+             last occurrence overrides earlier ones",
+            Some(190),
+        );
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &trailer_warning),
+            "input.pdf"
         );
     }
 
