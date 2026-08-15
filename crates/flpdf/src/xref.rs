@@ -6500,6 +6500,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_xref_table_fails_without_a_sink_when_the_trailer_parse_fails() {
+        // A caller not tracking diagnostics (`error_diagnostics_sink: None`,
+        // e.g. a call chain that never threaded a sink) must still see the
+        // parse failure -- only the diagnostic-forwarding step is skipped.
+        let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Foo 1 /Foo 2";
+        let mut cursor = ByteCursor::new(bytes, 4);
+        let result = parse_xref_table(&mut cursor, bytes, None);
+        assert!(result.is_err(), "truncated trailer dictionary must fail");
+    }
+
+    #[test]
     fn parse_xref_table_forwards_diagnostics_to_the_sink_when_the_trailer_is_not_a_dictionary() {
         // Mirrors `parse_trailer_candidate_surfaces_warnings_even_when_the_candidate_is_rejected`
         // above, but through `parse_xref_table`'s ordinary xref-table path:
@@ -6529,6 +6540,17 @@ mod tests {
                 ),
                 Some(dict_open_end as u64),
             )]
+        );
+    }
+
+    #[test]
+    fn parse_xref_table_fails_without_a_sink_when_the_trailer_is_not_a_dictionary() {
+        let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n[ 1 0 << /x 1 /x 2 >> ]";
+        let mut cursor = ByteCursor::new(bytes, 4);
+        let result = parse_xref_table(&mut cursor, bytes, None);
+        assert!(
+            result.is_err(),
+            "a non-dictionary trailer candidate must be rejected"
         );
     }
 
