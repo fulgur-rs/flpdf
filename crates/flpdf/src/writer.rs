@@ -2291,16 +2291,18 @@ pub(crate) fn write_stream_payload_with_pipeline(
     Ok(add_newline)
 }
 
-/// Legacy in-place stream encryption bridge retained for the linearized writer
-/// and its convergence-loop helpers. The canonical full-rewrite stream path
-/// uses [`pipe_writer_stream_payload`] so encryption remains a qpdf-shaped
-/// pipeline stage instead of materializing a replacement buffer.
+/// Legacy in-place stream encryption bridge retained until the linearized
+/// writer's `.5.3` cleanup removes its remaining test/oracle seam. The
+/// canonical full-rewrite stream path uses [`pipe_writer_stream_payload`] so
+/// encryption remains a qpdf-shaped pipeline stage instead of materializing a
+/// replacement buffer.
 ///
 /// This bridge draws a fresh AES IV internally on every call (or the fixed
 /// test vector under `ctx.static_aes_iv`) and delegates to
 /// [`encrypt_stream_payload_with_iv`]. The linearized hint-stream emitter uses
 /// the latter directly with one IV per `write_linearized` invocation so its
 /// repeated convergence passes see identical ciphertext.
+#[allow(dead_code)] // flpdf-3yn9.5.3 removes this legacy bridge after the cutover.
 pub(crate) fn encrypt_stream_payload_for_writer(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,

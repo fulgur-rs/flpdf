@@ -19,6 +19,20 @@ fn body_and_stream_production_slice() -> &'static str {
     &WRITER_SOURCE[start..end]
 }
 
+fn objstm_production_slice() -> &'static str {
+    let start_marker = "fn append_objstm_container_object";
+    // Match the section label without depending on the checkout's line ending
+    // convention (Windows may materialize this source as CRLF).
+    let end_marker = "// Public result types";
+    let start = WRITER_SOURCE
+        .find(start_marker)
+        .expect("linearization ObjStm marker must remain present");
+    let end = WRITER_SOURCE
+        .find(end_marker)
+        .expect("linearization public result marker must remain present");
+    &WRITER_SOURCE[start..end]
+}
+
 #[test]
 fn linearization_body_stream_route_has_no_legacy_object_bridge() {
     let production = body_and_stream_production_slice();
@@ -31,6 +45,30 @@ fn linearization_body_stream_route_has_no_legacy_object_bridge() {
         assert!(
             !production.contains(forbidden),
             "canonical linearization body/stream route still contains legacy token {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn linearization_objstm_route_uses_live_handles() {
+    let production = objstm_production_slice();
+    assert!(
+        production.contains("emit_objstm_body_from_handles_with_writer"),
+        "ObjStm members must be emitted through the canonical ObjectHandle writer"
+    );
+    assert!(
+        production.contains("get_object_handle"),
+        "ObjStm members must be resolved from Pdf's canonical handle registry"
+    );
+    for forbidden in [
+        "Vec<(ObjectRef, Object)>",
+        "pdf.resolve(orig)",
+        "emit_objstm_body_from_resolved",
+        "renumber_object_with_removed",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "canonical linearization ObjStm route still contains legacy token {forbidden:?}"
         );
     }
 }
