@@ -21,7 +21,9 @@ fn body_and_stream_production_slice() -> &'static str {
 
 fn objstm_production_slice() -> &'static str {
     let start_marker = "fn append_objstm_container_object";
-    let end_marker = "// ---------------------------------------------------------------------------\n// Public result types";
+    // Match the section label without depending on the checkout's line ending
+    // convention (Windows may materialize this source as CRLF).
+    let end_marker = "// Public result types";
     let start = WRITER_SOURCE
         .find(start_marker)
         .expect("linearization ObjStm marker must remain present");
