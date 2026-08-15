@@ -1017,6 +1017,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
         ObjectHandle::from_value_with_resolver(value, resolver)
     }
 
+    /// Construct a direct value from the live file parser. Unlike a
+    /// programmatic value lifted through [`Self::direct_object_handle`], qpdf
+    /// stamps parser-created direct values with their owning `QPDF*`
+    /// (`libqpdf/QPDFParser.cc:394-444`).
+    pub(crate) fn parsed_direct_object_handle(&self, value: ObjectValue) -> ObjectHandle {
+        let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
+        ObjectHandle::from_parsed_value_with_resolver(value, resolver)
+    }
+
     pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> String {
         let input_description = self.core.borrow().description.clone();
         format!(
@@ -3608,7 +3617,7 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
     }
 
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
-        self.resolver.direct_object_handle(value)
+        self.resolver.parsed_direct_object_handle(value)
     }
 
     fn description_template(&self) -> Option<String> {
@@ -3617,6 +3626,10 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
+    fn pdf_unique_id(&self) -> Option<u64> {
+        Some(self.pdf_unique_id)
+    }
+
     fn new_stream(&self) -> Result<ObjectHandle> {
         self.new_stream_handle()
     }

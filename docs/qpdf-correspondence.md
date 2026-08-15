@@ -559,7 +559,11 @@ flpdf 独自の追加防御であり、公開 `ObjectHandle` API 経由でのみ
 （`QPDF_Array.cc:10-26`）と同じく、挿入される値自身の owning document だけを
 比較する shallow 判定へ揃えた（flpdf-25kg.3.16.7.1）。`belongs_exclusively_to_pdf`
 の子孫再帰は、`replace_object` などのforeign replacement防御に残る別責務であり、
-array ownership checkからは呼び出さない。
+array ownership checkからは呼び出さない。qpdfのfile parserは非nullのdirect値にも
+`QPDFParser::setDescription`（`QPDFParser.cc:394-444`）経由でQPDF contextを付ける一方、
+literal nullは共有`QPDF_Null::create`（`QPDFParser.cc:395-410`）のためownerlessのまま。
+flpdfもparser生成経路だけsource PDF identityをstampし、programmatic/legacy direct値の
+ownerless性を維持している。
 
 ⚪ `reserve_objects` と `replace_foreign_indirect_objects` の両方を
 `stacker::maybe_grow`（`OBJECT_COPY_STACK_RED_ZONE`/`OBJECT_COPY_STACK_GROWTH_SIZE`）
