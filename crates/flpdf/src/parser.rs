@@ -947,6 +947,15 @@ mod live_input_tests {
         )
     }
 
+    #[test]
+    fn detached_resolver_has_no_pdf_identity() {
+        let resolver = WarningSink {
+            warnings: RefCell::new(Vec::new()),
+        };
+
+        assert_eq!(resolver.pdf_unique_id(), None);
+    }
+
     struct RecordingDecrypter {
         calls: Vec<Vec<u8>>,
         fail: bool,
@@ -2311,7 +2320,9 @@ impl ContentHandleResolver {
 
     fn direct(&self, value: ObjectValue) -> ObjectHandle {
         match &self.resolver {
-            Some(resolver) => ObjectHandle::from_value_with_resolver(value, resolver.clone()),
+            Some(resolver) => {
+                ObjectHandle::from_parsed_value_with_resolver(value, resolver.clone())
+            }
             None => ObjectHandle::from_value(value),
         }
     }

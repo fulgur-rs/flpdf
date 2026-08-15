@@ -4417,6 +4417,42 @@ mod tests {
     }
 
     #[test]
+    fn parsed_direct_array_rejects_a_foreign_indirect_item_like_qpdf() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut entries = vec![bytes.len()];
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Names << /Nums [] >> >>\nendobj\n");
+        entries.push(bytes.len());
+        bytes.extend_from_slice(b"2 0 obj\n7\nendobj\n");
+        let startxref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        for offset in &entries {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("open destination PDF");
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve_object_handle(&root)
+            .expect("resolve destination root");
+        let nums = root.get_key(b"/Names").get_key(b"/Nums");
+
+        let mut foreign_pdf = Pdf::open(Cursor::new(bytes)).expect("open foreign PDF");
+        let foreign_item = foreign_pdf.get_object_handle(ObjectRef::new(2, 0));
+        // qpdf's QPDFParser stamps the direct array with its QPDF context
+        // (`libqpdf/QPDFParser.cc:219-232,439-443` and
+        // `libqpdf/qpdf/QPDFValue.hh:60-66`), so QPDF_Array::checkOwnership
+        // (`libqpdf/QPDF_Array.cc:10-26`) rejects the foreign indirect item.
+        let error = nums
+            .append_array_item(foreign_item)
+            .expect_err("a parsed direct array must reject a foreign indirect item");
+
+        assert!(error.to_string().contains("different QPDF"));
+    }
+
+    #[test]
     fn keyword_token_at_requires_token_boundary() {
         // Keyword at EOF (nothing after) is a valid token.
         assert_eq!(

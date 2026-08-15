@@ -341,6 +341,14 @@ pub type ResourceConflicts =
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 
+    /// The owning document identity carried by qpdf's `QPDF*` on parser-made
+    /// direct values (`QPDFValue::setDescription`,
+    /// `libqpdf/qpdf/QPDFValue.hh:60-66`). Detached/test resolvers have no
+    /// document owner.
+    fn pdf_unique_id(&self) -> Option<u64> {
+        None
+    }
+
     /// Create qpdf's owned empty stream object for an ObjectHandle operation.
     fn new_stream(&self) -> Result<ObjectHandle> {
         Err(Error::Internal(
@@ -1557,15 +1565,35 @@ impl ObjectHandle {
         Self::new_direct(value, NO_PARSED_OFFSET)
     }
 
-    /// Construct a parser-created direct value with the owning document's
-    /// weak resolver, matching qpdf's per-value `QPDF*` association. The
-    /// resolver is intentionally weak so direct values do not keep the
-    /// document alive after parsing (`QPDFValue.hh:60-66,149-152`).
+    /// Construct a direct value with a weak resolver context. The resolver is
+    /// intentionally weak so a direct value does not keep its document alive;
+    /// parser-created values use [`Self::from_parsed_value_with_resolver`] to
+    /// add qpdf's per-value document identity as well.
     pub(crate) fn from_value_with_resolver(
         value: ObjectValue,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         Self::new_direct_with_resolver(value, NO_PARSED_OFFSET, Some(resolver))
+    }
+
+    /// Construct a parser-created direct value with the owning document's
+    /// weak resolver and identity, matching qpdf's per-value `QPDF*`
+    /// association (`QPDFValue.hh:60-66,149-152`). Programmatic direct values
+    /// deliberately use [`Self::from_value_with_resolver`] instead: qpdf does
+    /// not assign an owner to a newly constructed direct array merely because
+    /// it is inserted into an indirect dictionary.
+    pub(crate) fn from_parsed_value_with_resolver(
+        value: ObjectValue,
+        resolver: Weak<dyn DocumentResolver>,
+    ) -> Self {
+        let pdf_unique_id = resolver
+            .upgrade()
+            .and_then(|resolver| resolver.pdf_unique_id());
+        let handle = Self::from_value_with_resolver(value, resolver);
+        if !handle.is_null() {
+            handle.0.borrow_mut().active_pdf_unique_id = pdf_unique_id;
+        }
+        handle
     }
 
     /// Consume a directly-constructed, exclusively-owned handle and return
@@ -1752,16 +1780,13 @@ impl ObjectHandle {
     /// Unlike qpdf's own `checkOwnership`
     /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`, `QPDF_Array.cc:10-26`),
     /// which is a shallow, O(1) comparison of only the top-level handle's
-    /// own owning document, this walks the complete direct-value
-    /// descendant graph. It exists for [`Self::check_array_item_ownership`]
-    /// as a flpdf-specific defense against a foreign indirect object nested
-    /// several direct hops below an array item -- a shape qpdf's own
-    /// shallow check does not catch either (see
-    /// `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_container`
-    /// for the equivalent dictionary-key case, which flpdf accepts to match
-    /// qpdf exactly). [`Self::check_key_value_ownership`] (`replace_key`'s
-    /// ownership boundary) intentionally does not call this: qpdf's real
-    /// `checkOwnership` never does either.
+    /// own owning document, this walks the complete direct-value descendant
+    /// graph. It exists for resolver-side replacement validation as a
+    /// flpdf-specific defense against a foreign indirect object nested several
+    /// direct hops below a replacement value -- a shape qpdf's own shallow
+    /// check does not catch. [`Self::check_key_value_ownership`] (the
+    /// `replace_key` and array mutator ownership boundary) intentionally does
+    /// not call this: qpdf's real `checkOwnership` never does either.
     pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let mut pending = vec![self.clone()];
         let mut visited = BTreeSet::new();
@@ -2787,10 +2812,11 @@ impl ObjectHandle {
     /// `self`'s and `value`'s own owning document, never a walk into
     /// `value`'s descendants — and a value indirectly owned by a different
     /// document returns qpdf's `checkOwnership` logic error as
-    /// [`Error::Internal`]. A direct value (including a direct null) is
-    /// always unowned for this check, matching qpdf: `checkOwnership` never
-    /// associates ownership with a direct value through containment. A
-    /// direct null removes the key, while an indirect
+    /// [`Error::Internal`]. A programmatic direct value (including a direct
+    /// null) is unowned for this check, while a non-null direct value parsed
+    /// from a file carries qpdf's parser QPDF context. In either case,
+    /// containment alone never confers ownership. A direct null removes the
+    /// key, while an indirect
     /// null or dangling indirect reference is retained as the dictionary
     /// value. A no-op on a
     /// non-dictionary handle or an unresolved/missing/destroyed indirect
@@ -3136,10 +3162,13 @@ impl ObjectHandle {
     }
 
     /// Port `QPDF_Array::checkOwnership` (`libqpdf/QPDF_Array.cc:10-26`) at
-    /// the Rust error boundary. An indirect slot's active PDF is authoritative;
-    /// a direct value can retain one or more propagated owner ids through live
-    /// containment. A direct value with no owner id is qpdf's unowned array
-    /// case and is accepted by the upstream check.
+    /// the Rust error boundary. As with
+    /// [`Self::check_key_value_ownership`], compare only the receiver's and
+    /// item's own active PDF identities. A programmatic direct value can
+    /// retain propagated containment ids, but those ids are not qpdf ownership
+    /// and must not reject an array insertion; a non-null parser-created direct
+    /// value carries its source document identity just as qpdf's parsed value
+    /// does.
     fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
         let item_is_destroyed = {
             let slot = item.0.borrow();
@@ -3153,30 +3182,19 @@ impl ObjectHandle {
             ));
         }
 
-        let owner_pdf_ids = {
-            let slot = self.0.borrow();
-            match slot.active_pdf_unique_id {
-                Some(pdf_unique_id) => vec![pdf_unique_id],
-                None => slot.pdf_unique_ids.iter().copied().collect::<Vec<_>>(),
-            }
-        };
-        if owner_pdf_ids
-            .iter()
-            .any(|pdf_unique_id| !item.belongs_exclusively_to_pdf(*pdf_unique_id))
-        {
-            return Err(Error::Internal(FOREIGN_OBJECT_OWNERSHIP_ERROR.to_owned()));
-        }
-        Ok(())
+        self.check_key_value_ownership(item)
     }
 
     /// Port `QPDFObjectHandle::checkOwnership` (`libqpdf/QPDFObjectHandle.cc:
     /// 2355-2365`) exactly: qpdf compares only `this->getOwningQPDF()` and
     /// `item.getOwningQPDF()`, two O(1) reads of each handle's *own* owning
     /// document -- never a walk into either handle's descendants. A value's
-    /// `getOwningQPDF()` in qpdf is `nullptr` unless the value itself is
-    /// indirect (set once by `setObjGen`); mere containment inside another
-    /// document's object graph does not confer ownership. This deliberately
-    /// does not consult [`Self::belongs_exclusively_to_pdf`] or the
+    /// `getOwningQPDF()` in qpdf is `nullptr` for programmatically created
+    /// direct values and literal nulls; file-parser-created direct values do
+    /// carry the parser's QPDF context (`QPDFParser.cc:394-444`). Mere
+    /// containment inside another document's object graph does not confer
+    /// ownership. This deliberately does not consult
+    /// [`Self::belongs_exclusively_to_pdf`] or the
     /// `pdf_unique_ids` live-containment set that field reads from: that
     /// bookkeeping tracks *current* containment for dirty-marking
     /// ([`Self::containing_object_refs_for_pdf`]) and keeps a value's prior
@@ -15498,10 +15516,11 @@ mod mutation_tests {
         // `item.getOwningQPDF()` -- both O(1) reads of the *top-level*
         // handle's own owning-document pointer -- and never walks `item`'s
         // descendants. `QPDF_Array::checkOwnership` (`QPDF_Array.cc:10-26`)
-        // is the same shape. A direct value's own `getOwningQPDF()` is
-        // `nullptr` regardless of what it contains (ownership is a property
-        // of an *indirect* `QPDFObject`, set once by `setObjGen`, never by
-        // mere containment), so real qpdf's `replaceKey` accepts a direct
+        // is the same shape. A programmatically constructed direct value's
+        // own `getOwningQPDF()` is `nullptr` regardless of what it contains
+        // (file-parser-created direct values are the exception: qpdf stamps
+        // them through `QPDFParser::setDescription`, `QPDFParser.cc:439-443`),
+        // so real qpdf's `replaceKey` accepts a direct
         // container that nests a foreign indirect object several levels
         // down -- silently embedding an out-of-context object reference,
         // per qpdf's own `copyForeignObject` guidance for the caller to
@@ -15543,8 +15562,8 @@ mod mutation_tests {
         // container` above), and never clears when the null value is no
         // longer reachable from PDF A. Using it to drive the ownership check
         // wrongly rejects this direct null when it is later passed to
-        // `replace_key` on a PDF-B dictionary, even though a direct value is
-        // always unowned in qpdf and `QPDF_Dictionary::replaceKey`'s
+        // `replace_key` on a PDF-B dictionary, even though this programmatic
+        // direct value is unowned in qpdf and `QPDF_Dictionary::replaceKey`'s
         // null-removes-key branch (`QPDF_Dictionary.cc:135-146`) would run
         // unconditionally after qpdf's own (shallow, `object_ref`-only)
         // `checkOwnership` passes.
@@ -15557,9 +15576,9 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"/K".to_vec(), ObjectHandle::integer(1))]);
         destination.promote_to_indirect(ObjectRef::new(61, 0), 4243, Rc::downgrade(&resolver));
 
-        destination
-            .replace_key(b"/K", stale_null)
-            .expect("a direct null is always unowned in qpdf, regardless of prior containment");
+        destination.replace_key(b"/K", stale_null).expect(
+            "a programmatic direct null is unowned in qpdf, regardless of prior containment",
+        );
 
         assert!(!destination.has_key(b"/K"));
     }
@@ -15580,11 +15599,49 @@ mod mutation_tests {
         let destination = ObjectHandle::dictionary(vec![]);
         destination.promote_to_indirect(ObjectRef::new(63, 0), 4243, Rc::downgrade(&resolver));
 
-        destination
-            .replace_key(b"/Int", stale_integer)
-            .expect("a direct scalar is always unowned in qpdf, regardless of prior containment");
+        destination.replace_key(b"/Int", stale_integer).expect(
+            "a programmatic direct scalar is unowned in qpdf, regardless of prior containment",
+        );
 
         assert_eq!(destination.get_key(b"/Int").as_integer(), Some(7));
+    }
+
+    #[test]
+    fn set_array_item_accepts_a_direct_null_previously_contained_by_another_document() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let stale_null = ObjectHandle::null();
+        let pdf_a_container = ObjectHandle::dictionary(vec![(b"/X".to_vec(), stale_null.clone())]);
+        pdf_a_container.promote_to_indirect(ObjectRef::new(64, 0), 4242, Rc::downgrade(&resolver));
+
+        let destination = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        destination.promote_to_indirect(ObjectRef::new(65, 0), 4243, Rc::downgrade(&resolver));
+
+        destination.set_array_item(0, stale_null).expect(
+            "a programmatic direct null is unowned in qpdf, regardless of prior containment",
+        );
+
+        assert!(destination.try_array_item(0).unwrap().unwrap().is_null());
+    }
+
+    #[test]
+    fn append_array_item_accepts_a_direct_scalar_previously_contained_by_another_document() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let stale_integer = ObjectHandle::integer(7);
+        let pdf_a_container =
+            ObjectHandle::dictionary(vec![(b"/Y".to_vec(), stale_integer.clone())]);
+        pdf_a_container.promote_to_indirect(ObjectRef::new(66, 0), 4242, Rc::downgrade(&resolver));
+
+        let destination = ObjectHandle::array(vec![]);
+        destination.promote_to_indirect(ObjectRef::new(67, 0), 4243, Rc::downgrade(&resolver));
+
+        destination.append_array_item(stale_integer).expect(
+            "a programmatic direct scalar is unowned in qpdf, regardless of prior containment",
+        );
+
+        assert_eq!(
+            destination.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(7)
+        );
     }
 
     #[test]
