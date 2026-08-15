@@ -555,9 +555,11 @@ shallow 比較（`self`/`value` 自身の owning document のみ、子孫は辿�
 暫定穴埋め」ではなく、qpdf のこの境界そのものが持つ shallow-check の弱点に対する
 flpdf 独自の追加防御であり、公開 `ObjectHandle` API 経由でのみ構築可能な入力への
 防御として、実パースされた PDF の出力バイトには影響しない。`QPDF_Array` の各
-ミューテータ側（`check_array_item_ownership`）はまだこの shallow 比較に揃って
-おらず、`belongs_exclusively_to_pdf` の子孫再帰に依存したまま（flpdf-25kg.3.16.7.1
-で追跡）。
+ミューテータ側（`check_array_item_ownership`）も `QPDF_Array::checkOwnership`
+（`QPDF_Array.cc:10-26`）と同じく、挿入される値自身の owning document だけを
+比較する shallow 判定へ揃えた（flpdf-25kg.3.16.7.1）。`belongs_exclusively_to_pdf`
+の子孫再帰は、`replace_object` などのforeign replacement防御に残る別責務であり、
+array ownership checkからは呼び出さない。
 
 ⚪ `reserve_objects` と `replace_foreign_indirect_objects` の両方を
 `stacker::maybe_grow`（`OBJECT_COPY_STACK_RED_ZONE`/`OBJECT_COPY_STACK_GROWTH_SIZE`）

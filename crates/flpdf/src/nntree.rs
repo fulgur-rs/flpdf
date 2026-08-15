@@ -4331,7 +4331,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_tree_rejects_a_foreign_value_with_qpdf_array_ownership_error() {
+    fn canonical_tree_accepts_a_foreign_value_in_a_direct_array_like_qpdf() {
         let mut pdf = empty_pdf();
         let mut foreign_pdf = empty_pdf();
         let foreign_ref = ObjectRef::new(90, 0);
@@ -4343,17 +4343,20 @@ mod tests {
         let root_ref = ObjectRef::new(80, 0);
         pdf.set_object(root_ref, Object::Dictionary(root));
         let mut tree = NNTree::<NumberKey>::new(Object::Reference(root_ref), false);
-        let error = match tree.insert_raw_pair_with_allocator(
-            &mut pdf,
-            &mut ObjectAllocator::default(),
-            ObjectHandle::integer(1),
-            foreign,
-        ) {
-            Ok(_) => panic!("a foreign handle cannot enter a live tree array"), // cov:ignore: foreign ownership must be rejected before mutation
-            Err(error) => error,
-        };
+        // The /Nums array is a direct value, so qpdf's QPDF_Array::qpdf is
+        // null until the array itself is made indirect. Its
+        // QPDF_Array::checkOwnership (`libqpdf/QPDF_Array.cc:10-26`) therefore
+        // accepts the foreign indirect item, matching the live qpdf probe.
+        let cursor = tree
+            .insert_raw_pair_with_allocator(
+                &mut pdf,
+                &mut ObjectAllocator::default(),
+                ObjectHandle::integer(1),
+                foreign,
+            )
+            .expect("qpdf's shallow array ownership check accepts this direct array");
 
-        assert!(error.to_string().contains("different QPDF"));
+        assert!(cursor.positioned());
     }
 
     #[test]

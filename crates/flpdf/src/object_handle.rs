@@ -1752,16 +1752,13 @@ impl ObjectHandle {
     /// Unlike qpdf's own `checkOwnership`
     /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`, `QPDF_Array.cc:10-26`),
     /// which is a shallow, O(1) comparison of only the top-level handle's
-    /// own owning document, this walks the complete direct-value
-    /// descendant graph. It exists for [`Self::check_array_item_ownership`]
-    /// as a flpdf-specific defense against a foreign indirect object nested
-    /// several direct hops below an array item -- a shape qpdf's own
-    /// shallow check does not catch either (see
-    /// `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_container`
-    /// for the equivalent dictionary-key case, which flpdf accepts to match
-    /// qpdf exactly). [`Self::check_key_value_ownership`] (`replace_key`'s
-    /// ownership boundary) intentionally does not call this: qpdf's real
-    /// `checkOwnership` never does either.
+    /// own owning document, this walks the complete direct-value descendant
+    /// graph. It exists for resolver-side replacement validation as a
+    /// flpdf-specific defense against a foreign indirect object nested several
+    /// direct hops below a replacement value -- a shape qpdf's own shallow
+    /// check does not catch. [`Self::check_key_value_ownership`] (the
+    /// `replace_key` and array mutator ownership boundary) intentionally does
+    /// not call this: qpdf's real `checkOwnership` never does either.
     pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let mut pending = vec![self.clone()];
         let mut visited = BTreeSet::new();
@@ -3136,10 +3133,11 @@ impl ObjectHandle {
     }
 
     /// Port `QPDF_Array::checkOwnership` (`libqpdf/QPDF_Array.cc:10-26`) at
-    /// the Rust error boundary. An indirect slot's active PDF is authoritative;
-    /// a direct value can retain one or more propagated owner ids through live
-    /// containment. A direct value with no owner id is qpdf's unowned array
-    /// case and is accepted by the upstream check.
+    /// the Rust error boundary. As with
+    /// [`Self::check_key_value_ownership`], compare only the receiver's and
+    /// item's own active PDF identities. A direct value can retain propagated
+    /// containment ids, but those ids are not qpdf ownership and must not
+    /// reject an array insertion.
     fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
         let item_is_destroyed = {
             let slot = item.0.borrow();
@@ -3153,20 +3151,7 @@ impl ObjectHandle {
             ));
         }
 
-        let owner_pdf_ids = {
-            let slot = self.0.borrow();
-            match slot.active_pdf_unique_id {
-                Some(pdf_unique_id) => vec![pdf_unique_id],
-                None => slot.pdf_unique_ids.iter().copied().collect::<Vec<_>>(),
-            }
-        };
-        if owner_pdf_ids
-            .iter()
-            .any(|pdf_unique_id| !item.belongs_exclusively_to_pdf(*pdf_unique_id))
-        {
-            return Err(Error::Internal(FOREIGN_OBJECT_OWNERSHIP_ERROR.to_owned()));
-        }
-        Ok(())
+        self.check_key_value_ownership(item)
     }
 
     /// Port `QPDFObjectHandle::checkOwnership` (`libqpdf/QPDFObjectHandle.cc:
@@ -15585,6 +15570,44 @@ mod mutation_tests {
             .expect("a direct scalar is always unowned in qpdf, regardless of prior containment");
 
         assert_eq!(destination.get_key(b"/Int").as_integer(), Some(7));
+    }
+
+    #[test]
+    fn set_array_item_accepts_a_direct_null_previously_contained_by_another_document() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let stale_null = ObjectHandle::null();
+        let pdf_a_container = ObjectHandle::dictionary(vec![(b"/X".to_vec(), stale_null.clone())]);
+        pdf_a_container.promote_to_indirect(ObjectRef::new(64, 0), 4242, Rc::downgrade(&resolver));
+
+        let destination = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        destination.promote_to_indirect(ObjectRef::new(65, 0), 4243, Rc::downgrade(&resolver));
+
+        destination
+            .set_array_item(0, stale_null)
+            .expect("a direct null is always unowned in qpdf, regardless of prior containment");
+
+        assert!(destination.try_array_item(0).unwrap().unwrap().is_null());
+    }
+
+    #[test]
+    fn append_array_item_accepts_a_direct_scalar_previously_contained_by_another_document() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let stale_integer = ObjectHandle::integer(7);
+        let pdf_a_container =
+            ObjectHandle::dictionary(vec![(b"/Y".to_vec(), stale_integer.clone())]);
+        pdf_a_container.promote_to_indirect(ObjectRef::new(66, 0), 4242, Rc::downgrade(&resolver));
+
+        let destination = ObjectHandle::array(vec![]);
+        destination.promote_to_indirect(ObjectRef::new(67, 0), 4243, Rc::downgrade(&resolver));
+
+        destination
+            .append_array_item(stale_integer)
+            .expect("a direct scalar is always unowned in qpdf, regardless of prior containment");
+
+        assert_eq!(
+            destination.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(7)
+        );
     }
 
     #[test]
