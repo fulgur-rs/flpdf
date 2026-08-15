@@ -747,12 +747,13 @@ fn show_with_pdf(
     // independently re-raised as hard failures by this function's own reads
     // below), and `NotLinearized` cannot occur here since `is_linearized`
     // already passed above.
+    // cov:ignore-start: public show entry points use Cursor<Vec<u8>>; the
+    // canonical resolver catches parse/unsupported failures and this
+    // in-memory source cannot produce a read I/O error.
     if let Err(LinearizationCheckError::Io(error)) = check_linearization(pdf, file_bytes) {
-        // cov:ignore: public show entry points use Cursor<Vec<u8>>; the
-        // canonical resolver catches parse/unsupported failures and this
-        // in-memory source cannot produce a read I/O error.
         return Err(ShowLinearizationError::Io(error));
     }
+    // cov:ignore-end
 
     // 3. Locate, resolve, and decompress the hint stream object at /H[0].
     //
@@ -770,10 +771,10 @@ fn show_with_pdf(
         load_hint_stream(pdf, file_bytes, h_usize, params.h_length).map_err(
             |error| match error {
                 crate::Error::Unsupported(message) => malformed!("{message}"),
-                // cov:ignore: public show entry points use Cursor<Vec<u8>>; the
-                // canonical resolver catches parse/unsupported failures and this
+                // public show entry points use Cursor<Vec<u8>>; the canonical
+                // resolver catches parse/unsupported failures and this
                 // in-memory source cannot produce a read I/O error.
-                error => ShowLinearizationError::from(error),
+                error => ShowLinearizationError::from(error), // cov:ignore: see comment above
             },
         )?;
     // qpdf pipes the primary and (when present) overflow hint streams into
@@ -795,8 +796,7 @@ fn show_with_pdf(
             load_hint_stream(pdf, file_bytes, overflow_offset, params.h_overflow_length).map_err(
                 |error| match error {
                     crate::Error::Unsupported(message) => malformed!("{message}"),
-                    // cov:ignore: see the primary hint-stream error arm above.
-                    error => ShowLinearizationError::from(error),
+                    error => ShowLinearizationError::from(error), // cov:ignore: see the primary hint-stream error arm above
                 },
             )?;
         decompressed.extend_from_slice(&overflow_decompressed);
@@ -1812,25 +1812,17 @@ mod tests {
         sink.take_buffer().expect("compressed buffer")
     }
 
-    /// Regression test for the P2 finding that a genuine four-item `/H`
-    /// discarded the overflow stream's decoded bytes: `decompressed` was
-    /// always just the primary stream's buffer, so any table data that only
-    /// exists in the overflow half was silently unavailable. qpdf's
-    /// `readLinearizationData` pipes BOTH `readHintStream` calls into the
-    /// SAME `Pl_Buffer` (`QPDF_linearization.cc:241-245`), so `/S` and `/O`
-    /// index into the concatenation, not just the primary stream.
-    ///
-    /// Unlike `show_loads_the_four_item_overflow_hint_stream` (whose /H[2..3]
-    /// point at the SAME complete primary stream — a degenerate case that
-    /// never exercises real overflow), this builds two DIFFERENT physical
-    /// hint stream objects: the primary carries only the Page Offset Hint
-    /// Table section, the overflow carries only the Shared Object Hint Table
-    /// section, and `/S` is set to the split point in the concatenated
-    /// buffer. Before the fix this could only ever see the primary's bytes,
-    /// so `/S` would point past `decompressed.len()` and fail with "hint
-    /// stream /S offset ... is out of bounds".
-    #[test]
-    fn show_merges_a_genuine_two_stream_overflow_hint_table() {
+    /// Build a hand-rolled linearized PDF whose `/H` genuinely splits real
+    /// hint-table data across two physical stream objects: object 5 (the
+    /// primary) carries only the Page Offset Hint Table section, object 6
+    /// (the overflow) carries only the Shared Object Hint Table section, and
+    /// `/S` on the primary's dict is set to the split point in the
+    /// concatenated buffer. Unlike `show_loads_the_four_item_overflow_hint_stream`
+    /// (whose /H[2..3] point at the SAME complete primary stream — a
+    /// degenerate case that never exercises real overflow), decoding the
+    /// Shared Objects Hint Table here is only possible if the overflow
+    /// stream's bytes are actually appended after the primary's.
+    fn split_overflow_pdf_bytes() -> Vec<u8> {
         let po = PageOffsetHintTable {
             header: PageOffsetHeader {
                 least_object_count: 1,
@@ -1999,24 +1991,61 @@ mod tests {
         patch(&mut bytes, slots[5], 0); // /E — unused by this test
         patch(&mut bytes, slots[6], 0); // /T — unused by this test
 
-        // Before the fix this fails: /S points at `split`, which is past the
-        // primary-only `decompressed.len()`.
+        bytes
+    }
+
+    /// Regression test for the P2 finding that a genuine four-item `/H`
+    /// discarded the overflow stream's decoded bytes: `decompressed` was
+    /// always just the primary stream's buffer, so any table data that only
+    /// exists in the overflow half was silently unavailable. qpdf's
+    /// `readLinearizationData` pipes BOTH `readHintStream` calls into the
+    /// SAME `Pl_Buffer` (`QPDF_linearization.cc:241-245`), so `/S` and `/O`
+    /// index into the concatenation, not just the primary stream. Before the
+    /// fix this failed with "hint stream /S offset ... is out of bounds",
+    /// since `/S` (the split point) always pointed past the primary-only
+    /// `decompressed.len()`.
+    #[test]
+    fn show_merges_a_genuine_two_stream_overflow_hint_table() {
+        let bytes = split_overflow_pdf_bytes();
+
         let out = show_linearization_bytes(&bytes, "split.pdf")
             .expect("genuinely split /H overflow stream must merge into one dump");
         assert!(out.contains("\nShared Objects Hint Table\n\n"));
         // The Shared Objects Hint Table came from the overflow stream alone —
         // its two groups/lengths are only decodable if the merge actually
-        // appended the overflow bytes.
+        // appended the overflow bytes. `least_length: 10` plus each object's
+        // `length_minus_least` (5, 20) from `split_overflow_pdf_bytes`.
         assert!(out.contains("Shared Object 0:\n"));
         assert!(out.contains("Shared Object 1:\n"));
-        assert!(out.contains(&format!(
-            "group length: {}\n",
-            so.header.least_length + u64::from(so.objects[0].length_minus_least)
-        )));
-        assert!(out.contains(&format!(
-            "group length: {}\n",
-            so.header.least_length + u64::from(so.objects[1].length_minus_least)
-        )));
+        assert!(out.contains("group length: 15\n"));
+        assert!(out.contains("group length: 30\n"));
+    }
+
+    /// A corrupted overflow stream must still be reported as malformed, not
+    /// silently ignored — the merge in `show_with_pdf` propagates a genuine
+    /// decode failure from the overflow `load_hint_stream` call exactly like
+    /// it already does for the primary stream (`decode_failure_is_malformed`).
+    #[test]
+    fn show_reports_a_corrupted_overflow_hint_stream_as_malformed() {
+        let mut bytes = split_overflow_pdf_bytes();
+        let obj6 = bytes
+            .windows(b"6 0 obj".len())
+            .position(|window| window == b"6 0 obj")
+            .expect("overflow hint stream object header");
+        let stream_start = bytes[obj6..]
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .map(|relative| obj6 + relative + b"stream\n".len())
+            .expect("overflow stream keyword");
+        // Corrupt a byte a few bytes into the deflate payload (past the zlib
+        // header), matching `decode_failure_is_malformed`'s technique.
+        bytes[stream_start + 4] ^= 0xFF;
+
+        let result = show_linearization_bytes(&bytes, "split-corrupt.pdf");
+        assert!(
+            matches!(result, Err(ShowLinearizationError::Malformed { .. })),
+            "corrupted overflow hint payload must yield Malformed, got {result:?}"
+        );
     }
 
     #[test]

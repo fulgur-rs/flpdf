@@ -1670,7 +1670,7 @@ mod tests {
         let root_ref = ObjectRef::new(1, 0);
         let mut root = match pdf.resolve(root_ref).expect("resolve root") {
             crate::Object::Dictionary(dict) => dict,
-            other => panic!("expected root dictionary, got {other:?}"),
+            other => panic!("expected root dictionary, got {other:?}"), // cov:ignore: defensive; the fixture's root is always a dictionary
         };
         root.insert("Outlines", crate::Object::Reference(injected_ref));
         pdf.set_object(root_ref, crate::Object::Dictionary(root));
