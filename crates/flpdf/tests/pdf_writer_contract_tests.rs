@@ -335,6 +335,30 @@ fn page_object_with_null_key(contents: Object) -> Object {
     page
 }
 
+fn page_object_with_direct_stream_sibling(contents: Object, sibling_payload: &[u8]) -> Object {
+    let mut page = page_object(contents);
+    let mut sibling_dict = Dictionary::new();
+    sibling_dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(sibling_payload.len()).expect("small sibling stream")),
+    );
+    page.as_dict_mut().expect("page dictionary").insert(
+        "Extra",
+        Object::Stream(Stream::new(sibling_dict, sibling_payload.to_vec())),
+    );
+    page
+}
+
+fn direct_content_stream_with_metadata_type(payload: &[u8]) -> Stream {
+    let mut dict = Dictionary::new();
+    dict.insert("Type", Object::Name(b"Metadata".to_vec()));
+    dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(payload.len()).expect("small direct content stream")),
+    );
+    Stream::new(dict, payload.to_vec())
+}
+
 fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
 
@@ -1181,6 +1205,84 @@ fn pdf_writer_compact_direct_content_arrays_use_handle_children() -> flpdf::Resu
     assert!(contains_bytes(&output, b"N\rD"));
     assert!(contains_bytes(&output, b"ABC"));
     assert!(contains_bytes(&output, b"null"));
+    Ok(())
+}
+
+/// A page dictionary selected for the content-container serializer (its
+/// `/Contents` is a direct stream) may still carry an unrelated direct
+/// stream under a different key -- reachable through `Pdf::set_object`
+/// alone, since a nested `Object::Stream` lifts to a direct
+/// `ObjectValue::Stream` rather than being promoted to an indirect object
+/// (`reader.rs`'s `lift_bounded_with_options`, `Object::Stream` arm). qpdf
+/// itself can never construct this shape (`QPDFObjectHandle::newStream`
+/// always mints an indirect object), so there is no qpdf oracle for it, but
+/// the pre-existing materialized-`Object` writer path handled it correctly
+/// (`Object::write_pdf` frames every `Object::Stream` node uniformly
+/// regardless of nesting position). The generic per-object serializer
+/// inlines only a stream's dictionary at a child position
+/// (`unparse_object_walk`'s `unparse_container` doc,
+/// `crates/flpdf/src/object_handle.rs`), so this sibling must be framed by
+/// the content-container serializer itself rather than falling through.
+#[test]
+fn pdf_writer_frames_a_direct_stream_sibling_outside_contents() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object_with_direct_stream_sibling(
+            Object::Stream(direct_content_stream(b"AB")),
+            b"SIBLING-PAYLOAD",
+        ),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        content_normalization: true,
+        compress_streams: CompressStreams::No,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"/Length 15"));
+    assert!(contains_bytes(
+        &output,
+        b"\nstream\nSIBLING-PAYLOAD\nendstream"
+    ));
+    Ok(())
+}
+
+/// qpdf's `willFilterStream` (`libqpdf/QPDFWriter.cc:1271-1281`) treats the
+/// cleartext-metadata and content-normalization branches as mutually
+/// exclusive: `is_metadata` wins its `if`/`else if` chain, so `normalize`
+/// never becomes true for a metadata stream even when the writer's global
+/// content-normalization option is on. A direct `/Contents` stream is never
+/// itself `/Type /Metadata` in valid PDF usage, but this crate's tolerant
+/// object model does not forbid the shape, and the plain content-container
+/// serializer must not run the page-content tokenizer over it.
+#[test]
+fn pdf_writer_direct_content_stream_with_metadata_type_is_not_content_normalized(
+) -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_content_stream_with_metadata_type(
+            b"A\rB",
+        ))),
+    );
+
+    let mut output = Vec::new();
+    let settings = WriterTestSettings {
+        content_normalization: true,
+        compress_streams: CompressStreams::No,
+        object_streams: ObjectStreamMode::Disable,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
+
+    assert!(contains_bytes(&output, b"A\rB"));
+    assert!(!contains_bytes(&output, b"A\nB"));
     Ok(())
 }
 
