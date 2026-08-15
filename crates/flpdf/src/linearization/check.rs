@@ -1695,10 +1695,13 @@ mod tests {
             .expect("first page type");
         inherited[type_start..type_start + type_marker.len()].copy_from_slice(b"/Type null ");
         let inherited_result = check_linearization_bytes(&inherited);
+        // cov:ignore-start: the assertion deliberately proves that the
+        // NotLinearized arm is not matched by this malformed-but-linearized input.
         assert!(!matches!(
             inherited_result,
-            Err(LinearizationCheckError::NotLinearized) // cov:ignore: this negative assertion intentionally proves the arm is not matched
+            Err(LinearizationCheckError::NotLinearized)
         ));
+        // cov:ignore-end
     }
 
     #[test]
