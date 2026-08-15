@@ -5655,6 +5655,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// A corrupt JPEG that starts with a valid SOI marker (so the "Not a
+    /// JPEG file" check does not fire) but fails for a reason other than
+    /// running out of buffered bytes must fall through to the generic
+    /// `{identifier}: {error}` diagnostic, not the `UnexpectedEof`-specific
+    /// "invalid jpeg data reading from buffer" wording reserved for
+    /// qpdf's whole-buffer `fill_buffer_input_buffer` over-read case.
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+    #[test]
+    fn dct_stage_preserves_non_eof_libjpeg_diagnostic() {
+        // SOI, then a reserved/invalid marker (0xFF 0x02) with a well-formed
+        // 4-byte segment length — enough bytes present that this is not an
+        // end-of-data condition.
+        let malformed: &[u8] = &[
+            0xFF, 0xD8, 0xFF, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(malformed)
+                .expect("malformed JPEG with valid SOI must buffer");
+            stage.finish().expect_err("invalid marker must be rejected")
+        };
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.to_string(), "DCT decode: invalid marker: 0xFF00");
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
     #[cfg(feature = "qpdf-libjpeg-compat")]
     #[test]
     fn dct_compat_rejects_late_truncation_after_scanline_output() {
