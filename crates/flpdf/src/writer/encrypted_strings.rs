@@ -155,7 +155,7 @@ impl EncryptedStringEmitter {
         removed_refs: &std::collections::BTreeSet<ObjectRef>,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object); // cov:ignore: the pre-scanned page-content container cannot be the /Encrypt object
+            return write_encryption_dictionary_handle(out, object);
         }
 
         let cipher = self.cipher;
@@ -209,7 +209,7 @@ impl EncryptedStringEmitter {
         removed_refs: &std::collections::BTreeSet<ObjectRef>,
     ) -> crate::Result<()> {
         if emitted_ref == self.encrypt_ref {
-            return write_encryption_dictionary_handle(out, object);
+            return write_encryption_dictionary_handle(out, object); // cov:ignore: the pre-scanned page-content container cannot be the /Encrypt object
         }
 
         let cipher = self.cipher;
