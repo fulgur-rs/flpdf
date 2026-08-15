@@ -174,7 +174,7 @@ pub(crate) struct ObjectStreamPlan {
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
 }
 
-/// Convert public [`WriterOptions`](crate::writer::WriterOptions) into an internal
+/// Convert public [`WriterOptions`] into an internal
 /// [`PlannerConfig`].  The conversion is direct: `WriterOptions.object_streams`
 /// names the policy, and the planner's batch cap defaults to qpdf's value of
 /// 100.  Future writer-side knobs (e.g. an explicit cap override) would be
@@ -711,7 +711,7 @@ where
 /// planner, but each body is emitted from its live handle. This is the qpdf
 /// writer boundary: arrays and dictionaries retain indirect child identity,
 /// dictionary nulls are suppressed by the handle unparser, and no temporary
-/// [`Object`] tree is materialised merely to calculate the body offsets.
+/// [`ObjectHandle`] tree is materialised merely to calculate the body offsets.
 pub(crate) fn emit_objstm_body_from_handles(
     members: &[(ObjectRef, ObjectHandle)],
 ) -> crate::Result<ObjStmBody> {
@@ -727,7 +727,7 @@ pub(crate) fn emit_objstm_body_from_handles(
 /// per-object data-key scope is applied while the ObjectHandle walker writes
 /// strings. The callback receives the same two-pass member index used by the
 /// ObjStm pair table and may therefore preserve qpdf's encryption boundary
-/// without materialising a legacy [`Object`].
+/// without materialising a legacy object tree.
 pub(crate) fn emit_objstm_body_from_handles_with_writer<F>(
     members: &[(ObjectRef, ObjectHandle)],
     write_member: &mut F,
