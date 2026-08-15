@@ -1386,11 +1386,25 @@ fn id_object_to_handle(object: &Object) -> Result<ObjectHandle> {
 /// replacement is the same width as the placeholder, no byte offset shifts.
 ///
 /// The placeholder is replaced **only inside `id_ranges`** — the absolute byte
-/// spans of the sections that actually emit a `/ID` (collected by the writer as
-/// it lays them down). Scanning the whole buffer would corrupt the output if a
-/// content stream, string, or metadata object happened to contain the same
-/// fixed-width placeholder byte sequence; restricting the search to the known
-/// `/ID` sections makes that misfire impossible.
+/// span of each emitted `/ID [<hex0><hex1>]` array *token itself*, reported by
+/// [`xref_stream::write_object`] at the point it writes that token (see
+/// [`patch_first_page_xref`] and `write_main_xref_stream_and_trailer`, the two
+/// producers). Each range is exactly as wide as the placeholder
+/// ([`crate::writer::deterministic_id_array_len`]), so at most one position in
+/// it can ever match.
+///
+/// An earlier revision instead recorded the whole *section* containing a
+/// `/ID` site (the full xref-stream object, including its stream payload and
+/// — on the first-page xref stream — arbitrary custom (non-writer-owned)
+/// trailer entries preserved verbatim from the source trailer). A custom
+/// trailer value serialized as a PDF literal string does not escape `[`, `<`,
+/// digits, `>`, or `]`, so a source document engineering such a value could
+/// make that broader scan see a second, spurious match — tripping the
+/// `debug_assert_eq!` below in debug builds and, in release builds,
+/// corrupting that trailer entry's bytes. Tracking the exact token span
+/// instead of the containing section removes that failure mode structurally:
+/// a range this narrow has only one possible match position. Regression test:
+/// `deterministic_id_objstm_survives_custom_trailer_placeholder_lookalike`.
 ///
 /// # Panics
 ///
@@ -1590,6 +1604,15 @@ fn xref_id_bytes(source_trailer: &ObjectHandle) -> Result<Option<(Vec<u8>, Vec<u
 /// (qpdf's pass-1 sizing), this shifts no later offset while the hint object is
 /// spliced. The rebuilt dict carries the all-zero `/ID`
 /// placeholder, which [`patch_linearized_deterministic_id`] overwrites later.
+///
+/// Returns the absolute byte range (within `bytes`) of the emitted `/ID`
+/// array token, translated from [`xref_stream::write_padded_region`]'s
+/// region-relative range by `patch.region.start`. The caller records this
+/// exact span in `id_ranges` instead of the whole region — the region also
+/// carries this object's stream payload and, via `patch.canonical_entries`,
+/// arbitrary custom trailer entries whose serialized bytes could otherwise
+/// coincidentally match the placeholder's fixed byte pattern (see
+/// [`patch_linearized_deterministic_id`]'s doc).
 fn patch_first_page_xref(
     bytes: &mut [u8],
     patch: &FirstPageXrefPatch,
@@ -1598,7 +1621,7 @@ fn patch_first_page_xref(
     main_xref_offset: usize,
     hint_length: usize,
     pass1: bool,
-) -> Result<()> {
+) -> Result<Option<std::ops::Range<usize>>> {
     // The first-page xref object's own offset is the region start.
     let mut offs = xref_offsets.clone();
     offs.insert(patch.first_xref_num, patch.region.start);
@@ -1662,7 +1685,7 @@ fn patch_first_page_xref(
     // cov:ignore: the `?` below never fires — write_padded_region errors only if
     // the object exceeds its pass-1-sized region. Filtered final payloads fit
     // inside the wider predicted region; raw payloads retain the same size.
-    let region = xref_stream::write_padded_region(
+    let (region, region_id_range) = xref_stream::write_padded_region(
         ObjectRef::new(patch.first_xref_num, 0),
         &dict,
         &payload,
@@ -1677,7 +1700,7 @@ fn patch_first_page_xref(
         // cov:ignore-end
     }
     bytes[patch.region.clone()].copy_from_slice(&region);
-    Ok(())
+    Ok(region_id_range.map(|r| patch.region.start + r.start..patch.region.start + r.end))
 }
 
 /// Emit the **main (second-half) cross-reference stream** at end-of-body,
@@ -1694,9 +1717,12 @@ fn patch_first_page_xref(
 /// main chain (the first-page stream's own `/Prev` points forward here).  The
 /// file's trailing `startxref` targets the **first-page** xref (the chain leaf
 /// a linearized reader consults first), not this main xref.  Returns
-/// `(main_xref_offset, main_xref_offset)`: the caller computes `/T =
+/// `(main_xref_offset, main_xref_offset, id_range)`: the caller computes `/T =
 /// main_xref_offset − 1` (via `saturating_sub(1)`), matching qpdf's
 /// `xref_zero_offset` (the byte just before the main xref stream object).
+/// `id_range` is the absolute byte range (within `bytes`) of the emitted
+/// `/ID` array token — see [`patch_first_page_xref`]'s doc for why the caller
+/// records this exact span rather than the whole object.
 #[allow(clippy::too_many_arguments)]
 fn write_main_xref_stream_and_trailer(
     bytes: &mut Vec<u8>,
@@ -1709,7 +1735,7 @@ fn write_main_xref_stream_and_trailer(
     max_ostream_index: u64,
     pass1: bool,
     filtered: bool,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, Option<std::ops::Range<usize>>)> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
     let main_xref_num = relocation.main_xref_slot;
@@ -1785,9 +1811,12 @@ fn write_main_xref_stream_and_trailer(
         };
         xref_stream::first_pass_region_len(main_obj_ref, &p1_dict, main_count as usize)
     };
-    let region = xref_stream::write_padded_region(main_obj_ref, &dict, &payload, region_len)?;
+    let (region, region_id_range) =
+        xref_stream::write_padded_region(main_obj_ref, &dict, &payload, region_len)?;
+    let region_start = bytes.len();
     bytes.extend_from_slice(&region);
     bytes.push(b'\n');
+    let id_range = region_id_range.map(|r| region_start + r.start..region_start + r.end);
 
     // Trailing `startxref` → the **first-page** xref stream (qpdf's chain leaf).
     bytes.extend_from_slice(format!("startxref\n{first_page_obj_offset}\n%%EOF\n").as_bytes());
@@ -1797,7 +1826,7 @@ fn write_main_xref_stream_and_trailer(
     // computes `/T = second_return.saturating_sub(1)`, so return
     // `main_xref_offset` as the second element. The first element is also the
     // main xref offset (used for layout diagnostics / `last_xref`).
-    Ok((main_xref_offset, main_xref_offset))
+    Ok((main_xref_offset, main_xref_offset, id_range))
 }
 
 /// Serialize the hint-stream object dictionary + `stream\n` opener exactly as
@@ -2300,7 +2329,6 @@ fn do_write_pass<R: Read + Seek>(
         id_ranges.push(section_start..bytes.len());
         range
     } else {
-        let section_start = bytes.len();
         let patch = write_first_page_xref_stream(
             &mut bytes,
             relocation,
@@ -2314,10 +2342,15 @@ fn do_write_pass<R: Read + Seek>(
             encrypt_ctx.map(|ctx| ctx.encrypt_ref),
         )?;
         // First-page xref stream object carries one `/ID` (the main xref
-        // stream below carries the second).  `patch_first_page_xref` later
-        // overwrites only this object's entry payload (after the dict `/ID`),
-        // length-preservingly, so the span stays valid.
-        id_ranges.push(section_start..bytes.len());
+        // stream below carries the second). This call only reserves the
+        // region as blank padding — the object's real bytes, including its
+        // `/ID` token and canonical (custom) trailer entries, are written
+        // later by `patch_first_page_xref`, which is the one that reports the
+        // token's exact span for `id_ranges` (see that function's doc for why
+        // the whole region is not used: it also carries this object's stream
+        // payload and, via `canonical_entries`, arbitrary custom trailer
+        // entries whose serialized bytes could coincidentally contain the
+        // deterministic-`/ID` placeholder's fixed byte pattern).
         first_page_xref_patch = Some(patch);
         0..0
     };
@@ -2764,7 +2797,6 @@ fn do_write_pass<R: Read + Seek>(
              /E ({end_of_first_page_offset}) — linearization boundary violated"
         );
 
-        let main_section_start = bytes.len();
         let result = write_main_xref_stream_and_trailer(
             &mut bytes,
             &xref_offsets,
@@ -2776,29 +2808,43 @@ fn do_write_pass<R: Read + Seek>(
             max_ostream_index,
             pass1_digest,
             structural_streams_filtered,
-        )?;
+        )?; // cov:ignore: the validated linearization plan makes xref-stream serialization errors defensive.
+        let (main_xref_offset, main_first_entry_offset, main_id_range) = result;
         // Main xref stream object is the second (and last) `/ID` site on the
         // ObjStm path.  Its span extends through the trailing
         // `startxref`/`%%EOF` and is never touched by `patch_first_page_xref`
-        // below (which patches only the first-page region, before /E).
-        id_ranges.push(main_section_start..bytes.len());
+        // below (which patches only the first-page region, before /E). Record
+        // only the `/ID` array token's own span (not the whole object): this
+        // dict carries no canonical (custom) trailer entries
+        // (`write_main_xref_stream_and_trailer` always passes
+        // `canonical_entries: None`), but its stream payload is arbitrary
+        // binary xref data, so the tight span still avoids scanning bytes
+        // this function does not own. See `patch_first_page_xref`'s doc for
+        // the full rationale (that first-page sibling *does* carry custom
+        // trailer entries, which is what makes the tight span load-bearing
+        // there).
+        if let Some(id_range) = main_id_range {
+            id_ranges.push(id_range);
+        }
 
         // Every downstream object offset is now known, so rebuild the first-page
         // xref's reserved region with the real encoded object and `/Prev →
         // main xref`. The region's byte length is fixed (qpdf's pass-1 sizing),
-        // so this shifts no bytes between the two layout passes. `result.0` is
-        // the main xref offset.
-        patch_first_page_xref(
+        // so this shifts no bytes between the two layout passes.
+        let first_page_id_range = patch_first_page_xref(
             &mut bytes,
             patch,
             &xref_offsets,
             &member_new,
-            result.0,
+            main_xref_offset,
             hint_stream_obj_total_len,
             pass1_digest,
         )?; // cov:ignore: propagates patch_first_page_xref's unreachable region-overflow error arm.
+        if let Some(id_range) = first_page_id_range {
+            id_ranges.push(id_range);
+        }
 
-        result
+        (main_xref_offset, main_first_entry_offset)
     };
 
     Ok(LinearizedPassOutput {
@@ -9395,6 +9441,80 @@ mod tests {
             "an indirect trailer value naming a stream must stay a mapped \
              reference, matching qpdf's unparseChild rather than inlining \
              the dereferenced stream dictionary"
+        );
+    }
+
+    /// A custom trailer literal string may contain the exact deterministic
+    /// `/ID` placeholder bytes. The xref-stream patch must replace only the
+    /// actual `/ID` tokens and preserve that user value. This is the concrete
+    /// regression for the former whole-section scan in
+    /// `patch_linearized_deterministic_id`.
+    #[test]
+    fn deterministic_id_objstm_survives_custom_trailer_placeholder_lookalike() {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        // Literal string content embeds the exact 70-byte placeholder run a
+        // default (no source /ID) deterministic-id save would install:
+        // `[` + 32 '0' + `><` + 32 '0' + `>]`. None of `[`, `<`, `0`, `>`,
+        // `]` are literal-string-special, so `write_literal_string` emits
+        // them verbatim.
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 4 /Root 1 0 R /CustomTrailer \
+                 (POISON[<{}><{}>]POISON) >>\nstartxref\n{xref_start}\n%%EOF\n",
+                "0".repeat(32),
+                "0".repeat(32),
+            )
+            .as_bytes(),
+        );
+
+        let mut src = Pdf::open(Cursor::new(pdf.clone())).expect("probe fixture must parse");
+        let plan = LinearizationPlan::from_pdf(&mut src, true).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriterOptions {
+            deterministic_id: true,
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            ..WriterOptions::default()
+        };
+        let mut src2 = Pdf::open(Cursor::new(pdf)).expect("probe fixture must reparse");
+        let mut doc = write_linearized(&plan, &renumber, &mut src2, &opts)
+            .expect("custom trailer placeholder must not trip the ID patcher");
+        doc.back_patch().expect("back_patch");
+
+        let placeholder = b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
+        let occurrences = doc
+            .bytes
+            .windows(placeholder.len())
+            .filter(|w| *w == &placeholder[..])
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "the one placeholder-shaped user literal must survive while both xref /ID tokens are patched"
+        );
+
+        let id_marker = b"/ID [";
+        assert_eq!(
+            doc.bytes
+                .windows(id_marker.len())
+                .filter(|w| *w == id_marker)
+                .count(),
+            2,
+            "first-page and main xref streams must each retain one /ID array"
         );
     }
 

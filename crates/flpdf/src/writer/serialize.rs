@@ -439,26 +439,38 @@ pub(crate) mod xref_stream {
     /// Write a complete cross-reference stream indirect object
     /// (`<num> 0 obj … endobj\n`) to `out`, with `dict`'s keys in qpdf's fixed order
     /// and `payload` as the already-encoded stream body.
+    ///
+    /// Returns the byte range of the emitted `/ID [<hex0><hex1>]` array token
+    /// within `out` (`None` when `dict.id` is absent), so a deterministic-`/ID`
+    /// back-patch can target that exact span instead of scanning a whole
+    /// section — a section that may also carry a live trailer's arbitrary
+    /// custom entries, whose serialized bytes are not guaranteed to avoid the
+    /// placeholder's fixed byte pattern.
     pub(crate) fn write_object(
         out: &mut Vec<u8>,
         object: ObjectRef,
         dict: &XrefStreamDict,
         payload: &[u8],
-    ) {
+    ) -> Option<std::ops::Range<usize>> {
         write_object_dict_prefix(out, object, dict, payload.len());
-        if let Some((id0, id1)) = dict.id {
-            out.extend_from_slice(b" /ID [<");
+        let id_range = dict.id.map(|(id0, id1)| {
+            out.extend_from_slice(b" /ID ");
+            let id_start = out.len();
+            out.push(b'[');
+            out.push(b'<');
             push_hex(out, id0);
             out.extend_from_slice(b"><");
             push_hex(out, id1);
             out.extend_from_slice(b">]");
-        }
+            id_start..out.len()
+        });
         if let Some(encrypt) = dict.encrypt {
             out.extend_from_slice(
                 format!(" /Encrypt {} {} R", encrypt.number, encrypt.generation).as_bytes(),
             );
         }
         write_object_framing(out, payload);
+        id_range
     }
 
     /// Like [`write_object`] but writes the trailer `/ID` via `id_writer` at its
@@ -630,6 +642,13 @@ pub(crate) mod xref_stream {
     /// exactly `region_len` bytes (qpdf's pass-2 `writePad`), so the next object
     /// lands at a fixed offset regardless of the compressed length.
     ///
+    /// Returns the padded object bytes together with the `/ID` array token's
+    /// byte range within them (see [`write_object`]), so a caller that
+    /// back-patches a deterministic `/ID` placeholder later can target that
+    /// exact span rather than the whole region (which also carries this
+    /// object's stream payload and, on the first-page xref stream, arbitrary
+    /// custom trailer entries).
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::Unsupported`] if the encoded object already exceeds
@@ -639,9 +658,9 @@ pub(crate) mod xref_stream {
         dict: &XrefStreamDict,
         payload: &[u8],
         region_len: usize,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Option<std::ops::Range<usize>>)> {
         let mut buf = Vec::with_capacity(region_len);
-        write_object(&mut buf, object, dict, payload);
+        let id_range = write_object(&mut buf, object, dict, payload);
         if buf.len() > region_len {
             return Err(crate::Error::Unsupported(format!(
                 "linearized xref stream object ({} bytes) exceeds its reserved region \
@@ -650,7 +669,7 @@ pub(crate) mod xref_stream {
             )));
         }
         buf.resize(region_len, b' ');
-        Ok(buf)
+        Ok((buf, id_range))
     }
 
     #[cfg(test)]
@@ -877,12 +896,27 @@ pub(crate) mod xref_stream {
                 id: Some((&ID0, &ID1)),
                 encrypt: None,
             };
-            let region = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
+            let (region, id_range) =
+                write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
             assert_eq!(region.len(), 400);
             // The object bytes are intact, followed by ASCII-space padding.
             assert!(region.starts_with(b"5 0 obj\n<< /Type /XRef /Length 7"));
             assert!(region.ends_with(b"   "));
             assert!(region[region.len() - 1] == b' ');
+            // The returned `/ID` range must locate exactly the array token
+            // (`[<hex0><hex1>]`), not the whole padded region — a caller that
+            // back-patches a deterministic-`/ID` placeholder must be able to
+            // target only this span.
+            let id_range = id_range.expect("dict.id is Some");
+            let mut expected = Vec::new();
+            expected.push(b'[');
+            expected.push(b'<');
+            push_hex(&mut expected, &ID0);
+            expected.extend_from_slice(b"><");
+            push_hex(&mut expected, &ID1);
+            expected.extend_from_slice(b">]");
+            assert_eq!(&region[id_range.clone()], expected.as_slice());
+            assert_eq!(id_range.len(), 70);
         }
 
         #[test]
