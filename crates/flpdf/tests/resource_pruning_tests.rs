@@ -671,6 +671,66 @@ fn test_declared_but_uninvoked_form_xobject_is_still_recursed() {
     );
 }
 
+// The single-level test above discovers Fm0's declared children from
+// `scope.resources`, which is the *page's own* (never mutated by this walk)
+// /Resources — so it cannot catch a bug in how `recurse_form_xobject`'s own
+// tail loop discovers a Form's *own* declared children after that Form's own
+// dict was pruned in the same call. This nests one level deeper: a
+// declared-but-uninvoked ChildForm inside a Do-invoked ParentForm's own
+// /XObject dictionary. ParentForm's own content (`q Q`) never invokes Child,
+// so ParentForm's own /XObject/Child entry is itself pruned away as unused —
+// but qpdf's forEachXObject discovery of ParentForm's declared children is
+// unconditional on Do usage, so ChildForm must still be recursed into and its
+// own unused /F2 pruned, exactly like the page-level case.
+#[test]
+fn test_declared_but_uninvoked_child_form_nested_inside_a_form_is_still_recursed() {
+    let child_content = b"BT /F1 10 Tf (inside child) Tj ET";
+    let child_stream = {
+        let header = format!(
+            "8 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            child_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(child_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // ParentForm's own content never invokes /Child via Do — Child is
+    // declared only in ParentForm's own /XObject dictionary.
+    let parent_content = b"q Q";
+    let parent_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /XObject << /Child 8 0 R >> >> >>\nstream\n",
+            parent_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(parent_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // The page itself Do-invokes ParentForm.
+    let extra = vec![
+        (4, stream_obj(4, b"/Fm0 Do")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, parent_stream),
+        (8, child_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(8, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "a Form-owned declared-but-never-invoked child Form must still be \
+         recursed into and its own unused /Font entry pruned, even though the \
+         parent Form's own /XObject entry for it is separately pruned as \
+         unused: {keys:?}"
+    );
+}
+
 // Test (i): Form without /Resources inherits page scope — existing behaviour preserved.
 //
 // Setup:

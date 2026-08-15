@@ -1325,6 +1325,21 @@ fn recurse_form_xobject<R: Read + Seek>(
     };
     let form_has_own_resources = form_resources.is_some();
 
+    // Snapshot this Form's own /Resources before anything below can prune it.
+    // qpdf's `forEachXObject` (`QPDFPageObjectHelper.cc:313-345`) discovers a
+    // Form's declared `/XObject` children as a read wholly independent of
+    // `removeUnreferencedResourcesHelper`'s pruning (a separate function,
+    // `QPDFPageObjectHelper.cc:539-633`) — discovery is not gated on what
+    // pruning later decides to keep. If this Form's own content never invokes
+    // a declared child via `Do`, `prune_font_and_xobject_dictionaries` below
+    // removes that child's entry from `form_resources` as unused; enumerating
+    // *and* resolving that same Form's children afterward against the
+    // already-pruned dict would silently drop the child from discovery before
+    // it is ever visited — the same "capture children before pruning the
+    // parent" precedent the existing `remove_unreferenced_resources_in_form_xobjects`
+    // pre-pass above already follows via `form_xobjects_in_resources`.
+    let declared_child_resources = form_resources.clone();
+
     // A Form with its own /Resources is scope-independent (owner = itself); a
     // resource-less Form inherits the caller's scope owner. (See "Traversal
     // bound" for why the owner keys the dedup below.)
@@ -1378,6 +1393,10 @@ fn recurse_form_xobject<R: Read + Seek>(
         // dictionary (`QPDFPageObjectHelper.cc:575-633`); mark the page walk
         // incomplete so its resources remain conservative in that case.
         if form_has_own_resources {
+            // `declared_child_resources` above already holds the pre-prune
+            // snapshot that `child` needs, so this Form's own resources are
+            // no longer read after this write-back; `.take()` moves it out
+            // for the final `set_object` without leaving a dead reassignment.
             let mut resources = form_resources
                 .take()
                 .expect("own Form resources were resolved");
@@ -1391,13 +1410,18 @@ fn recurse_form_xobject<R: Read + Seek>(
             } else {
                 complete = false;
             }
-            form_resources = Some(resources);
         }
     }
 
+    // `child.resources` drives discovery of this Form's own declared children
+    // below, so it must be the pre-prune snapshot (`declared_child_resources`),
+    // not the (possibly just-pruned) `form_resources` — see the comment on
+    // `declared_child_resources` above. This is unrelated to what gets
+    // *written* to `ctx.pdf`: the write-back above already used the pruned
+    // `resources`/`form_resources`; only the discovery scope changes here.
     let child = Scope {
         resources: if form_has_own_resources {
-            form_resources.as_ref()
+            declared_child_resources.as_ref()
         } else {
             caller.resources
         },
