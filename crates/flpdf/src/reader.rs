@@ -2314,7 +2314,35 @@ impl<R: Read + Seek> Pdf<R> {
             }
             let handle = self.get_object_handle(object_ref);
             if !handle.is_resolved() || handle.is_missing() {
-                let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
+                // `parsed_xref_streams` is owned here, but every value is an
+                // xref-stream object read by `read_xrefStream`, so the
+                // `Object::Stream` arm is the one that always applies in
+                // practice. Move the payload directly into `Rc` instead of
+                // going through `lift_bounded`'s generic `&Object` match,
+                // which can only clone `stream.data` for a borrowed source
+                // (`lift_bounded_with_options`'s `Object::Stream` arm) --
+                // avoidable copying of every retained historical xref-stream
+                // payload otherwise, on top of the buffer this loop already
+                // owns.
+                let value = match object {
+                    Object::Stream(stream) => {
+                        let stream_dict = self.lift_dictionary_bounded_with_options(
+                            &stream.dict,
+                            0,
+                            crate::parser::MAX_PARSE_DEPTH,
+                            false,
+                        )?; // cov:ignore: closing continuation of a covered multi-line call; llvm-cov misattributes this line, not an untested branch
+                        ObjectValue::Stream {
+                            stream_dict: self
+                                .resolver
+                                .direct_object_handle(ObjectValue::Dictionary(stream_dict)),
+                            stream_data: Some(Rc::new(stream.data)),
+                            stream_length: 0,
+                            stream_provider: None,
+                        }
+                    }
+                    other => self.lift_bounded(&other, 0, crate::parser::MAX_PARSE_DEPTH)?,
+                };
                 handle.set_resolved(value);
             }
             self.qpdf_parsed_xref_stream_refs.insert(object_ref);
