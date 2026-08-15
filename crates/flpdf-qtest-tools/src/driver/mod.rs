@@ -91,11 +91,18 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     //    bytes identically, so it has no observable effect and is
     //    intentionally not reproduced here.
     let (open_bytes, filename_diagnostic): (Vec<u8>, Vec<u8>) = if n == 45 {
-        // qpdf's test 45 (test_driver.cc:3497-3519) decodes
-        // "<filename1>.obfuscated" by XOR-ing every byte with 0xcc and
-        // processes the result AS IF it were "<filename1>.pdf" -- that
-        // fabricated name, not the real .obfuscated path, is what appears
-        // in this test's diagnostics.
+        // qpdf's test 45 (test_driver.cc:3497-3519) reads
+        // "<filename1>.obfuscated" through `QUtil::read_file_into_memory`,
+        // which opens it via `QUtil::safe_fopen` (`libqpdf/QUtil.cc:1139`,
+        // `:490-518`) -- the real ".obfuscated" path is what an open/read
+        // failure there reports (`"open " + filename + ": " + strerror(...)`,
+        // `QPDFSystemError::createWhat`, `libqpdf/QPDFSystemError.cc:12-28`).
+        // Only *after* that read succeeds does qpdf XOR-decode the bytes and
+        // process the result AS IF it were "<filename1>.pdf"
+        // (`pdf.processMemoryFile((filename1 + ".pdf").c_str(), ...)`,
+        // test_driver.cc:3519) -- that fabricated name is what appears in
+        // this test's *later* parser diagnostics, never in the open/read
+        // failure itself.
         let mut obfuscated_path = filename.to_os_string();
         obfuscated_path.push(".obfuscated");
         let mut pdf_name = filename.to_os_string();
@@ -105,10 +112,11 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
             Ok(raw) => raw,
             Err(error) => {
                 let crt_message = crt_open_error_message(&obfuscated_path);
+                let obfuscated_diagnostic = os_str_diagnostic_bytes(&obfuscated_path);
                 return write_error_bytes(
                     stdout,
                     stderr,
-                    &open_error_bytes(&pdf_name_diagnostic, crt_message.as_deref(), &error),
+                    &open_error_bytes(&obfuscated_diagnostic, crt_message.as_deref(), &error),
                 );
             }
         };

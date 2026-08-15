@@ -22,13 +22,32 @@ use crate::output::write_bytes;
 /// handler. `password` mirrors the two-argument `processFile(path,
 /// password)` overload; an empty password matches the one-argument
 /// overload.
+///
+/// `QPDF::processFile` opens `path` through `FileInputSource`, which opens it
+/// with `QUtil::safe_fopen` (`libqpdf/FileInputSource.cc:14-18`,
+/// `libqpdf/QUtil.cc:490-518`); an open failure there throws
+/// `"open " + path + ": " + strerror(errno)`
+/// (`QPDFSystemError::createWhat`, `libqpdf/QPDFSystemError.cc:12-28`) --
+/// the same path-aware, CRT-probed format [`super::open_error_bytes`] and
+/// [`super::crt_open_error_message`] already build for this driver's
+/// *primary* `filename1` open failure, reused here instead of propagating a
+/// bare [`std::io::Error`] (whose `Display` carries neither the "open"
+/// operation nor `path` itself).
 fn open_secondary_pdf(
     path: &OsStr,
     password: &[u8],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<Pdf<std::fs::File>> {
-    let file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path).map_err(|error| {
+        let crt_message = super::crt_open_error_message(path);
+        let message = super::open_error_bytes(
+            &os_str_diagnostic_bytes(path),
+            crt_message.as_deref(),
+            &error,
+        );
+        flpdf::Error::System(String::from_utf8_lossy(&message).into_owned())
+    })?;
     let options = PdfOpenOptions {
         repair: true,
         password: password.to_vec(),

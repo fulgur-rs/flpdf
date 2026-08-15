@@ -334,7 +334,7 @@ pub(crate) fn run_test_15<R: Read + Seek>(
     let mut new_page_refs: Vec<Option<ObjectRef>> = Vec::new();
     for (index, content) in contents.into_iter().enumerate() {
         let page = page_template.shallow_copy()?;
-        page.replace_key(b"Contents", content)?;
+        page.replace_key(b"/Contents", content)?;
         if index == 0 {
             new_page_refs.push(None);
             new_pages.push(page);
@@ -455,7 +455,7 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     let page0 = pdf.get_object_handle(page0_ref);
     let page_copy = page0.shallow_copy()?;
     let page = pdf.make_indirect_object_handle(page_copy)?;
-    page.replace_key(b"Contents", contents)?;
+    page.replace_key(b"/Contents", contents)?;
 
     // Insert the page manually.
     let root_ref = pdf
@@ -464,9 +464,9 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     let root = pdf.get_object_handle(root_ref);
     let pages_dict = root.get_key(b"/Pages");
     let kids = pages_dict.get_key(b"/Kids");
-    page.replace_key(b"Parent", pages_dict.clone())?;
+    page.replace_key(b"/Parent", pages_dict.clone())?;
     pages_dict.replace_key(
-        b"Count",
+        b"/Count",
         ObjectHandle::integer(
             1 + i64::try_from(all_pages.len()).map_err(|_| {
                 Error::Internal("test 16 page count does not fit in i64".to_string())
@@ -535,4 +535,154 @@ pub(crate) fn run_test_17<R: Read + Seek>(
     let contents_string = String::from_utf8_lossy(&contents);
     assert!(contents_string.contains("page 0"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_test_16;
+    use flpdf::{DecodeLevel, PageDocumentHelper, Pdf, PdfOpenOptions};
+    use std::collections::BTreeMap;
+
+    /// A 10-page PDF whose page `i` has `/Contents` reading exactly
+    /// `"Original page {i}\n"` -- the same shape `run_test_15`/`run_test_16`
+    /// require (both assert an initial `getAllPages().len() == 10`,
+    /// `test_driver.cc:663,761`).
+    fn ten_page_pdf() -> Vec<u8> {
+        let n: u32 = 10;
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut write_obj = |bytes: &mut Vec<u8>, num: u32, body: &[u8]| {
+            offsets.insert(num, bytes.len());
+            bytes.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        };
+        write_obj(&mut bytes, 1, b"<< /Type /Catalog /Pages 2 0 R >>");
+        let kids: String = (0..n)
+            .map(|i| format!("{} 0 R", 3 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        write_obj(
+            &mut bytes,
+            2,
+            format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>").as_bytes(),
+        );
+        for i in 0..n {
+            let page_num = 3 + i;
+            let content_num = 3 + n + i;
+            write_obj(
+                &mut bytes,
+                page_num,
+                format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Contents {content_num} 0 R >>"
+                )
+                .as_bytes(),
+            );
+            let text = format!("Original page {i}\n");
+            write_obj(
+                &mut bytes,
+                content_num,
+                format!("<< /Length {} >>\nstream\n{text}endstream", text.len()).as_bytes(),
+            );
+        }
+        let max_num = 3 + 2 * n - 1;
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", max_num + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for num in 1..=max_num {
+            match offsets.get(&num) {
+                Some(offset) => {
+                    bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes())
+                }
+                None => bytes.extend_from_slice(b"0000000000 00000 f \n"),
+            }
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R >>\n", max_num + 1).as_bytes(),
+        );
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    /// Regression for the slashless-key bug this file's `replace_key` calls
+    /// used to have: `replace_key(b"Contents", ..)` (missing the leading
+    /// `/`) does not normalize -- per `ObjectHandle::replace_key`'s own doc,
+    /// "this API does not normalize slashless input" -- so it inserted a
+    /// *separate*, inert `Contents` entry next to the shallow copy's
+    /// existing canonical `/Contents`, leaving the new page's real content,
+    /// parent, and the page-tree's incremented count unreachable through the
+    /// canonical keys every other accessor (and `QPDFWriter`) reads.
+    #[test]
+    fn manual_page_insert_replaces_contents_parent_and_count_on_the_canonical_keys() {
+        let mut pdf = Pdf::open_mem_owned_with_options(ten_page_pdf(), PdfOpenOptions::default())
+            .expect("open ten-page fixture");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_16(
+            &mut pdf,
+            b"fixture.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run_test_16 must succeed against a well-formed 10-page fixture");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+
+        let root_ref = pdf.root_ref().expect("root");
+        let root = pdf.get_object_handle(root_ref);
+        let pages_dict = root.get_key(b"/Pages");
+        assert_eq!(
+            pages_dict.get_key(b"/Count").as_integer(),
+            Some(11),
+            "/Count must reflect the manually appended eleventh page"
+        );
+
+        let kids = pages_dict
+            .get_key(b"/Kids")
+            .as_array()
+            .expect("/Kids is an array");
+        assert_eq!(kids.len(), 11);
+        let new_page = kids.last().expect("appended page").clone();
+
+        assert!(
+            !new_page.has_key(b"Contents"),
+            "no stray slashless Contents entry should survive the fix"
+        );
+        assert!(
+            !new_page.has_key(b"Parent"),
+            "no stray slashless Parent entry should survive the fix"
+        );
+
+        let contents = new_page
+            .get_key(b"/Contents")
+            .get_stream_data(DecodeLevel::Generalized)
+            .expect("decode the new page's /Contents");
+        assert_eq!(
+            contents.as_slice(),
+            b"BT /F1 15 Tf 72 720 Td (New page 10) Tj ET\n",
+            "/Contents must hold the newly created stream, not the shallow-copied original"
+        );
+        assert_eq!(
+            new_page.get_key(b"/Parent").object_ref(),
+            pages_dict.object_ref(),
+            "/Parent must point back at the page tree, not stay absent"
+        );
+
+        // `run_test_16`'s own `all_pages.len()` (its local snapshot, taken
+        // before the manual edit) stays 10, matching qpdf's *stale* cached
+        // `all_pages` reference before `updateAllPagesCache()` runs
+        // (`test_driver.cc:761`, this function's own GAP note). A *fresh*
+        // `PageDocumentHelper::get_all_pages()` call, unlike qpdf's cache,
+        // always recomputes from the live tree (`PageDocumentHelper::
+        // get_all_pages`'s own doc), so it already sees the eleventh page
+        // this test just proved was correctly wired up.
+        let pages = PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("get_all_pages");
+        assert_eq!(pages.len(), 11);
+    }
 }

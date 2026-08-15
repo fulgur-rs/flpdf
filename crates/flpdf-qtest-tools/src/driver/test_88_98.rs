@@ -332,24 +332,41 @@ impl Pipeline for StdoutPipeline<'_> {
 /// matching [`document_json::write_json`]'s own parameter order; the empty
 /// `file_prefix` string has no effect (and no flpdf parameter) outside
 /// [`StreamDataMode::File`], so it is not carried through.
+///
+/// `QPDF::writeJSON` walks every object via `getAllObjects()`
+/// (`libqpdf/QPDF_json.cc:900-925`) and serializes each one, dereferencing it
+/// for the first time if it had not been resolved yet. A malformed object
+/// resolved lazily this way still goes through the same `QPDF::warn` call any
+/// other first resolution would (`libqpdf/QPDF.cc:487-493`), which -- unlike
+/// this driver's own suppressed-then-manually-drained diagnostics -- writes
+/// straight to the real process's warn logger the moment it fires, with no
+/// separate drain step required. `document_json::write_json` triggers the
+/// same lazy-resolution warnings through this crate's own
+/// [`flpdf::Pdf::repair_diagnostics`] collection, so they must be drained
+/// with [`emit_new_diagnostics`] once the call returns, matching every other
+/// test in this file that performs a resolution-triggering operation.
 pub(crate) fn run_test_91<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let mut sink = StdoutPipeline { stdout };
-    document_json::write_json(
-        pdf,
-        2,
-        &mut sink,
-        DecodeLevel::None,
-        &StreamDataMode::Inline,
-        &[],
-    )
-    .map_err(|error| Error::System(error.to_string()))
+    {
+        let mut sink = StdoutPipeline { stdout };
+        document_json::write_json(
+            pdf,
+            2,
+            &mut sink,
+            DecodeLevel::None,
+            &StreamDataMode::Inline,
+            &[],
+        )
+        .map_err(|error| Error::System(error.to_string()))?;
+    }
+    emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
