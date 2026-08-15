@@ -1090,7 +1090,7 @@ mod byte_gate {
     use crate::page_form_xobject::import_page_as_form_xobject;
     use crate::page_range::PageRange;
     use crate::pages::page_refs;
-    use crate::{Pdf, PdfWriter};
+    use crate::{Object, ObjectRef, Pdf, PdfWriter};
     use std::io::{Read, Seek};
     use std::path::Path;
 
@@ -1816,6 +1816,38 @@ mod byte_gate {
                 .windows(b"/F1_2 11 0 R".len())
                 .any(|window| window == b"/F1_2 11 0 R"),
             "flpdf AP `/Resources` must not use /F1_2"
+        );
+    }
+
+    /// Keep the hidden-collision fixture's empty Flate stream as a valid
+    /// initialized zlib stream rather than as zero raw bytes. qpdf 11.9.0
+    /// constructs the filter pipeline before writing stream data
+    /// (`libqpdf/QPDF_Stream.cc:548-574`), but `Pl_Flate` initializes its
+    /// codec only when `handleData` receives bytes
+    /// (`libqpdf/Pl_Flate.cc:81-98,112-131`). Its `finish` path consequently
+    /// has no initialized codec to flush for a zero-byte input
+    /// (`libqpdf/Pl_Flate.cc:188-205`). The fixture must therefore carry a
+    /// complete encoded empty stream so readers can exercise the Flate path.
+    #[test]
+    fn overlay_hidden_collision_fixture_uses_initialized_empty_flate_stream() {
+        let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
+        let stream = dest
+            .resolve(ObjectRef::new(8, 0))
+            .unwrap()
+            .into_stream()
+            .unwrap();
+
+        assert!(matches!(
+            stream.dict.get("Filter"),
+            Some(Object::Name(name)) if name.as_slice() == b"FlateDecode"
+        ));
+        assert!(
+            !stream.data.is_empty(),
+            "empty Flate stream must contain encoded zlib bytes"
+        );
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+            Vec::<u8>::new()
         );
     }
 
