@@ -157,6 +157,14 @@ write(
         },
     ),
 )
+write(
+    "dict_duplicate_key",
+    build_pdf(b"6 0 R", {6: b"<< /a 1 /a 2 >>"}),
+)
+write(
+    "dict_duplicate_key_after_reference_lookahead",
+    build_pdf(b"6 0 R", {6: b"[ 1 0 << /x 1 /x 2 >> ]"}),
+)
 
 flate_abc = zlib.compress(b"abc")
 write(

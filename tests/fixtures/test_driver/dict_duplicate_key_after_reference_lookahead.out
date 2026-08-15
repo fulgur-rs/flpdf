@@ -1,0 +1,9 @@
+WARNING: dict_duplicate_key_after_reference_lookahead.pdf (object 6 0, offset 127): dictionary has duplicated key /x; last occurrence overrides earlier ones
+/QTest is indirect and has type array (8)
+/QTest is an array with 3 items
+  item 0 is direct
+  item 1 is direct
+  item 2 is direct
+unparse: 6 0 R
+unparseResolved: [ 1 0 << /x 2 >> ]
+test 1 done
