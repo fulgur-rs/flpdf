@@ -1406,6 +1406,17 @@ fn id_object_to_handle(object: &Object) -> Result<ObjectHandle> {
 /// a range this narrow has only one possible match position. Regression test:
 /// `deterministic_id_objstm_survives_custom_trailer_placeholder_lookalike`.
 ///
+/// The classic (stream-free) table path also pushes onto an `id_ranges`
+/// vector inside the same `do_write_pass`, but with the old whole-section
+/// span (`write_part1_xref_and_trailer` / `write_main_xref_and_trailer`).
+/// That is harmless: `objstm_layout.is_empty()` picks one branch or the
+/// other for the *entire* pass (both first-page and main-trailer sites), so
+/// a classic-path run never produces the ObjStm-path pushes this function
+/// consumes, and this function itself is only ever invoked when
+/// `objstm_layout.is_empty()` is `false` (see the call site's guard). The
+/// classic path's own `/ID` is direct-written via `id_writer` and never
+/// reaches a placeholder at all, so it has no need of a precise span.
+///
 /// # Panics
 ///
 /// Panics (via `debug_assert!`) in debug builds if any `/ID` range does not
