@@ -32,6 +32,14 @@ emitted before the predictor pads and writes `A\0`.
 stream decryption: a valid explicit `/Crypt` filter is an identity stage.
 Ordinary flpdf decode continues rejecting `/Crypt`.
 
+`stream_dct` and `stream_dct_alias` use the same flpdf-authored JPEG payload
+with `/DCTDecode` and `/DCT`, respectively. They pin qpdf's raw stream output,
+decoded component bytes, and successful `qpdf_dl_all` stream termination.
+`stream_dct_decode_parms` records qpdf 11.9.0's default DCT filter contract:
+non-null `/DecodeParms` (including `/ColorTransform`) is not filterable.
+`stream_dct_malformed` records the codec failure boundary for a non-JPEG
+payload.
+
 `stream_flate_nondict_decode_parms` and
 `stream_lzw_nondict_decode_parms_array` pin qpdf's two type warnings at the
 non-dictionary parameter token before decoded output.

@@ -125,10 +125,33 @@ fn show_stream_raw_writes_to_out_file() {
 // flpdf-9hc.7.4: passthrough codec marker tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// For a DCTDecode stream, show-stream (without --raw) must print the marker
-/// `<binary, N bytes, codec DCTDecode>` and exit successfully.
+/// DCTDecode is decodable (unlike JBIG2Decode/JPXDecode/CCITTFaxDecode
+/// below), so show-stream must decode a valid JPEG stream and print the raw
+/// decoded pixel bytes instead of the `<binary, ...>` marker. Obj 6 of
+/// `stream_dct.pdf` holds a real 2x2 RGB JFIF JPEG (added alongside the
+/// qtest driver's own DCT decode coverage), decoding to 2*2*3 = 12 bytes.
 #[test]
-fn show_stream_passthrough_dct_prints_marker() {
+fn show_stream_dct_decodes_valid_jpeg() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "show-stream",
+        "6 0",
+        "../../tests/fixtures/test_driver/stream_dct.pdf",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::eq(
+        [
+            0x00, 0x34, 0x84, 0x71, 0x63, 0x5a, 0xd2, 0xc4, 0xbb, 0xff, 0x8b, 0x22,
+        ]
+        .as_slice(),
+    ));
+}
+
+/// Invalid `/DCTDecode` bytes must surface a decode error, not fall back to
+/// the passthrough marker used for genuinely undecodable codecs.
+#[test]
+fn show_stream_dct_invalid_bytes_report_decode_error() {
     let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC];
     let pdf_bytes = build_pdf_with_stream("DCTDecode", fake_jpeg);
 
@@ -139,11 +162,8 @@ fn show_stream_passthrough_dct_prints_marker() {
     cmd.args(["show-stream", "3 0"])
         .arg(temp.path())
         .assert()
-        .success()
-        .stdout(predicate::str::contains(format!(
-            "<binary, {} bytes, codec DCTDecode>",
-            fake_jpeg.len()
-        )));
+        .failure()
+        .stderr(predicate::str::contains("DCT decode:"));
 }
 
 /// For a JBIG2Decode stream, show-stream (without --raw) must print the marker.
@@ -311,12 +331,14 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
         ));
 }
 
-/// A single-element filter array `/Filter [/DCTDecode]` is equivalent to the
-/// direct name form and must also produce the passthrough marker.
+/// A single-element filter array `/Filter [/CCITTFaxDecode]` is equivalent to
+/// the direct name form and must also produce the passthrough marker.
+/// CCITTFaxDecode (unlike DCTDecode) has no decode factory, so it still
+/// exercises the marker path.
 #[test]
 fn show_stream_passthrough_single_element_array_prints_marker() {
-    let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC];
-    let pdf_bytes = build_pdf_with_filter_literal("[/DCTDecode]", fake_jpeg);
+    let fake_ccitt: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE];
+    let pdf_bytes = build_pdf_with_filter_literal("[/CCITTFaxDecode]", fake_ccitt);
 
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp.path(), pdf_bytes).unwrap();
@@ -327,17 +349,19 @@ fn show_stream_passthrough_single_element_array_prints_marker() {
         .assert()
         .success()
         .stdout(predicate::str::contains(format!(
-            "<binary, {} bytes, codec DCTDecode>",
-            fake_jpeg.len()
+            "<binary, {} bytes, codec CCITTFaxDecode>",
+            fake_ccitt.len()
         )));
 }
 
 /// With `--out`, a passthrough-codec stream must write the raw stored bytes to
-/// the file (the only available representation) and report the marker on stderr.
+/// the file (the only available representation) and report the marker on
+/// stderr. JBIG2Decode (unlike DCTDecode) has no decode factory, so it still
+/// exercises the marker path.
 #[test]
 fn show_stream_passthrough_out_writes_raw_bytes() {
-    let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC];
-    let pdf_bytes = build_pdf_with_stream("DCTDecode", fake_jpeg);
+    let fake_jbig2: &[u8] = &[0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A];
+    let pdf_bytes = build_pdf_with_stream("JBIG2Decode", fake_jbig2);
 
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp.path(), pdf_bytes).unwrap();
@@ -351,13 +375,13 @@ fn show_stream_passthrough_out_writes_raw_bytes() {
         .assert()
         .success()
         .stderr(predicate::str::contains(format!(
-            "<binary, {} bytes, codec DCTDecode>",
-            fake_jpeg.len()
+            "<binary, {} bytes, codec JBIG2Decode>",
+            fake_jbig2.len()
         )));
 
     let written = std::fs::read(out.path()).unwrap();
     assert_eq!(
-        written, fake_jpeg,
+        written, fake_jbig2,
         "--out must receive the raw stored bytes"
     );
 }

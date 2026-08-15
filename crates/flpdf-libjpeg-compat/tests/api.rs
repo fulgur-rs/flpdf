@@ -12,7 +12,7 @@ fn malformed_jpeg_returns_codec_diagnostic_without_callback() {
 
     match result {
         Err(DecodeError::Codec(message)) => {
-            assert_eq!(message, "Not a JPEG file: starts with 0x6e 6f");
+            assert_eq!(message, "Not a JPEG file: starts with 0x6e 0x6f");
         }
         Err(error) => panic!("unexpected error: {error:?}"),
         Ok(()) => panic!("malformed JPEG must fail"),

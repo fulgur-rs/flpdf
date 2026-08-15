@@ -168,7 +168,7 @@ flpdf_jpeg_format_error(
         (void)snprintf(
             diagnostic,
             sizeof(diagnostic),
-            "Not a JPEG file: starts with 0x%02x %02x",
+            "Not a JPEG file: starts with 0x%02x 0x%02x",
             (unsigned int)(common->err->msg_parm.i[0] & 0xff),
             (unsigned int)(common->err->msg_parm.i[1] & 0xff));
         flpdf_copy_error_message(destination, destination_len, diagnostic);

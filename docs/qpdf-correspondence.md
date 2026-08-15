@@ -687,6 +687,17 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 ---
 
+### DCT whole-buffer consumer correction (flpdf-n9t0.9)
+
+The DCT row above predates the qtest `qpdf_dl_all` follow-up. The legacy
+whole-buffer adapter is no longer passthrough-only: it drives the same
+`PlDct` stage as `decode_pipeline`, preserving qpdf's buffered finish,
+scanline output, output-limit enforcement, and codec diagnostics. The writer
+encoded-stream passthrough remains a separate responsibility. The qpdf
+11.9.0 `test_driver` differential covers `/DCTDecode`, `/DCT`, non-null
+`/ColorTransform` `DecodeParms`, malformed JPEG input, 57 fixtures, and 11
+CLI probes.
+
 ## 集計
 
 | 状態 | qpdf 側の該当行数 | 内訳 |

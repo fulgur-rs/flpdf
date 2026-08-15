@@ -23,6 +23,10 @@ dict_indirect_value_warning
 dict_duplicate_key
 dict_duplicate_key_after_reference_lookahead
 stream_flate
+stream_dct
+stream_dct_alias
+stream_dct_decode_parms
+stream_dct_malformed
 stream_indirect_filter
 stream_chained_filter
 stream_indirect_filter_array

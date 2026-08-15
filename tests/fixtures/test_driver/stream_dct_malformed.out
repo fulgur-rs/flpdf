@@ -1,0 +1,11 @@
+/QTest is indirect and has type stream (10)
+/QTest is a stream.  Dictionary: << /Filter /DCTDecode /Length 3 >>
+Raw stream data:
+abc
+Uncompressed stream data:
+WARNING: stream_dct_malformed.pdf (offset 161): error decoding stream data for object 6 0: Not a JPEG file: starts with 0x61 0x62
+
+End of stream data
+unparse: 6 0 R
+unparseResolved: 6 0 R
+test 1 done
