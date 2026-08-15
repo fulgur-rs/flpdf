@@ -6387,10 +6387,19 @@ mod tests {
     #[test]
     fn plain_writer_fallback_preserves_a_corrupt_flate_stream_verbatim_without_a_token_filter() {
         // No token filter is registered here (`is_data_modified` stays
-        // false), so this exercises `apply_stream_compress_policy_with_
-        // decode_level`'s LEGACY (`token_filtered_source: None`) decode
-        // path: `filters::decode_stream_data` fails on the corrupt payload,
-        // taking `StreamDecodeOutcome::Declined(stream.data.clone())`.
+        // false), and `/Filter /FlateDecode` is the bare-name form
+        // `is_lone_flate` recognizes, so this stream qualifies for
+        // `reencode_stream_for_compress`'s lone-Flate verbatim-preserve
+        // shortcut (`!is_data_modified && source_filter_is_lone_flate`,
+        // mirroring `QPDFWriter.cc:1265-1269`): the corrupt payload is
+        // preserved verbatim WITHOUT ever being handed to a decoder, not
+        // via a decode failure. For the sibling case that actually reaches
+        // `apply_stream_compress_policy_with_decode_level`'s legacy
+        // (`token_filtered_source: None`) decode attempt and fails inside
+        // it, see
+        // `plain_writer_fallback_preserves_a_corrupt_flate_stream_verbatim_when_the_legacy_decoder_itself_fails`,
+        // which uses the array-form `/Filter [/FlateDecode]` fixture
+        // `is_lone_flate` does not recognize.
         let raw = build_pdf_with_reachable_corrupt_flate_stream();
         let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
         let stream_ref = ObjectRef::new(3, 0);
