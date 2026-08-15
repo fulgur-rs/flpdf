@@ -1890,6 +1890,17 @@ mod tests {
     }
 
     #[test]
+    fn direct_null_filespec_stream_entries_are_empty() {
+        let mut pdf = open_minimal();
+        let mut helper = FileSpec::new(ObjectHandle::null(), &mut pdf).unwrap();
+
+        assert!(helper
+            .get_embedded_file_stream_entries()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn filespec_helper_marks_an_indirect_owner_of_a_direct_dictionary_dirty() {
         let mut pdf = open_minimal();
         let owner_ref = ObjectRef::new(5, 0);
