@@ -332,6 +332,11 @@ pub(crate) mod xref_stream {
         /// with `/Info`, `/Root`, and `/Size` and written in sorted key order after
         /// `/W`/`/Index`, before the generated `/ID`.
         pub trailer: Option<&'a Dictionary>,
+        /// Canonical entries from a live ObjectHandle trailer. Keys are decoded
+        /// and values are already serialized with the writer reference map, so
+        /// the xref route does not reconstruct trailer data from a stale
+        /// materialized Dictionary snapshot.
+        pub canonical_entries: Option<&'a [(Vec<u8>, Vec<u8>)]>,
         /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
         pub id: Option<(&'a [u8], &'a [u8])>,
         /// Trailer `/Encrypt` reference. qpdf emits this after `/ID` on the
@@ -378,22 +383,55 @@ pub(crate) mod xref_stream {
         if let Some((start, count)) = dict.index {
             out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
         }
-        let mut trailer = dict.trailer.cloned().unwrap_or_default();
-        if let Some(info) = dict.info {
-            trailer.insert("Info", Object::Reference(info));
-        }
-        if let Some(root) = dict.root {
-            trailer.insert("Root", Object::Reference(root));
-        }
-        trailer.insert("Size", Object::Integer(i64::from(dict.size)));
-        for (key, value) in trailer.iter() {
-            out.extend_from_slice(b" /");
-            crate::object::write_name_escaped(out, key);
-            out.push(b' ');
-            value.write_pdf(out);
-            if key == b"Size" {
-                if let Some(prev) = dict.prev {
-                    out.extend_from_slice(format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes());
+        if let Some(canonical_entries) = dict.canonical_entries {
+            let mut entries = canonical_entries.to_vec();
+            if let Some(info) = dict.info {
+                entries.push((
+                    b"/Info".to_vec(),
+                    format!("{} {} R", info.number, info.generation).into_bytes(),
+                ));
+            }
+            if let Some(root) = dict.root {
+                entries.push((
+                    b"/Root".to_vec(),
+                    format!("{} {} R", root.number, root.generation).into_bytes(),
+                ));
+            }
+            entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (key, value) in entries {
+                out.extend_from_slice(b" /");
+                crate::object::write_name_escaped(out, key.strip_prefix(b"/").unwrap_or(&key));
+                out.push(b' ');
+                out.extend_from_slice(&value);
+                if key == b"/Size" {
+                    if let Some(prev) = dict.prev {
+                        out.extend_from_slice(
+                            format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes(),
+                        );
+                    }
+                }
+            }
+        } else {
+            let mut trailer = dict.trailer.cloned().unwrap_or_default();
+            if let Some(info) = dict.info {
+                trailer.insert("Info", Object::Reference(info));
+            }
+            if let Some(root) = dict.root {
+                trailer.insert("Root", Object::Reference(root));
+            }
+            trailer.insert("Size", Object::Integer(i64::from(dict.size)));
+            for (key, value) in trailer.iter() {
+                out.extend_from_slice(b" /");
+                crate::object::write_name_escaped(out, key);
+                out.push(b' ');
+                value.write_pdf(out);
+                if key == b"Size" {
+                    if let Some(prev) = dict.prev {
+                        out.extend_from_slice(
+                            format!(" /Prev {prev:<PREV_FIELD_WIDTH$}").as_bytes(),
+                        );
+                    }
                 }
             }
         }
@@ -742,6 +780,7 @@ pub(crate) mod xref_stream {
                 // widths (not values) affect the region size.
                 prev: Some(2356),
                 trailer: None,
+                canonical_entries: None,
                 id: Some((&ID0, &ID1)),
                 encrypt: None,
             };
@@ -844,6 +883,7 @@ pub(crate) mod xref_stream {
                 size: 6,
                 prev: None,
                 trailer: None,
+                canonical_entries: None,
                 id: Some((&ID0, &ID1)),
                 encrypt: None,
             };
@@ -866,6 +906,7 @@ pub(crate) mod xref_stream {
                 size: 6,
                 prev: None,
                 trailer: None,
+                canonical_entries: None,
                 id: Some((&ID0, &ID1)),
                 encrypt: None,
             };
@@ -1020,6 +1061,7 @@ pub(crate) mod xref_stream {
                     size: 17,
                     prev: Some(2226),
                     trailer: None,
+                    canonical_entries: None,
                     id: Some((&ID0, &ID1)),
                     encrypt: None,
                 },
@@ -1058,6 +1100,7 @@ pub(crate) mod xref_stream {
                     size: 8,
                     prev: None,
                     trailer: Some(&trailer),
+                    canonical_entries: None,
                     id: Some((&ID0, &ID1)),
                     encrypt: None,
                 },
@@ -1086,6 +1129,7 @@ pub(crate) mod xref_stream {
                     size: 6,
                     prev: None,
                     trailer: None,
+                    canonical_entries: None,
                     id: Some((&ID0, &ID1)),
                     encrypt: None,
                 },
@@ -1132,6 +1176,7 @@ pub(crate) mod xref_stream {
                     size: 17,
                     prev: Some(2226),
                     trailer: None,
+                    canonical_entries: None,
                     id: Some((&ID0, &ID1)),
                     encrypt: None,
                 },
@@ -1157,6 +1202,7 @@ pub(crate) mod xref_stream {
                     size: 6,
                     prev: None,
                     trailer: None,
+                    canonical_entries: None,
                     id: Some((&ID0, &ID1)),
                     encrypt: None,
                 },
@@ -1243,6 +1289,7 @@ mod tests {
             size: 2,
             prev: None,
             trailer: None,
+            canonical_entries: None,
             id: None,
             encrypt: Some(ObjectRef::new(7, 0)),
         };
