@@ -5735,15 +5735,15 @@ mod tests {
 
     // --- qdf fallback: is_data_modified threading (flpdf-vkka) -------------
 
-    struct NoopTokenFilter;
+    struct PassthroughTokenFilter;
 
-    impl crate::token_filter::TokenFilter for NoopTokenFilter {
+    impl crate::token_filter::TokenFilter for PassthroughTokenFilter {
         fn handle_token(
             &mut self,
-            _token: &crate::tokenizer::Token,
-            _output: &mut crate::token_filter::TokenFilterOutput<'_>,
+            token: &crate::tokenizer::Token,
+            output: &mut crate::token_filter::TokenFilterOutput<'_>,
         ) -> crate::pipeline::PipelineResult<()> {
-            Ok(())
+            output.write_token(token)
         }
     }
 
@@ -5835,8 +5835,16 @@ mod tests {
             .as_ref()
             .clone();
         source_handle
-            .add_token_filter(Rc::new(RefCell::new(NoopTokenFilter)))
+            .add_token_filter(Rc::new(RefCell::new(PassthroughTokenFilter)))
             .expect("register token filter");
+        let filtered_decode = source_handle
+            .get_stream_data(DecodeLevel::Generalized)
+            .expect("filtered decode must run the registered passthrough filter");
+        assert_eq!(
+            filtered_decode.as_ref().as_slice(),
+            b"q Q",
+            "a passthrough token filter must forward the source content unchanged"
+        );
 
         let mut writer = PdfWriter::new(&mut pdf);
         writer.set_output_memory().expect("memory output");
