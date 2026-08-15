@@ -6103,7 +6103,7 @@ mod tests {
 
         let legacy_object = pdf.resolve(stream_ref).expect("legacy resolve");
         let Object::Stream(legacy_stream) = legacy_object else {
-            panic!("fixture object 3 must resolve to a stream");
+            panic!("fixture object 3 must resolve to a stream"); // cov:ignore: test-shape guard
         };
         let legacy_decoded = filters::decode_stream_data(&legacy_stream.dict, &legacy_stream.data)
             .expect("legacy decode must succeed");
@@ -6122,6 +6122,62 @@ mod tests {
             "decode_token_filtered_stream must agree byte-for-byte with the \
              legacy filters::decode_stream_data decoder for a passthrough \
              filter"
+        );
+    }
+
+    #[test]
+    fn decode_token_filtered_stream_reports_failure_on_a_decode_parms_length_mismatch() {
+        // A `/DecodeParms` array shorter than `/Filter`'s is a shape
+        // mismatch `ObjectHandle::pipe_stream_data`'s own
+        // `prepare_stream_filter_plan` rejects (its `count !=
+        // filter_names.len()` check, which sets no plan and leaves
+        // `filtering_attempted` false) but `writer.rs`'s own
+        // `filter_chain_is_decodable` -- a simpler name-only eligibility
+        // check -- does not see, so
+        // `apply_stream_compress_policy_with_decode_level`'s decode step is
+        // still reached for a stream like this one.
+        // `decode_token_filtered_stream` must treat `filtering_attempted ==
+        // false` the same as any other decode failure and report `Err`, so
+        // the caller's existing raw-preservation fallback runs instead of
+        // silently returning unfiltered/partial bytes.
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = raw.len() as u64;
+        raw.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /Extras 3 0 R>>\nendobj\n");
+        let off2 = raw.len() as u64;
+        raw.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n");
+        let off3 = raw.len() as u64;
+        raw.extend_from_slice(
+            b"3 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 1 1] \
+              /Filter [/FlateDecode /FlateDecode] /DecodeParms [<<>>] /Length 3>>\
+              \nstream\nabc\nendstream\nendobj\n",
+        );
+        let xref_start = raw.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n",
+        );
+        raw.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        raw.extend_from_slice(trailer.as_bytes());
+
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+        let handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve canonical handle");
+        handle
+            .add_token_filter(Rc::new(RefCell::new(PassthroughTokenFilter)))
+            .expect("register token filter");
+
+        let result = decode_token_filtered_stream(&handle);
+        assert!(
+            result.is_err(),
+            "a /DecodeParms length mismatch must make decode_token_filtered_stream \
+             report failure, not silently return unfiltered/partial bytes"
         );
     }
 
