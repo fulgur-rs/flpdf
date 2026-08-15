@@ -764,8 +764,8 @@ fn show_with_pdf(
             // canonical resolver catches parse/unsupported failures and this
             // in-memory source cannot produce a read I/O error.
             error => ShowLinearizationError::from(error),
-            // cov:ignore-end
         })?;
+    // cov:ignore-end
 
     if params.h_overflow_offset != 0 {
         let overflow_offset = usize::try_from(params.h_overflow_offset)
@@ -780,8 +780,8 @@ fn show_with_pdf(
                 // cov:ignore: see the primary hint-stream error arm above.
                 error => ShowLinearizationError::from(error),
             },
-            // cov:ignore-end
         )?;
+        // cov:ignore-end
     }
 
     // /S (shared object table offset) and /O (outline table offset) are keys on

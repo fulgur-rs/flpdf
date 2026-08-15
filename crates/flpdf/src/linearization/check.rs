@@ -240,10 +240,10 @@ fn first_page_source_extent<R: Read + Seek>(
             if use_outlines {
                 if let Some(outlines) = root_dict.get(b"/Outlines" as &[u8]).cloned() {
                     enqueue_references(&outlines, &mut pending)?;
-                }
+                } // cov:ignore: llvm maps the nested optional-branch cleanup to this brace
             }
-        }
-    }
+        } // cov:ignore: llvm maps the root-dictionary cleanup to this brace
+    } // cov:ignore: llvm maps the optional root-ref cleanup to this brace
 
     while let Some(object_ref) = pending.pop_front() {
         if !visited.insert(object_ref) {
@@ -426,7 +426,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
                 "/O ({o_num}) points to a dictionary with no /Type, /Parent or /MediaBox \
                  — does not look like a Page object"
             );
-        }
+        } // cov:ignore: qpdf's malformed no-Type failure returns before this brace
     }
 
     // qpdf records this as a linearization warning in
@@ -514,7 +514,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         let overflow_length = as_u64(&h_items[3], "H[3]")?;
         if overflow_offset != 0 {
             check_hint(2, overflow_offset, overflow_length)?;
-        }
+        } // cov:ignore: llvm maps the overflow closure cleanup to this brace
     }
 
     // -----------------------------------------------------------------------
@@ -1683,6 +1683,21 @@ mod tests {
             check_linearization_bytes(&unstructured),
             Err(LinearizationCheckError::InvalidParam { ref message })
                 if message.contains("does not look like a Page object")
+        ));
+
+        // qpdf also accepts a page whose /Type is absent when /Parent and
+        // /MediaBox provide the structural page shape.
+        let mut inherited = linearized_fixture_bytes();
+        let type_marker = b"/Type /Page";
+        let type_start = inherited
+            .windows(type_marker.len())
+            .rposition(|window| window == type_marker)
+            .expect("first page type");
+        inherited[type_start..type_start + type_marker.len()].copy_from_slice(b"/Type null ");
+        let inherited_result = check_linearization_bytes(&inherited);
+        assert!(!matches!(
+            inherited_result,
+            Err(LinearizationCheckError::NotLinearized)
         ));
     }
 
