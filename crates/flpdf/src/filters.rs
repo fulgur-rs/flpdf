@@ -3056,12 +3056,11 @@ mod tests {
         );
     }
 
-    /// passthrough-in-chain: /Filter [/ASCII85Decode /DCTDecode] decode must return Err
-    /// because DCTDecode is a passthrough codec that flpdf does not decode.
-    /// The input must be valid ASCII85 data so that step 0 succeeds and
-    /// step 1 (DCTDecode) is reached.
+    /// A DCTDecode stage in a filter chain reaches the JPEG decoder after the
+    /// preceding ASCII85 stage. The input must be valid ASCII85 data so that
+    /// step 0 succeeds and step 1 (DCTDecode) is reached.
     #[test]
-    fn passthrough_in_chain_returns_err_with_passthrough_message() {
+    fn dct_in_chain_rejects_malformed_jpeg_with_qpdf_diagnostic() {
         // Build a valid ASCII85-encoded payload so the first filter succeeds.
         let ascii85_encoded = ascii85::encode(b"some binary jpeg payload");
 
@@ -3070,16 +3069,20 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "chain containing DCTDecode must return Err"
+            "malformed JPEG after ASCII85 must return Err"
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("DCTDecode"),
-            "error must mention DCTDecode; got: {msg}"
+            msg.contains("DCT decode"),
+            "error must mention the DCT stage; got: {msg}"
         );
         assert!(
-            msg.contains("passthrough"),
-            "error must indicate passthrough intent; got: {msg}"
+            msg.contains("Not a JPEG file: starts with 0x73 0x6f"),
+            "error must preserve qpdf's JPEG diagnostic; got: {msg}"
+        );
+        assert!(
+            !msg.contains("passthrough"),
+            "DCT decoding must no longer report passthrough; got: {msg}"
         );
     }
 

@@ -11,10 +11,14 @@ use super::{emit_new_diagnostics, write_warning};
 use crate::output::write_bytes;
 
 fn stream_decode_error_detail(error: Error) -> String {
-    match error {
+    let detail = match error {
         Error::Unsupported(message) | Error::Internal(message) | Error::System(message) => message,
         error => error.to_string(),
-    }
+    };
+    detail
+        .strip_prefix("DCT decode: ")
+        .unwrap_or(&detail)
+        .to_owned()
 }
 
 fn write_decode_param_type_warning(

@@ -24,7 +24,14 @@ impl<'a> PlDct<'a> {
     }
 
     #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-    fn jpeg_error(&self, error: libjpeg_turbo_rs::JpegError) -> PipelineError {
+    fn jpeg_error(&self, error: libjpeg_turbo_rs::JpegError, data: &[u8]) -> PipelineError {
+        if let [first, second, ..] = data {
+            if !data.starts_with(&[0xff, 0xd8]) {
+                return self.runtime_error(format!(
+                    "Not a JPEG file: starts with 0x{first:02x} 0x{second:02x}"
+                ));
+            }
+        }
         PipelineError::runtime(format!("{}: {error}", self.identifier))
     }
 
@@ -79,7 +86,7 @@ impl Pipeline for PlDct<'_> {
         #[cfg(not(feature = "qpdf-libjpeg-compat"))]
         {
             let mut decoder = libjpeg_turbo_rs::ScanlineDecoder::new(&data)
-                .map_err(|error| self.jpeg_error(error))?;
+                .map_err(|error| self.jpeg_error(error, &data))?;
             let (precision, width, height, components) = {
                 let header = decoder.header();
                 (
@@ -115,7 +122,7 @@ impl Pipeline for PlDct<'_> {
             for _ in 0..height {
                 decoder
                     .read_scanline(&mut row)
-                    .map_err(|error| self.jpeg_error(error))?;
+                    .map_err(|error| self.jpeg_error(error, &data))?;
                 // cov:ignore-start: ScanlineDecoder writes into this caller-owned slice and returns no row with a different length
                 if row.len() != row_length {
                     return Err(self.runtime_error(format!(
@@ -127,7 +134,9 @@ impl Pipeline for PlDct<'_> {
                 self.next.write(&row)?;
             }
 
-            decoder.finish().map_err(|error| self.jpeg_error(error))?;
+            decoder
+                .finish()
+                .map_err(|error| self.jpeg_error(error, &data))?;
             self.next.finish()
         }
     }

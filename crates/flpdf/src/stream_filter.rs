@@ -1926,19 +1926,31 @@ impl StreamFilter for DctStreamFilter {
         ))))
     }
 
-    // The whole-buffer route remains the existing passthrough route for this
-    // bounded streaming migration. The qpdf-shaped stage above is exercised by
-    // the streaming caller and does not alter the writer/legacy decode route.
     fn pipe_decode_recovering(
         &mut self,
-        _data: &[u8],
-        _max_output: Option<usize>,
+        data: &[u8],
+        max_output: Option<usize>,
         _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
     ) -> Result<FilterDecodeOutcome> {
-        Err(Error::Unsupported(
-            "passthrough codec DCTDecode: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-                .to_string(),
-        ))
+        let mut sink = OutputBuffer::new(max_output);
+        let finish_phase = sink.finish_phase();
+        let output_position = sink.output_position();
+        let error = {
+            let mut stage = PlDct::new("DCT decode", &mut sink);
+            write_and_finish(
+                &mut stage,
+                data,
+                Some(finish_phase.as_ref()),
+                &output_position,
+            )
+            .map(map_stage_error)
+        };
+        let cleanup_data_start = sink.cleanup_data_start();
+        Ok(FilterDecodeOutcome {
+            data: sink.data,
+            cleanup_data_start,
+            error,
+        })
     }
 
     fn is_specialized_compression(&self) -> bool {
@@ -2178,8 +2190,8 @@ impl StreamFilter for PostPreflightFailure {
 /// adding one would mean replacing this `match`.
 ///
 /// The container and qpdf's registered production codecs are represented here;
-/// the DCT stage itself is the qpdf-shaped streaming primitive while the
-/// existing whole-buffer route remains passthrough-only for now.
+/// the DCT stage itself is the qpdf-shaped streaming primitive, and the
+/// whole-buffer adapter below drives that same stage for legacy callers.
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"Crypt" => Some(Box::new(CryptStreamFilter)),
@@ -5337,6 +5349,32 @@ pub(crate) mod tests {
         assert_eq!(sink.finishes, 1);
     }
 
+    #[test]
+    fn dct_whole_buffer_route_decodes_and_honors_output_limit() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+
+        let decoded = filter
+            .pipe_decode_recovering(&jpeg, None, &mut ignore_warning)
+            .expect("whole-buffer DCT route must construct");
+        assert!(decoded.error.is_none());
+        assert_eq!(decoded.data, canonical_dct_bytes(&jpeg));
+        assert_eq!(decoded.cleanup_data_start, 0);
+
+        let mut limited = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(limited.set_decode_params(&DecodeParams::Absent));
+        let limited = limited
+            .pipe_decode_recovering(&jpeg, Some(1), &mut ignore_warning)
+            .expect("limited whole-buffer DCT route must construct");
+        let error = limited.error.expect("DCT output limit must be reported");
+        assert!(!error.during_write);
+        assert_eq!(error.output_offset, 1);
+        assert_eq!(limited.data.len(), 1);
+        assert_eq!(limited.cleanup_data_start, 0);
+        assert!(error.error.to_string().contains(DECODE_OUTPUT_LIMIT_PREFIX));
+    }
+
     /// The oracle is qpdf 11.9.0. On Linux the resolver prefers the pinned
     /// `/usr/bin/qpdf`, otherwise it uses PATH `qpdf`; `FLPDF_QPDF_BIN` is an
     /// explicit override. Every selected executable is checked with
@@ -5527,11 +5565,14 @@ pub(crate) mod tests {
 
             assert!(matches!(error, PipelineError::Runtime(_)));
             #[cfg(not(feature = "qpdf-libjpeg-compat"))]
-            assert_eq!(error.to_string(), "DCT decode: unexpected marker: 0xFF6F");
+            assert_eq!(
+                error.to_string(),
+                "DCT decode: Not a JPEG file: starts with 0x6e 0x6f"
+            );
             #[cfg(feature = "qpdf-libjpeg-compat")]
             assert_eq!(
                 error.to_string(),
-                "DCT decode: Not a JPEG file: starts with 0x6e 6f"
+                "DCT decode: Not a JPEG file: starts with 0x6e 0x6f"
             );
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
@@ -5566,6 +5607,32 @@ pub(crate) mod tests {
                 error.to_string(),
                 "DCT decode: invalid jpeg data reading from buffer"
             );
+            assert!(sink.writes.is_empty());
+            assert_eq!(sink.write_attempts, 0);
+            assert_eq!(sink.finishes, 0);
+            assert_eq!(sink.finish_attempts, 0);
+        }
+
+        #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+        {
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            let error = {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage
+                    .write(b"x")
+                    .expect("short malformed input must buffer");
+                stage
+                    .finish()
+                    .expect_err("short malformed JPEG must fail at finish")
+            };
+
+            assert!(matches!(error, PipelineError::Runtime(_)));
+            assert!(error.to_string().starts_with("DCT decode: "));
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
@@ -5793,8 +5860,8 @@ pub(crate) mod tests {
 
     /// qpdf's `filter_factories` (`QPDF_Stream.cc:85-94`) holds `/Crypt`
     /// alongside six codecs, so [`stream_filter_for`] holds it too. DCTDecode
-    /// contributes the streaming stage; its legacy whole-buffer route remains
-    /// passthrough-only until that route is cut over.
+    /// contributes the streaming stage; its whole-buffer adapter drives the
+    /// same stage so both callers exercise the qpdf DCT decode primitive.
     ///
     /// The legacy `filters::prepare_decode_filters` route still routes a
     /// `Crypt` spec to `PreparedStage::Crypt` before this lookup. The

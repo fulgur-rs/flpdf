@@ -39,6 +39,7 @@ generate_all() {
     python3 - "$out_dir" <<'PYEOF'
 import os
 import sys
+import base64
 import zlib
 
 out_dir = sys.argv[1]
@@ -170,6 +171,34 @@ flate_abc = zlib.compress(b"abc")
 write(
     "stream_flate",
     build_pdf(b"6 0 R", {6: stream(b"/Filter /FlateDecode", flate_abc)}),
+)
+
+dct_jpeg = base64.b64decode(
+    b"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDAREAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDTvLW3gvriGGCKOJJGVERAAoBwAAOgr5DG43ExxNSMakklJ9X3Pq8Hg8PLD05SpxbcV0XY/9k="
+)
+write(
+    "stream_dct",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter /DCTDecode", dct_jpeg)}),
+)
+write(
+    "stream_dct_alias",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter /DCT", dct_jpeg)}),
+)
+write(
+    "stream_dct_decode_parms",
+    build_pdf(
+        b"6 0 R",
+        {
+            6: stream(
+                b"/Filter /DCTDecode /DecodeParms << /ColorTransform 0 >>",
+                dct_jpeg,
+            )
+        },
+    ),
+)
+write(
+    "stream_dct_malformed",
+    build_pdf(b"6 0 R", {6: stream(b"/Filter /DCTDecode", b"abc")}),
 )
 write(
     "stream_indirect_filter",
