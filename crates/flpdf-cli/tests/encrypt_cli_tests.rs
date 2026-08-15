@@ -128,6 +128,88 @@ fn assert_qdf_encrypted_output(output: &Path, password: &str) {
         .expect("authenticated reader resolves the QDF root");
 }
 
+fn xref_stream_dictionary(bytes: &[u8]) -> &[u8] {
+    let type_marker = b"/Type /XRef";
+    let type_start = bytes
+        .windows(type_marker.len())
+        .rposition(|window| window == type_marker)
+        .expect("xref stream dictionary has /Type /XRef");
+    let object_header = b" obj\n";
+    let object_end = bytes[..type_start]
+        .windows(object_header.len())
+        .rposition(|window| window == object_header)
+        .map(|offset| offset + object_header.len())
+        .expect("xref stream has an indirect-object header");
+    let dictionary_start = object_end
+        + bytes[object_end..type_start]
+            .windows(2)
+            .position(|window| window == b"<<")
+            .expect("xref stream has a dictionary");
+    let dictionary_end = type_start
+        + bytes[type_start..]
+            .windows(b">>\nstream".len())
+            .position(|window| window == b">>\nstream")
+            .expect("xref stream dictionary has a stream terminator")
+        + 2;
+    &bytes[dictionary_start..dictionary_end]
+}
+
+fn xref_stream_dictionary_keys(dictionary: &[u8]) -> Vec<&'static str> {
+    const KEYS: [&str; 10] = [
+        "/Type",
+        "/Length",
+        "/Filter",
+        "/DecodeParms",
+        "/W",
+        "/Info",
+        "/Root",
+        "/Size",
+        "/ID",
+        "/Encrypt",
+    ];
+    let mut positions = KEYS
+        .iter()
+        .filter_map(|key| {
+            dictionary
+                .windows(key.len())
+                .position(|window| window == key.as_bytes())
+                .map(|position| (position, *key))
+        })
+        .collect::<Vec<_>>();
+    positions.sort_unstable_by_key(|(position, _)| *position);
+    positions.into_iter().map(|(_, key)| key).collect()
+}
+
+fn assert_qpdf_xref_stream_dictionary_contract(dictionary: &[u8]) {
+    assert!(dictionary
+        .windows(b"/Filter /FlateDecode".len())
+        .any(|window| { window == b"/Filter /FlateDecode" }));
+    assert!(dictionary
+        .windows(b"/DecodeParms << /Columns 4 /Predictor 12 >>".len())
+        .any(|window| window == b"/DecodeParms << /Columns 4 /Predictor 12 >>"));
+    assert!(dictionary
+        .windows(b"/W [ 1 2 1 ]".len())
+        .any(|window| window == b"/W [ 1 2 1 ]"));
+    assert!(!dictionary
+        .windows(b"/Index".len())
+        .any(|window| window == b"/Index"));
+}
+
+fn assert_qpdf_uncompressed_xref_stream_dictionary_contract(dictionary: &[u8]) {
+    assert!(dictionary
+        .windows(b"/W [ 1 2 1 ]".len())
+        .any(|window| window == b"/W [ 1 2 1 ]"));
+    assert!(!dictionary
+        .windows(b"/Filter".len())
+        .any(|window| window == b"/Filter"));
+    assert!(!dictionary
+        .windows(b"/DecodeParms".len())
+        .any(|window| window == b"/DecodeParms"));
+    assert!(!dictionary
+        .windows(b"/Index".len())
+        .any(|window| window == b"/Index"));
+}
+
 /// Top-level alias: `flpdf --encrypt USER OWNER 128 --use-aes=y -- IN OUT`
 /// produces an encrypted PDF that qpdf accepts with the user password.
 #[test]
@@ -1956,6 +2038,45 @@ fn encrypt_with_generate_object_streams_round_trips_via_qpdf() {
         "output must carry /Encrypt"
     );
 
+    // Compare the structural xref-stream contract with qpdf 11.9.0. Object
+    // numbering and offsets are intentionally not byte-compared here, but the
+    // qpdf-owned dictionary order, dynamic widths, PNG predictor, and full
+    // range handling must agree.
+    let qpdf_output = tmp.path().join("qpdf_encrypted_objstm.pdf");
+    let qpdf_result = ShellCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=generate",
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf xref-stream reference failed:\n{}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+    let qpdf_bytes = std::fs::read(qpdf_output).unwrap();
+    let flpdf_dictionary = xref_stream_dictionary(&bytes);
+    let qpdf_dictionary = xref_stream_dictionary(&qpdf_bytes);
+    assert_eq!(
+        xref_stream_dictionary_keys(flpdf_dictionary),
+        xref_stream_dictionary_keys(qpdf_dictionary),
+        "flpdf and qpdf xref-stream dictionaries must use the same key order:\nflpdf={}\nqpdf={}",
+        String::from_utf8_lossy(flpdf_dictionary),
+        String::from_utf8_lossy(qpdf_dictionary)
+    );
+    assert_qpdf_xref_stream_dictionary_contract(flpdf_dictionary);
+    assert_qpdf_xref_stream_dictionary_contract(qpdf_dictionary);
+
     // qpdf がユーザーパスワードで復号できること
     let check = std::process::Command::new("qpdf")
         .arg("--password=user-pw")
@@ -1999,6 +2120,73 @@ fn encrypt_with_generate_object_streams_round_trips_via_qpdf() {
         "qpdf --check on decrypted PDF failed:\n{}",
         String::from_utf8_lossy(&check_result.stderr)
     );
+}
+
+#[test]
+fn encrypt_with_generate_object_streams_uncompressed_xref_matches_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("encrypted_objstm_uncompressed_xref.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--object-streams=generate",
+            "--compress-streams=n",
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let qpdf_output = tmp
+        .path()
+        .join("qpdf_encrypted_objstm_uncompressed_xref.pdf");
+    let qpdf_result = ShellCommand::new("qpdf")
+        .args([
+            "--static-id",
+            "--static-aes-iv",
+            "--object-streams=generate",
+            "--compress-streams=n",
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf uncompressed xref-stream reference failed:\n{}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    let flpdf_bytes = std::fs::read(&output).unwrap();
+    let qpdf_bytes = std::fs::read(&qpdf_output).unwrap();
+    let flpdf_dictionary = xref_stream_dictionary(&flpdf_bytes);
+    let qpdf_dictionary = xref_stream_dictionary(&qpdf_bytes);
+    assert_eq!(
+        xref_stream_dictionary_keys(flpdf_dictionary),
+        xref_stream_dictionary_keys(qpdf_dictionary),
+        "uncompressed flpdf and qpdf xref-stream dictionaries must use the same key order:\nflpdf={}\nqpdf={}",
+        String::from_utf8_lossy(flpdf_dictionary),
+        String::from_utf8_lossy(qpdf_dictionary)
+    );
+    assert_qpdf_uncompressed_xref_stream_dictionary_contract(flpdf_dictionary);
+    assert_qpdf_uncompressed_xref_stream_dictionary_contract(qpdf_dictionary);
 }
 
 /// flpdf-9hc.4.17: xref-stream ソース + --object-streams=disable + --encrypt

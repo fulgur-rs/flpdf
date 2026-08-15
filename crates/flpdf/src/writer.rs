@@ -1214,6 +1214,7 @@ fn strip_xref_stream_trailer_keys(trailer: &mut Dictionary) {
     }
 }
 
+#[cfg(test)]
 fn build_xref_stream_bytes(
     offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     ranges: &[(u32, u32)],
@@ -3934,217 +3935,61 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
 
         XrefForm::Stream => {
-            // Cross-reference stream — pick a fresh object number beyond all
-            // emitted objects.
-            let xref_object_number = object_count as u32;
-
-            // Build the xref stream entries.  We include every object number
-            // in `[0, xref_object_number]` so that `/Size` and `/Index` stay
-            // consistent: object 0 and any gaps in the emitted-objects set are
-            // emitted as free entries, and the xref stream object itself sits
-            // at the end.  This produces a single contiguous /Index range and
-            // matches the structure a reader expects from a non-incremental
-            // xref stream.
-            let final_object_count = (xref_object_number as usize).saturating_add(1);
-            let mut xref_entries: BTreeMap<u32, (u16, XrefEntry)> = BTreeMap::new();
-            xref_entries.insert(0, (65535, XrefEntry::Free { next: 0 }));
-            for number in 1..xref_object_number {
-                if let Some(&(gen, off)) = offsets.get(&number) {
-                    // Regular indirect object (plain or ObjStm container).
-                    xref_entries.insert(
-                        number,
-                        (
-                            gen,
-                            XrefEntry::Uncompressed {
-                                offset: u64::try_from(off).map_err(|_| {
-                                    // cov:ignore-start: Rust supports no target whose usize is wider than u64.
-                                    crate::Error::Unsupported(
-                                        "xref offset does not fit u64".to_string(),
-                                    )
-                                })?,
-                                // cov:ignore-end
-                            },
-                        ),
-                    );
-                } else if let Some(&(container_num, index_in_batch)) =
-                    member_new_to_batch.get(&number)
-                {
-                    // Member object that lives inside an ObjStm container.
-                    // Compressed members have implicit generation 0; the
-                    // type-2 xref record carries the container's object number
-                    // and the member's index within that container.
-                    xref_entries.insert(
-                        number,
-                        (
-                            0,
-                            XrefEntry::Compressed {
-                                stream: container_num,
-                                index: index_in_batch,
-                            },
-                        ),
-                    );
-                } else {
-                    // Gap in emitted objects — emit as a free entry so the
-                    // xref stream covers `[0, /Size)` contiguously.
-                    // cov:ignore-start: Catalog-first numbering is contiguous and every number is emitted or assigned to an ObjStm.
-                    xref_entries.insert(number, (0, XrefEntry::Free { next: 0 }));
-                    // cov:ignore-end
-                }
-            }
-            xref_entries.insert(
-                xref_object_number,
-                (
-                    0,
-                    XrefEntry::Uncompressed {
-                        offset: u64::try_from(xref_offset).map_err(|_| {
-                            // cov:ignore-start: Rust supports no target whose usize is wider than u64.
-                            crate::Error::Unsupported(
-                                "xref stream offset does not fit u64".to_string(),
-                            )
-                        })?,
-                        // cov:ignore-end
-                    },
-                ),
-            );
-            for (&number, &(_generation, entry)) in &xref_entries {
-                if number != 0 && !matches!(entry, XrefEntry::Free { .. }) {
-                    written_xref.insert(ObjectRef::new(number, 0), entry);
-                }
-            }
-
-            // The entries are now contiguous `[0, final_object_count)`, so a
-            // single Index range suffices.
-            let ranges: Vec<(u32, u32)> = vec![(0, final_object_count as u32)];
-
-            // Build the raw xref entry bytes (binary format: field widths
-            // declared in /W).  This is structural PDF data, not a content
-            // stream, so `apply_stream_compress_policy` is not used here.
-            // Instead we apply the compress_streams toggle directly: when
-            // `CompressStreams::Yes` the raw bytes are FlateDecode-compressed
-            // (matching qpdf's default behaviour for xref streams); when
-            // `CompressStreams::No` they are stored without any filter.
-            let raw_xref_bytes = build_xref_stream_bytes(&xref_entries, &ranges)?;
-
-            let index_array = ranges
+            // Cross-reference stream emission is delegated to the canonical
+            // plain-writer xref layer below.
+            let xref_size = object_count.checked_add(1).ok_or_else(|| {
+                crate::Error::Unsupported("full-rewrite: xref-stream /Size overflows usize".into())
+            })?;
+            let old_to_new: HashMap<ObjectRef, ObjectRef> = renumbered
                 .iter()
-                .flat_map(|&(start, count)| {
-                    [
-                        ObjectHandle::integer(i64::from(start)),
-                        ObjectHandle::integer(i64::from(count)),
-                    ]
-                })
+                .map(|(new_ref, old_ref)| (*old_ref, *new_ref))
                 .collect();
-
-            let xref_map = |object_ref: ObjectRef| {
-                renumber.new_for_original(object_ref).ok_or_else(|| {
-                    // cov:ignore-start: catalog-first planning inserts every live xref-stream reference
-                    crate::Error::Unsupported(format!(
-                        "full-rewrite: xref-stream trailer reference {object_ref} absent from renumber map"
-                    ))
-                    // cov:ignore-end
-                }) // cov:ignore: catalog-first planning makes every xref-stream reference resolvable
+            let layout = plain::xref::BodyLayout {
+                uncompressed: offsets.clone(),
+                compressed: member_new_to_batch
+                    .iter()
+                    .map(|(&number, &(container, index))| {
+                        (number, plain::xref::CompressedLocation { container, index })
+                    })
+                    .collect(),
             };
-            let xref_dict = build_writer_trailer_handle(
+            let trailer_handle = build_writer_trailer_handle(
                 pdf,
                 pdf.last_xref_form() == XrefForm::Stream,
                 true,
-                final_object_count,
+                xref_size,
                 new_root,
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
                 generated_id_handle.as_ref(),
             )?; // cov:ignore: validated xref trailer construction; LLVM maps this continuation to the call setup
-            xref_dict.replace_key(b"/Type", ObjectHandle::name(b"XRef".to_vec()))?;
-            xref_dict.replace_key(
-                b"/W",
-                ObjectHandle::array(vec![
-                    ObjectHandle::integer(1),
-                    ObjectHandle::integer(8),
-                    ObjectHandle::integer(4),
-                ]),
-            )?; // cov:ignore: validated xref /W replacement; LLVM maps this continuation to the call setup
-            xref_dict.replace_key(b"/Index", ObjectHandle::array(index_array))?;
-
-            // Apply the compress_streams policy: FlateDecode-compress the xref
-            // binary payload when Yes, or store raw bytes when No.
-            let stream_data = match options.compress_streams {
-                CompressStreams::Yes => {
-                    let mut encode_dict = Dictionary::new();
-                    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-                    match filters::encode_stream_data(&encode_dict, &raw_xref_bytes) {
-                        Ok(compressed) => {
-                            xref_dict.replace_key(
-                                b"/Filter",
-                                ObjectHandle::name(b"FlateDecode".to_vec()),
-                            )?; // cov:ignore: validated xref /Filter replacement; LLVM maps this continuation to the call setup
-                            compressed
-                        }
-                        // Compression failure is essentially impossible for
-                        // in-memory zlib, but fall back to raw bytes so we
-                        // never emit an unreadable xref stream.
-                        Err(_) => raw_xref_bytes,
-                    }
+            let id = if options.deterministic_id {
+                plain::xref::IdPlan::Deterministic {
+                    source_id0: det_id_source_id0.clone(),
+                    info_suffix: det_id_info_suffix.clone(),
                 }
-                CompressStreams::No => {
-                    // No filter: store the structural binary directly.
-                    raw_xref_bytes
+            } else {
+                plain::xref::IdPlan::Materialized {
+                    value: plain::xref::materialized_id_handle(
+                        &trailer_handle.try_get_key(b"/ID")?,
+                    )?,
                 }
             };
-
-            xref_dict.replace_key(
-                b"/Length",
-                ObjectHandle::integer(i64::try_from(stream_data.len()).map_err(|_| {
-                    // cov:ignore-start: an allocatable xref-stream payload fits in i64
-                    crate::Error::Unsupported("xref stream /Length does not fit i64".to_string())
-                    // cov:ignore-end
-                })?),
-            )?; // cov:ignore: validated xref /Length replacement; LLVM maps this continuation to the call setup
-
-            // The cross-reference stream dictionary is serialized in plain
-            // lexicographic order (so `/ID` is NOT last), and its compressed
-            // binary payload follows. When deterministic-/ID is requested,
-            // direct-write the real /ID inline at `/ID`'s sorted position,
-            // computed from the bytes written up to and including its opening
-            // `[` — the same digest range the placeholder-then-patch step used
-            // to target. qpdf does not produce byte-parity output for xref-stream
-            // form, but this content-derived /ID keeps the output self-stable.
-            bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
-            if options.deterministic_id {
-                let mut id_writer = |out: &mut Vec<u8>| {
-                    write_deterministic_id_inline(
-                        out,
-                        &det_id_info_suffix,
-                        det_id_source_id0.as_deref(),
-                    )
-                };
-                // cov:ignore-start: multiline handle-native xref dictionary call; deterministic branch is covered by xref-stream fixtures
-                xref_dict.unparse_dictionary_with_ref_map_and_id_writer(
-                    &mut bytes,
-                    Some(&mut id_writer),
-                    &xref_map,
+            let trailer = plain::xref::TrailerPlan {
+                form: XrefForm::Stream,
+                canonical_entries: plain::plan::canonical_trailer_entries_with_visibility(
+                    pdf,
+                    &old_to_new,
                     &skip_ref_set,
                     qpdf_null_visibility,
-                )?;
-                // cov:ignore-end
-            } else {
-                // cov:ignore-start: multiline handle-native xref dictionary call; ordinary branch is covered by xref-stream fixtures
-                xref_dict.unparse_dictionary_with_ref_map_and_id_writer(
-                    &mut bytes,
-                    None,
-                    &xref_map,
-                    &skip_ref_set,
-                    qpdf_null_visibility,
-                )?;
-                // cov:ignore-end
-            }
-            serialize::write_stream_payload(
-                &mut bytes,
-                &stream_data,
-                options.newline_before_endstream,
-            );
-            bytes.extend_from_slice(b"\nendobj\n");
-            bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+                )?, // cov:ignore: live trailer references are validated by the canonical map
+                root: new_root,
+                id,
+                encrypt: encrypt_ctx.as_ref().map(|ctx| ctx.encrypt_ref),
+                structural_filtered: matches!(options.compress_streams, CompressStreams::Yes),
+            };
+            written_xref = plain::xref::append_xref_and_trailer(&mut bytes, &layout, &trailer)?;
         }
     }
 

@@ -3808,7 +3808,7 @@ impl ObjectHandle {
         }
         let image_mask = stream_dict.try_get_key(b"/ImageMask")?;
         image_mask.try_dereference()?;
-        Ok(!(image_mask.as_boolean() == Some(true)))
+        Ok(image_mask.as_boolean() != Some(true))
     }
 
     /// Return the page's `/Contents` as the qpdf-normalized stream list.
@@ -9516,6 +9516,7 @@ impl ObjectHandle {
     /// surrounding `<< >>` and therefore does not use the trailer prefix or
     /// `/ID`-last ordering. This is the handle-native counterpart of the
     /// structural dictionary writer in `QPDFWriter.cc:2391-2495`.
+    #[allow(dead_code)] // retained as the handle-native generic xref-dictionary primitive
     pub(crate) fn unparse_dictionary_with_ref_map_and_id_writer(
         &self,
         out: &mut Vec<u8>,
@@ -9705,6 +9706,7 @@ fn unparse_trailer_entries_with_ref_map(
     Ok(())
 }
 
+#[allow(dead_code)] // retained with its public primitive until a future xref consumer needs it
 fn unparse_dictionary_entries_with_ref_map_and_id_writer(
     entries: &[(Vec<u8>, ObjectHandle)],
     mut id_writer: Option<crate::object::TrailerIdWriter>,
