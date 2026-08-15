@@ -393,10 +393,24 @@ fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec
 /// cannot represent a later `trailer_handle()` mutation. Direct dictionaries
 /// and arrays are serialized through the canonical writer boundary so nested
 /// dictionary nulls are omitted and array null positions remain present.
-fn canonical_trailer_entries(
+pub(crate) fn canonical_trailer_entries(
     pdf: &mut Pdf<impl Read + Seek>,
     map: &HashMap<ObjectRef, ObjectRef>,
     removed_refs: &BTreeSet<ObjectRef>,
+) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    canonical_trailer_entries_with_visibility(pdf, map, removed_refs, true)
+}
+
+/// Snapshot trailer entries while preserving qpdf's mode-dependent top-level
+/// null visibility. The ordinary plain route suppresses null trailer values,
+/// while the specialized encrypted writer passes `false`, matching
+/// `QPDFWriter::writeTrailer` after `getTrimmedTrailer` (`QPDFWriter.cc:2009-
+/// 2027, 2917-2926`).
+pub(crate) fn canonical_trailer_entries_with_visibility(
+    pdf: &mut Pdf<impl Read + Seek>,
+    map: &HashMap<ObjectRef, ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    suppress_null_values: bool,
 ) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let trailer = pdf.trailer_handle();
     let entries = trailer.try_as_dictionary()?.unwrap_or_default();
@@ -411,7 +425,7 @@ fn canonical_trailer_entries(
             || value.as_reference().is_some_and(|object_ref| {
                 object_ref.number == 0 || removed_refs.contains(&object_ref)
             })
-            || value.try_is_null()?
+            || (suppress_null_values && value.try_is_null()?)
         {
             continue;
         }
@@ -887,6 +901,38 @@ mod tests {
         assert!(!text.contains("/Gone"));
         assert!(!text.contains("/Zero"));
         assert!(!text.contains("/Removed"));
+    }
+
+    #[test]
+    fn canonical_trailer_entries_follow_qpdf_null_visibility() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer_handle();
+        trailer.remove_key(b"/Info");
+        let null_ref = ObjectRef::new(100, 0);
+        let null_handle = pdf.get_object_handle(null_ref);
+        null_handle.set_resolved(ObjectValue::Null);
+        trailer.replace_key(b"/Null", null_handle).unwrap();
+        let mut map = HashMap::new();
+        map.insert(null_ref, ObjectRef::new(200, 0));
+
+        let suppressed =
+            canonical_trailer_entries_with_visibility(&mut pdf, &map, &BTreeSet::new(), true)
+                .unwrap();
+        assert!(!suppressed.iter().any(|(key, _)| key == b"/Null"));
+
+        let visible =
+            canonical_trailer_entries_with_visibility(&mut pdf, &map, &BTreeSet::new(), false)
+                .unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .find(|(key, _)| key == b"/Null")
+                .map(|(_, value)| value.as_slice()),
+            Some(b"200 0 R".as_slice())
+        );
     }
 
     #[test]
