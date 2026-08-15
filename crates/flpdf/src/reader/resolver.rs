@@ -2447,6 +2447,27 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok((parsed.value, parsed.parsed_offset))
     }
 
+    /// Read and cache the object whose indirect header starts at `offset`.
+    ///
+    /// qpdf's `QPDF::readObjectAtOffset` is intentionally independent of the
+    /// effective xref entry: linearization `/H[0]` names a physical source
+    /// position, and the object generation found in that header is the
+    /// identity used for the returned handle.  Keep that distinction on the
+    /// canonical resolver rather than routing the caller through
+    /// `resolve(ObjectRef)` and trusting a possibly stale xref row.
+    pub(crate) fn resolve_object_handle_at_offset(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+    ) -> Result<ObjectHandle> {
+        let parsed = self
+            .read_object_at_offset_with_description(offset, expected, true, false)
+            .map_err(ReadObjectAtOffsetError::into_error)?;
+        let object_ref = parsed.object_ref;
+        self.cache_parsed_object(parsed);
+        Ok(self.get_object_handle(object_ref))
+    }
+
     fn read_object_at_offset_with_description(
         &self,
         offset: u64,
