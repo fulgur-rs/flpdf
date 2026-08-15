@@ -27,11 +27,10 @@
 //! - `Err(LinearizationCheckError::InvalidParam { … })` — a param-dict invariant failed
 //! - `Err(LinearizationCheckError::Io(…))` — I/O failure reading the file
 
-use crate::filters::decode_stream_data;
-use crate::pages::page_refs;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::fmt;
 use std::io::{BufReader, Read, Seek};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -162,24 +161,21 @@ macro_rules! fail {
     };
 }
 
-/// Extract a non-negative integer value from a PDF `Object`.
+/// Extract a qpdf-style non-negative integer from a canonical object handle.
 ///
-/// `Object::Real` is accepted only when it carries an exact integer value
-/// (`r.fract() == 0.0`); fractional values like `/N 1.9` would otherwise be
-/// silently truncated and could spuriously satisfy integer invariants the
-/// checker is enforcing.
-fn as_u64(obj: &Object, key: &str) -> std::result::Result<u64, LinearizationCheckError> {
-    match obj {
-        Object::Integer(n) if *n >= 0 => Ok(*n as u64),
-        Object::Real(r) | Object::RealLiteral { value: r, .. }
-            if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 =>
-        {
-            Ok(*r as u64)
-        }
-        other => Err(LinearizationCheckError::InvalidParam {
+/// `readLinearizationData` checks `isInteger()` before reading `/O`, `/E`,
+/// `/N`, `/T`, `/P`, and every `/H` item.  Do not accept an integer-valued
+/// real here: that would make malformed linearization dictionaries pass the
+/// consumer route even though qpdf rejects them.
+fn as_u64(obj: &ObjectHandle, key: &str) -> std::result::Result<u64, LinearizationCheckError> {
+    obj.try_dereference()
+        .map_err(LinearizationCheckError::from)?;
+    match obj.as_integer() {
+        Some(n) if n >= 0 => Ok(n as u64),
+        _ => Err(LinearizationCheckError::InvalidParam {
             message: format!(
                 "/{key} is not a non-negative integer (got {})",
-                debug_obj(other)
+                obj.type_name()
             ),
         }),
     }
@@ -188,12 +184,6 @@ fn as_u64(obj: &Object, key: &str) -> std::result::Result<u64, LinearizationChec
 /// Return `true` if `b` is a PDF whitespace byte (ISO 32000-1 §7.2.3).
 fn is_pdf_whitespace(b: u8) -> bool {
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
-}
-
-fn debug_obj(obj: &Object) -> String {
-    let mut buf = Vec::new();
-    obj.write_pdf(&mut buf);
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -237,26 +227,34 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     let first_obj_ref =
         find_first_object_ref(file_bytes).ok_or(LinearizationCheckError::NotLinearized)?;
-    let first_obj = pdf
-        .resolve_borrowed(first_obj_ref)
-        .map_err(LinearizationCheckError::from)?;
-    let Some(param_dict) = first_obj.as_dict().cloned() else {
+    let first_obj = pdf.get_object_handle(first_obj_ref);
+    let Some(_) = first_obj
+        .try_as_dictionary()
+        .map_err(LinearizationCheckError::from)?
+    else {
         return Err(LinearizationCheckError::NotLinearized);
     };
 
-    let Some(linearized_val) = param_dict.get("Linearized") else {
+    let linearized_val = first_obj
+        .try_get_key(b"/Linearized")
+        .map_err(LinearizationCheckError::from)?;
+    linearized_val
+        .try_dereference()
+        .map_err(LinearizationCheckError::from)?;
+    let linearized_value = linearized_val
+        .as_integer()
+        .map(|value| value as f64)
+        .or_else(|| linearized_val.as_real());
+    if !linearized_value.is_some_and(|value| value.is_finite() && value.floor() == 1.0) {
         return Err(LinearizationCheckError::NotLinearized);
-    };
-    match linearized_val {
-        Object::Integer(n) if *n > 0 => {}
-        Object::Real(r) | Object::RealLiteral { value: r, .. } if r.is_finite() && *r > 0.0 => {}
-        _ => return Err(LinearizationCheckError::NotLinearized),
     }
 
     // -----------------------------------------------------------------------
     // 2. /L must equal file length
     // -----------------------------------------------------------------------
-    let l_obj = param_dict.get("L").cloned().unwrap_or(Object::Null);
+    let l_obj = first_obj
+        .try_get_key(b"/L")
+        .map_err(LinearizationCheckError::from)?;
     let l_val = as_u64(&l_obj, "L")?;
     if l_val != file_len {
         fail!("/L ({l_val}) does not match file length ({file_len})");
@@ -265,9 +263,12 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     // 3. /N must equal the page count
     // -----------------------------------------------------------------------
-    let n_obj = param_dict.get("N").cloned().unwrap_or(Object::Null);
+    let n_obj = first_obj
+        .try_get_key(b"/N")
+        .map_err(LinearizationCheckError::from)?;
     let n_val = as_u64(&n_obj, "N")?;
-    let page_count = page_refs(pdf)
+    let page_count = PageDocumentHelper::new(pdf)
+        .get_all_pages()
         .map_err(|e| LinearizationCheckError::Io(Box::new(e)))?
         .len() as u64;
     if n_val != page_count {
@@ -277,7 +278,9 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     // 4. /O must point to an existing Page object
     // -----------------------------------------------------------------------
-    let o_obj = param_dict.get("O").cloned().unwrap_or(Object::Null);
+    let o_obj = first_obj
+        .try_get_key(b"/O")
+        .map_err(LinearizationCheckError::from)?;
     let o_num = as_u64(&o_obj, "O")?;
     // PDF object numbers are u32; an /O value beyond u32::MAX cannot refer to
     // a real object — silently casting with `as u32` would wrap and look up
@@ -286,51 +289,82 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         message: format!("/O ({o_num}) does not fit in u32 — invalid object number"),
     })?;
     let o_ref = ObjectRef::new(o_num_u32, 0);
-    let o_object = pdf
-        .resolve_borrowed(o_ref)
+    let o_object = pdf.get_object_handle(o_ref);
+    let is_null = o_object
+        .try_is_null()
         .map_err(LinearizationCheckError::from)?;
-    match &o_object {
-        Object::Dictionary(d) => {
-            if let Some(Object::Name(type_name)) = d.get("Type") {
-                if type_name != b"Page" {
-                    fail!(
-                        "/O ({o_num}) points to an object with /Type /{} instead of /Page",
-                        String::from_utf8_lossy(type_name)
-                    );
-                }
-            } else if d.get("Parent").is_none() && d.get("MediaBox").is_none() {
-                // Without /Type, require at least one of the structural keys
-                // every Page object must inherit (/Parent) or define (/MediaBox).
-                // Empty / unrelated dictionaries are not Page objects.
-                fail!(
-                    "/O ({o_num}) points to a dictionary with no /Type, /Parent or /MediaBox \
-                     — does not look like a Page object"
-                );
-            }
-        }
-        Object::Null => {
+    let Some(_) = o_object
+        .try_as_dictionary()
+        .map_err(LinearizationCheckError::from)?
+    else {
+        if is_null {
             fail!("/O ({o_num}) refers to a non-existent object");
         }
-        _ => {
-            fail!("/O ({o_num}) does not refer to a dictionary");
+        fail!("/O ({o_num}) does not refer to a dictionary");
+    };
+
+    let type_obj = o_object
+        .try_get_key(b"/Type")
+        .map_err(LinearizationCheckError::from)?;
+    type_obj
+        .try_dereference()
+        .map_err(LinearizationCheckError::from)?;
+    if let Some(type_name) = type_obj.as_name() {
+        if type_name != b"Page" {
+            fail!(
+                "/O ({o_num}) points to an object with /Type /{} instead of /Page",
+                String::from_utf8_lossy(&type_name)
+            );
+        }
+    } else if type_obj
+        .try_is_null()
+        .map_err(LinearizationCheckError::from)?
+    {
+        let parent = o_object
+            .try_get_key(b"/Parent")
+            .map_err(LinearizationCheckError::from)?;
+        let media_box = o_object
+            .try_get_key(b"/MediaBox")
+            .map_err(LinearizationCheckError::from)?;
+        if parent
+            .try_is_null()
+            .map_err(LinearizationCheckError::from)?
+            && media_box
+                .try_is_null()
+                .map_err(LinearizationCheckError::from)?
+        {
+            // Without /Type, require at least one of the structural keys every
+            // Page object must inherit or define.
+            fail!(
+                "/O ({o_num}) points to a dictionary with no /Type, /Parent or /MediaBox \
+                 — does not look like a Page object"
+            );
         }
     }
 
     // -----------------------------------------------------------------------
     // 5. /H — hint stream at H[0] must be FlateDecode-decodable
     // -----------------------------------------------------------------------
-    let h_obj = param_dict.get("H").cloned().unwrap_or(Object::Null);
-    // /H is [offset, length] or [[offset, length], [offset2, length2]]
-    let (h_offset, h_length) = match &h_obj {
-        Object::Array(arr) if arr.len() >= 2 => {
-            let off = as_u64(&arr[0], "H[0]")?;
-            let len = as_u64(&arr[1], "H[1]")?;
-            (off, len)
-        }
-        _ => {
-            fail!("/H is missing or has unexpected format (expected [offset length])");
-        }
+    let h_obj = first_obj
+        .try_get_key(b"/H")
+        .map_err(LinearizationCheckError::from)?;
+    h_obj
+        .try_dereference()
+        .map_err(LinearizationCheckError::from)?;
+    let Some(h_items) = h_obj.as_array() else {
+        fail!("/H is missing or has unexpected format (expected [offset length])");
     };
+    if !matches!(h_items.len(), 2 | 4) {
+        fail!(
+            "/H has the wrong number of items (expected 2 or 4, got {})",
+            h_items.len()
+        );
+    }
+    for (index, item) in h_items.iter().enumerate() {
+        let _ = as_u64(item, &format!("H[{index}]"))?;
+    }
+    let h_offset = as_u64(&h_items[0], "H[0]")?;
+    let h_length = as_u64(&h_items[1], "H[1]")?;
 
     // Bounds: H[0] within file, H[0]+H[1] within file.
     if h_offset >= file_len {
@@ -348,7 +382,9 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // -----------------------------------------------------------------------
     // 6. /E must be less than file length
     // -----------------------------------------------------------------------
-    let e_obj = param_dict.get("E").cloned().unwrap_or(Object::Null);
+    let e_obj = first_obj
+        .try_get_key(b"/E")
+        .map_err(LinearizationCheckError::from)?;
     let e_val = as_u64(&e_obj, "E")?;
     if e_val >= file_len {
         fail!("/E ({e_val}) must be less than file length ({file_len})");
@@ -370,7 +406,9 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // We accept either form: a classic `xref` keyword reachable by a short
     // backscan, OR an XRef stream object header at the /T target.
     // -----------------------------------------------------------------------
-    let t_obj = param_dict.get("T").cloned().unwrap_or(Object::Null);
+    let t_obj = first_obj
+        .try_get_key(b"/T")
+        .map_err(LinearizationCheckError::from)?;
     let t_val = as_u64(&t_obj, "T")?;
     // /T must fit in the platform's `usize` (matters on 32-bit targets where
     // `u64 as usize` would silently truncate) and must leave at least 4 bytes
@@ -437,14 +475,21 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         // checker validates arbitrary linearized PDFs (including third-party
         // producers), and a cross-reference stream with gen != 0 is
         // spec-legal — hardcoding 0 would mis-resolve and spuriously reject it.
-        let xref_obj = pdf
-            .resolve_borrowed(ObjectRef::new(xref_obj_num, xref_obj_gen))
+        let xref_obj = pdf.get_object_handle(ObjectRef::new(xref_obj_num, xref_obj_gen));
+        xref_obj
+            .try_dereference()
             .map_err(LinearizationCheckError::from)?;
-        let is_xref_stream = matches!(
-            &xref_obj,
-            Object::Stream(s)
-                if matches!(s.dict.get("Type"), Some(Object::Name(t)) if t.as_slice() == b"XRef")
-        );
+        let is_xref_stream = if let Some(xref_dict) = xref_obj.as_stream_dict() {
+            let type_obj = xref_dict
+                .try_get_key(b"/Type")
+                .map_err(LinearizationCheckError::from)?;
+            type_obj
+                .try_dereference()
+                .map_err(LinearizationCheckError::from)?;
+            type_obj.as_name().as_deref() == Some(b"XRef")
+        } else {
+            false
+        };
         if !is_xref_stream {
             fail!(
                 "/T ({t_val}) points at object {xref_obj_num} which is not a \
@@ -521,18 +566,21 @@ fn parse_xref_first_entry_pos(file_bytes: &[u8], xref_pos: usize) -> Option<usiz
     Some(i)
 }
 
-/// Verify that the hint stream object at `offset` in `file_bytes`:
+/// Resolve and decode the hint stream object at `offset` through the canonical
+/// object/stream route.
 ///
-/// 1. Starts with a strict `N G obj` header at `offset`
-/// 2. Spans `expected_h_length` bytes (matching `/H[1]`)
-/// 3. Is a stream with `/Filter /FlateDecode` (or compatible) whose
-///    compressed data can actually be decoded.
-fn check_hint_stream_at_offset<R: Read + Seek>(
+/// The raw byte slice is used only to identify the object reference at `/H[0]`.
+/// The object itself is then resolved as an [`ObjectHandle`], its qpdf source
+/// extents are used for the `/H[1]` check, and `get_stream_data` runs the
+/// specialized stream pipeline. This mirrors qpdf's `readHintStream` boundary
+/// (`libqpdf/QPDF_linearization.cc:245-321`) without materializing a legacy
+/// `Object::Stream` value.
+pub(crate) fn load_hint_stream<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     file_bytes: &[u8],
     offset: usize,
     expected_h_length: u64,
-) -> CheckResult {
+) -> Result<(ObjectHandle, Rc<Vec<u8>>)> {
     // /H[0] must point exactly at the `N G obj` header (after at most a few
     // leading whitespace bytes).  A loose scan that just searches for `obj`
     // anywhere in a window would accept misaligned offsets that happen to
@@ -543,68 +591,76 @@ fn check_hint_stream_at_offset<R: Read + Seek>(
     let window = &file_bytes[offset..scan_end];
 
     let Some((obj_num, obj_gen)) = parse_obj_header_at(window) else {
-        fail!(
+        return Err(crate::Error::Unsupported(format!(
             "/H[0] offset ({offset}) does not point at an indirect object header \
              (expected `N G obj`)"
-        );
+        )));
     };
-
-    // Compute the actual byte span of the indirect object: from `offset`
-    // through the `endobj` keyword (plus a single trailing newline if
-    // present, matching the canonical PDF whitespace).  This is what /H[1]
-    // is supposed to advertise.
-    let endobj_pos = file_bytes[offset..]
-        .windows(b"endobj".len())
-        .position(|w| w == b"endobj")
-        .map(|p| offset + p);
-    let Some(endobj_pos) = endobj_pos else {
-        fail!(
-            "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) has no endobj keyword"
-        );
-    };
-    let mut actual_end = endobj_pos + b"endobj".len();
-    if actual_end < file_bytes.len() && file_bytes[actual_end] == b'\n' {
-        actual_end += 1;
-    }
-    let actual_length = (actual_end - offset) as u64;
-    if actual_length != expected_h_length {
-        fail!(
-            "/H[1] ({expected_h_length}) does not match the actual hint stream byte length \
-             ({actual_length}) measured from offset {offset} to endobj"
-        );
-    }
 
     // Resolve the object via the Pdf handle.  Use the parsed generation so a
     // hint stream with a non-zero generation (e.g. after incremental update)
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
-    let hint_obj = pdf
-        .resolve_borrowed(hint_ref)
-        .map_err(LinearizationCheckError::from)?;
-
-    match hint_obj {
-        Object::Stream(stream) => {
-            // Attempt to decode the compressed data.
-            decode_stream_data(&stream.dict, &stream.data).map_err(|e| {
-                LinearizationCheckError::InvalidParam {
-                    message: format!(
-                        "hint stream (object {obj_num} {obj_gen}) could not be decoded: {e}"
-                    ),
-                }
-            })?;
-        }
-        Object::Null => {
-            fail!(
+    let hint_obj = pdf.get_object_handle(hint_ref);
+    hint_obj.try_dereference()?;
+    let Some(hint_dict) = hint_obj.as_stream_dict() else {
+        if hint_obj.is_null() {
+            return Err(crate::Error::Unsupported(format!(
                 "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) does not exist"
-            );
+            )));
         }
-        _ => {
-            fail!(
-                "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) is not a stream"
-            );
-        }
+        return Err(crate::Error::Unsupported(format!(
+            "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) is not a stream"
+        )));
+    };
+
+    // qpdf's readHintStream checks the object end span, but if /Length is an
+    // indirect object immediately after the stream it checks the length
+    // object's extent instead (`QPDF_linearization.cc:269-294`).
+    let (mut end_before_space, mut end_after_space) = hint_obj.end_offsets();
+    let length_obj = hint_dict.try_get_key(b"/Length")?;
+    if length_obj.object_ref().is_some() {
+        length_obj.try_dereference()?;
+        (end_before_space, end_after_space) = length_obj.end_offsets();
+    }
+    let computed_end = offset
+        .checked_add(usize::try_from(expected_h_length).map_err(|_| {
+            crate::Error::Unsupported(format!(
+                "/H[1] ({expected_h_length}) does not fit in platform usize"
+            ))
+        })?)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!(
+                "/H[0] ({offset}) plus /H[1] ({expected_h_length}) overflows"
+            ))
+        })?;
+    if end_before_space >= 0
+        && end_after_space >= 0
+        && (i64::try_from(computed_end).unwrap_or(i64::MAX) < end_before_space
+            || i64::try_from(computed_end).unwrap_or(i64::MAX) > end_after_space)
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "/H[1] ({expected_h_length}) does not match hint stream object span \
+             {end_before_space}..{end_after_space} from offset {offset}"
+        )));
     }
 
+    let decoded = hint_obj.get_stream_data(DecodeLevel::Specialized)?;
+    Ok((hint_dict, decoded))
+}
+
+/// Verify that the hint stream can be located, has the qpdf source extent
+/// advertised by `/H[1]`, and can be decoded by the specialized pipeline.
+fn check_hint_stream_at_offset<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    file_bytes: &[u8],
+    offset: usize,
+    expected_h_length: u64,
+) -> CheckResult {
+    load_hint_stream(pdf, file_bytes, offset, expected_h_length).map_err(|error| match error {
+        crate::Error::Unsupported(message) => LinearizationCheckError::InvalidParam { message },
+        error => LinearizationCheckError::Io(Box::new(error)),
+    })?;
     Ok(())
 }
 
@@ -1115,48 +1171,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_consumer_production_uses_the_canonical_object_handle_route() {
+        let source = include_str!("check.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("check.rs has a test module")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "resolve_borrowed(",
+            "decode_stream_data(",
+            "page_refs(",
+            "Object::",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "check.rs production must not use legacy {forbidden} route"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
-    // as_u64: fractional Real values must be rejected, not truncated
+    // as_u64: qpdf's deeper parameters require integer handles
     // -----------------------------------------------------------------------
     #[test]
-    fn as_u64_rejects_fractional_real() {
-        let frac = Object::Real(1.9);
+    fn as_u64_rejects_real() {
+        let frac = ObjectHandle::real(1.9);
         assert!(
             matches!(
                 as_u64(&frac, "N"),
                 Err(LinearizationCheckError::InvalidParam { .. })
             ),
-            "Real(1.9) must not be silently truncated to 1"
+            "real /N must be rejected rather than coerced to an integer"
         );
     }
 
     #[test]
-    fn as_u64_accepts_integer_valued_real() {
-        let exact = Object::Real(42.0);
-        assert_eq!(as_u64(&exact, "N").unwrap(), 42, "Real(42.0) is exact");
+    fn as_u64_rejects_integer_valued_real() {
+        let exact = ObjectHandle::real(42.0);
+        assert!(matches!(
+            as_u64(&exact, "N"),
+            Err(LinearizationCheckError::InvalidParam { .. })
+        ));
     }
 
-    /// `as_u64` accepts an integer-valued `RealLiteral` (source literal
-    /// preserved through the parser but still equal to the whole-number
-    /// value). Covers the `RealLiteral` arm added for byte-identical
-    /// parity.
+    /// `as_u64` rejects a real literal because qpdf checks `isInteger()` before
+    /// reading the deeper linearization parameters.
     #[test]
-    fn as_u64_accepts_integer_valued_real_literal() {
-        let lit = Object::RealLiteral {
-            value: 42.0,
-            literal: b"42.0".to_vec(),
-        };
-        assert_eq!(as_u64(&lit, "N").unwrap(), 42);
+    fn as_u64_rejects_integer_valued_real_literal() {
+        let lit = ObjectHandle::real_literal(42.0, b"42.0".to_vec());
+        assert!(matches!(
+            as_u64(&lit, "N"),
+            Err(LinearizationCheckError::InvalidParam { .. })
+        ));
     }
 
-    /// A fractional `RealLiteral` (source literal `.9`) is rejected via the
-    /// same `.fract() == 0.0` guard that applies to `Object::Real`.
+    /// A fractional `RealLiteral` (source literal `.9`) is rejected as a
+    /// non-integer qpdf parameter.
     #[test]
     fn as_u64_rejects_fractional_real_literal() {
-        let lit = Object::RealLiteral {
-            value: 0.9,
-            literal: b".9".to_vec(),
-        };
+        let lit = ObjectHandle::real_literal(0.9, b".9".to_vec());
         assert!(matches!(
             as_u64(&lit, "N"),
             Err(LinearizationCheckError::InvalidParam { .. })
@@ -1195,19 +1273,16 @@ mod tests {
         pdf
     }
 
-    /// `check_linearization` recognizes `/Linearized` when its value is an
-    /// [`Object::RealLiteral`] (source literal like `.9`) and proceeds past
-    /// the `NotLinearized` early-return into the downstream checks — where
-    /// the intentionally-incomplete fixture then fails. If the RealLiteral
-    /// arm were missing, the failure would be `NotLinearized`.
+    /// qpdf's `isLinearized` rejects a real literal below one before the
+    /// deeper linearization dictionary checks run.
     #[test]
-    fn check_linearization_accepts_real_literal_linearized_value() {
+    fn check_linearization_rejects_real_literal_below_one() {
         let pdf = linearization_like_pdf_with_real_literal_linearized();
         let err = check_linearization_bytes(&pdf)
             .expect_err("stub fixture cannot satisfy a full linearization check"); // cov:ignore: expect_err panic branch only fires on unexpected Ok
         assert!(
-            !matches!(err, LinearizationCheckError::NotLinearized),
-            "RealLiteral /Linearized must not be rejected as NotLinearized (got {err:?})" // cov:ignore: format arg only evaluated on assert failure
+            matches!(err, LinearizationCheckError::NotLinearized),
+            "qpdf rejects /Linearized .9 before deeper checks (got {err:?})" // cov:ignore: format arg only evaluated on assert failure
         );
     }
 

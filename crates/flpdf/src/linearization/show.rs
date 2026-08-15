@@ -28,10 +28,11 @@
 //! disregard the hint stream itself, so any raw offset `>= H_offset` has
 //! `H_length` added before display (qpdf's `adjusted_offset`).
 
-use super::check::find_first_object_ref;
+use super::check::{find_first_object_ref, load_hint_stream};
 use crate::bit_stream::{BitStream, BitStreamError};
-use crate::filters::decode_stream_data;
-use crate::{Object, ObjectRef, Pdf};
+use crate::{ObjectHandle, PageDocumentHelper, Pdf};
+#[cfg(test)]
+use crate::ObjectRef;
 use std::fmt;
 use std::io::Cursor;
 
@@ -503,16 +504,24 @@ fn dump_generic(out: &mut String, p: &LinParameters, t: &HGeneric) {
 // Driver
 // ---------------------------------------------------------------------------
 
-/// Read a required non-negative integer parameter from the linearization
-/// parameter dictionary.
-fn param_u64(dict: &crate::Dictionary, key: &'static str) -> ShowResult<u64> {
-    match dict.get(key) {
-        Some(Object::Integer(n)) if *n >= 0 => Ok(*n as u64),
-        Some(Object::Real(r)) | Some(Object::RealLiteral { value: r, .. })
-            if r.is_finite() && *r >= 0.0 && r.fract() == 0.0 =>
-        {
-            Ok(*r as u64)
-        }
+/// Read a required non-negative integer parameter from a canonical
+/// linearization dictionary handle.
+fn param_u64(dict: &ObjectHandle, key: &'static str) -> ShowResult<u64> {
+    let value = dict
+        .try_get_key(format!("/{key}").as_bytes())
+        .map_err(ShowLinearizationError::from)?;
+    integer_u64(&value, key)
+}
+
+/// Read a non-negative integer from an already-selected canonical value
+/// handle. This is used for array items such as qpdf's `/H` fields, where a
+/// second dictionary lookup would be a type error.
+fn integer_u64(value: &ObjectHandle, key: &str) -> ShowResult<u64> {
+    value
+        .try_dereference()
+        .map_err(ShowLinearizationError::from)?;
+    match value.as_integer() {
+        Some(n) if n >= 0 => Ok(n as u64),
         _ => Err(malformed!(
             "/{key} is missing or not a non-negative integer in the linearization dictionary"
         )),
@@ -524,30 +533,42 @@ fn param_u64(dict: &crate::Dictionary, key: &'static str) -> ShowResult<u64> {
 /// Returns `true` when `/Linearized` is a number whose floor is 1 and, when
 /// `/L` is an integer, `/L` equals `file_size` (qpdf returns false on a `/L`
 /// mismatch — i.e. treats the file as not linearized).
-fn is_linearized(dict: &crate::Dictionary, file_size: u64) -> bool {
-    let linearized_ok = match dict.get("Linearized") {
-        Some(Object::Integer(n)) => *n == 1,
-        Some(Object::Real(r)) | Some(Object::RealLiteral { value: r, .. }) => {
-            r.is_finite() && r.floor() == 1.0
-        }
-        _ => false,
-    };
+fn is_linearized(dict: &ObjectHandle, file_size: u64) -> ShowResult<bool> {
+    dict.try_dereference()
+        .map_err(ShowLinearizationError::from)?;
+    let linearized = dict
+        .try_get_key(b"/Linearized")
+        .map_err(ShowLinearizationError::from)?;
+    linearized
+        .try_dereference()
+        .map_err(ShowLinearizationError::from)?;
+    let linearized_ok = linearized
+        .as_integer()
+        .map(|value| value as f64)
+        .or_else(|| linearized.as_real())
+        .is_some_and(|value| value.is_finite() && value.floor() == 1.0);
     if !linearized_ok {
-        return false;
+        return Ok(false);
     }
-    if let Some(Object::Integer(l)) = dict.get("L") {
-        if *l < 0 || (*l as u64) != file_size {
-            return false;
+    let length = dict
+        .try_get_key(b"/L")
+        .map_err(ShowLinearizationError::from)?;
+    length
+        .try_dereference()
+        .map_err(ShowLinearizationError::from)?;
+    if let Some(l) = length.as_integer() {
+        if l < 0 || l as u64 != file_size {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Extract qpdf's `LinParameters` from the linearization parameter dictionary.
 ///
 /// `file_size` is the actual file length (used directly; qpdf's `isLinearized`
 /// has already verified that `/L` equals it).
-fn read_lin_parameters(dict: &crate::Dictionary, file_size: u64) -> ShowResult<LinParameters> {
+fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinParameters> {
     let first_page_object = param_u64(dict, "O")?;
     let first_page_end = param_u64(dict, "E")?;
     let npages_u64 = param_u64(dict, "N")?;
@@ -557,26 +578,38 @@ fn read_lin_parameters(dict: &crate::Dictionary, file_size: u64) -> ShowResult<L
         .map_err(|_| malformed!("/N ({npages_u64}) does not fit in u32"))?;
     let xref_zero_offset = param_u64(dict, "T")?;
     // /P (first page number) is optional; qpdf defaults to 0 when absent/null.
-    let first_page: i64 = match dict.get("P") {
-        Some(Object::Integer(n)) => *n,
-        Some(Object::Null) | None => 0,
-        _ => return Err(malformed!("/P is present but not an integer")),
+    let p = dict
+        .try_get_key(b"/P")
+        .map_err(ShowLinearizationError::from)?;
+    p.try_dereference().map_err(ShowLinearizationError::from)?;
+    let first_page: i64 = if let Some(n) = p.as_integer() {
+        n
+    } else if p.is_null() {
+        0
+    } else {
+        return Err(malformed!("/P is present but not an integer"));
     };
-    // /H is [offset length] (or 4 items for an overflow table; we use H[0..2]).
-    let (h_offset, h_length) = match dict.get("H") {
-        Some(Object::Array(arr)) if arr.len() >= 2 => {
-            let off = match &arr[0] {
-                Object::Integer(n) if *n >= 0 => *n as u64,
-                _ => return Err(malformed!("/H[0] is not a non-negative integer")),
-            };
-            let len = match &arr[1] {
-                Object::Integer(n) if *n >= 0 => *n as u64,
-                _ => return Err(malformed!("/H[1] is not a non-negative integer")),
-            };
-            (off, len)
-        }
-        _ => return Err(malformed!("/H is missing or not an [offset length] array")),
+    // /H is [offset length] or [offset length offset length] for an overflow
+    // table. qpdf rejects every other cardinality before reading the items.
+    let h = dict
+        .try_get_key(b"/H")
+        .map_err(ShowLinearizationError::from)?;
+    h.try_dereference().map_err(ShowLinearizationError::from)?;
+    let Some(h_items) = h.as_array() else {
+        return Err(malformed!("/H is missing or not an [offset length] array"));
     };
+    if !matches!(h_items.len(), 2 | 4) {
+        return Err(malformed!(
+            "/H has the wrong number of items (expected 2 or 4, got {})",
+            h_items.len()
+        ));
+    }
+    let h_offset = integer_u64(&h_items[0], "H[0]")?;
+    let h_length = integer_u64(&h_items[1], "H[1]")?;
+    if h_items.len() == 4 {
+        let _ = integer_u64(&h_items[2], "H[2]")?;
+        let _ = integer_u64(&h_items[3], "H[3]")?;
+    }
     Ok(LinParameters {
         file_size,
         first_page_object,
@@ -593,23 +626,34 @@ fn read_lin_parameters(dict: &crate::Dictionary, file_size: u64) -> ShowResult<L
 /// from the **hint stream** dictionary (not the parameter dict).
 ///
 /// Returns `(s_offset, outline_offset)`.
-fn read_hint_offsets(hint_dict: &crate::Dictionary) -> ShowResult<(usize, Option<usize>)> {
-    let s_offset = match hint_dict.get("S") {
-        Some(Object::Integer(n)) if *n >= 0 => usize::try_from(*n)
-            // cov:ignore: on 64-bit usize is u64, so a non-negative /S offset
-            // always fits; this only fires on 32-bit targets.
-            .map_err(|_| malformed!("hint stream /S offset does not fit in platform usize"))?,
-        _ => return Err(malformed!("hint stream /S offset is missing or invalid")),
-    };
-    let outline_offset: Option<usize> = match hint_dict.get("O") {
-        Some(Object::Integer(n)) if *n >= 0 => Some(
-            usize::try_from(*n)
-                // cov:ignore: on 64-bit usize is u64, so a non-negative /O offset
-                // always fits; this only fires on 32-bit targets.
+fn read_hint_offsets(hint_dict: &ObjectHandle) -> ShowResult<(usize, Option<usize>)> {
+    let s = hint_dict
+        .try_get_key(b"/S")
+        .map_err(ShowLinearizationError::from)?;
+    let s_value = integer_u64(&s, "S")?;
+    let s_offset = usize::try_from(s_value)
+        // cov:ignore: on 64-bit usize is u64, so a non-negative /S offset
+        // always fits; this only fires on 32-bit targets.
+        .map_err(|_| malformed!("hint stream /S offset does not fit in platform usize"))?;
+
+    let outline = hint_dict
+        .try_get_key(b"/O")
+        .map_err(ShowLinearizationError::from)?;
+    outline
+        .try_dereference()
+        .map_err(ShowLinearizationError::from)?;
+    let outline_offset = if let Some(value) = outline.as_integer() {
+        if value < 0 {
+            return Err(malformed!("hint stream /O offset is negative"));
+        }
+        Some(
+            usize::try_from(value as u64)
+                // cov:ignore: on 64-bit usize is u64, so a non-negative /O
+                // offset always fits; this only fires on 32-bit targets.
                 .map_err(|_| malformed!("hint stream /O offset does not fit in platform usize"))?,
-        ),
-        Some(Object::Integer(_)) => return Err(malformed!("hint stream /O offset is negative")),
-        _ => None,
+        )
+    } else {
+        None
     };
     Ok((s_offset, outline_offset))
 }
@@ -641,11 +685,15 @@ fn show_with_pdf(
         return not_linearized();
         // cov:ignore-end
     };
-    let first_obj = pdf.resolve_borrowed(first_obj_ref)?;
-    let Some(param_dict) = first_obj.as_dict().cloned() else {
+    let param_dict = pdf.get_object_handle(first_obj_ref);
+    if param_dict
+        .try_as_dictionary()
+        .map_err(ShowLinearizationError::from)?
+        .is_none()
+    {
         return not_linearized();
-    };
-    if !is_linearized(&param_dict, file_size) {
+    }
+    if !is_linearized(&param_dict, file_size)? {
         return not_linearized();
     }
 
@@ -658,7 +706,7 @@ fn show_with_pdf(
     // linearized file has /N equal to its page count, so this never rejects
     // valid input; a malformed /N (up to u32::MAX) is reported as malformed
     // rather than driving a multi-gigabyte pre-allocation (OOM DoS).
-    let page_count = crate::pages::page_refs(pdf)?.len();
+    let page_count = PageDocumentHelper::new(pdf).get_all_pages()?.len();
     if params.npages as usize != page_count {
         // cov:ignore-start: /N disagreeing with the page tree — never emitted by
         // flpdf's writer; this bounds read_h_page_offset against a malformed /N.
@@ -691,30 +739,15 @@ fn show_with_pdf(
         ));
         // cov:ignore-end
     }
-    let Some(hint_ref) = parse_obj_header(&file_bytes[h_usize..]) else {
-        // cov:ignore-start: /H[0] not pointing at an object header — never
-        // emitted by flpdf's writer.
-        return Err(malformed!(
-            "/H[0] offset ({}) does not point at an object header",
-            params.h_offset
-        ));
-        // cov:ignore-end
-    };
-    let hint_obj = pdf.resolve_borrowed(hint_ref)?;
-    let Object::Stream(stream) = &hint_obj else {
-        // cov:ignore-start: hint object not a stream — never emitted by flpdf.
-        return Err(malformed!(
-            "hint stream object at /H[0] offset {} is not a stream",
-            params.h_offset
-        ));
-        // cov:ignore-end
-    };
-    let decompressed = decode_stream_data(&stream.dict, &stream.data)
-        .map_err(|e| malformed!("hint stream could not be decoded: {e}"))?;
+    let (hint_dict, decompressed) = load_hint_stream(pdf, file_bytes, h_usize, params.h_length)
+        .map_err(|error| match error {
+            crate::Error::Unsupported(message) => malformed!("{message}"),
+            error => ShowLinearizationError::from(error),
+        })?;
 
     // /S (shared object table offset) and /O (outline table offset) are keys on
     // the HINT STREAM dictionary — not the parameter dict.
-    let (s_offset, outline_offset) = read_hint_offsets(&stream.dict)?;
+    let (s_offset, outline_offset) = read_hint_offsets(&hint_dict)?;
     if s_offset >= decompressed.len() {
         // cov:ignore-start: /S out of bounds — flpdf keeps /S in bounds.
         return Err(malformed!(
@@ -801,6 +834,7 @@ fn format_dump(
 
 /// Parse an `N G obj` header at the start of `window` and return its
 /// [`ObjectRef`].  Mirrors the strict header parser used by the checker.
+#[cfg(test)]
 fn parse_obj_header(window: &[u8]) -> Option<ObjectRef> {
     fn is_ws(b: u8) -> bool {
         matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
@@ -1495,43 +1529,35 @@ mod tests {
 
     #[test]
     fn param_u64_rejects_fractional() {
-        let mut d = crate::Dictionary::new();
-        d.insert("N", Object::Real(1.5));
+        let d = ObjectHandle::dictionary(vec![(b"/N".to_vec(), ObjectHandle::real(1.5))]);
         assert!(matches!(
             param_u64(&d, "N"),
             Err(ShowLinearizationError::Malformed { .. })
         ));
     }
 
-    /// `param_u64` recognizes a whole-number `/DA` parameter stored as
-    /// [`Object::RealLiteral`] (source literal like `5.0` that Rust's
-    /// shortest round-trip would render as `5`). Guards the RealLiteral
-    /// arm added for byte-identical parity.
+    /// qpdf rejects a whole-number real literal for a deeper linearization
+    /// parameter because `readLinearizationData` requires `isInteger()`.
     #[test]
-    fn param_u64_accepts_real_literal_whole_number() {
-        let mut d = crate::Dictionary::new();
-        d.insert(
-            "N",
-            Object::RealLiteral {
-                value: 5.0,
-                literal: b"5.0".to_vec(),
-            },
-        );
-        assert_eq!(param_u64(&d, "N").expect("must succeed"), 5);
+    fn param_u64_rejects_real_literal_whole_number() {
+        let d = ObjectHandle::dictionary(vec![(
+            b"/N".to_vec(),
+            ObjectHandle::real_literal(5.0, b"5.0".to_vec()),
+        )]);
+        assert!(matches!(
+            param_u64(&d, "N"),
+            Err(ShowLinearizationError::Malformed { .. })
+        ));
     }
 
-    /// A fractional `RealLiteral` (e.g. `1.5`) is still rejected — the
-    /// `.fract() == 0.0` guard applies to both real variants.
+    /// A fractional `RealLiteral` (e.g. `1.5`) is rejected as a non-integer
+    /// qpdf parameter.
     #[test]
     fn param_u64_rejects_fractional_real_literal() {
-        let mut d = crate::Dictionary::new();
-        d.insert(
-            "N",
-            Object::RealLiteral {
-                value: 1.5,
-                literal: b"1.5".to_vec(),
-            },
-        );
+        let d = ObjectHandle::dictionary(vec![(
+            b"/N".to_vec(),
+            ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
+        )]);
         assert!(matches!(
             param_u64(&d, "N"),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1732,27 +1758,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn show_consumer_production_uses_the_canonical_object_handle_route() {
+        let source = include_str!("show.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("show.rs has a test module")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "resolve_borrowed(",
+            "decode_stream_data(",
+            "page_refs(",
+            "Object::",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "show.rs production must not use legacy {forbidden} route"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Helper-level error arms via hand-built dictionaries (no byte fragility).
     // -----------------------------------------------------------------------
 
-    fn full_param_dict() -> crate::Dictionary {
-        let mut d = crate::Dictionary::new();
-        d.insert("O", Object::Integer(8));
-        d.insert("E", Object::Integer(1212));
-        d.insert("N", Object::Integer(2));
-        d.insert("T", Object::Integer(1885));
-        d.insert(
-            "H",
-            Object::Array(vec![Object::Integer(601), Object::Integer(128)]),
-        );
-        d
+    fn full_param_dict() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"/O".to_vec(), ObjectHandle::integer(8)),
+            (b"/E".to_vec(), ObjectHandle::integer(1212)),
+            (b"/N".to_vec(), ObjectHandle::integer(2)),
+            (b"/T".to_vec(), ObjectHandle::integer(1885)),
+            (
+                b"/H".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(601), ObjectHandle::integer(128)]),
+            ),
+        ])
     }
 
     #[test]
     fn read_lin_parameters_happy() {
-        let mut d = full_param_dict();
-        d.insert("P", Object::Integer(0));
+        let d = full_param_dict();
+        d.replace_key(b"/P", ObjectHandle::integer(0)).unwrap();
         let p = read_lin_parameters(&d, 2103).unwrap();
         assert_eq!(p.file_size, 2103);
         assert_eq!(p.first_page_object, 8);
@@ -1772,8 +1822,9 @@ mod tests {
 
     #[test]
     fn read_lin_parameters_p_wrong_type_is_malformed() {
-        let mut d = full_param_dict();
-        d.insert("P", Object::Name(b"oops".to_vec()));
+        let d = full_param_dict();
+        d.replace_key(b"/P", ObjectHandle::name(b"oops".to_vec()))
+            .unwrap();
         assert!(matches!(
             read_lin_parameters(&d, 2103),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1782,8 +1833,37 @@ mod tests {
 
     #[test]
     fn read_lin_parameters_h_too_short_is_malformed() {
-        let mut d = full_param_dict();
-        d.insert("H", Object::Array(vec![Object::Integer(601)]));
+        let d = full_param_dict();
+        d.replace_key(b"/H", ObjectHandle::array(vec![ObjectHandle::integer(601)]))
+            .unwrap();
+        assert!(matches!(
+            read_lin_parameters(&d, 2103),
+            Err(ShowLinearizationError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn read_lin_parameters_rejects_non_integer_deeper_parameter() {
+        let d = full_param_dict();
+        d.replace_key(b"/N", ObjectHandle::real(2.0)).unwrap();
+        assert!(matches!(
+            read_lin_parameters(&d, 2103),
+            Err(ShowLinearizationError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn read_lin_parameters_rejects_three_item_hint_array() {
+        let d = full_param_dict();
+        d.replace_key(
+            b"/H",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(601),
+                ObjectHandle::integer(128),
+                ObjectHandle::integer(0),
+            ]),
+        )
+        .unwrap();
         assert!(matches!(
             read_lin_parameters(&d, 2103),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1792,8 +1872,8 @@ mod tests {
 
     #[test]
     fn read_lin_parameters_h_not_array_is_malformed() {
-        let mut d = full_param_dict();
-        d.insert("H", Object::Integer(5));
+        let d = full_param_dict();
+        d.replace_key(b"/H", ObjectHandle::integer(5)).unwrap();
         assert!(matches!(
             read_lin_parameters(&d, 2103),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1802,11 +1882,15 @@ mod tests {
 
     #[test]
     fn read_lin_parameters_h0_wrong_type_is_malformed() {
-        let mut d = full_param_dict();
-        d.insert(
-            "H",
-            Object::Array(vec![Object::Name(b"x".to_vec()), Object::Integer(128)]),
-        );
+        let d = full_param_dict();
+        d.replace_key(
+            b"/H",
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"x".to_vec()),
+                ObjectHandle::integer(128),
+            ]),
+        )
+        .unwrap();
         assert!(matches!(
             read_lin_parameters(&d, 2103),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1815,11 +1899,15 @@ mod tests {
 
     #[test]
     fn read_lin_parameters_h1_wrong_type_is_malformed() {
-        let mut d = full_param_dict();
-        d.insert(
-            "H",
-            Object::Array(vec![Object::Integer(601), Object::Name(b"x".to_vec())]),
-        );
+        let d = full_param_dict();
+        d.replace_key(
+            b"/H",
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(601),
+                ObjectHandle::name(b"x".to_vec()),
+            ]),
+        )
+        .unwrap();
         assert!(matches!(
             read_lin_parameters(&d, 2103),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1828,20 +1916,20 @@ mod tests {
 
     #[test]
     fn read_hint_offsets_happy_and_outline() {
-        let mut d = crate::Dictionary::new();
-        d.insert("S", Object::Integer(36));
-        d.insert("O", Object::Integer(72));
+        let d = ObjectHandle::dictionary(vec![
+            (b"/S".to_vec(), ObjectHandle::integer(36)),
+            (b"/O".to_vec(), ObjectHandle::integer(72)),
+        ]);
         assert_eq!(read_hint_offsets(&d).unwrap(), (36, Some(72)));
 
         // No /O → None.
-        let mut d2 = crate::Dictionary::new();
-        d2.insert("S", Object::Integer(36));
+        let d2 = ObjectHandle::dictionary(vec![(b"/S".to_vec(), ObjectHandle::integer(36))]);
         assert_eq!(read_hint_offsets(&d2).unwrap(), (36, None));
     }
 
     #[test]
     fn read_hint_offsets_missing_s_is_malformed() {
-        let d = crate::Dictionary::new();
+        let d = ObjectHandle::dictionary(Vec::new());
         assert!(matches!(
             read_hint_offsets(&d),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1850,9 +1938,10 @@ mod tests {
 
     #[test]
     fn read_hint_offsets_negative_outline_is_malformed() {
-        let mut d = crate::Dictionary::new();
-        d.insert("S", Object::Integer(36));
-        d.insert("O", Object::Integer(-1));
+        let d = ObjectHandle::dictionary(vec![
+            (b"/S".to_vec(), ObjectHandle::integer(36)),
+            (b"/O".to_vec(), ObjectHandle::integer(-1)),
+        ]);
         assert!(matches!(
             read_hint_offsets(&d),
             Err(ShowLinearizationError::Malformed { .. })
@@ -1882,34 +1971,32 @@ mod tests {
 
     #[test]
     fn is_linearized_accepts_integer_and_real_one() {
-        let mut d = crate::Dictionary::new();
-        d.insert("Linearized", Object::Integer(1));
-        assert!(is_linearized(&d, 100));
+        let d = ObjectHandle::dictionary(vec![(b"/Linearized".to_vec(), ObjectHandle::integer(1))]);
+        assert!(is_linearized(&d, 100).unwrap());
 
-        let mut d2 = crate::Dictionary::new();
-        d2.insert("Linearized", Object::Real(1.0));
-        assert!(is_linearized(&d2, 100));
+        let d2 = ObjectHandle::dictionary(vec![(b"/Linearized".to_vec(), ObjectHandle::real(1.0))]);
+        assert!(is_linearized(&d2, 100).unwrap());
     }
 
     #[test]
     fn is_linearized_rejects_missing_or_wrong_linearized() {
         // Missing key.
-        assert!(!is_linearized(&crate::Dictionary::new(), 100));
+        assert!(!is_linearized(&ObjectHandle::dictionary(Vec::new()), 100).unwrap());
         // Wrong value.
-        let mut d = crate::Dictionary::new();
-        d.insert("Linearized", Object::Integer(0));
-        assert!(!is_linearized(&d, 100));
+        let d = ObjectHandle::dictionary(vec![(b"/Linearized".to_vec(), ObjectHandle::integer(0))]);
+        assert!(!is_linearized(&d, 100).unwrap());
     }
 
     #[test]
     fn is_linearized_rejects_l_mismatch() {
-        let mut d = crate::Dictionary::new();
-        d.insert("Linearized", Object::Integer(1));
-        d.insert("L", Object::Integer(999)); // != file_size
-        assert!(!is_linearized(&d, 100));
+        let d = ObjectHandle::dictionary(vec![
+            (b"/Linearized".to_vec(), ObjectHandle::integer(1)),
+            (b"/L".to_vec(), ObjectHandle::integer(999)),
+        ]);
+        assert!(!is_linearized(&d, 100).unwrap());
         // Matching /L is accepted.
-        d.insert("L", Object::Integer(100));
-        assert!(is_linearized(&d, 100));
+        d.replace_key(b"/L", ObjectHandle::integer(100)).unwrap();
+        assert!(is_linearized(&d, 100).unwrap());
     }
 
     #[test]
