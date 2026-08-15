@@ -625,6 +625,52 @@ fn test_form_own_resources_are_pruned_in_auto_mode() {
     );
 }
 
+// qpdf discovers which Form XObjects to recurse into by iterating
+// `xobj_dict.getKeys()` on the *declared* `/XObject` resource-dictionary keys
+// (`QPDFPageObjectHelper::forEachXObject`, `QPDFPageObjectHelper.cc:313-345`)
+// — completely independent of whether that name is ever invoked by a `Do`
+// operator in the content stream. A Form declared but never invoked is still
+// queued and recursed into.
+//
+// Fm0 is declared in the page's /Resources/XObject but the page content
+// (`q Q`) never invokes it via `Do`. Fm0 has its own /Resources with an
+// unused /F2 alongside a used /F1. qpdf still walks into Fm0 (because it is
+// declared, not because it is invoked) and prunes /F2 from Fm0's own /Font
+// dictionary.
+#[test]
+fn test_declared_but_uninvoked_form_xobject_is_still_recursed() {
+    let form_content = b"BT /F1 10 Tf (inside form) Tj ET";
+    let form_stream = {
+        let header = format!(
+            "7 0 obj\n<< /Subtype /Form /Length {} /Resources << /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >> >>\nstream\n",
+            form_content.len()
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(form_content);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    };
+    // Page content never invokes /Fm0 via Do — Fm0 is declared only.
+    let extra = vec![
+        (4, stream_obj(4, b"q Q")),
+        (5, obj_bytes(5, "<< /XObject << /Fm0 7 0 R >> >>")),
+        (7, form_stream),
+    ];
+    let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
+
+    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes).expect("prune");
+
+    let keys = form_resource_dict_keys(&mut pdf, ObjectRef::new(7, 0), "Font");
+    assert_eq!(
+        keys,
+        vec!["F1"],
+        "a declared-but-never-invoked Form XObject must still be recursed into and \
+         its own unused /Font entry pruned, matching qpdf's forEachXObject \
+         declared-key enumeration: {keys:?}"
+    );
+}
+
 // Test (i): Form without /Resources inherits page scope — existing behaviour preserved.
 //
 // Setup:

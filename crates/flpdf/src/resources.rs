@@ -1040,14 +1040,22 @@ impl ParserCallbacks for ResourceCallbacks {
 }
 
 /// Result of parsing a content stream before walking its referenced Forms.
+///
+/// `ResourceCallbacks::valid_xobjects` (the `Do`-invoked names) is
+/// deliberately not surfaced here: the recursion-triggering walk uses the
+/// declared `/XObject` resource-dictionary keys instead (see
+/// [`declared_xobject_names`]), matching qpdf's `forEachXObject`
+/// (`QPDFPageObjectHelper.cc:313-345`), which is a static structural walk over
+/// `xobj_dict.getKeys()` independent of content-stream parsing. Every name a
+/// `Do` operator could legally invoke is necessarily a declared key, so the
+/// declared set is a superset and `Do`-invoked names add nothing here.
 struct ParsedContent {
     complete: bool,
     names: ResourceNamesByType,
-    valid_xobjects: Vec<(Vec<u8>, usize)>,
 }
 
-/// Tokenise `stream_bytes` and collect its direct resource events and Form
-/// XObject calls without resolving any child object yet.
+/// Tokenise `stream_bytes` and collect its direct resource events without
+/// resolving any child object yet.
 fn parse_resource_content(stream_bytes: &[u8]) -> ParsedContent {
     let mut callbacks = ResourceCallbacks {
         finder: ResourceFinder::default(),
@@ -1059,13 +1067,34 @@ fn parse_resource_content(stream_bytes: &[u8]) -> ParsedContent {
     let complete =
         parse_result.is_ok() && !callbacks.finder.had_diagnostics() && callbacks.complete;
     let names = callbacks.finder.names_by_resource_type().clone();
-    let mut valid_xobjects = callbacks.valid_xobjects.into_iter().collect::<Vec<_>>();
-    valid_xobjects.sort_unstable_by_key(|(_, offset)| *offset);
-    ParsedContent {
-        complete,
-        names,
-        valid_xobjects,
-    }
+    ParsedContent { complete, names }
+}
+
+/// Return the declared `/XObject` resource-dictionary keys in `resources`.
+///
+/// Matches qpdf's `xobj_dict.getKeys()` enumeration in
+/// `QPDFPageObjectHelper::forEachXObject` (`QPDFPageObjectHelper.cc:313-345`):
+/// every key declared in the current scope's `/XObject` category is a
+/// recursion candidate, independent of whether the content stream ever
+/// invokes it with a `Do` operator. A Form declared but never invoked is
+/// still queued and walked by qpdf's traversal, so it must be here too.
+///
+/// The `/XObject` category itself may be a direct dictionary or an indirect
+/// reference (resolved the same way `recurse_form_xobject`'s own per-name
+/// lookup resolves it, and the way `form_xobjects_in_resources` resolves the
+/// category for the sibling "Form-owned resources" pruning pass).
+fn declared_xobject_names<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: Option<&Dictionary>,
+) -> Result<Vec<Vec<u8>>> {
+    let xobj_dict = match resources.and_then(|res| res.get("XObject")) {
+        Some(Object::Dictionary(xobj_dict)) => Some(xobj_dict.clone()),
+        Some(cat_ref @ Object::Reference(_)) => resolve_ref_chain(pdf, cat_ref)?.0.into_dict(),
+        _ => None,
+    };
+    Ok(xobj_dict
+        .map(|dict| dict.iter().map(|(name, _)| name.to_vec()).collect())
+        .unwrap_or_default())
 }
 
 /// Record direct resource names in the page or owning Form accumulator.
@@ -1092,6 +1121,16 @@ fn record_names_for_target(
 /// Form XObjects are still traversed regardless, so a resource-less Form nested
 /// inside an own-resources Form still contributes names to the page.
 ///
+/// Recursion targets are `scope`'s *declared* `/XObject` resource-dictionary
+/// keys (see [`declared_xobject_names`]), not the `Do`-invoked names found
+/// while tokenising this stream — qpdf's `forEachXObject` walk
+/// (`QPDFPageObjectHelper.cc:313-345`) is independent of content-stream
+/// parsing. Every declared child is visited even after an earlier child comes
+/// back incomplete: qpdf's `forEachFormXObject` visits every queued Form
+/// unconditionally, and only the accumulated failure gates the final
+/// page-level prune (`QPDFPageObjectHelper.cc:636-649`), so this walk must not
+/// short-circuit either.
+///
 /// Returns `Ok(true)` when the stream was tokenised to the end, `Ok(false)` when
 /// tokenisation stopped early on a malformed token (so `ctx.used` is incomplete
 /// and the page must be conservatively retained). Structural errors from
@@ -1109,10 +1148,9 @@ fn collect_from_stream<R: Read + Seek>(
         record_names_for_target(ctx, scope.target, &parsed.names);
     }
 
-    for (name, _) in parsed.valid_xobjects {
+    for name in declared_xobject_names(ctx.pdf, scope.resources)? {
         if !recurse_form_xobject(ctx, &name, scope, depth)? {
             complete = false;
-            break;
         }
     }
     Ok(complete)
@@ -1372,10 +1410,17 @@ fn recurse_form_xobject<R: Read + Seek>(
     // it propagates up and the page is conservatively retained. Child traversal
     // still runs after a malformed parent, matching qpdf's independent Form
     // queue and allowing a valid child to be processed.
-    for (name, _) in parsed.valid_xobjects {
+    //
+    // Children are this Form's *declared* `/XObject` keys (see
+    // `declared_xobject_names`), not just its `Do`-invoked names — qpdf's
+    // `forEachFormXObject` queues every declared Form regardless of `Do` usage
+    // (`QPDFPageObjectHelper.cc:313-345`). Every declared child is visited even
+    // after an earlier sibling comes back incomplete: qpdf's traversal never
+    // short-circuits on one Form's failure (`QPDFPageObjectHelper.cc:636-649`),
+    // it only accumulates `any_failures` for the final page-level prune.
+    for name in declared_xobject_names(ctx.pdf, child.resources)? {
         if !recurse_form_xobject(ctx, &name, child, depth + 1)? {
             complete = false;
-            break;
         }
     }
 
@@ -2124,31 +2169,53 @@ mod tests {
         assert!(matches!(error, Error::Parse { .. }));
     }
 
+    // The next two tests used to assert that a `Do` obscured by an earlier
+    // parser diagnostic, or absorbed into inline-image header parsing, never
+    // got recorded as a content-stream invocation and so never triggered
+    // recursion into the malformed `Fm0` Form. That distinction no longer
+    // matters: recursion is driven by the *declared* `/XObject` keys (see
+    // `declared_xobject_names`), matching qpdf's `forEachXObject`
+    // (`QPDFPageObjectHelper.cc:313-345`), which walks every declared Form
+    // regardless of what (if anything) the content stream does with `Do`.
+    // `Fm0` is declared in both fixtures, so it is visited either way and its
+    // malformed target surfaces the same structural `Error::Parse` as a
+    // directly Do-invoked malformed Form (see
+    // `resource_callbacks_propagate_form_resolution_errors`).
     #[test]
-    fn parser_diagnostic_before_form_use_stops_later_traversal() {
+    fn parser_diagnostic_does_not_prevent_declared_form_traversal() {
         let (mut pdf, resources) = malformed_form_pdf_and_resources();
 
-        let (complete, _) = collect_test_content(&mut pdf, b"<0g> /Fm0 Do", Some(&resources))
-            .expect("the later Do is outside the valid parser-event prefix");
-        assert!(!complete);
+        let error = collect_test_content(&mut pdf, b"<0g> /Fm0 Do", Some(&resources))
+            .expect_err("a declared Form is still visited even when an earlier token is malformed");
+        assert!(matches!(error, Error::Parse { .. }));
     }
 
     #[test]
-    fn invalid_inline_header_do_does_not_trigger_form_traversal() {
+    fn invalid_inline_header_does_not_prevent_declared_form_traversal() {
         let (mut pdf, resources) = malformed_form_pdf_and_resources();
 
-        let (complete, _) = collect_test_content(&mut pdf, b"BI /Fm0 Do", Some(&resources))
-            .expect("an invalid inline-image header is incomplete, not a Form traversal");
-        assert!(!complete);
+        let error = collect_test_content(&mut pdf, b"BI /Fm0 Do", Some(&resources)).expect_err(
+            "a declared Form is still visited even though this Do is absorbed by inline-header parsing",
+        );
+        assert!(matches!(error, Error::Parse { .. }));
     }
 
+    // Inline-image payload bytes are opaque to the parser (`/Fm0 Do` inside
+    // `ID`...`EI` is never tokenised as a content operator), so it must not be
+    // recorded as a used name. This is a `parsed.names` bookkeeping claim,
+    // independent of declared-name-driven recursion, so `resources` omits
+    // `/XObject` entirely here to isolate it from the (unrelated, and now
+    // unconditional) declared-Form traversal covered by the two tests above.
     #[test]
-    fn inline_image_payload_do_is_opaque_to_form_traversal() {
-        let (mut pdf, resources) = malformed_form_pdf_and_resources();
+    fn inline_image_payload_do_is_opaque_to_resource_name_detection() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 612 792] >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
 
-        let (complete, used) =
-            collect_test_content(&mut pdf, b"BI /W 1 ID /Fm0 Do EI Q", Some(&resources))
-                .expect("inline-image payload bytes are opaque");
+        let (complete, used) = collect_test_content(&mut pdf, b"BI /W 1 ID /Fm0 Do EI Q", None)
+            .expect("inline-image payload bytes are opaque");
         assert!(complete);
         assert!(!used.contains_key(b"XObject".as_slice()));
     }
@@ -2167,20 +2234,26 @@ mod tests {
         assert!(used[b"ExtGState".as_slice()].contains(b"Shared".as_slice()));
     }
 
+    // Previously this asserted that the shared `last_name` correctly routed
+    // `Do` to a malformed declared Form, proving the *old* Do-invoked
+    // recursion trigger picked it up. Recursion is no longer Do-invoked (see
+    // `declared_xobject_names`), so that no longer discriminates: `Fm0` would
+    // be visited regardless of whether `Do` ever routed it. Re-pointed at what
+    // the shared `last_name` claim actually is — `parsed.names` bookkeeping —
+    // by checking the *same* name is recorded under both `Font` (from `Tf`)
+    // and `XObject` (from `Do`) from one shared preceding name token.
     #[test]
-    fn pruning_recurses_each_shared_finder_xobject_name() {
+    fn shared_finder_last_name_recorded_for_font_and_xobject() {
         let bytes = build_page_with_resources_carrier_pdf(
             "<< /Type /Page /MediaBox [0 0 612 792] >>",
-            "<0g>",
+            "null",
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        let mut xobjects = Dictionary::new();
-        xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
-        let mut resources = Dictionary::new();
-        resources.insert("XObject", Object::Dictionary(xobjects));
 
-        let error = collect_test_content(&mut pdf, b"/Fm0 12 Tf 99 Do", Some(&resources))
-            .expect_err("retained last name must route Do to the malformed Form");
-        assert!(matches!(error, Error::Parse { .. }));
+        let (complete, used) = collect_test_content(&mut pdf, b"/Fm0 12 Tf 99 Do", None)
+            .expect("no /XObject is declared, so there is nothing to recurse into");
+        assert!(complete);
+        assert!(used[b"Font".as_slice()].contains(b"Fm0".as_slice()));
+        assert!(used[b"XObject".as_slice()].contains(b"Fm0".as_slice()));
     }
 }
