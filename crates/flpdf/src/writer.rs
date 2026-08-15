@@ -3486,19 +3486,24 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // re-filter rules. The resulting raw buffer is consumed directly
             // by the writer pipeline below; encryption does not mutate it.
             //
-            // `is_data_modified` is hardcoded false here: this fallback path
-            // (QDF / encrypted / content-normalized / non-default
-            // object-stream-mode writes -- see `write_plain::eligible`) only
-            // has the already-materialized `object`, with no canonical
-            // handle to query `is_data_modified()` from. A token-filtered
-            // lone-Flate stream written through this branch keeps today's
-            // verbatim-preserve shortcut instead of qpdf's forced re-encode;
-            // tracked as a follow-up, parallel to the linearized-writer fix
-            // this parameter exists for.
+            // This fallback path (QDF / encrypted / content-normalized /
+            // non-default object-stream-mode writes -- see
+            // `write_plain::eligible`) only has the already-materialized
+            // `object`, with no canonical handle of its own to query
+            // `is_data_modified()` from. Fetch one via the source ref instead
+            // -- the canonical handle graph shares state with the legacy
+            // resolve path, so this observes the same registered token
+            // filters -- mirroring `linearization/writer.rs`'s
+            // `stream_is_data_modified` helper for the linearized writer.
+            let is_data_modified = {
+                let handle = pdf.get_object_handle(*old_ref);
+                pdf.resolve_object_handle(&handle)?;
+                handle.is_data_modified()
+            };
             let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
                 stream,
                 options,
-                false,
+                is_data_modified,
                 qpdf_null_visibility,
                 pdf.recovered_stream_eol(*old_ref),
                 options.content_normalization && contents_seq.contains_key(old_ref),
@@ -5725,6 +5730,140 @@ mod tests {
             id1,
             vec![0u8; 16],
             "/ID[1] must not be the zero placeholder"
+        );
+    }
+
+    // --- qdf fallback: is_data_modified threading (flpdf-vkka) -------------
+
+    struct NoopTokenFilter;
+
+    impl crate::token_filter::TokenFilter for NoopTokenFilter {
+        fn handle_token(
+            &mut self,
+            _token: &crate::tokenizer::Token,
+            _output: &mut crate::token_filter::TokenFilterOutput<'_>,
+        ) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A minimal reachable single-stream fixture: object 3 is a lone-
+    /// /FlateDecode stream, referenced directly from the Catalog (an
+    /// arbitrary custom key, `/Extras`) so it survives the writer's
+    /// reachability-based renumbering (`CatalogFirstRenumber` walks every
+    /// dictionary key generically; see its own module doc). Compressed with
+    /// `Compression::none()` (stored deflate blocks) so flpdf's own
+    /// re-encoder (always the default level) makes "was this stream decoded
+    /// and re-encoded, or echoed verbatim" observable from the raw output
+    /// bytes alone — mirrors `form_field_object_helper::rendering`'s
+    /// `build_pdf_with_existing_flate_ap_stored`.
+    fn build_pdf_with_reachable_stored_flate_stream() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(b"q Q").expect("zlib encode");
+        let compressed = encoder.finish().expect("zlib finish");
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /Extras 3 0 R>>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [] /Count 0>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "3 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+                  /BBox [0 0 1 1] /Filter /FlateDecode /Length {}>>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 4 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn plain_writer_fallback_recompresses_a_token_filtered_lone_flate_stream_instead_of_preserving_it_verbatim(
+    ) {
+        // qpdf's QPDFWriter::willFilterStream (QPDFWriter.cc:1234-1245) consults
+        // QPDFObjectHandle::isDataModified() (QPDF_Stream.cc:321-324) -- true
+        // as soon as a token filter is registered -- before its lone-
+        // /FlateDecode verbatim-preserve shortcut. That check has no
+        // mode-specific branch: it applies identically whether qpdf is
+        // writing linearized, QDF, encrypted, or plain output. flpdf's
+        // linearized writer already threads a real is_data_modified value
+        // (linearization/writer.rs's stream_is_data_modified, fixing a
+        // confirmed byte-parity gap -- see PR #795). emit_canonical_pdf_inner's
+        // Object::Stream branch -- the `!write_plain::eligible` fallback used
+        // for --qdf, encrypted, content-normalized, and non-default
+        // --object-streams writes -- previously hardcoded is_data_modified:
+        // false, so a token-filtered lone-Flate stream kept the
+        // verbatim-preserve shortcut through this path instead of qpdf's
+        // forced decode + re-encode.
+        //
+        // Extra header text is used to route into this fallback (any
+        // `!write_plain::eligible` condition would do) instead of `--qdf`,
+        // because QDF mode forces `effective_stream_policy` to
+        // `CompressStreams::No` unconditionally (`QDF requires fully decoded
+        // streams regardless of stream_data`), which bypasses the
+        // lone-/FlateDecode verbatim-preserve shortcut entirely and so would
+        // never actually exercise `is_data_modified`.
+        let raw = build_pdf_with_reachable_stored_flate_stream();
+        let mut pdf = crate::Pdf::open_mem_owned(raw).expect("fixture must parse");
+        let stream_ref = ObjectRef::new(3, 0);
+        let source_handle = pdf.get_object_handle(stream_ref);
+        pdf.resolve_object_handle(&source_handle)
+            .expect("resolve source stream");
+        let source_raw = source_handle
+            .get_raw_stream_data()
+            .expect("source raw stream bytes")
+            .as_ref()
+            .clone();
+        source_handle
+            .add_token_filter(Rc::new(RefCell::new(NoopTokenFilter)))
+            .expect("register token filter");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_extra_header_text("% flpdf-vkka regression\n");
+        writer.write().expect("write");
+        let renumbered = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("stream mapping")
+            .expect("stream is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        let mut reparsed = crate::Pdf::open_mem_owned(output).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written stream");
+        let raw_written = written
+            .get_raw_stream_data()
+            .expect("written raw stream bytes");
+        assert_ne!(
+            raw_written.as_ref(),
+            &source_raw,
+            "plain writer's !eligible fallback must not echo a \
+             token-filtered lone-/FlateDecode stream's raw compressed bytes \
+             verbatim -- isDataModified() must defeat the verbatim-preserve \
+             shortcut, matching QPDFWriter::willFilterStream, and re-encode \
+             at flpdf's default (non-stored) compression level instead"
         );
     }
 
