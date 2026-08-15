@@ -4190,7 +4190,7 @@ fn decode_token_filtered_stream(handle: &ObjectHandle) -> Result<Vec<u8>> {
         DecodeLevel::All,
         false,
         false,
-    )?;
+    )?; // cov:ignore: llvm-cov attributes this call continuation to the decline arm; both the success and the mismatch tests exercise this call.
     if !success || !filtering_attempted {
         return Err(crate::Error::Unsupported(
             "token-filtered stream declined filtering".to_string(),
