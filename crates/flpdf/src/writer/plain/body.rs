@@ -168,19 +168,56 @@ fn emit_source_from_handle<R: Read + Seek>(
     Ok(())
 }
 
-fn canonical_stream_output(
+pub(crate) fn canonical_stream_output(
     handle: &ObjectHandle,
     options: &WriterOptions,
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
+    canonical_stream_output_with_rewrite_policy(handle, options, true, false)
+}
+
+/// Full-rewrite variant of [`canonical_stream_output`]. The legacy writer
+/// applies the same qpdf filter/provider pipeline and the cleartext-metadata
+/// policy that belongs to encrypted output. The live handle's source pipe owns
+/// recovered stream framing: Identity streams retain the recovered EOL in the
+/// source length, while the resolver removes it before an actual decryption
+/// stage. The writer must therefore not append that framing a second time.
+pub(crate) fn canonical_stream_output_for_rewrite(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    normalize_content: bool,
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
+    canonical_stream_output_with_rewrite_policy(handle, options, true, normalize_content)
+}
+
+fn canonical_stream_output_with_rewrite_policy(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
+    // The CLI's page-content normalizer records its completed transform on
+    // the live handle. Generic `replaceStreamData` calls remain eligible for
+    // QDF normalization, because replacement bytes alone do not establish
+    // that this particular consumer has already normalized them.
+    let normalize_content = normalize_content && !handle.content_normalization_applied();
     let source_has_lone_flate = canonical_is_lone_flate(&stream_dict)?;
     // QPDFWriter.cc:1251-1278 gives cleartext /Type /Metadata streams their
     // own policy: decode fully and emit without a filter, even when the global
     // writer policy would preserve or compress a lone-Flate source. The plain
     // route is unencrypted, so this exception always applies here.
-    let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+    let is_metadata_stream = apply_full_rewrite_metadata_policy
+        && stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?
+        && options
+            .encrypt
+            .as_ref()
+            .is_none_or(|params| !params.encrypt_metadata)
+        && options
+            .copy_encryption
+            .as_ref()
+            .is_none_or(|source| !crate::writer::copy_encryption_encrypts_metadata(source));
     let policy = if is_metadata_stream {
         Some(CompressStreams::No)
     } else {
@@ -195,7 +232,7 @@ fn canonical_stream_output(
         && source_has_lone_flate
         && !handle.is_data_modified()
         && !options.recompress_flate
-        && !options.content_normalization
+        && !normalize_content
         && !stream_dict.try_has_key(b"/F")?;
     let source_for_pipe = handle.clone();
 
@@ -211,11 +248,14 @@ fn canonical_stream_output(
             false,
         )
     } else {
-        let encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
+        let mut encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
             crate::object_handle::STREAM_ENCODE_COMPRESS
         } else {
             0
         };
+        if normalize_content {
+            encode_flags |= crate::object_handle::STREAM_ENCODE_NORMALIZE;
+        }
         let mut attempt = 1_u8;
         let (data, filtering_attempted) = loop {
             let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
@@ -251,6 +291,9 @@ fn canonical_stream_output(
 
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
     entries.remove(b"/Length".as_slice());
+    if !filtering_attempted {
+        remove_crypt_filter_for_unfiltered_stream(&mut entries)?;
+    }
     if filtering_attempted {
         entries.retain(|key, _| {
             !matches!(
@@ -272,6 +315,56 @@ fn canonical_stream_output(
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
     let refiltered = filtering_attempted && matches!(policy, Some(CompressStreams::Yes));
     Ok((dict, data, refiltered))
+}
+
+/// Mirror `QPDFWriter::unparseObject`'s unfiltered-stream cleanup
+/// (`libqpdf/QPDFWriter.cc:1446-1478`): source encryption is applied by the
+/// resolver pipe, so the writer never carries an explicit `/Crypt` stage into
+/// a rewritten stream dictionary. A direct `/Crypt` removes both filter keys;
+/// an array removes the first `/Crypt` item and its paired `/DecodeParms` slot,
+/// preserving the remaining filter representation byte-for-byte.
+fn remove_crypt_filter_for_unfiltered_stream(
+    entries: &mut std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+) -> crate::Result<()> {
+    let Some(filter) = entries.get(b"/Filter".as_slice()).cloned() else {
+        return Ok(());
+    };
+
+    if filter.try_is_name_and_equals(b"Crypt")? {
+        entries.remove(b"/Filter".as_slice());
+        entries.remove(b"/DecodeParms".as_slice());
+        return Ok(());
+    }
+
+    let Some(filters) = filter.try_as_array()? else {
+        return Ok(());
+    };
+    let mut crypt_index = None;
+    for (index, item) in filters.iter().enumerate() {
+        if item.try_is_name_and_equals(b"Crypt")? {
+            crypt_index = Some(index);
+            break;
+        }
+    }
+    let Some(crypt_index) = crypt_index else {
+        return Ok(());
+    };
+
+    let mut remaining_filters = filters;
+    remaining_filters.remove(crypt_index);
+    entries.insert(b"/Filter".to_vec(), ObjectHandle::array(remaining_filters));
+
+    let Some(decode_parms) = entries.get(b"/DecodeParms".as_slice()).cloned() else {
+        return Ok(());
+    };
+    let Some(mut decode_items) = decode_parms.try_as_array()? else {
+        return Ok(());
+    };
+    if decode_items.len() > crypt_index {
+        decode_items.remove(crypt_index);
+        entries.insert(b"/DecodeParms".to_vec(), ObjectHandle::array(decode_items));
+    }
+    Ok(())
 }
 
 fn canonical_is_lone_flate(dict: &ObjectHandle) -> crate::Result<bool> {
@@ -356,6 +449,33 @@ mod tests {
     use crate::{Dictionary, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Stream};
     use std::cell::RefCell;
     use std::io::Cursor;
+
+    #[test]
+    fn unfiltered_crypt_cleanup_handles_missing_and_scalar_decode_parms() {
+        for decode_parms in [None, Some(ObjectHandle::integer(7))] {
+            let mut entries = std::collections::BTreeMap::new();
+            entries.insert(
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"Crypt".to_vec()),
+                ]),
+            );
+            if let Some(decode_parms) = decode_parms {
+                entries.insert(b"/DecodeParms".to_vec(), decode_parms);
+            }
+
+            remove_crypt_filter_for_unfiltered_stream(&mut entries).unwrap();
+
+            assert_eq!(
+                entries
+                    .get(b"/Filter".as_slice())
+                    .and_then(|filter| filter.as_array())
+                    .map(|filters| filters.len()),
+                Some(1)
+            );
+        }
+    }
 
     #[test]
     fn disable_emission_records_every_planned_source_offset() {

@@ -1134,6 +1134,7 @@ impl Dictionary {
     /// classic trailer — so the plain order here is a known flpdf
     /// simplification, not something qpdf itself does. Byte-identical parity
     /// for xref-stream-form output is a separate, already out-of-scope gap.
+    #[cfg(test)]
     pub(crate) fn write_pdf_with_id_writer(
         &self,
         out: &mut Vec<u8>,

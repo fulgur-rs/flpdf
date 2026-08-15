@@ -874,6 +874,63 @@ pub(crate) fn wrap_objstm_body(
     }
 }
 
+/// Build the synthetic ObjStm container as an ObjectHandle while retaining
+/// the raw payload separately for the stream pipeline. The container has no
+/// source object identity, but its dictionary is still emitted through the
+/// same live-handle serializer as ordinary streams; `/Extends`, when present,
+/// is already in output-number space and is therefore stored as a reference
+/// token rather than a legacy `Object` value.
+pub(crate) fn wrap_objstm_body_as_handle(
+    body: &ObjStmBody,
+    compress: crate::writer::CompressStreams,
+    extends: Option<crate::ObjectRef>,
+) -> crate::Result<(ObjectHandle, Vec<u8>)> {
+    let (data, filter) = match compress {
+        crate::writer::CompressStreams::Yes => {
+            let mut encode_dict = Dictionary::new();
+            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            (
+                crate::filters::encode_stream_data(&encode_dict, &body.bytes)?,
+                true,
+            )
+        }
+        crate::writer::CompressStreams::No => (body.bytes.clone(), false),
+    };
+
+    let mut entries = vec![
+        (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+        (
+            b"N".to_vec(),
+            ObjectHandle::integer(i64::try_from(body.n_members).unwrap_or(i64::MAX)),
+        ),
+        (
+            b"First".to_vec(),
+            ObjectHandle::integer(i64::try_from(body.first_offset).unwrap_or(i64::MAX)),
+        ),
+        (
+            b"Length".to_vec(),
+            ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
+        ),
+    ];
+    if filter {
+        entries.push((
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        ));
+    }
+    if let Some(extends) = extends {
+        entries.push((
+            b"Extends".to_vec(),
+            ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(extends)),
+        ));
+    }
+    let handle = ObjectHandle::stream(
+        ObjectHandle::dictionary(entries),
+        std::rc::Rc::new(data.clone()),
+    );
+    Ok((handle, data))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2335,6 +2392,27 @@ mod tests {
         let parsed1 = crate::reader::parse_object_stream_entry(&stream, 1).unwrap();
         assert_eq!(parsed0.object, obj1, "index 0 must parse to Integer(42)");
         assert_eq!(parsed1.object, obj2, "index 1 must parse to Integer(99)");
+    }
+
+    #[test]
+    fn wrap_objstm_body_as_handle_preserves_raw_payload_and_extends() {
+        let body = ObjStmBody {
+            bytes: b"1 0\n42\n".to_vec(),
+            first_offset: 4,
+            n_members: 1,
+        };
+        let extends = ObjectRef::new(17, 0);
+        let (handle, data) =
+            wrap_objstm_body_as_handle(&body, crate::writer::CompressStreams::No, Some(extends))
+                .unwrap();
+
+        assert_eq!(data, body.bytes);
+        assert_eq!(handle.as_stream_data().as_deref(), Some(&body.bytes));
+        let dict = handle.as_stream_dict().expect("ObjStm stream dictionary");
+        assert_eq!(dict.get_key(b"/Type").as_name(), Some(b"ObjStm".to_vec()));
+        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(7));
+        assert_eq!(dict.get_key(b"/Filter").as_name(), None);
+        assert_eq!(dict.get_key(b"/Extends").as_reference(), Some(extends));
     }
 
     #[test]

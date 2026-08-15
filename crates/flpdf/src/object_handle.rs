@@ -112,7 +112,7 @@ use crate::{
     writer::DecodeLevel,
 };
 use crate::{json::Json, Dictionary, Error, Object, ObjectRef, Result, Stream};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
@@ -799,6 +799,12 @@ struct ObjectSlot {
     /// bytes; the stream pipeline consumes it after decoding and before
     /// normalization/encoding (`libqpdf/QPDF_Stream.cc:488-620`).
     stream_token_filters: StreamTokenFilterList,
+    /// Whether the current stream bytes have already passed the CLI's
+    /// content-normalization pass. This is deliberately separate from
+    /// `replaceStreamData`: qpdf treats replacement bytes as ordinary stream
+    /// data, while the writer must skip only the normalization that this
+    /// particular consumer has already performed.
+    content_normalization_applied: Rc<Cell<bool>>,
 }
 
 impl ObjectSlot {
@@ -1188,6 +1194,7 @@ impl ObjectHandle {
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
+            content_normalization_applied: Rc::new(Cell::new(false)),
         })));
         handle.register_state_owner();
         handle
@@ -1218,6 +1225,7 @@ impl ObjectHandle {
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
+            content_normalization_applied: Rc::new(Cell::new(false)),
         })));
         handle.register_state_owner();
         handle
@@ -1273,6 +1281,7 @@ impl ObjectHandle {
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
+            content_normalization_applied: Rc::new(Cell::new(false)),
         })));
         handle.register_state_owner();
         handle
@@ -1301,6 +1310,7 @@ impl ObjectHandle {
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
+            content_normalization_applied: Rc::new(Cell::new(false)),
         })));
         handle.register_state_owner();
         handle.with_value(|value| {
@@ -1390,9 +1400,15 @@ impl ObjectHandle {
             Self::state_children(&state)
         };
         let new_token_filters = Rc::new(RefCell::new(Vec::new()));
+        let new_content_normalization_applied = Rc::new(Cell::new(false));
         for owner in self.state_owner_handles() {
-            owner.0.borrow_mut().stream_token_filters = new_token_filters.clone();
             let parent = owner.containment_parent();
+            {
+                let mut owner_slot = owner.0.borrow_mut();
+                owner_slot.stream_token_filters = new_token_filters.clone();
+                owner_slot.content_normalization_applied =
+                    new_content_normalization_applied.clone();
+            }
             for child in &old_children {
                 Self::detach_child_from_parent(child, &parent);
             }
@@ -1422,6 +1438,7 @@ impl ObjectHandle {
             slot.state = new_state;
             slot.state_owners = Rc::new(RefCell::new(Vec::new()));
             slot.stream_token_filters = Rc::new(RefCell::new(Vec::new()));
+            slot.content_normalization_applied = Rc::new(Cell::new(false));
         }
         self.register_state_owner();
 
@@ -1464,9 +1481,20 @@ impl ObjectHandle {
             return Ok(());
         }
         source.validate_replacement_source()?;
-        let source_state = source.0.borrow().state.clone();
-        let source_owners = source.0.borrow().state_owners.clone();
-        let source_token_filters = source.0.borrow().stream_token_filters.clone();
+        let (
+            source_state,
+            source_owners,
+            source_token_filters,
+            source_content_normalization_applied,
+        ) = {
+            let source_slot = source.0.borrow();
+            (
+                source_slot.state.clone(),
+                source_slot.state_owners.clone(),
+                source_slot.stream_token_filters.clone(),
+                source_slot.content_normalization_applied.clone(),
+            )
+        };
         let old_state = {
             let mut target = self.0.borrow_mut();
             let old_state = target.state.clone();
@@ -1475,6 +1503,7 @@ impl ObjectHandle {
             target.state = source_state.clone();
             target.state_owners = source_owners.clone();
             target.stream_token_filters = source_token_filters;
+            target.content_normalization_applied = source_content_normalization_applied;
             old_state
         };
         Self::register_state_owner(self);
@@ -4161,6 +4190,7 @@ impl ObjectHandle {
         filter: Option<ObjectHandle>,
         decode_parms: Option<ObjectHandle>,
     ) {
+        self.set_content_normalization_applied(false);
         let length = data.len();
         self.with_value_mut(|v| {
             if let Some(ObjectValue::Stream {
@@ -4209,6 +4239,7 @@ impl ObjectHandle {
                 self.type_name()
             )));
         }
+        self.set_content_normalization_applied(false);
         if self.object_ref().is_none() {
             return Err(Error::System(
                 STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR.to_owned(),
@@ -4361,6 +4392,30 @@ impl ObjectHandle {
         let filters = self.0.borrow().stream_token_filters.clone();
         let modified = !filters.borrow().is_empty();
         modified
+    }
+
+    /// Whether the current stream bytes have already passed the explicit
+    /// content-normalization consumer. This is intentionally not inferred
+    /// from `replaceStreamData`: qpdf's replacement API is also used for
+    /// arbitrary caller data that still needs QDF normalization.
+    pub(crate) fn content_normalization_applied(&self) -> bool {
+        self.0.borrow().content_normalization_applied.get()
+    }
+
+    /// Mark the current stream bytes as normalized by the content consumer.
+    /// The marker follows the shared payload state, just like qpdf's stream
+    /// token-filter list, so aliases do not cause a second normalization pass.
+    #[doc(hidden)]
+    pub fn mark_content_normalization_applied(&self) {
+        self.set_content_normalization_applied(true);
+    }
+
+    fn set_content_normalization_applied(&self, applied: bool) {
+        let marker = self.0.borrow().content_normalization_applied.clone();
+        marker.set(applied);
+        for owner in self.state_owner_handles() {
+            owner.0.borrow_mut().content_normalization_applied = marker.clone();
+        }
     }
 
     /// Register a qpdf-style lazy token filter on this stream. The original
@@ -5569,6 +5624,18 @@ impl ObjectHandle {
         unparse_object_walk_qdf(self, indent, out)
     }
 
+    /// QDF writer emission with output-reference remapping and qpdf null
+    /// visibility for references removed during this write.
+    pub(crate) fn unparse_object_qdf_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        unparse_object_walk_qdf_with_ref_map(self, indent, out, map, removed_refs)
+    }
+
     /// QDF-mode counterpart of [`Self::unparse_object_with_string_writer`],
     /// including its cleartext hexadecimal signature `/Contents` exception.
     #[allow(dead_code)] // production callers land with the writer cutover
@@ -5609,6 +5676,52 @@ impl ObjectHandle {
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> Result<()> {
         unparse_object_walk_with_ref_map(self, out, map, removed_refs)
+    }
+
+    /// Encrypted writer counterpart of
+    /// [`Self::unparse_object_with_ref_map_and_removed`]. Reference identity,
+    /// qpdf null visibility, and string encryption are all applied while the
+    /// live handle graph is walked.
+    pub(crate) fn unparse_object_with_ref_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        unparse_object_walk_with_ref_map_and_string_writer(
+            self,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )
+    }
+
+    /// QDF/encrypted counterpart of
+    /// [`Self::unparse_object_with_ref_map_and_removed_with_string_writer`].
+    pub(crate) fn unparse_object_qdf_with_ref_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        unparse_object_walk_qdf_with_ref_map_and_string_writer(
+            self,
+            indent,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )
     }
 }
 
@@ -6639,6 +6752,525 @@ fn unparse_dict_entries_qdf(
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn write_child_qdf_with_ref_map(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            out.extend_from_slice(b"null");
+        } else {
+            out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+        }
+        return Ok(());
+    }
+    unparse_object_walk_qdf_with_ref_map(handle, indent, out, map, removed_refs)
+}
+
+fn unparse_object_walk_qdf_with_ref_map(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let reference = handle.with_value(|value| match value {
+            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
+            _ => None,
+        });
+        if let Some(object_ref) = reference {
+            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+                out.extend_from_slice(b"null");
+            } else {
+                out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+            }
+            return Ok(());
+        }
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_qdf_with_ref_map(value, indent, out, map, removed_refs)
+                        .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(container) => {
+                unparse_container_qdf_with_ref_map(container, indent, out, map, removed_refs)
+            }
+            None => Ok(()),
+        }
+    })
+}
+
+fn unparse_container_qdf_with_ref_map(
+    container: UnparseContainer,
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    match container {
+        UnparseContainer::Array(children) => {
+            out.push(b'[');
+            out.push(b'\n');
+            for child in children {
+                push_spaces(out, indent + 2);
+                write_child_qdf_with_ref_map(&child, indent + 2, out, map, removed_refs)?;
+                out.push(b'\n');
+            }
+            push_spaces(out, indent);
+            out.push(b']');
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_qdf_with_ref_map(&entries, indent, out, map, removed_refs)?;
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_qdf_with_ref_map(&stream_dict, indent, out, map, removed_refs)?;
+        }
+    }
+    Ok(())
+}
+
+fn unparse_object_value_qdf_with_ref_map(
+    value: &ObjectValue,
+    _indent: usize,
+    out: &mut Vec<u8>,
+    _map: &ObjectRefMap<'_>,
+    _removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    // `unparse_object_walk_qdf_with_ref_map` snapshots every array,
+    // dictionary, and stream before entering this borrow-scoped fallback.
+    // A bare reference is handled there as well, before this function is
+    // called. The only values that can reach this helper are therefore
+    // scalar payloads, whose QDF spelling is identical to the compact form.
+    unparse_object_value(value, out)
+}
+
+fn unparse_dict_entries_qdf_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<\n");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        push_spaces(out, indent + 2);
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
+        }
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn write_child_with_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            out.extend_from_slice(b"null");
+        } else {
+            out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+        }
+        return Ok(());
+    }
+    unparse_object_walk_with_ref_map_and_string_writer(handle, out, map, removed_refs, write_string)
+}
+
+fn unparse_object_walk_with_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let reference = handle.with_value(|value| match value {
+            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
+            _ => None,
+        });
+        if let Some(object_ref) = reference {
+            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+                out.extend_from_slice(b"null");
+            } else {
+                out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+            }
+            return Ok(());
+        }
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_with_ref_map_and_string_writer(
+                        value,
+                        out,
+                        map,
+                        removed_refs,
+                        write_string,
+                    )
+                    .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(container) => unparse_container_with_ref_map_and_string_writer(
+                container,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            ),
+            None => Ok(()),
+        }
+    })
+}
+
+fn unparse_container_with_ref_map_and_string_writer<F>(
+    container: UnparseContainer,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match container {
+        UnparseContainer::Array(children) => {
+            out.push(b'[');
+            for child in children {
+                out.push(b' ');
+                write_child_with_ref_map_and_string_writer(
+                    &child,
+                    out,
+                    map,
+                    removed_refs,
+                    write_string,
+                )?; // cov:ignore: LLVM maps the covered child call continuation to this line
+            }
+            out.extend_from_slice(b" ]");
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_with_ref_map_and_string_writer(
+                &entries,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )?; // cov:ignore: LLVM maps the covered dictionary call continuation to this line
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_with_ref_map_and_string_writer(
+                &stream_dict,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )?; // cov:ignore: LLVM maps the covered stream-dictionary call continuation to this line
+        }
+    }
+    Ok(())
+}
+
+fn unparse_object_value_with_ref_map_and_string_writer<F>(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    _map: &ObjectRefMap<'_>,
+    _removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match value {
+        ObjectValue::String(bytes) => write_string(out, bytes),
+        _ => unparse_object_value(value, out),
+    }
+}
+
+fn unparse_dict_entries_with_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            continue;
+        }
+        write_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+fn write_child_qdf_with_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            out.extend_from_slice(b"null");
+        } else {
+            out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+        }
+        return Ok(());
+    }
+    unparse_object_walk_qdf_with_ref_map_and_string_writer(
+        handle,
+        indent,
+        out,
+        map,
+        removed_refs,
+        write_string,
+    )
+}
+
+fn unparse_object_walk_qdf_with_ref_map_and_string_writer<F>(
+    handle: &ObjectHandle,
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        // cov:ignore: reserved precondition closure has no independent LLVM counter
+        if handle.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        handle.try_dereference()?;
+        let reference = handle.with_value(|value| match value {
+            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
+            _ => None,
+        });
+        if let Some(object_ref) = reference {
+            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+                out.extend_from_slice(b"null");
+            } else {
+                out.extend_from_slice(map(object_ref)?.to_string().as_bytes());
+            }
+            return Ok(());
+        }
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    unparse_object_value_qdf_with_ref_map_and_string_writer(
+                        value,
+                        indent,
+                        out,
+                        map,
+                        removed_refs,
+                        write_string,
+                    )
+                    .map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: after try_dereference, a live non-reserved handle cannot expose None
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(container) => unparse_container_qdf_with_ref_map_and_string_writer(
+                container,
+                indent,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            ),
+            None => Ok(()),
+        }
+    })
+}
+
+fn unparse_container_qdf_with_ref_map_and_string_writer<F>(
+    container: UnparseContainer,
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match container {
+        UnparseContainer::Array(children) => {
+            out.push(b'[');
+            out.push(b'\n');
+            for child in children {
+                push_spaces(out, indent + 2);
+                write_child_qdf_with_ref_map_and_string_writer(
+                    &child,
+                    indent + 2,
+                    out,
+                    map,
+                    removed_refs,
+                    write_string,
+                )?; // cov:ignore: LLVM maps the covered child call continuation to this line
+                out.push(b'\n');
+            }
+            push_spaces(out, indent);
+            out.push(b']');
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_qdf_with_ref_map_and_string_writer(
+                &entries,
+                indent,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )?; // cov:ignore: LLVM maps the covered dictionary call continuation to this line
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_qdf_with_ref_map_and_string_writer(
+                &stream_dict,
+                indent,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )?; // cov:ignore: LLVM maps the covered stream-dictionary call continuation to this line
+        }
+    }
+    Ok(())
+}
+
+fn unparse_object_value_qdf_with_ref_map_and_string_writer<F>(
+    value: &ObjectValue,
+    _indent: usize,
+    out: &mut Vec<u8>,
+    _map: &ObjectRefMap<'_>,
+    _removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    match value {
+        ObjectValue::String(bytes) => write_string(out, bytes),
+        _ => unparse_object_value(value, out),
+    }
+}
+
+fn unparse_dict_entries_qdf_with_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<\n");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        push_spaces(out, indent + 2);
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            out.push(b'\n');
+            continue;
+        }
+        write_child_qdf_with_ref_map_and_string_writer(
+            value,
+            indent + 2,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )?; // cov:ignore: LLVM maps the covered mapped dictionary child call continuation to this line
         out.push(b'\n');
     }
     push_spaces(out, indent);
@@ -8028,6 +8660,123 @@ impl ObjectHandle {
         })
     }
 
+    /// QDF stream-dictionary emission with output-reference remapping and
+    /// qpdf null visibility for references removed during this write.
+    #[allow(dead_code)] // compatibility wrapper; QDF writers may supply a synthetic length holder
+    pub(crate) fn unparse_stream_body_qdf_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        self.unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+            out,
+            indent,
+            map,
+            removed_refs,
+            None,
+        )
+    }
+
+    /// QDF stream-dictionary emission with the same reference remapping and
+    /// null visibility rules, but with an optional synthetic `/Length`
+    /// reference. QDF full-rewrite streams do not retain the source length;
+    /// qpdf writes a fresh holder immediately after the stream body. Keeping
+    /// that override at the serializer boundary avoids manufacturing a fake
+    /// source handle for an output-only object number.
+    pub(crate) fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_qdf_with_ref_map(
+                &entries,
+                indent,
+                out,
+                map,
+                removed_refs,
+                length_ref,
+            )
+        })
+    }
+
+    /// QDF stream-dictionary emission that combines output-reference
+    /// remapping, removed-reference null visibility, and encrypted string
+    /// serialization.
+    pub(crate) fn unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer<
+        F,
+    >(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer(
+                &entries,
+                indent,
+                out,
+                map,
+                removed_refs,
+                length_ref,
+                write_string,
+            )
+        })
+    }
+
     /// QDF-mode stream-dictionary counterpart of
     /// [`Self::unparse_stream_body_with_string_writer`], including its
     /// cleartext hexadecimal signature `/Contents` exception.
@@ -8113,6 +8862,52 @@ impl ObjectHandle {
                 _ => Vec::new(),
             };
             unparse_stream_dict_entries_with_ref_map(&entries, refiltered, out, map, removed_refs)
+        })
+    }
+
+    /// Compact stream-dictionary emission with output-reference remapping,
+    /// removed-reference null visibility, and encrypted string serialization.
+    pub(crate) fn unparse_stream_body_with_ref_map_and_removed_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        write_string: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+    {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_with_ref_map_and_string_writer(
+                &entries,
+                refiltered,
+                out,
+                map,
+                removed_refs,
+                write_string,
+            )
         })
     }
 }
@@ -8242,6 +9037,113 @@ fn unparse_stream_dict_entries_qdf(
         write_child_qdf(length, indent + 2, out)?;
         out.push(b'\n');
     }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_qdf_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    length_ref: Option<ObjectRef>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<\n");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        push_spaces(out, indent + 2);
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_qdf_with_ref_map(value, indent + 2, out, map, removed_refs)?;
+        }
+        out.push(b'\n');
+    }
+    if let Some(length_ref) = length_ref {
+        push_spaces(out, indent + 2);
+        out.extend_from_slice(b"/Length ");
+        out.extend_from_slice(length_ref.to_string().as_bytes());
+        out.push(b'\n');
+    } else if let Some(length) = length_value {
+        push_spaces(out, indent + 2);
+        out.extend_from_slice(b"/Length ");
+        write_child_qdf_with_ref_map(length, indent + 2, out, map, removed_refs)?;
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_qdf_with_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    length_ref: Option<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    out.extend_from_slice(b"<<\n");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        push_spaces(out, indent + 2);
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            out.push(b'\n');
+            continue;
+        }
+        write_child_qdf_with_ref_map_and_string_writer(
+            value,
+            indent + 2,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )?; // cov:ignore: LLVM maps the covered mapped stream child call continuation to this line
+        out.push(b'\n');
+    }
+    push_spaces(out, indent + 2);
+    out.extend_from_slice(b"/Length ");
+    if let Some(length_ref) = length_ref {
+        out.extend_from_slice(length_ref.to_string().as_bytes());
+    } else if let Some(length) = length_value {
+        write_child_qdf_with_ref_map_and_string_writer(
+            length,
+            indent + 2,
+            out,
+            map,
+            removed_refs,
+            write_string,
+        )?; // cov:ignore: LLVM maps the covered mapped length child call continuation to this line
+    } else {
+        out.extend_from_slice(b"null");
+    }
+    out.push(b'\n');
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
     Ok(())
@@ -8386,6 +9288,61 @@ fn unparse_stream_dict_entries_with_ref_map(
     Ok(())
 }
 
+fn unparse_stream_dict_entries_with_ref_map_and_string_writer<F>(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    refiltered: bool,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    write_string: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Vec<u8>, &[u8]) -> Result<()>,
+{
+    let excluded_entries;
+    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
+        excluded_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &excluded_entries
+    } else {
+        entries
+    };
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            continue;
+        }
+        write_child_with_ref_map_and_string_writer(value, out, map, removed_refs, write_string)?;
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_ref_map_and_string_writer(length, out, map, removed_refs, write_string)?;
+    }
+    if refiltered {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
 impl ObjectHandle {
     /// This trailer-shaped dictionary handle's writer-emission form,
     /// porting the caller-visible shape of `QPDFWriter::writeTrailer`
@@ -8484,6 +9441,88 @@ impl ObjectHandle {
             unparse_trailer_entries(&entries, xref_stream, id_writer, out)
         })
     }
+
+    /// Trailer writer with the same live-handle reference remapping used by
+    /// the canonical full-rewrite body route.
+    ///
+    /// `writeTrailer` is a separate qpdf responsibility from
+    /// `unparseObject`: it does not apply ordinary dictionary null
+    /// suppression, but its child values still have to be emitted from the
+    /// live handle graph and rewritten into the output-number space.  The
+    /// `qdf` flag selects qpdf's line-oriented classic-trailer spelling; the
+    /// values deliberately remain compact because qpdf hand-writes trailer
+    /// values in both modes (`QPDFWriter.cc:1160-1236`).
+    #[allow(clippy::too_many_arguments)] // qpdf keeps trailer layout, ID, mapping, and visibility controls orthogonal
+    pub(crate) fn unparse_trailer_with_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        xref_stream: bool,
+        qdf: bool,
+        id_writer: Option<crate::object::TrailerIdWriter>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        suppress_null_values: bool,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            unparse_trailer_entries_with_ref_map(
+                &entries,
+                xref_stream,
+                qdf,
+                id_writer,
+                map,
+                removed_refs,
+                suppress_null_values,
+                out,
+            )
+        })
+    }
+
+    /// Serialize a synthetic xref-stream dictionary from live handles in
+    /// lexicographic key order. Unlike `writeTrailer`, an xref stream owns its
+    /// surrounding `<< >>` and therefore does not use the trailer prefix or
+    /// `/ID`-last ordering. This is the handle-native counterpart of the
+    /// structural dictionary writer in `QPDFWriter.cc:2391-2495`.
+    pub(crate) fn unparse_dictionary_with_ref_map_and_id_writer(
+        &self,
+        out: &mut Vec<u8>,
+        id_writer: Option<crate::object::TrailerIdWriter>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+        suppress_null_values: bool,
+    ) -> Result<()> {
+        if self.is_reserved() {
+            return Err(reserved_unparse_error());
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            unparse_dictionary_entries_with_ref_map_and_id_writer(
+                &entries,
+                id_writer,
+                map,
+                removed_refs,
+                suppress_null_values,
+                out,
+            )
+        })
+    }
 }
 
 // `unparse_trailer`'s sole callee. Writes the (already-trimmed,
@@ -8543,6 +9582,126 @@ fn unparse_trailer_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // mirrors writeTrailer's independent layout, ID, mapping, and visibility controls
+fn unparse_trailer_entries_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    xref_stream: bool,
+    qdf: bool,
+    mut id_writer: Option<crate::object::TrailerIdWriter>,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    suppress_null_values: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if qdf {
+        out.extend_from_slice(b"trailer <<\n");
+    } else if !xref_stream {
+        out.extend_from_slice(b"trailer <<");
+    }
+
+    let mut id_value: Option<&ObjectHandle> = None;
+    let mut encrypt_value: Option<&ObjectHandle> = None;
+    for (key, value) in entries {
+        if suppress_null_values && value.try_is_null()? {
+            continue;
+        }
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        match key.as_slice() {
+            b"/ID" => {
+                id_value = Some(value);
+                continue;
+            }
+            b"/Encrypt" => {
+                encrypt_value = Some(value);
+                continue;
+            }
+            _ => {}
+        }
+
+        if qdf {
+            out.extend_from_slice(b"  ");
+        } else {
+            out.push(b' ');
+        }
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
+            // These two entries are installed by the writer immediately before
+            // emission and already carry output-space references. Every other
+            // trailer reference still belongs to the source graph and must go
+            // through the caller's old-to-new map.
+            write_child(value, out)?;
+        } else {
+            write_child_with_ref_map(value, out, map, removed_refs)?;
+        }
+        if qdf {
+            out.push(b'\n');
+        }
+    }
+
+    if let Some(value) = id_value {
+        if qdf {
+            out.extend_from_slice(b"  /ID ");
+        } else {
+            out.extend_from_slice(b" /ID ");
+        }
+        match id_writer.as_mut() {
+            Some(write_id) => write_id(out),
+            None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
+        }
+    }
+    if let Some(value) = encrypt_value {
+        out.extend_from_slice(b" /Encrypt ");
+        write_child(value, out)?;
+    }
+
+    if qdf {
+        if id_value.is_some() || encrypt_value.is_some() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(b">>\n");
+    } else {
+        out.extend_from_slice(b" >>");
+    }
+    Ok(())
+}
+
+fn unparse_dictionary_entries_with_ref_map_and_id_writer(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    mut id_writer: Option<crate::object::TrailerIdWriter>,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+    suppress_null_values: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<");
+    for (key, value) in entries {
+        if suppress_null_values && value.try_is_null()? {
+            continue;
+        }
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        if key.as_slice() == b"/ID" {
+            match id_writer.as_mut() {
+                Some(write_id) => write_id(out),
+                None => write_id_style_value_handle_with_ref_map(value, out, map, removed_refs)?,
+            }
+        } else if matches!(key.as_slice(), b"/Root" | b"/Encrypt") {
+            write_child(value, out)?;
+        } else {
+            write_child_with_ref_map(value, out, map, removed_refs)?;
+        }
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
 // Writes a trailer's `/ID` value in qpdf's `writeTrailer` compact shape:
 // `[<hex1><hex2>]`, no spaces (`QPDFWriter.cc:1194-1222`, `/ID [` then the
 // two identifier strings via `QPDF_String::unparse(true)`, then `]`).
@@ -8587,6 +9746,42 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Resul
             Ok(())
         }
         None => write_child(value, out),
+    }
+}
+
+fn write_id_style_value_handle_with_ref_map(
+    value: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if value.object_ref().is_some() {
+        return write_child_with_ref_map(value, out, map, removed_refs);
+    }
+    let compact: Option<(Vec<u8>, Vec<u8>)> = value.with_value(|v| match v {
+        Some(ObjectValue::Array(items)) if items.len() == 2 => {
+            let string_bytes = |item: &ObjectHandle| {
+                item.with_value(|iv| match iv {
+                    Some(ObjectValue::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+            };
+            match (string_bytes(&items[0]), string_bytes(&items[1])) {
+                (Some(b0), Some(b1)) => Some((b0, b1)),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    match compact {
+        Some((b0, b1)) => {
+            out.push(b'[');
+            crate::object::write_hex_string(out, &b0);
+            crate::object::write_hex_string(out, &b1);
+            out.push(b']');
+            Ok(())
+        }
+        None => unparse_object_walk_with_ref_map(value, out, map, removed_refs),
     }
 }
 
@@ -13349,6 +14544,625 @@ mod unparse_object_tests {
             .unparse_object_with_ref_map(&mut reference_out, &map)
             .unwrap();
         assert_eq!(reference_out, b"null");
+    }
+
+    #[test]
+    fn mapped_string_writers_walk_all_live_object_shapes() {
+        let kept = ObjectHandle::new_indirect_unresolved(ObjectRef::new(20, 0), 0);
+        kept.set_resolved(ObjectValue::Integer(7));
+        let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(21, 0), 0);
+        removed.set_resolved(ObjectValue::Integer(8));
+        let direct_reference =
+            ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(42, 0)));
+        let zero = ObjectHandle::new_indirect_unresolved(ObjectRef::new(0, 0), 0);
+
+        let signature = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::string(b"sig".to_vec())),
+        ]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![
+                (b"Child".to_vec(), kept.clone()),
+                (
+                    b"Payload".to_vec(),
+                    ObjectHandle::string(b"stream".to_vec()),
+                ),
+            ]),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
+            stream_length: 2,
+        });
+        let value = ObjectHandle::dictionary(vec![
+            (
+                b"Array".to_vec(),
+                ObjectHandle::array(vec![
+                    kept.clone(),
+                    removed.clone(),
+                    zero,
+                    direct_reference,
+                    ObjectHandle::integer(1),
+                    ObjectHandle::string(b"array".to_vec()),
+                ]),
+            ),
+            (
+                b"Nested".to_vec(),
+                ObjectHandle::dictionary(vec![(b"Removed".to_vec(), removed.clone())]),
+            ),
+            (b"Signature".to_vec(), signature),
+            (b"Stream".to_vec(), stream),
+            (b"Text".to_vec(), ObjectHandle::string(b"plain".to_vec())),
+        ]);
+        let mut removed_refs = BTreeSet::new();
+        removed_refs.insert(ObjectRef::new(21, 0));
+        let map = |object_ref: ObjectRef| {
+            Ok(ObjectRef::new(
+                object_ref.number + 100,
+                object_ref.generation,
+            ))
+        };
+
+        let mut compact = Vec::new();
+        value
+            .unparse_object_with_ref_map_and_removed_with_string_writer(
+                &mut compact,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        let compact_text = String::from_utf8_lossy(&compact);
+        assert!(compact_text.contains("120 0 R"));
+        assert!(compact_text.contains("142 0 R"));
+        assert!(compact_text.contains("<hook:plain>"));
+        assert!(compact_text.contains("/Contents <736967>"));
+        assert!(!compact_text.contains("/Removed"));
+
+        let mut qdf = Vec::new();
+        value
+            .unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                &mut qdf,
+                2,
+                &map,
+                &removed_refs,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        let qdf_text = String::from_utf8_lossy(&qdf);
+        assert!(qdf_text.contains("{hook:plain}"));
+        assert!(qdf_text.contains("/Contents <736967>"));
+        assert!(qdf_text.contains("120 0 R"));
+
+        let retained_redirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(90, 0), 0);
+        retained_redirect.set_resolved(ObjectValue::Reference(ObjectRef::new(42, 0)));
+        let removed_redirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), 0);
+        removed_redirect.set_resolved(ObjectValue::Reference(ObjectRef::new(21, 0)));
+        let mut redirect_out = Vec::new();
+        retained_redirect
+            .unparse_object_qdf_with_ref_map_and_removed(&mut redirect_out, 0, &map, &removed_refs)
+            .unwrap();
+        assert_eq!(redirect_out, b"142 0 R");
+        redirect_out.clear();
+        removed_redirect
+            .unparse_object_qdf_with_ref_map_and_removed(&mut redirect_out, 0, &map, &removed_refs)
+            .unwrap();
+        assert_eq!(redirect_out, b"null");
+        redirect_out.clear();
+        retained_redirect
+            .unparse_object_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        assert_eq!(redirect_out, b"142 0 R");
+        redirect_out.clear();
+        removed_redirect
+            .unparse_object_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        assert_eq!(redirect_out, b"null");
+        redirect_out.clear();
+        retained_redirect
+            .unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                0,
+                &map,
+                &removed_refs,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert_eq!(redirect_out, b"142 0 R");
+        redirect_out.clear();
+        removed_redirect
+            .unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                0,
+                &map,
+                &removed_refs,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert_eq!(redirect_out, b"null");
+
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(92, 0), 0);
+        missing.set_missing();
+        redirect_out.clear();
+        missing
+            .unparse_object_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        assert_eq!(redirect_out, b"null");
+        redirect_out.clear();
+        missing
+            .unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                0,
+                &map,
+                &removed_refs,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert_eq!(redirect_out, b"null");
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        assert!(reserved
+            .unparse_object_qdf_with_ref_map_and_removed(&mut redirect_out, 0, &map, &removed_refs,)
+            .is_err());
+        assert!(reserved
+            .unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                &mut redirect_out,
+                0,
+                &map,
+                &removed_refs,
+                &mut qdf_string_hook,
+            )
+            .is_err());
+
+        let mut qdf_plain = Vec::new();
+        value
+            .unparse_object_qdf_with_ref_map_and_removed(&mut qdf_plain, 0, &map, &removed_refs)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&qdf_plain).contains("/Contents <736967>"));
+    }
+
+    #[test]
+    fn mapped_stream_writers_cover_qdf_length_and_filter_variants() {
+        let kept = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), 0);
+        kept.set_resolved(ObjectValue::Integer(7));
+        let removed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(31, 0), 0);
+        removed.set_resolved(ObjectValue::Integer(8));
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![
+                (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+                (b"Contents".to_vec(), ObjectHandle::string(b"sig".to_vec())),
+                (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                ),
+                (b"Length".to_vec(), ObjectHandle::integer(3)),
+                (b"Link".to_vec(), kept),
+                (b"Removed".to_vec(), removed),
+                (b"Text".to_vec(), ObjectHandle::string(b"plain".to_vec())),
+                (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            ]),
+            stream_data: Some(Rc::new(b"abc".to_vec())),
+            stream_provider: None,
+            stream_length: 3,
+        });
+        let mut removed_refs = BTreeSet::new();
+        removed_refs.insert(ObjectRef::new(31, 0));
+        let map = |object_ref: ObjectRef| {
+            Ok(ObjectRef::new(
+                object_ref.number + 100,
+                object_ref.generation,
+            ))
+        };
+
+        let mut compact = Vec::new();
+        stream
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                &mut compact,
+                false,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        let compact_text = String::from_utf8_lossy(&compact);
+        assert!(compact_text.contains("/Link 130 0 R"));
+        assert!(compact_text.contains("/Length 3"));
+        assert!(compact_text.contains("<hook:plain>"));
+        assert!(!compact_text.contains("/Removed"));
+
+        let mut refiltered = Vec::new();
+        stream
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                &mut refiltered,
+                true,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        let refiltered_text = String::from_utf8_lossy(&refiltered);
+        assert!(!refiltered_text.contains("/Filter /ASCIIHexDecode"));
+        assert!(!refiltered_text.contains("/DecodeParms"));
+        assert!(refiltered_text.contains("/Filter /FlateDecode"));
+
+        let mut qdf_source_length = Vec::new();
+        stream
+            .unparse_stream_body_qdf_with_ref_map_and_removed(
+                &mut qdf_source_length,
+                2,
+                &map,
+                &removed_refs,
+            )
+            .unwrap();
+        let qdf_source_text = String::from_utf8_lossy(&qdf_source_length);
+        assert!(qdf_source_text.contains("/Length 3"));
+        assert!(qdf_source_text.contains("/Link 130 0 R"));
+
+        let mut qdf_synthetic_length = Vec::new();
+        stream
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+                &mut qdf_synthetic_length,
+                2,
+                &map,
+                &removed_refs,
+                Some(ObjectRef::new(77, 0)),
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&qdf_synthetic_length).contains("/Length 77 0 R"));
+
+        let mut qdf_encrypted_source_length = Vec::new();
+        stream
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                &mut qdf_encrypted_source_length,
+                2,
+                &map,
+                &removed_refs,
+                None,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        let qdf_encrypted_source_text = String::from_utf8_lossy(&qdf_encrypted_source_length);
+        assert!(qdf_encrypted_source_text.contains("{hook:plain}"));
+        assert!(qdf_encrypted_source_text.contains("/Length 3"));
+
+        let mut qdf_encrypted_synthetic_length = Vec::new();
+        stream
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                &mut qdf_encrypted_synthetic_length,
+                2,
+                &map,
+                &removed_refs,
+                Some(ObjectRef::new(78, 0)),
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&qdf_encrypted_synthetic_length).contains("/Length 78 0 R"));
+
+        let scalar = ObjectHandle::integer(5);
+        let mut scalar_qdf = Vec::new();
+        scalar
+            .unparse_stream_body_qdf_with_ref_map_and_removed(
+                &mut scalar_qdf,
+                0,
+                &map,
+                &removed_refs,
+            )
+            .unwrap();
+        assert_eq!(scalar_qdf, b"<<\n>>");
+        let mut scalar_qdf_encrypted = Vec::new();
+        scalar
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                &mut scalar_qdf_encrypted,
+                0,
+                &map,
+                &removed_refs,
+                None,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert_eq!(scalar_qdf_encrypted, b"<<\n  /Length null\n>>");
+        let mut scalar_compact_encrypted = Vec::new();
+        scalar
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                &mut scalar_compact_encrypted,
+                false,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        assert_eq!(scalar_compact_encrypted, b"<< >>");
+
+        let no_length = ObjectHandle::dictionary(vec![(
+            b"Text".to_vec(),
+            ObjectHandle::string(b"no-length".to_vec()),
+        )]);
+        let mut no_length_qdf = Vec::new();
+        no_length
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                &mut no_length_qdf,
+                0,
+                &map,
+                &removed_refs,
+                None,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&no_length_qdf).contains("/Length null"));
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let mut reserved_out = Vec::new();
+        assert!(reserved
+            .unparse_stream_body_qdf_with_ref_map_and_removed(
+                &mut reserved_out,
+                0,
+                &map,
+                &removed_refs,
+            )
+            .is_err());
+        assert!(reserved
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                &mut reserved_out,
+                0,
+                &map,
+                &removed_refs,
+                None,
+                &mut qdf_string_hook,
+            )
+            .is_err());
+        assert!(reserved
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                &mut reserved_out,
+                false,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .is_err());
+
+        let stream_with_non_dictionary_dict =
+            ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(Vec::new()));
+        let mut non_dictionary_dict_qdf = Vec::new();
+        stream_with_non_dictionary_dict
+            .unparse_stream_body_qdf_with_ref_map_and_removed(
+                &mut non_dictionary_dict_qdf,
+                0,
+                &map,
+                &removed_refs,
+            )
+            .unwrap();
+        assert_eq!(non_dictionary_dict_qdf, b"<<\n>>");
+        let mut non_dictionary_dict_qdf_string = Vec::new();
+        stream_with_non_dictionary_dict
+            .unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                &mut non_dictionary_dict_qdf_string,
+                0,
+                &map,
+                &removed_refs,
+                None,
+                &mut qdf_string_hook,
+            )
+            .unwrap();
+        assert_eq!(non_dictionary_dict_qdf_string, b"<<\n  /Length null\n>>");
+        let mut non_dictionary_dict_compact_string = Vec::new();
+        stream_with_non_dictionary_dict
+            .unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                &mut non_dictionary_dict_compact_string,
+                false,
+                &map,
+                &removed_refs,
+                &mut compact_string_hook,
+            )
+            .unwrap();
+        assert_eq!(non_dictionary_dict_compact_string, b"<< >>");
+    }
+
+    #[test]
+    fn mapped_trailer_and_xref_dictionary_walk_live_handles() {
+        let removed_ref = ObjectRef::new(31, 0);
+        let info = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), 0);
+        info.set_resolved(ObjectValue::Integer(7));
+        let removed = ObjectHandle::new_indirect_unresolved(removed_ref, 0);
+        removed.set_resolved(ObjectValue::Integer(8));
+        let id = ObjectHandle::array(vec![
+            ObjectHandle::string(vec![0xabu8, 0xcdu8]),
+            ObjectHandle::string(vec![0x12u8, 0x34u8]),
+        ]);
+        let indirect_id = ObjectHandle::new_indirect_unresolved(ObjectRef::new(32, 0), 0);
+        indirect_id.set_resolved(ObjectValue::Array(vec![
+            ObjectHandle::string(vec![0x01u8]),
+            ObjectHandle::string(vec![0x02u8]),
+        ]));
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"Size".to_vec(), ObjectHandle::integer(40)),
+            (
+                b"Root".to_vec(),
+                ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(10, 0))),
+            ),
+            (b"Info".to_vec(), info),
+            (b"ID".to_vec(), id.clone()),
+            (
+                b"Encrypt".to_vec(),
+                ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(11, 0))),
+            ),
+            (b"Null".to_vec(), ObjectHandle::null()),
+            (b"Removed".to_vec(), removed),
+        ]);
+        let mut removed_refs = BTreeSet::new();
+        removed_refs.insert(removed_ref);
+        let map = |object_ref: ObjectRef| {
+            Ok(ObjectRef::new(
+                object_ref.number + 100,
+                object_ref.generation,
+            ))
+        };
+
+        let mut qdf_trailer = Vec::new();
+        let mut qdf_id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"<computed>");
+        trailer
+            .unparse_trailer_with_ref_map(
+                &mut qdf_trailer,
+                false,
+                true,
+                Some(&mut qdf_id_writer),
+                &map,
+                &removed_refs,
+                true,
+            )
+            .unwrap();
+        let qdf_text = String::from_utf8_lossy(&qdf_trailer);
+        assert!(qdf_text.starts_with("trailer <<\n"));
+        assert!(qdf_text.contains("/Root 10 0 R"));
+        assert!(qdf_text.contains("/Encrypt 11 0 R"));
+        assert!(qdf_text.contains("/ID <computed>"));
+        assert!(!qdf_text.contains("/Null"));
+        assert!(!qdf_text.contains("/Removed"));
+
+        let mut classic_trailer = Vec::new();
+        trailer
+            .unparse_trailer_with_ref_map(
+                &mut classic_trailer,
+                false,
+                false,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .unwrap();
+        let classic_text = String::from_utf8_lossy(&classic_trailer);
+        assert!(classic_text.starts_with("trailer <<"));
+        assert!(classic_text.contains("/Info 130 0 R"));
+        assert!(classic_text.contains("/ID [<abcd><1234>]"));
+        assert!(classic_text.contains("/Null null"));
+
+        let mut xref_trailer = Vec::new();
+        trailer
+            .unparse_trailer_with_ref_map(
+                &mut xref_trailer,
+                true,
+                false,
+                None,
+                &map,
+                &removed_refs,
+                true,
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&xref_trailer).starts_with("trailer"));
+
+        let mut xref_dictionary = Vec::new();
+        let mut dictionary_id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"<dict-id>");
+        trailer
+            .unparse_dictionary_with_ref_map_and_id_writer(
+                &mut xref_dictionary,
+                Some(&mut dictionary_id_writer),
+                &map,
+                &removed_refs,
+                true,
+            )
+            .unwrap();
+        let xref_text = String::from_utf8_lossy(&xref_dictionary);
+        assert!(xref_text.contains("/ID <dict-id>"));
+        assert!(xref_text.contains("/Info 130 0 R"));
+        assert!(!xref_text.contains("/Null"));
+
+        let mut indirect_id_dictionary = Vec::new();
+        let indirect_id_dict = ObjectHandle::dictionary(vec![(b"ID".to_vec(), indirect_id)]);
+        indirect_id_dict
+            .unparse_dictionary_with_ref_map_and_id_writer(
+                &mut indirect_id_dictionary,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .unwrap();
+        assert!(String::from_utf8_lossy(&indirect_id_dictionary).contains("/ID 132 0 R"));
+
+        let fallback_shapes = [
+            ObjectHandle::array(vec![
+                ObjectHandle::string(vec![0x00u8]),
+                ObjectHandle::string(vec![0x11u8]),
+                ObjectHandle::string(vec![0x8fu8]),
+            ]),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::string(vec![0x8fu8]),
+            ]),
+            ObjectHandle::integer(7),
+        ];
+        for value in fallback_shapes {
+            let dict = ObjectHandle::dictionary(vec![(b"ID".to_vec(), value)]);
+            let mut out = Vec::new();
+            dict.unparse_dictionary_with_ref_map_and_id_writer(
+                &mut out,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .unwrap();
+            assert!(String::from_utf8_lossy(&out).contains("/ID "));
+        }
+
+        let reserved = ObjectHandle::new_reserved_direct();
+        let mut reserved_out = Vec::new();
+        assert!(reserved
+            .unparse_trailer_with_ref_map(
+                &mut reserved_out,
+                false,
+                false,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .is_err());
+        assert!(reserved
+            .unparse_dictionary_with_ref_map_and_id_writer(
+                &mut reserved_out,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .is_err());
+        let scalar = ObjectHandle::integer(7);
+        scalar
+            .unparse_trailer_with_ref_map(
+                &mut reserved_out,
+                false,
+                false,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .unwrap();
+        scalar
+            .unparse_dictionary_with_ref_map_and_id_writer(
+                &mut reserved_out,
+                None,
+                &map,
+                &removed_refs,
+                false,
+            )
+            .unwrap();
     }
 
     #[test]

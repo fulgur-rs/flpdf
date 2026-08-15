@@ -7,6 +7,7 @@ use flpdf::job::{
     write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
+use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p, outline_dest_remap::remap_outline_and_dests,
@@ -25,11 +26,11 @@ use flpdf::{
     },
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
-    parse_pdf_version, CompressStreams, CopyEncryptionSource, Dictionary, EncryptMethod,
-    EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectHandle,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
-    PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
-    RemoveUnreferencedResources, Severity, Stream, StreamDataMode,
+    parse_pdf_version, CompressStreams, CopyEncryptionSource, EncryptMethod, EncryptParams,
+    FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg, ObjectRef,
+    ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PdfWriter,
+    PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources, Severity,
+    StreamDataMode,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -3153,7 +3154,7 @@ fn run_rewrite(
         // Apply content normalization before the writer plans and emits the
         // linearized document.
         let normalization_last_bad = if normalize_content {
-            normalize_page_contents(&mut pdf)?
+            pdf.with_writer_stream_recovery(normalize_page_contents)?
         } else {
             Vec::new()
         };
@@ -3239,7 +3240,7 @@ fn run_rewrite(
         // the stored stream data, normalize, and write the result back via
         // set_object (same pattern as coalesce_page_contents).
         let normalization_last_bad = if normalize_content {
-            normalize_page_contents(&mut pdf)?
+            pdf.with_writer_stream_recovery(normalize_page_contents)?
         } else {
             Vec::new()
         };
@@ -4520,48 +4521,79 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     seen: &mut HashSet<ObjectRef>,
 ) -> CliResult<Vec<bool>> {
     let mut warnings = Vec::new();
-    for (stream_ref, stream) in pages::page_content_stream_entries_tolerant(pdf, page_ref)? {
-        if let Some(stream_ref) = stream_ref {
-            if let Some(last_bad) = normalize_and_store_stream(pdf, stream_ref, stream, seen)? {
-                warnings.push(last_bad);
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    let contents = page.get_key(b"/Contents");
+    let (contents, contents_ref) = pdf.resolve_object_handle_to_terminal_ref(&contents)?;
+
+    let mut streams = Vec::new();
+    if contents.as_stream_dict().is_some() {
+        if let Some(stream_ref) = contents_ref {
+            streams.push((stream_ref, contents));
+        }
+    } else if let Some(items) = contents.as_array() {
+        for item in items {
+            let (item, item_ref) = pdf.resolve_object_handle_to_terminal_ref(&item)?;
+            if item.as_stream_dict().is_some() {
+                if let Some(item_ref) = item_ref {
+                    streams.push((item_ref, item));
+                }
             }
+        }
+    }
+
+    for (stream_ref, stream) in streams {
+        if let Some(last_bad) = normalize_and_store_stream_handle(pdf, stream_ref, stream, seen)? {
+            warnings.push(last_bad);
         }
     }
     Ok(warnings)
 }
 
-/// Normalize the raw decoded bytes of the indirect stream at `stream_ref`
-/// and write the result back into `pdf` via [`Pdf::set_object`].
-fn normalize_and_store_stream<R: std::io::Read + std::io::Seek>(
+/// Normalize the decoded bytes of the indirect stream at `stream_ref` through
+/// the live ObjectHandle stream pipeline and mutate that same qpdf-style
+/// stream in place. Keeping the stream handle live is important for malformed
+/// content holders: the writer must observe one canonical resolution and not
+/// parse the legacy raw Object a second time.
+fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     stream_ref: ObjectRef,
-    stream: Stream,
+    stream: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,
 ) -> CliResult<Option<bool>> {
     if !seen.insert(stream_ref) {
         return Ok(None);
     }
 
-    // Decode the stored bytes through the declared filter pipeline.
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data)?;
+    // Decode the stored bytes through qpdf's canonical stream pipeline. This
+    // resolves indirect filters/parameters and preserves source recovery
+    // diagnostics on the owning document.
+    let decoded = stream.get_stream_data(StreamDecodeLevel::All)?;
 
     // Normalize the decoded content stream bytes.
-    let normalized = normalize_content_stream(&decoded);
+    let normalized = normalize_content_stream(decoded.as_ref());
     let warning = normalized
         .any_bad_tokens()
         .then(|| normalized.last_token_was_bad());
     let normalized = normalized.into_bytes();
 
-    // Build a new stream dict with the updated /Length.
-    let mut new_dict: Dictionary = stream.dict.clone();
-    // Remove filter / encode-form keys: the normalized bytes are raw (no filter).
-    for key in &["Filter", "DecodeParms", "DP", "DL"] {
-        new_dict.remove(key);
+    // Remove filter / encode-form keys and install the fresh direct length;
+    // the normalized payload is raw. This is qpdf's in-place stream mutation
+    // boundary, so mark the canonical indirect owner dirty for the writer.
+    let normalized = std::rc::Rc::new(normalized);
+    stream.replace_stream_data(
+        std::rc::Rc::clone(&normalized),
+        Some(ObjectHandle::null()),
+        Some(ObjectHandle::null()),
+    );
+    if let Some(dict) = stream.as_stream_dict() {
+        dict.replace_key(
+            b"/Length",
+            ObjectHandle::integer(i64::try_from(normalized.len())?),
+        )?;
     }
-    new_dict.insert("Length", Object::Integer(normalized.len() as i64));
-
-    let new_stream = Stream::new(new_dict, normalized);
-    pdf.set_object(stream_ref, Object::Stream(new_stream));
+    stream.mark_content_normalization_applied();
+    pdf.mark_object_handle_dirty(&stream)?;
     Ok(warning)
 }
 
@@ -5991,6 +6023,7 @@ fn run_copy_attachments_from(
 mod tests {
     use super::*;
     use flpdf::pipeline::{Pipeline, PipelineResult};
+    use flpdf::{Dictionary, Stream};
     use std::sync::{Arc, Mutex};
 
     struct ChunkRecordingSink {

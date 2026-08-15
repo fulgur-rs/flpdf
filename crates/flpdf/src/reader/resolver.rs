@@ -6748,21 +6748,38 @@ mod tests {
         String::from_utf8(qpdf.stdout).expect("qpdf object display is text")
     }
 
-    fn qpdf_contents_hex(object: &str) -> Vec<u8> {
+    fn qpdf_contents_bytes(object: &str) -> Vec<u8> {
+        if let Some((_, after_contents)) = object.split_once("/Contents <") {
+            let (hex, _) = after_contents
+                .split_once('>')
+                .expect("qpdf contents hex must terminate");
+            assert_eq!(hex.len() % 2, 0, "qpdf emitted an even-length hex string");
+            return hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    u8::from_str_radix(std::str::from_utf8(pair).expect("qpdf hex is ASCII"), 16)
+                        .expect("qpdf contents must be hexadecimal")
+                })
+                .collect();
+        }
+
         let (_, after_contents) = object
-            .split_once("/Contents <")
-            .expect("qpdf must display binary signature contents as hex");
-        let (hex, _) = after_contents
-            .split_once('>')
-            .expect("qpdf contents hex must terminate");
-        assert_eq!(hex.len() % 2, 0, "qpdf emitted an even-length hex string");
-        hex.as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                u8::from_str_radix(std::str::from_utf8(pair).expect("qpdf hex is ASCII"), 16)
-                    .expect("qpdf contents must be hexadecimal")
-            })
-            .collect()
+            .split_once("/Contents (")
+            .expect("qpdf must display signature contents as a string or hex");
+        let (literal, _) = after_contents
+            .split_once(')')
+            .expect("qpdf contents literal must terminate");
+        literal.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn qpdf_contents_bytes_accepts_hex_and_literal_forms() {
+        assert_eq!(
+            qpdf_contents_bytes("<< /Contents <000102ff> >>"),
+            vec![0, 1, 2, 255]
+        );
+        assert_eq!(qpdf_contents_bytes("<< /Contents (literal) >>"), b"literal");
     }
 
     fn aes128_encryption_state() -> crate::reader::EncryptionState {
@@ -6968,10 +6985,10 @@ mod tests {
         }
     }
 
-    // This catches a production regression where the parser leaves a
-    // signature Contents value decrypted after it has recognised the whole
-    // dictionary. qpdf's textual unparser chooses hex for this binary value,
-    // which lets the test compare the preserved ciphertext byte-for-byte.
+    // This catches a production regression where the parser loses the raw
+    // signature Contents value after it has recognized the whole dictionary.
+    // qpdf's writer leaves this field unencrypted and its textual unparser
+    // chooses hex, which lets the test compare the preserved bytes directly.
     #[test]
     fn canonical_resolver_signature_contents_matches_pinned_qpdf() {
         // cov:ignore-start: CI has pinned qpdf; this fallback is for developer hosts only.
@@ -6996,14 +7013,14 @@ mod tests {
             .get(b"/Contents".as_slice())
             .and_then(crate::ObjectHandle::as_string)
             .expect("signature /Contents is a string");
-        assert_ne!(contents, b"SignatureCipher");
+        assert_eq!(contents, b"SignatureCipher");
 
         let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
         let path = directory.path().join("signature.pdf");
         fs::write(&path, encrypted).expect("write encrypted qpdf fixture");
         let qpdf = qpdf_show_object(&path, info_ref);
         assert!(qpdf.contains("ReasonPlain"), "qpdf object:\n{qpdf}");
-        assert_eq!(contents, qpdf_contents_hex(&qpdf));
+        assert_eq!(contents, qpdf_contents_bytes(&qpdf));
 
         let no_byte_range = encrypted_info_fixture(
             b"<< /Type /Sig /Contents (SignatureCipher) >>",

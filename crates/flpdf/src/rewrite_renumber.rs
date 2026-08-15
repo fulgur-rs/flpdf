@@ -68,12 +68,14 @@ impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
 
 /// A map from original object references to their qpdf-style Catalog-first
 /// numbers, plus the visitation order that produced them.
+#[allow(dead_code)]
 pub(crate) struct CatalogFirstRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     /// Index `i` holds the original ref assigned new number `i + 1`.
     order: Vec<ObjectRef>,
 }
 
+#[allow(dead_code)]
 impl CatalogFirstRenumber {
     /// Return the new reference assigned to `original`, if it was reachable.
     pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
@@ -232,6 +234,16 @@ impl NewNumberLookup for CanonicalCatalogFirstRenumber {
 }
 
 impl CanonicalCatalogFirstRenumber {
+    /// Number of source objects reached by the canonical qpdf-style walk.
+    pub(crate) fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Return the new number assigned to an original object reference.
+    pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
+        self.old_to_new.get(&original).copied()
+    }
+
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
         self.order
             .iter()
@@ -994,6 +1006,7 @@ fn enqueue(
 /// over-deep region uncollected, so they would never be numbered — emitting a
 /// corrupt renumbered PDF as if it succeeded. Refusing is the safe choice
 /// (real PDFs never nest inline structures that deeply).
+#[allow(dead_code)]
 fn collect_refs(
     obj: &Object,
     depth: usize,

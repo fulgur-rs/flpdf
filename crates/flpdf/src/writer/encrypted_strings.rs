@@ -140,6 +140,58 @@ impl EncryptedStringEmitter {
             })
     }
 
+    /// Handle-based object emission with the writer's output reference map and
+    /// qpdf's removed-reference null policy threaded through the same string
+    /// encryption lifecycle.
+    #[allow(clippy::too_many_arguments)] // emission identity, qdf layout, mapping, and encryption remain separate qpdf dimensions
+    pub(crate) fn write_handle_object_with_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        object: &ObjectHandle,
+        qdf: bool,
+        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+    ) -> crate::Result<()> {
+        if emitted_ref == self.encrypt_ref {
+            return write_encryption_dictionary_handle(out, object);
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                if qdf {
+                    object.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                        out,
+                        0,
+                        map,
+                        removed_refs,
+                        &mut write_string,
+                    )
+                } else {
+                    object.unparse_object_with_ref_map_and_removed_with_string_writer(
+                        out,
+                        map,
+                        removed_refs,
+                        &mut write_string,
+                    )
+                }
+            })
+    }
+
     pub(crate) fn write_stream_dict(
         &mut self,
         out: &mut Vec<u8>,
@@ -226,6 +278,75 @@ impl EncryptedStringEmitter {
                     dict.unparse_stream_body_with_string_writer(
                         out,
                         options.refiltered,
+                        &mut write_string,
+                    )
+                }
+            })
+    }
+
+    /// Handle-based stream-dictionary emission with output-reference mapping
+    /// and removed-reference visibility. `length_ref` is used only by QDF's
+    /// synthetic stream-length holder.
+    #[allow(clippy::too_many_arguments)] // keeps the qpdf stream-dictionary contract explicit at this boundary
+    pub(crate) fn write_handle_stream_dict_with_ref_map(
+        &mut self,
+        out: &mut Vec<u8>,
+        emitted_ref: ObjectRef,
+        object_stream_index: Option<u32>,
+        dict: &ObjectHandle,
+        options: StreamDictOptions,
+        map: &dyn Fn(ObjectRef) -> crate::Result<ObjectRef>,
+        removed_refs: &std::collections::BTreeSet<ObjectRef>,
+        length_ref: Option<ObjectRef>,
+    ) -> crate::Result<()> {
+        if !options.encrypt_strings {
+            if options.qdf {
+                return dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+                    out,
+                    0,
+                    map,
+                    removed_refs,
+                    length_ref,
+                );
+            }
+            return dict.unparse_stream_body_with_ref_map_and_removed(
+                out,
+                options.refiltered,
+                map,
+                removed_refs,
+            );
+        }
+
+        let cipher = self.cipher;
+        let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
+        self.state
+            .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
+                let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
+                };
+                if options.qdf {
+                    dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                        out,
+                        0,
+                        map,
+                        removed_refs,
+                        length_ref,
+                        &mut write_string,
+                    )
+                } else {
+                    dict.unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                        out,
+                        options.refiltered,
+                        map,
+                        removed_refs,
                         &mut write_string,
                     )
                 }
@@ -785,6 +906,21 @@ mod tests {
             .expect("/Encrypt object must remain cleartext");
         assert_eq!(encrypt_output, b"<< /O <7072696e7461626c65> >>");
 
+        let identity_map = |object_ref: ObjectRef| Ok(object_ref);
+        let mut mapped_encrypt_output = Vec::new();
+        emitter
+            .write_handle_object_with_ref_map(
+                &mut mapped_encrypt_output,
+                context.encrypt_ref,
+                None,
+                &encrypt_object,
+                false,
+                &identity_map,
+                &std::collections::BTreeSet::new(),
+            )
+            .expect("mapped /Encrypt object must remain cleartext");
+        assert_eq!(mapped_encrypt_output, encrypt_output);
+
         let mut member_output = Vec::new();
         emitter
             .write_handle_object(
@@ -843,6 +979,22 @@ mod tests {
                 b"metadata-dictionary-secret"
             );
         }
+
+        let identity_map = |object_ref: ObjectRef| Ok(object_ref);
+        let mut mapped_cleartext = Vec::new();
+        EncryptedStringEmitter::from_context(&context)
+            .write_handle_stream_dict_with_ref_map(
+                &mut mapped_cleartext,
+                emitted_ref,
+                None,
+                &dict,
+                StreamDictOptions::new(true, false, false),
+                &identity_map,
+                &std::collections::BTreeSet::new(),
+                None,
+            )
+            .expect("mapped cleartext metadata dictionary emission");
+        assert!(mapped_cleartext.starts_with(b"<<\n"));
     }
 
     #[test]

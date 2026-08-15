@@ -31,6 +31,7 @@ pub fn write_stream_to_buf(
 }
 
 /// Write a stream dictionary with an optional inline trailer-ID writer.
+#[cfg(test)]
 pub(crate) fn write_stream_with_id_writer(
     out: &mut Vec<u8>,
     stream: &crate::Stream,

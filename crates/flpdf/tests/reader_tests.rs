@@ -911,11 +911,11 @@ fn document_identity_stream_filter_rewrite_restores_plaintext_recovered_eol() {
 }
 
 #[test]
-fn single_explicit_identity_crypt_filter_keeps_unfiltered_raw_payload() {
+fn single_explicit_crypt_filter_without_type_falls_back_to_document_filter() {
     assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
         encrypted_v4_identity_recovered_eol_fixture(true),
         "Data",
-        b"A\n",
+        b"",
         true,
     );
 }
