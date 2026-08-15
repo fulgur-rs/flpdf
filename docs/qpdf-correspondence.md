@@ -380,6 +380,18 @@ cargo test -p flpdf-cli --test cli_json --quiet
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
 
+`QPDFJob::writeQPDF`（`QPDFJob.cc:484-503`）は、出力またはinspectionを完了した後に
+文書のopen-time/lazy warningを集約し、`createsOutput()`（同 `:529-532`）に応じて
+`operation succeeded with warnings` または `operation succeeded with warnings; resulting
+file may have some problems` を一度だけ出力する。終了コード3の判定は同 `:534-563`、
+inspection側のwarning集約は `doInspection`（同 `:1646-1693`）がoracleである。
+flpdfは `crates/flpdf-cli/src/main.rs` の `finish_warning_state` / `finish_operation_warnings`
+を共通完了境界とし、rewrite/QDF/page-operation/attachment-write/JSON fileをoutput-producing
+経路、show/list/stream/JSON stdout/encryption inspectionをinspection経路として同じsuffix
+選択を行う。すべての成功出力を先に完了してから終了コード3を返し、fatal errorの途中では
+success summaryを出さない。JSONの `--json-output PATH` はqpdfの出力ファイル相当として
+resulting-file suffixを持ち、stdout JSONはinspection suffixを持つ。
+
 ### `QPDFLogger` の CLI consumer cutover と retained direct routes
 
 qpdf の route ownership は `QPDFJob.cc:343,498-502,625,709-925,2934,3051-3054,3094-3115`

@@ -503,7 +503,10 @@ fn rewrite_repaired_fixture_with_repair_flag() {
         output.to_str().unwrap(),
     ])
     .assert()
-    .success();
+    .code(3)
+    .stderr(predicate::str::contains(
+        "flpdf: operation succeeded with warnings; resulting file may have some problems",
+    ));
 
     assert!(output.exists());
     assert!(std::fs::metadata(output).unwrap().len() > 0);
@@ -580,6 +583,28 @@ fn qdf_subcommand_rewrites_output() {
     assert!(has(b"\nxref\n"), "expected a classic `xref` table");
     assert!(!has(b"/Type /XRef"), "QDF must not use an xref stream");
     assert!(!has(b"/Type /ObjStm"), "QDF must not use object streams");
+}
+
+#[test]
+fn qdf_repaired_input_keeps_output_and_exits_three_with_output_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("repaired.qdf.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "qdf",
+            "--repair",
+            "../../tests/fixtures/test_driver/repairable_input.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems",
+        ));
+
+    assert!(output.exists(), "warning exit must retain qdf output");
 }
 
 #[test]
@@ -1153,8 +1178,30 @@ fn show_info_with_repair_flag_handles_corrupt_xref() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--repair", "--show-info", input.to_str().unwrap()])
         .assert()
-        .success()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ))
+        .stderr(predicate::str::contains("resulting file may have some problems").not())
         .stdout(predicate::str::contains("Title = (Corrupt fixture)"));
+}
+
+#[test]
+fn show_catalog_repaired_input_exits_three_with_inspection_summary() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--repair",
+            "--show-catalog",
+            "../../tests/fixtures/test_driver/repairable_input.pdf",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ))
+        .stderr(predicate::str::contains("resulting file may have some problems").not())
+        .stdout(predicate::str::contains("Catalog:"));
 }
 
 #[test]
@@ -1276,8 +1323,11 @@ fn show_outline_warns_and_prints_empty_when_outline_resolution_fails() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--show-outline", fixture.path().to_str().unwrap()])
         .assert()
-        .success()
+        .code(3)
         .stderr(predicate::str::contains("WARNING:"))
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ))
         .stdout(predicate::str::contains("Outline:\n  <empty>"));
 }
 
@@ -2930,6 +2980,12 @@ fn json_and_side_files_complete_before_warning_exit_three() {
         .find("flpdf: operation succeeded with warnings")
         .unwrap();
     assert!(warning < summary, "{stderr}");
+    assert!(
+        stderr.contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems"
+        ),
+        "JSON written to a path is an output-producing operation: {stderr}"
+    );
 }
 
 #[test]
@@ -5189,6 +5245,32 @@ fn pages_extracts_subset_top_level_syntax() {
 }
 
 #[test]
+fn pages_repaired_input_keeps_output_and_exits_three_with_output_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("damaged.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(
+        &input,
+        include_bytes!("../../../tests/fixtures/compat/missing-mediabox-leaf.pdf"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair"])
+        .arg(&input)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&output)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems",
+        ));
+
+    assert!(output.exists(), "warning exit must retain extracted output");
+}
+
+#[test]
 fn pages_dot_shorthand_resolves_to_primary_input() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
@@ -5228,6 +5310,28 @@ fn rotate_single_spec_rewrites_all_pages() {
         .assert()
         .success()
         .stdout(predicate::str::contains("rotate: 180"));
+}
+
+#[test]
+fn rotate_repaired_input_keeps_output_and_exits_three_with_output_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("damaged.pdf");
+    let output = temp.path().join("rotated.pdf");
+    std::fs::write(&input, corrupt_xref_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair"])
+        .arg(&input)
+        .arg(&output)
+        .arg("--rotate=90")
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems",
+        ));
+
+    assert!(output.exists(), "warning exit must retain rotated output");
 }
 
 #[test]
@@ -5586,6 +5690,35 @@ fn add_attachment_default_key_is_basename() {
 }
 
 #[test]
+fn add_attachment_repaired_input_keeps_output_and_exits_three_with_output_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("damaged.pdf");
+    let attachment = temp.path().join("hello.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
+    std::fs::write(&attachment, b"hello world").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair"])
+        .arg(&input)
+        .args(["--add-attachment"])
+        .arg(&attachment)
+        .args(["--key=hello", "--"])
+        .arg(&output)
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems",
+        ));
+
+    assert!(
+        output.exists(),
+        "warning exit must retain attachment output"
+    );
+}
+
+#[test]
 fn add_attachment_explicit_key_and_filename() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
@@ -5902,6 +6035,24 @@ fn list_attachments_empty_document() {
             "{} has no embedded files\n",
             input.path().display()
         ));
+}
+
+#[test]
+fn list_attachments_repaired_input_exits_three_with_inspection_summary() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--repair",
+            "--list-attachments",
+            "../../tests/fixtures/test_driver/repairable_input.pdf",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings\n",
+        ))
+        .stderr(predicate::str::contains("resulting file may have some problems").not())
+        .stdout(predicate::str::contains("has no embedded files"));
 }
 
 #[test]

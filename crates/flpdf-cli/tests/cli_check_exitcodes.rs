@@ -759,11 +759,14 @@ fn rewrite_repair_warnings_use_qpdf_stderr_format() {
     cmd.env_remove("FLPDF_PROGNAME")
         .args(["rewrite", "--repair", &path, out.path().to_str().unwrap()])
         .assert()
-        .success()
+        .code(3)
         .stderr(predicate::str::contains(format!(
             "WARNING: {path}: file is damaged\n"
         )))
-        .stderr(predicate::str::contains("warning: ").not());
+        .stderr(predicate::str::contains("warning: ").not())
+        .stderr(predicate::str::contains(
+            "flpdf: operation succeeded with warnings; resulting file may have some problems",
+        ));
 }
 
 // ---------------------------------------------------------------------------
