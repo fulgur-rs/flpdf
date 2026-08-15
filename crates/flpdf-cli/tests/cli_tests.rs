@@ -4493,16 +4493,20 @@ fn rewrite_normalize_content_keeps_lazy_repair_warnings_before_normalization_war
                 .any(|line| line.ends_with(suffix)),
             "missing lazy warning ending with {suffix:?} before normalization warnings: {stderr}"
         );
+        assert_eq!(
+            lines[..normalization_start]
+                .iter()
+                .filter(|line| line.ends_with(suffix))
+                .count(),
+            1,
+            "lazy warning ending with {suffix:?} was emitted more than once: {stderr}"
+        );
     }
     assert_eq!(
         &lines[normalization_start..],
         [
             format!(
                 "WARNING: {}: content normalization encountered bad tokens",
-                input.display()
-            ),
-            format!(
-                "WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents",
                 input.display()
             ),
             format!(

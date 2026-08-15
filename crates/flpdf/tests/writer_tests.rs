@@ -1082,6 +1082,52 @@ fn write_qdf_header_has_binary_marker() {
     );
 }
 
+/// qpdf's QPDFWriter enumerates dictionary keys through the live handle graph,
+/// so a key whose indirect value resolves to null is omitted during emission.
+/// Keep this RED-to-GREEN test on the top-level consumer so both ordinary and
+/// stream dictionaries stay on the live ObjectHandle writer route.
+#[test]
+fn qdf_consumer_omits_dictionary_keys_that_resolve_to_null() {
+    let objects = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Drop 3 0 R /Keep 4 0 R /Stream 5 0 R >>\nendobj\n".as_slice(),
+        b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n".as_slice(),
+        b"3 0 obj\nnull\nendobj\n".as_slice(),
+        b"4 0 obj\n7\nendobj\n".as_slice(),
+        b"5 0 obj\n<< /Length 3 /Drop 3 0 R /Keep 4 0 R >>\nstream\nabc\nendstream\nendobj\n".as_slice(),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("null-key fixture must open");
+    let mut output = Vec::new();
+    write_qdf_output(&mut pdf, &mut output).expect("QDF rewrite must succeed");
+
+    assert!(
+        !output
+            .windows(b"/Drop".len())
+            .any(|window| window == b"/Drop"),
+        "qpdf writer must omit a dictionary key whose indirect value is null"
+    );
+    assert!(
+        output
+            .windows(b"/Keep".len())
+            .any(|window| window == b"/Keep"),
+        "non-null dictionary keys must remain visible"
+    );
+}
+
 /// A full rewrite normalizes every object's generation to 0 and drops objects
 /// unreachable from `/Root`. This fixture's `/Root` is `1 3 R` (a non-zero
 /// input generation — the sole mixed-generation exercise of the Catalog-first

@@ -16,10 +16,9 @@ mod settings;
 pub use object_streams::ObjectStreamMode;
 pub use pdf_writer::PdfWriter;
 pub use serialize::write_stream_to_buf;
-use serialize::{
-    framing_adds_newline as stream_framing_adds_newline, write_stream_payload,
-    write_stream_with_id_writer as write_stream_to_buf_with_id_writer,
-};
+#[cfg(test)]
+use serialize::write_stream_with_id_writer as write_stream_to_buf_with_id_writer;
+use serialize::{framing_adds_newline as stream_framing_adds_newline, write_stream_payload};
 pub use settings::DecodeLevel;
 
 /// Test-only convenience for exercising the canonical qpdf writer lifecycle
@@ -38,9 +37,12 @@ where
     writer.get_buffer()
 }
 
+use crate::object_handle::ObjectValue;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::pipeline::{Pipeline, PlString};
-use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
+use crate::{
+    filters, Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -1123,6 +1125,7 @@ fn strip_writer_trailer_history_keys(trailer: &mut Dictionary) {
 /// here. Every other indirect value (notably `/Info`, which the renumber walk
 /// always seeds) is rewritten through `map`; a value absent from the map is an
 /// error rather than a stale number leaking into the output.
+#[cfg(test)]
 fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
     trailer: &mut Dictionary,
     map: &M,
@@ -1174,14 +1177,6 @@ fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
         }
     }
     Ok(())
-}
-
-fn remap_qpdf_trailer_refs<R: Read + Seek, M: crate::rewrite_renumber::NewNumberLookup>(
-    pdf: &mut Pdf<R>,
-    trailer: &mut Dictionary,
-    map: &M,
-) -> Result<()> {
-    remap_qpdf_trailer_refs_with_removed(pdf, trailer, map, &BTreeSet::new())
 }
 
 fn remap_qpdf_trailer_refs_with_removed<
@@ -1390,10 +1385,10 @@ pub(crate) struct EncryptionContext {
 /// which needs the same `--cleartext-metadata` exemption for linearized output.
 pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
-    match pdf.resolve_borrowed(root).ok()? {
-        Object::Dictionary(dict) => dict.get_ref("Metadata"),
-        _ => None,
-    }
+    let root_handle = pdf.get_object_handle(root);
+    pdf.resolve_object_handle(&root_handle).ok()?;
+    let metadata = root_handle.try_get_key(b"/Metadata").ok()?;
+    metadata.object_ref().or_else(|| metadata.as_reference())
 }
 
 /// `id0` is the `/ID[0]` bytes the file encryption key is derived from
@@ -1752,7 +1747,9 @@ fn insert_standard_crypt_filter(dict: &mut Dictionary, cfm: &[u8], length: i64) 
 /// Return the donor's metadata-encryption policy using qpdf's default. qpdf
 /// only changes its default when `/EncryptMetadata` is present and boolean;
 /// an absent or otherwise unusable entry means metadata remains encrypted.
-fn copy_encryption_encrypts_metadata(src: &crate::encrypt_setup::CopyEncryptionSource) -> bool {
+pub(crate) fn copy_encryption_encrypts_metadata(
+    src: &crate::encrypt_setup::CopyEncryptionSource,
+) -> bool {
     copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict)
 }
 
@@ -2014,6 +2011,134 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
             // cov:ignore-end
         }
     }
+}
+
+fn generated_id_handle(value: &Object) -> Result<ObjectHandle> {
+    let Object::Array(values) = value else {
+        return Err(crate::Error::Unsupported(
+            "writer generated /ID is not an array".to_string(),
+        ));
+    };
+    let [Object::String(id0), Object::String(id1)] = values.as_slice() else {
+        return Err(crate::Error::Unsupported(
+            "writer generated /ID does not contain two strings".to_string(),
+        ));
+    };
+    Ok(ObjectHandle::array(vec![
+        ObjectHandle::string(id0.clone()),
+        ObjectHandle::string(id1.clone()),
+    ]))
+}
+
+/// Apply writer-owned trailer values without converting the live trailer back
+/// through the legacy `Dictionary` bridge. `/Root` and `/Encrypt` are already
+/// output-space references, while `/ID` is a direct writer-owned array.
+fn apply_encrypt_trailer_handle_entries<R: Read + Seek>(
+    trailer: &ObjectHandle,
+    pdf: &Pdf<R>,
+    options: &WriterOptions,
+    encrypt_ctx: Option<&EncryptionContext>,
+    deterministic_id: bool,
+    generated_id: Option<&ObjectHandle>,
+) -> Result<()> {
+    if let Some(ctx) = encrypt_ctx {
+        trailer.replace_key(
+            b"/Encrypt",
+            ObjectHandle::from_value(ObjectValue::Reference(ctx.encrypt_ref)),
+        )?;
+        if let Some(id) = generated_id {
+            trailer.replace_key(b"/ID", id.shallow_copy()?)?;
+        } else {
+            let id1 = if options.static_id {
+                QPDF_STATIC_ID.to_vec()
+            } else {
+                fresh_id_bytes().to_vec()
+            };
+            trailer.replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(ctx.id0.clone()),
+                    ObjectHandle::string(id1),
+                ]),
+            )?;
+        }
+    } else {
+        if pdf.is_encrypted() {
+            trailer.remove_key(b"/Encrypt");
+        }
+        if deterministic_id {
+            trailer.replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(vec![0; 16]),
+                    ObjectHandle::string(vec![0; 16]),
+                ]),
+            )?;
+        } else if let Some(id) = generated_id {
+            trailer.replace_key(b"/ID", id.shallow_copy()?)?;
+        } else {
+            return Err(crate::Error::Unsupported(
+                "writer trailer is missing its generated /ID".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the trimmed trailer shell used by the non-linearized full rewrite.
+/// The source trailer and all surviving child values stay in the canonical
+/// ObjectHandle graph; only writer-owned structural values are replaced.
+#[allow(clippy::too_many_arguments)] // qpdf keeps source form, output form, ID, and encryption independent
+fn build_writer_trailer_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    source_xref_stream: bool,
+    output_xref_stream: bool,
+    size: usize,
+    root: ObjectRef,
+    options: &WriterOptions,
+    encrypt_ctx: Option<&EncryptionContext>,
+    deterministic_id: bool,
+    generated_id: Option<&ObjectHandle>,
+) -> Result<ObjectHandle> {
+    let trailer = pdf.trailer_handle().shallow_copy()?;
+    for key in [b"/ID".as_slice(), b"/Encrypt", b"/Prev"] {
+        trailer.remove_key(key);
+    }
+    if source_xref_stream || output_xref_stream {
+        for key in [
+            b"/Type".as_slice(),
+            b"/F",
+            b"/FFilter",
+            b"/FDecodeParms",
+            b"/W",
+            b"/Index",
+            b"/Length",
+            b"/Filter",
+            b"/DecodeParms",
+            b"/XRefStm",
+        ] {
+            trailer.remove_key(key);
+        }
+    }
+    trailer.replace_key(
+        b"/Size",
+        ObjectHandle::integer(i64::try_from(size).map_err(|_| {
+            crate::Error::Unsupported("writer trailer /Size does not fit in i64".to_string())
+        })?),
+    )?;
+    trailer.replace_key(
+        b"/Root",
+        ObjectHandle::from_value(ObjectValue::Reference(root)),
+    )?;
+    apply_encrypt_trailer_handle_entries(
+        &trailer,
+        pdf,
+        options,
+        encrypt_ctx,
+        deterministic_id,
+        generated_id,
+    )?;
+    Ok(trailer)
 }
 
 /// Whether `cipher` needs an AES CBC initialization vector: `true` for both
@@ -2569,7 +2694,14 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
             options
         };
 
-    let result = emit_canonical_pdf_inner(pdf, out, options);
+    // qpdf's full-rewrite writer resolves source streams with its default
+    // stream-framing recovery enabled. Keep that recovery scoped to the
+    // specialized coordinator as well as the plain writer: this route now
+    // resolves ordinary objects through ObjectHandle, so malformed source
+    // `/Length` values must reach the same recovered stream shape before the
+    // handle-aware consumer serializes them.
+    let result =
+        pdf.with_plain_writer_stream_recovery(|pdf| emit_canonical_pdf_inner(pdf, out, options));
 
     // Restore the original Catalog and its pre-write dirty state. Runs on
     // success and on error alike so partial injection state cannot leak
@@ -2887,7 +3019,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // reused from the source), so a prior-QDF-pass holder reachable only via a
     // /Length edge is NOT numbered here and disappears cleanly from `renumbered`.
     // In non-QDF mode this is the same behaviour as before.
-    use crate::rewrite_renumber::CatalogFirstRenumber;
+    use crate::rewrite_renumber::CanonicalCatalogFirstRenumber;
     // The unencrypted/non-QDF case can reach this legacy path only when a
     // requested Preserve or Generate mode was suppressed to Disable by
     // force-version < 1.5. Keep its qpdf null-visibility behavior byte-stable.
@@ -2896,11 +3028,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         && options.copy_encryption.is_none()
         && pdf.encryption_ref().is_none()
         && pdf.deleted_object_refs().is_empty();
-    let renumber = if qpdf_null_visibility {
-        CatalogFirstRenumber::build_qpdf(pdf, true)?
-    } else {
-        CatalogFirstRenumber::build(pdf, true)?
-    };
+    let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    // The specialized writer is a live ObjectHandle consumer. Its
+    // Catalog-first walk must therefore use the same canonical graph as the
+    // emission loop; the legacy raw-Object walk would parse a content holder
+    // once for numbering and make the writer report its recovery warning a
+    // second time when the live handle is emitted.
+    let renumber = CanonicalCatalogFirstRenumber::build_qpdf(pdf, true, false, &removed_refs)?;
     // The new /Root reference (always seeded first by the walk, so present).
     let new_root = renumber
         .new_for_original(root_ref)
@@ -3129,7 +3263,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     //
     // `skip_refs` is also declared here (before the pre-scan) because the
     // pre-scan applies the same skip conditions as the main loop.
-    let skip_refs = pdf.deleted_object_refs();
+    let skip_refs = removed_refs;
+    let skip_ref_set: BTreeSet<ObjectRef> = skip_refs.iter().copied().collect();
 
     let mut qdf_emission_renumber: HashMap<ObjectRef, ObjectRef> = HashMap::new();
     let mut qdf_holder_map: HashMap<u32, u32> = HashMap::new();
@@ -3147,18 +3282,18 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // Determine whether this object is a real stream (needs a holder),
             // a non-stream object (no holder), or a structural stream that the
             // main loop skips (XRef / ObjStm).
-            let is_real_stream = match pdf.resolve_borrowed(*old_ref)? {
-                Object::Stream(s) => {
-                    let ty = s.dict.get("Type");
-                    let is_structural = matches!(ty, Some(Object::Name(n))
-                        if n.as_slice() == b"XRef" || n.as_slice() == b"ObjStm"); // cov:ignore: guard evaluated only when /Type is Name; XRef/ObjStm excluded upstream
-                    if is_structural {
-                        None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
-                    } else {
-                        Some(true)
-                    }
+            let object_handle = pdf.get_object_handle(*old_ref);
+            pdf.resolve_object_handle(&object_handle)?;
+            let is_real_stream = if object_handle.as_stream_dict().is_some() {
+                let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
+                    || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
+                if is_structural {
+                    None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
+                } else {
+                    Some(true)
                 }
-                _ => Some(false),
+            } else {
+                Some(false)
             };
             let Some(is_stream) = is_real_stream else {
                 continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
@@ -3197,6 +3332,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             options.static_id,
         ))
     };
+    let generated_id_handle = generated_id.as_ref().map(generated_id_handle).transpose()?;
 
     // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
     // Built ONCE up front so /ID[0] is decided before any object is encrypted.
@@ -3291,16 +3427,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             if options.qdf {
                 page_seq.insert(*page_ref, seq);
             }
-            // Reuse the page API's full holder-chain traversal for the
-            // terminal `(ObjectRef, Stream)` pairs. This covers a direct
-            // stream, ref -> ref -> stream, direct arrays, and arrays
-            // whose elements themselves use holder chains.
-            for (terminal_ref, _) in
-                crate::pages::page_content_stream_entries_tolerant(pdf, *page_ref)?
-            {
-                if let Some(terminal_ref) = terminal_ref {
-                    contents_seq.insert(terminal_ref, seq);
-                }
+            // Follow the page's `/Contents` holders through the canonical
+            // ObjectHandle graph. The legacy page helper materializes the
+            // same chain and would make a damaged stream's parser warning
+            // appear twice when the emission loop later resolves its live
+            // handle; qpdf's writer stays on one object cache throughout.
+            for terminal_ref in collect_content_stream_refs_tolerant(pdf, *page_ref)? {
+                contents_seq.insert(terminal_ref, seq);
             }
             collect_content_container_refs(pdf, *page_ref, &mut content_container_refs)?;
         }
@@ -3376,46 +3509,28 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             *new_ref
         };
 
-        // Resolve the object via its ORIGINAL ref; propagate the error so
-        // callers see corrupt input rather than a silent success with missing
-        // /Root descendants.
-        let mut object = pdf.resolve(*old_ref)?;
-
-        // Rewrite every internal reference to its emission number BEFORE any
-        // string-encryption or stream policy looks at the object. In QDF mode
-        // use qdf_emission_renumber (old→emission); otherwise use the CF renumber.
-        if options.qdf {
-            crate::rewrite_renumber::renumber_refs_in_place(&mut object, &qdf_emission_renumber)?;
-        } else if qpdf_null_visibility {
-            crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
-        } else {
-            crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
-        }
+        // Resolve the live ObjectHandle once. qpdf's writer keeps this handle
+        // as the source of truth and remaps only reference tokens while
+        // unparsing; it does not materialize the whole object graph before
+        // emission.
+        let object_handle = pdf.get_object_handle(*old_ref);
+        pdf.resolve_object_handle(&object_handle)?;
+        let is_stream = object_handle.as_stream_dict().is_some();
 
         // Direct `/Contents` streams have no terminal ObjectRef to put in
-        // `contents_seq`. Normalize only the page dictionary or indirect
-        // array holder that owns those direct values; all referenced terminal
-        // streams continue through the exact terminal-ref gate below.
-        if options.content_normalization && content_container_refs.contains(old_ref) {
-            normalize_direct_content_values(&mut object, options);
-        }
-
-        // Skip xref-stream container objects — we'll rebuild the xref from
-        // scratch below.  Skip ObjStm container objects — their members have
-        // already been resolved into the cache as individual objects and are
-        // emitted in the main loop. (Defensive: the reachability-based
-        // `CatalogFirstRenumber` already excludes structural containers, which
-        // are not reachable from /Root, so this only fires for a malformed input
-        // whose /Root graph reaches one. `LinearizationPlan::from_pdf` works from
-        // `object_refs()` — all objects — so it needs the explicit filter via
-        // `is_source_structural_container`.)
-        if let Object::Stream(ref s) = object {
-            let ty = s.dict.get("Type");
-            let is_xref = matches!(ty, Some(Object::Name(n)) if n.as_slice() == b"XRef");
-            let is_objstm = matches!(ty, Some(Object::Name(n)) if n.as_slice() == b"ObjStm");
-            if is_xref || is_objstm {
-                continue;
-            }
+        // `contents_seq`. Content normalization mutates the owning object, so
+        // retain the materialized compatibility path only for that explicitly
+        // selected transform until its handle-native normalizer is cut over.
+        let materialize_for_normalization =
+            options.content_normalization && content_container_refs.contains(old_ref);
+        // Skip xref-stream and ObjStm container objects — we'll rebuild the
+        // structural streams from scratch below. Handle predicates preserve
+        // qpdf's live dictionary lookup without resolving a legacy `Object`.
+        if is_stream
+            && (object_handle.try_is_dictionary_of_type(b"XRef", b"")?
+                || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?)
+        {
+            continue;
         }
 
         // Duplicate detection: `offsets` is keyed on the emitted number.
@@ -3470,137 +3585,300 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // stream's endobj.
         let mut qdf_holder_to_emit: Option<(u32, i64, bool)> = None;
 
-        if let Object::Stream(stream) = object {
-            // Determine the effective stream policy.
-            // QDF always wins (decoded), and effective_stream_policy handles
-            // that; None means preserve mode: emit the stream verbatim.
-            // qpdf re-filters (decode + re-encode to a single /FlateDecode, and
-            // emits /Length before the regenerated /Filter) only for streams
-            // whose source filter chain is NOT already a lone /FlateDecode. An
-            // already-Flate source is preserved by qpdf and keeps lexicographic
-            // dict order with /Length last. Capture that from the source filter
-            // so the output ordering tracks qpdf's re-filter decision rather
-            // than flpdf's unconditional decode/re-encode.
-            // Re-encode per the compress policy via the shared choke point so
-            // excluded modes and the plain pipeline cannot drift on qpdf's
-            // re-filter rules. The resulting raw buffer is consumed directly
-            // by the writer pipeline below; encryption does not mutate it.
-            //
-            // `is_data_modified` is hardcoded false here: this fallback path
-            // (QDF / encrypted / content-normalized / non-default
-            // object-stream-mode writes -- see `write_plain::eligible`) only
-            // has the already-materialized `object`, with no canonical
-            // handle to query `is_data_modified()` from. A token-filtered
-            // lone-Flate stream written through this branch keeps today's
-            // verbatim-preserve shortcut instead of qpdf's forced re-encode;
-            // tracked as a follow-up, parallel to the linearized-writer fix
-            // this parameter exists for.
-            let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
-                stream,
-                options,
-                false,
-                qpdf_null_visibility,
-                pdf.recovered_stream_eol(*old_ref),
-                options.content_normalization && contents_seq.contains_key(old_ref),
-                true,
-            );
+        let map = |object_ref: ObjectRef| {
+            if options.qdf {
+                qdf_emission_renumber
+                    .get(&object_ref)
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "full-rewrite: QDF reference {object_ref} absent from emission map"
+                        ))
+                    })
+            } else {
+                renumber.new_for_original(object_ref).ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "full-rewrite: reference {object_ref} absent from renumber map"
+                    ))
+                })
+            }
+        };
+        let removed_refs: BTreeSet<ObjectRef> = skip_refs.iter().copied().collect();
 
-            // qpdf obtains the filtered/raw buffer first, then decides whether
-            // the current stream is encrypted immediately before dictionary
-            // unparse (`QPDFWriter.cc:1528-1557`).  Cleartext metadata keeps the
-            // writer pipeline active but has no encryption stage after qpdf's
-            // `cur_data_key.clear()`.
+        // The handle stream pipeline is shared with the plain writer. Keep the
+        // materialized branch only for transformations that still mutate an
+        // owned Object; ordinary stream dictionaries and payloads use the
+        // live handle route below for every encryption mode.
+        if materialize_for_normalization {
+            let mut object = object_handle.materialize()?;
+            if options.qdf {
+                crate::rewrite_renumber::renumber_refs_in_place(
+                    &mut object,
+                    &qdf_emission_renumber,
+                )?;
+            } else if qpdf_null_visibility {
+                crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
+            } else {
+                crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
+            }
+            if materialize_for_normalization {
+                normalize_direct_content_values(&mut object, options);
+            }
+
+            if let Object::Stream(stream) = object {
+                // Determine the effective stream policy.
+                // QDF always wins (decoded), and effective_stream_policy handles
+                // that; None means preserve mode: emit the stream verbatim.
+                // qpdf re-filters (decode + re-encode to a single /FlateDecode, and
+                // emits /Length before the regenerated /Filter) only for streams
+                // whose source filter chain is NOT already a lone /FlateDecode. An
+                // already-Flate source is preserved by qpdf and keeps lexicographic
+                // dict order with /Length last. Capture that from the source filter
+                // so the output ordering tracks qpdf's re-filter decision rather
+                // than flpdf's unconditional decode/re-encode.
+                // Re-encode per the compress policy via the shared choke point so
+                // excluded modes and the plain pipeline cannot drift on qpdf's
+                // re-filter rules. The resulting raw buffer is consumed directly
+                // by the writer pipeline below; encryption does not mutate it.
+                //
+                // `is_data_modified` is hardcoded false here: this fallback path
+                // (QDF / encrypted / content-normalized / non-default
+                // object-stream-mode writes -- see `write_plain::eligible`) only
+                // has the already-materialized `object`, with no canonical
+                // handle to query `is_data_modified()` from. A token-filtered
+                // lone-Flate stream written through this branch keeps today's
+                // verbatim-preserve shortcut instead of qpdf's forced re-encode;
+                // tracked as a follow-up, parallel to the linearized-writer fix
+                // this parameter exists for.
+                let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
+                    stream,
+                    options,
+                    false,
+                    qpdf_null_visibility,
+                    pdf.recovered_stream_eol(*old_ref),
+                    options.content_normalization && contents_seq.contains_key(old_ref),
+                    true,
+                );
+
+                // qpdf obtains the filtered/raw buffer first, then decides whether
+                // the current stream is encrypted immediately before dictionary
+                // unparse (`QPDFWriter.cc:1528-1557`).  Cleartext metadata keeps the
+                // writer pipeline active but has no encryption stage after qpdf's
+                // `cur_data_key.clear()`.
+                let stream_encryption = encrypt_ctx
+                    .as_ref()
+                    .filter(|ctx| emit_ref != ctx.encrypt_ref);
+                let encrypt_stream = stream_encryption
+                    .is_some_and(|ctx| ctx.encrypt_metadata || ctx.metadata_ref != Some(*old_ref));
+
+                if options.qdf {
+                    if let Object::Stream(ref s) = reencoded {
+                        // QDF: split the stream's /Length into a separate
+                        // indirect length-holder object so flpdf::fix_qdf
+                        // (qdf_fix.rs) — which only ever rewrites an INDIRECT
+                        // `/Length M G R`, never a direct one — can repair the
+                        // length after a hand edit, then replace the dict entry
+                        // with `H 0 R`.
+                        //
+                        // qpdf's QDF holder stores the raw payload length. When
+                        // stream framing adds one LF, `%QDF: ignore_newline` tells
+                        // fix-qdf to exclude that byte from its measured length.
+                        let len_value = if let Some(ctx) = stream_encryption {
+                            let mut stream_length = s.data.len();
+                            adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
+                            i64::try_from(stream_length).map_err(|_| {
+                                // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
+                                crate::Error::Unsupported(
+                                    "encrypted stream /Length does not fit in i64".to_string(),
+                                )
+                                // cov:ignore-end
+                            })? // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
+                        } else {
+                            i64::try_from(s.data.len()).unwrap_or(i64::MAX)
+                        };
+                        // The holder number was assigned by the QDF emission pre-scan
+                        // as the slot immediately following this stream's emission slot.
+                        let holder_num =
+                            qdf_holder_map
+                                .get(&emit_ref.number)
+                                .copied()
+                                .ok_or_else(|| {
+                                    // cov:ignore-start: the pre-scan inserts a holder for every
+                                    // stream it assigns an emission slot to; a miss indicates a
+                                    // pre-scan/main-loop divergence that cannot occur in valid PDFs.
+                                    crate::Error::Unsupported(format!(
+                                    "full-rewrite: QDF holder not found for stream at emission {}",
+                                    emit_ref.number
+                                ))
+                                })?; // cov:ignore-end
+                        qdf_holder_to_emit = Some((holder_num, len_value, false));
+
+                        let mut holder_stream = s.clone();
+                        holder_stream
+                            .dict
+                            .insert("Length", Object::Reference(ObjectRef::new(holder_num, 0)));
+                        let added_newline = write_stream_to_buf_qdf(
+                            &mut bytes,
+                            &holder_stream,
+                            options.newline_before_endstream,
+                            encrypted_strings.as_mut(),
+                            emit_ref,
+                            stream_encryption,
+                            encrypt_stream,
+                        );
+                        if let Some((_, _, ignore_newline)) = qdf_holder_to_emit.as_mut() {
+                            *ignore_newline = added_newline?;
+                        } // cov:ignore: llvm-cov reports this executed QDF holder branch brace as uncovered.
+                    } else {
+                        // cov:ignore-start: unreachable — this arm is inside the
+                        // stream branch and reencode_stream_for_compress always
+                        // returns Object::Stream.
+                        reencoded.write_pdf_qdf(&mut bytes, 0);
+                        // cov:ignore-end
+                    }
+                } else {
+                    // Non-qdf: shared choke point — qpdf's re-filtered key order for
+                    // re-encoded streams, lexicographic order otherwise.
+                    let written = write_reencoded_object(
+                        &mut bytes,
+                        &reencoded,
+                        source_filter_is_lone_flate,
+                        options,
+                        encrypted_strings.as_mut(),
+                        emit_ref,
+                        StreamEncryptionOptions::new(stream_encryption, encrypt_stream),
+                    );
+                    written?;
+                }
+            } else if let Some(emitter) = encrypted_strings.as_mut() {
+                emitter.write_object(&mut bytes, emit_ref, None, &object, options.qdf)?;
+            } else if options.qdf {
+                object.write_pdf_qdf(&mut bytes, 0);
+            } else {
+                object.write_pdf(&mut bytes);
+            }
+        } else if is_stream {
+            // This is the qpdf stream writer's live-handle path: filtering and
+            // payload framing are decided from the stream handle, while the
+            // dictionary serializer remaps only child reference tokens.
+            let (stream_dict, stream_data, refiltered) =
+                plain::body::canonical_stream_output_for_rewrite(
+                    &object_handle,
+                    options,
+                    options.content_normalization && contents_seq.contains_key(old_ref),
+                )?;
             let stream_encryption = encrypt_ctx
                 .as_ref()
                 .filter(|ctx| emit_ref != ctx.encrypt_ref);
             let encrypt_stream = stream_encryption
                 .is_some_and(|ctx| ctx.encrypt_metadata || ctx.metadata_ref != Some(*old_ref));
-
-            if options.qdf {
-                if let Object::Stream(ref s) = reencoded {
-                    // QDF: split the stream's /Length into a separate
-                    // indirect length-holder object so flpdf::fix_qdf
-                    // (qdf_fix.rs) — which only ever rewrites an INDIRECT
-                    // `/Length M G R`, never a direct one — can repair the
-                    // length after a hand edit, then replace the dict entry
-                    // with `H 0 R`.
-                    //
-                    // qpdf's QDF holder stores the raw payload length. When
-                    // stream framing adds one LF, `%QDF: ignore_newline` tells
-                    // fix-qdf to exclude that byte from its measured length.
-                    let len_value = if let Some(ctx) = stream_encryption {
-                        let mut stream_length = s.data.len();
-                        adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
-                        i64::try_from(stream_length).map_err(|_| {
-                            // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
-                            crate::Error::Unsupported(
-                                "encrypted stream /Length does not fit in i64".to_string(),
-                            )
-                            // cov:ignore-end
-                        })? // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
-                    } else {
-                        i64::try_from(s.data.len()).unwrap_or(i64::MAX)
-                    };
-                    // The holder number was assigned by the QDF emission pre-scan
-                    // as the slot immediately following this stream's emission slot.
-                    let holder_num =
-                        qdf_holder_map
-                            .get(&emit_ref.number)
-                            .copied()
-                            .ok_or_else(|| {
-                                // cov:ignore-start: the pre-scan inserts a holder for every
-                                // stream it assigns an emission slot to; a miss indicates a
-                                // pre-scan/main-loop divergence that cannot occur in valid PDFs.
-                                crate::Error::Unsupported(format!(
-                                    "full-rewrite: QDF holder not found for stream at emission {}",
-                                    emit_ref.number
-                                ))
-                            })?; // cov:ignore-end
-                    qdf_holder_to_emit = Some((holder_num, len_value, false));
-
-                    let mut holder_stream = s.clone();
-                    holder_stream
-                        .dict
-                        .insert("Length", Object::Reference(ObjectRef::new(holder_num, 0)));
-                    let added_newline = write_stream_to_buf_qdf(
-                        &mut bytes,
-                        &holder_stream,
-                        options.newline_before_endstream,
-                        encrypted_strings.as_mut(),
-                        emit_ref,
-                        stream_encryption,
-                        encrypt_stream,
-                    );
-                    if let Some((_, _, ignore_newline)) = qdf_holder_to_emit.as_mut() {
-                        *ignore_newline = added_newline?;
-                    } // cov:ignore: llvm-cov reports this executed QDF holder branch brace as uncovered.
-                } else {
-                    // cov:ignore-start: unreachable — this arm is inside the
-                    // stream branch and reencode_stream_for_compress always
-                    // returns Object::Stream.
-                    reencoded.write_pdf_qdf(&mut bytes, 0);
-                    // cov:ignore-end
-                }
-            } else {
-                // Non-qdf: shared choke point — qpdf's re-filtered key order for
-                // re-encoded streams, lexicographic order otherwise.
-                let written = write_reencoded_object(
-                    &mut bytes,
-                    &reencoded,
-                    source_filter_is_lone_flate,
-                    options,
-                    encrypted_strings.as_mut(),
-                    emit_ref,
-                    StreamEncryptionOptions::new(stream_encryption, encrypt_stream),
-                );
-                written?;
+            let stream_dict = stream_dict;
+            let mut stream_length = stream_data.len();
+            if let Some(ctx) = stream_encryption {
+                adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
             }
-        } else if let Some(emitter) = encrypted_strings.as_mut() {
-            emitter.write_object(&mut bytes, emit_ref, None, &object, options.qdf)?;
-        } else if options.qdf {
-            object.write_pdf_qdf(&mut bytes, 0);
+            stream_dict.replace_key(
+                b"/Length",
+                ObjectHandle::integer(i64::try_from(stream_length).map_err(|_| {
+                    crate::Error::Unsupported("stream /Length does not fit in i64".to_string())
+                })?),
+            )?;
+
+            let holder_ref = if options.qdf {
+                let holder_num =
+                    qdf_holder_map
+                        .get(&emit_ref.number)
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "full-rewrite: QDF holder not found for stream at emission {}",
+                                emit_ref.number
+                            ))
+                        })?;
+                Some(ObjectRef::new(holder_num, 0))
+            } else {
+                None
+            };
+            let stream_options =
+                encrypted_strings::StreamDictOptions::new(options.qdf, refiltered, encrypt_stream);
+            if let Some(emitter) = encrypted_strings.as_mut() {
+                emitter.write_handle_stream_dict_with_ref_map(
+                    &mut bytes,
+                    emit_ref,
+                    None,
+                    &stream_dict,
+                    stream_options,
+                    &map,
+                    &removed_refs,
+                    holder_ref,
+                )?;
+            } else if options.qdf {
+                stream_dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+                    &mut bytes,
+                    0,
+                    &map,
+                    &removed_refs,
+                    holder_ref,
+                )?;
+            } else {
+                stream_dict.unparse_stream_body_with_ref_map_and_removed(
+                    &mut bytes,
+                    refiltered,
+                    &map,
+                    &removed_refs,
+                )?;
+            }
+
+            let added_newline = if let Some(ctx) = stream_encryption {
+                write_stream_payload_with_pipeline(
+                    &mut bytes,
+                    &stream_data,
+                    options.newline_before_endstream,
+                    emit_ref,
+                    ctx,
+                    encrypt_stream,
+                    None,
+                )?
+            } else {
+                serialize::write_stream_payload(
+                    &mut bytes,
+                    &stream_data,
+                    options.newline_before_endstream,
+                );
+                serialize::framing_adds_newline(&stream_data, options.newline_before_endstream)
+            };
+            if let Some(holder_ref) = holder_ref {
+                qdf_holder_to_emit = Some((
+                    holder_ref.number,
+                    i64::try_from(stream_length).unwrap_or(i64::MAX),
+                    added_newline,
+                ));
+            }
         } else {
-            object.write_pdf(&mut bytes);
+            if let Some(emitter) = encrypted_strings.as_mut() {
+                emitter.write_handle_object_with_ref_map(
+                    &mut bytes,
+                    emit_ref,
+                    None,
+                    &object_handle,
+                    options.qdf,
+                    &map,
+                    &removed_refs,
+                )?;
+            } else if options.qdf {
+                object_handle.unparse_object_qdf_with_ref_map_and_removed(
+                    &mut bytes,
+                    0,
+                    &map,
+                    &removed_refs,
+                )?;
+            } else {
+                object_handle.unparse_object_with_ref_map_and_removed(
+                    &mut bytes,
+                    &map,
+                    &removed_refs,
+                )?;
+            }
         }
 
         bytes.extend_from_slice(b"\nendobj\n");
@@ -3636,57 +3914,82 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // ── Step 5: emit each ObjStm container ───────────────────────────────────
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_ref = container_refs[batch_idx];
-        // Resolve each member by its ORIGINAL ref, rewrite its internal
-        // references to NEW numbers, and pair it with its NEW ref so the ObjStm
-        // pair table records the renumbered member number. Without this the
-        // members keep their old numbers and old internal links, corrupting the
-        // Catalog-first output (e.g. Catalog /Pages would dangle).
-        let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(batch.len());
+        // Resolve each member as a live ObjectHandle and remap only its child
+        // reference tokens during emission. The encrypted branch remains on
+        // the legacy callback until the handle-aware string-writer adapter is
+        // wired into the same boundary.
+        let mut handles = Vec::with_capacity(batch.len());
         for &old in batch {
-            let mut obj = pdf.resolve(old)?;
-            crate::rewrite_renumber::renumber_refs_in_place(&mut obj, &renumber)?;
+            let handle = pdf.get_object_handle(old);
+            pdf.resolve_object_handle(&handle)?;
             let new = renumber.new_for_original(old).ok_or_else(|| {
                 crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
             })?;
             emitted_old_to_new.insert(old, ObjectRef::new(new.number, 0));
-            resolved.push((new, obj));
+            handles.push((new, handle));
         }
-        let emitted = object_streams::emit_objstm_body_from_resolved_with_writer(
-            &resolved,
-            &mut |out, member_index, member_ref, object| {
-                if let Some(emitter) = encrypted_strings.as_mut() {
-                    emitter.write_object(out, member_ref, Some(member_index), object, false)
-                } else {
-                    object.write_pdf(out);
-                    Ok(())
-                }
+        let removed_refs: BTreeSet<ObjectRef> = skip_refs.iter().copied().collect();
+        let map = |object_ref: ObjectRef| {
+            renumber.new_for_original(object_ref).ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "full-rewrite: ObjStm reference {object_ref} absent from renumber map"
+                ))
+            })
+        };
+        let body = object_streams::emit_objstm_body_from_handles_with_writer(
+            &handles,
+            &mut |out, _member_index, _member_ref, handle| {
+                handle.unparse_object_with_ref_map_and_removed(out, &map, &removed_refs)
             },
-        );
-        let body = emitted?;
-        let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+        )?;
+        let (stream_handle, stream_data) =
+            object_streams::wrap_objstm_body_as_handle(&body, options.compress_streams, None)?;
+        let stream_dict = stream_handle.as_stream_dict().ok_or_else(|| {
+            crate::Error::Internal("ObjStm handle lost its stream dictionary".to_string())
+        })?;
+        let mut stream_length = stream_data.len();
+        if let Some(ctx) = &encrypt_ctx {
+            adjust_aes_stream_length(&mut stream_length, ctx, true)?;
+        }
+        stream_dict.replace_key(
+            b"/Length",
+            ObjectHandle::integer(i64::try_from(stream_length).map_err(|_| {
+                crate::Error::Unsupported(
+                    "encrypted ObjStm /Length does not fit in i64".to_string(),
+                )
+            })?),
+        )?;
 
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
         // stream's encryption covers them all.
+        let identity_map = |object_ref: ObjectRef| Ok(object_ref);
+        let no_removed_refs = BTreeSet::new();
         if let Some(ctx) = &encrypt_ctx {
-            let mut stream_length = stream.data.len();
-            adjust_aes_stream_length(&mut stream_length, ctx, true)?;
-            stream.dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(stream_length).map_err(|_| {
-                    // cov:ignore-start: an allocatable ObjStm length cannot exceed i64::MAX.
-                    crate::Error::Unsupported(
-                        "encrypted ObjStm /Length does not fit in i64".to_string(),
-                    )
-                    // cov:ignore-end
-                })?), // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
-            );
-            stream.dict.write_pdf(&mut bytes);
+            if let Some(emitter) = encrypted_strings.as_mut() {
+                emitter.write_handle_stream_dict_with_ref_map(
+                    &mut bytes,
+                    container_ref,
+                    None,
+                    &stream_dict,
+                    encrypted_strings::StreamDictOptions::new(false, false, true),
+                    &identity_map,
+                    &no_removed_refs,
+                    None,
+                )?;
+            } else {
+                stream_dict.unparse_stream_body_with_ref_map_and_removed(
+                    &mut bytes,
+                    false,
+                    &identity_map,
+                    &no_removed_refs,
+                )?;
+            }
             write_stream_payload_with_pipeline(
                 &mut bytes,
-                &stream.data,
+                &stream_data,
                 options.newline_before_endstream,
                 container_ref,
                 ctx,
@@ -3694,7 +3997,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 None,
             )?; // cov:ignore: the encrypted ObjStm route executes; this call continuation has no counter.
         } else {
-            write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
+            stream_dict.unparse_stream_body_with_ref_map_and_removed(
+                &mut bytes,
+                false,
+                &identity_map,
+                &no_removed_refs,
+            )?;
+            serialize::write_stream_payload(
+                &mut bytes,
+                &stream_data,
+                options.newline_before_endstream,
+            );
         }
         bytes.extend_from_slice(b"\nendobj\n");
         // QDF inter-object blank-line separator (flpdf-9hc.6.10). qdf mode
@@ -3713,7 +4026,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     if let Some(ctx) = &encrypt_ctx {
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", ctx.encrypt_ref.number).as_bytes());
-        encrypted_strings::write_encryption_dictionary(&mut bytes, &ctx.encrypt_dict);
+        let encrypt_handle = ctx.encrypt_dict_handle();
+        encrypted_strings::write_encryption_dictionary_handle(&mut bytes, &encrypt_handle)?;
         bytes.extend_from_slice(b"\nendobj\n");
         if options.qdf {
             bytes.push(b'\n');
@@ -3771,28 +4085,35 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             }
 
             // Trailer — start from the document trailer, strip incremental keys.
-            let mut trailer = pdf.trailer().clone();
-            strip_writer_trailer_history_keys(&mut trailer);
-            // Remap surviving indirect trailer refs (notably /Info) to emission
-            // numbers. /Root is overwritten explicitly with new_root below, and
-            // /Encrypt is handled by apply_encrypt_trailer_entries, so skip both.
-            if options.qdf {
-                remap_trailer_refs(&mut trailer, &qdf_emission_renumber, &skip_refs)?;
-            } else if qpdf_null_visibility {
-                remap_qpdf_trailer_refs(pdf, &mut trailer, &renumber)?;
-            } else {
-                remap_trailer_refs(&mut trailer, &renumber, &skip_refs)?;
-            }
-            trailer.insert("Size", Object::Integer(object_count as i64));
-            trailer.insert("Root", Object::Reference(new_root));
-            apply_encrypt_trailer_entries(
-                &mut trailer,
+            let trailer = build_writer_trailer_handle(
                 pdf,
+                pdf.last_xref_form() == XrefForm::Stream,
+                false,
+                object_count,
+                new_root,
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
-                generated_id.as_ref(),
-            );
+                generated_id_handle.as_ref(),
+            )?;
+            let trailer_map = |object_ref: ObjectRef| {
+                if options.qdf {
+                    qdf_emission_renumber
+                        .get(&object_ref)
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "full-rewrite: QDF trailer reference {object_ref} absent from emission map"
+                            ))
+                        })
+                } else {
+                    renumber.new_for_original(object_ref).ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "full-rewrite: trailer reference {object_ref} absent from renumber map"
+                        ))
+                    })
+                }
+            };
 
             if options.qdf {
                 // qpdf --qdf trailer: "trailer <<" on one line, then one
@@ -3806,12 +4127,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // dict serializer. Closing ">>" then startxref directly (no
                 // extra leading newline) to match the qpdf reference.
                 if options.deterministic_id {
-                    // Direct-write the real /ID inline (computed from the bytes
-                    // written up to and including its opening `[`) instead of
-                    // emitting the placeholder and byte-searching for it later.
-                    // The bytes are identical to the placeholder-then-patch
-                    // result for the same computed id, so output stays
-                    // byte-for-byte equal to qpdf 11.9.0.
                     let mut id_writer = |out: &mut Vec<u8>| {
                         write_deterministic_id_inline(
                             out,
@@ -3819,9 +4134,25 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                             det_id_source_id0.as_deref(),
                         )
                     };
-                    write_qdf_trailer(&mut bytes, &trailer, Some(&mut id_writer));
+                    trailer.unparse_trailer_with_ref_map(
+                        &mut bytes,
+                        false,
+                        true,
+                        Some(&mut id_writer),
+                        &trailer_map,
+                        &skip_ref_set,
+                        qpdf_null_visibility,
+                    )?;
                 } else {
-                    write_qdf_trailer(&mut bytes, &trailer, None);
+                    trailer.unparse_trailer_with_ref_map(
+                        &mut bytes,
+                        false,
+                        true,
+                        None,
+                        &trailer_map,
+                        &skip_ref_set,
+                        qpdf_null_visibility,
+                    )?;
                 }
                 bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
             } else {
@@ -3829,14 +4160,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // (single space, not its own line) with keys sorted but /ID
                 // forced last — `trailer << /Info .. /Root .. /Size N /ID [..]
                 // >>` (verified against qpdf 11.9.0 static-id goldens).
-                bytes.extend_from_slice(b"trailer ");
                 if options.deterministic_id {
-                    // Direct-write the real /ID inline (computed from the bytes
-                    // written up to and including its opening `[`) instead of
-                    // emitting the placeholder and byte-searching for it later.
-                    // The bytes are identical to the placeholder-then-patch
-                    // result for the same computed id, so output stays
-                    // byte-for-byte equal to qpdf 11.9.0.
                     let mut id_writer = |out: &mut Vec<u8>| {
                         write_deterministic_id_inline(
                             out,
@@ -3844,9 +4168,25 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                             det_id_source_id0.as_deref(),
                         )
                     };
-                    trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+                    trailer.unparse_trailer_with_ref_map(
+                        &mut bytes,
+                        false,
+                        false,
+                        Some(&mut id_writer),
+                        &trailer_map,
+                        &skip_ref_set,
+                        qpdf_null_visibility,
+                    )?;
                 } else {
-                    trailer.write_pdf_trailer(&mut bytes, None);
+                    trailer.unparse_trailer_with_ref_map(
+                        &mut bytes,
+                        false,
+                        false,
+                        None,
+                        &trailer_map,
+                        &skip_ref_set,
+                        qpdf_null_visibility,
+                    )?;
                 }
                 bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
             }
@@ -3944,44 +4284,44 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // `CompressStreams::No` they are stored without any filter.
             let raw_xref_bytes = build_xref_stream_bytes(&xref_entries, &ranges)?;
 
-            let mut index_array = Vec::with_capacity(ranges.len() * 2);
-            for &(start, count) in &ranges {
-                index_array.push(Object::Integer(i64::from(start)));
-                index_array.push(Object::Integer(i64::from(count)));
-            }
+            let index_array = ranges
+                .iter()
+                .flat_map(|&(start, count)| {
+                    [
+                        ObjectHandle::integer(i64::from(start)),
+                        ObjectHandle::integer(i64::from(count)),
+                    ]
+                })
+                .collect();
 
-            let mut xref_dict = pdf.trailer().clone();
-            strip_writer_trailer_history_keys(&mut xref_dict);
-            // Remap surviving indirect trailer refs (notably /Info) to NEW
-            // numbers. /Root is set explicitly to new_root below; /Encrypt is
-            // handled by apply_encrypt_trailer_entries.
-            if qpdf_null_visibility {
-                remap_qpdf_trailer_refs(pdf, &mut xref_dict, &renumber)?;
-            } else {
-                remap_trailer_refs(&mut xref_dict, &renumber, &skip_refs)?;
-            }
-            // The trailer may carry filter keys from the input's xref stream
-            // (e.g. /Filter /FlateDecode). We're emitting freshly built bytes
-            // via `Stream::new`, so any stale filter declaration would make
-            // readers attempt to decode the new bytes under the wrong codec.
-            // We set /Filter (or omit it) based on compress_streams below.
-            xref_dict.remove("Filter");
-            xref_dict.remove("DecodeParms");
-            xref_dict.remove("F");
-            xref_dict.remove("FFilter");
-            xref_dict.remove("FDecodeParms");
-            xref_dict.insert("Type", Object::Name(b"XRef".to_vec()));
-            xref_dict.insert("Size", Object::Integer(final_object_count as i64));
-            xref_dict.insert(
-                "W",
-                Object::Array(vec![
-                    Object::Integer(1),
-                    Object::Integer(8),
-                    Object::Integer(4),
+            let xref_map = |object_ref: ObjectRef| {
+                renumber.new_for_original(object_ref).ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "full-rewrite: xref-stream trailer reference {object_ref} absent from renumber map"
+                    ))
+                })
+            };
+            let xref_dict = build_writer_trailer_handle(
+                pdf,
+                pdf.last_xref_form() == XrefForm::Stream,
+                true,
+                final_object_count,
+                new_root,
+                options,
+                encrypt_ctx.as_ref(),
+                options.deterministic_id,
+                generated_id_handle.as_ref(),
+            )?;
+            xref_dict.replace_key(b"/Type", ObjectHandle::name(b"XRef".to_vec()))?;
+            xref_dict.replace_key(
+                b"/W",
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(8),
+                    ObjectHandle::integer(4),
                 ]),
-            );
-            xref_dict.insert("Index", Object::Array(index_array));
-            xref_dict.insert("Root", Object::Reference(new_root));
+            )?;
+            xref_dict.replace_key(b"/Index", ObjectHandle::array(index_array))?;
 
             // Apply the compress_streams policy: FlateDecode-compress the xref
             // binary payload when Yes, or store raw bytes when No.
@@ -3991,7 +4331,10 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
                     match filters::encode_stream_data(&encode_dict, &raw_xref_bytes) {
                         Ok(compressed) => {
-                            xref_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+                            xref_dict.replace_key(
+                                b"/Filter",
+                                ObjectHandle::name(b"FlateDecode".to_vec()),
+                            )?;
                             compressed
                         }
                         // Compression failure is essentially impossible for
@@ -4006,20 +4349,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 }
             };
 
-            xref_dict.insert(
-                "Length",
-                Object::Integer(i64::try_from(stream_data.len()).map_err(|_| {
+            xref_dict.replace_key(
+                b"/Length",
+                ObjectHandle::integer(i64::try_from(stream_data.len()).map_err(|_| {
                     crate::Error::Unsupported("xref stream /Length does not fit i64".to_string())
                 })?),
-            );
-            apply_encrypt_trailer_entries(
-                &mut xref_dict,
-                pdf,
-                options,
-                encrypt_ctx.as_ref(),
-                options.deterministic_id,
-                generated_id.as_ref(),
-            );
+            )?;
 
             // The cross-reference stream dictionary is serialized in plain
             // lexicographic order (so `/ID` is NOT last), and its compressed
@@ -4029,7 +4364,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // `[` — the same digest range the placeholder-then-patch step used
             // to target. qpdf does not produce byte-parity output for xref-stream
             // form, but this content-derived /ID keeps the output self-stable.
-            let xref_stream = crate::Stream::new(xref_dict, stream_data);
             bytes.extend_from_slice(format!("{xref_object_number} 0 obj\n").as_bytes());
             if options.deterministic_id {
                 let mut id_writer = |out: &mut Vec<u8>| {
@@ -4039,28 +4373,27 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         det_id_source_id0.as_deref(),
                     )
                 };
-                write_stream_to_buf_with_id_writer(
+                xref_dict.unparse_dictionary_with_ref_map_and_id_writer(
                     &mut bytes,
-                    &xref_stream,
-                    options.newline_before_endstream,
                     Some(&mut id_writer),
-                );
+                    &xref_map,
+                    &skip_ref_set,
+                    qpdf_null_visibility,
+                )?;
             } else {
-                // Route through the _with_id_writer variant with `None` so any
-                // stored `/ID` in the xref-stream dict is rendered via
-                // `write_id_style_value` (qpdf-trailer compact `[<hex><hex>]`).
-                // Plain `write_stream_to_buf` would use the generic
-                // `Dictionary::write_pdf`, whose array serializer now inserts
-                // separating spaces and would emit `/ID [ <hex> <hex> ]` — the
-                // shape the linearization `xref_stream::write_object` and the
-                // classic/QDF trailers all avoid.
-                write_stream_to_buf_with_id_writer(
+                xref_dict.unparse_dictionary_with_ref_map_and_id_writer(
                     &mut bytes,
-                    &xref_stream,
-                    options.newline_before_endstream,
                     None,
-                );
+                    &xref_map,
+                    &skip_ref_set,
+                    qpdf_null_visibility,
+                )?;
             }
+            serialize::write_stream_payload(
+                &mut bytes,
+                &stream_data,
+                options.newline_before_endstream,
+            );
             bytes.extend_from_slice(b"\nendobj\n");
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
         }
@@ -4300,16 +4633,28 @@ fn collect_content_container_refs<R: Read + Seek>(
         DirectArray(Vec<ObjectRef>),
         Indirect(ObjectRef),
     }
-    let contents = match pdf.resolve_borrowed(page_ref)? {
-        Object::Dictionary(dict) => match dict.get("Contents") {
-            Some(Object::Stream(_)) => Some(ContentsValue::DirectStream),
-            Some(Object::Array(items)) => Some(ContentsValue::DirectArray(
-                items.iter().filter_map(Object::as_ref_id).collect(),
-            )),
-            Some(Object::Reference(reference)) => Some(ContentsValue::Indirect(*reference)),
-            _ => None,
-        },
-        _ => None,
+    let page_handle = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page_handle)?;
+    let contents_handle = page_handle.try_get_key(b"/Contents")?;
+    let contents = if let Some(reference) = contents_handle
+        .object_ref()
+        .or_else(|| contents_handle.as_reference())
+    {
+        // A resolved indirect stream/array remains an indirect object for
+        // writer ownership purposes. Only a direct stream/array nested in the
+        // page dictionary belongs to the containing page object.
+        Some(ContentsValue::Indirect(reference))
+    } else if contents_handle.as_stream_dict().is_some() {
+        Some(ContentsValue::DirectStream)
+    } else {
+        contents_handle.try_as_array()?.map(|items| {
+            ContentsValue::DirectArray(
+                items
+                    .iter()
+                    .filter_map(|item| item.object_ref().or_else(|| item.as_reference()))
+                    .collect(),
+            )
+        })
     };
     match contents {
         Some(ContentsValue::DirectStream) => {
@@ -4329,6 +4674,42 @@ fn collect_content_container_refs<R: Read + Seek>(
     Ok(())
 }
 
+/// Collect terminal indirect stream references from a page's `/Contents`
+/// value without materializing the page-content holder chain. Direct streams
+/// and non-stream values are intentionally omitted: the former have no object
+/// identity for `contents_seq`, and the latter are the tolerant writer shape
+/// qpdf skips while still rewriting valid sibling streams.
+fn collect_content_stream_refs_tolerant<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Vec<ObjectRef>> {
+    let page_handle = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page_handle)?;
+    let contents_handle = page_handle.try_get_key(b"/Contents")?;
+    let (contents, contents_ref) = pdf.resolve_object_handle_to_terminal_ref(&contents_handle)?;
+
+    if contents.try_is_null()? {
+        return Ok(Vec::new());
+    }
+    if contents.as_stream_dict().is_some() {
+        return Ok(contents_ref.into_iter().collect());
+    }
+
+    let Some(items) = contents.try_as_array()? else {
+        return Ok(Vec::new());
+    };
+    let mut refs = Vec::with_capacity(items.len());
+    for item in items {
+        let (item, item_ref) = pdf.resolve_object_handle_to_terminal_ref(&item)?;
+        if item.as_stream_dict().is_some() {
+            if let Some(item_ref) = item_ref {
+                refs.push(item_ref);
+            }
+        }
+    }
+    Ok(refs)
+}
+
 /// Follow one `/Contents` holder chain until it reaches an array or stream.
 /// When it reaches an array, retain the array holder and inspect its reference
 /// elements for nested array holders. Direct stream elements are handled when
@@ -4345,18 +4726,18 @@ fn collect_content_array_holder_refs<R: Read + Seek>(
         if depth >= crate::ref_chain::MAX_REF_CHAIN_DEPTH || !visited.insert(current) {
             continue;
         }
-        match pdf.resolve_borrowed(current)? {
-            Object::Reference(next) => pending.push_back((*next, depth + 1)),
-            Object::Array(items) => {
-                containers.insert(current);
-                pending.extend(
-                    items
-                        .iter()
-                        .filter_map(Object::as_ref_id)
-                        .map(|reference| (reference, depth + 1)),
-                );
-            }
-            _ => {}
+        let handle = pdf.get_object_handle(current);
+        pdf.resolve_object_handle(&handle)?;
+        if let Some(next) = handle.as_reference() {
+            pending.push_back((next, depth + 1));
+        } else if let Some(items) = handle.try_as_array()? {
+            containers.insert(current);
+            pending.extend(
+                items
+                    .iter()
+                    .filter_map(|item| item.object_ref().or_else(|| item.as_reference()))
+                    .map(|reference| (reference, depth + 1)),
+            );
         }
     }
     Ok(())
@@ -4509,6 +4890,7 @@ fn write_stream_to_buf_qdf(
 /// writer to emit qpdf's content-derived identifier inline rather than via a
 /// placeholder-then-patch step. The closure runs only when the `/ID` key is
 /// present in the dictionary; if it is absent, `id_writer` is ignored.
+#[cfg(test)]
 fn write_qdf_trailer(
     bytes: &mut Vec<u8>,
     trailer: &Dictionary,

@@ -1604,6 +1604,12 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
             Ok(())
         }
         StringCipher::Aes128 { key } => {
+            if bytes.len() <= 16 {
+                // qpdf's Pl_AES_PDF zero-pads a short final input block,
+                // consumes it as the IV, and emits no plaintext block.
+                bytes.clear();
+                return Ok(());
+            }
             let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
                 return Err(EncryptedError::Malformed {
                     reason: "AES string is missing its 16-byte IV".into(),
@@ -1616,6 +1622,11 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
             Ok(())
         }
         StringCipher::Aes256 { key } => {
+            if bytes.len() <= 16 {
+                // Keep AES-256 aligned with qpdf's shared AES pipeline.
+                bytes.clear();
+                return Ok(());
+            }
             let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
                 return Err(EncryptedError::Malformed {
                     reason: "AES string is missing its 16-byte IV".into(),
@@ -4529,6 +4540,31 @@ mod tests {
 
         decrypt_cipher_bytes(&mut buf, StringCipher::Rc4 { key: &key[..] }).unwrap();
         assert_eq!(buf, plaintext);
+    }
+
+    /// qpdf's `Pl_AES_PDF::finish` zero-pads an input shorter than one AES
+    /// block, consumes that block as the IV, and emits no plaintext block.
+    /// Keep the same zero-ciphertext behavior for both AES string key sizes;
+    /// this is also required for qpdf-style signature `/Contents` values,
+    /// which are preserved as raw bytes after the enclosing dictionary is
+    /// recognized.
+    #[test]
+    fn decrypt_cipher_bytes_aes_accepts_iv_without_ciphertext() {
+        let aes128_key = [0x42; 16];
+        for input in [Vec::new(), vec![0x11; 15], vec![0x11; 16]] {
+            let mut aes128 = input;
+            decrypt_cipher_bytes(&mut aes128, StringCipher::Aes128 { key: &aes128_key })
+                .expect("qpdf accepts an AES IV without ciphertext");
+            assert!(aes128.is_empty());
+        }
+
+        let aes256_key = [0x77; 32];
+        for input in [Vec::new(), vec![0x22; 15], vec![0x22; 16]] {
+            let mut aes256 = input;
+            decrypt_cipher_bytes(&mut aes256, StringCipher::Aes256 { key: &aes256_key })
+                .expect("qpdf accepts an AES IV without ciphertext");
+            assert!(aes256.is_empty());
+        }
     }
 
     #[test]
