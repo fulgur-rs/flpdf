@@ -327,14 +327,14 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
 
         let resource_name = format!("/{xobj_name}");
-        let content = match &data.appearance {
+        let content = (match &data.appearance {
             AppearanceTarget::Canonical(_) => AnnotationObjectHelper::new(data.annot_ref, pdf)
                 .get_page_content_for_appearance(
                     &resource_name,
                     page_rotate,
                     required_flags,
                     forbidden_flags,
-                )?,
+                ),
             AppearanceTarget::Bridge(appearance_ref) => {
                 // This branch is limited to Pdf::set_object holder chains.
                 // The bridge normalizes only input values; qpdf placement,
@@ -351,11 +351,11 @@ fn flatten_annotations_on_page<R: Read + Seek>(
                             crate::annotation_helper::AppearanceContentOverrides::with_geometry(
                                 bbox, matrix, data.flags,
                             ),
-                        )?,
-                    (None, _) => Vec::new(),
+                        ),
+                    (None, _) => Ok(Vec::new()),
                 }
             }
-        };
+        })?;
         if content.is_empty() {
             continue;
         }
@@ -1558,10 +1558,11 @@ mod tests {
                 Object::Integer(20),
             ]),
         );
+        annotation.insert("AP", Object::Reference(ObjectRef::new(5, 0)));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
         let mut appearance = Dictionary::new();
         appearance.insert("N", Object::Reference(ObjectRef::new(6, 0)));
-        annotation.insert("AP", Object::Dictionary(appearance));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(appearance));
         pdf.set_object(
             ObjectRef::new(6, 0),
             Object::Reference(ObjectRef::new(7, 0)),
