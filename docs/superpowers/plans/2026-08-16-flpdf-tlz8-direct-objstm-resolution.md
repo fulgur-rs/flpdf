@@ -49,11 +49,11 @@ The existing `tests/fixtures/compat/objstm-extends-chain.pdf.hex` is an intentio
 - [ ] Add a test for the valid fixture that records the qpdf child-local and parent values and compares the current flpdf `Pdf::resolve` result. The test must fail against the current chain implementation by observing the parent value for the child object.
 - [ ] Turn the existing malformed fixture behavior into an explicit qpdf differential regression: qpdf object 2 is `null`, qpdf object 3 is `99`, while the current flpdf object 2 is `42` and object 3 is `99`. Keep the test diagnostic clear enough to show which side selected the wrong member.
 - [ ] Add coverage cases for a header object-number mismatch and an effective xref entry whose source stream differs from the container. These must establish the expected unresolved/null contract before implementation rather than encoding the old positional behavior.
-- [ ] Run the RED checks before touching `crates/flpdf/src`:
+- [ ] Mark the parity assertions `#[ignore = "RED oracle: enable with the direct object-number reader cutover"]` so this fixture-only PR remains CI-green. Run the RED checks explicitly with `--ignored` before touching `crates/flpdf/src`:
 
 ~~~bash
-cargo test -p flpdf --test reader_tests objstm_direct_container_qpdf_contract
-cargo test -p flpdf --test reader_tests resolves_compressed_entry_declared_in_extended_object_stream
+cargo test -p flpdf --test reader_tests objstm_direct_container_qpdf_contract -- --ignored --nocapture
+cargo test -p flpdf --test reader_tests resolves_compressed_entry_declared_in_extended_object_stream -- --ignored --nocapture
 ~~~
 
 Expected result: the new valid/direct-container assertion fails because the current reader crosses `/Extends` and/or selects by positional index. Record the failure and the qpdf output in the PR description.
@@ -80,6 +80,7 @@ cargo test -p flpdf --test writer_tests objstm
 
 - [ ] Before implementation, run the failing Task 1 tests and inspect all callers with `rg` so the production route and provenance consumers are explicit.
 - [ ] Add a focused unit/integration test for the parser contract before changing its implementation: supply a header with object numbers whose order differs from the xref field2 values and assert that the requested object number, not the positional index, is selected. Add a source-stream mismatch case that must remain unresolved.
+- [ ] Remove the `RED oracle` ignore attributes from the parity assertions in the same change as the production cutover, so Task 2 CI executes them as normal regression tests.
 - [ ] Change the canonical compressed-entry route so the type-2 field1 directly resolves the one ObjStm container. Do not call `object_stream_chain_member` or `collect_object_stream_chain` from this route.
 - [ ] Change the object-stream header parser to retain each `(object_number, offset)` pair in an object-number keyed map. Pass the requested `ObjectRef`/object number to selection; do not pass field2 as a positional target.
 - [ ] Before materialization, compare the effective xref entry for the header object with the direct source stream. Only a type-2 entry naming that same stream may be read from the header. A missing header, source-stream mismatch, non-stream container, or malformed header must follow the existing `Result`/known-null behavior established by the oracle tests, not silently fall back to a parent chain.
