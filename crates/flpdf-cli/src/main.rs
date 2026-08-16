@@ -26,11 +26,11 @@ use flpdf::{
     },
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
-    parse_pdf_version, CompressStreams, CopyEncryptionSource, EncryptMethod, EncryptParams,
-    FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg, ObjectRef,
-    ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PdfWriter,
-    PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources, Severity,
-    StreamDataMode,
+    parse_pdf_version, AcroFormDocumentHelper, CompressStreams, CopyEncryptionSource,
+    EncryptMethod, EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object,
+    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
+    PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
+    RemoveUnreferencedResources, Severity, StreamDataMode,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list_with_sink,
@@ -3389,15 +3389,31 @@ fn run_rewrite(
 ///   surfaced by [`enumerate_document_annotations`] rather than a brute-force
 ///   scan of all live objects.
 ///
+/// The page-enumeration facade projects each widget to its top-level field for
+/// callers that need the document field tree. qpdf's appearance pass instead
+/// consumes `getFieldForAnnotation` directly, so this route uses the canonical
+/// annotation-to-field map before it starts mutating any widget.
+///
 /// The candidate `ObjectRef`s are collected up front into an owned `Vec` so the
 /// per-widget mutation loop holds a single `&mut pdf` borrow at a time.
 fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
+    // qpdf's `generateAppearancesIfNeeded` resolves each widget through
+    // `getFieldForAnnotation`, not through the top-level field projection used
+    // by page annotation enumeration. Build that map once before collecting
+    // candidates so nested terminal widgets retain their local `/V`.
+    let field_refs_by_annotation = {
+        let mut helper = AcroFormDocumentHelper::new(pdf);
+        helper.annotation_to_field_map()?
+    };
+
     // Collect candidate widget refs first (the enumeration borrows `pdf`).
     let mut candidates: Vec<(ObjectRef, ObjectRef)> = Vec::new();
     for (_page_ref, annots) in enumerate_document_annotations(pdf)? {
         for annot in annots {
-            if let Some(field_ref) = annot.field_ref.filter(|_| annot.is_widget) {
-                candidates.push((field_ref, annot.annot_ref));
+            if annot.is_widget {
+                if let Some(field_ref) = field_refs_by_annotation.get(&annot.annot_ref).copied() {
+                    candidates.push((field_ref, annot.annot_ref));
+                }
             }
         }
     }

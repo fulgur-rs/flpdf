@@ -11,42 +11,26 @@
 //!
 //! # Widget-to-field linkage
 //!
-//! A Widget annotation may be "merged" into its field (the same dictionary
-//! object acts as both annotation and field, and carries `/FT`).  Alternatively
-//! the widget and its field may be separate objects, with the widget holding a
-//! `/Parent` reference to the field.  The linkage rule handles both cases:
-//!
-//! 1. If the widget dict carries a non-Null `/FT` **or** `/T` (any type,
-//!    including a Reference — presence alone identifies a field), the widget
-//!    *is* its own terminal field: return `Some(annot_ref)`. `/T` must be
-//!    checked too because a merged terminal field that *inherits* `/FT` from an
-//!    ancestor has no direct `/FT` but always carries its own `/T` (field name).
-//! 2. Otherwise return the widget's direct `/Parent` reference — the terminal
-//!    field that owns this widget.
-//! 3. If the widget has neither `/FT`/`/T` nor a `/Parent` reference, return
-//!    `None` (orphaned widget with no traceable field).
-//!
-//! The owning field is deliberately the *direct* parent rather than the nearest
-//! `/FT`-bearing ancestor: field attributes inherit *down* the field tree, so a
-//! terminal field may omit `/FT` while an ancestor supplies it. Returning the
-//! ancestor would wrongly merge several sibling terminal fields onto one ref.
-//!
-//! This direct-parent heuristic has no `QPDFAnnotationObjectHelper`
-//! correspondence — that class's own header comment attributes
-//! annotation/field cross-referencing to `QPDFAcroFormDocumentHelper` and
-//! `QPDFFormFieldObjectHelper` instead (`getFieldForAnnotation`, backed by
-//! `analyze()`/`traverseField()`, composed with `getTopLevelField()`). Cutting
-//! this heuristic over to that qpdf-faithful primitive
-//! ([`crate::AcroFormDocumentHelper::annotation_to_field_map`] and
-//! [`crate::AcroFormDocumentHelper::get_top_level_field`], both already present)
-//! changes what [`mod@crate::signatures`]'s appearance-generation consumer writes
-//! `/V` to for grouped fields, so it needs byte-level verification against
-//! `qpdf --generate-appearances` before landing — tracked separately from the
-//! `AnnotationObjectHelper`/`AcroFormDocumentHelper` primitives this module
-//! already uses.
+//! Widget-to-field association follows qpdf's
+//! `QPDFAcroFormDocumentHelper::getFieldForAnnotation` and
+//! `QPDFFormFieldObjectHelper::getTopLevelField` composition. Matching qpdf's
+//! own `analyze()` memoization (invoked lazily, only by a caller that needs a
+//! field association), the `annotation_to_field_map` is built at most once per
+//! [`enumerate_document_annotations`] call — shared across every page rather
+//! than rebuilt per page — and only when a page actually has a Widget
+//! annotation; a widget-free page never triggers it, so an unrelated
+//! malformed field tree elsewhere in the document cannot fail its
+//! enumeration. Each mapped field is then walked to its top-level field with
+//! the helper's cycle guard. A document without an `/AcroForm` `/Fields`
+//! entry therefore has no qpdf field association, while a page orphan in a
+//! document with such an entry is self-mapped by qpdf's analyze pass.
 
 use crate::page_object_helper::PageBox;
-use crate::{AnnotationObjectHelper, Object, ObjectRef, PageObjectHelper, Pdf, Result};
+use crate::{
+    AcroFormDocumentHelper, AnnotationObjectHelper, Object, ObjectRef, PageObjectHelper, Pdf,
+    Result,
+};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -75,15 +59,11 @@ pub struct EnumeratedAnnotation {
     /// `true` when `subtype == Some(b"Widget")`.
     pub is_widget: bool,
 
-    /// For Widget annotations: the [`ObjectRef`] of the AcroForm field that
-    /// owns this widget.
+    /// For Widget annotations: the top-level [`ObjectRef`] of the AcroForm
+    /// field that qpdf associates with this widget.
     ///
-    /// - When the widget dict itself carries `/FT` (merged field/widget), this
-    ///   equals `annot_ref`.
-    /// - Otherwise this is the widget's direct `/Parent` (the terminal field
-    ///   that owns it).
-    /// - `None` for non-Widget annotations, or for Widget annotations where no
-    ///   owning field can be found.
+    /// `None` for non-Widget annotations, or when qpdf's AcroForm analysis has
+    /// no field association for the widget.
     pub field_ref: Option<ObjectRef>,
 }
 
@@ -101,8 +81,8 @@ pub struct EnumeratedAnnotation {
 /// 2. For each ref, use [`AnnotationObjectHelper`] to read `/Subtype` and
 ///    `/Rect`.
 /// 3. Determine [`EnumeratedAnnotation::is_widget`].
-/// 4. For Widget annotations, resolve the owning field (see module
-///    documentation for the linkage rule).
+/// 4. For Widget annotations, resolve the qpdf field association and walk it
+///    to the top-level field (see module documentation).
 ///
 /// Returns an empty `Vec` when the page has no `/Annots` entry.
 ///
@@ -139,6 +119,27 @@ pub fn enumerate_page_annotations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<EnumeratedAnnotation>> {
+    let mut field_refs_by_annotation = None;
+    enumerate_page_annotations_with_cache(pdf, page_ref, &mut field_refs_by_annotation)
+}
+
+/// [`enumerate_page_annotations`]'s body, taking the qpdf-analyze-equivalent
+/// map as an in/out cache so [`enumerate_document_annotations`] can share one
+/// map across every page instead of rebuilding it (and re-walking every page
+/// for the orphan-widget pass) per page.
+///
+/// Mirrors qpdf's own laziness: `QPDFAcroFormDocumentHelper::analyze()` is
+/// memoized on `cache_valid` and only invoked by callers (`getFieldForAnnotation`,
+/// `getFormFieldsForPage`) that need a field association, so a page with zero
+/// widget annotations never triggers it. Building unconditionally here would
+/// mean an unrelated malformed field tree elsewhere in the document (e.g. one
+/// exceeding the AcroForm depth cap) fails ordinary annotation enumeration on
+/// pages that have no widgets and so never need that tree at all.
+fn enumerate_page_annotations_with_cache<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    field_refs_by_annotation: &mut Option<BTreeMap<ObjectRef, ObjectRef>>,
+) -> Result<Vec<EnumeratedAnnotation>> {
     // Step 1: obtain annotation refs (PageObjectHelper is dropped after this call).
     let annot_refs = {
         let mut page_helper = PageObjectHelper::new(page_ref, pdf);
@@ -146,6 +147,7 @@ pub fn enumerate_page_annotations<R: Read + Seek>(
     };
 
     let mut result = Vec::with_capacity(annot_refs.len());
+    let mut has_widget = false;
 
     for annot_ref in annot_refs {
         // Step 2: read /Subtype and /Rect via AnnotationObjectHelper (dropped
@@ -166,24 +168,55 @@ pub fn enumerate_page_annotations<R: Read + Seek>(
 
         // Step 3: classify.
         let is_widget = subtype.as_deref().is_some_and(|s| s == b"Widget");
-
-        // Step 4: widget-to-field linkage.
-        let field_ref = if is_widget {
-            find_field_ref(pdf, annot_ref)?
-        } else {
-            None
-        };
+        has_widget |= is_widget;
 
         result.push(EnumeratedAnnotation {
             annot_ref,
             subtype,
             rect,
             is_widget,
-            field_ref,
+            field_ref: None,
         });
     }
 
+    // Step 4: widget-to-field linkage, deferred until a widget is actually
+    // present on this page. The map contains only qpdf analyze associations;
+    // non-Widgets and unassociated Widgets remain None.
+    if has_widget {
+        if field_refs_by_annotation.is_none() {
+            *field_refs_by_annotation = Some(build_field_refs_by_annotation(pdf)?);
+        }
+        let map = field_refs_by_annotation
+            .as_ref()
+            .expect("populated immediately above");
+        for annotation in &mut result {
+            if annotation.is_widget {
+                annotation.field_ref = map.get(&annotation.annot_ref).copied();
+            }
+        }
+    }
+
     Ok(result)
+}
+
+/// Build the qpdf-`analyze()`-equivalent map from every widget annotation to
+/// its top-level field: [`AcroFormDocumentHelper::annotation_to_field_map`]
+/// (`getFieldForAnnotation`'s underlying association) composed with
+/// [`AcroFormDocumentHelper::get_top_level_field`], matching qpdf's
+/// `getFormFieldsForPage`'s `getFieldForAnnotation(annot).getTopLevelField()`.
+fn build_field_refs_by_annotation<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
+    let mut helper = AcroFormDocumentHelper::new(pdf);
+    let annotation_to_field = helper.annotation_to_field_map()?;
+    annotation_to_field
+        .into_iter()
+        .map(|(annot_ref, field_ref)| {
+            helper
+                .get_top_level_field(field_ref)
+                .map(|top_level| (annot_ref, top_level))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()
 }
 
 /// Enumerate and classify all annotations in the document, one entry per leaf
@@ -215,56 +248,17 @@ pub fn enumerate_document_annotations<R: Read + Seek>(
 ) -> Result<Vec<(ObjectRef, Vec<EnumeratedAnnotation>)>> {
     let page_refs = crate::pages::page_refs(pdf)?;
     let mut out = Vec::with_capacity(page_refs.len());
+    // One shared, lazily-built map across every page -- matching qpdf's own
+    // per-QPDFAcroFormDocumentHelper-instance memoization of analyze() --
+    // instead of each page's enumeration re-walking the whole field tree and
+    // every page's /Annots for the orphan-widget pass.
+    let mut field_refs_by_annotation = None;
     for page_ref in page_refs {
-        let annots = enumerate_page_annotations(pdf, page_ref)?;
+        let annots =
+            enumerate_page_annotations_with_cache(pdf, page_ref, &mut field_refs_by_annotation)?;
         out.push((page_ref, annots));
     }
     Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// Private: widget-to-field chain walk
-// ---------------------------------------------------------------------------
-
-/// Find the AcroForm field that directly owns the widget at `start`.
-///
-/// Returns `Some(field_ref)` where `field_ref` is:
-/// - `start` itself when the widget carries its own non-Null `/FT` (a merged
-///   widget/field), OR
-/// - the widget's direct `/Parent` (the *terminal* field that owns it).
-///
-/// The owning field is the **direct** parent, not the nearest `/FT`-bearing
-/// ancestor: field type and other attributes inherit *down* the field tree, so
-/// a terminal field may omit `/FT` while a higher ancestor supplies it. Walking
-/// up to the first `/FT` would wrongly collapse several sibling terminal fields
-/// (each inheriting `/FT` from a shared parent) onto that single ancestor.
-///
-/// Returns `None` when the widget has neither `/FT` nor a `/Parent` reference.
-fn find_field_ref<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Option<ObjectRef>> {
-    let node = pdf.resolve_borrowed(start)?;
-    let Some(dict) = node.as_dict() else {
-        return Ok(None);
-    };
-
-    // Merged widget: a non-Null /FT OR /T (field name) means the widget IS its
-    // own terminal field. /FT alone is not sufficient: a merged terminal field
-    // that *inherits* /FT from an ancestor has no direct /FT, but a terminal
-    // field always carries its own /T. Without the /T check such a field would
-    // fall through to the /Parent branch below and be wrongly aggregated into
-    // the ancestor together with its siblings. (review-pattern #2: both keys may
-    // be indirect, so presence — not value type — is what matters.)
-    if ["FT", "T", "Kids", "V", "DV", "Ff", "TU", "TM"]
-        .into_iter()
-        .any(|key| matches!(dict.get(key), Some(value) if !matches!(value, Object::Null)))
-    {
-        return Ok(Some(start));
-    }
-
-    // Separated widget: the owning terminal field is its direct /Parent.
-    match dict.get("Parent") {
-        Some(Object::Reference(parent_ref)) => Ok(Some(*parent_ref)),
-        _ => Ok(None),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,11 +281,29 @@ mod tests {
     ///
     /// Object layout: 1=Catalog, 2=Pages, 3=Page, 4..=extras.
     fn build_pdf(annots_entry: Option<&str>, extra_objects: &[(u32, &[u8])]) -> Vec<u8> {
+        build_pdf_with_acroform(annots_entry, None, extra_objects)
+    }
+
+    /// Build the same fixture with an explicit AcroForm `/Fields` array on
+    /// the catalog.  qpdf's analyze() only populates annotation_to_field when
+    /// `/AcroForm` has a `/Fields` key; keeping this opt-in lets tests separate
+    /// that contract from the no-AcroForm orphan behavior.
+    fn build_pdf_with_acroform(
+        annots_entry: Option<&str>,
+        fields_entry: Option<&str>,
+        extra_objects: &[(u32, &[u8])],
+    ) -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
 
         let off1 = pdf.len() as u64;
-        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let catalog = match fields_entry {
+            Some(fields) => format!(
+                "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields {fields} >> >>\nendobj\n"
+            ),
+            None => "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+        };
+        pdf.extend_from_slice(catalog.as_bytes());
 
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
@@ -369,8 +381,9 @@ mod tests {
         // obj 6: Text annotation (no rect)
         let obj6: &[u8] = b"6 0 obj\n<< /Type /Annot /Subtype /Text >>\nendobj\n";
 
-        let bytes = build_pdf(
+        let bytes = build_pdf_with_acroform(
             Some("[4 0 R 5 0 R 6 0 R]"),
+            Some("[4 0 R]"),
             &[(4, obj4), (5, obj5), (6, obj6)],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
@@ -411,7 +424,7 @@ mod tests {
         let obj4: &[u8] =
             b"4 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /FT /Tx >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4)]);
+        let bytes = build_pdf_with_acroform(Some("[4 0 R]"), Some("[4 0 R]"), &[(4, obj4)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
@@ -434,10 +447,10 @@ mod tests {
     fn separated_widget_field_ref_is_parent_field() {
         let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
                              /Rect [0 0 100 20] /Parent 5 0 R >>\nendobj\n";
-        let obj5: &[u8] =
-            b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (myfield) >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /FT /Tx /T (myfield) /Kids [4 0 R] >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5)]);
+        let bytes =
+            build_pdf_with_acroform(Some("[4 0 R]"), Some("[5 0 R]"), &[(4, obj4), (5, obj5)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
@@ -445,7 +458,8 @@ mod tests {
         assert_eq!(annots.len(), 1);
         let a = &annots[0];
         assert!(a.is_widget);
-        // field_ref should point to parent (obj 5 which has /FT)
+        // qpdf composes getFieldForAnnotation with getTopLevelField, so the
+        // separated widget resolves to the named top-level field (obj 5).
         assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
     }
 
@@ -459,9 +473,9 @@ mod tests {
     //   6 = Widget+field merged (no direct /FT, has /T, /Parent 5 0 R)
     //   5 = Ancestor field supplying the inherited /FT (/FT /Tx, /Kids [4 6])
     //
-    // Both leaves omit /FT (inherited) but carry their own /T. They are distinct
-    // terminal fields and must each report field_ref == itself — checking only
-    // /FT would send both to obj 5 and wrongly merge the siblings.
+    // Both leaves omit /FT (inherited) but carry their own /T. qpdf maps each
+    // annotation to its terminal field and getTopLevelField then returns the
+    // shared ancestor for this page-level form-field enumeration.
 
     #[test]
     fn merged_fields_inheriting_ft_are_not_aggregated_to_ancestor() {
@@ -471,15 +485,18 @@ mod tests {
         let obj6: &[u8] = b"6 0 obj\n<< /Type /Annot /Subtype /Widget \
                              /Rect [0 30 100 50] /T (field1) /Parent 5 0 R >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R 6 0 R]"), &[(4, obj4), (5, obj5), (6, obj6)]);
+        let bytes = build_pdf_with_acroform(
+            Some("[4 0 R 6 0 R]"),
+            Some("[5 0 R]"),
+            &[(4, obj4), (5, obj5), (6, obj6)],
+        );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         assert_eq!(annots.len(), 2);
-        // Each merged terminal field resolves to itself — NOT both to obj 5.
-        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(4, 0)));
-        assert_eq!(annots[1].field_ref, Some(ObjectRef::new(6, 0)));
+        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(5, 0)));
+        assert_eq!(annots[1].field_ref, Some(ObjectRef::new(5, 0)));
     }
 
     #[test]
@@ -488,12 +505,13 @@ mod tests {
                              /Rect [0 0 100 20] /V (local) /Parent 5 0 R >>\nendobj\n";
         let obj5: &[u8] = b"5 0 obj\n<< /FT /Tx /Kids [4 0 R] >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5)]);
+        let bytes =
+            build_pdf_with_acroform(Some("[4 0 R]"), Some("[5 0 R]"), &[(4, obj4), (5, obj5)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
         let annots = enumerate_page_annotations(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert_eq!(annots.len(), 1);
-        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(4, 0)));
+        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(5, 0)));
     }
 
     // -----------------------------------------------------------------------
@@ -513,17 +531,21 @@ mod tests {
     fn owning_field_is_direct_parent_not_ft_ancestor() {
         let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
                              /Rect [0 0 100 20] /Parent 5 0 R >>\nendobj\n";
-        let obj5: &[u8] = b"5 0 obj\n<< /Parent 6 0 R /T (option1) >>\nendobj\n";
-        let obj6: &[u8] = b"6 0 obj\n<< /FT /Btn /T (radio) >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /Parent 6 0 R /T (option1) /Kids [4 0 R] >>\nendobj\n";
+        let obj6: &[u8] = b"6 0 obj\n<< /FT /Btn /T (radio) /Kids [5 0 R] >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5), (6, obj6)]);
+        let bytes = build_pdf_with_acroform(
+            Some("[4 0 R]"),
+            Some("[6 0 R]"),
+            &[(4, obj4), (5, obj5), (6, obj6)],
+        );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         let a = &annots[0];
         assert!(a.is_widget);
-        assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
+        assert_eq!(a.field_ref, Some(ObjectRef::new(6, 0)));
     }
 
     // -----------------------------------------------------------------------
@@ -542,19 +564,19 @@ mod tests {
                              /Rect [0 0 50 20] /Parent 6 0 R >>\nendobj\n";
         let obj5: &[u8] = b"5 0 obj\n<< /Type /Annot /Subtype /Widget \
                              /Rect [60 0 110 20] /Parent 7 0 R >>\nendobj\n";
-        let obj6: &[u8] = b"6 0 obj\n<< /Parent 8 0 R /T (a) >>\nendobj\n";
-        let obj7: &[u8] = b"7 0 obj\n<< /Parent 8 0 R /T (b) >>\nendobj\n";
-        let obj8: &[u8] = b"8 0 obj\n<< /FT /Btn /T (group) >>\nendobj\n";
+        let obj6: &[u8] = b"6 0 obj\n<< /Parent 8 0 R /T (a) /Kids [4 0 R] >>\nendobj\n";
+        let obj7: &[u8] = b"7 0 obj\n<< /Parent 8 0 R /T (b) /Kids [5 0 R] >>\nendobj\n";
+        let obj8: &[u8] = b"8 0 obj\n<< /FT /Btn /T (group) /Kids [6 0 R 7 0 R] >>\nendobj\n";
 
-        let bytes = build_pdf(
+        let bytes = build_pdf_with_acroform(
             Some("[4 0 R 5 0 R]"),
+            Some("[8 0 R]"),
             &[(4, obj4), (5, obj5), (6, obj6), (7, obj7), (8, obj8)],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let annots = enumerate_page_annotations(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(6, 0)));
-        assert_eq!(annots[1].field_ref, Some(ObjectRef::new(7, 0)));
-        assert_ne!(annots[0].field_ref, annots[1].field_ref);
+        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(8, 0)));
+        assert_eq!(annots[1].field_ref, Some(ObjectRef::new(8, 0)));
     }
 
     // -----------------------------------------------------------------------
@@ -578,6 +600,104 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test: enumerate_document_annotations reuses one field-association map
+    // across every page instead of rebuilding it per page.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn document_enumeration_reuses_the_field_map_across_pages() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /AcroForm << /Fields [5 0 R 6 0 R] >> >>\nendobj\n",
+        );
+        let off2 = bytes.len();
+        bytes.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+        let off3 = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [5 0 R] >>\nendobj\n",
+        );
+        let off4 = bytes.len();
+        bytes.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [6 0 R] >>\nendobj\n",
+        );
+        let off5 = bytes.len();
+        bytes.extend_from_slice(
+            b"5 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /FT /Tx >>\nendobj\n",
+        );
+        let off6 = bytes.len();
+        bytes.extend_from_slice(
+            b"6 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /FT /Tx >>\nendobj\n",
+        );
+        let xref_start = bytes.len();
+        let xref = format!(
+            "xref\n0 7\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n\
+             {off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n{off6:010} 00000 n \n"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let result = enumerate_document_annotations(&mut pdf).unwrap();
+        assert_eq!(result.len(), 2);
+        let (page1_ref, page1_annots) = &result[0];
+        assert_eq!(*page1_ref, ObjectRef::new(3, 0));
+        assert_eq!(page1_annots[0].field_ref, Some(ObjectRef::new(5, 0)));
+        let (page2_ref, page2_annots) = &result[1];
+        assert_eq!(*page2_ref, ObjectRef::new(4, 0));
+        assert_eq!(page2_annots[0].field_ref, Some(ObjectRef::new(6, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: a page with no widgets must not pay for (or fail on) an
+    // unrelated malformed field tree elsewhere in the document. Matches
+    // qpdf's own laziness: analyze() is only invoked by a caller that needs
+    // a field association, so a page with zero widget annotations never
+    // triggers it.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn widget_free_page_ignores_an_overlong_field_tree_elsewhere() {
+        let obj4: &[u8] =
+            b"4 0 obj\n<< /Type /Annot /Subtype /Link /Rect [0 0 200 40] >>\nendobj\n";
+
+        let bytes = build_pdf_with_acroform(Some("[4 0 R]"), Some("[10 0 R]"), &[(4, obj4)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        // Build a /Kids chain deeper than DEFAULT_MAX_ACROFORM_DEPTH, rooted
+        // at 10 0 R (the sole /AcroForm /Fields entry). Traversing it would
+        // error; enumerating the widget-free page must never reach it.
+        let depth = crate::DEFAULT_MAX_ACROFORM_DEPTH + 5;
+        for level in 0..depth {
+            let this_ref = ObjectRef::new(10 + level as u32, 0);
+            let mut dict = crate::Dictionary::new();
+            if level + 1 < depth {
+                let next_ref = ObjectRef::new(10 + level as u32 + 1, 0);
+                dict.insert("Kids", Object::Array(vec![Object::Reference(next_ref)]));
+            } else {
+                dict.insert("FT", Object::Name(b"Tx".to_vec()));
+                dict.insert("T", Object::String(b"leaf".to_vec()));
+            }
+            pdf.set_object(this_ref, Object::Dictionary(dict));
+        }
+
+        let page_ref = ObjectRef::new(3, 0);
+        let annots = enumerate_page_annotations(&mut pdf, page_ref)
+            .expect("a widget-free page must not traverse the unrelated field tree");
+        assert_eq!(annots.len(), 1);
+        assert!(!annots[0].is_widget);
+        assert_eq!(annots[0].field_ref, None);
+    }
+
+    // -----------------------------------------------------------------------
     // Test: Widget with no /FT and no /Parent → field_ref is None
     // -----------------------------------------------------------------------
 
@@ -598,6 +718,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test: qpdf's orphan fallback runs when /AcroForm /Fields exists
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn orphan_widget_self_maps_when_acroform_fields_exist() {
+        let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [0 0 100 20] >>\nendobj\n";
+
+        let bytes = build_pdf_with_acroform(Some("[4 0 R]"), Some("[]"), &[(4, obj4)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
+        let a = &annots[0];
+        assert!(a.is_widget);
+        assert_eq!(a.field_ref, Some(ObjectRef::new(4, 0)));
+    }
+
+    // -----------------------------------------------------------------------
     // Test: /Parent cycle → terminates without panic, returns Some result
     // -----------------------------------------------------------------------
     //
@@ -611,17 +750,18 @@ mod tests {
                              /Rect [0 0 100 20] /Parent 5 0 R >>\nendobj\n";
         let obj5: &[u8] = b"5 0 obj\n<< /Parent 4 0 R >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5)]);
+        let bytes =
+            build_pdf_with_acroform(Some("[4 0 R]"), Some("[4 0 R]"), &[(4, obj4), (5, obj5)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        // Linkage is a single hop to the direct parent, so a /Parent cycle is
-        // harmless — it never walks far enough to loop. field_ref = obj 5.
+        // qpdf's getTopLevelField follows the cycle with an ObjGen seen guard
+        // and returns the node where the repeated object is observed (obj 4).
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         assert_eq!(annots.len(), 1);
         let a = &annots[0];
         assert!(a.is_widget);
-        assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
+        assert_eq!(a.field_ref, Some(ObjectRef::new(4, 0)));
     }
 
     // -----------------------------------------------------------------------
@@ -651,16 +791,17 @@ mod tests {
         // obj 5: field-like node, no /FT (generator omitted it)
         let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
                              /Rect [0 0 100 20] /Parent 5 0 R >>\nendobj\n";
-        let obj5: &[u8] = b"5 0 obj\n<< /T (noFT) >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /T (noFT) /Kids [4 0 R] >>\nendobj\n";
 
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5)]);
+        let bytes =
+            build_pdf_with_acroform(Some("[4 0 R]"), Some("[5 0 R]"), &[(4, obj4), (5, obj5)]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
         let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
         let a = &annots[0];
         assert!(a.is_widget);
-        // No /FT or /T on the widget — its direct parent (obj 5) is returned
+        // qpdf's canonical composition returns the top-level field (obj 5).
         assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
     }
 
