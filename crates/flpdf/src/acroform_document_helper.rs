@@ -181,9 +181,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when a field-tree node is not a dictionary,
-    ///   or when the field-tree depth limit is exceeded.
-    /// - Any error from [`Pdf::resolve`].
+    /// - Any error while resolving the live object graph or enumerating pages.
     pub fn annotation_to_field_map(&mut self) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
         Ok(self
             .canonical_annotation_to_field_map()?
@@ -237,13 +235,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let fields = self
             .pdf
             .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
-        let Some(fields) = fields.as_array() else {
-            return Ok(annotation_to_field);
-        };
-
-        let mut visited = BTreeSet::new();
-        for field in fields {
-            self.traverse_field_handles(field, None, 0, &mut visited, &mut annotation_to_field)?;
+        if let Some(fields) = fields.as_array() {
+            let mut visited = BTreeSet::new();
+            let map = &mut annotation_to_field;
+            for field in fields {
+                self.traverse_field_handles(field, None, 0, &mut visited, map)?;
+            }
         }
 
         // qpdf's orphan-widget fallback walks the canonical page annotation
@@ -309,16 +306,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         parent: Option<ObjectHandle>,
         depth: usize,
         visited: &mut BTreeSet<ObjectRef>,
-        annotation_to_field: &mut BTreeMap<ObjectRef, ObjectHandle>,
+        map: &mut BTreeMap<ObjectRef, ObjectHandle>,
     ) -> Result<()> {
         if depth > DEFAULT_MAX_ACROFORM_DEPTH {
-            let field_ref = field
-                .object_ref()
-                .map(|object_ref| object_ref.to_string())
-                .unwrap_or_else(|| "direct object".to_owned());
-            return Err(Error::Unsupported(format!(
-                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH} at {field_ref}"
-            )));
+            return Ok(());
         }
 
         let field = self.pdf.resolve_object_handle_to_terminal(&field)?;
@@ -336,14 +327,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let is_annotation;
         if let Some(kids) = kids.as_array() {
             is_field = true;
+            let parent = Some(field.clone());
             for kid in kids {
-                self.traverse_field_handles(
-                    kid,
-                    Some(field.clone()),
-                    depth + 1,
-                    visited,
-                    annotation_to_field,
-                )?;
+                self.traverse_field_handles(kid, parent.clone(), depth + 1, visited, map)?;
             }
             is_annotation = false;
         } else {
@@ -359,7 +345,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             } else {
                 parent.unwrap_or_else(|| field.clone())
             };
-            annotation_to_field.insert(field_ref, owning_field);
+            map.insert(field_ref, owning_field);
         }
         Ok(())
     }
@@ -1400,6 +1386,21 @@ mod tests {
         Pdf::open(std::io::Cursor::new(bytes)).expect("open")
     }
 
+    fn rootless_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(std::io::Cursor::new(bytes)).expect("open")
+    }
+
     fn refs_vec(nums: &[u32]) -> Vec<Object> {
         nums.iter()
             .map(|n| Object::Reference(ObjectRef::new(*n, 0)))
@@ -1678,9 +1679,9 @@ mod tests {
     }
 
     #[test]
-    fn annotation_to_field_map_orphan_widget_self_maps() {
-        // A widget on a page's /Annots that /AcroForm/Fields never reaches
-        // becomes its own field (qpdf's orphan-widget fallback).
+    fn annotation_to_field_map_orphan_widget_self_maps_when_fields_are_not_an_array() {
+        // qpdf replaces a non-array /Fields value with an empty array, then
+        // still runs the orphan-widget fallback over page annotations.
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(1, 0),
@@ -1688,7 +1689,7 @@ mod tests {
                 ("Pages", Object::Reference(ObjectRef::new(2, 0))),
                 (
                     "AcroForm",
-                    Object::Dictionary(dict(&[("Fields", Object::Array(vec![]))])),
+                    Object::Dictionary(dict(&[("Fields", Object::Name(b"not-an-array".to_vec()))])),
                 ),
             ])),
         );
@@ -1705,7 +1706,13 @@ mod tests {
             Object::Dictionary(dict(&[
                 ("Type", Object::Name(b"Page".to_vec())),
                 ("Parent", Object::Reference(ObjectRef::new(2, 0))),
-                ("Annots", refs(&[5])),
+                (
+                    "Annots",
+                    Object::Array(vec![
+                        Object::Reference(ObjectRef::new(5, 0)),
+                        Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
+                    ]),
+                ),
             ])),
         );
         pdf.set_object(
@@ -1717,6 +1724,115 @@ mod tests {
             .annotation_to_field_map()
             .unwrap();
         assert_eq!(map.get(&ObjectRef::new(5, 0)), Some(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn annotation_to_field_map_without_root_is_empty() {
+        let mut pdf = rootless_pdf();
+
+        assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn annotation_to_field_map_with_a_non_dictionary_root_is_empty() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Name(b"not-a-catalog".to_vec()),
+        );
+
+        assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn annotation_to_field_map_ignores_field_tree_depth_overflow() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[(
+                        "Fields",
+                        Object::Array(vec![Object::Reference(ObjectRef::new(10, 0))]),
+                    )])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![])),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        let depth = DEFAULT_MAX_ACROFORM_DEPTH + 2;
+        for level in 0..depth {
+            let object_ref = ObjectRef::new(10 + level as u32, 0);
+            let value = if level + 1 < depth {
+                Object::Dictionary(dict(&[(
+                    "Kids",
+                    Object::Array(vec![Object::Reference(ObjectRef::new(
+                        11 + level as u32,
+                        0,
+                    ))]),
+                )]))
+            } else {
+                Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))]))
+            };
+            pdf.set_object(object_ref, value);
+        }
+
+        assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn annotation_to_field_map_ignores_a_field_tree_cycle() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[(
+                        "Fields",
+                        Object::Array(vec![Object::Reference(ObjectRef::new(10, 0))]),
+                    )])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![])),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(10, 0),
+            Object::Dictionary(dict(&[(
+                "Kids",
+                Object::Array(vec![Object::Reference(ObjectRef::new(10, 0))]),
+            )])),
+        );
+
+        assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1852,5 +1968,19 @@ mod tests {
                 .unwrap(),
             Some(ObjectRef::new(7, 0))
         );
+    }
+
+    #[test]
+    fn canonical_field_for_annotation_ignores_a_direct_widget_handle() {
+        let mut pdf = empty_pdf();
+        let annotation = ObjectHandle::dictionary(vec![(
+            b"/Subtype".to_vec(),
+            ObjectHandle::name(b"Widget".to_vec()),
+        )]);
+
+        assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .canonical_field_for_annotation(annotation)
+            .unwrap()
+            .is_none());
     }
 }

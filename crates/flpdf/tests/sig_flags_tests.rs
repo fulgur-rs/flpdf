@@ -357,34 +357,6 @@ fn build_non_sig_widget_field_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
-/// A `/Kids` tree (`5 -> [6] -> [7] -> ...`) deeper than the traversal depth
-/// limit, so the analyze/traverseField enumeration raises the depth-limit error.
-fn build_deep_kids_tree_pdf() -> Vec<u8> {
-    let hops = DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30;
-    let mut objects: Vec<(u32, Vec<u8>)> = vec![
-        (
-            1,
-            b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".to_vec(),
-        ),
-        (
-            2,
-            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>".to_vec(),
-        ),
-        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
-        (4, b"<< /Fields [5 0 R] >>".to_vec()),
-    ];
-    // Field 5 groups 6, which groups 7, ... a /Kids chain deeper than the limit.
-    for level in 0..hops {
-        let obj = 5 + level;
-        let next = obj + 1;
-        objects.push((obj, format!("<< /Kids [{next} 0 R] >>").into_bytes()));
-    }
-    let tail = 5 + hops;
-    objects.push((tail, b"<< >>".to_vec()));
-    let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
-    build_pdf(&borrowed)
-}
-
 /// A top-level form field that is an annotation (`/Rect`) whose inherited
 /// `/FT /Sig` must be resolved up a long acyclic `/Parent` chain.
 fn build_deep_parent_chain_widget_field_pdf() -> Vec<u8> {
@@ -761,14 +733,6 @@ fn disable_digital_signatures_ignores_non_sig_form_field() {
     let fields = acroform_fields(&mut pdf);
     assert_eq!(fields, vec![Object::Reference(f5)], "/Fields is untouched");
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
-}
-
-#[test]
-fn disable_digital_signatures_errs_on_deep_kids_tree() {
-    // A /Kids tree deeper than the traversal depth limit surfaces the error out
-    // of the analyze/traverseField enumeration.
-    let mut pdf = open(build_deep_kids_tree_pdf());
-    assert!(disable_digital_signatures(&mut pdf).is_err());
 }
 
 #[test]
