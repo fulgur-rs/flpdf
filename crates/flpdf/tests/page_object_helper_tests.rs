@@ -151,6 +151,26 @@ fn content_stream_objects_parses_single_stream() {
 }
 
 #[test]
+fn get_page_contents_returns_canonical_stream_handles() {
+    let body = b"q Q";
+    let (num, extra) = make_stream_object(4, body);
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R",
+        &[(num, extra)],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let contents = helper
+        .get_page_contents()
+        .expect("page contents should resolve through ObjectHandle");
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].object_ref(), Some(ObjectRef::new(4, 0)));
+    assert!(contents[0].as_stream_dict().is_some());
+}
+
+#[test]
 fn content_stream_objects_concatenates_array_contents() {
     // Two-element /Contents array — objects from both streams appear.
     let body1 = b"q";
@@ -491,6 +511,72 @@ fn media_box_inherits_indirect_array_from_parent() {
     let mb = helper.media_box().unwrap().expect("expected /MediaBox");
 
     assert_eq!(mb, PageBox::new(0.0, 0.0, 400.0, 500.0));
+}
+
+#[test]
+fn get_attribute_uses_live_inherited_handle_and_copies_when_requested() {
+    let rect = (4u32, b"4 0 obj\n[0 0 400 500]\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox 4 0 R", "", &[rect]);
+    let mut pdf = open(bytes);
+    let page_ref = ObjectRef::new(3, 0);
+
+    let inherited = {
+        let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+        helper
+            .get_attribute(b"/MediaBox", false)
+            .expect("inherited attribute should resolve")
+    };
+    assert_eq!(
+        inherited.object_ref(),
+        Some(ObjectRef::new(4, 0)),
+        "copy_if_shared=false must retain the inherited indirect identity"
+    );
+
+    let copied = {
+        let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+        helper
+            .get_attribute(b"/MediaBox", true)
+            .expect("copying an inherited attribute should resolve")
+    };
+    assert!(
+        copied.is_direct(),
+        "copy_if_shared=true must return the shallow copy, not the shared indirect value"
+    );
+    assert_eq!(copied.as_array().expect("copied box array").len(), 4);
+
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page).unwrap();
+    let page_media_box = page.get_key(b"/MediaBox");
+    pdf.resolve_object_handle(&page_media_box).unwrap();
+    assert!(
+        page_media_box.is_direct(),
+        "copy_if_shared=true must materialize the copied value on the page"
+    );
+}
+
+#[test]
+fn get_crop_box_copies_a_media_box_fallback_when_requested() {
+    let bytes = build_single_page_pdf("/MediaBox [0 0 400 500]", "");
+    let mut pdf = open(bytes);
+    let page_ref = ObjectRef::new(3, 0);
+
+    let crop = {
+        let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
+        helper
+            .get_crop_box(false, true)
+            .expect("CropBox fallback should resolve")
+    };
+    assert!(crop.is_direct(), "fallback copy must be a direct handle");
+
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page).unwrap();
+    let page_crop_box = page.get_key(b"/CropBox");
+    pdf.resolve_object_handle(&page_crop_box).unwrap();
+    assert!(
+        page_crop_box.is_direct(),
+        "copy_if_fallback=true must materialize /CropBox on the page"
+    );
+    assert_eq!(page_crop_box.as_array().unwrap().len(), 4);
 }
 
 #[test]

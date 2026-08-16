@@ -122,11 +122,12 @@
 //! ```
 
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_rotate::resolve_inherited_rotate;
 use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -203,6 +204,179 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Self { page_ref, pdf }
     }
 
+    /// Return the live canonical handle for this page after validating its
+    /// `/Type`. This is the page-helper equivalent of qpdf's
+    /// `QPDFPageObjectHelper` construction over a `QPDFObjectHandle`: all
+    /// subsequent page attributes and mutations operate on the resolver-backed
+    /// object graph rather than on a legacy `Object` snapshot.
+    fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
+        let page = self.pdf.get_object_handle(self.page_ref);
+        self.pdf.resolve_object_handle(&page)?;
+        if page.as_dictionary().is_none() {
+            return Err(Error::Unsupported(format!(
+                "object {} is not a dictionary, cannot use as a page",
+                self.page_ref
+            )));
+        }
+
+        let page_type = page.try_get_key(b"/Type")?;
+        self.pdf.resolve_object_handle(&page_type)?;
+        match page_type.as_name() {
+            Some(name) if name.as_slice() == b"Page" => Ok(page),
+            Some(name) => Err(Error::Unsupported(format!(
+                "object {} has /Type /{}, expected /Page",
+                self.page_ref,
+                String::from_utf8_lossy(&name)
+            ))),
+            None if page.has_key(b"/Type") => Err(Error::Unsupported(format!(
+                "object {} has a non-name /Type entry",
+                self.page_ref
+            ))),
+            None => Err(Error::Unsupported(format!(
+                "object {} has no /Type entry",
+                self.page_ref
+            ))),
+        }
+    }
+
+    /// Return a live page attribute, applying qpdf's page-tree inheritance
+    /// rules for `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate`.
+    ///
+    /// When `copy_if_shared` is true, an inherited or indirect value is
+    /// shallow-copied into the page dictionary before it is returned. The
+    /// returned handle is therefore the value that a caller may mutate without
+    /// changing the shared source attribute, matching
+    /// `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:224-260`).
+    /// Missing and null attributes return a direct null handle.
+    pub fn get_attribute(&mut self, key: &[u8], copy_if_shared: bool) -> Result<ObjectHandle> {
+        let page = self.resolved_page_handle()?;
+        let inheritable = matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate");
+        let mut result = self
+            .pdf
+            .resolve_object_handle_to_terminal(&page.try_get_key(key)?)?;
+        let mut inherited = false;
+
+        if result.is_null() && inheritable {
+            let mut node = page.clone();
+            let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
+            let mut depth = 0usize;
+            loop {
+                if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+                    return Err(Error::Unsupported(format!(
+                        "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {}",
+                        self.page_ref
+                    )));
+                }
+                if !seen.insert(node.identity_key()) {
+                    break;
+                }
+
+                let parent = self
+                    .pdf
+                    .resolve_object_handle_to_terminal(&node.try_get_key(b"/Parent")?)?;
+                if parent.is_null() {
+                    break;
+                }
+                node = parent;
+                depth += 1;
+
+                let candidate = self
+                    .pdf
+                    .resolve_object_handle_to_terminal(&node.try_get_key(key)?)?;
+                if !candidate.is_null() {
+                    result = candidate;
+                    inherited = true;
+                    break;
+                }
+            }
+        }
+
+        if copy_if_shared && (inherited || result.is_indirect()) {
+            let copy = result.shallow_copy()?;
+            page.replace_key(key, copy.clone())?;
+            self.pdf.mark_object_handle_dirty(&page)?;
+            result = copy;
+        }
+        Ok(result)
+    }
+
+    /// Return the effective `/MediaBox` handle.
+    pub fn get_media_box(&mut self, copy_if_shared: bool) -> Result<ObjectHandle> {
+        self.get_attribute(b"/MediaBox", copy_if_shared)
+    }
+
+    /// Return the effective `/CropBox` handle, falling back to `/MediaBox`.
+    pub fn get_crop_box(
+        &mut self,
+        copy_if_shared: bool,
+        copy_if_fallback: bool,
+    ) -> Result<ObjectHandle> {
+        let result = self.get_attribute(b"/CropBox", copy_if_shared)?;
+        if !result.is_null() {
+            return Ok(result);
+        }
+        let fallback = self.get_media_box(copy_if_shared)?;
+        self.apply_fallback(b"/CropBox", fallback, copy_if_fallback)
+    }
+
+    /// Return the effective `/BleedBox` handle, falling back to `/CropBox`.
+    pub fn get_bleed_box(
+        &mut self,
+        copy_if_shared: bool,
+        copy_if_fallback: bool,
+    ) -> Result<ObjectHandle> {
+        let result = self.get_attribute(b"/BleedBox", copy_if_shared)?;
+        if !result.is_null() {
+            return Ok(result);
+        }
+        let fallback = self.get_crop_box(copy_if_shared, copy_if_fallback)?;
+        self.apply_fallback(b"/BleedBox", fallback, copy_if_fallback)
+    }
+
+    /// Return the effective `/TrimBox` handle, falling back to `/CropBox`.
+    pub fn get_trim_box(
+        &mut self,
+        copy_if_shared: bool,
+        copy_if_fallback: bool,
+    ) -> Result<ObjectHandle> {
+        let result = self.get_attribute(b"/TrimBox", copy_if_shared)?;
+        if !result.is_null() {
+            return Ok(result);
+        }
+        let fallback = self.get_crop_box(copy_if_shared, copy_if_fallback)?;
+        self.apply_fallback(b"/TrimBox", fallback, copy_if_fallback)
+    }
+
+    /// Return the effective `/ArtBox` handle, falling back to `/CropBox`.
+    pub fn get_art_box(
+        &mut self,
+        copy_if_shared: bool,
+        copy_if_fallback: bool,
+    ) -> Result<ObjectHandle> {
+        let result = self.get_attribute(b"/ArtBox", copy_if_shared)?;
+        if !result.is_null() {
+            return Ok(result);
+        }
+        let fallback = self.get_crop_box(copy_if_shared, copy_if_fallback)?;
+        self.apply_fallback(b"/ArtBox", fallback, copy_if_fallback)
+    }
+
+    fn apply_fallback(
+        &mut self,
+        key: &[u8],
+        fallback: ObjectHandle,
+        copy_if_fallback: bool,
+    ) -> Result<ObjectHandle> {
+        if !copy_if_fallback || fallback.is_null() {
+            return Ok(fallback);
+        }
+        let page = self.resolved_page_handle()?;
+        let copy = fallback.shallow_copy()?;
+        page.replace_key(key, copy.clone())?;
+        self.pdf.mark_object_handle_dirty(&page)?;
+        Ok(copy)
+    }
+
     /// Verify `page_ref` resolves to a leaf `/Type /Page` dictionary.
     ///
     /// Guards the public accessors so a `/Pages` tree node (or any other
@@ -263,6 +437,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let mut callbacks = ObjectRecordingCallbacks::default();
         parse_content_stream_data(&raw, &mut callbacks)?;
         Ok(callbacks.objects)
+    }
+
+    /// Return the page's `/Contents` as canonical stream handles.
+    ///
+    /// This is the direct `QPDFPageObjectHelper::getPageContents` route
+    /// (`libqpdf/QPDFPageObjectHelper.cc:439-442`) and deliberately preserves
+    /// each stream's identity and lazy provider instead of decoding it into a
+    /// byte buffer or legacy [`Object`] value.
+    pub fn get_page_contents(&mut self) -> Result<Vec<ObjectHandle>> {
+        let page = self.resolved_page_handle()?;
+        page.get_page_contents()
     }
 
     // -----------------------------------------------------------------------
@@ -473,8 +658,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn media_box(&mut self) -> Result<Option<PageBox>> {
-        self.ensure_leaf_page()?;
-        self.inherited_box(b"MediaBox")
+        let value = self.get_media_box(false)?;
+        self.page_box_from_handle(b"/MediaBox", value)
     }
 
     /// Return the effective `/CropBox` for this page, resolving inheritance
@@ -505,11 +690,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn crop_box(&mut self) -> Result<Option<PageBox>> {
-        self.ensure_leaf_page()?;
-        match self.inherited_box(b"CropBox")? {
-            Some(b) => Ok(Some(b)),
-            None => self.media_box(),
-        }
+        let value = self.get_crop_box(false, false)?;
+        self.page_box_from_handle(b"/CropBox", value)
     }
 
     /// Return the effective `/BleedBox` for this page.
@@ -539,11 +721,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn bleed_box(&mut self) -> Result<Option<PageBox>> {
-        self.ensure_leaf_page()?;
-        match self.leaf_box(b"BleedBox")? {
-            Some(b) => Ok(Some(b)),
-            None => self.crop_box(),
-        }
+        let value = self.get_bleed_box(false, false)?;
+        self.page_box_from_handle(b"/BleedBox", value)
     }
 
     /// Return the effective `/TrimBox` for this page.
@@ -573,11 +752,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn trim_box(&mut self) -> Result<Option<PageBox>> {
-        self.ensure_leaf_page()?;
-        match self.leaf_box(b"TrimBox")? {
-            Some(b) => Ok(Some(b)),
-            None => self.crop_box(),
-        }
+        let value = self.get_trim_box(false, false)?;
+        self.page_box_from_handle(b"/TrimBox", value)
     }
 
     /// Return the effective `/ArtBox` for this page.
@@ -607,166 +783,53 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn art_box(&mut self) -> Result<Option<PageBox>> {
-        self.ensure_leaf_page()?;
-        match self.leaf_box(b"ArtBox")? {
-            Some(b) => Ok(Some(b)),
-            None => self.crop_box(),
-        }
+        let value = self.get_art_box(false, false)?;
+        self.page_box_from_handle(b"/ArtBox", value)
     }
 
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Walk the `/Parent` chain looking for a rectangle array under `key`.
-    ///
-    /// Mirrors the pattern of [`crate::pages::resolve_inherited_resources`]:
-    /// - Per PDF §7.3.9, `Object::Null` is treated as absent.
-    /// - Cycle guard via a `BTreeSet<ObjectRef>`.
-    /// - Depth limited by [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
-    fn inherited_box(&mut self, key: &[u8]) -> Result<Option<PageBox>> {
-        let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-        let mut current = self.page_ref;
-        let mut depth: usize = 0;
-
-        loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {current}"
-                )));
-            }
-
-            if !seen.insert(current) {
-                // Cycle detected — stop walking.
-                return Ok(None);
-            }
-
-            let node_obj = self.pdf.resolve_borrowed(current)?;
-            let Object::Dictionary(dict) = node_obj else {
-                return Ok(None);
-            };
-
-            let val = dict.get(key).cloned();
-            let parent_val = dict.get("Parent").cloned();
-
-            if let Some(val) = val {
-                match val {
-                    Object::Null => {}
-                    Object::Array(arr) => {
-                        return parse_rect_array(&arr, key).map(Some);
-                    }
-                    Object::Reference(r) => {
-                        let resolved = self.pdf.resolve_borrowed(r)?;
-                        match resolved {
-                            Object::Null => {}
-                            Object::Array(arr) => {
-                                return parse_rect_array(arr, key).map(Some);
-                            }
-                            _ => {
-                                return Err(Error::Unsupported(format!(
-                                    "/{} reference {r} on node {current} does not resolve to an array",
-                                    String::from_utf8_lossy(key)
-                                )));
-                            }
-                        }
-                    }
-                    _ => {
-                        return Err(Error::Unsupported(format!(
-                            "/{} entry on node {current} has unexpected type",
-                            String::from_utf8_lossy(key)
-                        )));
-                    }
-                }
-            }
-
-            // Not found here — climb to /Parent.
-            let parent_val = match parent_val {
-                Some(Object::Null) | None => return Ok(None),
-                Some(v) => v,
-            };
-
-            match parent_val {
-                Object::Reference(r) => {
-                    current = r;
-                    depth += 1;
-                }
-                _ => return Ok(None),
-            }
-        }
-    }
-
-    /// Read a bounding-box key from the **leaf page only** (not inheritable).
-    ///
-    /// Used for `/BleedBox`, `/TrimBox`, and `/ArtBox` which are defined only
-    /// on the leaf and default to `/CropBox` per ISO 32000-1 §14.11.2.
-    fn leaf_box(&mut self, key: &[u8]) -> Result<Option<PageBox>> {
-        let page_obj = self.pdf.resolve_borrowed(self.page_ref)?;
-        let Object::Dictionary(dict) = page_obj else {
+    fn page_box_from_handle(&mut self, key: &[u8], value: ObjectHandle) -> Result<Option<PageBox>> {
+        if value.is_null() {
             return Ok(None);
-        };
-
-        let val = match dict.get(key).cloned() {
-            None => return Ok(None),
-            Some(Object::Null) => return Ok(None),
-            Some(v) => v,
-        };
-
-        match val {
-            Object::Array(arr) => parse_rect_array(&arr, key).map(Some),
-            Object::Reference(r) => {
-                let resolved = self.pdf.resolve_borrowed(r)?;
-                match resolved {
-                    Object::Null => Ok(None),
-                    Object::Array(arr) => parse_rect_array(arr, key).map(Some),
-                    _ => Err(Error::Unsupported(format!(
-                        "/{} reference {r} on page {} does not resolve to an array",
-                        String::from_utf8_lossy(key),
-                        self.page_ref
-                    ))),
-                }
-            }
-            _ => Err(Error::Unsupported(format!(
-                "/{} entry on page {} has unexpected type",
+        }
+        self.pdf.resolve_object_handle(&value)?;
+        let Some(items) = value.as_array() else {
+            return Err(Error::Unsupported(format!(
+                "{} on page {} does not resolve to an array",
                 String::from_utf8_lossy(key),
                 self.page_ref
-            ))),
+            )));
+        };
+        if items.len() < 4 {
+            return Err(Error::Unsupported(format!(
+                "{} rectangle array has {} elements, expected 4",
+                String::from_utf8_lossy(key),
+                items.len()
+            )));
         }
+        let mut coords = [0.0f64; 4];
+        for (index, item) in items.into_iter().take(4).enumerate() {
+            self.pdf.resolve_object_handle(&item)?;
+            coords[index] = item
+                .as_integer()
+                .map(|value| value as f64)
+                .or_else(|| item.as_real())
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "{} rectangle element {index} has type {} (expected number)",
+                        String::from_utf8_lossy(key),
+                        item.type_name()
+                    ))
+                })?;
+        }
+        Ok(Some(PageBox::new(
+            coords[0], coords[1], coords[2], coords[3],
+        )))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Private free functions
 // ---------------------------------------------------------------------------
-
-/// Parse a 4-element PDF rectangle array into a [`PageBox`].
-///
-/// Each element may be [`Object::Integer`] or [`Object::Real`]; both are
-/// coerced to `f64`. Returns [`Error::Unsupported`] when the array has fewer
-/// than 4 elements or contains non-numeric values.
-fn parse_rect_array(arr: &[Object], key: &[u8]) -> Result<PageBox> {
-    if arr.len() < 4 {
-        return Err(Error::Unsupported(format!(
-            "/{} rectangle array has {} elements, expected 4",
-            String::from_utf8_lossy(key),
-            arr.len()
-        )));
-    }
-    let mut coords = [0f64; 4];
-    for (i, elem) in arr.iter().take(4).enumerate() {
-        coords[i] = match elem {
-            Object::Integer(n) => *n as f64,
-            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "/{} rectangle element {i} has type {} (expected number)",
-                    String::from_utf8_lossy(key),
-                    object_type_name(other)
-                )));
-            }
-        };
-    }
-    Ok(PageBox::new(coords[0], coords[1], coords[2], coords[3]))
-}
 
 fn object_type_name(obj: &Object) -> &'static str {
     match obj {
