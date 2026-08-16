@@ -2020,6 +2020,17 @@ mod tests {
     }
 
     #[test]
+    fn encode_stream_data_ascii85_is_explicitly_unsupported() {
+        let dict = ascii85_dict();
+        let error = encode_stream_data(&dict, b"payload").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: ASCII85Encode is not supported: qpdf provides an ASCII85 decoder but no encoder"
+        );
+    }
+
+    #[test]
     fn decode_stream_data_ascii85_empty() {
         let dict = ascii85_dict();
         let plaintext = b"";
