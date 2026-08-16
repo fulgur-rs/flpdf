@@ -131,12 +131,12 @@ fn page_index_outline_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn outlines_for_page_uses_qpdf_breadth_first_order() {
+fn get_outlines_for_page_uses_qpdf_breadth_first_order() {
     let mut pdf = Pdf::open(Cursor::new(page_index_outline_pdf())).unwrap();
     let tree = pdf.outline().get_tree().unwrap();
 
     let titles: Vec<_> = tree
-        .outlines_for_page(Some(ObjectRef::new(3, 0)))
+        .get_outlines_for_page(Some(ObjectRef::new(3, 0)))
         .map(|(_id, item)| item.title.as_str())
         .collect();
 
@@ -144,12 +144,12 @@ fn outlines_for_page_uses_qpdf_breadth_first_order() {
 }
 
 #[test]
-fn outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
+fn get_outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
     let mut pdf = Pdf::open(Cursor::new(page_index_outline_pdf())).unwrap();
     let tree = pdf.outline().get_tree().unwrap();
 
     let titles: Vec<_> = tree
-        .outlines_for_page(None)
+        .get_outlines_for_page(None)
         .map(|(_id, item)| item.title.as_str())
         .collect();
 
@@ -164,7 +164,7 @@ fn outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
     );
 
     let zero_ref_titles: Vec<_> = tree
-        .outlines_for_page(Some(ObjectRef::new(0, 0)))
+        .get_outlines_for_page(Some(ObjectRef::new(0, 0)))
         .map(|(_id, item)| item.title.as_str())
         .collect();
     assert_eq!(zero_ref_titles, titles);
