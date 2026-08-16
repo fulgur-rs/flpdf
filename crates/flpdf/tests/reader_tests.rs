@@ -824,6 +824,10 @@ fn v4_explicit_crypt_filter_before_ascii85_decrypts_at_filter_slot() {
 /// qpdf counterpart either. This pins the current boundary of that divergence;
 /// the `/FlateDecode` variant still reconstructs its prefix because a Flate
 /// encoder exists.
+///
+/// The assertion below is not the target state: qpdf warns and carries on with
+/// the stream unfiltered while the document stays open, so moving this path onto
+/// qpdf's model is expected to rewrite this expectation rather than keep it.
 #[test]
 fn v4_explicit_crypt_filter_after_ascii85_reports_the_missing_encoder() {
     let mut pdf = Pdf::open(std::io::Cursor::new(
