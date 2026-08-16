@@ -375,6 +375,32 @@ fn annotation_handle_appearance_stream_missing_state_returns_null() {
     assert!(stream.is_null());
 }
 
+#[test]
+fn annotation_handle_appearance_stream_state_dictionary_key_missing_returns_null() {
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>".to_vec(),
+        ),
+        (
+            4,
+            b"<< /Type /Annot /AS /Off /AP << /N << /On 5 0 R >> >> >>".to_vec(),
+        ),
+        (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    // /AS selects "Off", a non-empty state, so the state-dictionary branch is
+    // taken; but /N's state dictionary only has an "On" entry, so the
+    // selected key doesn't resolve to a stream and the result is null.
+    let stream = annot
+        .get_appearance_stream(b"N", None)
+        .expect("get_appearance_stream()");
+    assert!(stream.is_null());
+}
+
 // ── FormFieldObjectHelper — leaf field (no /Parent) ───────────────────────────
 //
 // Object layout:

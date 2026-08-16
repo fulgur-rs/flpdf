@@ -82,11 +82,6 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         Self { annot, pdf }
     }
 
-    /// The underlying [`ObjectHandle`] for the annotation object.
-    pub fn object_handle(&self) -> &ObjectHandle {
-        &self.annot
-    }
-
     /// Resolve `self.annot` and return the key's resolved child handle.
     fn resolved_key(&mut self, key: &[u8]) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle(&self.annot)?;
