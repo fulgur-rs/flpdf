@@ -6,7 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::content_stream::{ParseControl, ParserCallbacks};
+use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl, ParserCallbacks};
+use crate::object_handle::ObjectHandle;
 use crate::{Object, Result};
 
 pub(crate) type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeSet<usize>>>;
@@ -109,6 +110,34 @@ impl ResourceFinder {
         }
         Ok(ParseControl::Continue)
     }
+
+    /// Canonical ObjectHandle-native counterpart of
+    /// [`Self::handle_object_borrowed`]. Resource pruning uses this callback
+    /// with `PageObjectHelper::parse_contents` so page content never crosses
+    /// through the legacy `Object` materialization boundary.
+    pub(crate) fn handle_object_handle(
+        &mut self,
+        object: &ObjectHandle,
+        offset: usize,
+        _length: usize,
+    ) -> Result<ParseControl> {
+        if let Some(name) = object.as_name() {
+            self.pending_operands = true;
+            self.last_name = Some((name, offset));
+        } else if let Some(operator) = object.as_operator() {
+            self.last_operator_started_at_boundary = !self.pending_operands;
+            self.pending_operands = false;
+            if let Some(resource_type) = operator_resource_type(&operator) {
+                self.record_last_name(resource_type);
+            }
+        } else if object.as_inline_image().is_some() {
+            // Inline-image payloads carry no resource operand semantics here;
+            // their `/CS` header is handled by the dedicated content scanner.
+        } else {
+            self.pending_operands = true;
+        }
+        Ok(ParseControl::Continue)
+    }
 }
 
 fn operator_resource_type(operator: &[u8]) -> Option<&'static [u8]> {
@@ -132,6 +161,26 @@ impl ParserCallbacks for ResourceFinder {
         length: usize,
     ) -> Result<ParseControl> {
         self.handle_object_borrowed(&object, offset, length)
+    }
+
+    fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {
+        self.had_diagnostics = true;
+        Ok(())
+    }
+
+    fn handle_eof(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl ObjectHandleParserCallbacks for ResourceFinder {
+    fn handle_object(
+        &mut self,
+        object: ObjectHandle,
+        offset: usize,
+        length: usize,
+    ) -> Result<ParseControl> {
+        self.handle_object_handle(&object, offset, length)
     }
 
     fn handle_diagnostic(&mut self, _offset: usize, _message: &str) -> Result<()> {

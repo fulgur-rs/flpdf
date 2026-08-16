@@ -121,16 +121,15 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::content_stream::{
-    parse_content_stream_data, ObjectHandleParserCallbacks, ParseControl, ParserCallbacks,
-};
+use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_rotate::resolve_inherited_rotate;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-use crate::pipeline::Pipeline;
-use crate::ref_chain::resolve_ref_chain;
+use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::tokenizer::{Token, TokenType};
+use crate::writer::DecodeLevel;
+use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -185,14 +184,227 @@ struct ObjectRecordingCallbacks {
     objects: Vec<Object>,
 }
 
-impl ParserCallbacks for ObjectRecordingCallbacks {
+struct ExternalizedInlineImage {
+    name: Vec<u8>,
+    dictionary: ObjectHandle,
+    data: Vec<u8>,
+}
+
+struct InlineImageExternalizer {
+    min_size: usize,
+    color_spaces: Option<ObjectHandle>,
+    resource_names: std::collections::BTreeSet<Vec<u8>>,
+    min_suffix: usize,
+    bi_bytes: Vec<u8>,
+    dict_bytes: Vec<u8>,
+    in_inline_image: bool,
+    images: Vec<ExternalizedInlineImage>,
+    unresolved_color_spaces: Vec<Vec<u8>>,
+}
+
+impl InlineImageExternalizer {
+    fn new(
+        min_size: usize,
+        color_spaces: Option<ObjectHandle>,
+        resource_names: std::collections::BTreeSet<Vec<u8>>,
+    ) -> Self {
+        Self {
+            min_size,
+            color_spaces,
+            resource_names,
+            min_suffix: 1,
+            bi_bytes: Vec::new(),
+            dict_bytes: Vec::new(),
+            in_inline_image: false,
+            images: Vec::new(),
+            unresolved_color_spaces: Vec::new(),
+        }
+    }
+
+    fn convert_inline_image_dictionary(
+        &mut self,
+        input: &[u8],
+        image_len: usize,
+    ) -> std::result::Result<ObjectHandle, PipelineError> {
+        let parsed = ObjectHandle::parse(input)
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
+        let Some(entries) = parsed.as_dictionary() else {
+            return Err(PipelineError::runtime(
+                "inline image dictionary did not parse as a dictionary",
+            ));
+        };
+        let result = ObjectHandle::dictionary(Vec::new());
+        result
+            .replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
+        result
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Image".to_vec()))
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
+
+        for (key, value) in entries {
+            let target_key = match key.as_slice() {
+                b"/BPC" => b"/BitsPerComponent".as_slice(),
+                b"/CS" => b"/ColorSpace".as_slice(),
+                b"/D" => b"/Decode".as_slice(),
+                b"/DP" => b"/DecodeParms".as_slice(),
+                b"/F" => b"/Filter".as_slice(),
+                b"/H" => b"/Height".as_slice(),
+                b"/IM" => b"/ImageMask".as_slice(),
+                b"/I" => b"/Interpolate".as_slice(),
+                b"/W" => b"/Width".as_slice(),
+                _ => key.as_slice(),
+            };
+            let value = if target_key == b"/ColorSpace" {
+                self.convert_color_space(value)
+            } else if target_key == b"/Filter" {
+                self.convert_filters(value)
+            } else {
+                value
+            };
+            result
+                .replace_key(target_key, value)
+                .map_err(|error| PipelineError::runtime(error.to_string()))?;
+        }
+        result
+            .replace_key(
+                b"/Length",
+                ObjectHandle::integer(i64::try_from(image_len).unwrap_or(i64::MAX)),
+            )
+            .map_err(|error| PipelineError::runtime(error.to_string()))?;
+        Ok(result)
+    }
+
+    fn convert_color_space(&mut self, value: ObjectHandle) -> ObjectHandle {
+        let Some(name) = value.as_name() else {
+            return value;
+        };
+        let name = name.strip_prefix(b"/").unwrap_or(&name);
+        let builtin = match name {
+            b"G" => Some(b"DeviceGray".as_slice()),
+            b"RGB" => Some(b"DeviceRGB".as_slice()),
+            b"CMYK" => Some(b"DeviceCMYK".as_slice()),
+            b"I" => Some(b"Indexed".as_slice()),
+            _ => None,
+        };
+        if let Some(name) = builtin {
+            return ObjectHandle::name(name.to_vec());
+        }
+        if let Some(color_spaces) = &self.color_spaces {
+            let mut key = b"/".to_vec();
+            key.extend_from_slice(name);
+            if color_spaces.has_key(&key) {
+                return color_spaces.get_key(&key);
+            }
+        }
+        self.unresolved_color_spaces.push(name.to_vec());
+        value
+    }
+
+    fn convert_filters(&self, value: ObjectHandle) -> ObjectHandle {
+        let Some(name) = value.as_name() else {
+            let Some(items) = value.as_array() else {
+                return value;
+            };
+            return ObjectHandle::array(
+                items
+                    .into_iter()
+                    .map(|item| self.convert_filter_name(item))
+                    .collect(),
+            );
+        };
+        self.convert_filter_name(ObjectHandle::name(name))
+    }
+
+    fn convert_filter_name(&self, value: ObjectHandle) -> ObjectHandle {
+        let Some(name) = value.as_name() else {
+            return value;
+        };
+        let name = name.strip_prefix(b"/").unwrap_or(&name);
+        let expanded = match name {
+            b"AHx" => Some(b"ASCIIHexDecode".as_slice()),
+            b"A85" => Some(b"ASCII85Decode".as_slice()),
+            b"LZW" => Some(b"LZWDecode".as_slice()),
+            b"Fl" => Some(b"FlateDecode".as_slice()),
+            b"RL" => Some(b"RunLengthDecode".as_slice()),
+            b"CCF" => Some(b"CCITTFaxDecode".as_slice()),
+            b"DCT" => Some(b"DCTDecode".as_slice()),
+            _ => None,
+        };
+        expanded
+            .map(|name| ObjectHandle::name(name.to_vec()))
+            .unwrap_or(value)
+    }
+
+    fn next_name(&mut self) -> Vec<u8> {
+        loop {
+            let mut name = b"/IIm".to_vec();
+            name.extend_from_slice(self.min_suffix.to_string().as_bytes());
+            self.min_suffix += 1;
+            if self.resource_names.insert(name.clone()) {
+                return name;
+            }
+        }
+    }
+}
+
+impl TokenFilter for InlineImageExternalizer {
+    fn handle_token(
+        &mut self,
+        token: &Token,
+        output: &mut crate::TokenFilterOutput<'_>,
+    ) -> crate::PipelineResult<()> {
+        if self.in_inline_image {
+            if token.token_type == TokenType::InlineImage {
+                if token.value.len() >= self.min_size {
+                    let dict_bytes = self.dict_bytes.clone();
+                    let dictionary =
+                        self.convert_inline_image_dictionary(&dict_bytes, token.value.len())?;
+                    let name = self.next_name();
+                    self.images.push(ExternalizedInlineImage {
+                        name: name.clone(),
+                        dictionary,
+                        data: token.value.clone(),
+                    });
+                    output.write(&name)?;
+                    output.write(b" Do\n")?;
+                } else {
+                    output.write(&self.bi_bytes)?;
+                    output.write_token(token)?;
+                    self.in_inline_image = false;
+                }
+                return Ok(());
+            }
+            if token.is_word_value(b"ID") {
+                self.bi_bytes.extend_from_slice(&token.value);
+                self.dict_bytes.extend_from_slice(b" >>");
+            } else if token.is_word_value(b"EI") {
+                self.in_inline_image = false;
+            } else {
+                self.bi_bytes.extend_from_slice(&token.raw);
+                self.dict_bytes.extend_from_slice(&token.raw);
+            }
+            return Ok(());
+        }
+
+        if token.is_word_value(b"BI") {
+            self.bi_bytes = token.value.clone();
+            self.dict_bytes = b"<< ".to_vec();
+            self.in_inline_image = true;
+        } else {
+            output.write_token(token)?;
+        }
+        Ok(())
+    }
+}
+
+impl ObjectHandleParserCallbacks for ObjectRecordingCallbacks {
     fn handle_object(
         &mut self,
-        object: Object,
+        object: ObjectHandle,
         _offset: usize,
         _length: usize,
     ) -> Result<ParseControl> {
-        self.objects.push(object);
+        self.objects.push(object.materialize()?);
         Ok(ParseControl::Continue)
     }
 
@@ -347,6 +559,226 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.apply_fallback(b"/ArtBox", fallback, copy_if_fallback)
     }
 
+    /// Convert this page into a new, document-owned Form XObject.
+    ///
+    /// The new stream retains a provider over the page's canonical content
+    /// route, so conversion does not eagerly decode or concatenate page bytes.
+    /// `/Resources`, `/Group`, and the effective `/TrimBox` are shallow-copied;
+    /// `/Matrix` is emitted when requested and either `/Rotate` or `/UserUnit`
+    /// is present, matching qpdf's `getFormXObjectForPage`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:740-782`).
+    pub fn get_form_xobject_for_page(
+        &mut self,
+        handle_transformations: bool,
+    ) -> Result<ObjectHandle> {
+        let page = self.resolved_page_handle()?;
+        let form = self.pdf.new_stream()?;
+        let dict = form
+            .as_stream_dict()
+            .ok_or_else(|| Error::Internal("new stream has no dictionary".to_owned()))?;
+        dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+        dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+
+        let resources = self.get_resources(false)?.shallow_copy()?;
+        dict.replace_key(b"/Resources", resources)?;
+        let group = self.get_attribute(b"/Group", false)?.shallow_copy()?;
+        dict.replace_key(b"/Group", group)?;
+        let bbox = self.get_trim_box(false, false)?.shallow_copy()?;
+        if rectangle_from_handle(self.pdf, &bbox)?.is_none() {
+            self.object.warn_if_possible(
+                "bounding box is invalid; form XObject created from page will not work",
+            )?;
+        }
+        dict.replace_key(b"/BBox", bbox)?;
+
+        if handle_transformations {
+            let rotate = self.get_attribute(b"/Rotate", false)?;
+            let user_unit = self.get_attribute(b"/UserUnit", false)?;
+            if !rotate.is_null() || !user_unit.is_null() {
+                let matrix = self.get_matrix_for_transformations(false)?;
+                dict.replace_key(
+                    b"/Matrix",
+                    ObjectHandle::array(
+                        matrix
+                            .get_as_matrix()
+                            .into_iter()
+                            .map(ObjectHandle::real)
+                            .collect(),
+                    ),
+                )?;
+            }
+        }
+
+        form.replace_stream_data_with_callback(
+            move |pipeline| page.pipe_page_contents(pipeline),
+            None,
+            None,
+        )?;
+        self.pdf.mark_object_handle_dirty(&form)?;
+        Ok(form)
+    }
+
+    /// Return qpdf's page/Form transformation matrix, using the effective
+    /// `/TrimBox`, inherited `/Rotate`, and leaf `/UserUnit`.
+    pub fn get_matrix_for_transformations(&mut self, invert: bool) -> Result<Matrix> {
+        let bbox = self.get_trim_box(false, false)?;
+        let Some(rect) = self.rectangle_for_matrix(&bbox)? else {
+            return Ok(Matrix::default());
+        };
+        let rotate_obj = self.get_attribute(b"/Rotate", false)?;
+        let scale_obj = self.get_attribute(b"/UserUnit", false)?;
+        if rotate_obj.is_null() && scale_obj.is_null() {
+            return Ok(Matrix::default());
+        }
+
+        let mut scale = scale_obj
+            .as_integer()
+            .map(|value| value as f64)
+            .or_else(|| scale_obj.as_real())
+            .unwrap_or(1.0);
+        let mut rotate = rotate_obj.as_integer().unwrap_or(0) as i32;
+        if invert {
+            if scale == 0.0 {
+                return Ok(Matrix::default());
+            }
+            scale = 1.0 / scale;
+            rotate = 360 - rotate;
+        }
+        let width = rect.urx - rect.llx;
+        let height = rect.ury - rect.lly;
+        Ok(match rotate {
+            90 => Matrix::new(0.0, -scale, scale, 0.0, 0.0, width * scale),
+            180 => Matrix::new(-scale, 0.0, 0.0, -scale, width * scale, height * scale),
+            270 => Matrix::new(0.0, scale, -scale, 0.0, height * scale, 0.0),
+            _ => Matrix::new(scale, 0.0, 0.0, scale, 0.0, 0.0),
+        })
+    }
+
+    /// Compute the qpdf placement matrix for `form` inside `rect`.
+    ///
+    /// Form `/BBox` and `/Matrix` are read from live canonical handles; the
+    /// destination inverse transformation comes from this page helper. A
+    /// malformed or degenerate Form returns `Ok(None)`, matching qpdf's empty
+    /// `QPDFMatrix` result from `getMatrixForFormXObjectPlacement`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:764-838`).
+    pub fn get_matrix_for_form_xobject_placement(
+        &mut self,
+        form: ObjectHandle,
+        rect: Rectangle,
+        invert_transformations: bool,
+        allow_shrink: bool,
+        allow_expand: bool,
+    ) -> Result<Option<Matrix>> {
+        self.pdf.resolve_object_handle(&form)?;
+        let form_dict = if form.is_form_xobject()? {
+            form.as_stream_dict().ok_or_else(|| {
+                Error::Unsupported("Form XObject has no stream dictionary".to_owned())
+            })?
+        } else {
+            return Ok(None);
+        };
+        let bbox = self
+            .pdf
+            .resolve_object_handle_to_terminal(&form_dict.try_get_key(b"/BBox")?)?;
+        let Some(bbox) = rectangle_from_handle(self.pdf, &bbox)? else {
+            return Ok(None);
+        };
+        let form_matrix = self
+            .pdf
+            .resolve_object_handle_to_terminal(&form_dict.try_get_key(b"/Matrix")?)?;
+        let form_matrix = matrix_from_handle(self.pdf, &form_matrix)?.unwrap_or_default();
+        let transform = self.get_matrix_for_transformations(invert_transformations)?;
+
+        let mut work = Matrix::default();
+        work.concat(transform);
+        work.concat(form_matrix);
+        let transformed = work.transform_rectangle(bbox);
+        if transformed.urx == transformed.llx || transformed.ury == transformed.lly {
+            return Ok(None);
+        }
+
+        let rect_w = rect.urx - rect.llx;
+        let rect_h = rect.ury - rect.lly;
+        let xscale = rect_w / (transformed.urx - transformed.llx);
+        let yscale = rect_h / (transformed.ury - transformed.lly);
+        let mut scale = xscale.min(yscale);
+        if scale > 1.0 {
+            if !allow_expand {
+                scale = 1.0;
+            }
+        } else if scale < 1.0 && !allow_shrink {
+            scale = 1.0;
+        }
+
+        work = Matrix::default();
+        work.scale(scale, scale);
+        work.concat(transform);
+        work.concat(form_matrix);
+        let transformed = work.transform_rectangle(bbox);
+        let tx = (rect.llx + rect.urx) / 2.0 - (transformed.llx + transformed.urx) / 2.0;
+        let ty = (rect.lly + rect.ury) / 2.0 - (transformed.lly + transformed.ury) / 2.0;
+        let mut result = Matrix::default();
+        result.translate(tx, ty);
+        result.scale(scale, scale);
+        result.concat(transform);
+        Ok(Some(result))
+    }
+
+    /// Build qpdf's `placeFormXObject` content fragment and return the matrix
+    /// used to place the Form. `name` is the complete PDF resource name,
+    /// including its leading slash. A malformed or degenerate Form uses
+    /// qpdf's identity-matrix fallback.
+    pub fn place_form_xobject(
+        &mut self,
+        form: ObjectHandle,
+        name: &str,
+        rect: Rectangle,
+        invert_transformations: bool,
+        allow_shrink: bool,
+        allow_expand: bool,
+    ) -> Result<(String, Matrix)> {
+        let matrix = self
+            .get_matrix_for_form_xobject_placement(
+                form,
+                rect,
+                invert_transformations,
+                allow_shrink,
+                allow_expand,
+            )?
+            .unwrap_or_default();
+        let fragment = format!("q\n{} cm\n{} Do\nQ\n", matrix.unparse(), name);
+        Ok((fragment, matrix))
+    }
+
+    /// Variant of [`Self::place_form_xobject`] that writes the placement
+    /// matrix into the caller's slot, matching qpdf's overload that accepts a
+    /// `QPDFMatrix&`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors qpdf's placeFormXObject overload and keeps placement flags explicit"
+    )]
+    pub fn place_form_xobject_with_matrix(
+        &mut self,
+        form: ObjectHandle,
+        name: &str,
+        rect: Rectangle,
+        matrix: &mut Matrix,
+        invert_transformations: bool,
+        allow_shrink: bool,
+        allow_expand: bool,
+    ) -> Result<String> {
+        let (fragment, computed) = self.place_form_xobject(
+            form,
+            name,
+            rect,
+            invert_transformations,
+            allow_shrink,
+            allow_expand,
+        )?;
+        *matrix = computed;
+        Ok(fragment)
+    }
+
     fn apply_fallback(
         &mut self,
         key: &[u8],
@@ -388,7 +820,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Aggregates the page's `/Contents` entry (single stream or array), decodes
     /// each stream through its filter pipeline (same as
     /// [`crate::pages::page_content_bytes`]), then parses the concatenated bytes
-    /// through [`parse_content_stream_data`].
+    /// through [`crate::content_stream::parse_content_stream_data`].
     ///
     /// Returns an empty `Vec` when the page has no `/Contents`.
     ///
@@ -397,7 +829,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
     ///   `/Type /Page` dictionary, or when a `/Contents` element is not a stream.
     /// - Any error from [`crate::pages::page_content_bytes`] or
-    ///   [`parse_content_stream_data`].
+    ///   [`crate::content_stream::parse_content_stream_data`].
     ///
     /// # Examples
     ///
@@ -416,11 +848,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn content_stream_objects(&mut self) -> Result<Vec<Object>> {
-        self.ensure_leaf_page()?;
-        let page_ref = self.require_page_ref()?;
-        let raw = crate::pages::page_content_bytes(self.pdf, page_ref)?;
         let mut callbacks = ObjectRecordingCallbacks::default();
-        parse_content_stream_data(&raw, &mut callbacks)?;
+        self.parse_contents(&mut callbacks)?;
         Ok(callbacks.objects)
     }
 
@@ -431,8 +860,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// each stream's identity and lazy provider instead of decoding it into a
     /// byte buffer or legacy [`Object`] value.
     pub fn get_page_contents(&mut self) -> Result<Vec<ObjectHandle>> {
-        let page = self.resolved_page_handle()?;
-        page.get_page_contents()
+        let (target, _) = self.resolved_attribute_target()?;
+        target.get_page_contents()
     }
 
     /// Add a canonical stream to the beginning or end of `/Contents`.
@@ -440,9 +869,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Mirrors `QPDFPageObjectHelper::addPageContents`
     /// (`libqpdf/QPDFPageObjectHelper.cc:449-452`).
     pub fn add_page_contents(&mut self, contents: ObjectHandle, first: bool) -> Result<()> {
-        let page = self.resolved_page_handle()?;
-        page.add_page_contents(contents, first)?;
-        self.pdf.mark_object_handle_dirty(&page)
+        let (target, _) = self.resolved_attribute_target()?;
+        target.add_page_contents(contents, first)?;
+        self.pdf.mark_object_handle_dirty(&target)
     }
 
     /// Rotate the page in the live object graph.
@@ -450,16 +879,35 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Mirrors `QPDFPageObjectHelper::rotatePage`
     /// (`libqpdf/QPDFPageObjectHelper.cc:455-458`).
     pub fn rotate_page(&mut self, angle: i32, relative: bool) -> Result<()> {
-        let page = self.resolved_page_handle()?;
-        page.rotate_page(angle, relative)?;
-        self.pdf.mark_object_handle_dirty(&page)
+        let (target, _) = self.resolved_attribute_target()?;
+        target.rotate_page(angle, relative)?;
+        self.pdf.mark_object_handle_dirty(&target)
     }
 
     /// Coalesce the page's content streams into one lazy provider-backed stream.
     pub fn coalesce_content_streams(&mut self) -> Result<()> {
+        let (target, _) = self.resolved_attribute_target()?;
+        target.coalesce_content_streams()?;
+        self.pdf.mark_object_handle_dirty(&target)
+    }
+
+    /// Return a new indirect page whose dictionary is a qpdf-style shallow
+    /// copy of this page.
+    ///
+    /// Direct child dictionaries/arrays are copied while indirect content and
+    /// resource objects retain their identity, matching
+    /// `QPDFPageObjectHelper::shallowCopyPage`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:654-662`). The copy is not inserted
+    /// into the page tree; callers may add it through the document helper.
+    pub fn shallow_copy_page(&mut self) -> Result<ObjectHandle> {
         let page = self.resolved_page_handle()?;
-        page.coalesce_content_streams()?;
-        self.pdf.mark_object_handle_dirty(&page)
+        if page.is_direct() {
+            return Err(Error::Internal(
+                "shallowCopyPage called with a direct object".to_owned(),
+            ));
+        }
+        let copy = page.shallow_copy()?;
+        self.pdf.make_indirect_object_handle(copy)
     }
 
     /// Parse the page contents through canonical ObjectHandle parser callbacks.
@@ -467,8 +915,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         &mut self,
         callbacks: &mut C,
     ) -> Result<()> {
-        let page = self.resolved_page_handle()?;
-        page.parse_page_contents(callbacks)
+        self.parse_contents(callbacks)
     }
 
     /// qpdf's old name for [`Self::parse_page_contents`].
@@ -476,7 +923,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         &mut self,
         callbacks: &mut C,
     ) -> Result<()> {
-        self.parse_page_contents(callbacks)
+        let (target, is_form) = self.resolved_attribute_target()?;
+        if is_form {
+            target.parse_as_contents(callbacks)
+        } else {
+            target.parse_page_contents(callbacks)
+        }
     }
 
     /// Apply a lexical token filter to decoded page contents.
@@ -485,8 +937,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         filter: &'b mut dyn TokenFilter,
         next: Option<&'b mut dyn Pipeline>,
     ) -> Result<()> {
-        let page = self.resolved_page_handle()?;
-        page.filter_page_contents(filter, next)
+        self.filter_contents(filter, next)
     }
 
     /// qpdf's old name for [`Self::filter_page_contents`].
@@ -495,25 +946,100 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         filter: &'b mut dyn TokenFilter,
         next: Option<&'b mut dyn Pipeline>,
     ) -> Result<()> {
-        self.filter_page_contents(filter, next)
+        let (target, is_form) = self.resolved_attribute_target()?;
+        if is_form {
+            target.filter_as_contents(filter, next)
+        } else {
+            target.filter_page_contents(filter, next)
+        }
     }
 
     /// Pipe decoded page contents into a pipeline.
     pub fn pipe_page_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {
-        let page = self.resolved_page_handle()?;
-        page.pipe_page_contents(pipeline)
+        self.pipe_contents(pipeline)
     }
 
     /// qpdf's old name for [`Self::pipe_page_contents`].
     pub fn pipe_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {
-        self.pipe_page_contents(pipeline)
+        let (target, is_form) = self.resolved_attribute_target()?;
+        if is_form {
+            let mut filtering_attempted = false;
+            let succeeded = target.pipe_stream_data(
+                pipeline,
+                &mut filtering_attempted,
+                0,
+                DecodeLevel::Specialized,
+                false,
+                false,
+            )?;
+            if succeeded {
+                Ok(())
+            } else {
+                Err(Error::Unsupported(format!(
+                    "object {}: errors while decoding content stream",
+                    object_handle_description(&target)
+                )))
+            }
+        } else {
+            target.pipe_page_contents(pipeline)
+        }
     }
 
     /// Attach a lazy token filter to the page's content stream.
     pub fn add_content_token_filter(&mut self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
-        let page = self.resolved_page_handle()?;
-        page.add_content_token_filter(filter)?;
-        self.pdf.mark_object_handle_dirty(&page)
+        let (target, is_form) = self.resolved_attribute_target()?;
+        if is_form {
+            target.add_token_filter(filter)?;
+        } else {
+            target.add_content_token_filter(filter)?;
+        }
+        self.pdf.mark_object_handle_dirty(&target)
+    }
+
+    /// Remove unused `/Font` and `/XObject` entries from this page or Form's
+    /// resource scope through the canonical ObjectHandle parser route.
+    ///
+    /// This is qpdf's `removeUnreferencedResources`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:539-649`). The document-level
+    /// `PageDocumentHelper` facade uses this same per-target operation.
+    pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
+        let (target, is_form) = self.resolved_attribute_target()?;
+        if is_form {
+            crate::resources::remove_unreferenced_resources_on_form(self.pdf, target)
+        } else {
+            let page_ref = self.require_page_ref()?;
+            crate::resources::remove_unreferenced_resources_on_page(self.pdf, page_ref)
+        }
+    }
+
+    /// Convert inline images into ordinary Image XObjects.
+    ///
+    /// This mirrors qpdf's `externalizeInlineImages` implementation
+    /// (`libqpdf/QPDFPageObjectHelper.cc:398-437`). The content is filtered
+    /// through the canonical page/Form pipeline, while image streams are
+    /// allocated and attached after filtering so the callback never needs a
+    /// second mutable borrow of the document. With `shallow == false`, nested
+    /// Form XObjects are processed in the same bounded traversal as qpdf;
+    /// `true` limits the operation to this target.
+    pub fn externalize_inline_images(&mut self, min_size: usize, shallow: bool) -> Result<()> {
+        let target = self.object.clone();
+        let description = self.target_description();
+        let mut nested_forms = Vec::new();
+        if !shallow {
+            self.for_each_form_xobject(true, |object, _, _| {
+                nested_forms.push(object);
+                Ok(())
+            })?;
+        }
+
+        externalize_inline_images_for_target(self.pdf, target, &description, min_size)?;
+        if !shallow {
+            for form in nested_forms {
+                let description = object_handle_description(&form);
+                externalize_inline_images_for_target(self.pdf, form, &description, min_size)?;
+            }
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -551,6 +1077,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     {
         let root = self.resolved_attribute_target()?.0;
         let mut queue = VecDeque::from([root]);
+        #[allow(
+            clippy::mutable_key_type,
+            reason = "qpdf traversal identity intentionally keys on canonical handle identity"
+        )]
         let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
 
         while let Some(node) = queue.pop_front() {
@@ -773,63 +1303,86 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
-        self.ensure_leaf_page()?;
+        let page = self.resolved_page_handle()?;
         let page_ref = self.require_page_ref()?;
-        let page_obj = self.pdf.resolve_borrowed(page_ref)?;
-        let Object::Dictionary(page_dict) = page_obj else {
+        let annots = self
+            .pdf
+            .resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+        if annots.is_null() {
+            return Ok(Vec::new());
+        }
+        let Some(annots_array) = annots.as_array() else {
             return Err(Error::Unsupported(format!(
-                "object {} is not a dictionary, cannot read /Annots",
-                page_ref
+                "/Annots on page {page_ref} does not resolve to an array"
             )));
         };
 
-        let annots_val = match page_dict.get("Annots").cloned() {
-            None => return Ok(Vec::new()),
-            Some(Object::Null) => return Ok(Vec::new()),
-            Some(v) => v,
-        };
-
-        // /Annots may be a direct array or an indirect reference to an array.
-        let annots_array = match annots_val {
-            Object::Array(arr) => arr,
-            Object::Reference(r) => {
-                // /Annots may be stored behind a holder chain (ref -> ref ->
-                // array); follow the chain to its terminal rather than a single
-                // hop, then move the owned array out.
-                let (terminal, _) = resolve_ref_chain(self.pdf, &Object::Reference(r))?;
-                match terminal {
-                    Object::Array(arr) => arr,
-                    _ => {
-                        return Err(Error::Unsupported(format!(
-                            "/Annots reference {r} on page {} does not resolve to an array",
-                            page_ref
-                        )));
-                    }
-                }
-            }
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "/Annots on page {} has unexpected type {}",
-                    page_ref,
-                    object_type_name(&other)
-                )));
-            }
-        };
-
         let mut refs = Vec::with_capacity(annots_array.len());
-        for (i, elem) in annots_array.iter().enumerate() {
-            match elem {
-                Object::Reference(r) => refs.push(*r),
-                other => {
-                    return Err(Error::Unsupported(format!(
-                        "/Annots element {i} on page {} has type {} (expected reference)",
-                        page_ref,
-                        object_type_name(other)
-                    )));
-                }
-            }
+        for (index, elem) in annots_array.iter().enumerate() {
+            let Some(object_ref) = elem.object_ref() else {
+                return Err(Error::Unsupported(format!(
+                    "/Annots element {index} on page {page_ref} is not an indirect reference"
+                )));
+            };
+            refs.push(object_ref);
         }
         Ok(refs)
+    }
+
+    /// Return canonical annotation handles, optionally restricted to a
+    /// `/Subtype` name, mirroring qpdf's fail-soft
+    /// `QPDFPageObjectHelper::getAnnotations`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:439-454`). A missing, null, or
+    /// non-array `/Annots` value yields an empty result; non-dictionary array
+    /// members are skipped. Direct annotation dictionaries are preserved in
+    /// this handle-native method even though [`Self::get_annotations`] retains
+    /// its historical indirect-reference contract.
+    pub fn get_annotation_handles(
+        &mut self,
+        only_subtype: Option<&[u8]>,
+    ) -> Result<Vec<ObjectHandle>> {
+        let page = self.resolved_page_handle()?;
+        let annots = self
+            .pdf
+            .resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+        let Some(annots_array) = annots.as_array() else {
+            return Ok(Vec::new());
+        };
+        let only_subtype = only_subtype
+            .map(|value| value.strip_prefix(b"/").unwrap_or(value))
+            .filter(|value| !value.is_empty());
+        let mut result = Vec::with_capacity(annots_array.len());
+        for item in annots_array {
+            let annotation = self.pdf.resolve_object_handle_to_terminal(&item)?;
+            if annotation.as_dictionary().is_none() {
+                continue;
+            }
+            if let Some(expected) = only_subtype {
+                let subtype = self
+                    .pdf
+                    .resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Subtype")?)?;
+                if subtype.as_name().as_deref() != Some(expected) {
+                    continue;
+                }
+            }
+            result.push(item);
+        }
+        Ok(result)
+    }
+
+    /// Return indirect annotation references using qpdf's filtered,
+    /// fail-soft enumeration boundary. This is the canonical consumer API for
+    /// ref-based helpers such as `AnnotationObjectHelper`; direct annotation
+    /// dictionaries remain available through [`Self::get_annotation_handles`].
+    pub fn get_annotations_filtered(
+        &mut self,
+        only_subtype: Option<&[u8]>,
+    ) -> Result<Vec<ObjectRef>> {
+        Ok(self
+            .get_annotation_handles(only_subtype)?
+            .into_iter()
+            .filter_map(|annotation| annotation.object_ref())
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1033,17 +1586,220 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             coords[0], coords[1], coords[2], coords[3],
         )))
     }
+
+    fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<PageBox>> {
+        self.pdf.resolve_object_handle(value)?;
+        let Some(items) = value.as_array() else {
+            return Ok(None);
+        };
+        if items.len() != 4 {
+            return Ok(None);
+        }
+        let mut coords = [0.0f64; 4];
+        for (index, item) in items.into_iter().take(4).enumerate() {
+            self.pdf.resolve_object_handle(&item)?;
+            let Some(number) = item
+                .as_integer()
+                .map(|value| value as f64)
+                .or_else(|| item.as_real())
+            else {
+                return Ok(None);
+            };
+            coords[index] = number;
+        }
+        Ok(Some(PageBox::new(
+            coords[0].min(coords[2]),
+            coords[1].min(coords[3]),
+            coords[0].max(coords[2]),
+            coords[1].max(coords[3]),
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Private free functions
 // ---------------------------------------------------------------------------
 
+fn collect_resource_names<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: &ObjectHandle,
+) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    let mut result = std::collections::BTreeSet::new();
+    let resources = pdf.resolve_object_handle_to_terminal(resources)?;
+    let Some(entries) = resources.as_dictionary() else {
+        return Ok(result);
+    };
+    for value in entries.into_values() {
+        let value = pdf.resolve_object_handle_to_terminal(&value)?;
+        if let Some(entries) = value.as_dictionary() {
+            result.extend(entries.into_keys());
+        }
+    }
+    Ok(result)
+}
+
+fn resolve_resource_dictionary<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: &ObjectHandle,
+    key: &[u8],
+) -> Result<Option<ObjectHandle>> {
+    let value = resources.get_key(key);
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    Ok(value.as_dictionary().map(|_| value))
+}
+
+fn externalize_inline_images_for_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: ObjectHandle,
+    description: &str,
+    min_size: usize,
+) -> Result<()> {
+    let (target, is_form) = resolve_attribute_target(pdf, object, description)?;
+    let resources =
+        get_attribute_for_target(pdf, target.clone(), b"/Resources", true, description)?;
+
+    // qpdf uses mergeResources to make /XObject direct and private before the
+    // filter runs. This is a no-op when /Resources is absent or malformed,
+    // preserving qpdf's warning/no-resource boundary for those documents.
+    let existing_xobjects = resources.get_key(b"/XObject");
+    pdf.resolve_object_handle(&existing_xobjects)?;
+    let empty_xobjects = ObjectHandle::dictionary(Vec::new());
+    let seed = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), empty_xobjects)]);
+    resources.merge_resources(&seed, None)?;
+    pdf.mark_object_handle_dirty(&resources)?;
+
+    let resource_names = collect_resource_names(pdf, &resources)?;
+    let color_spaces = resolve_resource_dictionary(pdf, &resources, b"/ColorSpace")?;
+    let mut filter = InlineImageExternalizer::new(min_size, color_spaces, resource_names);
+    let mut rewritten = Vec::new();
+    {
+        let mut helper = PageObjectHelper::from_object_handle(target.clone(), pdf);
+        let mut sink = PlString::new("externalized inline image content", None, &mut rewritten);
+        // qpdf catches filter/parser failures here, warns, and leaves the
+        // original content untouched. The Rust Result boundary is retained
+        // for setup/mutation errors; an unsuccessful filter is the same
+        // warning-only no-op rather than a partially rewritten page.
+        let filter_result = helper.filter_contents(&mut filter, Some(&mut sink));
+        if let Err(error) = filter_result {
+            for name in filter.unresolved_color_spaces.drain(..) {
+                resources.warn_if_possible(&format!(
+                    "unable to resolve colorspace /{}",
+                    String::from_utf8_lossy(&name)
+                ))?;
+            }
+            target.warn_if_possible(&format!(
+                "Unable to filter content stream: {error}; not attempting to externalize inline images from this stream"
+            ))?;
+            return Ok(());
+        }
+    }
+    for name in filter.unresolved_color_spaces.drain(..) {
+        resources.warn_if_possible(&format!(
+            "unable to resolve colorspace /{}",
+            String::from_utf8_lossy(&name)
+        ))?;
+    }
+    if filter.images.is_empty() {
+        return Ok(());
+    }
+
+    let xobjects = resources.get_key(b"/XObject");
+    pdf.resolve_object_handle(&xobjects)?;
+    if xobjects.as_dictionary().is_some() {
+        for image in filter.images {
+            let stream = pdf.new_stream_with_data(Rc::new(image.data))?;
+            let stream_dict = stream.as_stream_dict().ok_or_else(|| {
+                Error::Internal("new inline image stream has no dictionary".to_owned())
+            })?;
+            if let Some(entries) = image.dictionary.as_dictionary() {
+                for (key, value) in entries {
+                    stream_dict.replace_key(&key, value)?;
+                }
+            }
+            pdf.mark_object_handle_dirty(&stream)?;
+            xobjects.replace_key(&image.name, stream)?;
+        }
+        pdf.mark_object_handle_dirty(&xobjects)?;
+    }
+
+    if is_form {
+        target.replace_stream_data(
+            Rc::new(rewritten),
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        );
+    } else {
+        let contents = pdf.new_stream_with_data(Rc::new(rewritten))?;
+        target.replace_key(b"/Contents", contents)?;
+    }
+    pdf.mark_object_handle_dirty(&target)
+}
+
 fn object_handle_description(object: &ObjectHandle) -> String {
     object
         .object_ref()
         .map(|object_ref| object_ref.to_string())
         .unwrap_or_else(|| "direct object".to_owned())
+}
+
+fn rectangle_from_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+) -> Result<Option<Rectangle>> {
+    pdf.resolve_object_handle(handle)?;
+    let Some(items) = handle.as_array() else {
+        return Ok(None);
+    };
+    if items.len() != 4 {
+        return Ok(None);
+    }
+    let mut values = [0.0f64; 4];
+    for (index, item) in items.into_iter().enumerate() {
+        pdf.resolve_object_handle(&item)?;
+        let Some(value) = item
+            .as_integer()
+            .map(|value| value as f64)
+            .or_else(|| item.as_real())
+        else {
+            return Ok(None);
+        };
+        values[index] = value;
+    }
+    Ok(Some(Rectangle::new(
+        values[0].min(values[2]),
+        values[1].min(values[3]),
+        values[0].max(values[2]),
+        values[1].max(values[3]),
+    )))
+}
+
+fn matrix_from_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+) -> Result<Option<Matrix>> {
+    pdf.resolve_object_handle(handle)?;
+    let Some(items) = handle.as_array() else {
+        return Ok(None);
+    };
+    if items.len() != 6 {
+        return Ok(None);
+    }
+    let mut values = [0.0f64; 6];
+    for (index, item) in items.into_iter().enumerate() {
+        pdf.resolve_object_handle(&item)?;
+        let Some(value) = item
+            .as_integer()
+            .map(|value| value as f64)
+            .or_else(|| item.as_real())
+        else {
+            return Ok(None);
+        };
+        values[index] = value;
+    }
+    Ok(Some(Matrix::from(values)))
 }
 
 fn resolve_attribute_target<R: Read + Seek>(
@@ -1100,6 +1856,10 @@ fn get_attribute_for_target<R: Read + Seek>(
 
     if result.is_null() && inheritable {
         let mut node = dict.clone();
+        #[allow(
+            clippy::mutable_key_type,
+            reason = "page-tree cycle detection intentionally keys on canonical handle identity"
+        )]
         let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
         let mut depth = 0usize;
         loop {
