@@ -304,19 +304,23 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     }
 
     /// Return the live catalog `/PageLabels` value from the canonical handle
-    /// graph. A present direct-null value is retained as a handle so the
-    /// qpdf-shaped helper can distinguish key presence from an absent key;
-    /// the number-tree view treats that root as empty when it is queried.
+    /// graph. Values that resolve to null are absent, matching qpdf's
+    /// `QPDF_Dictionary::hasKey` visibility rule.
     fn pagelabels_root_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None);
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         let catalog = self.pdf.resolve_object_handle_to_terminal(&catalog)?;
-        let Some(dictionary) = catalog.try_as_dictionary()? else {
+        if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
-        };
-        Ok(dictionary.get(b"/PageLabels".as_slice()).cloned())
+        }
+        // qpdf's QPDF_Dictionary::hasKey hides values that are null, including
+        // an indirect reference that resolves to null (QPDF_Dictionary.cc:98-101).
+        if !catalog.try_has_key(b"/PageLabels")? {
+            return Ok(None);
+        }
+        Ok(Some(catalog.try_get_key(b"/PageLabels")?))
     }
 
     fn pagelabels_tree(&mut self) -> Result<Option<crate::nntree::HandleNumberTree>> {
@@ -1087,6 +1091,20 @@ mod tests {
         pdf
     }
 
+    fn pdf_with_catalog_pagelabels(value: Object) -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = bare_one_page_pdf();
+        let catalog_ref = pdf.root_ref().unwrap();
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        catalog.insert("PageLabels", value);
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        pdf
+    }
+
     fn label_dict(style: &str, st: Option<i64>, prefix: Option<&str>) -> Object {
         let mut d = Dictionary::new();
         d.insert("S", Object::Name(style.into()));
@@ -1485,6 +1503,30 @@ mod tests {
         assert_eq!(h.label_string_for_page(0).unwrap(), "1");
         assert_eq!(h.label_string_for_page(4).unwrap(), "5");
         assert!(h.label_for_page(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn direct_null_page_labels_key_is_absent() {
+        let mut pdf = pdf_with_catalog_pagelabels(Object::Null);
+        let mut helper = pdf.page_labels();
+
+        assert!(!helper.has_page_labels().unwrap());
+        assert!(helper.get_label_for_page(0).unwrap().is_none());
+        assert_eq!(helper.label_string_for_page(0).unwrap(), "1");
+        assert!(helper.ranges().unwrap().is_empty());
+    }
+
+    #[test]
+    fn indirect_null_page_labels_key_is_absent() {
+        let null_ref = ObjectRef::new(10, 0);
+        let mut pdf = pdf_with_catalog_pagelabels(Object::Reference(null_ref));
+        pdf.set_object(null_ref, Object::Null);
+        let mut helper = pdf.page_labels();
+
+        assert!(!helper.has_page_labels().unwrap());
+        assert!(helper.get_label_for_page(0).unwrap().is_none());
+        assert_eq!(helper.label_string_for_page(0).unwrap(), "1");
+        assert!(helper.ranges().unwrap().is_empty());
     }
 
     #[test]
