@@ -88,10 +88,10 @@ fn test_56_59_body<R: Read + Seek>(
     // GAP(QPDFPageObjectHelper::getFormXObjectForPage / QPDFObjectHandle::getAttribute /
     // QPDFPageObjectHelper::placeFormXObject): the per-page loop's first statement
     // (test_driver.cc:2095-2107) needs the page-to-Form-XObject conversion (mirrored by
-    // `flpdf::page_form_xobject::page_to_form_xobject`, `page_form_xobject.rs:72`), the
+    // `flpdf::page_form_xobject::get_form_xobject_for_page`, `page_form_xobject.rs:72`), the
     // inheritable-attribute lookup-with-create-if-missing used for `ph1.getAttribute("/Resources",
     // true)`, and the content-fragment placement helper (mirrored by `flpdf::overlay::place_form_xobject`,
-    // `overlay.rs:141`). `page_to_form_xobject` is `pub(crate)` and `place_form_xobject` is not
+    // `overlay.rs:141`). `get_form_xobject_for_page` is `pub(crate)` and `place_form_xobject` is not
     // even `pub(crate)`-reachable outside `overlay.rs`; no `getAttribute`-with-create equivalent
     // exists at any visibility. None of the three is exposed to this separate crate, so no
     // iteration of the loop can be attempted, and the `QPDFWriter` write of `a.pdf` at the end of

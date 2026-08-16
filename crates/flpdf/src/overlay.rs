@@ -4,7 +4,7 @@
 //! (qpdf 11.9.0).
 //!
 //! Each destination page that receives at least one overlay or underlay is
-//! rewritten as follows (see [`page_to_form_xobject`](crate::page_form_xobject)):
+//! rewritten as follows (see [`get_form_xobject_for_page`](crate::page_form_xobject)):
 //!
 //! 1. The destination page itself becomes a Form XObject named `/Fx0`.
 //! 2. Each source (underlay or overlay) is a Form XObject already imported into
@@ -27,7 +27,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::page_form_xobject::{page_to_form_xobject, read_page_transform, transformation_matrix};
+use crate::page_form_xobject::{
+    get_form_xobject_for_page, get_matrix_for_transformations, read_page_transform,
+};
 use crate::page_object_helper::{PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
@@ -73,7 +75,7 @@ pub(crate) struct OverlaySource {
 ///
 /// Returns `None` when the matrix-transformed `/BBox` is degenerate (zero width
 /// or height); the caller substitutes the identity, matching qpdf's `{}`.
-fn matrix_for_form_xobject_placement(
+fn get_matrix_for_form_xobject_placement(
     fo_bbox: Rectangle,
     fo_matrix: Matrix,
     rect: Rectangle,
@@ -147,7 +149,7 @@ fn place_form_xobject(
     allow_expand: bool,
     name: &str,
 ) -> (String, Matrix) {
-    let cm = matrix_for_form_xobject_placement(
+    let cm = get_matrix_for_form_xobject_placement(
         fo_bbox,
         fo_matrix,
         rect,
@@ -225,7 +227,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // qpdf's getMatrixForTransformations reads the box through getArrayAsRectangle
     // (libqpdf/QPDFPageObjectHelper.cc), so the width/height are the normalized
     // (non-negative) extents. These dims feed ONLY the tmatrix translation column
-    // (transformation_matrix puts width*scale/height*scale in positions e/f, never
+    // (get_matrix_for_transformations puts width*scale/height*scale in positions e/f, never
     // the a/b/c/d rotation part), and the placement centring (tx = r_cx - t_cx)
     // absorbs that translation -- so for a reversed box this normalization is an
     // output no-op that no byte-gate can isolate. It is kept to reproduce qpdf's
@@ -234,10 +236,10 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let normalized_trim = normalize_rectangle(trim_box);
     let trim_w = normalized_trim.urx - normalized_trim.llx;
     let trim_h = normalized_trim.ury - normalized_trim.lly;
-    let tmatrix = transformation_matrix(&dest_transform, trim_w, trim_h, true);
+    let tmatrix = get_matrix_for_transformations(&dest_transform, trim_w, trim_h, true);
 
     // 1. Convert the destination page itself to Form XObject /Fx0.
-    let fx0_ref = page_to_form_xobject(dest, dest_page_ref)?;
+    let fx0_ref = get_form_xobject_for_page(dest, dest_page_ref)?;
 
     // 2. Name the sources /Fx1.. in underlays-then-overlays order and build the
     //    new page /Resources /XObject mapping. /Fx0 is the page; the unique-name
@@ -485,7 +487,7 @@ where
     let mut surveys: Vec<Option<crate::overlay_annotations::AnnotationSurvey>> =
         Vec::with_capacity(source_refs.len());
     for &page_ref in &source_refs {
-        let xobject_ref = crate::page_form_xobject::page_to_form_xobject(source, page_ref)?;
+        let xobject_ref = crate::page_form_xobject::get_form_xobject_for_page(source, page_ref)?;
         // cov:ignore-start: `)?)` propagates xobject_object_closure error —
         // defensive on parser/resolver failure that no shipped fixture reaches.
         union.extend(crate::page_form_xobject::xobject_object_closure(
@@ -924,7 +926,7 @@ fn as_f64(o: &Object) -> f64 {
 
 /// Read a Form XObject dictionary's `/Matrix` as `[a b c d e f]`, defaulting to
 /// the identity when `/Matrix` is absent or not a 6+ element array. The Form
-/// XObjects built by [`page_to_form_xobject`] always carry a direct `/Matrix`
+/// XObjects built by [`get_form_xobject_for_page`] always carry a direct `/Matrix`
 /// array, so no indirect-reference resolution is needed here.
 fn matrix_or_identity(dict: &Dictionary) -> Matrix {
     match dict.get("Matrix").and_then(Object::as_array) {
