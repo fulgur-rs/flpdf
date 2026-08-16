@@ -8482,6 +8482,18 @@ mod tests {
             .parse_object_stream_entry_from_handle(&out_of_bounds, 7)
             .is_err());
 
+        let malformed_header =
+            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"not-an-integer 0".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&malformed_header, 7)
+            .is_err());
+
+        let too_large_object_number =
+            ObjectHandle::stream(direct_dict, Rc::new(b"4294967296 0".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&too_large_object_number, 7)
+            .is_err());
+
         let invalid_filter_dict = ObjectHandle::dictionary(vec![
             (b"N".to_vec(), ObjectHandle::integer(1)),
             (b"First".to_vec(), ObjectHandle::integer(4)),
@@ -8527,6 +8539,24 @@ mod tests {
         let negative_count =
             ObjectHandle::dictionary(vec![(b"N".to_vec(), ObjectHandle::integer(-1))]);
         assert!(object_stream_integer_from_handle(&negative_count, b"/N", "/N").is_err());
+    }
+
+    #[test]
+    fn compressed_resolution_rejects_a_stale_source_xref() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let object_ref = ObjectRef::new(7, 0);
+        pdf.cache.set_compressed(object_ref, 4, 0);
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: 5,
+                index: 0,
+            },
+        );
+
+        assert!(!pdf
+            .resolve_compressed_entry(object_ref, 4, 0)
+            .expect("stale source must be treated as unresolved"));
     }
 
     #[test]

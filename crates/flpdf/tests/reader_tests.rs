@@ -2507,6 +2507,7 @@ fn qpdf_show_object(fixture: &[u8], object_number: u32) -> Option<String> {
     let input = directory.path().join("fixture.pdf");
     std::fs::write(&input, fixture).expect("write qpdf differential fixture");
     let output = Command::new("qpdf")
+        .arg("--warning-exit-0")
         .arg(format!("--show-object={object_number}"))
         .arg(&input)
         .output()
