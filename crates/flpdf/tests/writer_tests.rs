@@ -9,6 +9,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::io::{BufReader, Cursor};
 
+#[path = "common/ascii85.rs"]
+mod ascii85;
 mod common;
 use common::{
     write_default, write_qdf_output, write_with_settings, write_with_settings_and_mapping,
@@ -2221,14 +2223,11 @@ fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
     let raw_data = b"Hello from multi-filter stream!".repeat(20);
     // Build stored = ASCII85(Flate(raw)):
     //   Step 1: FlateDecode encode raw → flated
-    //   Step 2: ASCII85Decode encode flated → a85
+    //   Step 2: test-only ASCII85 wrap flated → a85
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
     let flated = filters::encode_stream_data(&flate_dict, &raw_data).unwrap();
-
-    let mut a85_dict = Dictionary::new();
-    a85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
-    let a85 = filters::encode_stream_data(&a85_dict, &flated).unwrap();
+    let a85 = ascii85::fixture_bytes(&flated);
 
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::<usize>::new();

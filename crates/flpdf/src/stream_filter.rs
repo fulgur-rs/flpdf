@@ -46,7 +46,7 @@
 //! other key, which is why a `Crypt` stage keeps all of them.
 
 use crate::object_handle::{legacy_dictionary_key, ObjectHandle};
-use crate::pipeline::ascii85::Ascii85Decoder;
+use crate::pipeline::ascii85_decoder::Ascii85Decoder;
 use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
 use crate::pipeline::dct::PlDct;

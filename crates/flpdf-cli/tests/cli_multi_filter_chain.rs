@@ -24,6 +24,8 @@ use std::io::Cursor;
 use std::process::Command as ShellCommand;
 use tempfile::tempdir;
 
+#[path = "support/ascii85.rs"]
+mod ascii85;
 #[path = "support/filter_fixtures.rs"]
 mod filter_fixtures;
 use filter_fixtures::{
@@ -72,9 +74,20 @@ fn build_pdf_with_filter_array(
         stream_dict.insert("DecodeParms", parms);
     }
 
-    // encode_stream_data applies filters in reverse (encode direction).
-    let encoded =
-        filters::encode_stream_data(&stream_dict, raw_content).expect("encode multi-filter stream");
+    let encoded = if filter_names == [b"ASCII85Decode".as_slice(), b"FlateDecode".as_slice()] {
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        if let Some(parms) = stream_dict.get("DecodeParms") {
+            flate_dict.insert("DecodeParms", parms.clone());
+        }
+        let flate_encoded =
+            filters::encode_stream_data(&flate_dict, raw_content).expect("encode Flate stage");
+        ascii85::fixture_bytes(&flate_encoded)
+    } else {
+        // Keep the generic supported-filter encode path for combinations such
+        // as [/FlateDecode /ASCIIHexDecode].
+        filters::encode_stream_data(&stream_dict, raw_content).expect("encode multi-filter stream")
+    };
 
     // Build the filter dict text for the stream header.
     let filter_names_str: Vec<&str> = filter_names
@@ -376,9 +389,8 @@ fn cli_show_stream_flate_ascii_hex_chain() {
 //
 // Strategy:
 //   - Use the known LZW vector for "ABABABABABABAB" (EarlyChange=1, PDF default).
-//   - Wrap it in ASCII85 using encode_stream_data with /Filter /ASCII85Decode
-//     (encode applies the inverse = ascii85::encode).
-//   - Build PDF with /Filter [/ASCII85Decode /LZWDecode] and the double-encoded bytes.
+//   - Wrap it with the test-only ASCII85 fixture helper.
+//   - Build PDF with /Filter [/ASCII85Decode /LZWDecode] and the wrapped bytes.
 //   - show-stream must decode both layers and return the LZW payload.
 // ---------------------------------------------------------------------------
 
@@ -388,12 +400,10 @@ fn cli_show_stream_ascii85_lzw_chain() {
     let lzw_bytes = LZW_ABABABABABABAB_EC1;
     let expected_payload = LZW_ABABABABABABAB_PLAIN;
 
-    // ASCII85-encode the LZW bytes so we can store them as [/ASCII85Decode /LZWDecode].
-    // encode_stream_data with /Filter /ASCII85Decode applies ascii85::encode internally.
-    let mut ascii85_dict = Dictionary::new();
-    ascii85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
-    let stored =
-        filters::encode_stream_data(&ascii85_dict, lzw_bytes).expect("ascii85 encode of LZW bytes");
+    // ASCII85-wrap the LZW bytes so we can store them as
+    // [/ASCII85Decode /LZWDecode] without depending on production encode
+    // support for ASCII85.
+    let stored = ascii85::fixture_bytes(lzw_bytes);
 
     // /Filter [/ASCII85Decode /LZWDecode]: decode order is ASCII85 first, then LZW.
     let pdf_bytes = build_pdf_with_prefiltered_stream(

@@ -17,6 +17,9 @@ use std::process::Command;
 mod common;
 use common::{write_with_settings, WriterTestSettings};
 
+#[path = "common/ascii85.rs"]
+mod ascii85;
+
 #[test]
 fn opens_pdf_without_resolving_all_objects() {
     let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
@@ -758,6 +761,87 @@ fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
     assert_eq!(
         stream.dict.get("DecodeParms"),
         Some(&Object::Array(vec![Object::Null]))
+    );
+}
+
+/// `/Crypt` in the first `/Filter` slot needs no prefix reconstruction, so the
+/// ASCII85 filter that follows it stays fully supported. qpdf decodes this shape
+/// too:
+///
+/// ```text
+/// $ qpdf --show-object=4 --filtered-stream-data crypt_then_ascii85.pdf
+/// explicit crypt stream
+/// ```
+#[test]
+fn v4_explicit_crypt_filter_before_ascii85_decrypts_at_filter_slot() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_ascii85_crypt_filter_fixture(false),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"explicit crypt stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(
+            b"ASCII85Decode".to_vec()
+        )]))
+    );
+}
+
+/// A `/Crypt` slot that is not first has no qpdf counterpart, so flpdf reports
+/// the missing ASCII85 encoder rather than reconstructing the prefix.
+///
+/// qpdf attaches the decryption pipeline to the *raw* stream bytes no matter
+/// where `/Crypt` sits in `/Filter`: `QPDF::pipeStreamData` calls
+/// `QPDF::decryptStream` before any filter pipeline exists
+/// (`libqpdf/QPDF.cc:2489-2492`), `decryptStream` prepends `Pl_AES_PDF`/`Pl_RC4`
+/// and only reads the `/Crypt` slot to pick the crypt filter name
+/// (`libqpdf/QPDF_encryption.cc:1065-1090`, `:1136-1153`), and `SF_Crypt`
+/// contributes no decode stage at all (`libqpdf/QPDF_Stream.cc:52-57`).
+///
+/// So a stream stored as `ASCII85(encrypt(plaintext))` — what
+/// `/Filter [/ASCII85Decode /Crypt]` asks for — is undecodable in qpdf 11.9.0,
+/// which keeps the still-encrypted bytes instead of reconstructing anything:
+///
+/// ```text
+/// $ qpdf --show-object=4 --filtered-stream-data ascii85_then_crypt.pdf
+/// WARNING: ... error decoding stream data for object 4 0: character out of
+/// range during base 85 decode
+/// $ qpdf --decrypt --password= ascii85_then_crypt.pdf out.pdf
+/// WARNING: ... stream will be re-processed without filtering to avoid data loss
+/// $ qpdf --show-object=2 out.pdf     # renumbered from 4 0
+/// << /DecodeParms [ null ] /Filter [ /ASCII85Decode ] /Length 48 >>
+/// ```
+///
+/// flpdf's decode/decrypt/re-encode of the pre-`/Crypt` prefix therefore has no
+/// qpdf counterpart either. This pins the current boundary of that divergence;
+/// the `/FlateDecode` variant still reconstructs its prefix because a Flate
+/// encoder exists.
+///
+/// The assertion below is not the target state: qpdf warns and carries on with
+/// the stream unfiltered while the document stays open, so moving this path onto
+/// qpdf's model is expected to rewrite this expectation rather than keep it.
+#[test]
+fn v4_explicit_crypt_filter_after_ascii85_reports_the_missing_encoder() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_ascii85_crypt_filter_fixture(true),
+    ))
+    .unwrap();
+
+    let error = pdf
+        .resolve(ObjectRef::new(4, 0))
+        .expect_err("re-encoding the ASCII85 prefix has no encoder to call");
+
+    assert!(
+        matches!(&error, Error::Unsupported(message) if message.contains("ASCII85Encode")),
+        "expected the ASCII85 encode boundary, got {error:?}"
     );
 }
 
@@ -1668,6 +1752,63 @@ fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
     } else {
         "[]".to_string()
     };
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {length} /Filter {filters} /DecodeParms {decode_parms_array} >>\nstream\n"
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n0000000000 65535 f \n{obj4_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /Identity /StrF /Identity >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// Build the `/Crypt`-plus-ASCII85 counterpart of
+/// [`encrypted_v4_explicit_crypt_filter_fixture`].
+///
+/// Stream bytes follow the `/Filter` array's decode order, so
+/// `crypt_after_ascii85` decides which of the two transforms wraps the other.
+fn encrypted_v4_ascii85_crypt_filter_fixture(crypt_after_ascii85: bool) -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = fixed_r4_u_entry(true);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Data 4 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+
+    let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
+    let plaintext = b"explicit crypt stream";
+    let stream_data = if crypt_after_ascii85 {
+        let encrypted = aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], plaintext);
+        ascii85::fixture_bytes(&encrypted)
+    } else {
+        let encoded = ascii85::fixture_bytes(plaintext);
+        aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &encoded)
+    };
+    let (filters, decode_parms_array) = if crypt_after_ascii85 {
+        ("[/ASCII85Decode /Crypt]", "[null << /Name /StdCF >>]")
+    } else {
+        ("[/Crypt /ASCII85Decode]", "[<< /Name /StdCF >> null]")
+    };
+    let obj4_offset = bytes.len();
+    let length = stream_data.len();
     bytes.extend_from_slice(
         format!(
             "4 0 obj\n<< /Length {length} /Filter {filters} /DecodeParms {decode_parms_array} >>\nstream\n"

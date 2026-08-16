@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub(crate) mod ascii85;
+pub(crate) mod ascii85_decoder;
 
 pub(crate) mod aes;
 
