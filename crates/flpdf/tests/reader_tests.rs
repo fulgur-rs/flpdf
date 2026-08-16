@@ -2487,22 +2487,38 @@ fn assert_qpdf_object_contains(fixture: &[u8], object_number: u32, expected: &st
 }
 
 fn qpdf_show_object(fixture: &[u8], object_number: u32) -> Option<String> {
-    let version = Command::new("qpdf").arg("--version").output().ok()?;
-    if !version.status.success() || !String::from_utf8_lossy(&version.stdout).contains("11.9.0") {
+    let version = match Command::new("qpdf").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("qpdf --version failed to start: {error}"),
+    };
+    assert!(
+        version.status.success(),
+        "qpdf --version failed: {}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let version_line = String::from_utf8_lossy(&version.stdout);
+    if version_line
+        .lines()
+        .next()
+        .is_none_or(|line| line.trim() != "qpdf version 11.9.0")
+    {
         return None;
     }
 
-    let directory = tempfile::tempdir().ok()?;
+    let directory = tempfile::tempdir().expect("create qpdf differential fixture directory");
     let input = directory.path().join("fixture.pdf");
-    std::fs::write(&input, fixture).ok()?;
+    std::fs::write(&input, fixture).expect("write qpdf differential fixture");
     let output = Command::new("qpdf")
         .arg(format!("--show-object={object_number}"))
         .arg(&input)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .expect("run qpdf --show-object");
+    assert!(
+        output.status.success(),
+        "qpdf --show-object={object_number} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
