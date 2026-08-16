@@ -808,9 +808,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
         let (_, is_form) = self.resolved_attribute_target()?;
         let page = if is_form {
+            // cov:ignore-start: is_form is returned only for a stream whose
+            // canonical dictionary was already validated by is_form_xobject.
             self.object.as_stream_dict().ok_or_else(|| {
                 Error::Unsupported("Form XObject has no stream dictionary".to_owned())
             })?
+            // cov:ignore-end
         } else {
             self.object.clone()
         };
@@ -1861,9 +1864,12 @@ fn get_attribute_for_target<R: Read + Seek>(
 ) -> Result<ObjectHandle> {
     let (object, is_form) = resolve_attribute_target(pdf, object, description)?;
     let dict = if is_form {
+        // cov:ignore-start: resolve_attribute_target classifies a Form only
+        // after is_form_xobject confirms that its stream dictionary exists.
         object.as_stream_dict().ok_or_else(|| {
             Error::Unsupported(format!("object {description} is not a Form stream"))
         })?
+        // cov:ignore-end
     } else {
         object.clone()
     };
@@ -1934,6 +1940,8 @@ fn object_type_name(obj: &Object) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     /// `object_type_name` collapses both real variants to `"real"` — both
@@ -1960,5 +1968,136 @@ mod tests {
             object_type_name(&Object::InlineImage(b"data".to_vec())),
             "inline-image"
         );
+    }
+
+    #[test]
+    fn inline_image_dictionary_expands_qpdf_abbreviations() {
+        let mut externalizer = InlineImageExternalizer::new(
+            0,
+            Some(ObjectHandle::dictionary(vec![(
+                b"/Spot".to_vec(),
+                ObjectHandle::name(b"Separation".to_vec()),
+            )])),
+            BTreeSet::from([b"/IIm1".to_vec()]),
+        );
+
+        let image = externalizer
+            .convert_inline_image_dictionary(
+                b"<< /BPC 8 /CS /RGB /D [0 1] /DP << >> /F /AHx /H 2 /IM true /I false /W 1 /Other 5 >>",
+                3,
+            )
+            .expect("valid inline-image dictionaries should convert");
+        assert_eq!(image.get_key(b"/Type").as_name(), Some(b"XObject".to_vec()));
+        assert_eq!(
+            image.get_key(b"/Subtype").as_name(),
+            Some(b"Image".to_vec())
+        );
+        assert_eq!(image.get_key(b"/BitsPerComponent").as_integer(), Some(8));
+        assert_eq!(
+            image.get_key(b"/ColorSpace").as_name(),
+            Some(b"DeviceRGB".to_vec())
+        );
+        assert_eq!(
+            image.get_key(b"/Filter").as_name(),
+            Some(b"ASCIIHexDecode".to_vec())
+        );
+        assert_eq!(image.get_key(b"/Height").as_integer(), Some(2));
+        assert_eq!(image.get_key(b"/Width").as_integer(), Some(1));
+        assert_eq!(image.get_key(b"/Length").as_integer(), Some(3));
+        assert_eq!(image.get_key(b"/Other").as_integer(), Some(5));
+
+        let error = externalizer
+            .convert_inline_image_dictionary(b"[]", 0)
+            .expect_err("an inline-image header must be a dictionary");
+        assert!(error.to_string().contains("did not parse as a dictionary"));
+    }
+
+    #[test]
+    fn inline_image_externalizer_covers_colorspace_filters_and_name_conflicts() {
+        let mut externalizer = InlineImageExternalizer::new(
+            0,
+            Some(ObjectHandle::dictionary(vec![(
+                b"/Custom".to_vec(),
+                ObjectHandle::name(b"Resolved".to_vec()),
+            )])),
+            BTreeSet::from([b"/IIm1".to_vec()]),
+        );
+
+        for (short, expanded) in [
+            (b"G".as_slice(), b"DeviceGray".as_slice()),
+            (b"RGB".as_slice(), b"DeviceRGB".as_slice()),
+            (b"CMYK".as_slice(), b"DeviceCMYK".as_slice()),
+            (b"I".as_slice(), b"Indexed".as_slice()),
+        ] {
+            assert_eq!(
+                externalizer
+                    .convert_color_space(ObjectHandle::name(short.to_vec()))
+                    .as_name(),
+                Some(expanded.to_vec())
+            );
+        }
+        assert_eq!(
+            externalizer
+                .convert_color_space(ObjectHandle::name(b"Custom".to_vec()))
+                .as_name(),
+            Some(b"Resolved".to_vec())
+        );
+        assert_eq!(
+            externalizer
+                .convert_color_space(ObjectHandle::name(b"Missing".to_vec()))
+                .as_name(),
+            Some(b"Missing".to_vec())
+        );
+        assert_eq!(
+            externalizer
+                .convert_color_space(ObjectHandle::integer(7))
+                .as_integer(),
+            Some(7)
+        );
+        assert_eq!(
+            externalizer.unresolved_color_spaces,
+            vec![b"Missing".to_vec()]
+        );
+
+        for (short, expanded) in [
+            (b"AHx".as_slice(), b"ASCIIHexDecode".as_slice()),
+            (b"A85".as_slice(), b"ASCII85Decode".as_slice()),
+            (b"LZW".as_slice(), b"LZWDecode".as_slice()),
+            (b"Fl".as_slice(), b"FlateDecode".as_slice()),
+            (b"RL".as_slice(), b"RunLengthDecode".as_slice()),
+            (b"CCF".as_slice(), b"CCITTFaxDecode".as_slice()),
+            (b"DCT".as_slice(), b"DCTDecode".as_slice()),
+        ] {
+            assert_eq!(
+                externalizer
+                    .convert_filters(ObjectHandle::name(short.to_vec()))
+                    .as_name(),
+                Some(expanded.to_vec())
+            );
+        }
+        let array = externalizer.convert_filters(ObjectHandle::array(vec![
+            ObjectHandle::name(b"Fl".to_vec()),
+            ObjectHandle::integer(9),
+            ObjectHandle::name(b"Unknown".to_vec()),
+        ]));
+        let items = array.as_array().expect("filter arrays remain arrays");
+        assert_eq!(items[0].as_name(), Some(b"FlateDecode".to_vec()));
+        assert_eq!(items[1].as_integer(), Some(9));
+        assert_eq!(items[2].as_name(), Some(b"Unknown".to_vec()));
+        assert_eq!(
+            externalizer
+                .convert_filters(ObjectHandle::integer(4))
+                .as_integer(),
+            Some(4)
+        );
+        assert_eq!(
+            externalizer
+                .convert_filter_name(ObjectHandle::integer(4))
+                .as_integer(),
+            Some(4)
+        );
+
+        assert_eq!(externalizer.next_name(), b"/IIm2".to_vec());
+        assert_eq!(externalizer.next_name(), b"/IIm3".to_vec());
     }
 }

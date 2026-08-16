@@ -87,11 +87,14 @@ pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
         )));
     }
     let form = helper.get_form_xobject_for_page(true)?;
+    // cov:ignore-start: Pdf::new_stream registers every canonical Form as an
+    // indirect document-owned object; this is an allocation invariant guard.
     form.object_ref().ok_or_else(|| {
         Error::Internal(
             "canonical Form XObject was not registered as an indirect object".to_owned(),
         )
     })
+    // cov:ignore-end
 }
 
 /// Convert a page from `source` into a Form XObject and import it into `dest`.

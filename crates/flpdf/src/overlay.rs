@@ -311,6 +311,9 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
         }
     }
     {
+        // cov:ignore-start: the trailing `)?;` is the defensive error edge of
+        // a multiline placement call; valid source and destination pages are
+        // covered by the byte-identical overlay gates.
         let (fragment, _cm) = place_form_xobject_canonical(
             dest,
             dest_page_ref,
@@ -321,9 +324,12 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
             false,
             "Fx0",
         )?;
+        // cov:ignore-end
         content.push_str(&fragment);
     }
     for (name, xref, template) in &overlay_names {
+        // cov:ignore-start: symmetric defensive error edge for the multiline
+        // placement call; byte gates cover successful overlay placements.
         let (fragment, cm) = place_form_xobject_canonical(
             dest,
             dest_page_ref,
@@ -334,6 +340,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
             false,
             name,
         )?;
+        // cov:ignore-end
         content.push_str(&fragment);
         if let Some(tpl) = template {
             // cov:ignore-start: symmetric with the underlay branch above — the

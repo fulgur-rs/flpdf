@@ -5,10 +5,13 @@
 //! rotate, get_annotations, and all bounding-box variants) including
 //! inheritance resolution and per-page mutation round-trips.
 
+use flpdf::pipeline::PlString;
 use flpdf::{
-    apply_rotate_to_pages, pages, DecodeLevel, Error, Matrix, Object, ObjectHandle, ObjectRef,
-    PageBox, PageObjectHelper, Pdf, Rectangle, RotateMode, RotateOp,
+    apply_rotate_to_pages, pages, ContentToken, DecodeLevel, Error, Matrix, Object, ObjectHandle,
+    ObjectParserCallbacks, ObjectRef, PageBox, PageObjectHelper, ParseControl, Pdf, PipelineResult,
+    Rectangle, RotateMode, RotateOp, TokenFilter, TokenFilterOutput,
 };
+use std::cell::RefCell;
 use std::io::Cursor;
 use std::rc::Rc;
 
@@ -116,6 +119,41 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
 
+struct PassthroughFilter;
+
+impl TokenFilter for PassthroughFilter {
+    fn handle_token(
+        &mut self,
+        token: &ContentToken,
+        output: &mut TokenFilterOutput<'_>,
+    ) -> PipelineResult<()> {
+        output.write_token(token)
+    }
+}
+
+#[derive(Default)]
+struct CountingObjectCallbacks {
+    objects: usize,
+    eof_calls: usize,
+}
+
+impl ObjectParserCallbacks for CountingObjectCallbacks {
+    fn handle_object(
+        &mut self,
+        _object: ObjectHandle,
+        _offset: usize,
+        _length: usize,
+    ) -> flpdf::Result<ParseControl> {
+        self.objects += 1;
+        Ok(ParseControl::Continue)
+    }
+
+    fn handle_eof(&mut self) -> flpdf::Result<()> {
+        self.eof_calls += 1;
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // content_stream_objects()
 // ---------------------------------------------------------------------------
@@ -196,7 +234,7 @@ fn xobject_maps_follow_qpdf_direct_and_recursive_boundaries() {
     );
     let form = (
         5u32,
-        b"5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 20] /Resources << /XObject << /NestedImage 4 0 R >> >> /Length 1 >>\nstream\nx\nendstream\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 20] /Resources << /XObject << /NestedImage 4 0 R /Self 5 0 R >> >> /Length 1 >>\nstream\nx\nendstream\nendobj\n".to_vec(),
     );
     let bytes = build_pdf_with_extras(
         "/MediaBox [0 0 612 792] /Resources << /XObject << /PageImage 4 0 R /PageForm 5 0 R >> >>",
@@ -216,6 +254,24 @@ fn xobject_maps_follow_qpdf_direct_and_recursive_boundaries() {
         Some(ObjectRef::new(4, 0))
     );
     assert_eq!(helper.get_form_xobjects().unwrap().len(), 1);
+    assert_eq!(helper.get_page_images().unwrap().len(), 1);
+    assert_eq!(helper.get_form_xobjects_recursive().unwrap().len(), 2);
+
+    let mut visited = Vec::new();
+    helper
+        .for_each_xobject(true, |object, resources, key| {
+            visited.push((
+                key,
+                object.object_ref(),
+                resources.as_dictionary().is_some(),
+            ));
+            Ok(())
+        })
+        .expect("canonical XObject traversal should terminate on the Form cycle");
+    assert_eq!(visited.len(), 4);
+    assert!(visited
+        .iter()
+        .all(|(_, _, resources_are_dict)| { *resources_are_dict }));
 
     let mut recursive_images = helper
         .get_images_recursive()
@@ -235,6 +291,32 @@ fn xobject_maps_follow_qpdf_direct_and_recursive_boundaries() {
         Some(ObjectRef::new(4, 0))
     );
     assert!(recursive_images.is_empty());
+
+    let direct_form = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(1),
+                ]),
+            ),
+        ]),
+        Rc::new(Vec::new()),
+    );
+    let mut direct_form_helper = PageObjectHelper::from_object_handle(direct_form, &mut pdf);
+    let mut no_resource_visits = 0;
+    direct_form_helper
+        .for_each_xobject(true, |_, _, _| {
+            no_resource_visits += 1;
+            Ok(())
+        })
+        .expect("a Form without resources should simply have no XObjects");
+    assert_eq!(no_resource_visits, 0);
 }
 
 #[test]
@@ -362,6 +444,233 @@ fn form_xobject_placement_uses_canonical_form_and_page_handles() {
 }
 
 #[test]
+fn form_xobject_placement_handles_qpdf_fallback_and_scaling_boundaries() {
+    let bytes = build_single_page_pdf("/MediaBox [0 0 100 100]", "/TrimBox [0 0 100 100]");
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let non_form = ObjectHandle::dictionary(vec![(
+        b"/Type".to_vec(),
+        ObjectHandle::name(b"Page".to_vec()),
+    )]);
+    assert!(helper
+        .get_matrix_for_form_xobject_placement(
+            non_form,
+            Rectangle::new(0.0, 0.0, 100.0, 100.0),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .is_none());
+
+    let malformed_bbox = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (b"/BBox".to_vec(), ObjectHandle::integer(1)),
+        ]),
+        Rc::new(Vec::new()),
+    );
+    assert!(helper
+        .get_matrix_for_form_xobject_placement(
+            malformed_bbox,
+            Rectangle::new(0.0, 0.0, 100.0, 100.0),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .is_none());
+
+    let short_bbox = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(0); 3]),
+            ),
+        ]),
+        Rc::new(Vec::new()),
+    );
+    assert!(helper
+        .get_matrix_for_form_xobject_placement(
+            short_bbox,
+            Rectangle::new(0.0, 0.0, 100.0, 100.0),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .is_none());
+
+    let malformed_matrix = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(10),
+                    ObjectHandle::integer(10),
+                ]),
+            ),
+            (
+                b"/Matrix".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(1); 5]),
+            ),
+        ]),
+        Rc::new(Vec::new()),
+    );
+    let matrix = helper
+        .get_matrix_for_form_xobject_placement(
+            malformed_matrix,
+            Rectangle::new(0.0, 0.0, 20.0, 20.0),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("malformed optional Matrix uses qpdf identity fallback");
+    assert_eq!(matrix, Matrix::new(2.0, 0.0, 0.0, 2.0, 0.0, 0.0));
+
+    let non_numeric_matrix = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(10),
+                    ObjectHandle::integer(10),
+                ]),
+            ),
+            (
+                b"/Matrix".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(1),
+                    ObjectHandle::name(b"bad".to_vec()),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                ]),
+            ),
+        ]),
+        Rc::new(Vec::new()),
+    );
+    assert!(helper
+        .get_matrix_for_form_xobject_placement(
+            non_numeric_matrix,
+            Rectangle::new(0.0, 0.0, 20.0, 20.0),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .is_some());
+
+    let scaled_form = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(10),
+                    ObjectHandle::integer(10),
+                ]),
+            ),
+        ]),
+        Rc::new(Vec::new()),
+    );
+    let shrink_disabled = helper
+        .get_matrix_for_form_xobject_placement(
+            scaled_form.clone(),
+            Rectangle::new(0.0, 0.0, 5.0, 5.0),
+            false,
+            false,
+            true,
+        )
+        .unwrap()
+        .expect("non-degenerate Forms should have a matrix");
+    assert_eq!(shrink_disabled, Matrix::new(1.0, 0.0, 0.0, 1.0, -2.5, -2.5));
+    let expand_disabled = helper
+        .get_matrix_for_form_xobject_placement(
+            scaled_form.clone(),
+            Rectangle::new(0.0, 0.0, 20.0, 20.0),
+            false,
+            true,
+            false,
+        )
+        .unwrap()
+        .expect("expansion-disabled placement should still be valid");
+    assert_eq!(expand_disabled, Matrix::new(1.0, 0.0, 0.0, 1.0, 5.0, 5.0));
+    let expanded = helper
+        .get_matrix_for_form_xobject_placement(
+            scaled_form,
+            Rectangle::new(0.0, 0.0, 20.0, 20.0),
+            false,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("expansion-enabled placement should scale the Form");
+    assert_eq!(expanded, Matrix::new(2.0, 0.0, 0.0, 2.0, 0.0, 0.0));
+}
+
+#[test]
+fn transformation_and_attribute_helpers_cover_malformed_canonical_targets() {
+    let bytes = build_single_page_pdf(
+        "/MediaBox [0 0 100 100]",
+        "/TrimBox 1 /UserUnit 0 /Rotate 90",
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+    assert_eq!(
+        helper.get_matrix_for_transformations(true).unwrap(),
+        Matrix::default()
+    );
+
+    let direct_page = ObjectHandle::dictionary(vec![(
+        b"/Type".to_vec(),
+        ObjectHandle::name(b"Page".to_vec()),
+    )]);
+    let mut direct_page_helper = PageObjectHelper::from_object_handle(direct_page, &mut pdf);
+    assert!(direct_page_helper
+        .shallow_copy_page()
+        .expect_err("direct pages cannot be promoted through the page-ref API")
+        .to_string()
+        .contains("shallowCopyPage"));
+    assert!(direct_page_helper
+        .remove_unreferenced_resources()
+        .expect_err("resource pruning requires an indirect page reference")
+        .to_string()
+        .contains("operation requires a page object reference"));
+    drop(direct_page_helper);
+
+    for target in [
+        ObjectHandle::integer(1),
+        ObjectHandle::dictionary(Vec::new()),
+        ObjectHandle::dictionary(vec![(b"/Type".to_vec(), ObjectHandle::integer(1))]),
+        ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Pages".to_vec()),
+        )]),
+    ] {
+        let mut target_helper = PageObjectHelper::from_object_handle(target, &mut pdf);
+        assert!(target_helper.get_attribute(b"/MediaBox", false).is_err());
+    }
+}
+
+#[test]
 fn transformation_matrix_uses_identity_for_non_rectangle_trim_box() {
     let bytes = build_single_page_pdf(
         "/MediaBox [0 0 200 200]",
@@ -431,6 +740,54 @@ fn page_helper_remove_unreferenced_resources_prunes_canonical_categories() {
 }
 
 #[test]
+fn page_helper_resource_pruning_preserves_resources_when_content_is_incomplete() {
+    let (num, extra) = make_stream_object(4, b"/F1 12 Tf [");
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R /Resources << /Font << /F1 << >> /F2 << >> >> >>",
+        &[(num, extra)],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("incomplete content is a warning-only resource-pruning case");
+    let fonts = helper
+        .get_resources(false)
+        .unwrap()
+        .get_key(b"/Font")
+        .as_dictionary()
+        .unwrap();
+    assert_eq!(fonts.len(), 2, "unknown usage must retain every font");
+}
+
+#[test]
+fn page_helper_resource_pruning_shallow_copies_indirect_categories() {
+    let (num, extra) = make_stream_object(4, b"BT /F1 12 Tf ET");
+    let fonts = (
+        5u32,
+        b"5 0 obj\n<< /F1 << >> /F2 << >> >>\nendobj\n".to_vec(),
+    );
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R /Resources << /Font 5 0 R >>",
+        &[(num, extra), fonts],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("indirect resource categories should be copied before pruning");
+    let font_handle = helper.get_resources(false).unwrap().get_key(b"/Font");
+    assert!(font_handle.is_direct());
+    let fonts = font_handle.as_dictionary().unwrap();
+    assert!(fonts.iter().any(|(key, _)| key == b"/F1"));
+    assert!(!fonts.iter().any(|(key, _)| key == b"/F2"));
+}
+
+#[test]
 fn form_helper_remove_unreferenced_resources_prunes_form_categories() {
     let form_body = b"BT /F1 12 Tf ET";
     let mut form = format!(
@@ -460,6 +817,81 @@ fn form_helper_remove_unreferenced_resources_prunes_form_categories() {
 }
 
 #[test]
+fn form_helper_resource_pruning_handles_missing_nested_and_indirect_resources() {
+    let nested_body = b"BT /F1 12 Tf ET";
+    let mut nested = format!(
+        "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+         /Resources << /Font << /F1 << >> /F2 << >> >> /XObject 8 0 R >> /Length {} >>\nstream\n",
+        nested_body.len()
+    )
+    .into_bytes();
+    nested.extend_from_slice(nested_body);
+    nested.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let root_body = b"BT /F1 12 Tf ET";
+    let mut root = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+         /Resources << /Font 7 0 R /XObject << /Nested 6 0 R >> >> /Length {} >>\nstream\n",
+        root_body.len()
+    )
+    .into_bytes();
+    root.extend_from_slice(root_body);
+    root.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let fonts = (
+        7u32,
+        b"7 0 obj\n<< /F1 << >> /F2 << >> >>\nendobj\n".to_vec(),
+    );
+    let malformed_category = (8u32, b"8 0 obj\n1\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 100 100]",
+        "",
+        &[(5, root), (6, nested), fonts, malformed_category],
+    );
+    let mut pdf = open(bytes);
+    let form_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+    helper
+        .remove_unreferenced_resources()
+        .expect("Form resource pruning should cover nested and malformed categories");
+
+    let resources = helper.get_resources(false).unwrap();
+    let fonts = resources.get_key(b"/Font");
+    assert!(fonts.is_direct());
+    assert!(fonts
+        .as_dictionary()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key == b"/F1"));
+    assert!(!fonts
+        .as_dictionary()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key == b"/F2"));
+}
+
+#[test]
+fn form_helper_resource_pruning_is_a_noop_without_resources() {
+    let form_body = b"q Q";
+    let mut form = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length {} >>\nstream\n",
+        form_body.len()
+    )
+    .into_bytes();
+    form.extend_from_slice(form_body);
+    form.extend_from_slice(b"\nendstream\nendobj\n");
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 100 100]", "", &[(5, form)]);
+    let mut pdf = open(bytes);
+    let form_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("a Form without /Resources should be a no-op");
+    assert!(helper.get_resources(false).unwrap().is_null());
+}
+
+#[test]
 fn add_page_contents_uses_canonical_handles_and_preserves_order() {
     let first_body = b"Q";
     let (num, extra) = make_stream_object(4, first_body);
@@ -480,6 +912,102 @@ fn add_page_contents_uses_canonical_handles_and_preserves_order() {
     assert_eq!(contents.len(), 2);
     assert!(contents[0].is_same_object_as(&new_contents));
     assert_eq!(contents[1].object_ref(), Some(ObjectRef::new(4, 0)));
+}
+
+#[test]
+fn page_helper_canonical_content_aliases_cover_page_and_form_routes() {
+    let first = make_stream_object(4, b"q");
+    let second = make_stream_object(5, b"Q");
+    let form_body = b"q Q";
+    let form = (
+        6u32,
+        format!(
+            "6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << >> /Length {} >>\nstream\n",
+            form_body.len()
+        )
+        .into_bytes(),
+    );
+    let mut form_bytes = form.1;
+    form_bytes.extend_from_slice(form_body);
+    form_bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 100 100]",
+        "/Contents [4 0 R 5 0 R]",
+        &[first, second, (6, form_bytes)],
+    );
+    let mut pdf = open(bytes);
+
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+    let mut callbacks = CountingObjectCallbacks::default();
+    helper
+        .parse_page_contents(&mut callbacks)
+        .expect("page parser alias should use canonical callbacks");
+    assert!(callbacks.objects > 0);
+    assert_eq!(callbacks.eof_calls, 1);
+
+    let mut filter = PassthroughFilter;
+    let mut filtered = Vec::new();
+    let mut sink = PlString::new("page helper filter", None, &mut filtered);
+    helper
+        .filter_page_contents(&mut filter, Some(&mut sink))
+        .expect("page filter alias should use the canonical page route");
+    assert!(!filtered.is_empty());
+
+    let mut piped = Vec::new();
+    let mut pipeline = PlString::new("page helper pipe", None, &mut piped);
+    helper
+        .pipe_page_contents(&mut pipeline)
+        .expect("page pipe alias should decode canonical page contents");
+    assert_eq!(piped, b"q\nQ");
+
+    helper
+        .coalesce_content_streams()
+        .expect("page coalesce wrapper should retain a canonical provider");
+    helper
+        .rotate_page(90, false)
+        .expect("page rotate wrapper should mutate the live page");
+    assert_eq!(helper.rotate().unwrap(), 90);
+
+    helper
+        .add_content_token_filter(Rc::new(RefCell::new(PassthroughFilter)))
+        .expect("page token-filter wrapper should attach lazily");
+    drop(helper);
+
+    let form_handle = pdf.get_object_handle(ObjectRef::new(6, 0));
+    let mut form_helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+    let mut form_callbacks = CountingObjectCallbacks::default();
+    form_helper
+        .parse_contents(&mut form_callbacks)
+        .expect("Form parser should use its content-stream route");
+    assert!(form_callbacks.objects > 0);
+
+    let mut form_filter = PassthroughFilter;
+    form_helper
+        .filter_contents(&mut form_filter, None)
+        .expect("Form filter should use stream-content decoding");
+    let mut form_filter_alias = PassthroughFilter;
+    form_helper
+        .filter_page_contents(&mut form_filter_alias, None)
+        .expect("old Form filter alias should share the canonical route");
+
+    let mut form_output = Vec::new();
+    let mut form_pipeline = PlString::new("Form helper pipe", None, &mut form_output);
+    form_helper
+        .pipe_contents(&mut form_pipeline)
+        .expect("Form pipe should decode the stream data");
+    assert_eq!(form_output, b"q Q");
+
+    let mut form_output_alias = Vec::new();
+    let mut form_pipeline_alias =
+        PlString::new("Form helper pipe alias", None, &mut form_output_alias);
+    form_helper
+        .pipe_page_contents(&mut form_pipeline_alias)
+        .expect("old Form pipe alias should share the canonical route");
+    assert_eq!(form_output_alias, b"q Q");
+
+    form_helper
+        .add_content_token_filter(Rc::new(RefCell::new(PassthroughFilter)))
+        .expect("Form token-filter wrapper should attach lazily");
 }
 
 #[test]
@@ -604,6 +1132,35 @@ fn externalize_inline_images_warns_for_unknown_named_colorspace() {
 }
 
 #[test]
+fn externalize_inline_images_warns_and_preserves_content_on_filter_error() {
+    let malformed = (
+        4u32,
+        b"4 0 obj\n<< /Length 3 /Filter /ASCIIHexDecode >>\nstream\n0g\nendstream\nendobj\n"
+            .to_vec(),
+    );
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792] /Resources << /XObject << >> >>",
+        "/Contents 4 0 R",
+        &[malformed],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    helper
+        .externalize_inline_images(0, true)
+        .expect("qpdf's filter failure is warning-only for externalization");
+    assert!(helper.get_images().unwrap().is_empty());
+    drop(helper);
+    assert!(pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic
+            .message
+            .contains("Unable to filter content stream")));
+}
+
+#[test]
 fn externalize_inline_images_respects_minimum_payload_size() {
     let (num, extra) = make_stream_object(4, b"BI /W 1 /H 1 ID x EI");
     let bytes = build_pdf_with_extras(
@@ -724,6 +1281,18 @@ fn resources_returns_none_when_absent() {
         res.is_none(),
         "expected Ok(None) when no /Resources anywhere"
     );
+}
+
+#[test]
+fn resources_rejects_a_non_dictionary_value() {
+    let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "/Resources 42");
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let error = helper
+        .resources()
+        .expect_err("resources() must reject a non-dictionary terminal value");
+    assert!(error.to_string().contains("unexpected type integer"));
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +1451,19 @@ fn get_annotation_handles_preserves_direct_annotations() {
         Some(b"Text".to_vec())
     );
     assert_eq!(handles[1].object_ref(), Some(ObjectRef::new(4, 0)));
+}
+
+#[test]
+fn get_annotation_handles_skips_non_dictionary_members() {
+    let scalar = (5u32, b"5 0 obj\n7\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 612 792]", "/Annots [5 0 R]", &[scalar]);
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    assert!(helper
+        .get_annotation_handles(None)
+        .expect("malformed annotation members are skipped")
+        .is_empty());
 }
 
 #[test]

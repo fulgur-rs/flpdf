@@ -246,6 +246,24 @@ mod tests {
             .contains(&23));
     }
 
+    #[test]
+    fn canonical_callbacks_cover_inline_image_and_diagnostic_events() {
+        let mut finder = ResourceFinder::default();
+        let inline = ObjectHandle::inline_image(b"payload".to_vec());
+
+        assert_eq!(
+            finder
+                .handle_object_handle(&inline, 0, inline.as_inline_image().unwrap().len())
+                .unwrap(),
+            ParseControl::Continue
+        );
+        ObjectHandleParserCallbacks::handle_diagnostic(&mut finder, 2, "recovered")
+            .expect("diagnostics are warning-only");
+
+        assert!(finder.had_diagnostics());
+        assert!(!finder.has_pending_operands());
+    }
+
     fn hex_encode(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
