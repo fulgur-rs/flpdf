@@ -23,8 +23,8 @@ use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
-    AnnotationObjectHelper, Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
-    Stream,
+    AnnotationObjectHelper, Dictionary, Error, Matrix, Object, ObjectHandle, ObjectRef, Pdf,
+    Rectangle, Result, Stream,
 };
 use std::io::{Read, Seek};
 
@@ -91,9 +91,14 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     let all_annots = enumerate_page_annotations(pdf, page_ref)?;
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───
+    enum AppearanceTarget {
+        Canonical(ObjectHandle),
+        Bridge(ObjectRef),
+    }
+
     struct AnnotData {
         annot_ref: ObjectRef,
-        xobj_ref: ObjectRef, // the Form XObject to place
+        appearance: AppearanceTarget,
         flags: i64,
     }
 
@@ -129,11 +134,12 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             continue;
         }
         // Read /F through the canonical helper first. A zero result is also
-        // qpdf's fail-soft value for absent/non-integer /F, so only that
-        // result may fall back to the in-memory holder-chain bridge used by
-        // Pdf::set_object fixtures.
+        // qpdf's fail-soft value for absent/non-integer /F. Only a detected
+        // Pdf::set_object holder redirect may use the compatibility bridge.
         let canonical_flags = AnnotationObjectHelper::new(ea.annot_ref, pdf).get_flags()?;
-        let flags = if canonical_flags == 0 {
+        let legacy_flag_redirect =
+            canonical_flags == 0 && has_bare_reference_redirect(pdf, ea.annot_ref, "F")?;
+        let flags = if legacy_flag_redirect {
             read_annot_flags(pdf, ea.annot_ref)?
         } else {
             canonical_flags
@@ -148,15 +154,60 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // qpdf only retains annotations without any appearance dictionary.
         // Once /AP is present, a missing selected /N stream is itself a
         // flattening/removal outcome (for example an unchecked checkbox).
-        let has_appearance = annotation_has_appearance_dictionary(pdf, ea.annot_ref)?;
-        let xobj_ref = resolve_ap_n(pdf, ea.annot_ref)?;
-        if xobj_ref.is_none() {
-            if qpdf_flag_contract && has_appearance {
-                to_remove.push(ea.annot_ref);
+        let (appearance_dictionary, appearance) = {
+            let mut helper = AnnotationObjectHelper::new(ea.annot_ref, pdf);
+            (
+                helper.get_appearance_dictionary()?,
+                helper.get_appearance_stream(b"N", None)?,
+            )
+        };
+        let has_appearance = if appearance_dictionary.is_null() {
+            false
+        } else if appearance_dictionary.as_reference().is_some() {
+            // A bare-reference value is the in-memory holder shape, not a
+            // qpdf parsed object. Ask the bridge whether its terminal value
+            // is actually null before deciding whether to prune it.
+            annotation_has_appearance_dictionary(pdf, ea.annot_ref)?
+        } else {
+            true
+        };
+        let legacy_appearance_redirect = if has_bare_reference_redirect(pdf, ea.annot_ref, "AP")? {
+            true
+        } else if let Some(appearance_ref) = appearance_dictionary.object_ref() {
+            has_bare_reference_redirect(pdf, appearance_ref, "N")?
+        } else {
+            false
+        };
+        let appearance = if appearance.as_stream_dict().is_some() {
+            if let Some(appearance_ref) = appearance.object_ref() {
+                let legacy_geometry_redirect =
+                    has_bare_reference_redirect(pdf, appearance_ref, "BBox")?
+                        || has_bare_reference_redirect(pdf, appearance_ref, "Matrix")?;
+                if legacy_flag_redirect || legacy_geometry_redirect {
+                    AppearanceTarget::Bridge(appearance_ref)
+                } else {
+                    AppearanceTarget::Canonical(appearance)
+                }
+            } else {
+                AppearanceTarget::Canonical(appearance)
             }
-            continue;
-        }
-        let xobj_ref = xobj_ref.expect("checked above");
+        } else {
+            if !legacy_appearance_redirect {
+                if qpdf_flag_contract && has_appearance {
+                    to_remove.push(ea.annot_ref);
+                }
+                continue;
+            }
+            match resolve_ap_n(pdf, ea.annot_ref)? {
+                Some(appearance_ref) => AppearanceTarget::Bridge(appearance_ref),
+                None => {
+                    if qpdf_flag_contract && has_appearance {
+                        to_remove.push(ea.annot_ref);
+                    }
+                    continue;
+                }
+            }
+        };
 
         // Mode eligibility.
         let eligible = match mode {
@@ -210,7 +261,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
         candidates.push(AnnotData {
             annot_ref: ea.annot_ref,
-            xobj_ref,
+            appearance,
             flags,
         });
     }
@@ -276,42 +327,48 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
 
         let resource_name = format!("/{xobj_name}");
-        let content = AnnotationObjectHelper::new(data.annot_ref, pdf)
-            .get_page_content_for_appearance(
-                &resource_name,
-                page_rotate,
-                required_flags,
-                forbidden_flags,
-            )?;
-        let content = if content.is_empty() {
-            // The normal parsed route above is fully ObjectHandle-based. A
-            // small compatibility set of tests constructs multi-hop holder
-            // redirects with Pdf::set_object; normalize only that bridge
-            // data, then keep the qpdf placement/output implementation in
-            // AnnotationObjectHelper.
-            match read_xobj_bbox_and_matrix(pdf, data.xobj_ref)? {
-                (Some(bbox), matrix) => AnnotationObjectHelper::new(data.annot_ref, pdf)
-                    .get_page_content_for_selected_appearance_with_geometry(
-                        &resource_name,
-                        data.xobj_ref,
-                        page_rotate,
-                        required_flags,
-                        forbidden_flags,
-                        crate::annotation_helper::AppearanceContentOverrides::with_geometry(
-                            bbox, matrix, data.flags,
-                        ),
-                    )?,
-                (None, _) => Vec::new(),
+        let content = match &data.appearance {
+            AppearanceTarget::Canonical(_) => AnnotationObjectHelper::new(data.annot_ref, pdf)
+                .get_page_content_for_appearance(
+                    &resource_name,
+                    page_rotate,
+                    required_flags,
+                    forbidden_flags,
+                )?,
+            AppearanceTarget::Bridge(appearance_ref) => {
+                // This branch is limited to Pdf::set_object holder chains.
+                // The bridge normalizes only input values; qpdf placement,
+                // flag gating, stream mutation, and emitted content remain
+                // owned by AnnotationObjectHelper.
+                match read_xobj_bbox_and_matrix(pdf, *appearance_ref)? {
+                    (Some(bbox), matrix) => AnnotationObjectHelper::new(data.annot_ref, pdf)
+                        .get_page_content_for_selected_appearance_with_geometry(
+                            &resource_name,
+                            *appearance_ref,
+                            page_rotate,
+                            required_flags,
+                            forbidden_flags,
+                            crate::annotation_helper::AppearanceContentOverrides::with_geometry(
+                                bbox, matrix, data.flags,
+                            ),
+                        )?,
+                    (None, _) => Vec::new(),
+                }
             }
-        } else {
-            content
         };
         if content.is_empty() {
             continue;
         }
 
         // Register the Form XObject only when qpdf produced drawing content.
-        xobj_dict.insert(xobj_name.as_str(), Object::Reference(data.xobj_ref));
+        let xobject = match &data.appearance {
+            AppearanceTarget::Canonical(appearance) => match appearance.object_ref() {
+                Some(appearance_ref) => Object::Reference(appearance_ref),
+                None => appearance.materialize()?,
+            },
+            AppearanceTarget::Bridge(appearance_ref) => Object::Reference(*appearance_ref),
+        };
+        xobj_dict.insert(xobj_name.as_str(), xobject);
         append_bytes.extend_from_slice(&content);
         flattened_count += 1;
         if !qpdf_flag_contract {
@@ -644,6 +701,28 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Return whether a raw dictionary key has the in-memory holder shape created
+/// by `Pdf::set_object`: the key contains one reference whose stored value is
+/// another bare reference. Parsed PDF objects do not use this representation;
+/// their first referenced value is the terminal PDF object. This predicate is
+/// therefore the boundary that permits the compatibility bridge without
+/// broadening it to ordinary parsed indirect values.
+fn has_bare_reference_redirect<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    owner_ref: ObjectRef,
+    key: &str,
+) -> Result<bool> {
+    let value = match pdf.resolve(owner_ref)? {
+        Object::Dictionary(dict) => dict.get(key).cloned(),
+        Object::Stream(stream) => stream.dict.get(key).cloned(),
+        _ => None,
+    };
+    let Some(Object::Reference(reference)) = value else {
+        return Ok(false);
+    };
+    Ok(matches!(pdf.resolve(reference)?, Object::Reference(_)))
+}
 
 /// Read the annotation's `/F` flags integer, resolving indirect references.
 /// Returns 0 if absent (absence = no special flags).

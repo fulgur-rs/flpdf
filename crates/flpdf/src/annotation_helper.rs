@@ -399,9 +399,21 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
             return Ok(Vec::new());
         };
 
+        let flags = match overrides.flags {
+            Some(flags) => flags,
+            None => self.get_flags()?,
+        };
+        if (flags & forbidden_flags) != 0 {
+            return Ok(Vec::new());
+        }
+        if (flags & required_flags) != required_flags {
+            return Ok(Vec::new());
+        }
+
         let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
             return Ok(Vec::new());
         };
+
         let (bbox, matrix) = match overrides.geometry {
             Some((bbox, matrix)) => (bbox, matrix),
             None => {
@@ -414,17 +426,6 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
                 (bbox, matrix)
             }
         };
-
-        let flags = match overrides.flags {
-            Some(flags) => flags,
-            None => self.get_flags()?,
-        };
-        if (flags & forbidden_flags) != 0 {
-            return Ok(Vec::new());
-        }
-        if (flags & required_flags) != required_flags {
-            return Ok(Vec::new());
-        }
 
         let do_rotate = rotate != 0 && (flags & 0x10) != 0;
         let (rect, matrix) = if do_rotate {
