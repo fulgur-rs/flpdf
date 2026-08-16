@@ -28,9 +28,10 @@
 
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::filters::decode_stream_data;
+use crate::page_object_helper::PageObjectHelper;
 use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
@@ -52,42 +53,162 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
     if any_failures {
         return Ok(());
     }
-    let Some(used) = collect_used_names_for_page(pdf, page_ref)? else {
-        return Ok(());
-    };
-    let Some(mut resources) = crate::pages::resolve_inherited_resources(pdf, page_ref)? else {
-        return Ok(());
+
+    // The page action itself follows qpdf's canonical PageObjectHelper route:
+    // parsing stays on ObjectHandle callbacks and effective resources are
+    // copied through getAttribute(copy_if_shared=true). The Form pre-pass
+    // above remains separate because qpdf runs it before the page action and
+    // uses its unresolved-name accumulator to protect page resources.
+    let (finder, resources) = {
+        let mut helper = PageObjectHelper::new(page_ref, pdf);
+        let mut finder = ResourceFinder::default();
+        if helper.parse_contents(&mut finder).is_err()
+            || finder.had_diagnostics()
+            || finder.has_pending_operands()
+        {
+            return Ok(());
+        }
+        let resources = helper.get_resources(true)?;
+        (finder, resources)
     };
 
-    for category in [b"Font".as_slice(), b"XObject".as_slice()] {
-        let Some(value) = resources.get(category).cloned() else {
-            continue;
-        };
-        let Some(mut dictionary) = resolve_ref_chain(pdf, &value)?.0.into_dict() else {
-            continue;
-        };
-        let names = used.get(category).cloned().unwrap_or_default();
-        let remove = dictionary
-            .iter()
-            .filter(|(name, _)| !names.contains(*name) && !unresolved.contains(*name))
-            .map(|(name, _)| name.to_vec())
-            .collect::<Vec<_>>();
-        for name in remove {
-            dictionary.remove(&name);
-        }
-        resources.insert(category, Object::Dictionary(dictionary));
+    if resources.is_null() {
+        return Ok(());
     }
 
-    let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
-        // cov:ignore-start: page_ref comes from repaired get_all_pages and remains unmodified until this final write
-        return Err(Error::Unsupported(format!(
-            "page {page_ref} is not a dictionary"
-        )));
-        // cov:ignore-end
+    for category in [b"/Font".as_slice(), b"/XObject".as_slice()] {
+        let value = resources.get_key(category);
+        if value.is_null() {
+            continue;
+        }
+        pdf.resolve_object_handle(&value)?;
+        let dictionary = if value.is_indirect() {
+            let copy = value.shallow_copy()?;
+            resources.replace_key(category, copy.clone())?;
+            copy
+        } else {
+            value
+        };
+        if dictionary.as_dictionary().is_none() {
+            continue;
+        }
+        let category_name = &category[1..];
+        let names = finder
+            .names_by_resource_type()
+            .get(category_name)
+            .map(|entries| entries.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let remove = dictionary
+            .as_dictionary()
+            .into_iter()
+            .flat_map(|entries| entries.into_keys())
+            .filter(|name| {
+                let resource_name = name.strip_prefix(b"/").unwrap_or(name.as_slice());
+                !names
+                    .iter()
+                    .any(|used_name| used_name.as_slice() == resource_name)
+                    && !unresolved
+                        .iter()
+                        .any(|unresolved_name| unresolved_name.as_slice() == resource_name)
+            })
+            .collect::<Vec<_>>();
+        for name in remove {
+            dictionary.remove_key(&name);
+        }
+        pdf.mark_object_handle_dirty(&dictionary)?;
+    }
+
+    pdf.mark_object_handle_dirty(&resources)
+}
+
+/// qpdf's Form-XObject target route for
+/// `QPDFPageObjectHelper::removeUnreferencedResources`.
+///
+/// The page route above retains the document helper's unresolved-name
+/// accumulator because page resources may be referenced by a resource-less
+/// descendant Form. A Form helper has no containing page scope, so its nested
+/// Forms are pruned first through the same canonical ObjectHandle parser, then
+/// the requested Form is pruned.
+pub(crate) fn remove_unreferenced_resources_on_form<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    form: ObjectHandle,
+) -> Result<()> {
+    let mut nested_forms = Vec::new();
+    {
+        let mut helper = PageObjectHelper::from_object_handle(form.clone(), pdf);
+        helper.for_each_form_xobject(true, |nested, _, _| {
+            nested_forms.push(nested);
+            Ok(())
+        })?;
+    }
+
+    for nested in nested_forms {
+        prune_canonical_resource_target(pdf, nested)?;
+    }
+    prune_canonical_resource_target(pdf, form)
+}
+
+/// Prune a single canonical page/Form target after its content has been
+/// parsed by [`ResourceFinder`]. This is the ObjectHandle counterpart of
+/// qpdf's `removeUnreferencedResourcesHelper` resource-dictionary mutation.
+fn prune_canonical_resource_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    target: ObjectHandle,
+) -> Result<()> {
+    let (finder, resources) = {
+        let mut helper = PageObjectHelper::from_object_handle(target, pdf);
+        let mut finder = ResourceFinder::default();
+        if helper.parse_contents(&mut finder).is_err()
+            || finder.had_diagnostics()
+            || finder.has_pending_operands()
+        {
+            return Ok(());
+        }
+        let resources = helper.get_resources(true)?;
+        (finder, resources)
     };
-    page.insert("Resources", Object::Dictionary(resources));
-    pdf.set_object(page_ref, Object::Dictionary(page));
-    Ok(())
+
+    if resources.is_null() {
+        return Ok(());
+    }
+
+    for category in [b"/Font".as_slice(), b"/XObject".as_slice()] {
+        let value = resources.get_key(category);
+        if value.is_null() {
+            continue;
+        }
+        pdf.resolve_object_handle(&value)?;
+        let dictionary = if value.is_indirect() {
+            let copy = value.shallow_copy()?;
+            resources.replace_key(category, copy.clone())?;
+            copy
+        } else {
+            value
+        };
+        let Some(entries) = dictionary.as_dictionary() else {
+            continue;
+        };
+        let category_name = &category[1..];
+        let names = finder
+            .names_by_resource_type()
+            .get(category_name)
+            .map(|entries| entries.keys().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let remove = entries
+            .keys()
+            .filter(|key| {
+                let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+                !names.iter().any(|used| used.as_slice() == name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in remove {
+            dictionary.remove_key(&key);
+        }
+        pdf.mark_object_handle_dirty(&dictionary)?;
+    }
+
+    pdf.mark_object_handle_dirty(&resources)
 }
 
 /// Mirror qpdf's `forEachFormXObject(true, ...)` pre-pass for a page-resource

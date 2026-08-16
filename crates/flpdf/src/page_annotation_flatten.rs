@@ -86,9 +86,11 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     page_ref: ObjectRef,
     mode: FlattenMode,
 ) -> Result<usize> {
-    // ── Step 1: enumerate annotation handles without reading /Rect ────────
-    // qpdf's page helper obtains annotation handles first; the annotation
-    // helper validates /Rect only after the flags gate in
+    // ── Step 1: enumerate annotations without reading /Rect ──────────────
+    // qpdf's page helper obtains canonical annotation handles first; this
+    // compatibility consumer projects them to indirect refs because the
+    // downstream appearance/flag API is ref-based. The annotation helper
+    // validates /Rect only after the flags gate in
     // getPageContentForAppearance. Keep this route lazy instead of using
     // enumerate_page_annotations, whose public projection intentionally
     // materializes /Rect for its callers.
@@ -616,7 +618,7 @@ fn page_annotation_refs<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Vec<ObjectRef>> {
     let mut page_helper = PageObjectHelper::new(page_ref, pdf);
-    page_helper.get_annotations()
+    page_helper.get_annotations_filtered(None)
 }
 
 fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Object>> {

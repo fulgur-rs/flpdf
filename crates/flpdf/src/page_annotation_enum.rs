@@ -1,7 +1,8 @@
 //! qpdf correspondence: QPDFPageObjectHelper.cc annotation enumeration.
 //! Per-page annotation enumeration and widget-to-field linkage.
 //!
-//! [`enumerate_page_annotations`] reads the `/Annots` array of a leaf page,
+//! [`enumerate_page_annotations`] reads the canonical `/Annots` handle list of
+//! a leaf page, projects indirect entries to the ref-based public result, and
 //! resolves each annotation's `/Subtype` and `/Rect` via
 //! [`AnnotationObjectHelper`], and for Widget annotations resolves the owning
 //! AcroForm field object.
@@ -76,8 +77,9 @@ pub struct EnumeratedAnnotation {
 ///
 /// # Algorithm
 ///
-/// 1. Call [`PageObjectHelper::get_annotations`] to obtain the ordered list of
-///    annotation [`ObjectRef`]s from `/Annots`.
+/// 1. Call [`PageObjectHelper::get_annotations_filtered`] to obtain the
+///    ordered indirect annotation [`ObjectRef`] projection from the canonical
+///    `/Annots` handle list.
 /// 2. For each ref, use [`AnnotationObjectHelper`] to read `/Subtype` and
 ///    `/Rect`.
 /// 3. Determine [`EnumeratedAnnotation::is_widget`].
@@ -143,7 +145,7 @@ fn enumerate_page_annotations_with_cache<R: Read + Seek>(
     // Step 1: obtain annotation refs (PageObjectHelper is dropped after this call).
     let annot_refs = {
         let mut page_helper = PageObjectHelper::new(page_ref, pdf);
-        page_helper.get_annotations()?
+        page_helper.get_annotations_filtered(None)?
     };
 
     let mut result = Vec::with_capacity(annot_refs.len());
