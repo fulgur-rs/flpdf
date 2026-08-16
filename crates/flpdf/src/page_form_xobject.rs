@@ -204,7 +204,7 @@ where
     let mut xobject_refs = Vec::with_capacity(source_page_refs.len());
     let mut union: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in source_page_refs {
-        let xobject_ref = get_form_xobject_for_page(source, page_ref)?; // cov:ignore: import_pages_as_form_xobjects has no callers yet (pre-existing gap, unrelated to this rename)
+        let xobject_ref = get_form_xobject_for_page(source, page_ref)?;
         union.extend(xobject_object_closure(source, xobject_ref)?);
         xobject_refs.push(xobject_ref);
     }
