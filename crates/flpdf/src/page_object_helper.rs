@@ -132,7 +132,7 @@ use crate::ref_chain::resolve_ref_chain;
 use crate::token_filter::TokenFilter;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -175,7 +175,8 @@ impl PageBox {
 /// bounding boxes. All operations are delegated to the underlying `Pdf<R>`
 /// infrastructure; no state is cached inside this struct.
 pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
-    page_ref: ObjectRef,
+    object: ObjectHandle,
+    page_ref: Option<ObjectRef>,
     pdf: &'a mut Pdf<R>,
 }
 
@@ -207,7 +208,46 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// The helper does not validate this at construction time — methods will
     /// propagate errors when given a non-`/Page` reference.
     pub fn new(page_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
-        Self { page_ref, pdf }
+        let object = pdf.get_object_handle(page_ref);
+        Self {
+            object,
+            page_ref: Some(page_ref),
+            pdf,
+        }
+    }
+
+    /// Create a helper over a page or Form XObject handle.
+    ///
+    /// A Form XObject is represented by its stream handle; page attributes are
+    /// read from the stream dictionary and do not walk a page-tree parent
+    /// chain, matching qpdf's `QPDFPageObjectHelper(QPDFObjectHandle)`.
+    pub fn from_object_handle(object: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+        let page_ref = object.object_ref();
+        Self {
+            object,
+            page_ref,
+            pdf,
+        }
+    }
+
+    fn target_description(&self) -> String {
+        self.page_ref
+            .map(|object_ref| object_ref.to_string())
+            .unwrap_or_else(|| "direct object".to_owned())
+    }
+
+    fn require_page_ref(&self) -> Result<ObjectRef> {
+        self.page_ref.ok_or_else(|| {
+            Error::Unsupported("operation requires a page object reference".to_owned())
+        })
+    }
+
+    /// Resolve the target and return whether it is a Form XObject. Page
+    /// dictionaries and Form stream dictionaries are the only supported qpdf
+    /// PageObjectHelper targets.
+    fn resolved_attribute_target(&mut self) -> Result<(ObjectHandle, bool)> {
+        let description = self.target_description();
+        resolve_attribute_target(self.pdf, self.object.clone(), &description)
     }
 
     /// Return the live canonical handle for this page after validating its
@@ -216,33 +256,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// subsequent page attributes and mutations operate on the resolver-backed
     /// object graph rather than on a legacy `Object` snapshot.
     fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
-        let page = self.pdf.get_object_handle(self.page_ref);
-        self.pdf.resolve_object_handle(&page)?;
-        if page.as_dictionary().is_none() {
+        let (object, is_form) = self.resolved_attribute_target()?;
+        if is_form {
             return Err(Error::Unsupported(format!(
-                "object {} is not a dictionary, cannot use as a page",
-                self.page_ref
+                "object {} is a Form XObject, expected /Type /Page",
+                self.target_description()
             )));
         }
-
-        let page_type = page.try_get_key(b"/Type")?;
-        self.pdf.resolve_object_handle(&page_type)?;
-        match page_type.as_name() {
-            Some(name) if name.as_slice() == b"Page" => Ok(page),
-            Some(name) => Err(Error::Unsupported(format!(
-                "object {} has /Type /{}, expected /Page",
-                self.page_ref,
-                String::from_utf8_lossy(&name)
-            ))),
-            None if page.has_key(b"/Type") => Err(Error::Unsupported(format!(
-                "object {} has a non-name /Type entry",
-                self.page_ref
-            ))),
-            None => Err(Error::Unsupported(format!(
-                "object {} has no /Type entry",
-                self.page_ref
-            ))),
-        }
+        Ok(object)
     }
 
     /// Return a live page attribute, applying qpdf's page-tree inheritance
@@ -255,55 +276,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:224-260`).
     /// Missing and null attributes return a direct null handle.
     pub fn get_attribute(&mut self, key: &[u8], copy_if_shared: bool) -> Result<ObjectHandle> {
-        let page = self.resolved_page_handle()?;
-        let inheritable = matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate");
-        let mut result = self
-            .pdf
-            .resolve_object_handle_to_terminal(&page.try_get_key(key)?)?;
-        let mut inherited = false;
-
-        if result.is_null() && inheritable {
-            let mut node = page.clone();
-            let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
-            let mut depth = 0usize;
-            loop {
-                if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                    return Err(Error::Unsupported(format!(
-                        "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {}",
-                        self.page_ref
-                    )));
-                }
-                if !seen.insert(node.identity_key()) {
-                    break;
-                }
-
-                let parent = self
-                    .pdf
-                    .resolve_object_handle_to_terminal(&node.try_get_key(b"/Parent")?)?;
-                if parent.is_null() {
-                    break;
-                }
-                node = parent;
-                depth += 1;
-
-                let candidate = self
-                    .pdf
-                    .resolve_object_handle_to_terminal(&node.try_get_key(key)?)?;
-                if !candidate.is_null() {
-                    result = candidate;
-                    inherited = true;
-                    break;
-                }
-            }
-        }
-
-        if copy_if_shared && (inherited || result.is_indirect()) {
-            let copy = result.shallow_copy()?;
-            page.replace_key(key, copy.clone())?;
-            self.pdf.mark_object_handle_dirty(&page)?;
-            result = copy;
-        }
-        Ok(result)
+        let description = self.target_description();
+        get_attribute_for_target(
+            self.pdf,
+            self.object.clone(),
+            key,
+            copy_if_shared,
+            &description,
+        )
     }
 
     /// Return the effective `/MediaBox` handle.
@@ -376,7 +356,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if !copy_if_fallback || fallback.is_null() {
             return Ok(fallback);
         }
-        let page = self.resolved_page_handle()?;
+        let (_, is_form) = self.resolved_attribute_target()?;
+        let page = if is_form {
+            self.object.as_stream_dict().ok_or_else(|| {
+                Error::Unsupported("Form XObject has no stream dictionary".to_owned())
+            })?
+        } else {
+            self.object.clone()
+        };
         let copy = fallback.shallow_copy()?;
         page.replace_key(key, copy.clone())?;
         self.pdf.mark_object_handle_dirty(&page)?;
@@ -389,16 +376,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// dictionary) cannot be misread as a page and return plausible but
     /// incorrect inherited/default metadata.
     fn ensure_leaf_page(&mut self) -> Result<()> {
-        let obj = self.pdf.resolve_borrowed(self.page_ref)?;
-        match obj {
-            Object::Dictionary(ref d) if matches!(d.get("Type"), Some(Object::Name(n)) if n == b"Page") => {
-                Ok(())
-            }
-            _ => Err(Error::Unsupported(format!(
-                "object {} is not a /Type /Page dictionary",
-                self.page_ref
-            ))),
-        }
+        self.resolved_page_handle().map(|_| ())
     }
 
     // -----------------------------------------------------------------------
@@ -439,7 +417,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```
     pub fn content_stream_objects(&mut self) -> Result<Vec<Object>> {
         self.ensure_leaf_page()?;
-        let raw = crate::pages::page_content_bytes(self.pdf, self.page_ref)?;
+        let page_ref = self.require_page_ref()?;
+        let raw = crate::pages::page_content_bytes(self.pdf, page_ref)?;
         let mut callbacks = ObjectRecordingCallbacks::default();
         parse_content_stream_data(&raw, &mut callbacks)?;
         Ok(callbacks.objects)
@@ -546,6 +525,131 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.get_attribute(b"/Resources", copy_if_shared)
     }
 
+    /// Visit every XObject directly reachable from this page or Form XObject.
+    ///
+    /// The callback receives the XObject handle, its containing `/XObject`
+    /// dictionary handle, and the decoded resource key. With `recursive=true`,
+    /// Form XObjects are visited breadth-first and canonical identity prevents
+    /// cycles, matching qpdf's `forEachXObject` traversal
+    /// (`libqpdf/QPDFPageObjectHelper.cc:318-357`).
+    pub fn for_each_xobject<F>(&mut self, recursive: bool, action: F) -> Result<()>
+    where
+        F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
+    {
+        self.for_each_xobject_filtered(recursive, |_| Ok(true), action)
+    }
+
+    fn for_each_xobject_filtered<S, F>(
+        &mut self,
+        recursive: bool,
+        mut selector: S,
+        mut action: F,
+    ) -> Result<()>
+    where
+        S: FnMut(&ObjectHandle) -> Result<bool>,
+        F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
+    {
+        let root = self.resolved_attribute_target()?.0;
+        let mut queue = VecDeque::from([root]);
+        let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
+
+        while let Some(node) = queue.pop_front() {
+            if !seen.insert(node.identity_key()) {
+                continue;
+            }
+
+            let node_description = object_handle_description(&node);
+            let resources = get_attribute_for_target(
+                self.pdf,
+                node.clone(),
+                b"/Resources",
+                false,
+                &node_description,
+            )?;
+            if resources.is_null() {
+                continue;
+            }
+            let xobjects = self
+                .pdf
+                .resolve_object_handle_to_terminal(&resources.try_get_key(b"/XObject")?)?;
+            let Some(entries) = xobjects.as_dictionary() else {
+                continue;
+            };
+
+            for (key, value) in entries {
+                let object = self.pdf.resolve_object_handle_to_terminal(&value)?;
+                if selector(&object)? {
+                    action(object.clone(), xobjects.clone(), key)?;
+                }
+                if recursive && object.is_form_xobject()? {
+                    queue.push_back(object);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit image XObjects, optionally recursing through nested Forms.
+    pub fn for_each_image<F>(&mut self, recursive: bool, action: F) -> Result<()>
+    where
+        F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
+    {
+        self.for_each_xobject_filtered(recursive, |object| object.is_image(false), action)
+    }
+
+    /// Visit Form XObjects, optionally recursing through nested Forms.
+    pub fn for_each_form_xobject<F>(&mut self, recursive: bool, action: F) -> Result<()>
+    where
+        F: FnMut(ObjectHandle, ObjectHandle, Vec<u8>) -> Result<()>,
+    {
+        self.for_each_xobject_filtered(recursive, |object| object.is_form_xobject(), action)
+    }
+
+    /// Return direct image XObjects keyed by their resource names.
+    pub fn get_images(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        let mut result = BTreeMap::new();
+        self.for_each_image(false, |object, _, key| {
+            result.insert(key, object);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    /// qpdf's old `getPageImages` name for [`Self::get_images`].
+    pub fn get_page_images(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        self.get_images()
+    }
+
+    /// Return direct Form XObjects keyed by their resource names.
+    pub fn get_form_xobjects(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        let mut result = BTreeMap::new();
+        self.for_each_form_xobject(false, |object, _, key| {
+            result.insert(key, object);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    /// Return image XObjects from this target and all nested Forms.
+    pub fn get_images_recursive(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        let mut result = BTreeMap::new();
+        self.for_each_image(true, |object, _, key| {
+            result.insert(key, object);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    /// Return Form XObjects from this target and all nested Forms.
+    pub fn get_form_xobjects_recursive(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        let mut result = BTreeMap::new();
+        self.for_each_form_xobject(true, |object, _, key| {
+            result.insert(key, object);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
     /// Return the effective `/Resources` dictionary for this page, walking up
     /// the `/Parent` chain until one is found.
     ///
@@ -584,7 +688,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             Object::Dictionary(dictionary) => Ok(Some(dictionary)),
             other => Err(Error::Unsupported(format!(
                 "/Resources on page {} has unexpected type {}",
-                self.page_ref,
+                self.target_description(),
                 object_type_name(&other)
             ))),
         }
@@ -627,7 +731,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```
     pub fn rotate(&mut self) -> Result<i32> {
         self.ensure_leaf_page()?;
-        resolve_inherited_rotate(self.pdf, self.page_ref)
+        let page_ref = self.require_page_ref()?;
+        resolve_inherited_rotate(self.pdf, page_ref)
     }
 
     // -----------------------------------------------------------------------
@@ -669,11 +774,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// ```
     pub fn get_annotations(&mut self) -> Result<Vec<ObjectRef>> {
         self.ensure_leaf_page()?;
-        let page_obj = self.pdf.resolve_borrowed(self.page_ref)?;
+        let page_ref = self.require_page_ref()?;
+        let page_obj = self.pdf.resolve_borrowed(page_ref)?;
         let Object::Dictionary(page_dict) = page_obj else {
             return Err(Error::Unsupported(format!(
                 "object {} is not a dictionary, cannot read /Annots",
-                self.page_ref
+                page_ref
             )));
         };
 
@@ -696,7 +802,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                     _ => {
                         return Err(Error::Unsupported(format!(
                             "/Annots reference {r} on page {} does not resolve to an array",
-                            self.page_ref
+                            page_ref
                         )));
                     }
                 }
@@ -704,7 +810,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             other => {
                 return Err(Error::Unsupported(format!(
                     "/Annots on page {} has unexpected type {}",
-                    self.page_ref,
+                    page_ref,
                     object_type_name(&other)
                 )));
             }
@@ -717,7 +823,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 other => {
                     return Err(Error::Unsupported(format!(
                         "/Annots element {i} on page {} has type {} (expected reference)",
-                        self.page_ref,
+                        page_ref,
                         object_type_name(other)
                     )));
                 }
@@ -898,7 +1004,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             return Err(Error::Unsupported(format!(
                 "{} on page {} does not resolve to an array",
                 String::from_utf8_lossy(key),
-                self.page_ref
+                self.target_description()
             )));
         };
         if items.len() < 4 {
@@ -932,6 +1038,104 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 // ---------------------------------------------------------------------------
 // Private free functions
 // ---------------------------------------------------------------------------
+
+fn object_handle_description(object: &ObjectHandle) -> String {
+    object
+        .object_ref()
+        .map(|object_ref| object_ref.to_string())
+        .unwrap_or_else(|| "direct object".to_owned())
+}
+
+fn resolve_attribute_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: ObjectHandle,
+    description: &str,
+) -> Result<(ObjectHandle, bool)> {
+    pdf.resolve_object_handle(&object)?;
+    if object.is_form_xobject()? {
+        return Ok((object, true));
+    }
+    if object.as_dictionary().is_none() {
+        return Err(Error::Unsupported(format!(
+            "object {description} is not a page dictionary or Form XObject"
+        )));
+    }
+
+    let page_type = object.try_get_key(b"/Type")?;
+    pdf.resolve_object_handle(&page_type)?;
+    match page_type.as_name() {
+        Some(name) if name.as_slice() == b"Page" => Ok((object, false)),
+        Some(name) => Err(Error::Unsupported(format!(
+            "object {description} has /Type /{}, expected /Page",
+            String::from_utf8_lossy(&name)
+        ))),
+        None if object.has_key(b"/Type") => Err(Error::Unsupported(format!(
+            "object {description} has a non-name /Type entry"
+        ))),
+        None => Err(Error::Unsupported(format!(
+            "object {description} has no /Type entry"
+        ))),
+    }
+}
+
+fn get_attribute_for_target<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: ObjectHandle,
+    key: &[u8],
+    copy_if_shared: bool,
+    description: &str,
+) -> Result<ObjectHandle> {
+    let (object, is_form) = resolve_attribute_target(pdf, object, description)?;
+    let dict = if is_form {
+        object.as_stream_dict().ok_or_else(|| {
+            Error::Unsupported(format!("object {description} is not a Form stream"))
+        })?
+    } else {
+        object.clone()
+    };
+    let inheritable =
+        !is_form && matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate");
+    let mut result = pdf.resolve_object_handle_to_terminal(&dict.try_get_key(key)?)?;
+    let mut inherited = false;
+
+    if result.is_null() && inheritable {
+        let mut node = dict.clone();
+        let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
+        let mut depth = 0usize;
+        loop {
+            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+                return Err(Error::Unsupported(format!(
+                    "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {description}"
+                )));
+            }
+            if !seen.insert(node.identity_key()) {
+                break;
+            }
+
+            let parent = pdf.resolve_object_handle_to_terminal(&node.try_get_key(b"/Parent")?)?;
+            if parent.is_null() {
+                break;
+            }
+            node = parent;
+            depth += 1;
+
+            let candidate = pdf.resolve_object_handle_to_terminal(&node.try_get_key(key)?)?;
+            if !candidate.is_null() {
+                result = candidate;
+                inherited = true;
+                break;
+            }
+        }
+    }
+
+    if copy_if_shared && (inherited || result.is_indirect()) {
+        let copy = result.shallow_copy()?;
+        dict.replace_key(key, copy.clone())?;
+        pdf.mark_object_handle_dirty(&dict)?;
+        result = copy;
+    }
+    Ok(result)
+}
 
 fn object_type_name(obj: &Object) -> &'static str {
     match obj {

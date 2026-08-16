@@ -172,6 +172,72 @@ fn get_page_contents_returns_canonical_stream_handles() {
 }
 
 #[test]
+fn form_xobject_helper_reads_attributes_from_the_stream_dictionary() {
+    let form = (
+        4u32,
+        b"4 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 20] /Resources << /XObject << >> >> /Length 1 >>\nstream\nx\nendstream\nendobj\n".to_vec(),
+    );
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 612 792]", "", &[form]);
+    let mut pdf = open(bytes);
+    let form_handle = pdf.get_object_handle(ObjectRef::new(4, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+
+    let bbox = helper
+        .get_attribute(b"/BBox", false)
+        .expect("Form XObject attributes should use its stream dictionary");
+    assert_eq!(bbox.as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn xobject_maps_follow_qpdf_direct_and_recursive_boundaries() {
+    let image = (
+        4u32,
+        b"4 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Length 1 >>\nstream\nx\nendstream\nendobj\n".to_vec(),
+    );
+    let form = (
+        5u32,
+        b"5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 20] /Resources << /XObject << /NestedImage 4 0 R >> >> /Length 1 >>\nstream\nx\nendstream\nendobj\n".to_vec(),
+    );
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792] /Resources << /XObject << /PageImage 4 0 R /PageForm 5 0 R >> >>",
+        "",
+        &[image, form],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let direct_images = helper.get_images().expect("direct images should resolve");
+    assert_eq!(direct_images.len(), 1);
+    assert_eq!(
+        direct_images
+            .get(b"/PageImage".as_slice())
+            .unwrap()
+            .object_ref(),
+        Some(ObjectRef::new(4, 0))
+    );
+    assert_eq!(helper.get_form_xobjects().unwrap().len(), 1);
+
+    let mut recursive_images = helper
+        .get_images_recursive()
+        .expect("recursive images should resolve");
+    assert_eq!(
+        recursive_images
+            .remove(b"/PageImage".as_slice())
+            .unwrap()
+            .object_ref(),
+        Some(ObjectRef::new(4, 0))
+    );
+    assert_eq!(
+        recursive_images
+            .remove(b"/NestedImage".as_slice())
+            .unwrap()
+            .object_ref(),
+        Some(ObjectRef::new(4, 0))
+    );
+    assert!(recursive_images.is_empty());
+}
+
+#[test]
 fn add_page_contents_uses_canonical_handles_and_preserves_order() {
     let first_body = b"Q";
     let (num, extra) = make_stream_object(4, first_body);
