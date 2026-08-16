@@ -327,7 +327,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
 
         let resource_name = format!("/{xobj_name}");
-        let content = (match &data.appearance {
+        let content_result = match &data.appearance {
             AppearanceTarget::Canonical(_) => AnnotationObjectHelper::new(data.annot_ref, pdf)
                 .get_page_content_for_appearance(
                     &resource_name,
@@ -355,7 +355,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
                     (None, _) => Ok(Vec::new()),
                 }
             }
-        })?;
+        };
+        let content = content_result?;
         if content.is_empty() {
             continue;
         }
