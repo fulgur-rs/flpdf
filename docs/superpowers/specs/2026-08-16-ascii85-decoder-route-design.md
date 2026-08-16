@@ -2,7 +2,9 @@
 
 ## Status
 
-Approved by the user on 2026-08-16. Implementation is pending spec review.
+Approved by the user on 2026-08-16 and implemented on branch
+`feature/flpdf-ascii85-decoder-route`. The status and topology below describe
+the post-cutover tree unless a section is explicitly marked historical.
 
 ## Goal
 
@@ -29,38 +31,45 @@ Pinned qpdf 11.9.0 is authoritative:
   side adds only Flate compression and content normalization; it does not add
   an ASCII85 encoder.
 
-The current Rust route inventory is:
+Post-cutover Rust route inventory:
 
 | Route | Current location | Responsibility | Decision |
 | --- | --- | --- | --- |
-| Canonical decoder | `crates/flpdf/src/pipeline/ascii85.rs` plus `stream_filter.rs` | qpdf-shaped streaming decode stage and factory wiring | Rename the module file to `ascii85_decoder.rs`; preserve behavior |
-| Legacy encoder | `crates/flpdf/src/ascii85.rs` plus `filters.rs` | flpdf-only whole-buffer ASCII85 encoding used by encode helpers and test fixture construction | Delete production implementation and callers |
+| Canonical decoder | `crates/flpdf/src/pipeline/ascii85_decoder.rs` plus `stream_filter.rs` | qpdf-shaped streaming decode stage and factory wiring | Retained as the sole production ASCII85 route |
+| Encode boundary | `crates/flpdf/src/filters.rs` | Public encode API surface for `/Filter`-driven writer helpers | `/ASCII85Decode` returns `Error::Unsupported`; no production ASCII85 encoder exists |
 
-The legacy route is not repaired or moved into the decoder module. Moving it
-would preserve a qpdf-nonexistent responsibility and would mix encode and
-decode ownership in one qpdf-correspondence module.
+Historical pre-cutover inventory (kept for review/audit context only):
+
+| Route | Former location | Responsibility | Cutover outcome |
+| --- | --- | --- | --- |
+| Canonical decoder | `crates/flpdf/src/pipeline/ascii85.rs` plus `stream_filter.rs` | qpdf-shaped streaming decode stage and factory wiring | Renamed to `ascii85_decoder.rs` with behavior preserved |
+| Legacy encoder | `crates/flpdf/src/ascii85.rs` plus `filters.rs` | flpdf-only whole-buffer ASCII85 encoding used by encode helpers and test fixture construction | Deleted from production code; test fixtures use test-only helpers or fixed bytes |
+
+The deleted legacy route was not repaired or moved into the decoder module.
+Moving it would preserve a qpdf-nonexistent responsibility and would mix
+encode and decode ownership in one qpdf-correspondence module.
 
 ## Architecture and migration
 
-1. Rename `crates/flpdf/src/pipeline/ascii85.rs` to
+1. `crates/flpdf/src/pipeline/ascii85.rs` was renamed to
    `crates/flpdf/src/pipeline/ascii85_decoder.rs`.
-2. Change the pipeline module declaration and all imports, including
-   `stream_filter.rs` and the live codec-oracle tests, to
+2. The pipeline module declaration and imports, including `stream_filter.rs`
+   and the live codec-oracle tests, now use
    `pipeline::ascii85_decoder::Ascii85Decoder`.
-3. Delete `crates/flpdf/src/ascii85.rs` and its root module declaration.
-4. Remove the `ASCII85Decode` branch from
+3. `crates/flpdf/src/ascii85.rs` and its root module declaration were deleted.
+4. The `ASCII85Decode` branch was removed from
    `filters::apply_single_filter_encode`. The existing public
    `filters::encode_stream_data` and crate-internal handle variant retain their
    API shape, but return a clear `Unsupported` error for an ASCII85 encode
    request.
-5. Keep the production decode path unchanged: `Ascii85StreamFilter` continues
-   to construct one streaming decoder and the existing downstream/error
-   contracts remain authoritative.
-6. Replace production-test fixture construction that currently calls the
-   encoder with fixed encoded payloads or test-only helpers. No test helper may
-   be imported by production code.
-7. Update qpdf correspondence/module-index documentation so the old encoder
-   mapping is removed and the decoder mapping points to the new filename.
+5. The production decode path stayed unchanged: `Ascii85StreamFilter`
+   continues to construct one streaming decoder and the existing
+   downstream/error contracts remain authoritative.
+6. Production-test fixture construction that had called the encoder now uses
+   fixed encoded payloads or test-only helpers. No test helper is imported by
+   production code.
+7. qpdf correspondence/module-index documentation now removes the old encoder
+   mapping and points the decoder mapping at the new filename.
 
 This is one bounded cutover: the canonical decoder consumer is already wired,
 so no bridge caller remains after the rename. The only intentional behavior
@@ -84,7 +93,7 @@ change is that encode requests for ASCII85 become unsupported.
 
 ## Testing strategy
 
-The first implementation test is RED and exercises the canonical public encode
+The implementation was gated by a RED test on the canonical public encode
 boundary:
 
 - Add a focused test proving `encode_stream_data` rejects an ASCII85 encode

@@ -357,8 +357,12 @@ pub fn decode_stream_data_with_limits(
     )
 }
 
-/// Encode `stream_data` by applying the stream dictionary's `/Filter` chain,
-/// the inverse of [`decode_stream_data`].
+/// Encode `stream_data` by applying the stream dictionary's `/Filter` chain.
+///
+/// This is not a perfect inverse of [`decode_stream_data`]. In particular,
+/// `/ASCII85Decode` intentionally returns [`Error::Unsupported`]: qpdf exposes
+/// the ASCII85 decoder in its stream pipeline, but does not provide a
+/// corresponding ASCII85 encoder.
 ///
 /// Every PNG predictor encodes with the Up row filter, so `/Predictor 10`
 /// through `/Predictor 15` produce identical output. The predictor number is
@@ -374,6 +378,8 @@ pub fn decode_stream_data_with_limits(
 /// - `/Filter` is neither a name nor an array of names.
 /// - `/DecodeParms` selects an unsupported `/Predictor` or an invalid row
 ///   geometry, on the same terms as [`decode_stream_data`].
+/// - a filter is decode-only on the encode path, including `/ASCII85Decode`
+///   and `LZWDecode`.
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
