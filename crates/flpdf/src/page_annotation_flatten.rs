@@ -23,8 +23,8 @@ use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
-    AnnotationObjectHelper, Dictionary, Error, Matrix, Object, ObjectHandle, ObjectRef, Pdf,
-    Rectangle, Result, Stream,
+    AnnotationObjectHelper, Dictionary, Error, Matrix, Object, ObjectHandle, ObjectRef,
+    PageObjectHelper, Pdf, Rectangle, Result, Stream,
 };
 use std::io::{Read, Seek};
 
@@ -87,8 +87,16 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     page_ref: ObjectRef,
     mode: FlattenMode,
 ) -> Result<usize> {
-    // ── Step 1: enumerate all annotations on the page ─────────────────────
-    let all_annots = enumerate_page_annotations(pdf, page_ref)?;
+    // ── Step 1: enumerate annotation handles without reading /Rect ────────
+    // qpdf's page helper obtains annotation handles first; the annotation
+    // helper validates /Rect only after the flags gate in
+    // getPageContentForAppearance. Keep this route lazy instead of using
+    // enumerate_page_annotations, whose public projection intentionally
+    // materializes /Rect for its callers.
+    let annot_refs = {
+        let mut page_helper = PageObjectHelper::new(page_ref, pdf);
+        page_helper.get_annotations()?
+    };
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───
     enum AppearanceTarget {
@@ -129,18 +137,18 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             } => (true, skip_widgets, page_rotate, required, forbidden),
         };
 
-    for ea in &all_annots {
-        if skip_widgets && ea.is_widget {
+    for annot_ref in annot_refs {
+        if skip_widgets && AnnotationObjectHelper::new(annot_ref, pdf).get_subtype()? == b"Widget" {
             continue;
         }
         // Read /F through the canonical helper first. A zero result is also
         // qpdf's fail-soft value for absent/non-integer /F. Only a detected
         // Pdf::set_object holder redirect may use the compatibility bridge.
-        let canonical_flags = AnnotationObjectHelper::new(ea.annot_ref, pdf).get_flags()?;
+        let canonical_flags = AnnotationObjectHelper::new(annot_ref, pdf).get_flags()?;
         let legacy_flag_redirect =
-            canonical_flags == 0 && has_bare_reference_redirect(pdf, ea.annot_ref, "F")?;
+            canonical_flags == 0 && has_bare_reference_redirect(pdf, annot_ref, "F")?;
         let flags = if legacy_flag_redirect {
-            read_annot_flags(pdf, ea.annot_ref)?
+            read_annot_flags(pdf, annot_ref)?
         } else {
             canonical_flags
         };
@@ -155,7 +163,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // Once /AP is present, a missing selected /N stream is itself a
         // flattening/removal outcome (for example an unchecked checkbox).
         let (appearance_dictionary, appearance) = {
-            let mut helper = AnnotationObjectHelper::new(ea.annot_ref, pdf);
+            let mut helper = AnnotationObjectHelper::new(annot_ref, pdf);
             (
                 helper.get_appearance_dictionary()?,
                 helper.get_appearance_stream(b"N", None)?,
@@ -167,11 +175,11 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             // A bare-reference value is the in-memory holder shape, not a
             // qpdf parsed object. Ask the bridge whether its terminal value
             // is actually null before deciding whether to prune it.
-            annotation_has_appearance_dictionary(pdf, ea.annot_ref)?
+            annotation_has_appearance_dictionary(pdf, annot_ref)?
         } else {
             true
         };
-        let legacy_appearance_redirect = has_bare_reference_redirect(pdf, ea.annot_ref, "AP")?
+        let legacy_appearance_redirect = has_bare_reference_redirect(pdf, annot_ref, "AP")?
             || has_bare_reference_redirect_in_handle(pdf, &appearance_dictionary, b"/N")?
             || if let Some(appearance_ref) = appearance_dictionary.object_ref() {
                 has_bare_reference_redirect(pdf, appearance_ref, "N")?
@@ -194,15 +202,15 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         } else {
             if !legacy_appearance_redirect {
                 if qpdf_flag_contract && has_appearance {
-                    to_remove.push(ea.annot_ref);
+                    to_remove.push(annot_ref);
                 }
                 continue;
             }
-            match resolve_ap_n(pdf, ea.annot_ref)? {
+            match resolve_ap_n(pdf, annot_ref)? {
                 Some(appearance_ref) => AppearanceTarget::Bridge(appearance_ref),
                 None => {
                     if qpdf_flag_contract && has_appearance {
-                        to_remove.push(ea.annot_ref);
+                        to_remove.push(annot_ref);
                     }
                     continue;
                 }
@@ -225,25 +233,27 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
         if !eligible {
             if qpdf_flag_contract {
-                to_remove.push(ea.annot_ref);
+                to_remove.push(annot_ref);
             }
             continue;
         }
         if qpdf_flag_contract {
-            to_remove.push(ea.annot_ref);
+            to_remove.push(annot_ref);
         }
-
-        // Read /Rect from the enumerated annotation (already resolved by enum).
-        let rect = match &ea.rect {
-            Some(r) => *r,
-            None => continue, // no rect — cannot place
-        };
 
         // The retained test-only legacy modes predate qpdf's direct flag API
         // and intentionally preserve their zero-area/inverted-rectangle
         // behavior. The qpdf-shaped helper owns the rectangle and appearance
         // geometry calculation for both paths.
         if !qpdf_flag_contract {
+            let has_rect = pdf
+                .resolve_borrowed(annot_ref)?
+                .as_dict()
+                .is_some_and(|dict| !matches!(dict.get("Rect"), None | Some(Object::Null)));
+            if !has_rect {
+                continue;
+            }
+            let rect = AnnotationObjectHelper::new(annot_ref, pdf).get_rect()?;
             let (llx, urx) = if rect.llx <= rect.urx {
                 (rect.llx, rect.urx)
             } else {
@@ -260,7 +270,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         }
 
         candidates.push(AnnotData {
-            annot_ref: ea.annot_ref,
+            annot_ref,
             appearance,
             flags,
         });

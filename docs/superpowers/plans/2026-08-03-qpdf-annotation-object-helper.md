@@ -162,7 +162,7 @@ git commit -m "feat: add ObjectHandle annotation helper"
 - Modify: `crates/flpdf/src/annotation_helper.rs`
 - Modify: `crates/flpdf/src/page_annotation_flatten.rs`
 - Modify: `crates/flpdf/tests/page_document_helper_tests.rs`
-- Reference: `libqpdf/QPDFAnnotationObjectHelper.cc:78-193`
+- Reference: `libqpdf/QPDFAnnotationObjectHelper.cc:78-226` (including `/Subtype` mutation and emitted content at `:224-225`)
 
 **Interfaces:**
 - Consumes: Task 2 `get_appearance_stream`, `get_rect`, and `get_flags`.
