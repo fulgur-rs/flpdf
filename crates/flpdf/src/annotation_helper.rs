@@ -2,17 +2,25 @@
 //! Typed accessor helpers for annotation objects.
 //!
 //! [`AnnotationObjectHelper`] wraps an annotation [`ObjectRef`] together with
-//! a `&mut Pdf<R>` and exposes typed, panic-free read-only accessors for the
-//! common annotation attributes.
-//!
-//! The helper is intentionally **read-only** and **thin** — it holds no copied
-//! state and re-reads the live document on every call.
+//! a `&mut Pdf<R>` and exposes typed, fail-soft read-only accessors for the
+//! common annotation attributes, mirroring qpdf's own transparently
+//! dereferencing `QPDFObjectHandle` API on top of this crate's
+//! [`ObjectHandle`], which requires an explicit resolve at every hop
+//! (`Pdf::resolve_object_handle`) — see
+//! [`crate::form_field_object_helper::FormFieldObjectHelper`] for the same
+//! established shape.
 //!
 //! # Design
 //!
-//! - Annotation attributes (`/Subtype`, `/Rect`, `/AP`, `/A`) are **leaf-only**
-//!   — they are read directly from the annotation dictionary without walking any
-//!   `/Parent` chain (per ISO 32000-1 §12.5, these keys are not inheritable).
+//! - Annotation attributes (`/Subtype`, `/Rect`, `/AP`, `/AS`, `/F`) are
+//!   **leaf-only** — they are read directly from the annotation dictionary
+//!   without walking any `/Parent` chain (per ISO 32000-1 §12.5, these keys
+//!   are not inheritable).
+//! - Accessors are **fail-soft**, matching qpdf: a missing key or a value of
+//!   the wrong type yields a default (empty name, zero flags, a
+//!   `(0, 0, 0, 0)` rectangle, a null handle) rather than an error. Only an
+//!   I/O, parse, filter, or decryption failure while resolving an
+//!   [`ObjectHandle`] surfaces as `Err`.
 //! - `/Rect` reuses [`PageBox`] from [`crate::page_object_helper`].
 //!
 //! # Examples
@@ -32,20 +40,18 @@
 //!     drop(page_helper);
 //!     for annot_ref in annot_refs {
 //!         let mut annot = AnnotationObjectHelper::new(annot_ref, &mut pdf);
-//!         if let Some(subtype) = annot.subtype()? {
-//!             println!("annotation subtype: {}", String::from_utf8_lossy(&subtype));
-//!         }
-//!         if let Some(rect) = annot.rect()? {
-//!             println!("rect: [{} {} {} {}]", rect.llx, rect.lly, rect.urx, rect.ury);
-//!         }
+//!         let subtype = annot.get_subtype()?;
+//!         println!("annotation subtype: {}", String::from_utf8_lossy(&subtype));
+//!         let rect = annot.get_rect()?;
+//!         println!("rect: [{} {} {} {}]", rect.llx, rect.lly, rect.urx, rect.ury);
 //!     }
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-//!
+
+use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -63,32 +69,30 @@ use std::io::{Read, Seek};
 /// itself, consistent with ISO 32000-1 §12.5 which specifies that annotation
 /// attributes are not inheritable.
 pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
-    annot_ref: ObjectRef,
+    annot: ObjectHandle,
     pdf: &'a mut Pdf<R>,
 }
 
 impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// Construct a new helper for the annotation at `annot_ref`.
     ///
-    /// The constructor does not resolve the object; errors are surfaced by the
-    /// individual accessor methods.
+    /// The constructor does not resolve the object; errors are surfaced by
+    /// the individual accessor methods.
     pub fn new(annot_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
-        Self { annot_ref, pdf }
+        let annot = pdf.get_object_handle(annot_ref);
+        Self { annot, pdf }
     }
 
-    /// Resolve the annotation dictionary.
-    fn resolve_dict(&mut self) -> Result<Dictionary> {
-        match self.pdf.resolve_borrowed(self.annot_ref)? {
-            Object::Dictionary(d) => Ok(d.clone()),
-            _ => Err(Error::Unsupported(format!(
-                "annotation object {} is not a dictionary",
-                self.annot_ref
-            ))),
-        }
+    /// Resolve `self.annot` and return the key's resolved child handle.
+    fn resolved_key(&mut self, key: &[u8]) -> Result<ObjectHandle> {
+        self.pdf.resolve_object_handle(&self.annot)?;
+        let child = self.annot.get_key(key);
+        self.pdf.resolve_object_handle(&child)?;
+        Ok(child)
     }
 
     // -----------------------------------------------------------------------
-    // subtype — /Subtype (Name, leaf-only)
+    // get_subtype — /Subtype (Name, leaf-only)
     // -----------------------------------------------------------------------
 
     /// Return the annotation subtype (`/Subtype`) as raw name bytes.
@@ -96,7 +100,10 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// Common values include `b"Text"`, `b"Link"`, `b"Highlight"`,
     /// `b"Widget"`, etc. (ISO 32000-1 Table 169).
     ///
-    /// Returns `Ok(None)` when `/Subtype` is absent or not a name.
+    /// Mirrors `QPDFAnnotationObjectHelper::getSubtype`
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:14-17`): returns an empty
+    /// `Vec` when `/Subtype` is absent or not a name, never an error for
+    /// that reason.
     ///
     /// # Errors
     ///
@@ -111,39 +118,40 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
     /// let mut annot = AnnotationObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    /// if let Some(subtype) = annot.subtype()? {
-    ///     println!("subtype: {}", String::from_utf8_lossy(&subtype));
-    /// }
+    /// let subtype = annot.get_subtype()?;
+    /// println!("subtype: {}", String::from_utf8_lossy(&subtype));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn subtype(&mut self) -> Result<Option<Vec<u8>>> {
-        let dict = self.resolve_dict()?;
-        Ok(match dict.get("Subtype").cloned() {
-            Some(value) => match resolve_ref_chain(self.pdf, &value)?.0 {
-                Object::Name(bytes) => Some(bytes),
-                _ => None,
-            },
-            _ => None,
-        })
+    pub fn get_subtype(&mut self) -> Result<Vec<u8>> {
+        Ok(self
+            .resolved_key(b"/Subtype")?
+            .as_name()
+            .unwrap_or_default())
     }
 
     // -----------------------------------------------------------------------
-    // rect — /Rect (4-element array, leaf-only)
+    // get_rect — /Rect (4-element numeric array, leaf-only)
     // -----------------------------------------------------------------------
 
     /// Return the annotation rectangle (`/Rect`) as a [`PageBox`].
     ///
-    /// The four numbers are `[llx, lly, urx, ury]` in default user-space units
-    /// (ISO 32000-1 §12.5.4). Both [`Object::Integer`] and [`Object::Real`]
-    /// elements are accepted and coerced to `f64`.
+    /// The four numbers are `[llx, lly, urx, ury]` in default user-space
+    /// units (ISO 32000-1 §12.5.4). Both integer and real elements are
+    /// accepted and coerced to `f64`.
     ///
-    /// Returns `Ok(None)` when `/Rect` is absent.
+    /// Mirrors `QPDFObjectHandle::getArrayAsRectangle`
+    /// (`libqpdf/QPDFObjectHandle.cc:817-836`), used by
+    /// `QPDFAnnotationObjectHelper::getRect`: a missing `/Rect`, a
+    /// non-array value, an array with a length other than 4, or a
+    /// non-numeric element all yield `PageBox::new(0.0, 0.0, 0.0, 0.0)`
+    /// rather than an error. The four corners are normalized to
+    /// `llx <= urx` and `lly <= ury` via `min`/`max`, so a rectangle array
+    /// stored with corners in reverse order is still returned upright.
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when `/Rect` is present but is not a 4-element
-    ///   numeric array.
-    /// - Any error from resolving the annotation object.
+    /// Propagates any error from resolving the annotation object or an
+    /// indirect `/Rect` array element.
     ///
     /// # Examples
     ///
@@ -154,177 +162,179 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     ///
     /// let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
     /// let mut annot = AnnotationObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    /// if let Some(r) = annot.rect()? {
-    ///     println!("[{} {} {} {}]", r.llx, r.lly, r.urx, r.ury);
-    /// }
+    /// let r = annot.get_rect()?;
+    /// println!("[{} {} {} {}]", r.llx, r.lly, r.urx, r.ury);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn rect(&mut self) -> Result<Option<PageBox>> {
-        let dict = self.resolve_dict()?;
-        let val = match dict.get("Rect").cloned() {
-            None | Some(Object::Null) => return Ok(None),
-            Some(v) => v,
+    pub fn get_rect(&mut self) -> Result<PageBox> {
+        let rect = self.resolved_key(b"/Rect")?;
+        self.array_as_rectangle(&rect)
+    }
+
+    /// Resolve `handle` as a 4-element numeric array into a [`PageBox`],
+    /// mirroring `QPDFObjectHandle::getArrayAsRectangle`.
+    fn array_as_rectangle(&mut self, handle: &ObjectHandle) -> Result<PageBox> {
+        let zero = PageBox::new(0.0, 0.0, 0.0, 0.0);
+        let Some(items) = handle.as_array() else {
+            return Ok(zero);
         };
-        let arr = resolve_to_array(val, self.pdf, self.annot_ref, "Rect")?;
-        parse_rect_array(&arr, b"Rect").map(Some)
+        if items.len() != 4 {
+            return Ok(zero);
+        }
+        let mut nums = [0.0f64; 4];
+        for (i, item) in items.iter().enumerate() {
+            self.pdf.resolve_object_handle(item)?;
+            let Some(n) = as_number(item) else {
+                return Ok(zero);
+            };
+            nums[i] = n;
+        }
+        Ok(PageBox::new(
+            nums[0].min(nums[2]),
+            nums[1].min(nums[3]),
+            nums[0].max(nums[2]),
+            nums[1].max(nums[3]),
+        ))
     }
 
     // -----------------------------------------------------------------------
-    // appearance — /AP (Dictionary or Reference → Dictionary, leaf-only)
+    // get_appearance_dictionary — /AP (leaf-only)
     // -----------------------------------------------------------------------
 
-    /// Return the annotation appearance dictionary (`/AP`).
+    /// Return the resolved `/AP` value.
     ///
-    /// `/AP` contains the appearance streams keyed by `/N` (normal), `/R`
-    /// (rollover), and `/D` (down) (ISO 32000-1 §12.5.5). The dictionary is
-    /// returned as-is; individual appearance streams must be fetched separately.
-    ///
-    /// An indirect `/AP` reference is resolved automatically.
-    ///
-    /// Returns `Ok(None)` when `/AP` is absent or null.
+    /// Mirrors `QPDFAnnotationObjectHelper::getAppearanceDictionary`
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:24-27`): returns whatever
+    /// `/AP` resolves to verbatim, without checking that it is actually a
+    /// dictionary. Callers that need the dictionary should check the
+    /// returned handle's type; a null handle means `/AP` was absent.
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when `/AP` resolves to a non-dictionary.
-    /// - Any error from [`Pdf::resolve`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use flpdf::{AnnotationObjectHelper, ObjectRef, Pdf};
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// let mut annot = AnnotationObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    /// if let Some(ap) = annot.appearance()? {
-    ///     let has_normal = ap.get("N").is_some();
-    ///     println!("has normal appearance: {has_normal}");
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn appearance(&mut self) -> Result<Option<Dictionary>> {
-        let dict = self.resolve_dict()?;
-        resolve_optional_dict(dict.get("AP").cloned(), self.pdf, self.annot_ref, "AP")
+    /// Propagates any error from resolving the annotation object or `/AP`.
+    pub fn get_appearance_dictionary(&mut self) -> Result<ObjectHandle> {
+        self.resolved_key(b"/AP")
     }
 
     // -----------------------------------------------------------------------
-    // action — /A (Dictionary or Reference → Dictionary, leaf-only)
+    // get_appearance_state — /AS (Name, leaf-only)
     // -----------------------------------------------------------------------
 
-    /// Return the annotation action dictionary (`/A`).
+    /// Return the appearance state (`/AS`) as raw name bytes, or an empty
+    /// `Vec` if `/AS` is absent or not a name.
     ///
-    /// The returned dictionary contains at minimum `/S` (action subtype, e.g.
-    /// `b"URI"`, `b"GoTo"`) plus action-specific keys (ISO 32000-1 §12.6).
-    ///
-    /// An indirect `/A` reference is resolved automatically.
-    ///
-    /// Returns `Ok(None)` when `/A` is absent or null.
+    /// Mirrors `QPDFAnnotationObjectHelper::getAppearanceState`
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:30-38`).
     ///
     /// # Errors
     ///
-    /// - [`Error::Unsupported`] when `/A` resolves to a non-dictionary.
-    /// - Any error from [`Pdf::resolve`].
+    /// Propagates any error from resolving the annotation object or `/AS`.
+    pub fn get_appearance_state(&mut self) -> Result<Vec<u8>> {
+        Ok(self.resolved_key(b"/AS")?.as_name().unwrap_or_default())
+    }
+
+    // -----------------------------------------------------------------------
+    // get_flags — /F (Integer, leaf-only)
+    // -----------------------------------------------------------------------
+
+    /// Return the annotation flags (`/F`), a logical OR of
+    /// `pdf_annotation_flag_e` bits (ISO 32000-1 Table 165), or `0` if `/F`
+    /// is absent or not an integer.
     ///
-    /// # Examples
+    /// Mirrors `QPDFAnnotationObjectHelper::getFlags`
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:41-45`).
     ///
-    /// ```no_run
-    /// use flpdf::{AnnotationObjectHelper, ObjectRef, Pdf};
-    /// use std::fs::File;
-    /// use std::io::BufReader;
+    /// # Errors
     ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// let mut annot = AnnotationObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    /// if let Some(action) = annot.action()? {
-    ///     if let Some(Object::Name(s)) = action.get("S") {
-    ///         println!("action subtype: {}", String::from_utf8_lossy(s));
-    ///     }
-    /// }
-    /// # use flpdf::Object;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn action(&mut self) -> Result<Option<Dictionary>> {
-        let dict = self.resolve_dict()?;
-        resolve_optional_dict(dict.get("A").cloned(), self.pdf, self.annot_ref, "A")
+    /// Propagates any error from resolving the annotation object or `/F`.
+    pub fn get_flags(&mut self) -> Result<i64> {
+        Ok(self.resolved_key(b"/F")?.as_integer().unwrap_or(0))
+    }
+
+    // -----------------------------------------------------------------------
+    // get_appearance_stream — /AP/<which>[/<state>]
+    // -----------------------------------------------------------------------
+
+    /// Select an appearance stream from `/AP`.
+    ///
+    /// `which` selects the entry within `/AP` — typically `b"N"` (normal),
+    /// `b"R"` (rollover), or `b"D"` (down), as a decoded PDF name (no
+    /// leading `/`, matching [`Self::get_subtype`]/
+    /// [`Self::get_appearance_state`]'s own convention — [`ObjectHandle::
+    /// get_key`] requires the `/`, so both `which` and `state` get it
+    /// prepended internally). If `/AP/<which>` is itself a stream, it is
+    /// returned directly. If it is a subdictionary (a state dictionary),
+    /// `state` selects a key within it when non-empty, falling back to
+    /// [`Self::get_appearance_state`]'s `/AS` value when `state` is `None`
+    /// or empty. Returns a null [`ObjectHandle`] when no stream can be
+    /// selected.
+    ///
+    /// Mirrors `QPDFAnnotationObjectHelper::getAppearanceStream`
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:48-71`), including qpdf issue
+    /// #949's observed behavior: when `/AP/<which>` is already a stream, the
+    /// state is disregarded even if one was requested.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from resolving the annotation object, `/AP`,
+    /// `/AS`, or the selected appearance entries.
+    pub fn get_appearance_stream(
+        &mut self,
+        which: &[u8],
+        state: Option<&[u8]>,
+    ) -> Result<ObjectHandle> {
+        let ap = self.get_appearance_dictionary()?;
+        if ap.as_dictionary().is_some() {
+            let ap_sub = ap.get_key(&dict_key(which));
+            self.pdf.resolve_object_handle(&ap_sub)?;
+            if ap_sub.as_stream_dict().is_some() {
+                // qpdf issue #949: a direct appearance stream disregards
+                // state entirely (`QPDFAnnotationObjectHelper.cc:59-63`).
+                // `/AS` must not even be resolved on this path — qpdf's own
+                // eager `getAppearanceState()` call is infallible in C++,
+                // but this crate's `/AS` resolution can genuinely error (a
+                // malformed or cyclic indirect reference), and that error
+                // must not surface for a state qpdf never consults here.
+                return Ok(ap_sub);
+            }
+            if ap_sub.as_dictionary().is_some() {
+                let desired_state: Vec<u8> = match state {
+                    Some(s) if !s.is_empty() => s.to_vec(),
+                    _ => self.get_appearance_state()?,
+                };
+                if !desired_state.is_empty() {
+                    let ap_sub_val = ap_sub.get_key(&dict_key(&desired_state));
+                    self.pdf.resolve_object_handle(&ap_sub_val)?;
+                    if ap_sub_val.as_stream_dict().is_some() {
+                        return Ok(ap_sub_val);
+                    }
+                }
+            } // cov:ignore: llvm-cov brace-region artifact, not untested — reached by both annotation_handle_appearance_stream_missing_state_returns_null and _state_dictionary_key_missing_returns_null, same as the pre-existing single-block version of this brace
+        } // cov:ignore: llvm-cov brace-region artifact, not untested — same two tests fall through to this outer brace after the inner one
+        Ok(ObjectHandle::null())
     }
 }
 
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Private free functions
 // ---------------------------------------------------------------------------
 
-/// Resolve `val` to an `Array`, following at most one level of indirection.
-fn resolve_to_array<R: Read + Seek>(
-    val: Object,
-    pdf: &mut Pdf<R>,
-    origin: ObjectRef,
-    key: &str,
-) -> Result<Vec<Object>> {
-    match val {
-        Object::Array(arr) => Ok(arr),
-        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
-            Object::Array(arr) => Ok(arr.clone()),
-            _ => Err(Error::Unsupported(format!(
-                "/{key} reference {r} on object {origin} does not resolve to an array"
-            ))),
-        },
-        _ => Err(Error::Unsupported(format!(
-            "/{key} on object {origin} has unexpected type"
-        ))),
-    }
+/// Prepend the `/` [`ObjectHandle::get_key`] requires to a decoded PDF name
+/// value (e.g. from [`AnnotationObjectHelper::get_appearance_state`], which
+/// like every other name-valued accessor in this crate returns the name
+/// without it).
+fn dict_key(name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(name.len() + 1);
+    key.push(b'/');
+    key.extend_from_slice(name);
+    key
 }
 
-/// Resolve an optional dictionary value, handling indirection.
-///
-/// Returns `Ok(None)` when `val` is `None` or `Some(Null)`.
-fn resolve_optional_dict<R: Read + Seek>(
-    val: Option<Object>,
-    pdf: &mut Pdf<R>,
-    origin: ObjectRef,
-    key: &str,
-) -> Result<Option<Dictionary>> {
-    match val {
-        None | Some(Object::Null) => Ok(None),
-        Some(Object::Dictionary(d)) => Ok(Some(d)),
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-            Object::Dictionary(d) => Ok(Some(d.clone())),
-            Object::Null => Ok(None),
-            _ => Err(Error::Unsupported(format!(
-                "/{key} reference {r} on object {origin} does not resolve to a dictionary"
-            ))),
-        },
-        Some(_) => Err(Error::Unsupported(format!(
-            "/{key} on object {origin} has unexpected type"
-        ))),
-    }
-}
-
-/// Parse a 4-element PDF rectangle array into a [`PageBox`].
-///
-/// Mirrors `page_object_helper::parse_rect_array` — kept private here to
-/// avoid coupling across modules.
-fn parse_rect_array(arr: &[Object], key: &[u8]) -> Result<PageBox> {
-    if arr.len() != 4 {
-        return Err(Error::Unsupported(format!(
-            "/{} rectangle array has {} elements, expected 4",
-            String::from_utf8_lossy(key),
-            arr.len()
-        )));
-    }
-    let mut coords = [0f64; 4];
-    for (i, elem) in arr.iter().take(4).enumerate() {
-        coords[i] = match elem {
-            Object::Integer(n) => *n as f64,
-            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "/{} rectangle element {i} has unexpected type {:?}",
-                    String::from_utf8_lossy(key),
-                    std::mem::discriminant(other)
-                )));
-            }
-        };
-    }
-    Ok(PageBox::new(coords[0], coords[1], coords[2], coords[3]))
+/// Coerce a resolved [`ObjectHandle`] to `f64` if it is an integer or real,
+/// mirroring `QPDFObjectHandle::getValueAsNumber`.
+fn as_number(handle: &ObjectHandle) -> Option<f64> {
+    handle
+        .as_integer()
+        .map(|n| n as f64)
+        .or_else(|| handle.as_real())
 }

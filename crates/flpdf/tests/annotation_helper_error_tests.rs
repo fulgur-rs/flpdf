@@ -4,14 +4,14 @@
 //! malformed-input branches of [`flpdf::AnnotationObjectHelper`] and
 //! [`flpdf::FormFieldObjectHelper`]:
 //!
-//! - the shared resolver free functions (`resolve_to_array`,
-//!   `resolve_optional_dict`, `parse_rect_array`) reached via `rect()`,
-//!   `appearance()`, and `action()`;
+//! - [`flpdf::AnnotationObjectHelper`]'s fail-soft defaults for a malformed
+//!   `/Rect` or a non-dictionary `/AP`, mirroring qpdf's typed-getter
+//!   type-warning-and-default contract rather than erroring;
 //! - each inheritance walk's `/Parent`-chain anomalies — direct/indirect Null,
 //!   wrong value type, non-dictionary node, cycles, and long acyclic chains —
 //!   across `/FT` names, `/V` objects, and `/Ff` integers.
 
-use flpdf::{AnnotationObjectHelper, Error, FormFieldObjectHelper, ObjectRef, Pdf};
+use flpdf::{AnnotationObjectHelper, FormFieldObjectHelper, ObjectRef, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -39,81 +39,80 @@ fn doc(mut objects: Vec<(u32, String)>) -> Vec<u8> {
     build_pdf(&base, 1)
 }
 
-fn assert_unsupported<T: std::fmt::Debug>(result: flpdf::Result<T>) {
-    match result {
-        Err(Error::Unsupported(_)) => {}
-        other => panic!("expected Error::Unsupported, got {other:?}"),
-    }
-}
-
 // ===========================================================================
-// AnnotationObjectHelper — shared resolver free functions
+// AnnotationObjectHelper — fail-soft defaults (qpdf typed-getter contract)
 // ===========================================================================
 
 #[test]
-fn rect_reference_not_array_errors() {
+fn rect_reference_not_array_returns_zero_box() {
     let bytes = doc(vec![
         (10, "<< /Type /Annot /Rect 11 0 R >>".into()),
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(annot.rect());
+    assert_eq!(
+        annot.get_rect().unwrap(),
+        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+    );
 }
 
 #[test]
-fn rect_unexpected_type_errors() {
+fn rect_unexpected_type_returns_zero_box() {
     let bytes = doc(vec![(10, "<< /Type /Annot /Rect 42 >>".into())]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(annot.rect());
+    assert_eq!(
+        annot.get_rect().unwrap(),
+        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+    );
 }
 
 #[test]
-fn rect_wrong_length_errors() {
+fn rect_wrong_length_returns_zero_box() {
     let bytes = doc(vec![(10, "<< /Type /Annot /Rect [0 0 1] >>".into())]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(annot.rect());
+    assert_eq!(
+        annot.get_rect().unwrap(),
+        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+    );
 }
 
 #[test]
-fn rect_non_numeric_element_errors() {
+fn rect_non_numeric_element_returns_zero_box() {
     let bytes = doc(vec![(10, "<< /Type /Annot /Rect [0 0 1 /X] >>".into())]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(annot.rect());
+    assert_eq!(
+        annot.get_rect().unwrap(),
+        flpdf::PageBox::new(0.0, 0.0, 0.0, 0.0)
+    );
 }
 
 #[test]
-fn appearance_indirect_null_returns_none() {
+fn appearance_indirect_null_returns_null_handle() {
     let bytes = doc(vec![
         (10, "<< /Type /Annot /AP 11 0 R >>".into()),
         (11, "null".into()),
     ]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(annot.appearance().unwrap(), None);
+    assert!(annot.get_appearance_dictionary().unwrap().is_null());
 }
 
 #[test]
-fn appearance_reference_not_dict_errors() {
+fn appearance_reference_not_dict_returns_the_resolved_value_verbatim() {
+    // qpdf's getAppearanceDictionary returns getKey("/AP") verbatim, with no
+    // dictionary-type check of its own.
     let bytes = doc(vec![
         (10, "<< /Type /Annot /AP 11 0 R >>".into()),
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(annot.appearance());
-}
-
-#[test]
-fn action_unexpected_type_errors() {
-    // /A is neither dict, reference, nor null: resolve_optional_dict errors.
-    let bytes = doc(vec![(10, "<< /Type /Annot /A 42 >>".into())]);
-    let mut pdf = open(bytes);
-    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(annot.action());
+    let ap = annot.get_appearance_dictionary().unwrap();
+    assert_eq!(ap.as_integer(), Some(42));
 }
 
 // ===========================================================================

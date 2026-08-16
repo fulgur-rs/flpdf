@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFPageObjectHelper.cc and QPDFAnnotationObjectHelper.cc annotation enumeration.
+//! qpdf correspondence: QPDFPageObjectHelper.cc annotation enumeration.
 //! Per-page annotation enumeration and widget-to-field linkage.
 //!
 //! [`enumerate_page_annotations`] reads the `/Annots` array of a leaf page,
@@ -30,6 +30,20 @@
 //! `/FT`-bearing ancestor: field attributes inherit *down* the field tree, so a
 //! terminal field may omit `/FT` while an ancestor supplies it. Returning the
 //! ancestor would wrongly merge several sibling terminal fields onto one ref.
+//!
+//! This direct-parent heuristic has no `QPDFAnnotationObjectHelper`
+//! correspondence — that class's own header comment attributes
+//! annotation/field cross-referencing to `QPDFAcroFormDocumentHelper` and
+//! `QPDFFormFieldObjectHelper` instead (`getFieldForAnnotation`, backed by
+//! `analyze()`/`traverseField()`, composed with `getTopLevelField()`). Cutting
+//! this heuristic over to that qpdf-faithful primitive
+//! ([`crate::AcroFormDocumentHelper::annotation_to_field_map`] and
+//! [`crate::AcroFormDocumentHelper::top_level_field`], both already present)
+//! changes what [`mod@crate::signatures`]'s appearance-generation consumer writes
+//! `/V` to for grouped fields, so it needs byte-level verification against
+//! `qpdf --generate-appearances` before landing — tracked separately from the
+//! `AnnotationObjectHelper`/`AcroFormDocumentHelper` primitives this module
+//! already uses.
 
 use crate::page_object_helper::PageBox;
 use crate::{AnnotationObjectHelper, Object, ObjectRef, PageObjectHelper, Pdf, Result};
@@ -53,7 +67,7 @@ pub struct EnumeratedAnnotation {
     pub subtype: Option<Vec<u8>>,
 
     /// The annotation bounding rectangle (`/Rect`), resolved via
-    /// [`AnnotationObjectHelper::rect`].
+    /// [`AnnotationObjectHelper::get_rect`].
     ///
     /// `None` when `/Rect` is absent.
     pub rect: Option<PageBox>,
@@ -134,13 +148,21 @@ pub fn enumerate_page_annotations<R: Read + Seek>(
     let mut result = Vec::with_capacity(annot_refs.len());
 
     for annot_ref in annot_refs {
-        // Step 2: read /Subtype and /Rect via AnnotationObjectHelper (dropped after).
-        let (subtype, rect) = {
-            let mut annot_helper = AnnotationObjectHelper::new(annot_ref, pdf);
-            let subtype = annot_helper.subtype()?;
-            let rect = annot_helper.rect()?;
-            (subtype, rect)
-        };
+        // Step 2: read /Subtype and /Rect via AnnotationObjectHelper (dropped
+        // after each call). /Rect presence is checked directly rather than
+        // via `get_rect`'s qpdf-faithful fail-soft default (which cannot
+        // distinguish an absent `/Rect` from a present-but-degenerate one),
+        // preserving this module's existing "no /Rect -> None" contract for
+        // its `page_annotation_flatten.rs` consumer.
+        let raw_subtype = AnnotationObjectHelper::new(annot_ref, pdf).get_subtype()?;
+        let subtype = (!raw_subtype.is_empty()).then_some(raw_subtype);
+        let has_rect_key = pdf
+            .resolve_borrowed(annot_ref)?
+            .as_dict()
+            .is_some_and(|d| !matches!(d.get("Rect"), None | Some(Object::Null)));
+        let rect = has_rect_key
+            .then(|| AnnotationObjectHelper::new(annot_ref, pdf).get_rect())
+            .transpose()?;
 
         // Step 3: classify.
         let is_widget = subtype.as_deref().is_some_and(|s| s == b"Widget");

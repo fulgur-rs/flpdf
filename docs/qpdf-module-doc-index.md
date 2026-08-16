@@ -68,7 +68,7 @@
 | `crates/flpdf/src/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/overlay_annotations.rs` | correspondence | QPDFPageObjectHelper.cc, QPDFAcroFormDocumentHelper.cc, ResourceFinder.cc, and QPDFObjectHandle.cc overlay responsibilities |
 | `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs |
-| `crates/flpdf/src/page_annotation_enum.rs` | correspondence | QPDFPageObjectHelper.cc and QPDFAnnotationObjectHelper.cc annotation enumeration |
+| `crates/flpdf/src/page_annotation_enum.rs` | correspondence | QPDFPageObjectHelper.cc annotation enumeration |
 | `crates/flpdf/src/page_annotation_flatten.rs` | correspondence | QPDFPageObjectHelper.cc annotation flattening split from the page helper |
 | `crates/flpdf/src/page_closure.rs` | correspondence | QPDF.cc copyForeignObject graph closure split from object copying |
 | `crates/flpdf/src/page_collate.rs` | correspondence | QPDFJob.cc handlePageSpecs collate ordering split into a page-operation module |
