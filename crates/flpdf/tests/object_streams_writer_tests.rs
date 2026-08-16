@@ -1311,7 +1311,7 @@ fn info_and_missing_junk_pdf(n: u32) -> Vec<u8> {
 
 #[test]
 fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
-    // flpdf-ndjy: the NON-linearized generate path fed `compressible_objgens`
+    // flpdf-ndjy: the NON-linearized generate path fed `get_compressible_objgens`
     // (which admits Null-resolving missing refs) straight into the even split,
     // so 100 dangling /Junk trailer refs became null ObjStm members (two /N 52
     // containers). qpdf emits ONE /N 4 ObjStm holding only the four real objects
