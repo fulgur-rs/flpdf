@@ -30,6 +30,7 @@ use assert_cmd::Command;
 use flpdf::{AnnotationObjectHelper, DecodeLevel, Object, Pdf};
 use std::fs::File;
 use std::io::BufReader;
+use std::path::Path;
 
 mod common;
 use common::first_widget_ref;
@@ -161,6 +162,49 @@ fn tx_widget_with_ap_needing(need_appearances: bool) -> Vec<u8> {
           /Length 17 >>\nstream\nBT (Hello) Tj ET\nendstream\nendobj\n"
             .to_vec(),
     ])
+}
+
+/// A nested Tx field whose merged terminal widget carries a local value that
+/// differs from its top-level ancestor. qpdf's appearance-generation route
+/// resolves the widget association directly, so it must render
+/// `(child-value)` rather than the ancestor's `(parent-value)`.
+fn nested_tx_widget_with_local_value() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true \
+          /DR << /Font << /Helv 7 0 R >> >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 6 0 R /Annots [5 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /FT /Tx /T (parent) /V (parent-value) /DA (/Helv 12 Tf 0 g) \
+          /Kids [5 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (child) \
+          /V (child-value) /DA (/Helv 12 Tf 0 g) /Parent 4 0 R \
+          /Rect [100 700 300 720] /P 3 0 R \
+          /AP << /N 8 0 R >> >>\nendobj\n"
+            .to_vec(),
+        b"6 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>\nendobj\n".to_vec(),
+        b"8 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 200 20] \
+          /Resources << /ProcSet [/PDF /Text] /Font << /Helv 7 0 R >> >> \
+          /Length 33 >>\nstream\n/Tx BMC\nBT (old-value) Tj ET\nEMC\nendstream\nendobj\n"
+            .to_vec(),
+    ])
+}
+
+fn widget_normal_appearance_data(path: &Path) -> Vec<u8> {
+    let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
+    let widget_ref = first_widget_ref(&mut pdf);
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    helper
+        .get_appearance_stream(b"N", None)
+        .unwrap()
+        .get_stream_data(DecodeLevel::Generalized)
+        .unwrap()
+        .to_vec()
 }
 
 /// Single-page AcroForm PDF with a checkbox (Btn, no pushbutton/radio bits).
@@ -391,6 +435,37 @@ fn generate_appearances_tx_reuses_existing_ap() {
     assert!(
         data.windows(16).any(|w| w == b"BT (Hello) Tj ET"),
         "qpdf's no-wrapper fallback must preserve source appearance content; data={as_str:?}"
+    );
+}
+
+/// Appearance generation must use qpdf's direct widget-to-field association,
+/// not the top-level projection exposed by page annotation enumeration.
+#[test]
+fn generate_appearances_uses_nested_terminal_field_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("nested-tx.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(&input, nested_tx_widget_with_local_value()).unwrap();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances", "--compress-streams=y"])
+        .arg(&input)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_data = widget_normal_appearance_data(&flpdf_output);
+    assert!(
+        flpdf_data
+            .windows(b"child-value".len())
+            .any(|w| w == b"child-value"),
+        "flpdf must render the same terminal field value; data={flpdf_data:?}"
+    );
+    assert!(
+        !flpdf_data
+            .windows(b"parent-value".len())
+            .any(|w| w == b"parent-value"),
+        "flpdf must not render the top-level ancestor's value; data={flpdf_data:?}"
     );
 }
 

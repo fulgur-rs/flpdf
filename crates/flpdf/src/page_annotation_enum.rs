@@ -572,6 +572,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test: qpdf's orphan fallback runs when /AcroForm /Fields exists
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn orphan_widget_self_maps_when_acroform_fields_exist() {
+        let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [0 0 100 20] >>\nendobj\n";
+
+        let bytes = build_pdf_with_acroform(Some("[4 0 R]"), Some("[]"), &[(4, obj4)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let annots = enumerate_page_annotations(&mut pdf, page_ref).unwrap();
+        let a = &annots[0];
+        assert!(a.is_widget);
+        assert_eq!(a.field_ref, Some(ObjectRef::new(4, 0)));
+    }
+
+    // -----------------------------------------------------------------------
     // Test: /Parent cycle → terminates without panic, returns Some result
     // -----------------------------------------------------------------------
     //
