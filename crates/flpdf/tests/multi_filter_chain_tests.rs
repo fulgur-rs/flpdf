@@ -10,6 +10,9 @@
 
 use flpdf::{filters, Dictionary, Object};
 
+#[path = "common/ascii85.rs"]
+mod ascii85;
+
 // ---------------------------------------------------------------------------
 // (a) [/ASCII85Decode /FlateDecode] — no DecodeParms
 // ---------------------------------------------------------------------------
@@ -28,9 +31,13 @@ fn chain_ascii85_then_flate_round_trip() {
         ]),
     );
 
-    // encode_stream_data applies filters in *reverse* order (encode direction):
-    //   raw → FlateDecode-encode → ASCII85-encode
-    let encoded = filters::encode_stream_data(&dict, raw).expect("encode chain");
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+
+    // Stored bytes must still satisfy the declared decode order:
+    //   encoded → ASCII85Decode → FlateDecode → raw
+    let flate_encoded = filters::encode_stream_data(&flate_dict, raw).expect("Flate encode");
+    let encoded = ascii85::fixture_bytes(&flate_encoded);
 
     // decode_stream_data applies filters in declared order:
     //   encoded → ASCII85Decode → FlateDecode → raw
@@ -110,11 +117,18 @@ fn chain_ascii85_then_flate_with_predictor_decode_params() {
     );
     dict.insert(
         "DecodeParms",
-        Object::Array(vec![Object::Null, Object::Dictionary(flate_params)]),
+        Object::Array(vec![Object::Null, Object::Dictionary(flate_params.clone())]),
     );
 
-    // encode: apply predictor to raw data, then FlateDecode-encode, then ASCII85-encode
-    let encoded = filters::encode_stream_data(&dict, &raw).expect("encode with predictor chain");
+    let mut flate_only_dict = Dictionary::new();
+    flate_only_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    flate_only_dict.insert("DecodeParms", Object::Dictionary(flate_params.clone()));
+
+    // Stored bytes remain ASCII85(Flate+predictor(raw)); the public decode path
+    // still consumes the original array-form Filter and DecodeParms semantics.
+    let flate_encoded =
+        filters::encode_stream_data(&flate_only_dict, &raw).expect("Flate encode with predictor");
+    let encoded = ascii85::fixture_bytes(&flate_encoded);
 
     // decode: ASCII85Decode, then FlateDecode + undo predictor → original raw
     let decoded =
@@ -177,10 +191,7 @@ fn chain_ascii85_then_flate_then_run_length_decodes_asymmetric_payload() {
     let flate_encoded =
         filters::encode_stream_data(&flate_dict, &run_length_encoded).expect("Flate encode");
 
-    let mut ascii85_dict = Dictionary::new();
-    ascii85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
-    let encoded =
-        filters::encode_stream_data(&ascii85_dict, &flate_encoded).expect("ASCII85 encode");
+    let encoded = ascii85::fixture_bytes(&flate_encoded);
 
     let mut chain_dict = Dictionary::new();
     chain_dict.insert(
@@ -247,7 +258,10 @@ fn scalar_decode_parms_are_reused_across_public_multi_filter_path() {
         ]),
     );
 
-    let encoded = filters::encode_stream_data(&dict, raw).expect("encode filter chain");
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let flate_encoded = filters::encode_stream_data(&flate_dict, raw).expect("Flate encode");
+    let encoded = ascii85::fixture_bytes(&flate_encoded);
     dict.insert("DecodeParms", Object::Dictionary(params));
     let error = filters::decode_stream_data(&dict, &encoded).unwrap_err();
 
