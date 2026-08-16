@@ -38,7 +38,7 @@
 //! `analyze()`/`traverseField()`, composed with `getTopLevelField()`). Cutting
 //! this heuristic over to that qpdf-faithful primitive
 //! ([`crate::AcroFormDocumentHelper::annotation_to_field_map`] and
-//! [`crate::AcroFormDocumentHelper::top_level_field`], both already present)
+//! [`crate::AcroFormDocumentHelper::get_top_level_field`], both already present)
 //! changes what [`mod@crate::signatures`]'s appearance-generation consumer writes
 //! `/V` to for grouped fields, so it needs byte-level verification against
 //! `qpdf --generate-appearances` before landing — tracked separately from the

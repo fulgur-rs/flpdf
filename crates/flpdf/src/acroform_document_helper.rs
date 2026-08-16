@@ -166,7 +166,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// cached state (see [`Self::fields`]), so the full traversal recomputes
     /// on every call — a caller doing multiple lookups within one operation
     /// should call this once and index the returned map directly rather than
-    /// calling [`Self::field_for_annotation`] per widget. Algorithm and
+    /// calling [`Self::get_field_for_annotation`] per widget. Algorithm and
     /// output order are unchanged from qpdf; only the container (recomputed
     /// value vs. cached member) differs, and it does not change output
     /// bytes.
@@ -238,7 +238,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Propagates [`Self::annotation_to_field_map`]'s errors.
-    pub fn field_for_annotation(&mut self, annot_ref: ObjectRef) -> Result<Option<ObjectRef>> {
+    pub fn get_field_for_annotation(&mut self, annot_ref: ObjectRef) -> Result<Option<ObjectRef>> {
         let subtype = self
             .pdf
             .resolve_borrowed(annot_ref)?
@@ -265,7 +265,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// Mirrors `QPDFFormFieldObjectHelper::getTopLevelField`
     /// (`libqpdf/QPDFFormFieldObjectHelper.cc:36-47`). This is
-    /// [`Self::field_for_annotation`]'s natural composition partner: qpdf's
+    /// [`Self::get_field_for_annotation`]'s natural composition partner: qpdf's
     /// `getFormFieldsForPage` calls `getFieldForAnnotation(annot).
     /// getTopLevelField()` for exactly this reason — `getFieldForAnnotation`
     /// alone can return a "separated" widget's own ref (see that method's
@@ -287,7 +287,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// Any error from [`Pdf::resolve`].
-    pub fn top_level_field(&mut self, start: ObjectRef) -> Result<ObjectRef> {
+    pub fn get_top_level_field(&mut self, start: ObjectRef) -> Result<ObjectRef> {
         let mut current = start;
         let mut seen = BTreeSet::new();
         while seen.insert(current) {
@@ -1360,7 +1360,7 @@ fn page_widget_annotation_refs<R: Read + Seek>(
             .resolve_borrowed(annot_ref)?
             .as_dict()
             .and_then(|dict| dict.get("Subtype").cloned());
-        // See `field_for_annotation`'s doc: `/Subtype` must resolve the same
+        // See `get_field_for_annotation`'s doc: `/Subtype` must resolve the same
         // whether stored direct or indirect (`QPDFObjectHandle.cc:462-466`).
         let is_widget = match subtype {
             Some(value) => {
@@ -1685,7 +1685,7 @@ mod tests {
     #[test]
     fn page_widget_annotation_refs_resolves_an_indirect_subtype() {
         // Same qpdf `getKey("/Subtype")` transparent-dereference contract as
-        // `field_for_annotation_resolves_an_indirect_subtype`.
+        // `get_field_for_annotation_resolves_an_indirect_subtype`.
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(3, 0),
@@ -1778,22 +1778,22 @@ mod tests {
         // present, so `our_field = field` (9), matching
         // `libqpdf/QPDFAcroFormDocumentHelper.cc:343-347`. Callers that want
         // the named field walk the rest of the way with
-        // `top_level_field` (see the next test).
+        // `get_top_level_field` (see the next test).
         assert_eq!(map.get(&ObjectRef::new(9, 0)), Some(&ObjectRef::new(9, 0)));
         assert_eq!(
-            helper.top_level_field(ObjectRef::new(9, 0)).unwrap(),
+            helper.get_top_level_field(ObjectRef::new(9, 0)).unwrap(),
             ObjectRef::new(8, 0)
         );
-        // A merged top-level field/widget has no /Parent: top_level_field is
-        // a no-op.
+        // A merged top-level field/widget has no /Parent: get_top_level_field
+        // is a no-op.
         assert_eq!(
-            helper.top_level_field(ObjectRef::new(7, 0)).unwrap(),
+            helper.get_top_level_field(ObjectRef::new(7, 0)).unwrap(),
             ObjectRef::new(7, 0)
         );
     }
 
     #[test]
-    fn top_level_field_stops_at_cycle() {
+    fn get_top_level_field_stops_at_cycle() {
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(5, 0),
@@ -1805,13 +1805,13 @@ mod tests {
         );
         // Must terminate rather than looping forever.
         let top = AcroFormDocumentHelper::new(&mut pdf)
-            .top_level_field(ObjectRef::new(5, 0))
+            .get_top_level_field(ObjectRef::new(5, 0))
             .unwrap();
         assert!(top == ObjectRef::new(5, 0) || top == ObjectRef::new(6, 0));
     }
 
     #[test]
-    fn top_level_field_stops_at_non_dictionary_parent() {
+    fn get_top_level_field_stops_at_non_dictionary_parent() {
         // 5's /Parent is an indirect reference to 6, but 6 doesn't resolve to
         // a dictionary. qpdf's getTopLevelField advances onto /Parent's
         // target unconditionally (`libqpdf/QPDFFormFieldObjectHelper.cc:34-45`
@@ -1827,7 +1827,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
 
         let top = AcroFormDocumentHelper::new(&mut pdf)
-            .top_level_field(ObjectRef::new(5, 0))
+            .get_top_level_field(ObjectRef::new(5, 0))
             .unwrap();
         assert_eq!(top, ObjectRef::new(6, 0));
     }
@@ -1906,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn field_for_annotation_non_widget_returns_none_without_traversal() {
+    fn get_field_for_annotation_non_widget_returns_none_without_traversal() {
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(5, 0),
@@ -1914,26 +1914,26 @@ mod tests {
         );
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
-                .field_for_annotation(ObjectRef::new(5, 0))
+                .get_field_for_annotation(ObjectRef::new(5, 0))
                 .unwrap(),
             None
         );
     }
 
     #[test]
-    fn field_for_annotation_missing_subtype_returns_none_without_traversal() {
+    fn get_field_for_annotation_missing_subtype_returns_none_without_traversal() {
         let mut pdf = empty_pdf();
         pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(dict(&[])));
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
-                .field_for_annotation(ObjectRef::new(5, 0))
+                .get_field_for_annotation(ObjectRef::new(5, 0))
                 .unwrap(),
             None
         );
     }
 
     #[test]
-    fn field_for_annotation_looks_up_the_map() {
+    fn get_field_for_annotation_looks_up_the_map() {
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(1, 0),
@@ -1962,14 +1962,14 @@ mod tests {
         );
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
-                .field_for_annotation(ObjectRef::new(7, 0))
+                .get_field_for_annotation(ObjectRef::new(7, 0))
                 .unwrap(),
             Some(ObjectRef::new(7, 0))
         );
     }
 
     #[test]
-    fn field_for_annotation_resolves_an_indirect_subtype() {
+    fn get_field_for_annotation_resolves_an_indirect_subtype() {
         // qpdf's `getFieldForAnnotation` gate
         // (`isDictionaryOfType("", "/Widget")`) transparently dereferences
         // `getKey("/Subtype")`, so a /Subtype stored as an indirect reference
@@ -2003,7 +2003,7 @@ mod tests {
         );
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
-                .field_for_annotation(ObjectRef::new(7, 0))
+                .get_field_for_annotation(ObjectRef::new(7, 0))
                 .unwrap(),
             Some(ObjectRef::new(7, 0))
         );

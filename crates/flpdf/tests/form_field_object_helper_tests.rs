@@ -640,7 +640,7 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
     assert!(!field.is_null().unwrap());
     assert_eq!(field.parent().unwrap(), Some(ObjectRef::new(11, 0)));
     assert_eq!(
-        field.top_level_field().unwrap(),
+        field.get_top_level_field().unwrap(),
         (ObjectRef::new(12, 0), true)
     );
     assert_eq!(
@@ -680,7 +680,7 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
 }
 
 #[test]
-fn top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
+fn get_top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
     let bytes = doc(vec![
         (10, "<< /Parent 11 0 R >>".into()),
         (11, "<< /Parent 10 0 R >>".into()),
@@ -689,7 +689,7 @@ fn top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
 
     assert_eq!(
         FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-            .top_level_field()
+            .get_top_level_field()
             .unwrap(),
         (ObjectRef::new(10, 0), true)
     );
@@ -1552,7 +1552,7 @@ fn radio_keeps_direct_children_without_appearance_or_grandchildren() {
 }
 
 #[test]
-fn top_level_field_limits_depth_but_inherited_reference_reaches_the_terminal_value() {
+fn get_top_level_field_limits_depth_but_inherited_reference_reaches_the_terminal_value() {
     let mut objects = Vec::new();
     for number in 10..=111 {
         let dictionary = if number == 111 {
@@ -1566,7 +1566,7 @@ fn top_level_field_limits_depth_but_inherited_reference_reaches_the_terminal_val
     let mut pdf = open(doc(objects));
 
     let top_level = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .top_level_field()
+        .get_top_level_field()
         .unwrap_err();
     assert!(top_level
         .to_string()
@@ -2102,7 +2102,7 @@ fn choices_resolve_each_indirect_item_to_its_terminal_string() {
 }
 
 #[test]
-fn top_level_field_stops_before_a_parent_that_resolves_to_null() {
+fn get_top_level_field_stops_before_a_parent_that_resolves_to_null() {
     let bytes = doc(vec![
         (10, "<< /Parent 20 0 R >>".into()),
         (20, "null".into()),
@@ -2111,7 +2111,7 @@ fn top_level_field_stops_before_a_parent_that_resolves_to_null() {
 
     assert_eq!(
         FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-            .top_level_field()
+            .get_top_level_field()
             .unwrap(),
         (ObjectRef::new(10, 0), false)
     );
