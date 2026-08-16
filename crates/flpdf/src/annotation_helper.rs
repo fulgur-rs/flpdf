@@ -51,7 +51,7 @@
 
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
-use crate::{ObjectRef, Pdf, Result};
+use crate::{Matrix, ObjectRef, Pdf, Rectangle, Result};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -71,6 +71,21 @@ use std::io::{Read, Seek};
 pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
     annot: ObjectHandle,
     pdf: &'a mut Pdf<R>,
+}
+
+#[derive(Default)]
+pub(crate) struct AppearanceContentOverrides {
+    geometry: Option<(Rectangle, Matrix)>,
+    flags: Option<i64>,
+}
+
+impl AppearanceContentOverrides {
+    pub(crate) fn with_geometry(bbox: Rectangle, matrix: Matrix, flags: i64) -> Self {
+        Self {
+            geometry: Some((bbox, matrix)),
+            flags: Some(flags),
+        }
+    }
 }
 
 impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
@@ -312,6 +327,211 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
             } // cov:ignore: llvm-cov brace-region artifact, not untested — reached by both annotation_handle_appearance_stream_missing_state_returns_null and _state_dictionary_key_missing_returns_null, same as the pre-existing single-block version of this brace
         } // cov:ignore: llvm-cov brace-region artifact, not untested — same two tests fall through to this outer brace after the inner one
         Ok(ObjectHandle::null())
+    }
+
+    // -----------------------------------------------------------------------
+    // get_page_content_for_appearance — qpdf appearance placement
+    // -----------------------------------------------------------------------
+
+    /// Generate page content that draws the normal appearance as a Form XObject.
+    ///
+    /// This is the Rust counterpart of
+    /// `QPDFAnnotationObjectHelper::getPageContentForAppearance`
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:78-193`). `name` is the complete
+    /// PDF resource name, including its leading slash (for example,
+    /// `"/Fxo1"`). An empty result means that the annotation has no usable
+    /// normal appearance, its flags do not satisfy the requested contract, its
+    /// rectangle or appearance bounding box is invalid, or its transformed
+    /// appearance has zero width or height.
+    pub fn get_page_content_for_appearance(
+        &mut self,
+        name: &str,
+        rotate: i32,
+        required_flags: i64,
+        forbidden_flags: i64,
+    ) -> Result<Vec<u8>> {
+        let appearance = self.get_appearance_stream(b"N", None)?;
+        self.build_page_content_for_appearance(
+            name,
+            appearance,
+            rotate,
+            required_flags,
+            forbidden_flags,
+            AppearanceContentOverrides::default(),
+        )
+    }
+
+    /// Compatibility fallback for a bridge-selected stream whose `/BBox`,
+    /// `/Matrix`, or `/F` value is itself a `Pdf::set_object` redirect. The
+    /// bridge supplies those already-normalized values; all qpdf placement,
+    /// flag gating, stream mutation, and emitted content remain here.
+    pub(crate) fn get_page_content_for_selected_appearance_with_geometry(
+        &mut self,
+        name: &str,
+        appearance_ref: ObjectRef,
+        rotate: i32,
+        required_flags: i64,
+        forbidden_flags: i64,
+        overrides: AppearanceContentOverrides,
+    ) -> Result<Vec<u8>> {
+        let appearance = self.pdf.get_object_handle(appearance_ref);
+        self.pdf.resolve_object_handle(&appearance)?;
+        self.build_page_content_for_appearance(
+            name,
+            appearance,
+            rotate,
+            required_flags,
+            forbidden_flags,
+            overrides,
+        )
+    }
+
+    fn build_page_content_for_appearance(
+        &mut self,
+        name: &str,
+        appearance: ObjectHandle,
+        rotate: i32,
+        required_flags: i64,
+        forbidden_flags: i64,
+        overrides: AppearanceContentOverrides,
+    ) -> Result<Vec<u8>> {
+        let Some(appearance_dict) = appearance.as_stream_dict() else {
+            return Ok(Vec::new());
+        };
+
+        let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
+            return Ok(Vec::new());
+        };
+        let (bbox, matrix) = match overrides.geometry {
+            Some((bbox, matrix)) => (bbox, matrix),
+            None => {
+                let bbox_handle = appearance_dict.get_key(b"/BBox");
+                let Some(bbox) = self.rectangle_from_handle(&bbox_handle)? else {
+                    return Ok(Vec::new());
+                };
+                let matrix_handle = appearance_dict.get_key(b"/Matrix");
+                let matrix = self.matrix_from_handle(&matrix_handle)?.unwrap_or_default();
+                (bbox, matrix)
+            }
+        };
+
+        let flags = match overrides.flags {
+            Some(flags) => flags,
+            None => self.get_flags()?,
+        };
+        if (flags & forbidden_flags) != 0 {
+            return Ok(Vec::new());
+        }
+        if (flags & required_flags) != required_flags {
+            return Ok(Vec::new());
+        }
+
+        let do_rotate = rotate != 0 && (flags & 0x10) != 0;
+        let (rect, matrix) = if do_rotate {
+            let mut rotated_matrix = Matrix::default();
+            rotated_matrix.rotatex90(rotate);
+            rotated_matrix.concat(matrix);
+            let rect_width = rect.urx - rect.llx;
+            let rect_height = rect.ury - rect.lly;
+            let rotated_rect = match rotate {
+                90 => Rectangle::new(
+                    rect.llx,
+                    rect.ury,
+                    rect.llx + rect_height,
+                    rect.ury + rect_width,
+                ),
+                180 => Rectangle::new(
+                    rect.llx - rect_width,
+                    rect.ury,
+                    rect.llx,
+                    rect.ury + rect_height,
+                ),
+                270 => Rectangle::new(
+                    rect.llx - rect_height,
+                    rect.ury - rect_width,
+                    rect.llx,
+                    rect.ury,
+                ),
+                _ => rect,
+            };
+            (rotated_rect, rotated_matrix)
+        } else {
+            (rect, matrix)
+        };
+
+        let transformed_bbox = matrix.transform_rectangle(bbox);
+        let width = transformed_bbox.urx - transformed_bbox.llx;
+        let height = transformed_bbox.ury - transformed_bbox.lly;
+        if width == 0.0 || height == 0.0 {
+            return Ok(Vec::new());
+        }
+
+        let mut placement = Matrix::default();
+        placement.translate(rect.llx, rect.lly);
+        placement.scale(
+            (rect.urx - rect.llx) / width,
+            (rect.ury - rect.lly) / height,
+        );
+        placement.translate(-transformed_bbox.llx, -transformed_bbox.lly);
+        if do_rotate {
+            placement.rotatex90(rotate);
+        }
+
+        appearance_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+        self.pdf.mark_object_handle_dirty(&appearance_dict)?;
+
+        Ok(format!("q\n{} cm\n{} Do\nQ\n", placement.unparse(), name).into_bytes())
+    }
+
+    /// Return a normalized rectangle for a required numeric array key.
+    fn rectangle_for_key(&mut self, key: &[u8]) -> Result<Option<Rectangle>> {
+        let handle = self.resolved_key(key)?;
+        self.rectangle_from_handle(&handle)
+    }
+
+    /// Return a normalized rectangle when `handle` is a valid four-number array.
+    fn rectangle_from_handle(&mut self, handle: &ObjectHandle) -> Result<Option<Rectangle>> {
+        self.pdf.resolve_object_handle(handle)?;
+        let Some(items) = handle.as_array() else {
+            return Ok(None);
+        };
+        if items.len() != 4 {
+            return Ok(None);
+        }
+        let mut numbers = [0.0; 4];
+        for (index, item) in items.iter().enumerate() {
+            self.pdf.resolve_object_handle(item)?;
+            let Some(number) = as_number(item) else {
+                return Ok(None);
+            };
+            numbers[index] = number;
+        }
+        Ok(Some(Rectangle::new(
+            numbers[0].min(numbers[2]),
+            numbers[1].min(numbers[3]),
+            numbers[0].max(numbers[2]),
+            numbers[1].max(numbers[3]),
+        )))
+    }
+
+    /// Return a six-number matrix, or `None` when qpdf would use identity.
+    fn matrix_from_handle(&mut self, handle: &ObjectHandle) -> Result<Option<Matrix>> {
+        self.pdf.resolve_object_handle(handle)?;
+        let Some(items) = handle.as_array() else {
+            return Ok(None);
+        };
+        if items.len() != 6 {
+            return Ok(None);
+        }
+        let mut numbers = [0.0; 6];
+        for (index, item) in items.iter().enumerate() {
+            self.pdf.resolve_object_handle(item)?;
+            let Some(number) = as_number(item) else {
+                return Ok(None);
+            };
+            numbers[index] = number;
+        }
+        Ok(Some(Matrix::from(numbers)))
     }
 }
 

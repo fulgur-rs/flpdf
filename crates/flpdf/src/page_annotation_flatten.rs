@@ -4,12 +4,17 @@
 //! [`flatten_annotations_on_page`] processes every eligible annotation on a
 //! single leaf page:
 //!
-//! 1. Reads the annotation's `/AP/N` appearance stream (a Form XObject).
-//! 2. Registers that stream in the page `/Resources/XObject` dictionary.
-//! 3. Appends `q {A} cm /{name} Do Q` to the page content stream, where `A` is
-//!    the affine matrix that maps the appearance's bounding box onto the
-//!    annotation `/Rect`.
-//! 4. Removes the annotation from the page `/Annots` array.
+//! 1. Selects the annotation's `/AP/N` appearance stream (a Form XObject).
+//! 2. Delegates qpdf's `/BBox` + `/Matrix` + `/Rect` placement and content
+//!    construction to [`crate::AnnotationObjectHelper`].
+//! 3. Registers the selected stream in the page `/Resources/XObject` dictionary.
+//! 4. Appends the helper's `q\n... cm\n/name Do\nQ\n` content to the page.
+//! 5. Removes the annotation from the page `/Annots` array.
+//!
+//! `resolve_ap_n`, `read_annot_flags`, and
+//! `annotation_has_appearance_dictionary` remain a bounded compatibility
+//! bridge for `Pdf::set_object`-constructed holder chains. They are not the
+//! parsed qpdf route and do not own placement or emitted content.
 //!
 //! The qpdf document-helper entry point applies this to every leaf page with
 //! its caller-supplied required and forbidden annotation-flag masks.
@@ -17,7 +22,10 @@
 use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
+use crate::{
+    AnnotationObjectHelper, Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
+    Stream,
+};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -84,37 +92,52 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───
     struct AnnotData {
+        annot_ref: ObjectRef,
         xobj_ref: ObjectRef, // the Form XObject to place
-        matrix_a: Matrix,    // placement matrix A
+        flags: i64,
     }
 
-    let mut to_flatten: Vec<AnnotData> = Vec::new();
+    let mut candidates: Vec<AnnotData> = Vec::new();
     // Track annot_refs that should be removed from /Annots (same set).
     let mut to_remove: Vec<ObjectRef> = Vec::new();
     #[cfg(test)]
-    let (qpdf_flag_contract, skip_widgets, page_rotate) = match mode {
-        FlattenMode::Flags {
-            skip_widgets,
-            page_rotate,
-            ..
-        } => (true, skip_widgets, page_rotate),
-        _ => (false, false, 0),
-    };
+    let (qpdf_flag_contract, skip_widgets, page_rotate, required_flags, forbidden_flags) =
+        match mode {
+            FlattenMode::Flags {
+                required,
+                forbidden,
+                skip_widgets,
+                page_rotate,
+                ..
+            } => (true, skip_widgets, page_rotate, required, forbidden),
+            _ => (false, false, 0, 0, 0),
+        };
     #[cfg(not(test))]
-    let (qpdf_flag_contract, skip_widgets, page_rotate) = match mode {
-        FlattenMode::Flags {
-            skip_widgets,
-            page_rotate,
-            ..
-        } => (true, skip_widgets, page_rotate),
-    };
+    let (qpdf_flag_contract, skip_widgets, page_rotate, required_flags, forbidden_flags) =
+        match mode {
+            FlattenMode::Flags {
+                required,
+                forbidden,
+                skip_widgets,
+                page_rotate,
+                ..
+            } => (true, skip_widgets, page_rotate, required, forbidden),
+        };
 
     for ea in &all_annots {
         if skip_widgets && ea.is_widget {
             continue;
         }
-        // Read /F flags from the annotation dict (indirect ref resolved).
-        let flags = read_annot_flags(pdf, ea.annot_ref)?;
+        // Read /F through the canonical helper first. A zero result is also
+        // qpdf's fail-soft value for absent/non-integer /F, so only that
+        // result may fall back to the in-memory holder-chain bridge used by
+        // Pdf::set_object fixtures.
+        let canonical_flags = AnnotationObjectHelper::new(ea.annot_ref, pdf).get_flags()?;
+        let flags = if canonical_flags == 0 {
+            read_annot_flags(pdf, ea.annot_ref)?
+        } else {
+            canonical_flags
+        };
         #[cfg(test)]
         let hidden = (flags & FLAG_HIDDEN) != 0;
         #[cfg(test)]
@@ -165,20 +188,10 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             None => continue, // no rect — cannot place
         };
 
-        // Read /BBox and /Matrix from the Form XObject stream dict.
-        let (bbox, mut ap_matrix) = read_xobj_bbox_and_matrix(pdf, xobj_ref)?;
-        let bbox = match bbox {
-            Some(b) => b,
-            None => continue, // /BBox required
-        };
-
-        // `an_no_rotate` is 0x10. qpdf deliberately reads only the leaf
-        // page's `/Rotate` key here (rather than resolving inheritance).
-        let do_rotate = page_rotate != 0 && (flags & 0x10) != 0;
-        let mut rect = rect;
         // The retained test-only legacy modes predate qpdf's direct flag API
         // and intentionally preserve their zero-area/inverted-rectangle
-        // behavior. The public qpdf path below uses qpdf's raw rectangle.
+        // behavior. The qpdf-shaped helper owns the rectangle and appearance
+        // geometry calculation for both paths.
         if !qpdf_flag_contract {
             let (llx, urx) = if rect.llx <= rect.urx {
                 (rect.llx, rect.urx)
@@ -193,67 +206,20 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             if (urx - llx).abs() < 1e-6 || (ury - lly).abs() < 1e-6 {
                 continue;
             }
-            rect = crate::PageBox::new(llx, lly, urx, ury);
-        }
-        if do_rotate {
-            let mut rotation = Matrix::default();
-            rotation.rotatex90(page_rotate);
-            rotation.concat(ap_matrix);
-            ap_matrix = rotation;
-            let rect_w = rect.urx - rect.llx;
-            let rect_h = rect.ury - rect.lly;
-            rect = match page_rotate {
-                90 => crate::PageBox::new(rect.llx, rect.ury, rect.llx + rect_h, rect.ury + rect_w),
-                // cov:ignore-start: source-derived 180-degree formula; 90-degree public test covers shared NoRotate path
-                180 => {
-                    crate::PageBox::new(rect.llx - rect_w, rect.ury, rect.llx, rect.ury + rect_h)
-                }
-                // cov:ignore-end
-                // cov:ignore-start: source-derived 270-degree formula; 90-degree public test covers shared NoRotate path
-                270 => {
-                    crate::PageBox::new(rect.llx - rect_h, rect.ury - rect_w, rect.llx, rect.ury)
-                }
-                // cov:ignore-end
-                _ => rect, // cov:ignore: malformed non-quarter-turn Rotate is a qpdf no-op
-            };
         }
 
-        // Transform the 4 corners of /BBox by /Matrix to get the transformed bbox.
-        let transformed_bbox = ap_matrix.transform_rectangle(bbox);
-        let tx0 = transformed_bbox.llx;
-        let tx1 = transformed_bbox.urx;
-        let ty0 = transformed_bbox.lly;
-        let ty1 = transformed_bbox.ury;
-
-        let tw = tx1 - tx0;
-        let th = ty1 - ty0;
-
-        // qpdf only rejects exact zero dimensions here.
-        if tw == 0.0 || th == 0.0 {
-            continue;
-        }
-
-        // qpdf computes A by translation, scale, translation and finally
-        // rotates A for NoRotate widgets.
-        let mut matrix_a = Matrix::default();
-        matrix_a.translate(rect.llx, rect.lly);
-        matrix_a.scale((rect.urx - rect.llx) / tw, (rect.ury - rect.lly) / th);
-        matrix_a.translate(-tx0, -ty0);
-        if do_rotate {
-            matrix_a.rotatex90(page_rotate);
-        }
-
-        to_flatten.push(AnnotData { xobj_ref, matrix_a });
-        if !qpdf_flag_contract {
-            to_remove.push(ea.annot_ref);
-        }
+        candidates.push(AnnotData {
+            annot_ref: ea.annot_ref,
+            xobj_ref,
+            flags,
+        });
     }
 
-    if to_flatten.is_empty() && to_remove.is_empty() {
+    if candidates.is_empty() && to_remove.is_empty() {
         return Ok(0);
     }
 
-    if to_flatten.is_empty() {
+    if candidates.is_empty() {
         let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
             return Err(Error::Unsupported(format!(
@@ -298,7 +264,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // Counter for unique XObject name generation.
     let mut xobj_counter: u32 = 1;
 
-    for data in &to_flatten {
+    let mut flattened_count = 0;
+    for data in &candidates {
         // Choose a name that doesn't collide with existing /XObject keys.
         let xobj_name = loop {
             let candidate = format!("Fxo{xobj_counter}");
@@ -308,21 +275,64 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             }
         };
 
-        // Register the Form XObject.
-        xobj_dict.insert(xobj_name.as_str(), Object::Reference(data.xobj_ref));
+        let resource_name = format!("/{xobj_name}");
+        let content = AnnotationObjectHelper::new(data.annot_ref, pdf)
+            .get_page_content_for_appearance(
+                &resource_name,
+                page_rotate,
+                required_flags,
+                forbidden_flags,
+            )?;
+        let content = if content.is_empty() {
+            // The normal parsed route above is fully ObjectHandle-based. A
+            // small compatibility set of tests constructs multi-hop holder
+            // redirects with Pdf::set_object; normalize only that bridge
+            // data, then keep the qpdf placement/output implementation in
+            // AnnotationObjectHelper.
+            match read_xobj_bbox_and_matrix(pdf, data.xobj_ref)? {
+                (Some(bbox), matrix) => AnnotationObjectHelper::new(data.annot_ref, pdf)
+                    .get_page_content_for_selected_appearance_with_geometry(
+                        &resource_name,
+                        data.xobj_ref,
+                        page_rotate,
+                        required_flags,
+                        forbidden_flags,
+                        crate::annotation_helper::AppearanceContentOverrides::with_geometry(
+                            bbox, matrix, data.flags,
+                        ),
+                    )?,
+                (None, _) => Vec::new(),
+            }
+        } else {
+            content
+        };
+        if content.is_empty() {
+            continue;
+        }
 
-        // Build "q {a b c d e f} cm /{name} Do Q\n".
-        let cm_line = format!(
-            "q\n{} {} {} {} {} {} cm\n/{} Do\nQ\n",
-            fmt_f64(data.matrix_a.a),
-            fmt_f64(data.matrix_a.b),
-            fmt_f64(data.matrix_a.c),
-            fmt_f64(data.matrix_a.d),
-            fmt_f64(data.matrix_a.e),
-            fmt_f64(data.matrix_a.f),
-            xobj_name,
-        );
-        append_bytes.extend_from_slice(cm_line.as_bytes());
+        // Register the Form XObject only when qpdf produced drawing content.
+        xobj_dict.insert(xobj_name.as_str(), Object::Reference(data.xobj_ref));
+        append_bytes.extend_from_slice(&content);
+        flattened_count += 1;
+        if !qpdf_flag_contract {
+            to_remove.push(data.annot_ref);
+        }
+    }
+
+    if flattened_count == 0 {
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
+            // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a dictionary after flatten"
+            )));
+            // cov:ignore-end
+        };
+        replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
+        if qpdf_flag_contract {
+            add_qpdf_flatten_contents(pdf, &mut page_dict, Vec::new())?; // cov:ignore: covered structurally by indirect-contents public fixture
+        } // cov:ignore: llvm-cov maps the tested qpdf wrapper branch to this synthetic closing brace
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+        return Ok(0);
     }
 
     // ── Step 6: Add qpdf-shaped page-content wrappers ─────────────────────
@@ -355,7 +365,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     pdf.set_object(page_ref, Object::Dictionary(page_dict));
 
-    Ok(to_flatten.len())
+    Ok(flattened_count)
 }
 
 fn replace_pruned_annots<R: Read + Seek>(
@@ -634,18 +644,6 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Format an f64 as a compact, locale-independent PDF number.
-/// Integers are emitted without a decimal point (e.g. `200.0` → `"200"`).
-fn fmt_f64(v: f64) -> String {
-    if v.is_finite() && v == v.trunc() && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        let s = format!("{v:.6}");
-        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-        trimmed.to_string()
-    }
-}
 
 /// Read the annotation's `/F` flags integer, resolving indirect references.
 /// Returns 0 if absent (absence = no special flags).
@@ -1601,19 +1599,6 @@ mod tests {
 
         // qpdf removes /Annots after every annotation has been flattened.
         assert!(page_dict.get("Annots").is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // Test: fmt_f64 helper
-    // -----------------------------------------------------------------------
-    #[test]
-    fn fmt_f64_formats_correctly() {
-        assert_eq!(fmt_f64(0.0), "0");
-        assert_eq!(fmt_f64(1.0), "1");
-        assert_eq!(fmt_f64(-1.0), "-1");
-        assert_eq!(fmt_f64(50.0), "50");
-        assert_eq!(fmt_f64(0.5), "0.5");
-        assert_eq!(fmt_f64(1.25), "1.25");
     }
 
     // -----------------------------------------------------------------------
@@ -2911,20 +2896,5 @@ mod tests {
         let (bbox, matrix) = read_xobj_bbox_and_matrix(&mut pdf, xobj_ref).unwrap();
         assert!(bbox.is_none(), "direct non-array /BBox should return None");
         assert_eq!(matrix, Matrix::default());
-    }
-
-    // -----------------------------------------------------------------------
-    // Test: fmt_f64 for non-finite / non-integer float
-    // -----------------------------------------------------------------------
-    #[test]
-    fn fmt_f64_non_integer_float() {
-        // covers the else branch of fmt_f64 (line 316-319)
-        assert_eq!(fmt_f64(0.5), "0.5");
-        assert_eq!(fmt_f64(1.25), "1.25");
-        assert_eq!(fmt_f64(0.123456), "0.123456");
-        // trailing zeros removed
-        assert_eq!(fmt_f64(1.500_000), "1.5");
-        // very large integer-valued float
-        assert_eq!(fmt_f64(1_000_000.0), "1000000");
     }
 }
