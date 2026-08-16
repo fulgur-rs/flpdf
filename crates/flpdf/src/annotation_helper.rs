@@ -300,7 +300,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
                     return Ok(ap_sub_val);
                 }
             }
-        }
+        } // cov:ignore: llvm-cov brace-region artifact, not untested — reached by both annotation_handle_appearance_stream_missing_state_returns_null and _state_dictionary_key_missing_returns_null (line 304's hit count sums both paths; this line's own counter stays 0)
         Ok(ObjectHandle::null())
     }
 }
