@@ -5949,10 +5949,10 @@ mod tests {
             .arg(&path)
             .output()
             .expect("run pinned qpdf indirect DecodeParms probe");
+        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
         assert!(
             qpdf.status.success(),
-            "qpdf indirect DecodeParms probe failed:\n{}",
-            String::from_utf8_lossy(&qpdf.stderr)
+            "qpdf indirect DecodeParms probe failed:\n{qpdf_stderr}"
         );
 
         let mut pdf = Pdf::open_with_options(
@@ -5974,6 +5974,37 @@ mod tests {
             .clone();
         assert_eq!(qpdf.stdout, PLAINTEXT, "qpdf oracle plaintext");
         assert_eq!(flpdf, qpdf.stdout, "flpdf and qpdf stream bytes");
+    }
+
+    #[test]
+    fn explicit_crypt_prefix_resolution_covers_bounds_and_cycles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
+        );
+        stream_dict.insert("DecodeParms", Object::Array(Vec::new()));
+        pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
+            .expect("missing DecodeParms entry must be accepted");
+
+        let cycle_ref = ObjectRef::new(5, 0);
+        let cycle_handle = pdf.get_object_handle(cycle_ref);
+        let mut seen = BTreeSet::from([cycle_ref]);
+        pdf.resolve_filter_prefix_handle_tree(&cycle_handle, 0, &mut seen)
+            .expect("already-seen filter prefix must terminate");
+
+        let depth_error = pdf
+            .resolve_filter_prefix_handle_tree(
+                &cycle_handle,
+                crate::parser::MAX_PARSE_DEPTH + 1,
+                &mut BTreeSet::new(),
+            )
+            .expect_err("excessive filter prefix nesting must be rejected");
+        assert!(
+            matches!(depth_error, Error::Unsupported(message) if message.contains("filter prefix object nesting"))
+        );
     }
 
     #[test]
