@@ -2697,7 +2697,43 @@ mod tests {
     // here exercises it. It stays covered by the existing hand-derived
     // `merge_adjacent_ranges`/`labels_for_page_range_*` unit tests above.
 
+    use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    /// Resolve qpdf 11.9.0: prefer `/usr/bin/qpdf` on Linux (apt-installed,
+    /// pinned by CI), otherwise resolve `qpdf` on `PATH` (CI installs the
+    /// pinned build there on macOS/Windows; see `.github/workflows/ci.yml`'s
+    /// "Add qpdf 11.9.0 to PATH" steps). Returns `None` — the caller skips —
+    /// unless the resolved candidate reports exactly `qpdf version 11.9.0`,
+    /// so a developer host without the pinned binary doesn't fail `cargo
+    /// test`, and a differently-versioned `qpdf` on `PATH` doesn't produce
+    /// a silently wrong oracle comparison.
+    fn pinned_qpdf() -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        let candidates: &[&str] = &["/usr/bin/qpdf", "qpdf"];
+        #[cfg(not(target_os = "linux"))]
+        let candidates: &[&str] = &["qpdf"];
+
+        for candidate in candidates {
+            // cov:ignore-start: CI provides the pinned qpdf 11.9.0 binary on every candidate path; a launch failure, non-zero exit, or version mismatch only happens on a developer host missing it.
+            let Ok(version) = Command::new(candidate).arg("--version").output() else {
+                continue;
+            };
+            if !version.status.success() {
+                continue;
+            }
+            // cov:ignore-end
+            let first_line = String::from_utf8_lossy(&version.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if first_line == "qpdf version 11.9.0" {
+                return Some(PathBuf::from(candidate));
+            } // cov:ignore: CI's pinned candidate always matches; the non-matching-version fallthrough only happens on a developer host with a different qpdf on PATH
+        }
+        None // cov:ignore: CI always resolves a pinned candidate above; only reached on a developer host missing qpdf entirely
+    }
 
     /// A 7-page PDF whose `/PageLabels /Nums` covers, at indices 0-5: an
     /// `/S`-only range, a range with none of `/S`/`/P`/`/St`, an `/St`-only
@@ -2753,8 +2789,8 @@ mod tests {
 
     /// Run `qpdf --json=2 --json-key=pagelabels` and return the parsed
     /// `"pagelabels"` array.
-    fn qpdf_json_pagelabels(path: &std::path::Path) -> Json {
-        let qpdf = Command::new("/usr/bin/qpdf")
+    fn qpdf_json_pagelabels(qpdf: &Path, path: &Path) -> Json {
+        let qpdf = Command::new(qpdf)
             .arg("--json=2")
             .arg("--json-key=pagelabels")
             .arg(path)
@@ -2840,12 +2876,18 @@ mod tests {
 
     #[test]
     fn get_labels_for_page_range_matches_pinned_qpdf_json_oracle() {
+        let Some(qpdf) = pinned_qpdf() else {
+            // cov:ignore-start: CI provides the pinned qpdf binary; this is a developer-host skip
+            eprintln!("pinned qpdf 11.9.0 unavailable; skipping pagelabels oracle");
+            return;
+            // cov:ignore-end
+        };
         let bytes = qpdf_pagelabels_probe_pdf();
         let directory = tempfile::tempdir().expect("temporary qpdf oracle directory");
         let path = directory.path().join("pagelabels-probe.pdf");
         std::fs::write(&path, &bytes).expect("write qpdf oracle fixture");
 
-        let pagelabels = qpdf_json_pagelabels(&path);
+        let pagelabels = qpdf_json_pagelabels(&qpdf, &path);
         let mut expected: Vec<(i64, Json)> = Vec::new();
         pagelabels.for_each_array_item(|entry| {
             let index = entry
@@ -2886,6 +2928,12 @@ mod tests {
 
     #[test]
     fn get_label_for_page_matches_pinned_qpdf_json_oracle_for_every_page() {
+        let Some(qpdf) = pinned_qpdf() else {
+            // cov:ignore-start: CI provides the pinned qpdf binary; this is a developer-host skip
+            eprintln!("pinned qpdf 11.9.0 unavailable; skipping pagelabels oracle");
+            return;
+            // cov:ignore-end
+        };
         let bytes = qpdf_pagelabels_probe_pdf();
         let directory = tempfile::tempdir().expect("temporary qpdf oracle directory");
         let input_path = directory.path().join("pagelabels-probe.pdf");
@@ -2896,7 +2944,7 @@ mod tests {
 
         for page_idx in 0i64..7 {
             let output_path = directory.path().join(format!("page-{page_idx}.pdf"));
-            let extract = Command::new("/usr/bin/qpdf")
+            let extract = Command::new(&qpdf)
                 .arg("--empty")
                 .arg("--pages")
                 .arg(&input_path)
@@ -2911,7 +2959,7 @@ mod tests {
                 "qpdf page {page_idx} extraction failed: {extract_stderr}"
             );
 
-            let entries = qpdf_json_pagelabels(&output_path);
+            let entries = qpdf_json_pagelabels(&qpdf, &output_path);
             let mut expected_label = None;
             entries.for_each_array_item(|entry| {
                 expected_label = Some(entry.get_dict_item("label"));
