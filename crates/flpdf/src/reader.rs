@@ -437,19 +437,6 @@ pub struct PdfOpenOptions {
     pub description: String,
 }
 
-// Maximum number of object streams an `/Extends` chain may link before
-// `collect_object_stream_chain` rejects it. The chain is followed by self
-// recursion (one stack frame per link), so without this bound an adversarial
-// non-cyclic chain — each object stream pointing at a distinct parent — recurses
-// until the stack overflows and the process aborts (the no-panic/no-abort
-// guarantee's failure mode, same class as the parser-nesting bound). Cycle
-// detection alone does not help here because every link is a fresh reference.
-// `/Extends` (ISO 32000-2 §7.5.7) chains object streams; real documents go at
-// most one or two deep, so 100 only rejects pathological input and matches the
-// crate's other tree-walk depth limits.
-#[cfg(test)]
-const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
-
 // Stack-growth protection for this module's two recursive hubs: `lift_bounded`
 // here, and `ResolverHandle::resolve_indirect` in the `resolver` child module,
 // which reaches these as `super::READER_STACK_RED_ZONE`/
@@ -3884,99 +3871,6 @@ impl<R: Read + Seek> Pdf<R> {
                 diagnostic.message
             ))?;
         }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn compressed_parent_for_entry(
-        &mut self,
-        stream_ref: ObjectRef,
-        target_index: u32,
-    ) -> Result<(ObjectRef, u32)> {
-        let Some(stream_handle) = self.object_stream_handle_with_legacy_fallback(stream_ref)?
-        else {
-            return Err(Error::parse(0, "compressed parent is not an object stream"));
-        };
-        if stream_handle.as_stream_dict().is_none() {
-            return Err(Error::parse(0, "compressed parent is not an object stream"));
-        }
-        let (parent_ref, parent_index, _) =
-            self.object_stream_chain_member(stream_ref, &stream_handle, target_index)?;
-        Ok((parent_ref, parent_index))
-    }
-
-    #[cfg(test)]
-    fn object_stream_chain_member(
-        &mut self,
-        stream_ref: ObjectRef,
-        stream_handle: &ObjectHandle,
-        target_index: u32,
-    ) -> Result<(ObjectRef, u32, ObjectHandle)> {
-        let mut streams = Vec::new();
-        self.collect_object_stream_chain(
-            stream_ref,
-            stream_handle,
-            &mut streams,
-            &mut BTreeSet::new(),
-        )?;
-
-        let target_index = usize::try_from(target_index)
-            .map_err(|_| Error::parse(0, "compressed object index does not fit usize"))?;
-        let mut remaining = target_index;
-        for (member_stream_ref, member_stream) in streams {
-            let stream_dict = member_stream
-                .as_stream_dict()
-                .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
-            let member_count = object_stream_count_from_handle(&stream_dict)?;
-            if remaining < member_count {
-                let member_index = u32::try_from(remaining)
-                    .map_err(|_| Error::parse(0, "compressed object index does not fit u32"))?;
-                return Ok((member_stream_ref, member_index, member_stream));
-            }
-            remaining -= member_count;
-        }
-
-        Err(Error::parse(
-            0,
-            "compressed object index out of range for object stream chain",
-        ))
-    }
-
-    #[cfg(test)]
-    fn collect_object_stream_chain(
-        &mut self,
-        stream_ref: ObjectRef,
-        stream_handle: &ObjectHandle,
-        streams: &mut Vec<(ObjectRef, ObjectHandle)>,
-        seen: &mut BTreeSet<ObjectRef>,
-    ) -> Result<()> {
-        // `seen` starts empty at the entry call and grows by one per `/Extends`
-        // hop, so `seen.len()` is the current recursion depth. Bound it before
-        // descending another level to keep the stack from overflowing on a long
-        // non-cyclic chain. Checked before the cycle insert below so a too-deep
-        // chain and a cyclic one surface as distinct errors.
-        if seen.len() >= MAX_OBJECT_STREAM_CHAIN_DEPTH {
-            return Err(Error::parse(0, "object stream /Extends chain too deep"));
-        }
-        if !seen.insert(stream_ref) {
-            return Err(Error::parse(0, "object stream /Extends cycle"));
-        }
-
-        self.resolve_object_handle(stream_handle)?;
-        let stream_dict = stream_handle
-            .as_stream_dict()
-            .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
-        let extends = stream_dict.try_get_key(b"/Extends")?;
-        if let Some(parent_ref) = extends.object_ref().or_else(|| extends.as_reference()) {
-            let parent_handle = self.get_object_handle(parent_ref);
-            self.resolve_object_handle(&parent_handle)?;
-            if parent_handle.as_stream_dict().is_none() {
-                return Err(Error::parse(0, "object stream /Extends is not a stream"));
-            }
-            self.collect_object_stream_chain(parent_ref, &parent_handle, streams, seen)?;
-        }
-
-        streams.push((stream_ref, stream_handle.clone()));
         Ok(())
     }
 }
@@ -8388,17 +8282,6 @@ mod tests {
             .decode_object_stream_data(&provider_handle)
             .is_err());
 
-        let mut not_an_object_stream =
-            Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-        let non_stream = ObjectRef::new(9, 0);
-        not_an_object_stream.set_object(non_stream, Object::Integer(1));
-        assert!(matches!(
-            not_an_object_stream
-                .compressed_parent_for_entry(non_stream, 0)
-                .expect_err("non-stream compressed parent"),
-            Error::Parse { .. }
-        ));
-
         let missing_count = ObjectHandle::dictionary(vec![]);
         assert!(object_stream_integer_from_handle(&missing_count, b"/N", "/N").is_err());
         let negative_count =
@@ -9112,101 +8995,6 @@ mod tests {
             Arc::strong_count(&kept),
             2,
             "the document must read the caller's allocation, not a copy"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // collect_object_stream_chain: /Extends chain depth bound
-    // ------------------------------------------------------------------
-
-    /// Builds a classic-xref PDF whose object streams form an `/Extends` chain
-    /// of `chain_len` links: objects `4..4+chain_len`, each linking to the next
-    /// and the last without `/Extends`. The head object stream is object 4.
-    ///
-    /// The streams are empty (`/N 0`); `collect_object_stream_chain` only walks
-    /// `/Extends` and never parses members, so empty streams exercise the depth
-    /// guard fully without needing real compressed payloads.
-    fn objstm_extends_chain_pdf(chain_len: usize) -> Vec<u8> {
-        let mut bodies: Vec<Vec<u8>> = vec![
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
-        ];
-        let first_objstm = 4u32;
-        for i in 0..chain_len {
-            let obj_num = first_objstm + i as u32;
-            let extends = if i + 1 < chain_len {
-                format!(" /Extends {} 0 R", obj_num + 1)
-            } else {
-                String::new()
-            };
-            bodies.push(
-                format!(
-                    "{obj_num} 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0{extends} >>\nstream\n\nendstream\nendobj\n"
-                )
-                .into_bytes(),
-            );
-        }
-
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.5\n");
-        let mut offsets = Vec::with_capacity(bodies.len());
-        for body in &bodies {
-            offsets.push(pdf.len() as u64);
-            pdf.extend_from_slice(body);
-        }
-
-        let size = bodies.len() + 1; // +1 for the free object 0
-        let xref_start = pdf.len() as u64;
-        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
-        for off in &offsets {
-            xref.push_str(&format!("{off:010} 00000 n \n"));
-        }
-        pdf.extend_from_slice(xref.as_bytes());
-        pdf.extend_from_slice(
-            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-        pdf
-    }
-
-    /// A chain exactly at the limit is collected in full (the depth guard's
-    /// non-error path).
-    #[test]
-    fn collect_object_stream_chain_accepts_chain_at_limit() {
-        let bytes = objstm_extends_chain_pdf(MAX_OBJECT_STREAM_CHAIN_DEPTH);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let head = ObjectRef::new(4, 0);
-        let head_handle = pdf.get_object_handle(head);
-        pdf.resolve_object_handle(&head_handle)
-            .expect("resolve head");
-        let mut streams = Vec::new();
-        pdf.collect_object_stream_chain(head, &head_handle, &mut streams, &mut BTreeSet::new())
-            .expect("a chain at the depth limit must be accepted");
-        assert_eq!(streams.len(), MAX_OBJECT_STREAM_CHAIN_DEPTH);
-    }
-
-    /// One link past the limit aborts with a catchable parse error rather than
-    /// recursing until the stack overflows.
-    #[test]
-    fn collect_object_stream_chain_rejects_overlong_extends_chain() {
-        let bytes = objstm_extends_chain_pdf(MAX_OBJECT_STREAM_CHAIN_DEPTH + 1);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
-        let head = ObjectRef::new(4, 0);
-        let head_handle = pdf.get_object_handle(head);
-        pdf.resolve_object_handle(&head_handle)
-            .expect("resolve head");
-        let mut streams = Vec::new();
-        let err = pdf
-            .collect_object_stream_chain(head, &head_handle, &mut streams, &mut BTreeSet::new())
-            .expect_err("a chain past the depth limit must be rejected");
-        assert!(
-            matches!(err, Error::Parse { .. }),
-            "expected a parse error, got: {err:?}"
-        );
-        assert!(
-            err.to_string().contains("too deep"),
-            "expected a depth error, got: {err}"
         );
     }
 
