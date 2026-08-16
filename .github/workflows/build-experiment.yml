@@ -104,10 +104,24 @@ jobs:
           echo "[experiment] Compiling lines in cargo test --no-run: ${compiling}"
           test "${compiling}" -eq 0
 
+      # The number is only half the decision: dropping debug info costs
+      # backtrace quality, and on MSVC that means no PDB to resolve frames
+      # against. Run a real `should_panic` unit test with the panic hook
+      # printing, so the trade-off is measured on an actual test binary of
+      # this workspace rather than argued from first principles.
+      - name: Backtrace quality under this profile
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          echo "[experiment] backtrace for a should_panic unit test:"
+          cargo test -p flpdf --lib \
+            cache::tests::source_free_xref_entry_is_unreachable_during_cache_construction \
+            -- --exact --nocapture 2>&1 | head -40
+
       - name: Report artifact size
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "[experiment] target/debug/deps total:"
-          du -sh target/debug/deps
+          echo "[experiment] target/debug/deps total: $(du -sh target/debug/deps | cut -f1)"
