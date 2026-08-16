@@ -96,7 +96,7 @@ impl OutlineTree {
     /// the identical hazard for the same reason (its outline destinations
     /// are live, mutable `QPDFObjectHandle` values too), so this is qpdf
     /// parity rather than an flpdf-only limitation.
-    pub fn outlines_for_page(
+    pub fn get_outlines_for_page(
         &self,
         page: Option<ObjectRef>,
     ) -> impl Iterator<Item = (OutlineId, &OutlineItem)> {

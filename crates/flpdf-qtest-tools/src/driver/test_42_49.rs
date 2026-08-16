@@ -695,7 +695,7 @@ pub(crate) fn run_test_49<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     // qpdf 11.9.0 qpdf/test_driver.cc:1923-1937.
     //
-    // `OutlineTree::outlines_for_page` is qpdf's
+    // `OutlineTree::get_outlines_for_page` is qpdf's
     // `QPDFOutlineDocumentHelper::getOutlinesForPage`
     // (`outline.rs:84-109`'s own doc cites the qpdf source), and
     // `OutlineItem::title`/`::dest` are the decoded `/Title` and resolved
@@ -704,7 +704,7 @@ pub(crate) fn run_test_49<R: Read + Seek>(
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
     for (pageno, page_ref) in pages.into_iter().enumerate() {
         let lines: Vec<(String, Vec<u8>)> = tree
-            .outlines_for_page(Some(page_ref))
+            .get_outlines_for_page(Some(page_ref))
             .map(|(_, item)| (item.title.clone(), item.dest.unparse_resolved()))
             .collect();
         for (title, dest) in lines {
