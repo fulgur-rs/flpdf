@@ -478,10 +478,13 @@ impl BootstrapHandleDocument {
                     Some(offset as u64),
                 );
             }
+            // qpdf's `resolveObjectsInStream` always parses the member and
+            // `updateCache` overwrites an existing cache slot
+            // (`libqpdf/QPDF.cc:1821-1828,1843-1857`). A reentrant lookup
+            // during stream-dictionary resolution can have temporarily
+            // resolved this handle to null, so do not let that provisional
+            // value suppress the real member parse.
             let member_handle = self.handle_for_reference(object_ref);
-            if member_handle.is_resolved() {
-                continue;
-            }
             let parsed_offset = parsed.parsed_offset;
             // cov:ignore-start: the handle parser guarantees an exclusively owned direct member value
             let value = parsed.value.into_direct_value().ok_or_else(|| {
@@ -3298,7 +3301,7 @@ mod tests {
         XrefReadContextSpec, XrefRegistration,
     };
     use crate::filters;
-    use crate::object_handle::{DocumentResolver, ObjectValue};
+    use crate::object_handle::DocumentResolver;
     use crate::{
         Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, XrefEntry,
     };
@@ -3377,6 +3380,24 @@ mod tests {
         let encoded = crate::stream_filter::encode_flate(&payload).unwrap();
         let mut bytes = format!(
             "{stream_number} 0 obj\n<< /Type /ObjStm /N {} /First {first} /Filter /FlateDecode /Length {} >>\nstream\n",
+            members.len(),
+            encoded.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&encoded);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    }
+
+    fn test_flate_objstm_bytes_with_decode_parms_ref(
+        stream_number: u32,
+        members: &[(u32, &[u8])],
+        decode_parms_object_number: u32,
+    ) -> Vec<u8> {
+        let (payload, first) = test_objstm_payload(members);
+        let encoded = crate::stream_filter::encode_flate(&payload).unwrap();
+        let mut bytes = format!(
+            "{stream_number} 0 obj\n<< /Type /ObjStm /N {} /First {first} /Filter /FlateDecode /DecodeParms {decode_parms_object_number} 0 R /Length {} >>\nstream\n",
             members.len(),
             encoded.len()
         )
@@ -3813,34 +3834,62 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.message.contains("integer out of range")));
 
-        let mut skipped_member_bytes = b" \n".to_vec();
-        let skipped_member_offset = skipped_member_bytes.len() as u64;
-        skipped_member_bytes.extend_from_slice(&test_objstm_bytes(8, &[(2, b"42".as_slice())]));
-        let mut skipped_member_registration = XrefRegistration::default();
-        skipped_member_registration.insert_xref_entry(
+        // qpdf's `resolve` may temporarily cache a null for a compressed member
+        // when resolving the object stream's own `/DecodeParms` re-enters the
+        // same object stream (`QPDF.cc:1745-1749`). The outer member loop still
+        // parses every member and `updateCache` unconditionally overwrites that
+        // provisional value (`QPDF.cc:1821-1828,1843-1857`). The member loop
+        // must do the same rather than skipping an already-resolved handle.
+        let mut overwritten_member_bytes = b" \n".to_vec();
+        let overwritten_member_offset = overwritten_member_bytes.len() as u64;
+        overwritten_member_bytes.extend_from_slice(&test_flate_objstm_bytes_with_decode_parms_ref(
+            8,
+            &[(2, b"<< /Marker 42 >>".as_slice()), (3, b"99".as_slice())],
+            2,
+        ));
+        let mut overwritten_member_registration = XrefRegistration::default();
+        overwritten_member_registration.insert_xref_entry(
             ObjectRef::new(8, 0),
             XrefEntry::Uncompressed {
-                offset: skipped_member_offset,
+                offset: overwritten_member_offset,
             },
         );
-        skipped_member_registration.insert_xref_entry(
+        overwritten_member_registration.insert_xref_entry(
             ObjectRef::new(2, 0),
             XrefEntry::Compressed {
                 stream: 8,
                 index: 0,
             },
         );
-        let skipped_member_document = BootstrapHandleDocument::new(
-            &skipped_member_bytes,
-            XrefEntryLookup::Registration(&skipped_member_registration.entries),
+        overwritten_member_registration.insert_xref_entry(
+            ObjectRef::new(3, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 1,
+            },
+        );
+        let overwritten_member_document = BootstrapHandleDocument::new(
+            &overwritten_member_bytes,
+            XrefEntryLookup::Registration(&overwritten_member_registration.entries),
             XrefLoadOptions::default(),
         );
-        let skipped_member = skipped_member_document.handle_for_reference(ObjectRef::new(2, 0));
-        skipped_member.set_resolved(ObjectValue::Null);
-        skipped_member_document
-            .resolve_object_stream(8)
-            .expect("already-resolved member is skipped");
-        assert!(skipped_member.is_null());
+        let overwritten_member =
+            overwritten_member_document.handle_for_reference(ObjectRef::new(3, 0));
+        overwritten_member
+            .try_dereference()
+            .expect("member resolution re-enters the object stream");
+        assert_eq!(overwritten_member.try_as_integer().unwrap(), Some(99));
+
+        let decode_parms_member =
+            overwritten_member_document.handle_for_reference(ObjectRef::new(2, 0));
+        assert_eq!(
+            decode_parms_member
+                .try_get_key(b"/Marker")
+                .expect("reentrant DecodeParms member is a dictionary")
+                .try_as_integer()
+                .unwrap(),
+            Some(42)
+        );
     }
 
     #[test]

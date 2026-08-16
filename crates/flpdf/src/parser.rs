@@ -1774,9 +1774,10 @@ pub(crate) struct ParsedFileObjectHandle {
 
 /// Parse one qpdf file-object body while retaining the live handle graph and
 /// the tokenizer position needed by stream framing. This keeps the
-/// `QPDFParser::parse` ownership boundary (`libqpdf/QPDFParser.cc:327-365`)
-/// intact: indirect references are minted as handles during tokenization and
-/// the caller, not this parser, decides how stream framing consumes the tail.
+/// `QPDFParser::parse` ownership boundary (`libqpdf/QPDFParser.cc:155-172`)
+/// intact: indirect references are minted as handles during tokenization. The
+/// caller, not this parser, decides how stream framing consumes the tail, as
+/// `QPDF::readObject` does after parsing (`libqpdf/QPDF.cc:1331-1349`).
 pub(crate) fn parse_qpdf_file_object_handle_with_diagnostics(
     input: &[u8],
     base_offset: i64,
