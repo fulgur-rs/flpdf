@@ -572,6 +572,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         handle_transformations: bool,
     ) -> Result<ObjectHandle> {
         let page = self.resolved_page_handle()?;
+        // Capture the page's original content container before a consumer can
+        // replace `/Contents` on the page (overlay does exactly that after
+        // creating /Fx0). The provider remains lazy and ObjectHandle-backed,
+        // but its source must be the content graph observed at conversion
+        // time; otherwise a later page rewrite makes the Form provider read
+        // the newly inserted /Fx0 Do fragment recursively.
+        let page_contents = page.try_get_key(b"/Contents")?;
+        let page_description = format!(
+            "contents from page object {}",
+            object_handle_description(&page)
+        );
         let form = self.pdf.new_stream()?;
         let dict = form
             .as_stream_dict()
@@ -610,7 +621,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         form.replace_stream_data_with_callback(
-            move |pipeline| page.pipe_page_contents(pipeline),
+            move |pipeline| {
+                let mut all_description = String::new();
+                page_contents.pipe_content_streams(
+                    pipeline,
+                    &page_description,
+                    &mut all_description,
+                )
+            },
             None,
             None,
         )?;

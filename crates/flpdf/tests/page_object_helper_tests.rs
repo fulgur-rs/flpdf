@@ -6,8 +6,8 @@
 //! inheritance resolution and per-page mutation round-trips.
 
 use flpdf::{
-    apply_rotate_to_pages, pages, Error, Matrix, Object, ObjectHandle, ObjectRef, PageBox,
-    PageObjectHelper, Pdf, Rectangle, RotateMode, RotateOp,
+    apply_rotate_to_pages, pages, DecodeLevel, Error, Matrix, Object, ObjectHandle, ObjectRef,
+    PageBox, PageObjectHelper, Pdf, Rectangle, RotateMode, RotateOp,
 };
 use std::io::Cursor;
 use std::rc::Rc;
@@ -260,6 +260,36 @@ fn get_form_xobject_for_page_builds_a_lazy_canonical_form_stream() {
     assert_eq!(dict.get_key(b"/Type").as_name(), Some(b"XObject".to_vec()));
     assert_eq!(dict.get_key(b"/Subtype").as_name(), Some(b"Form".to_vec()));
     assert_eq!(dict.get_key(b"/BBox").as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn get_form_xobject_for_page_keeps_original_contents_after_page_rewrite() {
+    let (num, extra) = make_stream_object(4, b"q Q");
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R",
+        &[(num, extra)],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let form = helper
+        .get_form_xobject_for_page(false)
+        .expect("page should become a Form XObject");
+    let replacement = ObjectHandle::stream(
+        ObjectHandle::dictionary(Vec::new()),
+        Rc::new(b"q /Fx0 Do Q".to_vec()),
+    );
+    helper
+        .add_page_contents(replacement, false)
+        .expect("rewriting the page contents should succeed");
+
+    assert_eq!(
+        form.get_stream_data(DecodeLevel::Specialized)
+            .expect("Form provider should retain the original content")
+            .as_slice(),
+        b"q Q"
+    );
 }
 
 #[test]
