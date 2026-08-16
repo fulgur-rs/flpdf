@@ -2,13 +2,22 @@
 //!
 //! Tests the following filter array combinations:
 //!   (a) [/ASCII85Decode /FlateDecode] — round-trip, no DecodeParms
-//!   (b) [/FlateDecode /ASCIIHexDecode] — round-trip, no DecodeParms
+//!   (b) [/FlateDecode /ASCIIHexDecode] — pre-encoded fixture, no DecodeParms
 //!   (c) [/ASCII85Decode /FlateDecode] — with DecodeParms array [null <<Predictor 12...>>]
 //!   (d) [/FlateDecode /RunLengthDecode] — round-trip, no DecodeParms
 //!   (e) DecodeParms as a bare null Object — must not panic; filters apply without predictor
 //!   (f) [/ASCII85Decode /FlateDecode /RunLengthDecode] — mixed registered decoder chain
 
 use flpdf::{filters, Dictionary, Object};
+
+fn ascii_hex_encode(input: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(input.len() * 2 + 1);
+    for byte in input {
+        encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
+    }
+    encoded.push(b'>');
+    encoded
+}
 
 #[path = "common/ascii85.rs"]
 mod ascii85;
@@ -51,12 +60,12 @@ fn chain_ascii85_then_flate_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) [/FlateDecode /ASCIIHexDecode] — no DecodeParms
+// (b) [/FlateDecode /ASCIIHexDecode] — pre-encoded fixture, no DecodeParms
 // ---------------------------------------------------------------------------
 
 #[test]
-fn chain_flate_then_ascii_hex_round_trip() {
-    let raw = b"Testing FlateDecode + ASCIIHexDecode chain: both encode and decode directions.";
+fn chain_flate_then_ascii_hex_decodes_preencoded_fixture() {
+    let raw = b"Testing FlateDecode + ASCIIHexDecode decoder fixture.";
 
     // Filter = [/FlateDecode /ASCIIHexDecode]
     let mut dict = Dictionary::new();
@@ -68,8 +77,12 @@ fn chain_flate_then_ascii_hex_round_trip() {
         ]),
     );
 
-    // encode: raw → ASCIIHex-encode → FlateDecode-encode
-    let encoded = filters::encode_stream_data(&dict, raw).expect("encode chain");
+    // qpdf has an ASCIIHex decoder but no matching encoder. Build the fixture
+    // with the remaining Flate encoder: raw → ASCIIHex → Flate.
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let encoded = filters::encode_stream_data(&flate_dict, &ascii_hex_encode(raw))
+        .expect("encode Flate wrapper");
 
     // decode: encoded → FlateDecode → ASCIIHex-decode → raw
     let decoded = filters::decode_stream_data(&dict, &encoded).expect("decode chain");
@@ -229,7 +242,10 @@ fn chain_null_decode_parms_is_ignored() {
     // Set DecodeParms to a bare Null (edge case: malformed but should not crash)
     dict.insert("DecodeParms", Object::Null);
 
-    let encoded = filters::encode_stream_data(&dict, raw).expect("encode with null DecodeParms");
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let encoded = filters::encode_stream_data(&flate_dict, &ascii_hex_encode(raw))
+        .expect("encode Flate wrapper with null DecodeParms");
     let decoded =
         filters::decode_stream_data(&dict, &encoded).expect("decode with null DecodeParms");
 

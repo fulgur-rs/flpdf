@@ -1,7 +1,6 @@
 //! qpdf correspondence: QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter.
 use std::borrow::Cow;
 
-use crate::ascii_hex;
 use crate::object_handle::ObjectHandle;
 #[cfg(test)]
 use crate::pipeline::test_support::ascii85_fixture_bytes;
@@ -357,12 +356,12 @@ pub fn decode_stream_data_with_limits(
     )
 }
 
-/// Encode `stream_data` by applying the stream dictionary's `/Filter` chain.
+/// Encode `stream_data` by applying the stream dictionary's write-supported
+/// `/Filter` chain.
 ///
-/// This is not a perfect inverse of [`decode_stream_data`]. In particular,
-/// `/ASCII85Decode` intentionally returns [`Error::Unsupported`]: qpdf exposes
-/// the ASCII85 decoder in its stream pipeline, but does not provide a
-/// corresponding ASCII85 encoder.
+/// This is not a complete inverse of [`decode_stream_data`]. qpdf exposes
+/// ASCII85 and ASCIIHex decoding but no corresponding encoders, so chains that
+/// contain `/ASCII85Decode` or `/ASCIIHexDecode` return [`Error::Unsupported`].
 ///
 /// Every PNG predictor encodes with the Up row filter, so `/Predictor 10`
 /// through `/Predictor 15` produce identical output. The predictor number is
@@ -378,8 +377,8 @@ pub fn decode_stream_data_with_limits(
 /// - `/Filter` is neither a name nor an array of names.
 /// - `/DecodeParms` selects an unsupported `/Predictor` or an invalid row
 ///   geometry, on the same terms as [`decode_stream_data`].
-/// - a filter is decode-only on the encode path, including `/ASCII85Decode`
-///   and `LZWDecode`.
+/// - a filter is decode-only on the encode path, including `/ASCII85Decode`,
+///   `/ASCIIHexDecode`, and `LZWDecode`.
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
@@ -400,8 +399,10 @@ pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 /// # Errors
 ///
 /// Returns the same filter and predictor errors as [`encode_stream_data`],
-/// plus [`Error::Internal`] if an indirect holder or child still needs a
-/// document resolver after its document has been dropped.
+/// including the explicit unsupported results for `/ASCII85Decode` and
+/// `/ASCIIHexDecode`, plus
+/// [`Error::Internal`] if an indirect holder or child still needs a document
+/// resolver after its document has been dropped.
 #[allow(dead_code)] // promoted when flpdf-egzr.3.2.5 migrates writer consumers
 pub(crate) fn encode_stream_data_from_handle(
     stream_dict: &ObjectHandle,
@@ -968,7 +969,10 @@ fn apply_single_filter_encode(
     }
 
     if filter_name == b"ASCIIHexDecode" {
-        return Ok(ascii_hex::encode(stream_data));
+        return Err(
+            "ASCIIHexEncode is not supported: qpdf provides an ASCIIHex decoder but no encoder"
+                .to_string(),
+        );
     }
 
     if filter_name == b"RunLengthDecode" {
@@ -1047,6 +1051,15 @@ mod tests {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         dict
+    }
+
+    fn ascii_hex_encode(input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(input.len() * 2 + 1);
+        for byte in input {
+            output.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        output.push(b'>');
+        output
     }
 
     fn valid_prefix_then_invalid_stored_block() -> (Vec<u8>, Vec<u8>) {
@@ -1961,11 +1974,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_stream_data_ascii_hex_round_trip() {
+    fn decode_stream_data_ascii_hex_fixture() {
         let dict = ascii_hex_dict();
         let plaintext = b"Hello from ASCIIHexDecode filter!";
 
-        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let encoded = ascii_hex_encode(plaintext);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext.as_slice());
@@ -1976,7 +1989,7 @@ mod tests {
         let dict = ascii_hex_dict();
         let plaintext = b"";
 
-        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let encoded = ascii_hex_encode(plaintext);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext.as_slice());
@@ -1989,7 +2002,7 @@ mod tests {
         // encode always emits two hex chars per byte so no padding needed on decode
         let plaintext = b"ABC";
 
-        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let encoded = ascii_hex_encode(plaintext);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext.as_slice());
@@ -2007,6 +2020,16 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: character out of range during base Hex decode: "
+        );
+    }
+
+    #[test]
+    fn encode_stream_data_ascii_hex_is_explicitly_unsupported() {
+        let error = encode_stream_data(&ascii_hex_dict(), b"payload").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: ASCIIHexEncode is not supported: qpdf provides an ASCIIHex decoder but no encoder"
         );
     }
 
@@ -2440,11 +2463,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_stream_data_array_chain_round_trips_ascii_hex_then_flate() {
+    fn decode_stream_data_array_chain_accepts_ascii_hex_then_flate_fixture() {
         let dict = array_filter_dict(&[b"ASCIIHexDecode", b"FlateDecode"]);
         let plaintext: Vec<u8> = (0u8..=200u8).collect();
 
-        let encoded = encode_stream_data(&dict, &plaintext).unwrap();
+        let flate = flate_dict();
+        let compressed = encode_stream_data(&flate, &plaintext).unwrap();
+        let encoded = ascii_hex_encode(&compressed);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext);
@@ -3449,15 +3474,7 @@ mod tests {
         let original = b"hello";
         let mut data = original.to_vec();
         for _ in 0..16 {
-            data = encode_stream_data(
-                &{
-                    let mut d = Dictionary::new();
-                    d.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
-                    d
-                },
-                &data,
-            )
-            .unwrap();
+            data = ascii_hex_encode(&data);
         }
         let mut dict = Dictionary::new();
         dict.insert(
@@ -4044,7 +4061,7 @@ mod tests {
         /// `stream_decode_recovery_public_api.rs`'s own hex encoder emits no
         /// EOD for the same reason.
         fn asciihex_without_eod(data: &[u8]) -> Vec<u8> {
-            let mut encoded = ascii_hex::encode(data);
+            let mut encoded = ascii_hex_encode(data);
             let eod = encoded.pop();
             assert_eq!(eod, Some(b'>'));
             encoded
@@ -4090,12 +4107,9 @@ mod tests {
 
             // 17 ASCIIHex stages, encoded stage by stage: each round appends its
             // own `>` EOD, so the nesting unwinds one stage per decode.
-            let mut one_stage = Dictionary::new();
-            one_stage.insert("Filter", filter_name(b"ASCIIHexDecode"));
             let mut seventeen_stage_data = b"A".to_vec();
             for _ in 0..17 {
-                seventeen_stage_data =
-                    encode_stream_data(&one_stage, &seventeen_stage_data).unwrap();
+                seventeen_stage_data = ascii_hex_encode(&seventeen_stage_data);
             }
 
             vec![
@@ -4151,7 +4165,7 @@ mod tests {
                     label: "ASCIIHex payload",
                     filter: Some(filter_name(b"ASCIIHexDecode")),
                     decode_params: None,
-                    stream_data: ascii_hex::encode(&plain),
+                    stream_data: ascii_hex_encode(&plain),
                 },
                 Row {
                     label: "RunLength payload",
@@ -4163,7 +4177,7 @@ mod tests {
                     label: "chain of two: ASCIIHex then Flate",
                     filter: Some(filter_array(&[b"ASCIIHexDecode", b"FlateDecode"])),
                     decode_params: None,
-                    stream_data: ascii_hex::encode(&flate),
+                    stream_data: ascii_hex_encode(&flate),
                 },
                 Row {
                     label: "2000 decoded bytes, straddling the max_output sweep",
@@ -4356,12 +4370,12 @@ mod tests {
                 (
                     "ASCIIHexDecode",
                     filter_name(b"ASCIIHexDecode"),
-                    ascii_hex::encode(&plain),
+                    ascii_hex_encode(&plain),
                 ),
                 (
                     "chain replicating the scalar",
                     filter_array(&[b"ASCIIHexDecode", b"FlateDecode"]),
-                    ascii_hex::encode(&flate),
+                    ascii_hex_encode(&flate),
                 ),
             ];
 

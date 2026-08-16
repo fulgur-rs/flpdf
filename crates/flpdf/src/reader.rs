@@ -3551,29 +3551,15 @@ impl<R: Read + Seek> Pdf<R> {
                 self.warn_unknown_crypt_filters(warn_unknown_string, false)?;
                 return Ok((object, false));
             } else if has_explicit_crypt_filter {
-                // Resolve every indirect child of the prefix handles before
-                // borrowing the encryption state again. qpdf can resolve
-                // these handles while its EncryptionParameters shared_ptr is
-                // live; Rust's shared RefCell would otherwise panic when the
-                // resolver parses a source-backed /DecodeParms dictionary.
-                self.resolve_explicit_crypt_filter_prefixes(&stream.dict)?;
                 let mut encryption_guard = self.encryption.borrow_mut();
                 let encryption = encryption_guard
                     .as_mut()
                     .expect("encryption state remains present before stream pass");
-                let mut decode_prefix = |prefix_dict: &Dictionary, encoded: &[u8]| {
-                    self.decode_filter_prefix_from_handle(prefix_dict, encoded)
-                };
-                let mut encode_prefix = |prefix_dict: &Dictionary, decoded: &[u8]| {
-                    self.encode_filter_prefix_from_handle(prefix_dict, decoded)
-                };
-                warn_unknown_stream = apply_explicit_crypt_filters_with_decoder(
+                warn_unknown_stream = apply_explicit_crypt_filters(
                     object_ref,
                     stream,
                     encryption,
                     recovered_stream_eol,
-                    &mut decode_prefix,
-                    &mut encode_prefix,
                 )?;
                 stream_payload_transformed = true;
             } else {
@@ -3691,97 +3677,7 @@ impl<R: Read + Seek> Pdf<R> {
         ))
     }
 
-    /// Lift the short legacy `/Crypt` prefix dictionary into the document's
-    /// canonical handle graph before decoding it. qpdf's
-    /// `QPDF_Stream::filterable` reads `/Filter`, `/DecodeParms`, and their
-    /// children through resolving accessors (`libqpdf/QPDF_Stream.cc:386-482`);
-    /// passing the raw dictionary to the old filter entry point would leave an
-    /// indirect prefix parameter as an unresolved `Object::Reference`.
-    fn decode_filter_prefix_from_handle(
-        &self,
-        prefix_dict: &Dictionary,
-        encoded: &[u8],
-    ) -> Result<Vec<u8>> {
-        let prefix_handle = self.filter_dictionary_to_handle(prefix_dict, 0)?;
-        crate::filters::decode_stream_data_from_handle(
-            &prefix_handle,
-            encoded,
-            crate::filters::DecodeLimits::default(),
-        )
-    }
-
-    fn encode_filter_prefix_from_handle(
-        &self,
-        prefix_dict: &Dictionary,
-        decoded: &[u8],
-    ) -> Result<Vec<u8>> {
-        let prefix_handle = self.filter_dictionary_to_handle(prefix_dict, 0)?;
-        crate::filters::encode_stream_data_from_handle(&prefix_handle, decoded)
-    }
-
-    /// Eagerly resolve the canonical handles used by every prefix before the
-    /// encryption `RefCell` is borrowed for the actual decrypt/re-encode pass.
-    /// qpdf's `QPDF_Stream::filterable` can dereference these children while
-    /// `EncryptionParameters` is alive (`libqpdf/QPDF_Stream.cc:386-482`),
-    /// but the Rust resolver shares that state through `RefCell`.
-    fn resolve_explicit_crypt_filter_prefixes(&mut self, stream_dict: &Dictionary) -> Result<()> {
-        let Some(Object::Array(mut filters)) = stream_dict.get("Filter").cloned() else {
-            return Ok(());
-        };
-        let mut decode_params = stream_dict.get("DecodeParms").cloned();
-        let mut seen = BTreeSet::new();
-
-        while let Some(crypt_index) = filters
-            .iter()
-            .position(|filter| matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt"))
-        {
-            let prefix_dict = filter_prefix_dict(&filters, decode_params.as_ref(), crypt_index);
-            let prefix_handle = self.filter_dictionary_to_handle(&prefix_dict, 0)?;
-            self.resolve_filter_prefix_handle_tree(&prefix_handle, 0, &mut seen)?;
-
-            filters.remove(crypt_index);
-            if let Some(Object::Array(params)) = &mut decode_params {
-                if crypt_index < params.len() {
-                    params.remove(crypt_index);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn resolve_filter_prefix_handle_tree(
-        &mut self,
-        handle: &ObjectHandle,
-        depth: usize,
-        seen: &mut BTreeSet<ObjectRef>,
-    ) -> Result<()> {
-        if depth > crate::parser::MAX_PARSE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "filter prefix object nesting exceeds maximum of {}",
-                crate::parser::MAX_PARSE_DEPTH
-            )));
-        }
-        if let Some(object_ref) = handle.object_ref() {
-            if !seen.insert(object_ref) {
-                return Ok(());
-            }
-        }
-
-        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
-            self.resolve_object_handle(handle)?;
-            if let Some(children) = handle.as_array() {
-                for child in children {
-                    self.resolve_filter_prefix_handle_tree(&child, depth + 1, seen)?;
-                }
-            } else if let Some(entries) = handle.as_dictionary() {
-                for child in entries.values() {
-                    self.resolve_filter_prefix_handle_tree(child, depth + 1, seen)?;
-                }
-            }
-            Ok(())
-        })
-    }
-
+    #[cfg(test)]
     fn filter_dictionary_to_handle(
         &self,
         dictionary: &Dictionary,
@@ -3807,6 +3703,7 @@ impl<R: Read + Seek> Pdf<R> {
             .direct_object_handle(ObjectValue::Dictionary(entries)))
     }
 
+    #[cfg(test)]
     fn filter_object_to_handle(&self, object: &Object, depth: usize) -> Result<ObjectHandle> {
         if depth > crate::parser::MAX_PARSE_DEPTH {
             return Err(Error::Unsupported(format!(
@@ -4367,15 +4264,11 @@ fn decrypt_stream_bytes(
 /// streams: a `/Crypt` filter naming a method qpdf does not recognise still
 /// goes through `QPDF::decryptStream`'s switch, whose unknown arm warns and
 /// resets `cf_stream` (`libqpdf/QPDF_encryption.cc:1121-1133`).
-type StreamPrefixCodec<'a> = dyn FnMut(&Dictionary, &[u8]) -> Result<Vec<u8>> + 'a;
-
-fn apply_explicit_crypt_filters_with_decoder(
+fn apply_explicit_crypt_filters(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     encryption: &mut EncryptionState,
     recovered_stream_eol: Option<&[u8]>,
-    decode_prefix: &mut StreamPrefixCodec<'_>,
-    encode_prefix: &mut StreamPrefixCodec<'_>,
 ) -> Result<bool> {
     let filter = stream
         .dict
@@ -4386,22 +4279,55 @@ fn apply_explicit_crypt_filters_with_decoder(
     if let Some(filters) = filter.as_array() {
         crate::filters::validate_filter_chain_len(filters)?;
     }
-    if let Some(eol) = recovered_stream_eol {
-        stream.data.extend_from_slice(eol);
-    }
 
     let mut warn_unknown = false;
 
-    if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
-        let mode = explicit_crypt_mode(encryption, decode_params.as_ref());
-        let (use_aes, warn) = encryption.stream_method(Some(mode));
-        warn_unknown |= warn;
-        if let Some(use_aes) = use_aes {
-            if let Some(eol) = recovered_stream_eol {
-                stream.data.truncate(stream.data.len() - eol.len());
-            }
-            decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
+    // qpdf's QPDF::decryptStream prepends one decryption stage to the source
+    // pipeline before QPDF_Stream applies any /Filter entry
+    // (QPDF_encryption.cc:1041-1043, QPDF.cc:2477-2492). The legacy raw
+    // Object compatibility path is still materialized here, but it must keep
+    // that ordering: decrypt the raw payload once, then remove /Crypt and
+    // leave every other filter's encoded bytes untouched. Decoding a prefix
+    // and re-encoding it made the result depend on flpdf-only encoders and
+    // was wrong whenever /Crypt followed ASCII85/ASCIIHex/Flate.
+    let explicit_mode = match &filter {
+        Object::Name(name) if name.as_slice() == b"Crypt" => {
+            Some(explicit_crypt_mode(encryption, decode_params.as_ref()))
         }
+        Object::Array(filters) => filters
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, filter)| {
+                if !matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt") {
+                    return None;
+                }
+                let params = decode_params_at(decode_params.as_ref(), index)?;
+                let params_dict = params.as_dict()?;
+                params_dict.get("Name")?.as_name()?;
+                Some(explicit_crypt_mode(encryption, Some(params)))
+            }),
+        _ => None, // cov:ignore: the caller only enters for a name or array containing Crypt
+    };
+    // For an array, a malformed or missing local `/Name` leaves qpdf's
+    // `method` at `e_unknown`, which falls back to the document `/StmF`.
+    let (use_aes, warn) = encryption.stream_method(explicit_mode);
+    warn_unknown |= warn;
+
+    if let Some(eol) = recovered_stream_eol {
+        stream.data.extend_from_slice(eol);
+        if use_aes.is_some() {
+            // The recovered line ending belongs to the parser's source span,
+            // not to the encrypted stream payload. qpdf subtracts it from the
+            // source length before its prepended decryption stage.
+            stream.data.truncate(stream.data.len() - eol.len());
+        }
+    }
+    if let Some(use_aes) = use_aes {
+        decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
+    }
+
+    if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
         stream.dict.remove("Filter");
         stream.dict.remove("DecodeParms");
         return Ok(warn_unknown);
@@ -4410,39 +4336,17 @@ fn apply_explicit_crypt_filters_with_decoder(
     let mut filters = filter
         .into_array()
         .expect("explicit /Crypt filter is either a name or an array");
-    let mut framing = recovered_stream_eol;
-
-    while let Some(crypt_index) = filters
-        .iter()
-        .position(|filter| matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt"))
-    {
-        let crypt_params = decode_params_at(decode_params.as_ref(), crypt_index).cloned();
-        let mode = explicit_crypt_mode(encryption, crypt_params.as_ref());
-        let (use_aes, warn) = encryption.stream_method(Some(mode));
-        warn_unknown |= warn;
-
-        if let Some(use_aes) = use_aes {
-            let prefix_dict = filter_prefix_dict(&filters, decode_params.as_ref(), crypt_index);
-            let mut encoded = stream.data.clone();
-            if crypt_index == 0 {
-                if let Some(eol) = framing.take() {
-                    encoded.truncate(encoded.len() - eol.len());
+    let mut index = 0;
+    while index < filters.len() {
+        if matches!(&filters[index], Object::Name(name) if name.as_slice() == b"Crypt") {
+            filters.remove(index);
+            if let Some(Object::Array(params)) = &mut decode_params {
+                if index < params.len() {
+                    params.remove(index);
                 }
             }
-            let mut decoded_prefix = decode_prefix(&prefix_dict, &encoded)?;
-            decrypt_stream_bytes(object_ref, &mut decoded_prefix, use_aes, encryption)?;
-            stream.data = encode_prefix(&prefix_dict, &decoded_prefix)?;
-        }
-
-        // The endstream-scan EOL has now been accounted for in the source
-        // representation and must not be appended again by the writer.
-        // Identity keeps those exact recovered raw bytes.
-        framing = None;
-        filters.remove(crypt_index);
-        if let Some(Object::Array(params)) = &mut decode_params {
-            if crypt_index < params.len() {
-                params.remove(crypt_index);
-            }
+        } else {
+            index += 1;
         }
     }
 
@@ -4461,29 +4365,6 @@ fn apply_explicit_crypt_filters_with_decoder(
     Ok(warn_unknown)
 }
 
-#[cfg(test)]
-fn apply_explicit_crypt_filters(
-    object_ref: ObjectRef,
-    stream: &mut crate::Stream,
-    encryption: &mut EncryptionState,
-    recovered_stream_eol: Option<&[u8]>,
-) -> Result<bool> {
-    let mut decode_prefix = |prefix_dict: &Dictionary, encoded: &[u8]| {
-        crate::filters::decode_stream_data(prefix_dict, encoded)
-    };
-    let mut encode_prefix = |prefix_dict: &Dictionary, decoded: &[u8]| {
-        crate::filters::encode_stream_data(prefix_dict, decoded)
-    };
-    apply_explicit_crypt_filters_with_decoder(
-        object_ref,
-        stream,
-        encryption,
-        recovered_stream_eol,
-        &mut decode_prefix,
-        &mut encode_prefix,
-    )
-}
-
 fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
     let params = decode_params?;
     if params.as_dict().is_some() {
@@ -4491,26 +4372,6 @@ fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Obj
     } else {
         params.as_array()?.get(index)
     }
-}
-
-fn filter_prefix_dict(
-    filters: &[Object],
-    decode_params: Option<&Object>,
-    prefix_len: usize,
-) -> Dictionary {
-    let mut prefix = Dictionary::new();
-    if prefix_len == 0 {
-        return prefix;
-    }
-    prefix.insert("Filter", Object::Array(filters[..prefix_len].to_vec()));
-    if let Some(params) = decode_params {
-        let params = match params {
-            Object::Array(params) => Object::Array(params[..prefix_len.min(params.len())].to_vec()),
-            params => params.clone(),
-        };
-        prefix.insert("DecodeParms", params);
-    }
-    prefix
 }
 
 /// The crypt filter a stream's own `/Crypt` `/DecodeParms` names, read the way
@@ -5697,16 +5558,18 @@ mod tests {
     }
 
     #[test]
-    fn production_explicit_crypt_prefix_resolves_indirect_decode_params() {
+    fn production_explicit_crypt_keeps_indirect_decode_params() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
         let decode_params_ref = ObjectRef::new(5, 0);
         let plaintext = b"native prefix";
         let encryption = explicit_rc4_encryption_state();
-        let ciphertext = rc4_ciphertext(ObjectRef::new(4, 0), plaintext, &encryption);
-
         let mut predictor_input = vec![0];
-        predictor_input.extend_from_slice(&ciphertext);
-        let encoded = flate_encoded(&predictor_input);
+        predictor_input.extend_from_slice(plaintext);
+        let encoded = rc4_ciphertext(
+            ObjectRef::new(4, 0),
+            &flate_encoded(&predictor_input),
+            &encryption,
+        );
 
         let mut decode_params = Dictionary::new();
         decode_params.insert("Predictor", Object::Integer(12));
@@ -5745,7 +5608,7 @@ mod tests {
         };
         let stream_handle = pdf
             .filter_dictionary_to_handle(&stream.dict, 0)
-            .expect("lift rewritten filter prefix");
+            .expect("lift remaining filter parameters");
         let decoded = crate::filters::decode_stream_data_from_handle(
             &stream_handle,
             &stream.data,
@@ -5756,7 +5619,7 @@ mod tests {
     }
 
     #[test]
-    fn source_backed_explicit_crypt_prefix_does_not_reenter_encryption_cell() {
+    fn source_backed_explicit_crypt_keeps_decode_params_without_reentry() {
         let decode_params_ref = ObjectRef::new(5, 0);
         let bytes = classic_pdf_with_bodies(
             &[
@@ -5771,11 +5634,13 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open source-backed fixture");
         let plaintext = b"native prefix";
         let encryption = explicit_rc4_encryption_state();
-        let ciphertext = rc4_ciphertext(ObjectRef::new(4, 0), plaintext, &encryption);
-
         let mut predictor_input = vec![0];
-        predictor_input.extend_from_slice(&ciphertext);
-        let encoded = flate_encoded(&predictor_input);
+        predictor_input.extend_from_slice(plaintext);
+        let encoded = rc4_ciphertext(
+            ObjectRef::new(4, 0),
+            &flate_encoded(&predictor_input),
+            &encryption,
+        );
 
         let mut stream_dict = Dictionary::new();
         stream_dict.insert(
@@ -5807,7 +5672,7 @@ mod tests {
         };
         let stream_handle = pdf
             .filter_dictionary_to_handle(&stream.dict, 0)
-            .expect("lift rewritten source-backed filter prefix");
+            .expect("lift remaining source-backed filter parameters");
         let decoded = crate::filters::decode_stream_data_from_handle(
             &stream_handle,
             &stream.data,
@@ -5974,40 +5839,6 @@ mod tests {
             .clone();
         assert_eq!(qpdf.stdout, PLAINTEXT, "qpdf oracle plaintext");
         assert_eq!(flpdf, qpdf.stdout, "flpdf and qpdf stream bytes");
-    }
-
-    #[test]
-    fn explicit_crypt_prefix_resolution_covers_bounds_and_cycles() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
-
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert(
-            "Filter",
-            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
-        );
-        stream_dict.insert("DecodeParms", Object::Array(Vec::new()));
-        pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
-            .expect("missing DecodeParms entry must be accepted");
-        stream_dict.insert("DecodeParms", Object::Dictionary(Dictionary::new()));
-        pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
-            .expect("dictionary DecodeParms must be accepted");
-
-        let cycle_ref = ObjectRef::new(5, 0);
-        let cycle_handle = pdf.get_object_handle(cycle_ref);
-        let mut seen = BTreeSet::from([cycle_ref]);
-        pdf.resolve_filter_prefix_handle_tree(&cycle_handle, 0, &mut seen)
-            .expect("already-seen filter prefix must terminate");
-
-        let depth_error = pdf
-            .resolve_filter_prefix_handle_tree(
-                &cycle_handle,
-                crate::parser::MAX_PARSE_DEPTH + 1,
-                &mut BTreeSet::new(),
-            )
-            .expect_err("excessive filter prefix nesting must be rejected");
-        assert!(
-            matches!(depth_error, Error::Unsupported(message) if message.contains("filter prefix object nesting"))
-        );
     }
 
     #[test]
@@ -6533,6 +6364,14 @@ mod tests {
         crate::filters::encode_stream_data(&dict, plaintext).expect("Flate encode")
     }
 
+    fn ascii_hex_encoded_without_eod(plaintext: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(plaintext.len() * 2);
+        for byte in plaintext {
+            encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
+        }
+        encoded
+    }
+
     fn crypt_params(name: &[u8]) -> Object {
         let mut params = Dictionary::new();
         params.insert("Name", Object::Name(name.to_vec()));
@@ -6730,6 +6569,46 @@ mod tests {
     }
 
     #[test]
+    fn explicit_crypt_decrypts_before_ascii_hex_regardless_of_filter_slot() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = explicit_rc4_encryption_state();
+        let plaintext = b"crypt before ascii hex";
+        let encoded = ascii_hex_encoded_without_eod(plaintext);
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"ASCIIHexDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, crypt_params(b"StdCF")]),
+        );
+        let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &encoded, &encryption));
+
+        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None)
+            .expect("remove Crypt without re-encoding the ASCIIHex prefix");
+
+        assert_eq!(
+            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+                .expect("decode remaining ASCIIHex"),
+            plaintext
+        );
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Array(vec![Object::Name(
+                b"ASCIIHexDecode".to_vec()
+            )]))
+        );
+        assert_eq!(
+            stream.dict.get("DecodeParms"),
+            Some(&Object::Array(vec![Object::Null]))
+        );
+    }
+
+    #[test]
     fn singleton_explicit_crypt_array_removes_filter_entries() {
         let mut encryption = explicit_rc4_encryption_state();
         let mut dict = Dictionary::new();
@@ -6803,26 +6682,6 @@ mod tests {
             stream.dict.get("DecodeParms"),
             Some(&Object::Array(vec![Object::Null]))
         );
-    }
-
-    #[test]
-    fn explicit_crypt_helpers_apply_dictionary_decode_params_to_prefix() {
-        let params = crypt_params(b"Identity");
-        assert_eq!(decode_params_at(Some(&params), 7), Some(&params));
-
-        let filters = vec![
-            Object::Name(b"FlateDecode".to_vec()),
-            Object::Name(b"Crypt".to_vec()),
-        ];
-        let prefix = filter_prefix_dict(&filters, Some(&params), 1);
-        assert_eq!(
-            prefix.get("Filter"),
-            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
-        );
-        assert_eq!(prefix.get("DecodeParms"), Some(&params));
-
-        let prefix_without_params = filter_prefix_dict(&filters, None, 1);
-        assert_eq!(prefix_without_params.get("DecodeParms"), None);
     }
 
     /// Minimal valid single-page PDF used across `open_mem` tests.

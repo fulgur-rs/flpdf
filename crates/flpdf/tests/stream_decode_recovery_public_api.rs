@@ -33,12 +33,11 @@ fn odd_nibble_error_dictionary() -> Dictionary {
 
 #[test]
 fn recovering_limits_keep_default_chain_cap_but_allow_explicit_unlimited_chain() {
-    let one_stage = asciihex_dictionary(1);
     let dictionary = asciihex_dictionary(17);
     let original = b"A";
     let mut encoded = original.to_vec();
     for _ in 0..17 {
-        encoded = encode_stream_data(&one_stage, &encoded).unwrap();
+        encoded = asciihex_encode(&encoded);
     }
 
     assert_eq!(

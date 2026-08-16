@@ -7,7 +7,6 @@
 | `crates/flpdf/src/acroform_document_helper.rs` | correspondence | QPDFAcroFormDocumentHelper.cc responsibilities shared with overlay and signature modules |
 | `crates/flpdf/src/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
 | `crates/flpdf/src/annotation_helper.rs` | correspondence | \`QPDFAnnotationObjectHelper.cc\` |
-| `crates/flpdf/src/ascii_hex.rs` | correspondence | flpdf-specific ASCIIHex encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCIIHexDecoder but no matching encoder component |
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
