@@ -1,8 +1,9 @@
 //! qpdf correspondence: QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter.
 use std::borrow::Cow;
 
-use crate::ascii85;
 use crate::object_handle::ObjectHandle;
+#[cfg(test)]
+use crate::pipeline::test_support::ascii85_fixture_bytes;
 use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
@@ -359,8 +360,8 @@ pub fn decode_stream_data_with_limits(
 /// `/Filter` chain.
 ///
 /// This is not a complete inverse of [`decode_stream_data`]. qpdf exposes
-/// ASCIIHex decoding but no corresponding ASCIIHex encoder, so a chain that
-/// contains `/ASCIIHexDecode` returns [`Error::Unsupported`].
+/// ASCII85 and ASCIIHex decoding but no corresponding encoders, so chains that
+/// contain `/ASCII85Decode` or `/ASCIIHexDecode` return [`Error::Unsupported`].
 ///
 /// Every PNG predictor encodes with the Up row filter, so `/Predictor 10`
 /// through `/Predictor 15` produce identical output. The predictor number is
@@ -376,8 +377,8 @@ pub fn decode_stream_data_with_limits(
 /// - `/Filter` is neither a name nor an array of names.
 /// - `/DecodeParms` selects an unsupported `/Predictor` or an invalid row
 ///   geometry, on the same terms as [`decode_stream_data`].
-/// - `/Filter` contains `ASCIIHexDecode`; qpdf provides the decoder but no
-///   corresponding ASCIIHex encoder.
+/// - a filter is decode-only on the encode path, including `/ASCII85Decode`,
+///   `/ASCIIHexDecode`, and `LZWDecode`.
 pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
@@ -398,7 +399,8 @@ pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 /// # Errors
 ///
 /// Returns the same filter and predictor errors as [`encode_stream_data`],
-/// including the explicit unsupported result for `/ASCIIHexDecode`, plus
+/// including the explicit unsupported results for `/ASCII85Decode` and
+/// `/ASCIIHexDecode`, plus
 /// [`Error::Internal`] if an indirect holder or child still needs a document
 /// resolver after its document has been dropped.
 #[allow(dead_code)] // promoted when flpdf-egzr.3.2.5 migrates writer consumers
@@ -960,7 +962,10 @@ fn apply_single_filter_encode(
     stream_data: &[u8],
 ) -> std::result::Result<Vec<u8>, String> {
     if filter_name == b"ASCII85Decode" {
-        return Ok(ascii85::encode(stream_data));
+        return Err(
+            "ASCII85Encode is not supported: qpdf provides an ASCII85 decoder but no encoder"
+                .to_string(),
+        );
     }
 
     if filter_name == b"ASCIIHexDecode" {
@@ -1553,9 +1558,9 @@ mod tests {
             Object::Name(b"ASCII85Decode".to_vec()),
             Object::Name(b"ASCIIHexDecode".to_vec()),
         ]);
-        let mut encoded = ascii85::encode(b"4   ");
+        let mut encoded = ascii85_fixture_bytes(b"4   ");
         encoded.truncate(encoded.len() - 2);
-        let cleanup = ascii85::encode(b"G");
+        let cleanup = ascii85_fixture_bytes(b"G");
         encoded.extend_from_slice(&cleanup[..2]);
         encoded.push(b'z');
         let mut decrypt = |_: &DecodeParams, data: &[u8]| Ok(data.to_vec());
@@ -1629,9 +1634,9 @@ mod tests {
             Object::Name(b"ASCIIHexDecode".to_vec()),
             Object::Name(b"TestRejectDecode".to_vec()),
         ]);
-        let mut encoded = ascii85::encode(b"4   ");
+        let mut encoded = ascii85_fixture_bytes(b"4   ");
         encoded.truncate(encoded.len() - 2);
-        let cleanup = ascii85::encode(b"G");
+        let cleanup = ascii85_fixture_bytes(b"G");
         encoded.extend_from_slice(&cleanup[..2]);
         encoded.push(b'z');
 
@@ -2041,10 +2046,21 @@ mod tests {
         let dict = ascii85_dict();
         let plaintext = b"Hello from ASCII85Decode filter!";
 
-        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let encoded = ascii85_fixture_bytes(plaintext);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn encode_stream_data_ascii85_is_explicitly_unsupported() {
+        let dict = ascii85_dict();
+        let error = encode_stream_data(&dict, b"payload").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: ASCII85Encode is not supported: qpdf provides an ASCII85 decoder but no encoder"
+        );
     }
 
     #[test]
@@ -2052,7 +2068,7 @@ mod tests {
         let dict = ascii85_dict();
         let plaintext = b"";
 
-        let encoded = encode_stream_data(&dict, plaintext).unwrap();
+        let encoded = ascii85_fixture_bytes(plaintext);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, plaintext.as_slice());
@@ -2064,7 +2080,7 @@ mod tests {
         // A 4-byte all-zero block triggers the 'z' shorthand in the encoder
         let plaintext = [0u8; 8]; // two complete zero blocks → encoder emits "zz~>"
 
-        let encoded = encode_stream_data(&dict, &plaintext).unwrap();
+        let encoded = ascii85_fixture_bytes(&plaintext);
         // Verify the encoder actually used the 'z' shorthand
         assert!(
             encoded.contains(&b'z'),
@@ -2080,7 +2096,7 @@ mod tests {
         let dict = ascii85_dict();
         // Test all three short-final-group lengths: 1, 2, 3 bytes remainder
         for plaintext in [b"M".as_slice(), b"Ma", b"Man"] {
-            let encoded = encode_stream_data(&dict, plaintext).unwrap();
+            let encoded = ascii85_fixture_bytes(plaintext);
             let decoded = decode_stream_data(&dict, &encoded).unwrap();
             assert_eq!(
                 decoded,
@@ -2360,8 +2376,11 @@ mod tests {
         let chain = array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]);
         let native_chain = native_encode_dictionary(&chain);
         let payload = b"reverse-order chain payload";
-        let encoded = encode_stream_data_from_handle(&native_chain, payload).unwrap();
-        assert_eq!(decode_stream_data(&chain, &encoded).unwrap(), payload);
+        let error = encode_stream_data_from_handle(&native_chain, payload).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: ASCII85Encode is not supported: qpdf provides an ASCII85 decoder but no encoder"
+        );
     }
 
     #[test]
@@ -2430,16 +2449,17 @@ mod tests {
     }
 
     #[test]
-    fn encode_stream_data_array_chain_round_trips_ascii85_then_flate() {
+    fn encode_stream_data_array_chain_rejects_ascii85_then_flate() {
         // Decoder order: ASCII85Decode, then FlateDecode.
         // Encoder must therefore apply FlateDecode first, then ASCII85Decode.
         let dict = array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]);
         let plaintext = b"Round-trip me through ASCII85 over Flate, please!";
 
-        let encoded = encode_stream_data(&dict, plaintext).unwrap();
-        let decoded = decode_stream_data(&dict, &encoded).unwrap();
-
-        assert_eq!(decoded, plaintext.as_slice());
+        let error = encode_stream_data(&dict, plaintext).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: ASCII85Encode is not supported: qpdf provides an ASCII85 decoder but no encoder"
+        );
     }
 
     #[test]
@@ -3009,7 +3029,8 @@ mod tests {
         let dict = array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]);
         let payload = b"chain round-trip: Flate + ASCII85 (flpdf-9hc.7.5)";
 
-        let encoded = encode_stream_data(&dict, payload).unwrap();
+        let flate_encoded = encode_flate(payload).unwrap();
+        let encoded = ascii85_fixture_bytes(&flate_encoded);
         let decoded = decode_stream_data(&dict, &encoded).unwrap();
 
         assert_eq!(decoded, payload.as_slice());
@@ -3058,7 +3079,7 @@ mod tests {
     #[test]
     fn dct_in_chain_rejects_malformed_jpeg_with_qpdf_diagnostic() {
         // Build a valid ASCII85-encoded payload so the first filter succeeds.
-        let ascii85_encoded = ascii85::encode(b"some binary jpeg payload");
+        let ascii85_encoded = ascii85_fixture_bytes(b"some binary jpeg payload");
 
         let dict = array_filter_dict(&[b"ASCII85Decode", b"DCTDecode"]);
         let result = decode_stream_data(&dict, &ascii85_encoded);
@@ -4138,7 +4159,7 @@ mod tests {
                     label: "ASCII85 payload",
                     filter: Some(filter_name(b"ASCII85Decode")),
                     decode_params: None,
-                    stream_data: ascii85::encode(&plain),
+                    stream_data: ascii85_fixture_bytes(&plain),
                 },
                 Row {
                     label: "ASCIIHex payload",

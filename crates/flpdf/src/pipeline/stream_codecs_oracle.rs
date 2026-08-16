@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
-use super::ascii85::Ascii85Decoder;
+use super::ascii85_decoder::Ascii85Decoder;
 use super::ascii_hex::AsciiHexDecoder;
 use super::run_length::{RunLength, RunLengthAction};
 use super::test_support::{RecordingSink, TraceCall};

@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary.
+//! qpdf correspondence: `EmbeddedFileDocumentHelper` implements QPDFEmbeddedFileDocumentHelper.hh's public API (hasEmbeddedFiles, getEmbeddedFiles, getEmbeddedFile, replaceEmbeddedFile, removeEmbeddedFile).
 //! Read/write access to the `/Names /EmbeddedFiles` name-tree.
 //!
 //! # Reader

@@ -4,7 +4,8 @@
 （`scripts/fetch-qpdf-source.sh` で取得。パスは `--print-path` で解決する。
 本表のファイル名・行数はすべてこのツリーに対するもの。将来 v12 に追従する際は
 `git log v11.9.0..v12.0.0 -- libqpdf/` が移植差分になる）
-**調査日:** 2026-07-29（初版）/ 2026-08-02（Phase 2 着手時の再測 — `flpdf-1e5g`）
+**調査日:** 2026-07-29（初版）/ 2026-08-02（Phase 2 着手時の再測 — `flpdf-1e5g`）/
+2026-08-16（`flpdf-egzr`/`flpdf-3yn9` 大量クローズ後の再測）
 **関連:** `flpdf-qxba`（部品積み上げによる責務分割）/
 [設計書](superpowers/specs/2026-07-25-qpdf-component-bottom-up-refactor-design.md)
 
@@ -61,10 +62,11 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
   アドホック分岐ゼロ / 対応行 / ゲート通過）を満たす必要がある
 
 したがって「本表で ✅ なら `Mirrors` にできる」は成り立たない。
-現状は **mirror 5 / correspondence 129**（`content_normalizer` / `matrix` /
-`pdf_version` / `security/rc4` / `tokenizer` のみが `Mirrors`）。
+現状は **mirror 5 / correspondence 146**（2026-08-16 再測。`content_normalizer` /
+`matrix` / `pdf_version` / `security/rc4` / `tokenizer` のみが `Mirrors`）。
 本表で ✅ の `nntree.rs` / `json/` / `xref_entry.rs` / `bit_stream.rs` /
-`bit_writer.rs` / `optimization.rs` / `pipeline.rs` が `correspondence` のままである
+`bit_writer.rs` / `optimization.rs` / `pipeline.rs` / `embedded_files.rs` /
+`filespec_helper.rs` が `correspondence` のままである
 のは、責務境界が一致していても DoD 全体を検証していないためであり、
 必ずしも矛盾ではない。**昇格は各部品の担当スライスで D1〜D5 を検証したうえで
 行うこと**（D1 だけでは足りない）。
@@ -73,6 +75,72 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
 責務境界が一致しているとも言えないため、本表でも ✅ にしてはならない。
 2026-08-02 の再測ではこの観点で §7 の 3 行を ✅ から 🔀 に訂正した
 （`filespec_helper.rs` / `embedded_files.rs` / `page_label_document_helper.rs`）。
+
+### 2026-08-16 の再測
+
+2026-08-14〜08-16 にかけて `flpdf-egzr.3.2`（ObjectHandle consumer cutover）・
+`flpdf-3yn9`（Tier A〜D ヘルパー境界確定）系列で 70 件以上の issue が close
+され、本表が「pending」として記述していた箇所の多くが完了事実になっていた。
+bd (`bd show`) と実コードを突き合わせて次を訂正した。
+
+**(a) モジュール doc の自己申告が解消され ✅ に訂正した 2 行**
+
+| 節 | qpdf | 訂正前 | 訂正後 | 由来 |
+|---|---|---|---|---|
+| §7 | `QPDFEmbeddedFileDocumentHelper.cc` | 🔀 D1 未達 | ✅ D1 完成（D2 は `flpdf-q2fo` まで未達のまま） | `flpdf-jzy7`。`embedded_files.rs` 冒頭の自己申告文言も併せて訂正 |
+| §7 | `QPDFFileSpecObjectHelper`/`QPDFEFStreamObjectHelper` | 🔀 D1 未達 | ✅ D1 完成（D2 は同上） | `flpdf-d9sq`。`filespec_helper.rs` は既に自己申告のヘッジが無かった |
+
+これに連動して §9 の `doJSONAttachments`/`doJSONPageLabels` 内訳表（旧 🔀）も
+✅ に揃えた。`doJSONPageLabels` は §7 側が既に ✅ だったにもかかわらず表が
+追随していなかった既存の drift でもある。
+
+**(b) 「pending」記述を完了事実に訂正した箇所（状態記号は変更なし）**
+
+以下は closed issue を裏付けに文言だけを過去形化した。記号は元々 🔀 の
+根拠が ObjectHandle 移行の未完了ではなく責務境界の smear そのものだったため、
+維持している（下記 (c) 参照）。
+
+- §1 `QPDFObjectHandle.cc` / `QPDFObject.cc`・`QPDFValue.cc`: `flpdf-egzr.3.1`
+  （reader cutover）・`flpdf-mfir` の close を反映。旧 raw `Object` route の
+  最終削除は `flpdf-egzr.3.2.8`（open）
+- §2 `QPDF.cc`（reader.rs/xref.rs 行）: `flpdf-egzr.3.2.10` + 子
+  `.3.2.10.1`/`.3.2.10.2`（PR #859 merged）で reader.rs/xref.rs 自身の filter
+  呼び出しが production では ObjectHandle 経由のみになったことを確認し、
+  「別 issue」「行数は暫定値」という古い注記を除去
+- §3 `QPDFWriter.cc`: `flpdf-egzr.3.2.5`（+ 子 4件）・`flpdf-3yn9.11`/`.12`
+  の close を反映。`flpdf-egzr.3.2.15` セクション（暗号化 emission surface）
+  も「後続 cutover が使用する（予定）」を「使用している（実績）」に訂正
+- §6 `TokenFilter` 行の `flpdf-vkka` 注記: 「ゲート未配線」を、close 済みの
+  検証結果（`plain/body.rs` は対応済み、`emit_canonical_pdf_inner` 側は
+  PR #831 後に該当分岐が構造的に到達不能）に置き換え
+
+**(c) §4 `QPDF_linearization.cc` は ✅ 化を検討し見送った**
+
+producer（`flpdf-3yn9.4`）・consumer（`flpdf-egzr.3.2.9`）は close 済みで、
+production 経路から `Object::`/`resolve_borrowed` が消えたことをテストが
+機械的に保証している。しかし ✅ の判定基準は「ObjectHandle 移行の完了」では
+なく「責務境界の一致」であり、`linearization/` は依然 `plan.rs`/`hint_*`/
+`check.rs`/`show.rs` など 5+ モジュールに分散したまま — `optimization.rs` が
+2026-08-02 に ✅ を得た決め手（単一モジュールへの完全集約、旧所在地の空化）
+を満たしていない。また `flpdf-3yn9.5`（線形化書き込み経路）は issue タイトル
+自身が「§3 `QPDFWriter.cc` スライス」と宣言しており、§4 の根拠に使うのは
+帰属を誤る。記号は 🔀 のまま維持し、行内の説明のみ更新した。
+
+**(d) 検証可能性テーブルの stale 記述を訂正**
+
+- 「null 可視性」行の `cmp_null_visibility_tests` ⚠ CI 未列挙は stale —
+  `flpdf-qxba.2` で解消済みで `.github/workflows/ci.yml` に実際に列挙されて
+  いることを確認し ✅ に訂正
+- 「暗号化出力」行の CLI 列 ❌ は不正確 — `encrypt_cli_tests` に
+  `qpdf-zlib-compat` 関数レベル gate の byte-identical テストが 2 件存在し
+  CI で実行されていることを確認し 🟡 に訂正（library 側は引き続き gate 無し）
+
+**(e) mirror / correspondence カウントを再測**
+
+`scripts/qpdf-module-docs.py --check` は同期済み（exit 0）だったが、本表
+冒頭の「correspondence 129」が古く、実測は 146（mirror は 5 のまま変化なし）。
+Phase 2 進行に伴う新規モジュール分割（`job/`, `document_json.rs`,
+`optimization/inherited_attrs.rs` 等）が主因。
 
 **機械可読なモジュール索引:** [`qpdf-module-doc-index.md`](qpdf-module-doc-index.md) は
 各 source module 先頭の対応行から生成する。この索引は注釈の欠落と drift を検査する
@@ -132,12 +200,12 @@ paths and Windows directory-open failures for both metadata helpers.
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) + `object_handle.rs`(shared handle identity・parsed offset・遅延解決・live direct containment・`QPDF::newReserved`/`QPDF_Reserved`・`copyStream`/`StreamDataProvider` source dispatch) + `qpdf_null.rs`(9-37: `reference_is_null` / `value_is_null` = `isNull` の間接参照解決) + `overlay_annotations.rs`(1685-1737: `merge_resources_shallow` = `mergeResources`) + `overlay_appearance_stream.rs`（段階的 conflict merge の再現） | 🔀 アクセサが各所に散在（`flpdf-mfir`）。object identity / 遅延解決は `object_handle.rs` へ移行中（`flpdf-egzr.3.1`）。qpdf の array/dictionary/stream が保持する現在の forward child を正本とし、incremental dirty lookup 用に各 forward edge と一対一の immediate weak reverse edge を派生記録する。削除・置換後の旧 child は旧 root を返さない。`try_get_keys` は `QPDFObjectHandle::getKeys` → `QPDF_Dictionary::getKeys`（`QPDFObjectHandle.cc:997-1009`; `QPDF_Dictionary.cc:117-127`）に対応し、holder と全 child を lazy resolve して null value のキーを除外した `BTreeSet` を返す。child resolve 前に辞書 snapshot の borrow は終了し、resolver error は伝播する。`stream_filter.rs` の consuming stage は retained-key reduction 前に `try_get_keys` を使用する。`shallow_copy` は `QPDFObjectHandle::shallowCopy`（`QPDFObjectHandle.cc:2072-2079`）に対応し、stream は `QPDF_Stream::copy`（`QPDF_Stream.cc:140-145`）が `shallow` 引数を無視して無条件に `std::runtime_error` を投げるのに合わせて `Error::System` で拒否する。`QPDF_Dictionary::copy`/`QPDF_Array::copy` が direct な子に `shallowCopy` を掛けるため、コンテナに入れ子の direct stream も同じ拒否に到達する。qpdf の `QPDFObjectHandle::copyStream`（`QPDFObjectHandle.cc:2136-2151`）と `QPDF::copyStreamData`（`QPDF.cc:2216-2272`）を `ObjectHandle::copy_stream` と resolver-owned stream-copy boundary として実装済み（`flpdf-a8mk`）。Buffer は `Rc<Vec<u8>>` 共有、provider-backed source は source handle を保持する retry-aware provider、original-file source は qpdf の `ForeignStreamData` 相当として source の `StreamInput`/encryption state/object number/parsed offset/length と destination dictionary を copy 時に凍結し、destination resolver を warning sink として遅延 dispatch する。source `Pdf` 解放後も入力と暗号状態だけで読み続け、source 側へ警告を戻さない。`set_immediate_copy_from` は qpdf の source-side `setImmediateCopyFrom` に対応する。`QPDFObjectHandle::isReserved`/`QPDF::newReserved` は `ObjectState::Reserved` と `Pdf::new_reserved` に対応し、`ot_reserved` は null/missing/destroyed と区別して、materialize と全 ObjectHandle writer entrypoint で `QPDFObjectHandle: attempting to unparse a reserved object` を返す。 |
+| `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) + `object_handle.rs`(shared handle identity・parsed offset・遅延解決・live direct containment・`QPDF::newReserved`/`QPDF_Reserved`・`copyStream`/`StreamDataProvider` source dispatch) + `qpdf_null.rs`(9-37: `reference_is_null` / `value_is_null` = `isNull` の間接参照解決) + `overlay_annotations.rs`(1685-1737: `merge_resources_shallow` = `mergeResources`) + `overlay_appearance_stream.rs`（段階的 conflict merge の再現） | 🔀 アクセサは `object.rs` / `object_handle.rs` に分割されたまま（旧 raw `Object` route の削除・統合は `flpdf-egzr.3.2.8` が担当、open。`flpdf-mfir` はその削除対象へのリファクタなので着手せず close 済み）。object identity / 遅延解決は `object_handle.rs` の production route への移行が完了済み（`flpdf-egzr.3.1`、2026-08-09 close）。qpdf の array/dictionary/stream が保持する現在の forward child を正本とし、incremental dirty lookup 用に各 forward edge と一対一の immediate weak reverse edge を派生記録する。削除・置換後の旧 child は旧 root を返さない。`try_get_keys` は `QPDFObjectHandle::getKeys` → `QPDF_Dictionary::getKeys`（`QPDFObjectHandle.cc:997-1009`; `QPDF_Dictionary.cc:117-127`）に対応し、holder と全 child を lazy resolve して null value のキーを除外した `BTreeSet` を返す。child resolve 前に辞書 snapshot の borrow は終了し、resolver error は伝播する。`stream_filter.rs` の consuming stage は retained-key reduction 前に `try_get_keys` を使用する。`shallow_copy` は `QPDFObjectHandle::shallowCopy`（`QPDFObjectHandle.cc:2072-2079`）に対応し、stream は `QPDF_Stream::copy`（`QPDF_Stream.cc:140-145`）が `shallow` 引数を無視して無条件に `std::runtime_error` を投げるのに合わせて `Error::System` で拒否する。`QPDF_Dictionary::copy`/`QPDF_Array::copy` が direct な子に `shallowCopy` を掛けるため、コンテナに入れ子の direct stream も同じ拒否に到達する。qpdf の `QPDFObjectHandle::copyStream`（`QPDFObjectHandle.cc:2136-2151`）と `QPDF::copyStreamData`（`QPDF.cc:2216-2272`）を `ObjectHandle::copy_stream` と resolver-owned stream-copy boundary として実装済み（`flpdf-a8mk`）。Buffer は `Rc<Vec<u8>>` 共有、provider-backed source は source handle を保持する retry-aware provider、original-file source は qpdf の `ForeignStreamData` 相当として source の `StreamInput`/encryption state/object number/parsed offset/length と destination dictionary を copy 時に凍結し、destination resolver を warning sink として遅延 dispatch する。source `Pdf` 解放後も入力と暗号状態だけで読み続け、source 側へ警告を戻さない。`set_immediate_copy_from` は qpdf の source-side `setImmediateCopyFrom` に対応する。`QPDFObjectHandle::isReserved`/`QPDF::newReserved` は `ObjectState::Reserved` と `Pdf::new_reserved` に対応し、`ot_reserved` は null/missing/destroyed と区別して、materialize と全 ObjectHandle writer entrypoint で `QPDFObjectHandle: attempting to unparse a reserved object` を返す。 |
 | `QPDFObjectHandle::StreamDataProvider` / `QPDF_Stream` | `QPDFObjectHandle.hh:68-127`; `QPDFObjectHandle.cc:48-90,1365-1428`; `QPDF_Stream.cc:571-620,640-660` | `object_handle.rs` の `StreamDataProvider`、`ObjectValue::Stream.stream_provider`、`replace_stream_data_provider`、callback adapter、`pipe_stream_source` | ✅ qpdf の provider ownership、通常/retry family の選択、identity forwarding、遅延・反復 invocation、`Pl_Count` による encoded-byte length 検証、buffer/provider の排他を canonical route で保持する。qpdf の `std::shared_ptr` container は `Rc<dyn StreamDataProvider>` に置換するが、これは内部所有表現だけの差であり、callback/error/finish/`/Length` の観測契約は変えない。登録 API は stable `ObjectRef` を必要とするため indirect stream に限定し、direct stream は登録時に `Error::System` で拒否する。既存 document-owned stream の provider/dictionary 置換は live graph mutation なので、writer 前に `Pdf::mark_object_handle_dirty` を要求する | ✅ |
 | `QPDFObjectHandle::isNameAndEquals` / `isDictionaryOfType` / `getArrayNItems` / `getArrayItem` / `isOrHasName`（行数は上段に計上済み） | — | `object_handle.rs` の `try_is_name_and_equals` / `try_is_dictionary_of_type` / `try_array_len` / `try_array_item` / `try_is_or_has_name`（`QPDFObjectHandle.cc:456-466,759-785,1027-1039`） | ✅ holder と child を qpdf 順に lazy resolve。container borrow は resolver 再入前に解放し、配列全体を snapshot しない。`try_array_item` は `QPDF::decryptStream` が equal-length 確認後に使う valid-index 面のみで、qpdf が warning と特殊 null を返す invalid access は契約外 |
 | `QPDFObjectHandle::typeWarning` / `warnIfPossible` / `objectWarning` / `warn` / `getIntValue` / `getIntValueAsInt`（行数は上段に計上済み） | — | `object_handle.rs` の `type_warning` / `warn_if_possible` / `object_warning` / `warn_through_context` / `context` と `DocumentResolver::warn`、`try_get_int_value` / `try_get_int_value_as_int`、`reader/resolver.rs` の `push_object_warning`（`QPDFObjectHandle.cc:502-543,2168-2212,2385-2396`; `QPDF.cc:487-494`） | 🔀 メッセージ文言は qpdf と完全一致。live parser が生成した direct value と canonical indirect handle は `HandleResolver::direct_handle` / `ChildHandles` から同じ weak document context と、qpdf の `QPDFParser` と同じ parse-call description template を持つ。非 null の top-level・array・dictionary・scalar は `input-description, object N G at offset $PO` を共有し、`QPDFValue` と同じ container offset shift を経て `DocumentResolver::warn` → `push_object_warning` で `Pdf::repair_diagnostics` と同じ収集先へ同順に届く。parsed null は qpdf と同じく description を持たない。literal null は containment parent の context を借りず、qpdf の `QPDF_Null::create` に対応する contextless 分岐をネスト後も維持する一方、missing-key null は `setChildDescription` に対応する Child description 経由で親の context を保持する（`QPDF_Null.cc:12-15`; `QPDFParser.cc:397-410`; `QPDFObject_private.hh:79-91`）。明示的 parse と programmatic direct は qpdf の contextless 分岐を維持する。no-context 分岐は qpdf のまま 2 通り — `typeWarning`/`objectWarning` は `throw QPDFExc`（`std::runtime_error` 派生、`QPDFExc.hh:29`）に対応する `Error::System`、`warnIfPossible` は `QPDFLogger::defaultLogger()->getError()` へ素の文言を書いて正常復帰する。`getKey`/`getKeys` の `typeWarning` は `try_get_key`/`try_get_keys` に実装済み。live parser の direct value は weak document context を持ち、stream_filter の consuming `/DecodeParms` 読み出しで qpdf と同じ回復可能な警告を `DocumentResolver::warn` へ送る。contextless の programmatic direct は qpdf と同じく `Error::System` 相当の throw を維持する。`asDictionary`/`asInteger` に対応する `try_as_dictionary`/`try_as_integer` は qpdf 同様 warning を出さない |
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
-| `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` + `object_handle.rs` の `ObjectHandle` / `ObjectValue`（共有 identity・qpdf 互換 parsed offset・`IndirectState` 遅延解決・Pdf identity provenance） | 🔀 `object.rs` の `Object` は静的な値表現のみ。`QPDFValue` 相当の共有 identity・parsed offset・遅延解決状態は `object_handle.rs` が新たに担う（layer cutover 進行中）。Pdf identity provenance は live containment から分離して detach 後も保持する。両モジュールに分割されているため `✅` から変更 |
+| `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` + `object_handle.rs` の `ObjectHandle` / `ObjectValue`（共有 identity・qpdf 互換 parsed offset・`IndirectState` 遅延解決・Pdf identity provenance） | 🔀 `object.rs` の `Object` は静的な値表現のみ。`QPDFValue` 相当の共有 identity・parsed offset・遅延解決状態は `object_handle.rs` が担う。production route への cutover は完了済み（`flpdf-egzr.3.1`）。Pdf identity provenance は live containment から分離して detach 後も保持する。旧 raw `Object` route の最終削除は `flpdf-egzr.3.2.8`（open）待ち。両モジュールに分割されているため `✅` から変更 |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
 | `QPDFXRefEntry.cc` | 51 | `xref_entry.rs`（`XrefEntry` = free / uncompressed / compressed の 3 variant）。consumer は `xref.rs` / `reader.rs` / `cache.rs` / `writer.rs` / `writer/{object_streams,plain/plan}.rs` / `linearization/{writer,plan}.rs` | ✅ `flpdf-qxba.9.2` で完全 cutover（`XrefOffset` 削除）。`xref.rs` 側に型定義は残っていない |
 | `PDFVersion.cc` | 68 | `pdf_version.rs` の `PdfVersion` | ✅ |
@@ -147,7 +215,7 @@ paths and Windows directory-open failures for both metadata helpers.
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF.cc` | 2667 | `engine.rs`(475: `Pdf::empty`、ほか8つの public factory — `Pdf::open` / `open_with_repair` / `open_best_effort` / `open_with_options` / `open_mem` / `open_mem_with_options` / `open_mem_owned` / `open_mem_owned_with_options` —、`open_with_repair_mode`、`NEXT_PDF_ID`、`MAX_RESOLUTION_FALLBACKS`。`emptyPDF` / `processFile` / `processMemoryFile` の construction path) + `pdf.rs`(297: `Pdf<R>` container、`Drop` = `QPDF::~QPDF`、version/trailer/root/extension/page-enumeration-state accessors。`QPDF.hh:1438-1518`; `QPDF.cc:215-232,2323-2358,2647-2651`) + `reader.rs`(8185: object resolution, recovery, diagnostics, authentication, and `Pdf::get_xref_table` / `Pdf::get_all_objects`) + `reader/resolver.rs`(2367: canonical resolver。`QPDF::resolve` が触る `QPDF::Members` — `m->file` / `m->xref_table` / `m->obj_cache` / `m->resolving` / `m->resolved_object_streams` / `m->attempt_recovery` / `m->encp` — を `ResolverCore` に集約し、`Rc<RefCell<..>>` 経由で `ObjectHandle` の `Weak<dyn DocumentResolver>` から到達可能にする。`m->obj_cache` は canonical handle registry そのもので、`Pdf::get_object_handle`（= `QPDF::getObject`, `QPDF.cc:1952-1959`）と `Pdf::drop`（= `~QPDF`）の両方がここを見る。`Pdf::get_xref_table` は `QPDF::getXRefTable`（`QPDF.cc:2370-2377`）の effective source table snapshot、`Pdf::get_all_objects` は `fixDanglingReferences` と `m->obj_cache` enumeration（`QPDF.cc:1258-1294`）を canonical handle 上で実行する。`m->encp`（`flpdf-25kg.3.11`）は `Pdf::encryption` と同一の `Rc<RefCell<Option<EncryptionState>>>` を共有し、qpdf の `shared_ptr<EncryptionParameters>` を複数の owner が保持する形を再現する。`pipe_stream_data` は `QPDF::pipeStreamData` と同じく source read 前に `QPDF::decryptStream` 相当を呼び、同じ cell の method state / object-key cache を更新して AES/RC4 stage を前置する。`flpdf-25kg.3.5` slice 1 時点では `readObjectAtOffset`/`readObject`/`readStream` の uncompressed（xref type 1）経路のみ移植済み。`flpdf-25kg.3.5.1` で canonical type-1 stream framing recovery（malformed framing token、attempted token offset、live `recoverStreamLength` scan）を追加済み。ObjStm / xref stream と original stream bytes の source-dispatch consumer cutover は別 issue。resolve 時文字列復号と pipe 時ストリーム復号 primitive は移植済み。**行数は slice 進行中のため暫定値**) + `reader/file_object.rs`(1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) + `cache.rs`(112: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(441: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) + `ref_chain.rs`(159: `resolve_ref_chain` / `terminal_ref_of_chain` / `MAX_REF_CHAIN_DEPTH` — 深さ上限付き間接参照解決の共有プリミティブ。20 モジュールが使用) | 🔀 |
+| `QPDF.cc` | 2667 | `engine.rs`(475: `Pdf::empty`、ほか8つの public factory — `Pdf::open` / `open_with_repair` / `open_best_effort` / `open_with_options` / `open_mem` / `open_mem_with_options` / `open_mem_owned` / `open_mem_owned_with_options` —、`open_with_repair_mode`、`NEXT_PDF_ID`、`MAX_RESOLUTION_FALLBACKS`。`emptyPDF` / `processFile` / `processMemoryFile` の construction path) + `pdf.rs`(297: `Pdf<R>` container、`Drop` = `QPDF::~QPDF`、version/trailer/root/extension/page-enumeration-state accessors。`QPDF.hh:1438-1518`; `QPDF.cc:215-232,2323-2358,2647-2651`) + `reader.rs`(8185: object resolution, recovery, diagnostics, authentication, and `Pdf::get_xref_table` / `Pdf::get_all_objects`) + `reader/resolver.rs`(2367: canonical resolver。`QPDF::resolve` が触る `QPDF::Members` — `m->file` / `m->xref_table` / `m->obj_cache` / `m->resolving` / `m->resolved_object_streams` / `m->attempt_recovery` / `m->encp` — を `ResolverCore` に集約し、`Rc<RefCell<..>>` 経由で `ObjectHandle` の `Weak<dyn DocumentResolver>` から到達可能にする。`m->obj_cache` は canonical handle registry そのもので、`Pdf::get_object_handle`（= `QPDF::getObject`, `QPDF.cc:1952-1959`）と `Pdf::drop`（= `~QPDF`）の両方がここを見る。`Pdf::get_xref_table` は `QPDF::getXRefTable`（`QPDF.cc:2370-2377`）の effective source table snapshot、`Pdf::get_all_objects` は `fixDanglingReferences` と `m->obj_cache` enumeration（`QPDF.cc:1258-1294`）を canonical handle 上で実行する。`m->encp`（`flpdf-25kg.3.11`）は `Pdf::encryption` と同一の `Rc<RefCell<Option<EncryptionState>>>` を共有し、qpdf の `shared_ptr<EncryptionParameters>` を複数の owner が保持する形を再現する。`pipe_stream_data` は `QPDF::pipeStreamData` と同じく source read 前に `QPDF::decryptStream` 相当を呼び、同じ cell の method state / object-key cache を更新して AES/RC4 stage を前置する。`flpdf-25kg.3.5`/`.3.5.1`（ともに close 済み）で `readObjectAtOffset`/`readObject`/`readStream` の全 xref 形式（uncompressed type 1・ObjStm・canonical type-1 stream framing recovery を含む）が canonical resolver へ移植済み。`reader.rs`/`xref.rs` 自身の filter 呼び出し箇所の consumer cutover も `flpdf-egzr.3.2.10`（子 `.3.2.10.1`/`.3.2.10.2` close 済み、PR #859 merged）で完了し、production 経路の `decode_stream_data`/`encode_stream_data` 呼び出しはテストコードのみに残る。resolve 時文字列復号と pipe 時ストリーム復号 primitive は移植済み。残る raw `Object` route（`resolve_borrowed` と repair/recovery 経路）の削除は `flpdf-egzr.3.2.8`（open）が担当) + `reader/file_object.rs`(1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) + `cache.rs`(112: xref 由来の `ObjectCache` / `CacheEntry`。消費者は `reader.rs`) + `writer/object_streams.rs`(207-237: `compressible_objgens_qpdf_plan` = `getCompressibleObjGens`、`QPDF.cc:2392-2445`)  + `signatures.rs`(245-: `removeSecurityRestrictions`) + `page_closure.rs`(441: `page_object_closure`。`object_copy.rs` は pre-closed な集合しか受け取らず、両者で `copyForeignObject` 相当を構成する) + `ref_chain.rs`(159: `resolve_ref_chain` / `terminal_ref_of_chain` / `MAX_REF_CHAIN_DEPTH` — 深さ上限付き間接参照解決の共有プリミティブ。20 モジュールが使用) | 🔀 |
 | `QPDF.cc`（xref registration/recovery と mutation 境界） | `516-607,686-708,1187-1210,1996-2005` | `xref.rs` の `XrefRegistration` が xref 読み取り・recovery merge ごとの object-number-wide `deleted_objects` free-row filter を所有する。通常の `read_xref` は `/Size` 整合性検証までこの set を使い、その後 clear する（`:686-708`）。一方 `reconstruct_xref` の line scan は `:575` で clear してから `:576-607` の candidate xref-stream re-read に進み、その re-read は fresh registration を持つ。`ResolverCore` にはいずれの一時 state も渡さない。`reader.rs` の `Pdf::set_object` / `replace_object_handle` は canonical cache replacement だけを担い、この xref set を clear/add しない。canonical xref/cache removal と outstanding handle の null 化は `remove_object_handle` が担う。 | ✅ |
 | `QPDFParser::parse` / `QPDF::readObject`（indirect handle生成とstream framingの境界） | `QPDFParser.cc:155-172`; `QPDF.cc:1331-1349` | `parser.rs::parse_qpdf_file_object_handle_with_diagnostics` がtokenize中にindirect `ObjectHandle`を生成し、`xref.rs::BootstrapHandleDocument` がpre-`Pdf`のObjStm/xref bootstrapで同じhandle graphを使う。stream tailのframingはcaller側で継続する。 | 🔀 pre-`Pdf` bootstrap ownerはqpdf parserの一時contextに対応し、post-openのcanonical resolver (`flpdf-25kg.3.5`)とは分離している |
 | `QPDF.hh`（`EncryptionParameters`） | 899-921 | `reader.rs`(54-69: `EncryptionState`)。qpdf は独立した2つの bool、`encrypted` / `encryption_initialized`（`QPDF.hh:907-908`）を持つが、flpdf はこれを単一の `Option<EncryptionState>`（`None` = 未初期化 or 認証済み未暗号化のいずれか、`Some` = 認証済み暗号化）に畳んでいる。安全性の根拠: `encryption_initialized` の唯一の用途は `initializeEncryption()`（`QPDF.cc:471` で1文書につき高々1回しか呼ばれない）内の再入防止ガード（`QPDF_encryption.cc:721,724`）で、flpdf の構造上この再入自体が起こり得ないため観測可能な挙動差は生じない。逸脱理由は `reader/resolver.rs` の `ResolverCore::encryption_parameters` doc にも記載（`flpdf-25kg.3.11`） | ⚪ |
@@ -163,7 +231,7 @@ paths and Windows directory-open failures for both metadata helpers.
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFWriter.cc` | 3044 | `writer.rs`(4494) + `writer/serialize.rs`(1008) + `writer/object_streams.rs`(739) + `writer/encryption_state.rs`(258) + `writer/encrypted_strings.rs`(213) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(3603) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `rewrite_renumber.rs`(893) = **13,650 行 / 13 ファイル**。加えて `object.rs`(412: `write_pdf` = `unparseObject` / 491: `write_pdf_qdf` / 585-: trailer `/ID` = `writeTrailer`。`writer.rs` と `linearization/writer.rs` が委譲) と `qpdf_null.rs`(38-57: `visible_entries` = `QPDFWriter.cc:1491` の null 値 dict キー抑制)。さらに `object_handle.rs`(1705-: `unparse_object` / 1745-: `unparse_object_qdf` / 2302-: `unparse_stream_body` / 2375-: `unparse_stream_body_qdf` / 2569-: `unparse_trailer` = `unparseObject`(`QPDFWriter.cc:1318-1605`、dict 分岐 `:1346-1527`、stream 分岐 `:1528-1605`) / `writeTrailer`(`:1160-1230`) の `ObjectHandle` 版。`object.rs` の materialize-to-`Object` bridge を経由せず `ObjectHandle` のグラフを直接歩く新 primitive 群（`flpdf-egzr.3.2.13`）。`unparse_stream_body_qdf` は最終レビューで見つかったギャップの修正（Task 9）: `write_pdf_stream_qdf`(`object.rs:1036`、real production callsite は `writer.rs:4437`)に対応する QDF+stream 形の primitive が欠けていた。`Dictionary::write_pdf_stream_qdf` 自身に `refiltered` 概念が無いため（唯一の呼び出し元 `write_stream_to_buf_qdf` は既に確定済みの `/Filter`/`/Length` を持つ dict しか渡さない）、`unparse_stream_body`（compact 版）と異なりこちらも `refiltered` パラメータを持たない。null 値 dict キー抑制(`:1490-1491`)は `try_is_null` 経由で `unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf` の4つに適用し、`unparse_trailer` は `writeTrailer` 自身と同様に無抑制。`writer/encryption_state.rs` の `WriterEncryptionState` は `QPDFWriter::Members` の暗号 state (`QPDFWriter.hh:641-663`)、`set_data_key` は `setDataKey` (`QPDFWriter.cc:842-847`) と `compute_data_key` (`QPDF_encryption.cc:325-356`)、`with_object_data_key` は非 ObjStm member の set/unparse/clear (`QPDFWriter.cc:1761-1796`) に対応する。source ID ではなく emitted ID と generation 0 を使い、`Option<u32>` が qpdf の `-1` sentinel を置換する。qpdf の明示 clear は正常系だけだが、Rust callback の `Err` 後にも clear するのは出力 byte を変えず stale state を残さない内部代替である。全て `pub(crate)`・`#[allow(dead_code)]`。`flpdf-a32l` は AES で暗号化済みの文字列を full / linearized writer の共通 serializer context で強制 hex 化し、RC4・非暗号化・ObjStm member は既存の heuristic を維持する（`QPDFWriter.cc:1567-1592`）。既存 primitive の production consumer 移行は `flpdf-egzr.3.2.5`、暗号 state の consumer 移行は `flpdf-3yn9.12` 待ち | 🔀 |
+| `QPDFWriter.cc` | 3044 | `writer.rs`(4494) + `writer/serialize.rs`(1008) + `writer/object_streams.rs`(739) + `writer/encryption_state.rs`(258) + `writer/encrypted_strings.rs`(213) + `writer/plain/{plan,body,xref}.rs`(898) + `linearization/writer.rs`(3603) + `linearization/part1.rs`(370) + `linearization/back_patch.rs`(324) + `linearization/renumber.rs`(850) + `rewrite_renumber.rs`(893) = **13,650 行 / 13 ファイル**。加えて `object.rs`(412: `write_pdf` = `unparseObject` / 491: `write_pdf_qdf` / 585-: trailer `/ID` = `writeTrailer`。`writer.rs` と `linearization/writer.rs` が委譲) と `qpdf_null.rs`(38-57: `visible_entries` = `QPDFWriter.cc:1491` の null 値 dict キー抑制)。さらに `object_handle.rs`(1705-: `unparse_object` / 1745-: `unparse_object_qdf` / 2302-: `unparse_stream_body` / 2375-: `unparse_stream_body_qdf` / 2569-: `unparse_trailer` = `unparseObject`(`QPDFWriter.cc:1318-1605`、dict 分岐 `:1346-1527`、stream 分岐 `:1528-1605`) / `writeTrailer`(`:1160-1230`) の `ObjectHandle` 版。`object.rs` の materialize-to-`Object` bridge を経由せず `ObjectHandle` のグラフを直接歩く新 primitive 群（`flpdf-egzr.3.2.13`）。`unparse_stream_body_qdf` は最終レビューで見つかったギャップの修正（Task 9）: `write_pdf_stream_qdf`(`object.rs:1036`、real production callsite は `writer.rs:4437`)に対応する QDF+stream 形の primitive が欠けていた。`Dictionary::write_pdf_stream_qdf` 自身に `refiltered` 概念が無いため（唯一の呼び出し元 `write_stream_to_buf_qdf` は既に確定済みの `/Filter`/`/Length` を持つ dict しか渡さない）、`unparse_stream_body`（compact 版）と異なりこちらも `refiltered` パラメータを持たない。null 値 dict キー抑制(`:1490-1491`)は `try_is_null` 経由で `unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf` の4つに適用し、`unparse_trailer` は `writeTrailer` 自身と同様に無抑制。`writer/encryption_state.rs` の `WriterEncryptionState` は `QPDFWriter::Members` の暗号 state (`QPDFWriter.hh:641-663`)、`set_data_key` は `setDataKey` (`QPDFWriter.cc:842-847`) と `compute_data_key` (`QPDF_encryption.cc:325-356`)、`with_object_data_key` は非 ObjStm member の set/unparse/clear (`QPDFWriter.cc:1761-1796`) に対応する。source ID ではなく emitted ID と generation 0 を使い、`Option<u32>` が qpdf の `-1` sentinel を置換する。qpdf の明示 clear は正常系だけだが、Rust callback の `Err` 後にも clear するのは出力 byte を変えず stale state を残さない内部代替である。全て `pub(crate)`・`#[allow(dead_code)]`。`flpdf-a32l` は AES で暗号化済みの文字列を full / linearized writer の共通 serializer context で強制 hex 化し、RC4・非暗号化・ObjStm member は既存の heuristic を維持する（`QPDFWriter.cc:1567-1592`）。既存 primitive の production consumer 移行（`flpdf-egzr.3.2.5` + 子 `.5.1`〜`.5.4`）と暗号 state の consumer 移行（`flpdf-3yn9.11`/`.12`）はいずれも close 済みで、`PlAesPdf`/`PlRc4`/`run_writer_pipeline`/`adjust_aes_stream_length` は production コードで実使用されている。🔀 の根拠は ObjectHandle 移行の未完了ではなく、下記の「xref 出力が 3 箇所に分かれる」構造的 smear が独立に残っていること | 🔀 |
 
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
@@ -205,8 +273,8 @@ stream dictionary にだけ適用する。`/Encrypt` object と ObjStm member �
 迂回し、平文の hex string として出力する。`EncryptionContext::encrypt_dict_handle` と
 `write_encryption_dictionary_handle` は `QPDFWriter.cc:2244-2255` の直接
 Encrypt-map emission を handle tree で再現し、直接の `/O` `/U` `/OE` `/UE`
-`/Perms` だけを hex 化する。既存 consumer の切替は行わず、後続の
-`flpdf-egzr.3.2.5` writer cutover がこの surface を使用する。
+`/Perms` だけを hex 化する。`flpdf-egzr.3.2.5`（close 済み）writer cutover が
+この surface を production consumer として使用している。
 
 **renumber は重複していない**: `rewrite_renumber.rs` は `linearization/plan.rs` からも
 使われる共有機構で、`linearization/renumber.rs` はその上に載る最終採番層。qpdf の
@@ -216,7 +284,7 @@ Encrypt-map emission を handle tree で再現し、直接の `/O` `/U` `/OE` `/
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF_linearization.cc` | 1796 | `linearization/`（`plan.rs` 3032, `hint_*` 1651, `check.rs` 726, `show.rs` 995, ほか）≒ 8,000 行 | 🔀 |
+| `QPDF_linearization.cc` | 1796 | `linearization/`（`plan.rs` 3032, `hint_*` 1651, `check.rs` 726, `show.rs` 995, ほか）≒ 8,000 行 | 🔀 実装は 5+ モジュールに分散したまま（`optimization.rs` が達成したような単一モジュールへの集約は未達）。ObjectHandle 移行自体は完了: producer 側（`flpdf-3yn9.4`、plan.rs + hint_\*）と consumer 側（`flpdf-egzr.3.2.9`、check.rs + show.rs）が close 済みで、`check_consumer_production_uses_the_canonical_object_handle_route` / `show_consumer_production_uses_the_canonical_object_handle_route` が production 経路から `Object::` / `resolve_borrowed` / `decode_stream_data` / `page_refs` が消えたことを機械的に保証する。唯一の例外は `plan.rs` の `collect_direct_refs`（Object 版）で、`linearization/writer.rs::resolve_catalog_adbe_status`（§3 領域）専用の未解決 raw 値 shape-only walk であり、closure 計算本体は同ファイルの `collect_direct_handle_refs`（ObjectHandle 版）が担う。線形化書き込み経路自体（writer.rs 側、`flpdf-3yn9.5` 系列）は issue タイトルが明記する通り §3 `QPDFWriter.cc` のスライスであり本行の対応先ではない |
 | `QPDF_optimization.cc` | 381 | `optimization.rs`（optimization orchestration、inherited-page preparation、object-user maps、compressed-object folding）+ `optimization/inherited_attrs.rs`(575) | ✅ `flpdf-qxba.9.3` / `.9.4` で完全 cutover。`linearization/plan.rs` 側に `ObjUser` / `update_object_maps` は残っていない |
 
 `ObjUser` 分類（`ou_page` / `ou_thumb` / `ou_trailer_key` / `ou_root_key`）と
@@ -249,13 +317,13 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_LZWDecoder` | 189 | `pipeline/lzw.rs`（3-byte rotating buffer、1 入力 byte あたり 1 code、table 成長と code 幅遷移、eod latch、qpdf の 7 種の診断文言）+ `stream_filter.rs` 経由の production decode | ✅ |
 | `Pl_PNGFilter` | 232 | `pipeline/png_filter.rs`（32-bit wrapping の row 幅算出、constructor の 3 種 rejection、未知 filter byte の無視、finish の zero-pad row、Up 固定 encoder）+ `filters.rs` / `writer/serialize.rs` の production consumer。⚪ row buffer の確保だけは constructor ではなく最初の write まで遅延（出力バイト・呼び出し境界・エラー timing に影響しない） | ✅ |
 | `Pl_TIFFPredictor` | 175 | `pipeline/tiff_predictor.rs`（incremental row buffering、8-bit の byte differencing、packed sample の signed MSB bit I/O、finish 時の zero padding）+ `stream_filter.rs` / `filters.rs` の Predictor 2 production consumer。qpdf の TIFF fixture vectors と construction/write/finish error timing を pin。qpdf が filter instance に保持する stage ownership は、flpdf では `PipelineRef::Owned` が内側 predictor を保持する意図的な Rust ownership substitution | ✅ |
-| `Pl_ASCII85Decoder` / `SF_ASCII85Decode` | 108 + 31 | `pipeline/ascii85.rs` + `stream_filter.rs`（`SF_ASCII85Decode::getDecodePipeline` 相当の単段 stage 構築を含む） | ✅ |
+| `Pl_ASCII85Decoder` / `SF_ASCII85Decode` | 108 + 31 | `pipeline/ascii85_decoder.rs` + `stream_filter.rs`（`SF_ASCII85Decode::getDecodePipeline` 相当の単段 stage 構築を含む） | ✅ |
 | `Pl_ASCIIHexDecoder` / `SF_ASCIIHexDecode` | 96 + 31 | `pipeline/ascii_hex.rs` + `stream_filter.rs`（`SF_ASCIIHexDecode::getDecodePipeline` 相当の単段 stage 構築を含む） | ✅ |
 | `Pl_RunLength` / `SF_RunLengthDecode` | 146 + 38 | `pipeline/run_length.rs` + `stream_filter.rs`（`SF_RunLengthDecode::getDecodePipeline` 相当の単段 stage 構築を含む） | ✅ |
 | `Pl_AES_PDF` | 200 | `pipeline/aes.rs`（qpdf の contract を全量移植: block 単位の write バッファリング、first-block を IV として消費する復号側と IV を先頭へ書く暗号化側、ISO 32000-1 7.6.2 の padding とその strip、`useZeroIV` / `setIV` / `useStaticIV` / `disablePadding` / `disableCBC`）＋ `security/standard.rs` の AES single-buffer helper と `writer.rs` の stream consumer | 🔀 `reader/resolver.rs` の `QPDF::decryptStream` 対応は `PlAesPdf` を source-read pipeline の前段へ接続済み。legacy resolve-time single-buffer helper は consumer cutover まで併存するため、同じ qpdf モジュールが 2 箇所に存在する。⚪ `QPDFCryptoImpl::rijndael_init` / `rijndael_process` の crypto provider 抽象は `aes` / `cbc` crate の直接利用に置換（§ 逸脱候補の crypto provider 行と同じ代替）。block ごとに 1 回 process する呼び出し形は保持し、chaining 状態のみ provider 側ではなく cipher が持つ。既知の逸脱: qpdf の padding strip は PKCS#7 厳密ではなく（末尾バイトが不整合ならブロックを丸ごと残す、`Pl_AES_PDF.cc:184-196`）、既存の `security/primitives.rs` の `decrypt_padded::<Pkcs7>` は同じ入力を `Err` にする。`pipeline/aes.rs` は qpdf 側に合わせてあるので、cutover 前後で受理する文書が変わる |
 | `Pl_RC4` | 43 | `pipeline/rc4.rs`（65,536-byte既定buffer、stateful `security/rc4.rs`、write/finish lifecycle）+ `reader/resolver.rs` の pipe-time decrypt stage + `reader.rs` / `writer.rs` の既存 stream consumer | ✅ |
 | `Pl_QPDFTokenizer.cc` / `ContentNormalizer.cc` | 141 | `pipeline/qpdf_tokenizer.rs`（optional downstream を持つ token-filter runner、EOF-token → `handle_eof`、`ID` separator 注入、inline-image 切替、raw token/discard/output、`handle_eof` 成功後の永久 detach と finish/error timing）+ production consumer `content_normalizer.rs`（bad-token state、CR/string/name normalization） | ✅ |
-| `QPDFObjectHandle::TokenFilter` / `QPDF_Stream::addTokenFilter` / `isDataModified` | `QPDFObjectHandle.hh:129-190,420-475,978-1010`; `QPDF_Stream.cc:321-324,488-620,663-666` | `ObjectHandle::add_token_filter` / `is_data_modified` が共有filter listとdecoded→token-filter→normalize/encodeのlazy pipeを担う。`form_field_object_helper/rendering.rs` の既存 `/AP/N` reuse は eager `replace_stream_data` からqpdf `ValueSetter`相当の `AppearanceTokenFilter` へ移行し、`writer/plain/body.rs` は `is_data_modified` をlone-Flate fast pathの条件に含める。`linearization/writer.rs` の `append_body_object`（`stream_is_data_modified` helper 経由）も同じ `willFilterStream` 由来のゲートを適用: qpdf の `writeLinearized` は `QPDF::optimize` の `skip_stream_parameters` probe と実書き込みの計2回 `pipeStreamData` を呼び、token filter は pipe 間で状態リセットしないため実書き込み側は exhausted filter のパススルー（= stale content）を再エンコードする。flpdf の linearized writer には optimize 相当の二重 pipe が無いため、token filter 自体は起動せず「既に materialize 済みの (pre-filter) バイトを decode→re-encode」するだけで同じ observed output に一致させる（`docs.rs` 非公開のモジュール内 doc 参照）。`writer.rs` の `emit_canonical_pdf_inner` fallback と `writer/plain/body.rs` の `!plan.canonical` 分岐は同種のゲートが未配線（flpdf-vkka で追跡） | ✅ |
+| `QPDFObjectHandle::TokenFilter` / `QPDF_Stream::addTokenFilter` / `isDataModified` | `QPDFObjectHandle.hh:129-190,420-475,978-1010`; `QPDF_Stream.cc:321-324,488-620,663-666` | `ObjectHandle::add_token_filter` / `is_data_modified` が共有filter listとdecoded→token-filter→normalize/encodeのlazy pipeを担う。`form_field_object_helper/rendering.rs` の既存 `/AP/N` reuse は eager `replace_stream_data` からqpdf `ValueSetter`相当の `AppearanceTokenFilter` へ移行し、`writer/plain/body.rs` は `is_data_modified` をlone-Flate fast pathの条件に含める。`linearization/writer.rs` の `append_body_object`（`stream_is_data_modified` helper 経由）も同じ `willFilterStream` 由来のゲートを適用: qpdf の `writeLinearized` は `QPDF::optimize` の `skip_stream_parameters` probe と実書き込みの計2回 `pipeStreamData` を呼び、token filter は pipe 間で状態リセットしないため実書き込み側は exhausted filter のパススルー（= stale content）を再エンコードする。flpdf の linearized writer には optimize 相当の二重 pipe が無いため、token filter 自体は起動せず「既に materialize 済みの (pre-filter) バイトを decode→re-encode」するだけで同じ observed output に一致させる（`docs.rs` 非公開のモジュール内 doc 参照）。`writer.rs` の `emit_canonical_pdf_inner` fallback と `writer/plain/body.rs` の `!plan.canonical` 分岐について、同種のゲート配線の要否を `flpdf-vkka` で検証済み（close）: `plain/body.rs` は既に canonical handle 経由で `is_data_modified()` を参照しており、`emit_canonical_pdf_inner` 側は PR #831 の `materialize_for_normalization` narrowing 後、`Object::Stream` 分岐が構造的に到達不能なため追加配線は不要と確認された | ✅ |
 | `QPDFStreamFilter.cc` | 19 | `stream_filter.rs`（`set_decode_params`、decode pipeline factory、specialized / lossy の既定分類）。`QPDFStreamFilter::getDecodePipeline`(`QPDFStreamFilter.hh:46-49`) に対応する `StreamFilter::decode_pipeline` は `stream_filter_for` が返す全 filter が実装し、`None` は qpdf の `nullptr`（11.9.0 でこれを返すのは `SF_Crypt` だけ、`QPDF_Stream.cc:52-56`）。qpdf-shaped の production caller は `ObjectHandle::pipe_stream_data` に接続済みで、public whole-buffer decode helper は従来経路として併存する。**⚪ (B) stage の所有者**: qpdf は構築した stage を filter instance 内に保持し呼び出し側へは非所有ポインタを返す（`QPDFStreamFilter.hh:47` が「pipeline は自クラスの instance 破棄時に delete されること」を要求し、`SF_FlateLzwDecode.cc:88`・`:108` の `pipelines.push_back` がそれを果たす）。flpdf は stage を値で返し、多段 chain の内側 stage は `pipeline.rs` の `PipelineRef::Owned` が持つ（上の `Pipeline.cc` 行も参照）。構築順・stage 数は不変で動くのは所有者だけ。出力バイト不変の根拠（分類 (B) 条件 1）は、この slot を通る本番 write path（`filters::encode_stream_data` → `encode_flate` の deflate）を `qpdf-zlib-compat` gated の `cmp_generate_objstm_tests` が qpdf golden で pin していること。**⚪ (B) registry の入れ物**: filter 名の registry は qpdf が `filter_factories` の `std::map`(`QPDF_Stream.cc:85-94`)、flpdf は `stream_filter_for` の `match`。この map は iterate されず名前引き(`:425-426`)にしか使われないので入れ物としては等価だが、run time に map を書き換える `QPDF_Stream::registerStreamFilter`(`:148-151`) に対応する API は flpdf に無く、`match` のままでは追加できない。入れ物は等価でも登録集合は等価でなく、qpdf の `SF_DCTDecode` (`SF_DCTDecode.hh:8-40`) / `/DCTDecode` factory (`QPDF_Stream.cc:91`) に対応する arm は `stream_filter.rs` の `b"DCTDecode" => Some(Box::new(DctStreamFilter))` として存在し、canonical `decode_pipeline` へ接続する。legacy whole-buffer route は passthrough-only のまま（writer passthrough は別責務、下の `Pl_DCT.cc` row が対応を記録）。`QPDF_Stream::filterable`(`QPDF_Stream.cc:378-485`) 相当の `/Filter` `/DecodeParms` shape 読み取りも同モジュールが持ち、`flpdf-25kg.3.4` 以降は `Object` 版(`decode_filter_specs_from_object`) と `ObjectHandle` 版(`decode_filter_specs_from_handle`) の 2 つの shape reader が同じ分岐順で共通の `FilterSpec` を組む。下流（codec stack、predictor geometry、`max_output`、warning 順序）は `filters.rs` の `decode_prepared_specs` 1 実装を共有（本番 caller は shape ごとに 1 つずつの計 2 つ）。ただし `max_filter_chain` は shape reader 側で適用するため呼び出しが 2 箇所に分かれる。各 reader 単体の precedence は絶対値テストで pin 済みで、2 者間の整合を見るのは `handle_reader_matches_object_reader_for_every_filter_shape`。2 reader が一致するのは direct な子までで、間接参照を解決するのは `ObjectHandle` 版のみ（qpdf のアクセサ側に合わせた意図的な差）。`ObjectHandle` 版の decode entry point(`filters.rs` の `decode_stream_data_from_handle` / `decode_stream_data_recovering_from_handle`) は本番 caller をまだ持たず、`flpdf-25kg.3.5` の resolver 配線で接続される。既知の逸脱: unfilterable ケースで qpdf は warning を出したうえで `getStreamData` を失敗させるが flpdf は同文言を warning 無しの `Err` としてのみ返す（D3）。handle reader は retained-key reduction 前に `try_get_keys` を用いて direct・indirect・dangling の nullish entry を省き、legacy reader は non-resolving の責務内で同等に direct-null を省く。**⚪ DecodeParams の所有 snapshot**: qpdf は `/DecodeParms` を `QPDFObjectHandle`（`shared_ptr`）のまま filter chain に複製するのに対し、flpdf の `DecodeParams` は所有 snapshot なので consumer が読むキーだけを保持する（`RETAINED_DECODE_PARAM_KEYS` の geometry 5 キーは全 filter で、`Crypt` 段は全キー。`SF_Crypt::setDecodeParms`(`QPDF_Stream.cc:33-50`) が `getKeys()` を走査して `/Type`・`/Name` 以外のキーで `filterable = false` にするため、`Crypt` 段の保持キー集合は filterability そのものを決める — キーを落とすと qpdf が拒否する stream を受理してしまう。name の byte 列を持つのは `CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS` の 2 キー、すなわち crypt provider が読む `/Name` と `isDictionaryOfType("/CryptFilterDecodeParms")` が比較する `/Type` だけで、`Crypt` 段の未知キーを含む他の slot の name は `ParamValue::Other` に落ちる — その 2 キー以外で qpdf が非整数の種別を見る箇所は無く、`SF_FlateLzwDecode` は `isInteger()` だけを問う）。出力バイト・エラー timing には影響しない（書き出し側は source dictionary をそのまま複製し、この型から `/DecodeParms` を再構築しない）。filterability は逆にこの snapshot から決まるので、保持集合は各 `setDecodeParms` が読む集合と一致させる必要がある（`SF_FlateLzwDecode` は名前の無いキーを `else` 無しで無視するので geometry 5 キーで足り、`SF_Crypt` は `else` arm で拒否するので全キーが要る）。値そのものは qpdf 側も保存せず、`decryptStream` が live graph から読み直す。`QPDF_Stream.cc` 本体の行は §1 にあり、二重帰属を避けてここには再掲しない | ✅ |
 | `Pl_DCT.cc` (buffer/decode) | 207 (`1-57,77-116,119-143,195-248,296-326`) | `pipeline/dct.rs` + `stream_filter.rs` の `DctStreamFilter`（`decode_pipeline` が canonical route。qpdf の buffered write、empty/repeated `finish` の downstream finish、libjpeg scanline 出力、error/cleanup を対応）; qpdf refs: `Pl_DCT.hh:30-70`, `Pl_DCT.cc:1-57,77-116,119-143,195-248,296-326`, `SF_DCTDecode.hh:8-40`。stage owner は qpdf の filter-instance 保持 + caller の non-owning pointer に対し、Rust は stage を値で返し `PipelineRef::Owned` と `next` の borrow で保持する correspondence class (B) | ✅ default backend は `libjpeg-turbo-rs = 0.8.0`、`qpdf-libjpeg-compat` は `flpdf-libjpeg-compat` を明示的に有効化する system libjpeg backend（no vendored library、runtime switch なし）。system-libjpeg の ABI boundary は `flpdf-libjpeg-compat`（`csrc/jpeg_compat.c/.h` + `ffi.rs`）が所有し、`BITS_IN_JSAMPLE == 8`、libjpeg 6b-compatible (`JPEG_LIB_VERSION >= 62`) capability/version guard、qpdf 相当の whole-buffer exhaustion (`invalid jpeg data reading from buffer`、fake EOI なし)、panic-contained callback を持つ。qpdf 11.9.0 の 8-bit scope を対象に、最小 image XObject の `qpdf --show-object=3 --filtered-stream-data` differential（2026-08-10 観測）は default/C とも qpdf stdout 12 bytes = canonical `DctSink` 12 bytes、mismatch 0、stderr 0。canonical consumer は `decode_pipeline`、legacy whole-buffer bridge caller は後続 `flpdf-3yn9.6` で cutover、writer passthrough は別責務として残す |
 | `Pl_DCT.cc` (compression) | 119 (`58-76,117-118,144-194,249-295`) | `pipeline/dct.rs` に qpdf の圧縮constructor、圧縮destination、`Pl_DCT::compress` の対応はまだ無い。writer側のDCT passthroughはこのqpdf compression primitiveの代替ではなく、圧縮実装はwriter/compression follow-upに残す | ❌ missing |
@@ -292,8 +360,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(476) + `outline.rs`(143) | ✅ live `ObjectHandle` route: `OutlineItem.object`/`dest` retain canonical identity, `/Dest` and `/A /GoTo /D` use qpdf-shaped handle accessors, named destinations use `HandleNameTree`, and JSON consumes the handles directly. The narrow terminal-handle chase only covers flpdf's temporary `Pdf::set_object` bare-reference bridge; parsed qpdf objects stay one-hop/live. |
 | `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(1037) + `nntree.rs` (`HandleNumberTree`) | ✅ canonical ObjectHandle route for `hasPageLabels`, `getLabelForPage`, `getLabelsForPageRange`, and `pageLabelDict`; typed page-operation adapters and JSON migration remain downstream |
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 (`34-75,106-168,216-390,391-520,560-700`) | `nntree.rs`（shared canonical `ObjectHandle` engine + `NameTree`/`NumberTree` wrappers）+ consumer adapters。qpdf の live `QPDFObjectHandle`/`QPDF_Array` mutation（`NNTree.cc:34-75` の iterator value 更新、`:106-168` の limits、`:216-390` の split/insert、`:391-520` の remove/deepen、`:560-700` の find）に対応し、`ResolvedArray` は `ObjectHandle::set_array_items` で alias を保持したまま更新、direct kid の indirect 化は `Pdf::make_indirect_from_object_handle`、root split は既存 root slot を維持する。dirty propagation で raw compatibility read/writer も canonical mutation を観測する。`Object` は root の compatibility projection と test-only raw fixture boundary に限定し、production tree mutation は `Pdf::set_object` を経由しない | ✅ |
-| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | 🔀 モジュール doc 自身が「完全な公開ヘルパー境界を持たない」と申告。D1 未達 |
-| `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | 🔀 モジュール doc 自身が「partial helper surface; 公開 API は未完成」と申告。D1 未達。なお `json_inspect.rs` が同じ責務を再実装しているため D2 も未達（`flpdf-q2fo` で解消） |
+| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ D1 完成（`flpdf-jzy7`）: `has_embedded_files`/`get_embedded_files`/`get_embedded_file`/`replace_embedded_file`/`remove_embedded_file` が `QPDFEmbeddedFileDocumentHelper.hh` の公開 API と 1:1 対応。モジュール doc の自己申告も更新済み。D2 は未達のまま — `json_inspect.rs` の `build_attachments_section` はこのヘルパーを経由せず `NameTree` を直接歩く（`flpdf-q2fo` で解消予定） |
+| `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ D1 完成（`flpdf-d9sq`）。D2 は未達のまま — `json_inspect.rs::filespec_dict_to_json` が `FileSpec`/`EmbeddedFileStream` を経由せず同じ Mac/DOS 優先順位ロジックを再実装している（`flpdf-q2fo` で解消予定） |
 | `ResourceFinder.cc` | 56 | `resource_finder.rs`（operator/name tracking と resource type/offset 集約。flat `getNames()` oracle view は categorized map から test 内で導出）。production consumer は `resource_replacer.rs` と `resources.rs` の resource pruning | ✅ |
 | `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `overlay_annotations.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
@@ -459,10 +527,10 @@ qpdf 側のコピペバグ（`QPDFJob.cc:1319-1322`）を再現できていな�
 | doJSON* | 経由すべきヘルパー | §7 の状態 |
 |---|---|---|
 | `doJSONAcroform` | `QPDFAcroFormDocumentHelper` + `QPDFFormFieldObjectHelper` + `QPDFAnnotationObjectHelper` + `QPDFPageDocumentHelper` | 🔀 / 🔀 / 🔀 / 🔀 |
-| `doJSONAttachments` | `QPDFEmbeddedFileDocumentHelper` + `QPDFFileSpecObjectHelper` + `QPDFEFStreamObjectHelper` | 🔀 / 🔀（いずれもモジュール doc 自身が公開 API 未完成と申告。加えて `json_inspect.rs` の再実装により D2 も未達） |
+| `doJSONAttachments` | `QPDFEmbeddedFileDocumentHelper` + `QPDFFileSpecObjectHelper` + `QPDFEFStreamObjectHelper` | ✅ / ✅（D1 は完成済み。`json_inspect.rs` の再実装により D2 はなお未達 — `flpdf-q2fo` で解消予定） |
 | `doJSONPages` | `QPDFPageDocumentHelper` + `QPDFPageObjectHelper` | 🔀 / 🔀 |
 | `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |
-| `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | 🔀 |
+| `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | ✅ |
 
 ## 10. インフラ
 
@@ -613,9 +681,9 @@ byte golden の無い書き込み経路は安全に移動できない。🔀 行
 | linearize + objstm | `cmp_linearize_objstm_tests` ✅ | ✅ |
 | overlay / underlay | `overlay::byte_gate` ✅ | `cli_byte_identical_overlay` ✅ |
 | `--deterministic-id` | `deterministic_id_qpdf_parity_tests` ✅ | — |
-| null 可視性 | `cmp_null_visibility_tests` ⚠ **CI 未列挙**（`flpdf-qxba.2`） | — |
+| null 可視性 | `cmp_null_visibility_tests` ✅ | — |
 | QDF | 🟡 **部分的にあり**（下記）。`overlay::byte_gate` の QDF 12 件を含む | 🟡 `cli_byte_identical_overlay.rs` の QDF 3 件 |
-| 暗号化出力 | ❌ gated byte gate 無し | ❌ |
+| 暗号化出力 | ❌ gated byte gate 無し | 🟡 `encrypt_cli_tests` の `encrypted_document_is_byte_identical_to_qpdf` / `cli_linearize_encrypt_aes128_byte_identical_to_qpdf` 2件（`qpdf-zlib-compat` 関数レベル gate、CI 列挙済み） |
 | incremental update | ❌ gated byte gate 無し | ❌ |
 
 ### QDF の既存カバレッジ（部分的）
@@ -645,7 +713,9 @@ QDF は他の出力モードと**排他**であり、次の組み合わせに by
 広げる際に必要になるのはこちら。
 
 gated テストは `.github/workflows/ci.yml` の bytes-identical ジョブに手で列挙しないと
-CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れている。
+CI で走らない。ファイル全体が gated な 11 件は全て列挙済み（`cmp_null_visibility_tests`
+の列挙漏れは `flpdf-qxba.2` で解消済み）。新規に file-level gate を追加する際は
+同様の手動列挙が必要な点に注意。
 
 ---
 
@@ -703,8 +773,8 @@ CLI probes.
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ 境界一致 | 4,020 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
-| 🔀 smeared | 27,540 | 再配置の主対象。qpdf 全体の 66% |
+| ✅ 境界一致 | 4,422 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
+| 🔀 smeared | 27,138 | 再配置の主対象。qpdf 全体の 65% |
 | ❌ missing | 1,002 | `Pl_DCT.cc` compression(119) / `QPDF_json.cc` 入力側(833) / `QTC`(50) |
 | ⚪ 逸脱候補 | 6,660 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
@@ -712,11 +782,21 @@ CLI probes.
 
 本文の各行を機械的に集計した値である（`状態` 列の記号ごとに `行` 列を合算）。
 **この合計もスナップショットであり、維持対象ではない**（上記「行数の位置づけ」参照）。
-読み取るべきは「smeared が 7 割を占める」という規模感であって、個々の値ではない。
+読み取るべきは「smeared が 6 割台を占める」という規模感であって、個々の値ではない。
 数値を更新する場合に限り、合計が qpdf 実測と一致することを確認する。
 過去に 41,336 と記載して 123 行の欠損があったが、内訳は集計漏れ 185 行
 （`ランダム源 3 ファイル` 行）と汎用 `Pl_*` 行の過大記載 −62 行だった。
 どの qpdf ファイルもいずれかの行に属していることは確認済み。
+
+**2026-08-16 再測**: `flpdf-egzr`/`flpdf-3yn9` 系の ObjectHandle 移行・Tier
+ヘルパー D1 完成が 70 件以上 close されたのを受けて状態記号を再点検した。
+実際に記号が動いたのは `QPDFEmbeddedFileDocumentHelper.cc`(122行) と
+`QPDFFileSpecObjectHelper`/`QPDFEFStreamObjectHelper`(280行) の 🔀→✅ の
+2 行のみ（計 402 行が smeared → 境界一致に移動）。他の多くの行は
+ObjectHandle 移行という**実装手段**が完了していても、qpdf 側の 1 ファイルに
+対し flpdf 側が複数モジュールへ分散したままという**責務境界の smear**は
+解消していないため記号を維持した（詳細は各行および冒頭「2026-08-16 の
+再測」節）。
 
 **❌ の数え方**: 以前は `Pipeline.cc` + `Pl_*.cc` 21 ファイル計 ~2,400 行を丸ごと
 missing として傘で数えていたが、個々の `Pl_*` は下の各行で 境界一致 / smeared /

@@ -7,7 +7,6 @@
 | `crates/flpdf/src/acroform_document_helper.rs` | correspondence | QPDFAcroFormDocumentHelper.cc responsibilities shared with overlay and signature modules |
 | `crates/flpdf/src/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
 | `crates/flpdf/src/annotation_helper.rs` | correspondence | \`QPDFAnnotationObjectHelper.cc\` |
-| `crates/flpdf/src/ascii85.rs` | correspondence | flpdf-specific ASCII85 encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCII85Decoder but no matching encoder component |
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
@@ -18,7 +17,7 @@
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
-| `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
+| `crates/flpdf/src/embedded_files.rs` | correspondence | \`EmbeddedFileDocumentHelper\` implements QPDFEmbeddedFileDocumentHelper.hh's public API (hasEmbeddedFiles, getEmbeddedFiles, getEmbeddedFile, replaceEmbeddedFile, removeEmbeddedFile) |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\`, \`processFile()\`, and \`processMemoryFile()\`) and their shared construction orchestration |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
@@ -93,7 +92,7 @@
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
 | `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
 | `crates/flpdf/src/pipeline/aes.rs` | correspondence | Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time |
-| `crates/flpdf/src/pipeline/ascii85.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
+| `crates/flpdf/src/pipeline/ascii85_decoder.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/ascii_hex.rs` | correspondence | Pl_ASCIIHexDecoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/base64.rs` | correspondence | Pl_Base64.cc streaming encode/decode, aliases, padding, and lifecycle |
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |

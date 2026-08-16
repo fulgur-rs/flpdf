@@ -12,9 +12,13 @@ use md5::{Digest, Md5};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
+use std::process::Command;
 
 mod common;
 use common::{write_with_settings, WriterTestSettings};
+
+#[path = "common/ascii85.rs"]
+mod ascii85;
 
 #[test]
 fn opens_pdf_without_resolving_all_objects() {
@@ -774,6 +778,64 @@ fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
     assert_eq!(
         stream.dict.get("DecodeParms"),
         Some(&Object::Array(vec![Object::Null]))
+    );
+}
+
+/// `/Crypt` in the first `/Filter` slot needs no prefix reconstruction, so the
+/// ASCII85 filter that follows it stays fully supported. qpdf decodes this shape
+/// too:
+///
+/// ```text
+/// $ qpdf --show-object=4 --filtered-stream-data crypt_then_ascii85.pdf
+/// explicit crypt stream
+/// ```
+#[test]
+fn v4_explicit_crypt_filter_before_ascii85_decrypts_at_filter_slot() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_ascii85_crypt_filter_fixture(false),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"explicit crypt stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(
+            b"ASCII85Decode".to_vec()
+        )]))
+    );
+}
+
+/// qpdf attaches the decryption pipeline to the raw stream bytes before any
+/// `/Filter` stage, regardless of the `/Crypt` slot position
+/// (`libqpdf/QPDF.cc:2489-2492`, `libqpdf/QPDF_encryption.cc:1065-1090`).
+/// Therefore the ASCII85 representation is encrypted as a whole and remains
+/// encoded after the compatibility path removes `/Crypt`.
+#[test]
+fn v4_explicit_crypt_filter_after_ascii85_decrypts_before_filter() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_ascii85_crypt_filter_fixture(true),
+    ))
+    .unwrap();
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+    assert_eq!(
+        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"explicit crypt stream"
+    );
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(
+            b"ASCII85Decode".to_vec()
+        )]))
     );
 }
 
@@ -1744,6 +1806,58 @@ fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
     bytes
 }
 
+/// Build the `/Crypt`-plus-ASCII85 counterpart of
+/// [`encrypted_v4_explicit_crypt_filter_fixture`].
+///
+/// Stream bytes follow the `/Filter` array's decode order, so
+/// `crypt_after_ascii85` decides which of the two transforms wraps the other.
+fn encrypted_v4_ascii85_crypt_filter_fixture(crypt_after_ascii85: bool) -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = fixed_r4_u_entry(true);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Data 4 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+
+    let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
+    let plaintext = b"explicit crypt stream";
+    let encoded = ascii85::fixture_bytes(plaintext);
+    let stream_data = aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &encoded);
+    let (filters, decode_parms_array) = if crypt_after_ascii85 {
+        ("[/ASCII85Decode /Crypt]", "[null << /Name /StdCF >>]")
+    } else {
+        ("[/Crypt /ASCII85Decode]", "[<< /Name /StdCF >> null]")
+    };
+    let obj4_offset = bytes.len();
+    let length = stream_data.len();
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {length} /Filter {filters} /DecodeParms {decode_parms_array} >>\nstream\n"
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n0000000000 65535 f \n{obj4_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /Identity /StrF /Identity >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 fn encrypted_v4_plaintext_metadata_stream_fixture() -> Vec<u8> {
     encrypted_v4_plaintext_metadata_stream_fixture_with_body(b"<xmpmeta>plain</xmpmeta>", true)
 }
@@ -2256,16 +2370,68 @@ fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
 }
 
 #[test]
+#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
 fn resolves_compressed_entry_declared_in_extended_object_stream() {
-    let mut pdf = Pdf::open(std::io::Cursor::new(objstm_extends_chain_pdf())).unwrap();
+    let fixture = objstm_extends_chain_pdf();
+    assert_qpdf_object_contains(&fixture, 2, "null");
+    assert_qpdf_object_contains(&fixture, 3, "99");
 
-    assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
-        Object::Integer(42)
-    );
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+
+    assert_eq!(pdf.resolve(ObjectRef::new(2, 0)).unwrap(), Object::Null);
     assert_eq!(
         pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
         Object::Integer(99)
+    );
+}
+
+#[test]
+#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
+fn objstm_direct_container_qpdf_contract() {
+    let fixture = objstm_direct_container_pdf();
+    assert_qpdf_object_contains(&fixture, 2, "null");
+    assert_qpdf_object_contains(&fixture, 3, "null");
+    assert_qpdf_object_contains(&fixture, 10, "/V 100");
+    assert_qpdf_object_contains(&fixture, 11, "/V 200");
+    assert_qpdf_object_contains(&fixture, 12, "/V 300");
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Null,
+        "a header object number, not the xref field2, controls materialization"
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        Object::Null,
+        "a header object number, not the xref field2, controls materialization"
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0)).unwrap(),
+        parse_object(b"<< /V 100 >>").unwrap()
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        parse_object(b"<< /V 200 >>").unwrap()
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        parse_object(b"<< /V 300 >>").unwrap(),
+        "a child xref entry must resolve against the child container directly"
+    );
+}
+
+#[test]
+#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
+fn objstm_direct_container_rejects_effective_xref_source_mismatch() {
+    let fixture = objstm_direct_container_pdf_with_child_source(4);
+    assert_qpdf_object_contains(&fixture, 12, "null");
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        Object::Null,
+        "a child header must not be used when effective xref points at another stream"
     );
 }
 
@@ -2420,6 +2586,109 @@ fn objstm_extends_chain_pdf() -> Vec<u8> {
     ))
 }
 
+fn objstm_direct_container_pdf() -> Vec<u8> {
+    objstm_direct_container_pdf_with_child_source(5)
+}
+
+fn objstm_direct_container_pdf_with_child_source(child_source: u32) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let (parent_data, parent_first) =
+        encode_plain_objstm(&[(10, b"<< /V 100 >>"), (11, b"<< /V 200 >>")]);
+    let parent_offset = bytes.len();
+    let parent_header = format!(
+        "4 0 obj\n<< /Type /ObjStm /N 2 /First {parent_first} /Length {} >>\nstream\n",
+        parent_data.len()
+    );
+    bytes.extend_from_slice(parent_header.as_bytes());
+    bytes.extend_from_slice(&parent_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let (child_data, child_first) = encode_plain_objstm(&[(12, b"<< /V 300 >>")]);
+    let child_offset = bytes.len();
+    let child_header = format!(
+        "5 0 obj\n<< /Type /ObjStm /N 1 /First {child_first} /Length {} /Extends 4 0 R >>\nstream\n",
+        child_data.len()
+    );
+    bytes.extend_from_slice(child_header.as_bytes());
+    bytes.extend_from_slice(&child_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_stream_offset = bytes.len();
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 5, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 1);
+    append_xref_stream_entry(&mut xref_entries, 1, parent_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, child_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_stream_offset as u32, 0);
+    for _ in 7..10 {
+        append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    }
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 1);
+    append_xref_stream_entry(&mut xref_entries, 2, child_source, 0);
+
+    let xref_stream = format!(
+        "6 0 obj\n<< /Type /XRef /Size 13 /Root 1 0 R /W [1 3 1] /Index [0 13] /Length {} >>\nstream\n",
+        xref_entries.len()
+    );
+    bytes.extend_from_slice(xref_stream.as_bytes());
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_stream_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn assert_qpdf_object_contains(fixture: &[u8], object_number: u32, expected: &str) {
+    let Some(output) = qpdf_show_object(fixture, object_number) else {
+        return;
+    };
+    assert!(
+        output.contains(expected),
+        "qpdf --show-object={object_number} output {output:?} must contain {expected:?}"
+    );
+}
+
+fn qpdf_show_object(fixture: &[u8], object_number: u32) -> Option<String> {
+    let version = match Command::new("qpdf").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("qpdf --version failed to start: {error}"),
+    };
+    assert!(
+        version.status.success(),
+        "qpdf --version failed: {}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let version_line = String::from_utf8_lossy(&version.stdout);
+    if version_line
+        .lines()
+        .next()
+        .is_none_or(|line| line.trim() != "qpdf version 11.9.0")
+    {
+        return None;
+    }
+
+    let directory = tempfile::tempdir().expect("create qpdf differential fixture directory");
+    let input = directory.path().join("fixture.pdf");
+    std::fs::write(&input, fixture).expect("write qpdf differential fixture");
+    let output = Command::new("qpdf")
+        .arg(format!("--show-object={object_number}"))
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-object");
+    assert!(
+        output.status.success(),
+        "qpdf --show-object={object_number} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn decode_hex_fixture(hex: &str) -> Vec<u8> {
     let digits: Vec<u8> = hex
         .bytes()
@@ -2463,6 +2732,25 @@ fn encode_flate_objstm(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
     let encoded = encoder.finish().unwrap();
 
     (encoded, header.len())
+}
+
+fn encode_plain_objstm(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+    let mut header = String::new();
+    let mut body = Vec::new();
+
+    for (index, (number, object_data)) in members.iter().enumerate() {
+        let offset = body.len();
+        header.push_str(&format!("{number} {offset} "));
+        body.extend_from_slice(object_data);
+        if index + 1 < members.len() {
+            body.push(b'\n');
+        }
+    }
+
+    let header_len = header.len();
+    let mut data = header.into_bytes();
+    data.extend_from_slice(&body);
+    (data, header_len)
 }
 
 fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
