@@ -19,7 +19,7 @@
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
-| `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
+| `crates/flpdf/src/embedded_files.rs` | correspondence | \`EmbeddedFileDocumentHelper\` implements QPDFEmbeddedFileDocumentHelper.hh's public API (hasEmbeddedFiles, getEmbeddedFiles, getEmbeddedFile, replaceEmbeddedFile, removeEmbeddedFile) |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\`, \`processFile()\`, and \`processMemoryFile()\`) and their shared construction orchestration |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
