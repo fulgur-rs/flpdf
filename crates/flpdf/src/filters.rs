@@ -2000,6 +2000,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn encode_stream_data_ascii_hex_is_explicitly_unsupported() {
+        let error = encode_stream_data(&ascii_hex_dict(), b"payload").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: ASCIIHexEncode is not supported: qpdf provides an ASCIIHex decoder but no encoder"
+        );
+    }
+
     // ----- ASCII85Decode filter integration tests -----
 
     fn ascii85_dict() -> Dictionary {
