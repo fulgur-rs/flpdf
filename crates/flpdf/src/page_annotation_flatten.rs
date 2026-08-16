@@ -1468,6 +1468,28 @@ mod tests {
     }
 
     #[test]
+    fn flatten_annotations_uses_canonical_indirect_appearance_dictionary() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n4, obj4_bytes) = obj_dict(4, "<< /Type /Annot /Rect [0 0 100 20] /AP 5 0 R >>");
+        let (n5, obj5_bytes) = obj_dict(5, "<< /N 6 0 R >>");
+        let (n6, obj6_bytes) = obj_wrap(6, xobj_body);
+        let bytes = build_pdf(
+            "/Annots [4 0 R]",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(
+            flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
+            1
+        );
+        assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .windows(2)
+            .any(|window| window == b"Do"));
+    }
+
+    #[test]
     fn flatten_annotations_bridge_handles_direct_appearance_dictionary_holder() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         let mut annotation = Dictionary::new();
