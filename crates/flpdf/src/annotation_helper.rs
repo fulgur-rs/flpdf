@@ -284,24 +284,33 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         state: Option<&[u8]>,
     ) -> Result<ObjectHandle> {
         let ap = self.get_appearance_dictionary()?;
-        let desired_state: Vec<u8> = match state {
-            Some(s) if !s.is_empty() => s.to_vec(),
-            _ => self.get_appearance_state()?,
-        };
         if ap.as_dictionary().is_some() {
             let ap_sub = ap.get_key(&dict_key(which));
             self.pdf.resolve_object_handle(&ap_sub)?;
             if ap_sub.as_stream_dict().is_some() {
+                // qpdf issue #949: a direct appearance stream disregards
+                // state entirely (`QPDFAnnotationObjectHelper.cc:59-63`).
+                // `/AS` must not even be resolved on this path — qpdf's own
+                // eager `getAppearanceState()` call is infallible in C++,
+                // but this crate's `/AS` resolution can genuinely error (a
+                // malformed or cyclic indirect reference), and that error
+                // must not surface for a state qpdf never consults here.
                 return Ok(ap_sub);
             }
-            if ap_sub.as_dictionary().is_some() && !desired_state.is_empty() {
-                let ap_sub_val = ap_sub.get_key(&dict_key(&desired_state));
-                self.pdf.resolve_object_handle(&ap_sub_val)?;
-                if ap_sub_val.as_stream_dict().is_some() {
-                    return Ok(ap_sub_val);
+            if ap_sub.as_dictionary().is_some() {
+                let desired_state: Vec<u8> = match state {
+                    Some(s) if !s.is_empty() => s.to_vec(),
+                    _ => self.get_appearance_state()?,
+                };
+                if !desired_state.is_empty() {
+                    let ap_sub_val = ap_sub.get_key(&dict_key(&desired_state));
+                    self.pdf.resolve_object_handle(&ap_sub_val)?;
+                    if ap_sub_val.as_stream_dict().is_some() {
+                        return Ok(ap_sub_val);
+                    }
                 }
-            }
-        } // cov:ignore: llvm-cov brace-region artifact, not untested — reached by both annotation_handle_appearance_stream_missing_state_returns_null and _state_dictionary_key_missing_returns_null (line 304's hit count sums both paths; this line's own counter stays 0)
+            } // cov:ignore: llvm-cov brace-region artifact, not untested — reached by both annotation_handle_appearance_stream_missing_state_returns_null and _state_dictionary_key_missing_returns_null, same as the pre-existing single-block version of this brace
+        } // cov:ignore: llvm-cov brace-region artifact, not untested — same two tests fall through to this outer brace after the inner one
         Ok(ObjectHandle::null())
     }
 }

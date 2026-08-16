@@ -487,8 +487,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         match catalog.get("AcroForm").cloned() {
             None | Some(Object::Null) => Ok(None),
             Some(Object::Dictionary(dict)) => Ok(Some(dict)),
+            // qpdf's `analyze()` (`QPDFAcroFormDocumentHelper.cc:241-243`)
+            // reads `/AcroForm` through `getKey`, which transparently
+            // dereferences, then treats a non-dictionary result as absent
+            // with no warning, regardless of whether the source was direct
+            // or indirect. `resolve_dict`'s hard `Err` on a non-dictionary
+            // target is the right contract for callers that already know
+            // they hold a field/annotation reference, but not here: this
+            // method's own direct-value arms above already return `None`
+            // for a malformed `/AcroForm`, and an indirect reference to the
+            // same malformed shapes must degrade the same way.
             Some(Object::Reference(acroform_ref)) => {
-                Ok(Some(self.resolve_dict(acroform_ref, "AcroForm")?))
+                match self.pdf.resolve_borrowed(acroform_ref)? {
+                    Object::Dictionary(dict) => Ok(Some(dict.clone())),
+                    _ => Ok(None),
+                }
             }
             Some(_) => Ok(None),
         }
@@ -1859,6 +1872,37 @@ mod tests {
             .annotation_to_field_map()
             .unwrap();
         assert_eq!(map.get(&ObjectRef::new(5, 0)), Some(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn annotation_to_field_map_treats_a_malformed_indirect_acroform_as_absent() {
+        // qpdf's `analyze()` (`QPDFAcroFormDocumentHelper.cc:241-243`) reads
+        // `/AcroForm` through `getKey`, which transparently dereferences,
+        // then treats any non-dictionary result as absent with no error --
+        // regardless of whether the source was a direct value or an
+        // indirect reference to a dangling/null/non-dictionary target.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                ("AcroForm", Object::Reference(ObjectRef::new(9, 0))),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![])),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(ObjectRef::new(9, 0), Object::Null);
+
+        let map = AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .expect("a malformed indirect /AcroForm must degrade to an empty map, not Err");
+        assert!(map.is_empty());
     }
 
     #[test]
