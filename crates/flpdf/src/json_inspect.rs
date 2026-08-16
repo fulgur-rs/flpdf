@@ -19,7 +19,9 @@
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json::Json;
-use crate::object::{Dictionary, Object, ObjectRef, Stream};
+#[cfg(test)]
+use crate::object::Dictionary;
+use crate::object::{Object, ObjectRef, Stream};
 use crate::object_handle::{ObjectHandle, ObjectJsonError};
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PipelineError, PlOStream, PlStdioFile};
@@ -1024,31 +1026,6 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
 
 // ── build_pagelabels_section ──────────────────────────────────────────────────
 
-/// Convert a page-label dictionary (`/Type /PageLabel`) to a JSON object with
-/// keys in alphabetical order: `first`, `prefix`, `style`.
-///
-/// - `first`  = `/St` (integer, default 1)
-/// - `prefix` = `/P` (PDF text string, decoded without `u:`/`b:` prefix; default `""`)
-/// - `style`  = `/S` (name string `"D"/"R"/"r"/"A"/"a"`, or `null` when absent)
-fn label_dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
-    // Derive /S, /P, /St via the shared (non-resolving) LabelRange parser to keep
-    // a single source of truth. `from_dict` is byte-for-byte equivalent to the
-    // prior inline extraction; use it (not the live ObjectHandle route) to preserve the
-    // existing non-resolving JSON behavior.
-    let range = crate::page_label_document_helper::LabelRange::from_dict(dict);
-    let style = match range.style.to_name() {
-        Some(s) => Json::make_string(s),
-        None => Json::make_null(),
-    };
-
-    // Key order: alphabetical → first, prefix, style
-    json_dictionary([
-        ("first".to_string(), Json::make_int(range.start)),
-        ("prefix".to_string(), Json::make_string(range.prefix)),
-        ("style".to_string(), style),
-    ])
-}
-
 /// Build the qpdf JSON v2 `"pagelabels"` section.
 ///
 /// Returns a [`Json`] array where each element is a JSON object with
@@ -1060,62 +1037,38 @@ fn label_dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails during tree walk.
 pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-
     // qpdf's doJSONPageLabels obtains the full page list before checking
     // whether /PageLabels exists. Preserve both that validation side effect
     // and the observable everCalledGetAllPages metadata state.
-    crate::pages::page_refs(pdf)?;
-
-    // Resolve the Catalog.
-    // A successful page-tree walk has already validated both invariants.
-    let catalog_ref = pdf
-        .root_ref()
-        .ok_or_else(|| ConvertError::PdfError("page tree has no catalog".to_string()))?;
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .map_err(ConvertError::from)?;
-    let mut catalog_dict = catalog
-        .as_dict()
-        .cloned()
-        .ok_or_else(|| ConvertError::PdfError("catalog is not a dictionary".to_string()))?;
-
-    // Look up /PageLabels.  May be absent, a direct Dictionary, or a Reference.
-    let pagelabels_val = match catalog_dict.get("PageLabels") {
-        Some(v) => v.clone(),
-        None => return Ok(Json::make_array()),
-    };
-
-    let original_pagelabels = pagelabels_val.clone();
-    let mut tree = crate::NumberTree::new(pagelabels_val, true);
-    tree.set_max_depth(DEFAULT_MAX_PAGE_TREE_DEPTH);
-    let raw_entries = tree.as_map(pdf).map_err(ConvertError::from)?;
-    if tree.root() != &original_pagelabels {
-        catalog_dict.insert("PageLabels", tree.into_root());
-        pdf.set_object(catalog_ref, Object::Dictionary(catalog_dict));
-    }
-
-    let mut entries = Vec::with_capacity(raw_entries.len());
-    for (index, value) in raw_entries {
-        let dictionary = match value {
-            Object::Dictionary(dictionary) => Some(dictionary),
-            Object::Reference(object_ref) => {
-                let (terminal, _) =
-                    crate::ref_chain::resolve_ref_chain(pdf, &Object::Reference(object_ref))
-                        .map_err(ConvertError::from)?;
-                terminal.into_dict()
-            }
-            _ => None,
-        };
-        if let Some(dictionary) = dictionary {
-            entries.push((index, dictionary));
+    let page_count = crate::pages::page_refs(pdf)?.len();
+    let entries = {
+        let mut helper = crate::page_label_document_helper::PageLabelDocumentHelper::new(pdf);
+        // qpdf's doJSONPageLabels gates only on hasPageLabels(): for a
+        // zero-page document that still has /PageLabels,
+        // getLabelsForPageRange(0, -1, 0, ...) still unconditionally pushes
+        // one reconstructed leading label before its per-page loop (which
+        // then never executes for end_idx < start_idx) --
+        // QPDFPageLabelDocumentHelper.cc:54-90. A page-count shortcut here
+        // would diverge from that single-entry output.
+        if !helper.has_page_labels()? {
+            return Ok(Json::make_array());
         }
-    }
+
+        // QPDFJob::doJSONPageLabels asks the page-label helper for the effective
+        // entries covering every page, rather than serializing raw number-tree
+        // nodes. Keep the handles live through this call so /St adjustments,
+        // explicit empty /P values, and unknown /S names retain qpdf semantics.
+        let page_count = i64::try_from(page_count)
+            .map_err(|_| ConvertError::PdfError("page count exceeds i64".to_string()))?;
+        let mut entries = Vec::new();
+        helper.get_labels_for_page_range(0, page_count - 1, 0, &mut entries)?;
+        entries
+    };
 
     let result: Result<Vec<Json>, ConvertError> = entries
         .into_iter()
-        .map(|(idx, label_dict)| {
-            let label_json = label_dict_to_json(&label_dict)?;
+        .map(|(idx, label)| {
+            let label_json = pdf_object_to_json(&label)?;
             json_dictionary([
                 ("index".to_string(), Json::make_int(idx)),
                 ("label".to_string(), label_json),
@@ -6442,6 +6395,52 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     }
 
+    // ── 35b. /PageLabels present on a zero-page document → one fabricated
+    //         leading entry, not an empty array ────────────────────────────
+    //
+    // QPDFPageLabelDocumentHelper::getLabelsForPageRange(0, -1, 0, ...)
+    // unconditionally pushes a reconstructed label for index 0 *before* its
+    // per-page loop runs (QPDFPageLabelDocumentHelper.cc:65-90); the loop
+    // itself (`for i = start_idx+1; i <= end_idx; ++i`) simply never
+    // executes when end_idx (npages - 1 = -1) < start_idx + 1. A page-count
+    // shortcut in the JSON builder must not skip that leading entry.
+
+    #[test]
+    fn pagelabels_present_on_zero_page_document_yields_one_entry() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /PageLabels 3 0 R >>\nendobj\n",
+        );
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let off3 = bytes.len();
+        bytes.extend_from_slice(b"3 0 obj\n<< /Nums [0 << /S /D /St 1 >>] >>\nendobj\n");
+        let xref_start = bytes.len();
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open zero-page fixture");
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let serde_json::Value::Array(arr) = &result else {
+            panic!("expected Array, got {result:?}"); // cov:ignore: build_pagelabels_section always returns json_array(..)
+        };
+        assert_eq!(
+            arr.len(),
+            1,
+            "a zero-page document with /PageLabels must still yield qpdf's \
+             one fabricated leading entry, got {arr:?}"
+        );
+        let entry = object_pairs(&arr[0]);
+        assert_eq!(entry[0], ("index".to_string(), number(0)));
+    }
+
     // ── 36. No /PageLabels → empty array ─────────────────────────────────────
 
     #[test]
@@ -6516,22 +6515,14 @@ mod tests {
         assert_eq!(entry[1].0, "label");
 
         let label_pairs = object_pairs(&entry[1].1);
-        // Key order: first, prefix, style
-        assert_eq!(label_pairs[0], ("first".to_string(), number(1)));
         assert_eq!(
-            label_pairs[1],
+            label_pairs[0],
             (
-                "prefix".to_string(),
-                serde_json::Value::String(String::new())
+                "/S".to_string(),
+                serde_json::Value::String("/D".to_string())
             )
         );
-        assert_eq!(
-            label_pairs[2],
-            (
-                "style".to_string(),
-                serde_json::Value::String("D".to_string())
-            )
-        );
+        assert_eq!(label_pairs[1], ("/St".to_string(), number(1)));
     }
 
     #[test]
@@ -6558,8 +6549,8 @@ mod tests {
 
     #[test]
     fn pagelabels_multiple_ranges() {
-        // /Nums [0 << /S /D >> 5 << /S /R /P "Appx" /St 1 >> 10 << /S /a >>]
-        let mut pdf = load_one_page_pdf();
+        // /Nums [0 << /S /D >> 1 << /S /R /P "Appx" /St 1 >> 2 << /S /a >>]
+        let mut pdf = load_fixture_pdf("three-page.pdf");
 
         let mut label0 = Dictionary::new();
         label0.insert("S", Object::Name(b"D".to_vec()));
@@ -6579,9 +6570,9 @@ mod tests {
                 Object::Array(vec![
                     Object::Integer(0),
                     Object::Dictionary(label0),
-                    Object::Integer(5),
+                    Object::Integer(1),
                     Object::Dictionary(label5),
-                    Object::Integer(10),
+                    Object::Integer(2),
                     Object::Dictionary(label10),
                 ]),
             );
@@ -6601,23 +6592,26 @@ mod tests {
             value_for_key(&e, "index").as_i64().unwrap()
         };
         assert_eq!(get_index(0), 0);
-        assert_eq!(get_index(1), 5);
-        assert_eq!(get_index(2), 10);
+        assert_eq!(get_index(1), 1);
+        assert_eq!(get_index(2), 2);
 
         // Check styles
         let get_style = |i: usize| {
             let e = object_pairs(&arr[i]);
             let lp = object_pairs(&e[1].1);
-            lp[2].1.clone()
+            value_for_key(&lp, "/S").clone()
         };
-        assert_eq!(get_style(0), serde_json::Value::String("D".to_string()));
-        assert_eq!(get_style(1), serde_json::Value::String("R".to_string()));
-        assert_eq!(get_style(2), serde_json::Value::String("a".to_string()));
+        assert_eq!(get_style(0), serde_json::Value::String("/D".to_string()));
+        assert_eq!(get_style(1), serde_json::Value::String("/R".to_string()));
+        assert_eq!(get_style(2), serde_json::Value::String("/a".to_string()));
 
         // Check prefix on entry 1
         let e1 = object_pairs(&arr[1]);
         let lp1 = object_pairs(&e1[1].1);
-        assert_eq!(lp1[1].1, serde_json::Value::String("Appx".to_string()));
+        assert_eq!(
+            value_for_key(&lp1, "/P").clone(),
+            serde_json::Value::String("u:Appx".to_string())
+        );
     }
 
     // ── 38b. Indirect label value is resolved ────────────────────────────────
@@ -6649,12 +6643,12 @@ mod tests {
         );
     }
 
-    // ── 38c. Non-dict label value is skipped ──────────────────────────────────
+    // ── 38c. Non-dict label value uses qpdf's fabricated default ─────────────
 
     #[test]
-    fn pagelabels_non_dict_value_skipped() {
-        // A /Nums value that is neither a dict nor a reference is skipped
-        // (covers the `_ => Ok(None)` arm of the decode hook).
+    fn pagelabels_non_dict_value_fabricates_default() {
+        // QPDFPageLabelDocumentHelper ignores the non-dictionary entry, then
+        // getLabelsForPageRange fabricates the default /St 1 label.
         let mut pdf = load_one_page_pdf();
         let pagelabels = Object::Dictionary({
             let mut d = Dictionary::new();
@@ -6667,18 +6661,21 @@ mod tests {
         patch_pagelabels(&mut pdf, pagelabels);
 
         let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let serde_json::Value::Array(entries) = result else {
+            panic!("expected array"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(entries.len(), 1);
         assert_eq!(
-            result,
-            serde_json::Value::Array(vec![]),
-            "non-dict label value yields no entries"
+            object_pairs(&object_pairs(&entries[0])[1].1),
+            vec![("/St".to_string(), number(1))]
         );
     }
 
-    // ── 39. /S absent → style: null ──────────────────────────────────────────
+    // ── 39. /S absent → qpdf omits the null dictionary key ──────────────────
 
     #[test]
-    fn pagelabels_no_style_gives_null() {
-        // Label dict with only /P — no /S → style must be null
+    fn pagelabels_no_style_omits_null_key() {
+        // Label dict with only /P — qpdf omits null /S and adds /St.
         let mut pdf = load_one_page_pdf();
 
         let mut label = Dictionary::new();
@@ -6701,11 +6698,15 @@ mod tests {
         assert_eq!(arr.len(), 1);
         let entry = object_pairs(&arr[0]);
         let label_pairs = object_pairs(&entry[1].1);
-        assert_eq!(label_pairs[2].0, "style");
         assert_eq!(
-            label_pairs[2].1,
-            serde_json::Value::Null,
-            "style must be null when /S is absent"
+            label_pairs,
+            vec![
+                (
+                    "/P".to_string(),
+                    serde_json::Value::String("u:App".to_string())
+                ),
+                ("/St".to_string(), number(1)),
+            ]
         );
     }
 
@@ -6743,7 +6744,16 @@ mod tests {
         let entry = object_pairs(&arr[0]);
         assert_eq!(entry[0].1, number(0));
         let lp = object_pairs(&entry[1].1);
-        assert_eq!(lp[2].1, serde_json::Value::String("r".to_string()));
+        assert_eq!(
+            lp,
+            vec![
+                (
+                    "/S".to_string(),
+                    serde_json::Value::String("/r".to_string())
+                ),
+                ("/St".to_string(), number(1)),
+            ]
+        );
     }
 
     // ── 41. All compat fixtures without /PageLabels yield empty array ─────────
