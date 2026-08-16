@@ -281,24 +281,80 @@ fn cli_json_outlines_and_pagelabels_sections_are_populated() {
         );
     }
 
-    // "pagelabels": two ranges (roman from 0, decimal from 2), today's
-    // {index, label: {first, prefix, style}} shape.
+    // "pagelabels": two ranges (roman from 0, decimal from 2), qpdf's raw
+    // label dictionary shape.
     let pagelabels = json.get("pagelabels").and_then(|v| v.as_array()).unwrap();
     assert_eq!(pagelabels.len(), 2, "two label ranges");
     assert_eq!(pagelabels[0].get("index").and_then(|v| v.as_i64()), Some(0));
     assert_eq!(
         pagelabels[0]
             .get("label")
-            .and_then(|l| l.get("style"))
+            .and_then(|l| l.get("/S"))
             .and_then(|v| v.as_str()),
-        Some("r")
+        Some("/r")
+    );
+    assert_eq!(
+        pagelabels[0]
+            .get("label")
+            .and_then(|l| l.get("/St"))
+            .and_then(|v| v.as_i64()),
+        Some(1)
     );
     assert_eq!(pagelabels[1].get("index").and_then(|v| v.as_i64()), Some(2));
     assert_eq!(
         pagelabels[1]
             .get("label")
-            .and_then(|l| l.get("style"))
+            .and_then(|l| l.get("/S"))
             .and_then(|v| v.as_str()),
-        Some("D")
+        Some("/D")
+    );
+    assert_eq!(
+        pagelabels[1]
+            .get("label")
+            .and_then(|l| l.get("/St"))
+            .and_then(|v| v.as_i64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn cli_json_pagelabels_matches_qpdf_v2_bytes() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_outline_pagelabels_qpdf] qpdf {EXPECTED_QPDF_VERSION} not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("in.pdf");
+    std::fs::write(&src, outline_and_dests_four_page_pdf()).unwrap();
+
+    let qpdf_output = Shell::new(qpdf_command())
+        .args([
+            "--json=2",
+            "--json-key=pagelabels",
+            src.to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf_output.status.success(),
+        "qpdf JSON output failed: {}",
+        String::from_utf8_lossy(&qpdf_output.stderr)
+    );
+
+    let flpdf_output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=pagelabels", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        flpdf_output.status.success(),
+        "flpdf JSON output failed: {}",
+        String::from_utf8_lossy(&flpdf_output.stderr)
+    );
+
+    assert_eq!(
+        flpdf_output.stdout, qpdf_output.stdout,
+        "pagelabels JSON must remain byte-identical to qpdf 11.9.0"
     );
 }
