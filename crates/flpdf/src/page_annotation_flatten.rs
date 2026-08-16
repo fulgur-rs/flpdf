@@ -171,15 +171,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         } else {
             true
         };
-        let legacy_appearance_redirect = if has_bare_reference_redirect(pdf, ea.annot_ref, "AP")? {
-            true
-        } else if has_bare_reference_redirect_in_handle(pdf, &appearance_dictionary, b"/N")? {
-            true
-        } else if let Some(appearance_ref) = appearance_dictionary.object_ref() {
-            has_bare_reference_redirect(pdf, appearance_ref, "N")?
-        } else {
-            false
-        };
+        let legacy_appearance_redirect = has_bare_reference_redirect(pdf, ea.annot_ref, "AP")?
+            || has_bare_reference_redirect_in_handle(pdf, &appearance_dictionary, b"/N")?
+            || if let Some(appearance_ref) = appearance_dictionary.object_ref() {
+                has_bare_reference_redirect(pdf, appearance_ref, "N")?
+            } else {
+                false
+            };
         let appearance = if appearance.as_stream_dict().is_some() {
             if let Some(appearance_ref) = appearance.object_ref() {
                 let legacy_geometry_redirect =
