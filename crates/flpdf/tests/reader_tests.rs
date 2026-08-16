@@ -2370,7 +2370,6 @@ fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
 }
 
 #[test]
-#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
 fn resolves_compressed_entry_declared_in_extended_object_stream() {
     let fixture = objstm_extends_chain_pdf();
     assert_qpdf_object_contains(&fixture, 2, "null");
@@ -2386,7 +2385,6 @@ fn resolves_compressed_entry_declared_in_extended_object_stream() {
 }
 
 #[test]
-#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
 fn objstm_direct_container_qpdf_contract() {
     let fixture = objstm_direct_container_pdf();
     assert_qpdf_object_contains(&fixture, 2, "null");
@@ -2422,7 +2420,6 @@ fn objstm_direct_container_qpdf_contract() {
 }
 
 #[test]
-#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
 fn objstm_direct_container_rejects_effective_xref_source_mismatch() {
     let fixture = objstm_direct_container_pdf_with_child_source(4);
     assert_qpdf_object_contains(&fixture, 12, "null");
@@ -2677,6 +2674,7 @@ fn qpdf_show_object(fixture: &[u8], object_number: u32) -> Option<String> {
     let input = directory.path().join("fixture.pdf");
     std::fs::write(&input, fixture).expect("write qpdf differential fixture");
     let output = Command::new("qpdf")
+        .arg("--warning-exit-0")
         .arg(format!("--show-object={object_number}"))
         .arg(&input)
         .output()

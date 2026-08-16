@@ -447,6 +447,7 @@ pub struct PdfOpenOptions {
 // `/Extends` (ISO 32000-2 §7.5.7) chains object streams; real documents go at
 // most one or two deep, so 100 only rejects pathological input and matches the
 // crate's other tree-walk depth limits.
+#[cfg(test)]
 const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 
 // Stack-growth protection for this module's two recursive hubs: `lift_bounded`
@@ -1458,14 +1459,11 @@ impl<R: Read + Seek> Pdf<R> {
         source_index: u32,
     ) {
         let stream_ref = ObjectRef::new(source_stream, 0);
-        let (parent_ref, parent_index) = self
-            .compressed_parent_for_entry(stream_ref, source_index)
-            .unwrap_or((stream_ref, source_index));
         self.compressed_member_parents.insert(
             object_ref,
             CompressedMemberProvenance {
-                parent_ref,
-                parent_index,
+                parent_ref: stream_ref,
+                parent_index: source_index,
                 source_stream,
                 source_index,
             },
@@ -3363,12 +3361,12 @@ impl<R: Read + Seek> Pdf<R> {
             .filter(|(object_ref, _)| !removed.contains(object_ref))
             .collect();
         self.cache.synchronize_with_xref(&entries);
-        // Keep the actual `/Extends`-resolved parent for a still-identical
+        // Keep the direct object-stream provenance for a still-identical
         // compressed xref entry, but never let a mapping survive a rebuilt
         // type-1 entry or a changed object-stream/index pair. qpdf's live
         // xref table is the authority after reconstruction
-        // (`libqpdf/QPDF.cc:532-562`); the extra source identity stored with
-        // each chain parent prevents the legacy writer from treating a
+        // (`libqpdf/QPDF.cc:532-562`); the source identity stored with each
+        // compressed member prevents the legacy writer from treating a
         // formerly compressed object as an object-stream member.
         self.compressed_member_parents
             .retain(|object_ref, provenance| {
@@ -3460,6 +3458,23 @@ impl<R: Read + Seek> Pdf<R> {
         stream: u32,
         index: u32,
     ) -> Result<bool> {
+        // qpdf's effective xref is authoritative for the member/source pair
+        // (`QPDF.cc:1792-1795`). Tests that seed only the legacy cache have
+        // no source row, so the direct parser remains available for that
+        // narrow compatibility setup; source-backed documents always take
+        // this check.
+        if let Some(source_entry) = self.resolver.xref_entry(object_ref) {
+            if !matches!(
+                source_entry,
+                XrefEntry::Compressed {
+                    stream: source_stream,
+                    ..
+                } if source_stream == stream
+            ) {
+                return Ok(false);
+            }
+        }
+
         let stream_ref = ObjectRef::new(stream, 0);
         // qpdf resolves the object-stream container through the same object
         // cache as every other indirect object (`QPDF.cc:1756-1833`). Keep
@@ -3483,8 +3498,11 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
 
-        let (parent_ref, parent_index, parsed) =
-            self.parse_object_stream_chain_entry(stream_ref, &stream_handle, index)?;
+        let Some(parsed) =
+            self.parse_object_stream_entry_from_handle(&stream_handle, object_ref.number)?
+        else {
+            return Ok(false);
+        };
         let ParsedObjectStreamEntry {
             object,
             diagnostics,
@@ -3494,14 +3512,14 @@ impl<R: Read + Seek> Pdf<R> {
         self.compressed_member_parents.insert(
             object_ref,
             CompressedMemberProvenance {
-                parent_ref,
-                parent_index,
+                parent_ref: stream_ref,
+                parent_index: index,
                 source_stream: stream,
                 source_index: index,
             },
         );
         self.cache.set_resolved(object_ref, object);
-        self.record_object_stream_diagnostics(parent_ref, object_ref, diagnostics)?;
+        self.record_object_stream_diagnostics(stream_ref, object_ref, diagnostics)?;
         Ok(true)
     }
 
@@ -3775,23 +3793,11 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    fn parse_object_stream_chain_entry(
-        &mut self,
-        stream_ref: ObjectRef,
-        stream_handle: &ObjectHandle,
-        target_index: u32,
-    ) -> Result<(ObjectRef, u32, ParsedObjectStreamEntry)> {
-        let (member_stream_ref, member_index, member_stream) =
-            self.object_stream_chain_member(stream_ref, stream_handle, target_index)?;
-        let parsed = self.parse_object_stream_entry_from_handle(&member_stream, member_index)?;
-        Ok((member_stream_ref, member_index, parsed))
-    }
-
     fn parse_object_stream_entry_from_handle(
         &mut self,
         stream_handle: &ObjectHandle,
-        target_index: u32,
-    ) -> Result<ParsedObjectStreamEntry> {
+        target_object_number: u32,
+    ) -> Result<Option<ParsedObjectStreamEntry>> {
         let stream_dict = stream_handle
             .as_stream_dict()
             .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
@@ -3804,27 +3810,27 @@ impl<R: Read + Seek> Pdf<R> {
             .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
 
         let mut tokenizer = Tokenizer::new(&stream_data);
-        let mut object_offsets = Vec::with_capacity(stream_object_count);
+        let mut object_offsets = BTreeMap::new();
         for _ in 0..stream_object_count {
-            let _object_number =
-                parse_non_negative_u64(tokenizer.next_integer()?, "object stream object number")?;
+            // qpdf stores these pairs in std::map keyed by object number
+            // (`QPDF.cc:1788-1790`); the type-2 field2 is not this selector.
+            let object_number = u32::try_from(parse_non_negative_u64(
+                tokenizer.next_integer()?,
+                "object stream object number",
+            )?)
+            .map_err(|_| Error::parse(0, "object stream object number does not fit u32"))?;
             let object_offset =
                 parse_non_negative_u64(tokenizer.next_integer()?, "object stream object offset")?;
-            object_offsets.push(object_offset);
+            object_offsets.insert(object_number, object_offset);
         }
 
-        let target_index = usize::try_from(target_index)
-            .map_err(|_| Error::parse(0, "compressed object index does not fit usize"))?;
-        if target_index >= object_offsets.len() {
-            return Err(Error::parse(
-                0,
-                "compressed object index out of range for this stream",
-            ));
-        }
+        let Some(object_offset) = object_offsets.get(&target_object_number).copied() else {
+            return Ok(None);
+        };
 
         let start = first
             .checked_add(
-                usize::try_from(object_offsets[target_index])
+                usize::try_from(object_offset)
                     .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?,
             )
             .ok_or_else(|| Error::parse(0, "compressed object offset overflow"))?;
@@ -3837,10 +3843,10 @@ impl<R: Read + Seek> Pdf<R> {
         for diagnostic in &mut diagnostics {
             diagnostic.relative_offset += start;
         }
-        Ok(ParsedObjectStreamEntry {
+        Ok(Some(ParsedObjectStreamEntry {
             object,
             diagnostics,
-        })
+        }))
     }
 
     fn decode_object_stream_data(&self, stream_handle: &ObjectHandle) -> Result<Vec<u8>> {
@@ -3881,6 +3887,7 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn compressed_parent_for_entry(
         &mut self,
         stream_ref: ObjectRef,
@@ -3898,6 +3905,7 @@ impl<R: Read + Seek> Pdf<R> {
         Ok((parent_ref, parent_index))
     }
 
+    #[cfg(test)]
     fn object_stream_chain_member(
         &mut self,
         stream_ref: ObjectRef,
@@ -3934,6 +3942,7 @@ impl<R: Read + Seek> Pdf<R> {
         ))
     }
 
+    #[cfg(test)]
     fn collect_object_stream_chain(
         &mut self,
         stream_ref: ObjectRef,
@@ -8324,11 +8333,30 @@ mod tests {
             ObjectHandle::stream(direct_dict.clone(), Rc::new(b"7 0 << /Value 1 >>".to_vec()));
         assert!(source_pdf
             .parse_object_stream_entry_from_handle(&out_of_range, 1)
-            .is_err());
+            .expect("missing header object must be unresolved")
+            .is_none());
 
         let out_of_bounds = ObjectHandle::stream(direct_dict.clone(), Rc::new(b"7 999".to_vec()));
         assert!(source_pdf
-            .parse_object_stream_entry_from_handle(&out_of_bounds, 0)
+            .parse_object_stream_entry_from_handle(&out_of_bounds, 7)
+            .is_err());
+
+        let malformed_header =
+            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"not-an-integer 0".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&malformed_header, 7)
+            .is_err());
+
+        let negative_object_number =
+            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"-1 0".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&negative_object_number, 7)
+            .is_err());
+
+        let too_large_object_number =
+            ObjectHandle::stream(direct_dict, Rc::new(b"4294967296 0".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&too_large_object_number, 7)
             .is_err());
 
         let invalid_filter_dict = ObjectHandle::dictionary(vec![
@@ -8376,6 +8404,24 @@ mod tests {
         let negative_count =
             ObjectHandle::dictionary(vec![(b"N".to_vec(), ObjectHandle::integer(-1))]);
         assert!(object_stream_integer_from_handle(&negative_count, b"/N", "/N").is_err());
+    }
+
+    #[test]
+    fn compressed_resolution_rejects_a_stale_source_xref() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let object_ref = ObjectRef::new(7, 0);
+        pdf.cache.set_compressed(object_ref, 4, 0);
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: 5,
+                index: 0,
+            },
+        );
+
+        assert!(!pdf
+            .resolve_compressed_entry(object_ref, 4, 0)
+            .expect("stale source must be treated as unresolved"));
     }
 
     #[test]

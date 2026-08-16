@@ -675,7 +675,8 @@ fn pdf_writer_rewrites_member_declared_in_extended_object_stream() {
 
     assert_eq!(
         pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
-        Object::Integer(42)
+        Object::Null,
+        "qpdf does not materialize a child-stream member whose header names another object"
     );
     pdf.set_object(ObjectRef::new(2, 0), Object::Integer(43));
     assert_eq!(
