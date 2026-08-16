@@ -113,7 +113,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     /// Return the top-level field and whether it differs from this field.
-    pub fn top_level_field(&mut self) -> Result<(ObjectRef, bool)> {
+    pub fn get_top_level_field(&mut self) -> Result<(ObjectRef, bool)> {
         let mut current = self.field.clone();
         let mut seen = Vec::new();
         let mut top = self.field_ref;

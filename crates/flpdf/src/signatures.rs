@@ -744,4 +744,4 @@ fn certificate_entry<R: Read + Seek>(
 // `traverse_field`/`resolve_kids_array`/`page_widget_annotation_refs` and
 // their unit tests moved to `acroform_document_helper.rs` alongside the
 // shared `analyze()` port those functions became
-// (`AcroFormDocumentHelper::annotation_to_field_map`/`field_for_annotation`).
+// (`AcroFormDocumentHelper::annotation_to_field_map`/`get_field_for_annotation`).
