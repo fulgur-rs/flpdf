@@ -3218,12 +3218,39 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         self.cache.set_reserved(expected_ref);
-        let resolved_object = match self.resolve_borrowed(holder) {
-            Ok(Object::Integer(value)) => Ok(Some(ResolvedStreamLength::Integer(*value))),
-            Ok(Object::Null) => Ok(None),
-            Ok(_) => Ok(Some(ResolvedStreamLength::Invalid)),
-            Err(Error::Parse { .. }) => Ok(Some(ResolvedStreamLength::Invalid)),
-            Err(err) => Err(err),
+        let length_handle = self.get_object_handle(holder);
+        let resolved_object = if length_handle.is_resolved() {
+            if length_handle.is_missing() {
+                Ok(None)
+            } else {
+                match length_handle.try_as_integer()? {
+                    Some(value) => Ok(Some(ResolvedStreamLength::Integer(value))),
+                    None if length_handle.is_null() => Ok(None),
+                    None => Ok(Some(ResolvedStreamLength::Invalid)),
+                }
+            }
+        } else {
+            // Stream framing is qpdf's readObjectAtOffset recovery boundary
+            // (`QPDF.cc:1360-1402, 1485-1531`). The bounded legacy reader is
+            // still authoritative while it is establishing that boundary:
+            // the canonical parser intentionally reads a whole source window
+            // and would otherwise replay warnings from a malformed holder.
+            // Synchronize its result into the canonical child handle below so
+            // later consumers share one ObjectHandle identity.
+            let legacy_object = self.resolve_borrowed(holder).cloned();
+            if let Ok(object) = &legacy_object {
+                if !length_handle.is_resolved() {
+                    let value = self.lift_for_set_object(object, &length_handle)?;
+                    length_handle.set_resolved(value);
+                } // cov:ignore: resolve_borrowed synchronizes the canonical holder before returning; this preserves a defensive cache-only guard
+            }
+            match legacy_object {
+                Ok(Object::Integer(value)) => Ok(Some(ResolvedStreamLength::Integer(value))),
+                Ok(Object::Null) => Ok(None),
+                Ok(_) => Ok(Some(ResolvedStreamLength::Invalid)),
+                Err(Error::Parse { .. }) => Ok(Some(ResolvedStreamLength::Invalid)),
+                Err(err) => Err(err),
+            }
         };
         let resolved = match resolved_object {
             Ok(Some(resolved)) => resolved,
@@ -3434,49 +3461,30 @@ impl<R: Read + Seek> Pdf<R> {
         index: u32,
     ) -> Result<bool> {
         let stream_ref = ObjectRef::new(stream, 0);
-        let stream_object = match self.cache.entry(stream_ref).cloned() {
-            Some(CacheEntry::Resolved(object)) => object,
-            Some(CacheEntry::Unresolved { offset }) => {
-                let policy = RecoveryPolicy::RequireTokenTerminator;
-                let mut parsed =
-                    self.read_object_at_with_policy(stream_ref, offset, policy, policy)?;
-                if parsed.object_ref != stream_ref {
-                    return Ok(false);
-                }
-                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
-                let recovered_eol_bytes =
-                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
-                let (object, stream_payload_transformed) =
-                    self.decrypt_resolved_object(stream_ref, parsed.object, recovered_eol_bytes)?;
-                self.cache.set_resolved(stream_ref, object.clone());
-                if stream_payload_transformed {
-                    self.transformed_stream_refs.insert(stream_ref);
-                } else {
-                    self.transformed_stream_refs.remove(&stream_ref);
-                }
-                if let Some(eol) = recovered_eol {
-                    self.recovered_stream_eols.insert(stream_ref, eol);
-                } else {
-                    self.recovered_stream_eols.remove(&stream_ref);
-                }
-                self.record_file_object_diagnostics(stream_ref, offset, parsed.diagnostics)?;
-                object
-            }
-            Some(
-                CacheEntry::Compressed { .. }
-                | CacheEntry::Missing
-                | CacheEntry::Deleted
-                | CacheEntry::Reserved,
-            )
-            | None => return Ok(false),
-        };
-
-        let Some(stream_object) = stream_object.into_stream() else {
+        // qpdf resolves the object-stream container through the same object
+        // cache as every other indirect object (`QPDF.cc:1756-1833`). Keep
+        // this compatibility-cache consumer on that canonical handle too:
+        // its stream dictionary and payload must be read through the live
+        // `QPDF_Stream` filter path, not through a second raw `Object` copy.
+        let Some(stream_handle) = self.object_stream_handle_with_legacy_fallback(stream_ref)?
+        else {
             return Ok(false);
         };
+        if stream_handle.as_stream_dict().is_none() {
+            return Ok(false);
+        }
+        if !matches!(
+            self.cache.entry(stream_ref),
+            Some(CacheEntry::Resolved(Object::Stream(_)))
+        ) {
+            let stream_object = stream_handle.materialize()?;
+            if matches!(stream_object, Object::Stream(_)) {
+                self.cache.set_resolved(stream_ref, stream_object);
+            }
+        }
 
         let (parent_ref, parent_index, parsed) =
-            self.parse_object_stream_chain_entry(stream_ref, &stream_object, index)?;
+            self.parse_object_stream_chain_entry(stream_ref, &stream_handle, index)?;
         let ParsedObjectStreamEntry {
             object,
             diagnostics,
@@ -3498,41 +3506,81 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn decrypt_resolved_object(
-        &self,
+        &mut self,
         object_ref: ObjectRef,
         mut object: Object,
         recovered_stream_eol: Option<&[u8]>,
     ) -> Result<(Object, bool)> {
-        // `borrow_mut` because qpdf's crypt-filter switch rewrites `cf_string`
-        // and `cf_stream` on its unknown-filter arm. The guard is dropped
-        // before any warning is pushed, since that borrows the resolver.
-        let mut encryption_guard = self.encryption.borrow_mut();
-        let Some(encryption) = encryption_guard.as_mut() else {
-            return Ok((object, false));
+        let encrypt_ref = {
+            let encryption_guard = self.encryption.borrow();
+            let Some(encryption) = encryption_guard.as_ref() else {
+                return Ok((object, false));
+            };
+            encryption.encrypt_ref
         };
-        if Some(object_ref) == encryption.encrypt_ref {
+        if Some(object_ref) == encrypt_ref {
             return Ok((object, false));
         }
 
         // qpdf `QPDF::decryptString` (`libqpdf/QPDF_encryption.cc:977-1039`).
-        let warn_unknown_string = decrypt_object_strings(object_ref, &mut object, encryption)?;
+        // Keep this borrow scoped to the string pass. The stream pass below
+        // may resolve indirect filter parameters through the document resolver,
+        // which shares this RefCell (unlike qpdf's shared_ptr state).
+        let warn_unknown_string = {
+            let mut encryption_guard = self.encryption.borrow_mut();
+            let encryption = encryption_guard
+                .as_mut()
+                .expect("encryption state remains present after initial check");
+            decrypt_object_strings(object_ref, &mut object, encryption)?
+        };
 
         let mut stream_payload_transformed = false;
         let mut warn_unknown_stream = false;
         if let Object::Stream(stream) = &mut object {
-            if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
-                drop(encryption_guard);
+            let (encrypt_metadata, has_explicit_crypt_filter) = {
+                let encryption_guard = self.encryption.borrow();
+                let encryption = encryption_guard
+                    .as_ref()
+                    .expect("encryption state remains present after string pass");
+                (
+                    encryption.encrypt_metadata,
+                    stream_has_explicit_crypt_filter(&stream.dict),
+                )
+            };
+            if !encrypt_metadata && is_metadata_stream(&stream.dict) {
                 self.warn_unknown_crypt_filters(warn_unknown_string, false)?;
                 return Ok((object, false));
-            } else if stream_has_explicit_crypt_filter(&stream.dict) {
-                warn_unknown_stream = apply_explicit_crypt_filters(
+            } else if has_explicit_crypt_filter {
+                // Resolve every indirect child of the prefix handles before
+                // borrowing the encryption state again. qpdf can resolve
+                // these handles while its EncryptionParameters shared_ptr is
+                // live; Rust's shared RefCell would otherwise panic when the
+                // resolver parses a source-backed /DecodeParms dictionary.
+                self.resolve_explicit_crypt_filter_prefixes(&stream.dict)?;
+                let mut encryption_guard = self.encryption.borrow_mut();
+                let encryption = encryption_guard
+                    .as_mut()
+                    .expect("encryption state remains present before stream pass");
+                let mut decode_prefix = |prefix_dict: &Dictionary, encoded: &[u8]| {
+                    self.decode_filter_prefix_from_handle(prefix_dict, encoded)
+                };
+                let mut encode_prefix = |prefix_dict: &Dictionary, decoded: &[u8]| {
+                    self.encode_filter_prefix_from_handle(prefix_dict, decoded)
+                };
+                warn_unknown_stream = apply_explicit_crypt_filters_with_decoder(
                     object_ref,
                     stream,
                     encryption,
                     recovered_stream_eol,
+                    &mut decode_prefix,
+                    &mut encode_prefix,
                 )?;
                 stream_payload_transformed = true;
             } else {
+                let mut encryption_guard = self.encryption.borrow_mut();
+                let encryption = encryption_guard
+                    .as_mut()
+                    .expect("encryption state remains present before stream pass");
                 // qpdf `QPDF::decryptStream`'s method selection
                 // (`libqpdf/QPDF_encryption.cc:1062-1134`), for a stream that
                 // declared no `/Crypt` filter of its own.
@@ -3551,9 +3599,260 @@ impl<R: Read + Seek> Pdf<R> {
                 }
             }
         }
-        drop(encryption_guard);
         self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream)?;
         Ok((object, stream_payload_transformed))
+    }
+
+    /// Recover an object-stream container that exists only in the legacy
+    /// compatibility cache. Normal source-backed objects are resolved by the
+    /// canonical resolver above; this narrow bridge is for callers/tests that
+    /// intentionally seed `Pdf::cache` directly, and for malformed stream
+    /// framing where qpdf's recovery reader is the established owner.
+    fn object_stream_handle_with_legacy_fallback(
+        &mut self,
+        stream_ref: ObjectRef,
+    ) -> Result<Option<ObjectHandle>> {
+        let stream_handle = self.get_object_handle(stream_ref);
+        let prefer_legacy_framing = self.object_stream_needs_legacy_framing(stream_ref)?;
+        let canonical_error = if prefer_legacy_framing {
+            None
+        } else {
+            self.resolve_object_handle(&stream_handle).err()
+        };
+        if !prefer_legacy_framing && canonical_error.is_none() && !stream_handle.is_missing() {
+            return Ok(Some(stream_handle));
+        }
+
+        match self.cache.entry(stream_ref).cloned() {
+            Some(CacheEntry::Resolved(object)) => {
+                if !matches!(object, Object::Stream(_)) {
+                    return Ok(None);
+                }
+                let value = self.lift_for_set_object(&object, &stream_handle)?;
+                stream_handle.set_resolved(value);
+                Ok(Some(stream_handle))
+            }
+            Some(CacheEntry::Unresolved { offset }) => {
+                let policy = RecoveryPolicy::RequireTokenTerminator;
+                let mut parsed =
+                    self.read_object_at_with_policy(stream_ref, offset, policy, policy)?;
+                if parsed.object_ref != stream_ref {
+                    return Ok(None);
+                }
+                let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
+                let recovered_eol_bytes =
+                    recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
+                let (object, stream_payload_transformed) =
+                    self.decrypt_resolved_object(stream_ref, parsed.object, recovered_eol_bytes)?;
+                if !matches!(object, Object::Stream(_)) {
+                    return Ok(None); // cov:ignore: successful stream framing always yields Object::Stream here
+                }
+                self.cache.set_resolved(stream_ref, object.clone());
+                if stream_payload_transformed {
+                    self.transformed_stream_refs.insert(stream_ref);
+                } else {
+                    self.transformed_stream_refs.remove(&stream_ref);
+                }
+                if let Some(eol) = recovered_eol {
+                    self.recovered_stream_eols.insert(stream_ref, eol);
+                } else {
+                    self.recovered_stream_eols.remove(&stream_ref);
+                }
+                self.record_file_object_diagnostics(stream_ref, offset, parsed.diagnostics)?;
+                let value = self.lift_for_set_object(&object, &stream_handle)?;
+                stream_handle.set_resolved(value);
+                Ok(Some(stream_handle))
+            }
+            Some(
+                CacheEntry::Compressed { .. }
+                | CacheEntry::Missing
+                | CacheEntry::Deleted
+                | CacheEntry::Reserved,
+            )
+            | None => match canonical_error {
+                Some(error) => Err(error), // cov:ignore: an error with no recoverable cache entry is a defensive propagation arm
+                None => Ok(None),
+            },
+        }
+    }
+
+    fn object_stream_needs_legacy_framing(&mut self, stream_ref: ObjectRef) -> Result<bool> {
+        let Some(CacheEntry::Unresolved { offset }) = self.cache.entry(stream_ref).cloned() else {
+            return Ok(false);
+        };
+        let bytes = self.read_bounded_object_window(offset)?;
+        let pending = parse_file_object_syntax(&bytes)?;
+        let PendingBody::Stream { dict, .. } = pending.body else {
+            return Ok(false);
+        };
+        Ok(!matches!(
+            dict.get("Length"),
+            Some(Object::Integer(value)) if *value >= 0
+        ))
+    }
+
+    /// Lift the short legacy `/Crypt` prefix dictionary into the document's
+    /// canonical handle graph before decoding it. qpdf's
+    /// `QPDF_Stream::filterable` reads `/Filter`, `/DecodeParms`, and their
+    /// children through resolving accessors (`libqpdf/QPDF_Stream.cc:386-482`);
+    /// passing the raw dictionary to the old filter entry point would leave an
+    /// indirect prefix parameter as an unresolved `Object::Reference`.
+    fn decode_filter_prefix_from_handle(
+        &self,
+        prefix_dict: &Dictionary,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>> {
+        let prefix_handle = self.filter_dictionary_to_handle(prefix_dict, 0)?;
+        crate::filters::decode_stream_data_from_handle(
+            &prefix_handle,
+            encoded,
+            crate::filters::DecodeLimits::default(),
+        )
+    }
+
+    fn encode_filter_prefix_from_handle(
+        &self,
+        prefix_dict: &Dictionary,
+        decoded: &[u8],
+    ) -> Result<Vec<u8>> {
+        let prefix_handle = self.filter_dictionary_to_handle(prefix_dict, 0)?;
+        crate::filters::encode_stream_data_from_handle(&prefix_handle, decoded)
+    }
+
+    /// Eagerly resolve the canonical handles used by every prefix before the
+    /// encryption `RefCell` is borrowed for the actual decrypt/re-encode pass.
+    /// qpdf's `QPDF_Stream::filterable` can dereference these children while
+    /// `EncryptionParameters` is alive (`libqpdf/QPDF_Stream.cc:386-482`),
+    /// but the Rust resolver shares that state through `RefCell`.
+    fn resolve_explicit_crypt_filter_prefixes(&mut self, stream_dict: &Dictionary) -> Result<()> {
+        let Some(Object::Array(mut filters)) = stream_dict.get("Filter").cloned() else {
+            return Ok(());
+        };
+        let mut decode_params = stream_dict.get("DecodeParms").cloned();
+        let mut seen = BTreeSet::new();
+
+        while let Some(crypt_index) = filters
+            .iter()
+            .position(|filter| matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt"))
+        {
+            let prefix_dict = filter_prefix_dict(&filters, decode_params.as_ref(), crypt_index);
+            let prefix_handle = self.filter_dictionary_to_handle(&prefix_dict, 0)?;
+            self.resolve_filter_prefix_handle_tree(&prefix_handle, 0, &mut seen)?;
+
+            filters.remove(crypt_index);
+            if let Some(Object::Array(params)) = &mut decode_params {
+                if crypt_index < params.len() {
+                    params.remove(crypt_index);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_filter_prefix_handle_tree(
+        &mut self,
+        handle: &ObjectHandle,
+        depth: usize,
+        seen: &mut BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        if depth > crate::parser::MAX_PARSE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "filter prefix object nesting exceeds maximum of {}",
+                crate::parser::MAX_PARSE_DEPTH
+            )));
+        }
+        if let Some(object_ref) = handle.object_ref() {
+            if !seen.insert(object_ref) {
+                return Ok(());
+            }
+        }
+
+        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
+            self.resolve_object_handle(handle)?;
+            if let Some(children) = handle.as_array() {
+                for child in children {
+                    self.resolve_filter_prefix_handle_tree(&child, depth + 1, seen)?;
+                }
+            } else if let Some(entries) = handle.as_dictionary() {
+                for child in entries.values() {
+                    self.resolve_filter_prefix_handle_tree(child, depth + 1, seen)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn filter_dictionary_to_handle(
+        &self,
+        dictionary: &Dictionary,
+        depth: usize,
+    ) -> Result<ObjectHandle> {
+        if depth > crate::parser::MAX_PARSE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "filter prefix dictionary nesting exceeds maximum of {}",
+                crate::parser::MAX_PARSE_DEPTH
+            )));
+        }
+        let entries = dictionary
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    crate::object_handle::canonical_dictionary_key_from_legacy(key),
+                    self.filter_object_to_handle(value, depth + 1)?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        Ok(self
+            .resolver
+            .direct_object_handle(ObjectValue::Dictionary(entries)))
+    }
+
+    fn filter_object_to_handle(&self, object: &Object, depth: usize) -> Result<ObjectHandle> {
+        if depth > crate::parser::MAX_PARSE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "filter prefix object nesting exceeds maximum of {}",
+                crate::parser::MAX_PARSE_DEPTH
+            )));
+        }
+        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
+            let value = match object {
+                Object::Null => ObjectValue::Null,
+                Object::Boolean(value) => ObjectValue::Boolean(*value),
+                Object::Integer(value) => ObjectValue::Integer(*value),
+                Object::Real(value) => ObjectValue::Real(*value),
+                Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
+                    value: *value,
+                    literal: literal.clone(),
+                },
+                Object::Name(value) => ObjectValue::Name(value.clone()),
+                Object::String(value) => ObjectValue::String(value.clone()),
+                Object::Array(values) => ObjectValue::Array(
+                    values
+                        .iter()
+                        .map(|value| self.filter_object_to_handle(value, depth + 1))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                Object::Dictionary(dictionary) => {
+                    let handle = self.filter_dictionary_to_handle(dictionary, depth + 1)?;
+                    return Ok(handle);
+                }
+                Object::Stream(stream) => ObjectValue::Stream {
+                    stream_dict: self.filter_dictionary_to_handle(&stream.dict, depth + 1)?,
+                    stream_data: Some(Rc::new(stream.data.clone())),
+                    stream_length: 0,
+                    stream_provider: None,
+                },
+                Object::Reference(object_ref) => {
+                    return Ok(self.resolver.get_object_handle(*object_ref));
+                }
+                Object::Operator(_) | Object::InlineImage(_) => {
+                    return Err(Error::Unsupported(
+                        "filter prefix contains a content-stream-only object".to_owned(),
+                    ));
+                }
+            };
+            Ok(self.resolver.direct_object_handle(value))
+        })
     }
 
     /// qpdf's unknown-crypt-filter warnings, in the order qpdf emits them for
@@ -3582,13 +3881,88 @@ impl<R: Read + Seek> Pdf<R> {
     fn parse_object_stream_chain_entry(
         &mut self,
         stream_ref: ObjectRef,
-        stream_object: &crate::Stream,
+        stream_handle: &ObjectHandle,
         target_index: u32,
     ) -> Result<(ObjectRef, u32, ParsedObjectStreamEntry)> {
         let (member_stream_ref, member_index, member_stream) =
-            self.object_stream_chain_member(stream_ref, stream_object, target_index)?;
-        let parsed = parse_object_stream_entry(&member_stream, member_index)?;
+            self.object_stream_chain_member(stream_ref, stream_handle, target_index)?;
+        let parsed = self.parse_object_stream_entry_from_handle(&member_stream, member_index)?;
         Ok((member_stream_ref, member_index, parsed))
+    }
+
+    fn parse_object_stream_entry_from_handle(
+        &mut self,
+        stream_handle: &ObjectHandle,
+        target_index: u32,
+    ) -> Result<ParsedObjectStreamEntry> {
+        let stream_dict = stream_handle
+            .as_stream_dict()
+            .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
+        let stream_data = self.decode_object_stream_data(stream_handle)?;
+        let stream_object_count = object_stream_count_from_handle(&stream_dict)?;
+        let stream_data_first =
+            object_stream_integer_from_handle(&stream_dict, b"/First", "/First")?;
+
+        let first = usize::try_from(stream_data_first)
+            .map_err(|_| Error::parse(0, "Object stream /First does not fit usize"))?;
+
+        let mut tokenizer = Tokenizer::new(&stream_data);
+        let mut object_offsets = Vec::with_capacity(stream_object_count);
+        for _ in 0..stream_object_count {
+            let _object_number =
+                parse_non_negative_u64(tokenizer.next_integer()?, "object stream object number")?;
+            let object_offset =
+                parse_non_negative_u64(tokenizer.next_integer()?, "object stream object offset")?;
+            object_offsets.push(object_offset);
+        }
+
+        let target_index = usize::try_from(target_index)
+            .map_err(|_| Error::parse(0, "compressed object index does not fit usize"))?;
+        if target_index >= object_offsets.len() {
+            return Err(Error::parse(
+                0,
+                "compressed object index out of range for this stream",
+            ));
+        }
+
+        let start = first
+            .checked_add(
+                usize::try_from(object_offsets[target_index])
+                    .map_err(|_| Error::parse(0, "object stream offset does not fit usize"))?,
+            )
+            .ok_or_else(|| Error::parse(0, "compressed object offset overflow"))?;
+
+        if start > stream_data.len() {
+            return Err(Error::parse(0, "compressed object offset out of range"));
+        }
+
+        let (object, mut diagnostics) = parse_qpdf_file_object(&stream_data[start..])?;
+        for diagnostic in &mut diagnostics {
+            diagnostic.relative_offset += start;
+        }
+        Ok(ParsedObjectStreamEntry {
+            object,
+            diagnostics,
+        })
+    }
+
+    fn decode_object_stream_data(&self, stream_handle: &ObjectHandle) -> Result<Vec<u8>> {
+        let mut decoded_stream = crate::pipeline::buffer::Buffer::new("object stream", None);
+        let mut filtering_attempted = false;
+        let _success = stream_handle.pipe_stream_data_for_object_stream(
+            &mut decoded_stream,
+            &mut filtering_attempted,
+            0,
+            crate::writer::DecodeLevel::Specialized,
+            false,
+            false,
+        )?;
+        if !filtering_attempted {
+            return Err(Error::Unsupported(
+                "getStreamData called on unfilterable stream".to_owned(),
+            ));
+        }
+        Ok(decoded_stream.take_buffer()?)
     }
 
     fn record_object_stream_diagnostics(
@@ -3615,25 +3989,28 @@ impl<R: Read + Seek> Pdf<R> {
         stream_ref: ObjectRef,
         target_index: u32,
     ) -> Result<(ObjectRef, u32)> {
-        let stream_object = self.resolve_borrowed(stream_ref)?;
-        let Some(stream_object) = stream_object.as_stream().cloned() else {
+        let Some(stream_handle) = self.object_stream_handle_with_legacy_fallback(stream_ref)?
+        else {
             return Err(Error::parse(0, "compressed parent is not an object stream"));
         };
+        if stream_handle.as_stream_dict().is_none() {
+            return Err(Error::parse(0, "compressed parent is not an object stream"));
+        }
         let (parent_ref, parent_index, _) =
-            self.object_stream_chain_member(stream_ref, &stream_object, target_index)?;
+            self.object_stream_chain_member(stream_ref, &stream_handle, target_index)?;
         Ok((parent_ref, parent_index))
     }
 
     fn object_stream_chain_member(
         &mut self,
         stream_ref: ObjectRef,
-        stream_object: &crate::Stream,
+        stream_handle: &ObjectHandle,
         target_index: u32,
-    ) -> Result<(ObjectRef, u32, crate::Stream)> {
+    ) -> Result<(ObjectRef, u32, ObjectHandle)> {
         let mut streams = Vec::new();
         self.collect_object_stream_chain(
             stream_ref,
-            stream_object,
+            stream_handle,
             &mut streams,
             &mut BTreeSet::new(),
         )?;
@@ -3642,7 +4019,10 @@ impl<R: Read + Seek> Pdf<R> {
             .map_err(|_| Error::parse(0, "compressed object index does not fit usize"))?;
         let mut remaining = target_index;
         for (member_stream_ref, member_stream) in streams {
-            let member_count = object_stream_count(&member_stream)?;
+            let stream_dict = member_stream
+                .as_stream_dict()
+                .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
+            let member_count = object_stream_count_from_handle(&stream_dict)?;
             if remaining < member_count {
                 let member_index = u32::try_from(remaining)
                     .map_err(|_| Error::parse(0, "compressed object index does not fit u32"))?;
@@ -3660,8 +4040,8 @@ impl<R: Read + Seek> Pdf<R> {
     fn collect_object_stream_chain(
         &mut self,
         stream_ref: ObjectRef,
-        stream_object: &crate::Stream,
-        streams: &mut Vec<(ObjectRef, crate::Stream)>,
+        stream_handle: &ObjectHandle,
+        streams: &mut Vec<(ObjectRef, ObjectHandle)>,
         seen: &mut BTreeSet<ObjectRef>,
     ) -> Result<()> {
         // `seen` starts empty at the entry call and grows by one per `/Extends`
@@ -3676,15 +4056,21 @@ impl<R: Read + Seek> Pdf<R> {
             return Err(Error::parse(0, "object stream /Extends cycle"));
         }
 
-        if let Some(parent_ref) = stream_object.dict.get_ref("Extends") {
-            let parent_object = self.resolve_borrowed(parent_ref)?;
-            let Some(parent_stream) = parent_object.as_stream().cloned() else {
+        self.resolve_object_handle(stream_handle)?;
+        let stream_dict = stream_handle
+            .as_stream_dict()
+            .ok_or_else(|| Error::parse(0, "object stream is not a stream"))?;
+        let extends = stream_dict.try_get_key(b"/Extends")?;
+        if let Some(parent_ref) = extends.object_ref().or_else(|| extends.as_reference()) {
+            let parent_handle = self.get_object_handle(parent_ref);
+            self.resolve_object_handle(&parent_handle)?;
+            if parent_handle.as_stream_dict().is_none() {
                 return Err(Error::parse(0, "object stream /Extends is not a stream"));
-            };
-            self.collect_object_stream_chain(parent_ref, &parent_stream, streams, seen)?;
+            }
+            self.collect_object_stream_chain(parent_ref, &parent_handle, streams, seen)?;
         }
 
-        streams.push((stream_ref, stream_object.clone()));
+        streams.push((stream_ref, stream_handle.clone()));
         Ok(())
     }
 }
@@ -3981,11 +4367,15 @@ fn decrypt_stream_bytes(
 /// streams: a `/Crypt` filter naming a method qpdf does not recognise still
 /// goes through `QPDF::decryptStream`'s switch, whose unknown arm warns and
 /// resets `cf_stream` (`libqpdf/QPDF_encryption.cc:1121-1133`).
-fn apply_explicit_crypt_filters(
+type StreamPrefixCodec<'a> = dyn FnMut(&Dictionary, &[u8]) -> Result<Vec<u8>> + 'a;
+
+fn apply_explicit_crypt_filters_with_decoder(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     encryption: &mut EncryptionState,
     recovered_stream_eol: Option<&[u8]>,
+    decode_prefix: &mut StreamPrefixCodec<'_>,
+    encode_prefix: &mut StreamPrefixCodec<'_>,
 ) -> Result<bool> {
     let filter = stream
         .dict
@@ -4039,9 +4429,9 @@ fn apply_explicit_crypt_filters(
                     encoded.truncate(encoded.len() - eol.len());
                 }
             }
-            let mut decoded_prefix = crate::filters::decode_stream_data(&prefix_dict, &encoded)?;
+            let mut decoded_prefix = decode_prefix(&prefix_dict, &encoded)?;
             decrypt_stream_bytes(object_ref, &mut decoded_prefix, use_aes, encryption)?;
-            stream.data = crate::filters::encode_stream_data(&prefix_dict, &decoded_prefix)?;
+            stream.data = encode_prefix(&prefix_dict, &decoded_prefix)?;
         }
 
         // The endstream-scan EOL has now been accounted for in the source
@@ -4069,6 +4459,29 @@ fn apply_explicit_crypt_filters(
         };
     }
     Ok(warn_unknown)
+}
+
+#[cfg(test)]
+fn apply_explicit_crypt_filters(
+    object_ref: ObjectRef,
+    stream: &mut crate::Stream,
+    encryption: &mut EncryptionState,
+    recovered_stream_eol: Option<&[u8]>,
+) -> Result<bool> {
+    let mut decode_prefix = |prefix_dict: &Dictionary, encoded: &[u8]| {
+        crate::filters::decode_stream_data(prefix_dict, encoded)
+    };
+    let mut encode_prefix = |prefix_dict: &Dictionary, decoded: &[u8]| {
+        crate::filters::encode_stream_data(prefix_dict, decoded)
+    };
+    apply_explicit_crypt_filters_with_decoder(
+        object_ref,
+        stream,
+        encryption,
+        recovered_stream_eol,
+        &mut decode_prefix,
+        &mut encode_prefix,
+    )
 }
 
 fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
@@ -4140,6 +4553,7 @@ fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_object_stream_entry(
     stream_object: &crate::Stream,
     target_index: u32,
@@ -4601,6 +5015,7 @@ fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
     Some(String::from_utf8_lossy(cfm).to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn object_stream_count(stream_object: &crate::Stream) -> Result<usize> {
     usize::try_from(parse_non_negative_i64(
         stream_object
@@ -4612,6 +5027,33 @@ pub(crate) fn object_stream_count(stream_object: &crate::Stream) -> Result<usize
     .map_err(|_| Error::parse(0, "Object stream /N does not fit usize"))
 }
 
+fn object_stream_integer_from_handle(
+    stream_dict: &ObjectHandle,
+    key: &[u8],
+    label: &str,
+) -> Result<i64> {
+    let value = stream_dict.try_get_key(key)?.try_as_integer()?;
+    let Some(value) = value else {
+        return Err(Error::parse(
+            0,
+            format!("object stream {label} is not an integer"),
+        ));
+    };
+    if value < 0 {
+        return Err(Error::parse(
+            0,
+            format!("object stream {label} is negative"),
+        ));
+    }
+    Ok(value)
+}
+
+fn object_stream_count_from_handle(stream_dict: &ObjectHandle) -> Result<usize> {
+    usize::try_from(object_stream_integer_from_handle(stream_dict, b"/N", "/N")?)
+        .map_err(|_| Error::parse(0, "object stream /N does not fit usize"))
+}
+
+#[cfg(test)]
 fn parse_non_negative_i64(value: &crate::Object, context: &str) -> Result<i64> {
     let crate::Object::Integer(integer) = value else {
         return Err(Error::parse(0, format!("{context} is not integer")));
@@ -4637,6 +5079,7 @@ mod tests {
     use crate::pipeline::PipelineHandle;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
+    use std::process::Command;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -4768,7 +5211,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
         let file = std::fs::File::open(path).expect("encrypted fixture");
-        let pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
+        let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
         let encrypt_ref = pdf.encryption_ref().expect("indirect /Encrypt");
         let sentinel = Object::Integer(42);
 
@@ -5251,6 +5694,433 @@ mod tests {
         decrypt_stream_bytes(object_ref, &mut ciphertext, false, &mut encryption)
             .expect("RC4 encryption");
         ciphertext
+    }
+
+    #[test]
+    fn production_explicit_crypt_prefix_resolves_indirect_decode_params() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let decode_params_ref = ObjectRef::new(5, 0);
+        let plaintext = b"native prefix";
+        let encryption = explicit_rc4_encryption_state();
+        let ciphertext = rc4_ciphertext(ObjectRef::new(4, 0), plaintext, &encryption);
+
+        let mut predictor_input = vec![0];
+        predictor_input.extend_from_slice(&ciphertext);
+        let encoded = flate_encoded(&predictor_input);
+
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(12));
+        decode_params.insert("Columns", Object::Integer(plaintext.len() as i64));
+        decode_params.insert("Colors", Object::Integer(1));
+        decode_params.insert("BitsPerComponent", Object::Integer(8));
+        pdf.set_object(decode_params_ref, Object::Dictionary(decode_params));
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        stream_dict.insert(
+            "DecodeParms",
+            Object::Array(vec![
+                Object::Reference(decode_params_ref),
+                crypt_params(b"StdCF"),
+            ]),
+        );
+        *pdf.encryption.borrow_mut() = Some(encryption);
+
+        let (object, transformed) = pdf
+            .decrypt_resolved_object(
+                ObjectRef::new(4, 0),
+                Object::Stream(Stream::new(stream_dict, encoded)),
+                None,
+            )
+            .expect("production explicit Crypt route");
+        assert!(transformed);
+        let Object::Stream(stream) = object else {
+            panic!("fixture must remain a stream"); // cov:ignore: constructed as a stream above
+        };
+        let stream_handle = pdf
+            .filter_dictionary_to_handle(&stream.dict, 0)
+            .expect("lift rewritten filter prefix");
+        let decoded = crate::filters::decode_stream_data_from_handle(
+            &stream_handle,
+            &stream.data,
+            crate::filters::DecodeLimits::default(),
+        )
+        .expect("decode rewritten stream through native params");
+        assert_eq!(decoded, plaintext);
+    }
+
+    #[test]
+    fn source_backed_explicit_crypt_prefix_does_not_reenter_encryption_cell() {
+        let decode_params_ref = ObjectRef::new(5, 0);
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+                b"4 0 obj\nnull\nendobj\n",
+                b"5 0 obj\n<< /Predictor 12 /Columns 13 /Colors 1 /BitsPerComponent 8 >>\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open source-backed fixture");
+        let plaintext = b"native prefix";
+        let encryption = explicit_rc4_encryption_state();
+        let ciphertext = rc4_ciphertext(ObjectRef::new(4, 0), plaintext, &encryption);
+
+        let mut predictor_input = vec![0];
+        predictor_input.extend_from_slice(&ciphertext);
+        let encoded = flate_encoded(&predictor_input);
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        stream_dict.insert(
+            "DecodeParms",
+            Object::Array(vec![
+                Object::Reference(decode_params_ref),
+                crypt_params(b"StdCF"),
+            ]),
+        );
+        *pdf.encryption.borrow_mut() = Some(encryption);
+
+        let (object, transformed) = pdf
+            .decrypt_resolved_object(
+                ObjectRef::new(4, 0),
+                Object::Stream(Stream::new(stream_dict, encoded)),
+                None,
+            )
+            .expect("source-backed DecodeParms must not reenter encryption state");
+        assert!(transformed);
+        let Object::Stream(stream) = object else {
+            panic!("fixture must remain a stream"); // cov:ignore: constructed as a stream above
+        };
+        let stream_handle = pdf
+            .filter_dictionary_to_handle(&stream.dict, 0)
+            .expect("lift rewritten source-backed filter prefix");
+        let decoded = crate::filters::decode_stream_data_from_handle(
+            &stream_handle,
+            &stream.data,
+            crate::filters::DecodeLimits::default(),
+        )
+        .expect("decode rewritten source-backed stream through native params");
+        assert_eq!(decoded, plaintext);
+    }
+
+    /// Compare the canonical source-backed indirect-`/DecodeParms` route with
+    /// qpdf 11.9.0 on a real encrypted PDF. The stream stores
+    /// `RC4(FlateDecode(plaintext))`, so qpdf must resolve object 5 while
+    /// building its filtered pipeline and flpdf must select the same
+    /// source-backed handles before decrypting the stream.
+    #[test]
+    fn source_backed_indirect_decode_params_match_pinned_qpdf_bytes() {
+        let version = match Command::new("/usr/bin/qpdf").arg("--version").output() {
+            Ok(version) => version,
+            // cov:ignore-start: CI provides the pinned qpdf binary; this is a developer-host skip
+            Err(error) => {
+                eprintln!(
+                    "/usr/bin/qpdf unavailable; skipping indirect DecodeParms oracle: {error}"
+                );
+                return;
+            } // cov:ignore-end
+        };
+        let first_line = String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if first_line != "qpdf version 11.9.0" {
+            // cov:ignore-start: CI provides exactly qpdf 11.9.0; this is a developer-host skip
+            eprintln!(
+                "expected /usr/bin/qpdf 11.9.0; skipping indirect DecodeParms oracle: {first_line}"
+            );
+            return;
+            // cov:ignore-end
+        }
+
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::security::standard::{
+            build_v4_encrypt_dict, encrypt_cipher_bytes, per_object_key, ObjectKeyAlg,
+            StringEncryptCipher, V4CryptMethod, V4EncryptParams,
+        };
+
+        const PASSWORD: &[u8] = b"user-pw";
+        const OWNER_PASSWORD: &[u8] = b"owner-pw";
+        const ID0: [u8; 16] = [0x42; 16];
+        const PLAINTEXT: &[u8] = b"qpdf indirect DecodeParms oracle payload";
+        let encryption_params = EncryptParams::rc4(
+            EncryptMethod::V4Rc4128,
+            PASSWORD.to_vec(),
+            OWNER_PASSWORD.to_vec(),
+        );
+        let (encrypt_dict, file_key) = build_v4_encrypt_dict(&V4EncryptParams {
+            method: V4CryptMethod::Rc4,
+            user_password: PASSWORD,
+            owner_password: OWNER_PASSWORD,
+            p: encryption_params.permissions.to_p_bits(),
+            id0: &ID0,
+            encrypt_metadata: true,
+        })
+        .expect("build qpdf-compatible V=4 encryption dictionary");
+        let object_key = per_object_key(&file_key, 4, 0, ObjectKeyAlg::Rc4);
+        let mut predictor_input = vec![0];
+        predictor_input.extend_from_slice(PLAINTEXT);
+        let mut encoded = flate_encoded(&predictor_input);
+        encrypt_cipher_bytes(
+            &mut encoded,
+            StringEncryptCipher::Rc4 { key: &object_key },
+            &[0; 16],
+        )
+        .expect("encrypt explicit Crypt payload");
+
+        let mut encrypt_wire = Vec::new();
+        crate::writer::encrypted_strings::write_encryption_dictionary(
+            &mut encrypt_wire,
+            &encrypt_dict,
+        );
+        let mut bodies = Vec::new();
+        bodies.push(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec());
+        bodies.push(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec());
+        bodies.push(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n"
+                .to_vec(),
+        );
+        let mut stream = format!(
+            "4 0 obj\n<< /Length {} /Filter [/FlateDecode /Crypt] /DecodeParms [5 0 R << /Type /CryptFilterDecodeParms /Name /StdCF >>] >>\nstream\n",
+            encoded.len()
+        )
+        .into_bytes();
+        stream.extend_from_slice(&encoded);
+        stream.extend_from_slice(b"\nendstream\nendobj\n");
+        bodies.push(stream);
+        bodies.push(
+            format!(
+                "5 0 obj\n<< /Predictor 12 /Columns {} /Colors 1 /BitsPerComponent 8 >>\nendobj\n",
+                PLAINTEXT.len()
+            )
+            .into_bytes(),
+        );
+        bodies.push({
+            let mut body = b"6 0 obj\n".to_vec();
+            body.extend_from_slice(&encrypt_wire);
+            body.extend_from_slice(b"\nendobj\n");
+            body
+        });
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(bodies.len());
+        for body in &bodies {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(body);
+        }
+        let xref_start = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        let id_hex = ID0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 7 /Root 1 0 R /Encrypt 6 0 R /ID [<{id_hex}><{id_hex}>] >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let directory = tempfile::tempdir().expect("temporary qpdf oracle directory");
+        let path = directory.path().join("indirect-decode-parms.pdf");
+        std::fs::write(&path, &bytes).expect("write qpdf oracle fixture");
+        let qpdf = Command::new("/usr/bin/qpdf")
+            .arg("--password=user-pw")
+            .arg("--show-object=4")
+            .arg("--filtered-stream-data")
+            .arg(&path)
+            .output()
+            .expect("run pinned qpdf indirect DecodeParms probe");
+        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+        assert!(
+            qpdf.status.success(),
+            "qpdf indirect DecodeParms probe failed:\n{qpdf_stderr}"
+        );
+
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            crate::PdfOpenOptions {
+                password: PASSWORD.to_vec(),
+                allow_weak_crypto: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open qpdf oracle fixture with flpdf");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve_object_handle(&stream)
+            .expect("resolve source-backed encrypted stream");
+        let flpdf = stream
+            .get_stream_data(crate::writer::DecodeLevel::All)
+            .expect("decode source-backed encrypted stream with flpdf")
+            .as_ref()
+            .clone();
+        assert_eq!(qpdf.stdout, PLAINTEXT, "qpdf oracle plaintext");
+        assert_eq!(flpdf, qpdf.stdout, "flpdf and qpdf stream bytes");
+    }
+
+    #[test]
+    fn explicit_crypt_prefix_resolution_covers_bounds_and_cycles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec())]),
+        );
+        stream_dict.insert("DecodeParms", Object::Array(Vec::new()));
+        pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
+            .expect("missing DecodeParms entry must be accepted");
+        stream_dict.insert("DecodeParms", Object::Dictionary(Dictionary::new()));
+        pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
+            .expect("dictionary DecodeParms must be accepted");
+
+        let cycle_ref = ObjectRef::new(5, 0);
+        let cycle_handle = pdf.get_object_handle(cycle_ref);
+        let mut seen = BTreeSet::from([cycle_ref]);
+        pdf.resolve_filter_prefix_handle_tree(&cycle_handle, 0, &mut seen)
+            .expect("already-seen filter prefix must terminate");
+
+        let depth_error = pdf
+            .resolve_filter_prefix_handle_tree(
+                &cycle_handle,
+                crate::parser::MAX_PARSE_DEPTH + 1,
+                &mut BTreeSet::new(),
+            )
+            .expect_err("excessive filter prefix nesting must be rejected");
+        assert!(
+            matches!(depth_error, Error::Unsupported(message) if message.contains("filter prefix object nesting"))
+        );
+    }
+
+    #[test]
+    fn filter_prefix_lift_handles_legacy_kinds_and_depth_limits() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let mut nested = Dictionary::new();
+        nested.insert("Value", Object::Integer(7));
+
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Null", Object::Null);
+        dictionary.insert("Boolean", Object::Boolean(true));
+        dictionary.insert("Integer", Object::Integer(7));
+        dictionary.insert("Real", Object::Real(1.5));
+        dictionary.insert(
+            "RealLiteral",
+            Object::RealLiteral {
+                value: 0.4,
+                literal: b".4".to_vec(),
+            },
+        );
+        dictionary.insert("Name", Object::Name(b"FlateDecode".to_vec()));
+        dictionary.insert("String", Object::String(b"params".to_vec()));
+        dictionary.insert(
+            "Array",
+            Object::Array(vec![Object::Boolean(false), Object::Integer(2)]),
+        );
+        dictionary.insert("Dictionary", Object::Dictionary(nested));
+        dictionary.insert(
+            "Stream",
+            Object::Stream(Stream::new(Dictionary::new(), b"payload".to_vec())),
+        );
+        let referenced = ObjectRef::new(5, 0);
+        dictionary.insert("Reference", Object::Reference(referenced));
+
+        let handle = pdf
+            .filter_dictionary_to_handle(&dictionary, 0)
+            .expect("all ordinary PDF object kinds lift into handles");
+        assert_eq!(
+            handle
+                .try_get_key(b"/Reference")
+                .expect("reference child")
+                .object_ref(),
+            Some(referenced)
+        );
+        assert!(handle
+            .try_get_key(b"/Dictionary")
+            .expect("dictionary child")
+            .as_dictionary()
+            .is_some());
+        assert!(handle
+            .try_get_key(b"/Stream")
+            .expect("stream child")
+            .as_stream_dict()
+            .is_some());
+
+        assert!(pdf
+            .filter_dictionary_to_handle(&Dictionary::new(), crate::parser::MAX_PARSE_DEPTH + 1)
+            .is_err());
+        assert!(pdf
+            .filter_object_to_handle(&Object::Null, crate::parser::MAX_PARSE_DEPTH + 1)
+            .is_err());
+        assert!(pdf
+            .filter_object_to_handle(&Object::Operator(b"q".to_vec()), 0)
+            .is_err());
+        assert!(pdf
+            .filter_object_to_handle(&Object::InlineImage(b"BI".to_vec()), 0)
+            .is_err());
+    }
+
+    #[test]
+    fn cached_stream_length_handles_follow_qpdf_classification_and_sync() {
+        let pending = parse_file_object_syntax(
+            b"1 0 obj\n<< /Length 99 0 R >>\nstream\nabc\nendstream\nendobj\n",
+        )
+        .expect("pending stream");
+        let target = ObjectRef::new(1, 0);
+        let holder = ObjectRef::new(99, 0);
+
+        let mut null_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let null_handle = null_pdf.get_object_handle(holder);
+        null_handle.set_resolved(ObjectValue::Null);
+        assert!(null_handle.is_resolved());
+        assert!(null_handle.is_null());
+        assert!(null_pdf.cache.entry(holder).is_none());
+        assert_eq!(
+            null_pdf
+                .resolve_pending_stream_length(target, &pending, 0)
+                .expect("cached null holder"),
+            Some(ResolvedStreamLength::Missing)
+        );
+
+        let mut invalid_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        invalid_pdf
+            .get_object_handle(holder)
+            .set_resolved(ObjectValue::Name(b"not-an-integer".to_vec()));
+        assert_eq!(
+            invalid_pdf
+                .resolve_pending_stream_length(target, &pending, 0)
+                .expect("cached invalid holder"),
+            Some(ResolvedStreamLength::Invalid)
+        );
+
+        let mut sync_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let length_handle = sync_pdf.get_object_handle(holder);
+        sync_pdf.cache.set_resolved(holder, Object::Integer(3));
+        assert!(!length_handle.is_resolved());
+        assert_eq!(
+            sync_pdf
+                .resolve_pending_stream_length(target, &pending, 0)
+                .expect("legacy cache holder"),
+            Some(ResolvedStreamLength::Integer(3))
+        );
+        assert!(length_handle.is_resolved());
     }
 
     #[test]
@@ -7502,6 +8372,154 @@ mod tests {
     }
 
     #[test]
+    fn legacy_compressed_resolution_resolves_indirect_objstm_decode_parms() {
+        let decoded_objstm = b"7 0 << /Value 1 >>";
+        let mut predictor_input = vec![0];
+        predictor_input.extend_from_slice(decoded_objstm);
+        let encoded_objstm = flate_encoded(&predictor_input);
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        stream_dict.insert("N", Object::Integer(1));
+        stream_dict.insert("First", Object::Integer(4));
+        stream_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        stream_dict.insert("DecodeParms", Object::Reference(ObjectRef::new(5, 0)));
+
+        let decode_parms = format!(
+            "5 0 obj\n<< /Predictor 12 /Columns {} /Colors 1 /BitsPerComponent 8 >>\nendobj\n",
+            decoded_objstm.len()
+        )
+        .into_bytes();
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                b"2 0 obj\nnull\nendobj\n",
+                b"3 0 obj\nnull\nendobj\n",
+                b"4 0 obj\nnull\nendobj\n",
+                decode_parms.as_slice(),
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect DecodeParms fixture");
+        stream_dict.insert("Length", Object::Integer(encoded_objstm.len() as i64));
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Stream(Stream::new(stream_dict, encoded_objstm)),
+        );
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("indirect DecodeParms must resolve through the canonical stream handle");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1))
+        );
+    }
+
+    #[test]
+    fn object_stream_consumer_covers_legacy_cache_and_handle_error_boundaries() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let stream_ref = ObjectRef::new(7, 0);
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        stream_dict.insert("N", Object::Integer(1));
+        stream_dict.insert("First", Object::Integer(4));
+        stream_dict.insert("Length", Object::Integer(16));
+        let stream = Stream::new(stream_dict, b"7 0 << /Value 1 >>".to_vec());
+        pdf.cache.set_resolved(stream_ref, Object::Stream(stream));
+        let stream_handle = pdf
+            .object_stream_handle_with_legacy_fallback(stream_ref)
+            .expect("cache-seeded stream")
+            .expect("stream handle");
+        assert!(stream_handle.as_stream_dict().is_some());
+
+        let non_stream_ref = ObjectRef::new(8, 0);
+        pdf.cache.set_resolved(non_stream_ref, Object::Integer(1));
+        assert!(pdf
+            .object_stream_handle_with_legacy_fallback(non_stream_ref)
+            .expect("cache-seeded non-stream")
+            .is_none());
+
+        let mut source_pdf = Pdf::open_mem_owned(classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /Crypt /DecodeParms << /Name /Identity >> /Length 2 0 R >>\nstream\n7 0 << /Value 1 >>\nendstream\nendobj\n",
+                b"2 0 obj\n18\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        ))
+        .expect("open malformed-framing identity stream");
+        *source_pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
+        source_pdf
+            .object_stream_handle_with_legacy_fallback(ObjectRef::new(1, 0))
+            .expect("legacy framing fallback")
+            .expect("identity encrypted object stream");
+        assert!(source_pdf
+            .transformed_stream_refs
+            .contains(&ObjectRef::new(1, 0)));
+
+        let direct_dict = ObjectHandle::dictionary(vec![
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+        ]);
+        let out_of_range =
+            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"7 0 << /Value 1 >>".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&out_of_range, 1)
+            .is_err());
+
+        let out_of_bounds = ObjectHandle::stream(direct_dict.clone(), Rc::new(b"7 999".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&out_of_bounds, 0)
+            .is_err());
+
+        let invalid_filter_dict = ObjectHandle::dictionary(vec![
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        let invalid_filter =
+            ObjectHandle::stream(invalid_filter_dict, Rc::new(b"not flate data".to_vec()));
+        assert!(source_pdf
+            .decode_object_stream_data(&invalid_filter)
+            .is_err());
+
+        let provider_ref = ObjectRef::new(10, 0);
+        let mut provider_dict = Dictionary::new();
+        provider_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        source_pdf.set_object(
+            provider_ref,
+            Object::Stream(Stream::new(provider_dict, Vec::new())),
+        );
+        let provider_handle = source_pdf.get_object_handle(provider_ref);
+        provider_handle
+            .replace_stream_data_with_retry_callback(|_, _, _| Ok(false), None, None)
+            .expect("install retry-aware provider");
+        assert!(source_pdf
+            .decode_object_stream_data(&provider_handle)
+            .is_err());
+
+        let mut not_an_object_stream =
+            Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let non_stream = ObjectRef::new(9, 0);
+        not_an_object_stream.set_object(non_stream, Object::Integer(1));
+        assert!(matches!(
+            not_an_object_stream
+                .compressed_parent_for_entry(non_stream, 0)
+                .expect_err("non-stream compressed parent"),
+            Error::Parse { .. }
+        ));
+
+        let missing_count = ObjectHandle::dictionary(vec![]);
+        assert!(object_stream_integer_from_handle(&missing_count, b"/N", "/N").is_err());
+        let negative_count =
+            ObjectHandle::dictionary(vec![(b"N".to_vec(), ObjectHandle::integer(-1))]);
+        assert!(object_stream_integer_from_handle(&negative_count, b"/N", "/N").is_err());
+    }
+
+    #[test]
     fn qpdf_json_resolution_observes_a_handle_dictionary_mutation() {
         let object_ref = ObjectRef::new(1, 0);
         let bytes = classic_pdf_with_bodies(
@@ -8254,10 +9272,11 @@ mod tests {
         let bytes = objstm_extends_chain_pdf(MAX_OBJECT_STREAM_CHAIN_DEPTH);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let head = ObjectRef::new(4, 0);
-        let resolved = pdf.resolve(head).expect("resolve head");
-        let head_stream = resolved.as_stream().expect("head object must be a stream");
+        let head_handle = pdf.get_object_handle(head);
+        pdf.resolve_object_handle(&head_handle)
+            .expect("resolve head");
         let mut streams = Vec::new();
-        pdf.collect_object_stream_chain(head, head_stream, &mut streams, &mut BTreeSet::new())
+        pdf.collect_object_stream_chain(head, &head_handle, &mut streams, &mut BTreeSet::new())
             .expect("a chain at the depth limit must be accepted");
         assert_eq!(streams.len(), MAX_OBJECT_STREAM_CHAIN_DEPTH);
     }
@@ -8269,11 +9288,12 @@ mod tests {
         let bytes = objstm_extends_chain_pdf(MAX_OBJECT_STREAM_CHAIN_DEPTH + 1);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let head = ObjectRef::new(4, 0);
-        let resolved = pdf.resolve(head).expect("resolve head");
-        let head_stream = resolved.as_stream().expect("head object must be a stream");
+        let head_handle = pdf.get_object_handle(head);
+        pdf.resolve_object_handle(&head_handle)
+            .expect("resolve head");
         let mut streams = Vec::new();
         let err = pdf
-            .collect_object_stream_chain(head, head_stream, &mut streams, &mut BTreeSet::new())
+            .collect_object_stream_chain(head, &head_handle, &mut streams, &mut BTreeSet::new())
             .expect_err("a chain past the depth limit must be rejected");
         assert!(
             matches!(err, Error::Parse { .. }),
