@@ -19,7 +19,6 @@
 //! The qpdf document-helper entry point applies this to every leaf page with
 //! its caller-supplied required and forbidden annotation-flag masks.
 
-use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
@@ -93,10 +92,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // getPageContentForAppearance. Keep this route lazy instead of using
     // enumerate_page_annotations, whose public projection intentionally
     // materializes /Rect for its callers.
-    let annot_refs = {
-        let mut page_helper = PageObjectHelper::new(page_ref, pdf);
-        page_helper.get_annotations()?
-    };
+    let annot_refs = page_annotation_refs(pdf, page_ref)?;
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───
     enum AppearanceTarget {
@@ -601,6 +597,21 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     Ok(())
 }
 
+/// Return only the annotation references on a page.
+///
+/// qpdf's `QPDFPageObjectHelper::getAnnotations` does not inspect annotation
+/// fields such as `/Rect`; those are read later by
+/// `QPDFAnnotationObjectHelper::getPageContentForAppearance`, after the
+/// flags gate. Keep the resource-merge prepass on this refs-only boundary as
+/// well, so an excluded widget cannot materialize `/Rect` before that gate.
+fn page_annotation_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Vec<ObjectRef>> {
+    let mut page_helper = PageObjectHelper::new(page_ref, pdf);
+    page_helper.get_annotations()
+}
+
 fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Object>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None); // cov:ignore: a parsed Pdf always has a root reference
@@ -623,11 +634,11 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
     page_ref: ObjectRef,
     default_resources: &Object,
 ) -> Result<()> {
-    for annotation in enumerate_page_annotations(pdf, page_ref)? {
-        if !annotation.is_widget {
+    for annot_ref in page_annotation_refs(pdf, page_ref)? {
+        if AnnotationObjectHelper::new(annot_ref, pdf).get_subtype()? != b"Widget" {
             continue; // cov:ignore: non-widget annotations do not merge default resources
         }
-        let Some(appearance_ref) = resolve_ap_n(pdf, annotation.annot_ref)? else {
+        let Some(appearance_ref) = resolve_ap_n(pdf, annot_ref)? else {
             continue; // cov:ignore: widget without selected appearance has no merge target
         };
         let Object::Stream(mut appearance) = pdf.resolve(appearance_ref)? else {

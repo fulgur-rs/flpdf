@@ -67,6 +67,50 @@ fn build_n_page_pdf(n: u32) -> Vec<u8> {
     out
 }
 
+fn build_pdf(page_extra: &str, extra_objects: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+
+    for (number, body) in [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+    ] {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    offsets.insert(3, out.len() as u64);
+    out.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] {page_extra} >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+    for &(number, ref body) in extra_objects {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(body);
+    }
+
+    let max_number = offsets.keys().copied().max().unwrap_or(3);
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", max_number + 1).as_bytes());
+    for number in 1..=max_number {
+        match offsets.get(&number) {
+            Some(offset) => out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+            max_number + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
@@ -918,6 +962,55 @@ fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
         page.get("Annots").is_some(),
         "qpdf skips widgets before it needs their malformed /AcroForm/DR"
     );
+}
+
+#[test]
+fn helper_flatten_annotations_defers_widget_rect_validation_past_resource_merge() {
+    let mut pdf = open(build_pdf(
+        "/Annots [5 0 R]",
+        &[
+            (
+                4,
+                b"4 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << >> /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec(),
+            ),
+            (
+                5,
+                b"5 0 obj\n<< /Type /Annot /Subtype /Widget /F 2 /Rect 7 0 R /AP << /N 4 0 R >> >>\nendobj\n".to_vec(),
+            ),
+            (6, b"6 0 obj\n<< >>\nendobj\n".to_vec()),
+            (
+                7,
+                b"7 0 obj\n[0 0 /malformed 20]\nendobj\n".to_vec(),
+            ),
+        ],
+    ));
+
+    let mut acroform = Dictionary::new();
+    acroform.insert("DR", Object::Reference(ObjectRef::new(6, 0)));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("AcroForm", Object::Dictionary(acroform));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    let annotation = pdf.get_object_handle(ObjectRef::new(5, 0));
+    pdf.resolve_object_handle(&annotation).unwrap();
+    let rect = annotation.get_key(b"/Rect");
+    assert!(!rect.is_resolved());
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x2)
+        .unwrap();
+
+    assert!(
+        !rect.is_resolved(),
+        "qpdf's resource merge must not materialize /Rect before the flags gate"
+    );
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(page.get("Annots").is_none());
 }
 
 #[test]
