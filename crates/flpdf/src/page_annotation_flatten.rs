@@ -1322,6 +1322,286 @@ mod tests {
         obj_wrap(num, body)
     }
 
+    /// Build a minimal annotation fixture for direct ObjectHandle placement
+    /// tests. `stream_dictionary` is already a complete stream dictionary and
+    /// is wrapped as object 5 when present.
+    fn open_annotation_helper_fixture(
+        annotation: &str,
+        stream_dictionary: Option<&str>,
+    ) -> Pdf<Cursor<Vec<u8>>> {
+        let mut objects = vec![obj_dict(4, annotation)];
+        if let Some(stream_dictionary) = stream_dictionary {
+            let mut stream = stream_dictionary.as_bytes().to_vec();
+            stream.extend_from_slice(b"\nstream\n\nendstream\n");
+            objects.push(obj_wrap(5, stream));
+        }
+        Pdf::open(Cursor::new(build_pdf("", &objects))).unwrap()
+    }
+
+    #[test]
+    fn annotation_helper_qpdf_validation_and_rotation_paths() {
+        let stream_dictionary = "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Length 0 >>";
+        let annotation = "<< /Type /Annot /Rect [10 20 110 40] /F 4 /AP << /N 5 0 R >> >>";
+
+        let mut pdf = open_annotation_helper_fixture("<< /Type /Annot /Rect [0 0 100 20] >>", None);
+        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+
+        let mut pdf = open_annotation_helper_fixture(annotation, Some(stream_dictionary));
+        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+            .get_page_content_for_appearance("/Fxo1", 0, 0, 4)
+            .unwrap()
+            .is_empty());
+
+        let mut pdf = open_annotation_helper_fixture(
+            "<< /Type /Annot /Rect [0 0 100] /AP << /N 5 0 R >> >>",
+            Some(stream_dictionary),
+        );
+        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+
+        let mut pdf = open_annotation_helper_fixture(
+            "<< /Type /Annot /Rect [0 0 bad 20] /AP << /N 5 0 R >> >>",
+            Some(stream_dictionary),
+        );
+        assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+
+        let mut pdf = open_annotation_helper_fixture(
+            annotation,
+            Some(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0] /Length 0 >>",
+            ),
+        );
+        assert!(!AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+
+        let mut pdf = open_annotation_helper_fixture(
+            annotation,
+            Some(
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 bad 1 0 0] /Length 0 >>",
+            ),
+        );
+        assert!(!AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+            .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
+            .unwrap()
+            .is_empty());
+
+        for rotate in [180, 270, 45] {
+            let annotation = "<< /Type /Annot /Rect [10 20 110 40] /F 16 /AP << /N 5 0 R >> >>";
+            let mut pdf = open_annotation_helper_fixture(annotation, Some(stream_dictionary));
+            assert!(
+                !AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
+                    .get_page_content_for_appearance("/Fxo1", rotate, 0, 0)
+                    .unwrap()
+                    .is_empty(),
+                "qpdf NoRotate path must produce content for rotation {rotate}"
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_annotations_uses_canonical_inline_appearance() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance = Dictionary::new();
+        appearance.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Stream(Stream::new(appearance, Vec::new())));
+        let mut annotation = Dictionary::new();
+        annotation.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        annotation.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        annotation.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+
+        assert_eq!(
+            flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
+            1
+        );
+        assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .windows(2)
+            .any(|window| window == b"Do"));
+    }
+
+    #[test]
+    fn flatten_annotations_bridge_handles_holder_selection_and_bad_bbox() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut annotation = Dictionary::new();
+        annotation.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        annotation.insert("AP", Object::Reference(ObjectRef::new(5, 0)));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        let mut appearance = Dictionary::new();
+        appearance.insert("N", Object::Reference(ObjectRef::new(6, 0)));
+        pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(appearance));
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
+        let mut stream_dictionary = Dictionary::new();
+        stream_dictionary.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Stream(Stream::new(stream_dictionary, Vec::new())),
+        );
+        assert_eq!(
+            resolve_ap_n(&mut pdf, ObjectRef::new(4, 0)).unwrap(),
+            Some(ObjectRef::new(7, 0))
+        );
+        let (appearance_dictionary, selected_appearance) = {
+            let mut helper = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+            (
+                helper.get_appearance_dictionary().unwrap(),
+                helper.get_appearance_stream(b"N", None).unwrap(),
+            )
+        };
+        assert_eq!(
+            appearance_dictionary.object_ref(),
+            Some(ObjectRef::new(5, 0))
+        );
+        assert!(selected_appearance.is_null());
+        assert_eq!(
+            flatten_annotations_on_page(
+                &mut pdf,
+                ObjectRef::new(3, 0),
+                FlattenMode::Flags {
+                    required: 0,
+                    forbidden: 0,
+                    skip_widgets: false,
+                    page_rotate: 0,
+                },
+            )
+            .unwrap(),
+            1
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut annotation = Dictionary::new();
+        annotation.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        annotation.insert("AP", Object::Reference(ObjectRef::new(5, 0)));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(6, 0)),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(Dictionary::new()));
+        assert_eq!(
+            flatten_annotations_on_page(
+                &mut pdf,
+                ObjectRef::new(3, 0),
+                FlattenMode::Flags {
+                    required: 0,
+                    forbidden: 0,
+                    skip_widgets: false,
+                    page_rotate: 0,
+                },
+            )
+            .unwrap(),
+            0
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut annotation = Dictionary::new();
+        annotation.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.insert("N", Object::Reference(ObjectRef::new(6, 0)));
+        annotation.insert("AP", Object::Dictionary(appearance));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
+        let mut stream_dictionary = Dictionary::new();
+        stream_dictionary.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+            ]),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Stream(Stream::new(stream_dictionary, Vec::new())),
+        );
+        assert_eq!(
+            flatten_annotations_on_page(
+                &mut pdf,
+                ObjectRef::new(3, 0),
+                FlattenMode::Flags {
+                    required: 0,
+                    forbidden: 0,
+                    skip_widgets: false,
+                    page_rotate: 0,
+                },
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bare_reference_redirect_ignores_non_container_owner() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        pdf.set_object(ObjectRef::new(4, 0), Object::Integer(1));
+        assert!(!has_bare_reference_redirect(&mut pdf, ObjectRef::new(4, 0), "F").unwrap());
+    }
+
     // -----------------------------------------------------------------------
     // Test: basic widget flattening with All mode
     // -----------------------------------------------------------------------
