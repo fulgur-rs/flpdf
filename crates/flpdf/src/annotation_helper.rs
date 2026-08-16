@@ -337,7 +337,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     ///
     /// This is the Rust counterpart of
     /// `QPDFAnnotationObjectHelper::getPageContentForAppearance`
-    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:78-193`). `name` is the complete
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:78-226`). `name` is the complete
     /// PDF resource name, including its leading slash (for example,
     /// `"/Fxo1"`). An empty result means that the annotation has no usable
     /// normal appearance, its flags do not satisfy the requested contract, its

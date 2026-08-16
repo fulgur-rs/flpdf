@@ -173,6 +173,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
         let legacy_appearance_redirect = if has_bare_reference_redirect(pdf, ea.annot_ref, "AP")? {
             true
+        } else if has_bare_reference_redirect_in_handle(pdf, &appearance_dictionary, b"/N")? {
+            true
         } else if let Some(appearance_ref) = appearance_dictionary.object_ref() {
             has_bare_reference_redirect(pdf, appearance_ref, "N")?
         } else {
@@ -720,6 +722,25 @@ fn has_bare_reference_redirect<R: Read + Seek>(
         _ => None,
     };
     let Some(Object::Reference(reference)) = value else {
+        return Ok(false);
+    };
+    Ok(matches!(pdf.resolve(reference)?, Object::Reference(_)))
+}
+
+/// Return whether a resolved canonical dictionary handle contains a
+/// `Pdf::set_object` holder redirect at `key`.
+///
+/// This is the direct-dictionary counterpart to
+/// [`has_bare_reference_redirect`]. A direct `/AP` dictionary has no
+/// `ObjectRef` of its own, so its `/N` child must be inspected through the
+/// live `ObjectHandle` rather than through the legacy object cache.
+fn has_bare_reference_redirect_in_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    owner: &ObjectHandle,
+    key: &[u8],
+) -> Result<bool> {
+    let value = owner.get_key(key);
+    let Some(reference) = value.object_ref() else {
         return Ok(false);
     };
     Ok(matches!(pdf.resolve(reference)?, Object::Reference(_)))
@@ -1441,6 +1462,84 @@ mod tests {
         assert_eq!(
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
             1
+        );
+        assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .windows(2)
+            .any(|window| window == b"Do"));
+    }
+
+    #[test]
+    fn flatten_annotations_bridge_handles_direct_appearance_dictionary_holder() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut annotation = Dictionary::new();
+        annotation.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.insert("N", Object::Reference(ObjectRef::new(6, 0)));
+        annotation.insert("AP", Object::Dictionary(appearance));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
+        let mut stream_dictionary = Dictionary::new();
+        stream_dictionary.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Stream(Stream::new(stream_dictionary, Vec::new())),
+        );
+
+        let (appearance_dictionary, selected_appearance) = {
+            let mut helper = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+            (
+                helper.get_appearance_dictionary().unwrap(),
+                helper.get_appearance_stream(b"N", None).unwrap(),
+            )
+        };
+        assert!(appearance_dictionary.as_dictionary().is_some());
+        assert_eq!(
+            appearance_dictionary.get_key(b"/N").object_ref(),
+            Some(ObjectRef::new(6, 0))
+        );
+        assert!(selected_appearance.is_null());
+        assert!(
+            has_bare_reference_redirect_in_handle(&mut pdf, &appearance_dictionary, b"/N").unwrap()
+        );
+        assert_eq!(
+            resolve_ap_n(&mut pdf, ObjectRef::new(4, 0)).unwrap(),
+            Some(ObjectRef::new(7, 0))
+        );
+
+        assert_eq!(
+            flatten_annotations_on_page(
+                &mut pdf,
+                ObjectRef::new(3, 0),
+                FlattenMode::Flags {
+                    required: 0,
+                    forbidden: 0,
+                    skip_widgets: false,
+                    page_rotate: 0,
+                },
+            )
+            .unwrap(),
+            1,
+            "a direct /AP dictionary must still reach its /N holder-chain stream"
         );
         assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
             .unwrap()
