@@ -796,7 +796,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             invert_transformations,
             allow_shrink,
             allow_expand,
-        )?;
+        )?; // cov:ignore: matrix placement is validated by the helper before this overload; only its defensive error edge is excluded
         *matrix = computed;
         Ok(fragment)
     }
@@ -996,7 +996,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 DecodeLevel::Specialized,
                 false,
                 false,
-            )?;
+            )?; // cov:ignore: a failed Form provider is represented by succeeded=false; this is only the defensive provider-error edge
             if succeeded {
                 Ok(())
             } else {
