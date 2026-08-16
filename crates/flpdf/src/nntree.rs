@@ -903,6 +903,14 @@ impl HandleNumberTree {
 
         let result: Result<()> = (|| {
             let Some(dictionary) = node.try_as_dictionary()? else {
+                // qpdf's NNTreeIterator::deepen warns at this boundary and
+                // abandons only the malformed branch; its increment loop then
+                // continues with the next sibling (NNTree.cc:114-146,584-609).
+                let warning = structural_message(
+                    node.object_ref(),
+                    "non-dictionary node while traversing name/number tree",
+                );
+                pdf.push_warning(warning)?;
                 return Ok(());
             };
 
@@ -3503,6 +3511,36 @@ mod tests {
             .expect("non-empty local entries must be readable");
 
         assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn handle_number_tree_warns_for_non_dictionary_kid_and_continues_siblings() {
+        let mut pdf = empty_pdf();
+        let invalid_ref = ObjectRef::new(10, 0);
+        let valid_ref = ObjectRef::new(11, 0);
+        pdf.set_object(invalid_ref, Object::Integer(0));
+        pdf.set_object(valid_ref, number_leaf(&[(4, b"four")], Some((4, 4))));
+
+        let root = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![
+                pdf.get_object_handle(invalid_ref),
+                pdf.get_object_handle(valid_ref),
+            ]),
+        )]);
+
+        let entries = HandleNumberTree::new(root, 1)
+            .entries(&mut pdf)
+            .expect("a non-dictionary branch must not abort later siblings");
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            ["Name/Number tree node (object 10): non-dictionary node while traversing name/number tree"]
+        );
     }
 
     #[test]
