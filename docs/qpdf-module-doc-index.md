@@ -7,7 +7,6 @@
 | `crates/flpdf/src/acroform_document_helper.rs` | correspondence | QPDFAcroFormDocumentHelper.cc responsibilities shared with overlay and signature modules |
 | `crates/flpdf/src/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
 | `crates/flpdf/src/annotation_helper.rs` | correspondence | \`QPDFAnnotationObjectHelper.cc\` |
-| `crates/flpdf/src/ascii85.rs` | correspondence | flpdf-specific ASCII85 encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCII85Decoder but no matching encoder component |
 | `crates/flpdf/src/ascii_hex.rs` | correspondence | flpdf-specific ASCIIHex encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCIIHexDecoder but no matching encoder component |
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
@@ -94,7 +93,7 @@
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
 | `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
 | `crates/flpdf/src/pipeline/aes.rs` | correspondence | Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time |
-| `crates/flpdf/src/pipeline/ascii85.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
+| `crates/flpdf/src/pipeline/ascii85_decoder.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/ascii_hex.rs` | correspondence | Pl_ASCIIHexDecoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/base64.rs` | correspondence | Pl_Base64.cc streaming encode/decode, aliases, padding, and lifecycle |
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
