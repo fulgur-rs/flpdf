@@ -26,18 +26,29 @@ oracle は固定済み qpdf 11.9.0 の
 
 ## 公開 API
 
-`AnnotationObjectHelper` は `ObjectHandle` を値として保持し、qpdf の公開面を
-snake_case で提供する。`ObjectRef + &mut Pdf` を受け取る constructor、raw
-`Dictionary` / `Object` を返す accessor、compatibility wrapper は残さない。
+`AnnotationObjectHelper` は annotation の `ObjectRef` を保持し、qpdf の公開面を
+snake_case で提供する。raw `Dictionary` / `Object` を返す accessor、
+compatibility wrapper は残さない。実装時に確定した設計として、
+`ObjectRef + &mut Pdf` を受け取る constructor は残す —
+ObjectHandle アクセサ自身が resolve のたびに `&mut Pdf` を要求する
+(indirect な子を都度 resolve する) ため、helper が生存期間つきの可変借用を
+保持する形が自然な境界になった。
 
 最低限、以下を提供する。
 
-- `new(ObjectHandle)`
-- `object_handle(&self) -> &ObjectHandle`
-- `get_rect(&self) -> Option<PageBox>`
-- `get_appearance_dictionary(&self) -> ObjectHandle`
-- `get_flags(&self) -> i64`
-- `get_appearance_stream(&self, which: &[u8], state: Option<&[u8]>) -> ObjectHandle`
+- `new(annot_ref: ObjectRef, pdf: &mut Pdf<R>)`
+- `get_rect(&mut self) -> Result<PageBox>`
+- `get_appearance_dictionary(&mut self) -> Result<ObjectHandle>`
+- `get_flags(&mut self) -> Result<i64>`
+- `get_appearance_stream(&mut self, which: &[u8], state: Option<&[u8]>) -> Result<ObjectHandle>`
+
+戻り値が `Result` なのは、ObjectHandle の resolve 経路が壊れた間接参照や
+深いネストで実際にエラーを返しうるため — qpdf 側の対応 accessor は
+fail-soft（型不一致は既定値、例外を投げない）だが、flpdf の resolver はその
+fail-soft 性を型不一致に限って再現し、構造的な resolve 失敗は `Err` として
+伝播する。個々の accessor は qpdf の欠落・null・型不一致の規約を
+`Result<T>` の `Ok` 側で再現する（例: `get_flags` は欠落・非整数を `Ok(0)`
+に正規化する）。
 
 qpdf の null-object 規約に合わせ、欠落・null・型不一致の optional read は null
 ObjectHandle 又は既定値に正規化する。壊れた間接参照のエラーは ObjectHandle の
@@ -52,8 +63,9 @@ ObjectHandle 又は既定値に正規化する。壊れた間接参照のエラ�
    Tier A1 の module に移して依存を一方向にする。
 3. `page_annotation_enum.rs` の page traversal / widget linkage を消費側へ移し、
    public re-export を削除する。旧 module の実装は削除する。
-4. `rg` で対象 helper と移行した consumer に `Object::`、`resolve_borrowed`、
-   raw `Pdf` constructor が残っていないことを確認する。
+4. `rg` で対象 helper と移行した consumer に `Object::`、`resolve_borrowed`
+   ベースの raw アクセスが残っていないことを確認する
+   （`ObjectRef + &mut Pdf` constructor 自体は上記のとおり意図した設計）。
 
 ## テストと完了条件
 
