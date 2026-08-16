@@ -2234,7 +2234,7 @@ impl LinearizationPlan {
         // no slot neither inflates the split boundary nor reaches
         // `place_objstm_members_per_half` without a slot (which would panic).
         // Dangling/missing refs (e.g. `/Info 99 0 R` with no xref entry) are
-        // already excluded upstream by `compressible_objgens`. For a well-formed
+        // already excluded upstream by `get_compressible_objgens`. For a well-formed
         // PDF every member is assigned, so the filter is a no-op and the batches
         // stay byte-identical.
         let assigned = self.renumber_assigned_refs();
@@ -2512,7 +2512,7 @@ impl std::ops::Deref for RoutedObjStmBatch {
 /// Compute the linearized generate-mode ObjStm membership.
 ///
 /// Runs qpdf's `generateObjectStreams` even split
-/// ([`compressible_objgens`](crate::writer::object_streams::compressible_objgens)
+/// ([`get_compressible_objgens`](crate::writer::object_streams::get_compressible_objgens)
 /// →
 /// [`even_split_into_streams`](crate::writer::object_streams::even_split_into_streams),
 /// hard-coded 100 per stream — *not* the planner cap) over the whole document,
@@ -2525,11 +2525,11 @@ impl std::ops::Deref for RoutedObjStmBatch {
 ///
 /// `assigned` is the set of refs that receive a renumber slot
 /// ([`LinearizationPlan::renumber_assigned_refs`]). A live, reachable object that
-/// [`compressible_objgens`](crate::writer::object_streams::compressible_objgens)
+/// [`get_compressible_objgens`](crate::writer::object_streams::get_compressible_objgens)
 /// admits but the linearization plan places in no part — a trailer-only object
 /// with no slot — is dropped **before** the even split, so it cannot inflate the
 /// split boundary and scatter real members across separate ObjStms. (Dangling /
-/// missing refs are already excluded upstream by `compressible_objgens`, which
+/// missing refs are already excluded upstream by `get_compressible_objgens`, which
 /// qpdf treats as null, so they never reach this retain.) The page dictionaries
 /// and root Catalog are in `assigned`, so they still consume split positions and
 /// are erased afterwards, exactly as qpdf does.
@@ -2546,7 +2546,7 @@ pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
     // references reached from arrays. Do not append `resurrectable_null_refs`
     // here: that set remains a planner/all-refs aid, and appending it would give
     // array-null objects duplicate ObjStm membership.
-    let mut eligible = crate::writer::object_streams::compressible_objgens(pdf)?;
+    let mut eligible = crate::writer::object_streams::get_compressible_objgens(pdf)?;
     // Drop refs without a renumber slot before the split (see doc above).
     eligible.retain(|r| assigned.contains(r));
     let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
@@ -7019,7 +7019,7 @@ mod tests {
     }
 
     /// Single-page PDF whose trailer references a missing `/Info` object
-    /// (`99 0 R`, no xref entry). `compressible_objgens` excludes the dangling
+    /// (`99 0 R`, no xref entry). `get_compressible_objgens` excludes the dangling
     /// ref from the compressible set (qpdf treats a missing ref as null), so it
     /// never reaches the linearized ObjStm membership or the generate renumber
     /// walk. Mirrors the Codex Security PoC (`flpdf-4vpi`).
@@ -7050,7 +7050,7 @@ mod tests {
     /// Single-page PDF with a real `/Info` (obj 4) whose trailer also carries `n`
     /// missing `/Junk` refs (objects `10..10+n`, none with an xref entry). qpdf
     /// drops each dangling ref before it can enter the compressible set, so it
-    /// emits one ObjStm holding only the real members. `compressible_objgens`
+    /// emits one ObjStm holding only the real members. `get_compressible_objgens`
     /// excludes the missing refs the same way: were they admitted, with `n` large
     /// enough they would cross the 100-member even-split boundary and scatter the
     /// two real members (the `/Info` dict and the `/Pages` tree) into separate
@@ -7105,7 +7105,7 @@ mod tests {
     }
 
     /// A missing trailer-only `/Info 99 0 R` must not receive a renumber slot or
-    /// be batched into an ObjStm: `compressible_objgens` excludes the dangling
+    /// be batched into an ObjStm: `get_compressible_objgens` excludes the dangling
     /// ref, so it never reaches `place_objstm_members_per_half` without a slot
     /// (which would panic). End-to-end guard for the Codex Security PoC
     /// (`flpdf-4vpi`).

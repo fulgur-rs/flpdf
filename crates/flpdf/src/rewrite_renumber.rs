@@ -514,7 +514,7 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
 ///
 /// This set is used by linearization's all-ref and object-user planning. ObjStm
 /// Generate membership has its own qpdf DFS
-/// ([`crate::writer::object_streams::compressible_objgens`]) and must not append
+/// ([`crate::writer::object_streams::get_compressible_objgens`]) and must not append
 /// this set a second time.
 ///
 /// Propagates resolve errors and the [`MAX_INLINE_DEPTH`] guard from the walk.
@@ -655,7 +655,7 @@ impl CatalogFirstRenumber {
 /// object order (qpdf stores members in a `std::set<QPDFObjGen>`). Containers
 /// are therefore numbered in the order their first member is encountered.
 ///
-/// The container membership comes from the caller (the `compressible_objgens`
+/// The container membership comes from the caller (the `get_compressible_objgens`
 /// traversal split into even groups); this type only assigns the numbers in
 /// qpdf's order.
 //

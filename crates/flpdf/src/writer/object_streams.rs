@@ -348,7 +348,7 @@ pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
 /// qpdf hides dictionary entries whose values resolve to null, but retains
 /// indirect identities reached from arrays even when they are missing, free,
 /// or real-null objects.
-pub(crate) fn compressible_objgens<R: std::io::Read + std::io::Seek>(
+pub(crate) fn get_compressible_objgens<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<Vec<ObjectRef>> {
     Ok(compressible_objgens_qpdf_plan(pdf)?.eligible)
@@ -1019,7 +1019,7 @@ mod tests {
     fn compressible_objgens_is_qpdf_dfs_traversal_order() {
         let bytes = reverse_kids_pdf(3);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
         // Catalog(1), Pages(2), then kids in array order [5,4,3] (descending).
         assert_eq!(
             order,
@@ -1046,7 +1046,7 @@ mod tests {
             .unwrap();
         pdf.mark_object_handle_dirty(&root).unwrap();
 
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
 
         assert_eq!(
             order,
@@ -1093,7 +1093,7 @@ mod tests {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
         pdf.delete_object(ObjectRef::new(4, 1));
 
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
 
         assert!(
             eligible.contains(&ref0(4)),
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn compressible_objgens_excludes_stream_objects() {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(pdf_with_content_stream())).unwrap();
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
         assert!(
             !order.contains(&ref0(4)),
             "the content stream (obj 4) must not be a compressible object; got {order:?}"
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn compressible_objgens_traverses_stream_dictionary_children() {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(pdf_with_content_stream())).unwrap();
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
         assert!(
             order.contains(&ref0(5)),
             "obj 5, reachable only via the stream dict's /Meta, must be found; got {order:?}"
@@ -1258,7 +1258,7 @@ mod tests {
             (5, b"3".to_vec()),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
         assert!(
             !order.contains(&ref0(5)),
             "indirect /Length holder (obj 5) must be omitted from the traversal; got {order:?}"
@@ -1286,7 +1286,7 @@ mod tests {
             ),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
         assert!(
             !order.contains(&ref0(4)),
             "signature dictionary (obj 4) must be excluded from the compressible set; got {order:?}"
@@ -1348,7 +1348,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
         let dict_only_real_null = ref0(4);
         let array_real_null = ref0(5);
         let array_missing = ref0(99);
@@ -1381,7 +1381,7 @@ mod tests {
             (5, b"null".to_vec()),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
 
         assert!(
             eligible.contains(&ref0(4)),
@@ -1413,7 +1413,7 @@ mod tests {
         // reference as an integer. Seed the holder as a reference so this test
         // exercises the shared chained-reference predicate.
         pdf.set_object(ref0(5), Object::Reference(ref0(6)));
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
 
         assert!(
             !eligible.contains(&ref0(4)),
@@ -1440,7 +1440,7 @@ mod tests {
             (5, b"null".to_vec()),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
 
         assert!(
             eligible.contains(&ref0(4)),
@@ -1466,7 +1466,7 @@ mod tests {
             ),
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
 
         assert!(
             eligible.contains(&ref0(4)),
@@ -1479,7 +1479,7 @@ mod tests {
         let bytes =
             include_bytes!("../../../../tests/fixtures/compat/null-visible-split-boundary.pdf");
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
         let expected_first: Vec<ObjectRef> = [ref0(1), ref0(2), ref0(3)]
             .into_iter()
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn even_split_matches_qpdf_partition_on_130_page_reverse() {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
 
         assert_eq!(groups.len(), 2, "132 eligible -> 2 streams");
@@ -1560,7 +1560,7 @@ mod tests {
     #[test]
     fn generate_renumber_matches_qpdf_on_130_page_reverse() {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
         let renumber_groups: Vec<ObjectStreamGroup> = groups
             .iter()
@@ -1602,7 +1602,7 @@ mod tests {
         );
         let bytes = std::fs::read(path).unwrap();
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let order = compressible_objgens(&mut pdf).unwrap();
+        let order = get_compressible_objgens(&mut pdf).unwrap();
         assert!(
             !order.contains(&ref0(12)),
             "the /Encrypt dictionary (obj 12) must be excluded from the compressible set; got {order:?}"
@@ -1653,7 +1653,7 @@ mod tests {
         ]);
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
 
-        let eligible = compressible_objgens(&mut pdf).unwrap();
+        let eligible = get_compressible_objgens(&mut pdf).unwrap();
 
         assert!(!eligible.contains(&ref0(4)), "streams are not compressible");
         assert!(
