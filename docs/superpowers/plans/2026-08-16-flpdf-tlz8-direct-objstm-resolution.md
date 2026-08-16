@@ -40,8 +40,7 @@ The existing `tests/fixtures/compat/objstm-extends-chain.pdf.hex` is an intentio
 
 **Files:**
 
-- Add or modify: `crates/flpdf/tests/reader_tests.rs`
-- Add: `tests/fixtures/compat/objstm-direct-container.pdf.hex` (or an equally explicit flpdf-authored fixture name)
+- Add or modify: `crates/flpdf/tests/reader_tests.rs` with an explicit direct-container fixture builder (a committed `.hex` fixture is also acceptable)
 - Inspect only: `tests/fixtures/compat/objstm-extends-chain.pdf.hex`, `crates/flpdf/tests/writer_tests.rs`
 
 - [ ] Re-read the existing reader and writer tests around the ObjStm fixtures and preserve the writer `/Extends` assertions as a separate behavior.
