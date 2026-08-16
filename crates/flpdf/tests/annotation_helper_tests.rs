@@ -401,6 +401,84 @@ fn annotation_handle_appearance_stream_state_dictionary_key_missing_returns_null
     assert!(stream.is_null());
 }
 
+#[test]
+fn annotation_handle_builds_qpdf_page_content_for_appearance() {
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (3, b"<< /Type /Page /Parent 2 0 R >>".to_vec()),
+        (
+            4,
+            b"<< /Type /Annot /Rect [10 20 110 40] /F 4 /AP << /N 5 0 R >> >>".to_vec(),
+        ),
+        (
+            5,
+            b"<< /Type /XObject /BBox [0 0 100 20] /Length 0 >>\nstream\n\nendstream".to_vec(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+
+    let content = annot
+        .get_page_content_for_appearance("/Fxo1", 0, 0, 0x3)
+        .expect("get_page_content_for_appearance()");
+    assert_eq!(content, b"q\n1 0 0 1 10 20 cm\n/Fxo1 Do\nQ\n".to_vec());
+
+    let appearance = annot
+        .get_appearance_stream(b"N", None)
+        .expect("get_appearance_stream()");
+    assert_eq!(
+        appearance
+            .as_stream_dict()
+            .expect("appearance stream dictionary")
+            .get_key(b"/Subtype")
+            .as_name(),
+        Some(b"Form".to_vec())
+    );
+
+    let skipped = annot
+        .get_page_content_for_appearance("/Fxo1", 0, 8, 0)
+        .expect("flag-gated appearance content");
+    assert!(
+        skipped.is_empty(),
+        "missing required flags must suppress content"
+    );
+}
+
+#[test]
+fn annotation_handle_builds_no_rotate_page_content_for_appearance() {
+    let bytes = build_annotation_pdf(
+        "/Subtype /Widget /F 16 /Rect [10 20 110 40] \
+         /AP << /N 5 0 R >>",
+    );
+    let bytes = {
+        let mut pdf = open(bytes);
+        let mut stream = flpdf::Dictionary::new();
+        stream.insert(
+            "BBox",
+            flpdf::Object::Array(vec![
+                flpdf::Object::Integer(0),
+                flpdf::Object::Integer(0),
+                flpdf::Object::Integer(100),
+                flpdf::Object::Integer(20),
+            ]),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            flpdf::Object::Stream(flpdf::Stream::new(stream, Vec::new())),
+        );
+        pdf
+    };
+
+    // The helper owns the same qpdf NoRotate transform used by page flattening.
+    let mut pdf = bytes;
+    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+    let content = annot
+        .get_page_content_for_appearance("/Fxo1", 90, 0, 0x3)
+        .expect("get_page_content_for_appearance()");
+    assert_eq!(content, b"q\n0 1 -1 0 30 40 cm\n/Fxo1 Do\nQ\n".to_vec());
+}
+
 // ── FormFieldObjectHelper — leaf field (no /Parent) ───────────────────────────
 //
 // Object layout:
