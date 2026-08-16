@@ -239,16 +239,20 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// Propagates [`Self::annotation_to_field_map`]'s errors.
     pub fn field_for_annotation(&mut self, annot_ref: ObjectRef) -> Result<Option<ObjectRef>> {
-        let is_widget = self
+        let subtype = self
             .pdf
             .resolve_borrowed(annot_ref)?
             .as_dict()
-            .is_some_and(|dict| {
-                matches!(
-                    dict.get("Subtype"),
-                    Some(Object::Name(name)) if name.as_slice() == b"Widget"
-                )
-            });
+            .and_then(|dict| dict.get("Subtype").cloned());
+        // `getKey("/Subtype")` transparently dereferences on the qpdf side
+        // (`QPDFObjectHandle::isDictionaryOfType`, `QPDFObjectHandle.cc:462-466`),
+        // so an indirect `/Subtype` must resolve the same as a direct one here.
+        let is_widget = match subtype {
+            Some(value) => {
+                matches!(resolve_ref_chain(self.pdf, &value)?.0, Object::Name(name) if name.as_slice() == b"Widget")
+            }
+            None => false,
+        };
         if !is_widget {
             return Ok(None);
         }
@@ -1339,15 +1343,18 @@ fn page_widget_annotation_refs<R: Read + Seek>(
         let Object::Reference(annot_ref) = annot else {
             continue;
         };
-        let is_widget = pdf
+        let subtype = pdf
             .resolve_borrowed(annot_ref)?
             .as_dict()
-            .is_some_and(|dict| {
-                matches!(
-                    dict.get("Subtype"),
-                    Some(Object::Name(name)) if name.as_slice() == b"Widget"
-                )
-            });
+            .and_then(|dict| dict.get("Subtype").cloned());
+        // See `field_for_annotation`'s doc: `/Subtype` must resolve the same
+        // whether stored direct or indirect (`QPDFObjectHandle.cc:462-466`).
+        let is_widget = match subtype {
+            Some(value) => {
+                matches!(resolve_ref_chain(pdf, &value)?.0, Object::Name(name) if name.as_slice() == b"Widget")
+            }
+            None => false,
+        };
         if is_widget {
             widgets.push(annot_ref);
         }
@@ -1663,6 +1670,31 @@ mod tests {
     }
 
     #[test]
+    fn page_widget_annotation_refs_resolves_an_indirect_subtype() {
+        // Same qpdf `getKey("/Subtype")` transparent-dereference contract as
+        // `field_for_annotation_resolves_an_indirect_subtype`.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[(
+                "Annots",
+                Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
+            )])),
+        );
+        pdf.set_object(ObjectRef::new(9, 0), Object::Name(b"Widget".to_vec()));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[(
+                "Subtype",
+                Object::Reference(ObjectRef::new(9, 0)),
+            )])),
+        );
+
+        let widgets = page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(widgets, vec![ObjectRef::new(5, 0)]);
+    }
+
+    #[test]
     fn page_widget_annotation_refs_handles_non_dict_page_and_missing_annots() {
         let mut pdf = empty_pdf();
         // A non-dictionary page yields no widgets.
@@ -1845,6 +1877,18 @@ mod tests {
     }
 
     #[test]
+    fn field_for_annotation_missing_subtype_returns_none_without_traversal() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(dict(&[])));
+        assert_eq!(
+            AcroFormDocumentHelper::new(&mut pdf)
+                .field_for_annotation(ObjectRef::new(5, 0))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn field_for_annotation_looks_up_the_map() {
         let mut pdf = empty_pdf();
         pdf.set_object(
@@ -1869,6 +1913,47 @@ mod tests {
             ObjectRef::new(7, 0),
             Object::Dictionary(dict(&[
                 ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("FT", Object::Name(b"Tx".to_vec())),
+            ])),
+        );
+        assert_eq!(
+            AcroFormDocumentHelper::new(&mut pdf)
+                .field_for_annotation(ObjectRef::new(7, 0))
+                .unwrap(),
+            Some(ObjectRef::new(7, 0))
+        );
+    }
+
+    #[test]
+    fn field_for_annotation_resolves_an_indirect_subtype() {
+        // qpdf's `getFieldForAnnotation` gate
+        // (`isDictionaryOfType("", "/Widget")`) transparently dereferences
+        // `getKey("/Subtype")`, so a /Subtype stored as an indirect reference
+        // must classify as a widget the same as a direct one.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![])),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(ObjectRef::new(9, 0), Object::Name(b"Widget".to_vec()));
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Reference(ObjectRef::new(9, 0))),
                 ("FT", Object::Name(b"Tx".to_vec())),
             ])),
         );

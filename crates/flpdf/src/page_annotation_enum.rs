@@ -39,7 +39,7 @@
 //! this heuristic over to that qpdf-faithful primitive
 //! ([`crate::AcroFormDocumentHelper::annotation_to_field_map`] and
 //! [`crate::AcroFormDocumentHelper::top_level_field`], both already present)
-//! changes what [`crate::signatures`]'s appearance-generation consumer writes
+//! changes what [`mod@crate::signatures`]'s appearance-generation consumer writes
 //! `/V` to for grouped fields, so it needs byte-level verification against
 //! `qpdf --generate-appearances` before landing — tracked separately from the
 //! `AnnotationObjectHelper`/`AcroFormDocumentHelper` primitives this module
@@ -67,7 +67,7 @@ pub struct EnumeratedAnnotation {
     pub subtype: Option<Vec<u8>>,
 
     /// The annotation bounding rectangle (`/Rect`), resolved via
-    /// [`AnnotationObjectHelper::rect`].
+    /// [`AnnotationObjectHelper::get_rect`].
     ///
     /// `None` when `/Rect` is absent.
     pub rect: Option<PageBox>,

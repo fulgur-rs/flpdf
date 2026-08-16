@@ -6,8 +6,9 @@
 //! common annotation attributes, mirroring qpdf's own transparently
 //! dereferencing `QPDFObjectHandle` API on top of this crate's
 //! [`ObjectHandle`], which requires an explicit resolve at every hop
-//! (`Pdf::resolve_object_handle`) — see [`FormFieldObjectHelper`] for the
-//! same established shape.
+//! (`Pdf::resolve_object_handle`) — see
+//! [`crate::form_field_object_helper::FormFieldObjectHelper`] for the same
+//! established shape.
 //!
 //! # Design
 //!
