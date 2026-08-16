@@ -1123,6 +1123,81 @@ mod tests {
     }
 
     #[test]
+    fn import_pages_as_form_xobjects_shares_one_copy_of_a_common_resource() {
+        // Two source pages that both reference the same font (F1 -> object 4).
+        // Importing both in one call must union their reachable closures and run
+        // copy_objects exactly once, so the shared font is copied into dest a
+        // single time and both imported XObjects' /Resources point at the same
+        // dest object -- matching qpdf's copyForeignObject, which keeps one
+        // foreign->local map per source document (per-page copies would instead
+        // duplicate the font, diverging from qpdf's overlay output).
+        let mut source = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+                ),
+                (4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+                (5, "<< /Length 3 >>\nstream\nfoo\nendstream"),
+                (
+                    6,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>",
+                ),
+                (7, "<< /Length 3 >>\nstream\nbar\nendstream"),
+            ],
+            1,
+        ));
+
+        let mut dest = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+            ],
+            1,
+        ));
+
+        let imported = import_pages_as_form_xobjects(
+            &mut dest,
+            &mut source,
+            &[ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 2);
+
+        let stream0 = form_stream(&mut dest, imported[0]);
+        let res0 = stream0.dict.get("Resources").unwrap().as_dict().unwrap();
+        let font_ref0 = match res0.get("Font").unwrap().as_dict().unwrap().get("F1") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("F1 should be a reference, got {other:?}"), // cov:ignore: defensive — fixture guarantees a reference
+        };
+
+        let stream1 = form_stream(&mut dest, imported[1]);
+        let res1 = stream1.dict.get("Resources").unwrap().as_dict().unwrap();
+        let font_ref1 = match res1.get("Font").unwrap().as_dict().unwrap().get("F1") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("F1 should be a reference, got {other:?}"), // cov:ignore: defensive — fixture guarantees a reference
+        };
+
+        assert_eq!(
+            font_ref0, font_ref1,
+            "the shared font must be copied into dest exactly once"
+        );
+        let font_obj = dest.resolve(font_ref0).unwrap();
+        let font = font_obj
+            .as_dict()
+            .expect("font ref resolves to a dict in dest");
+        assert_eq!(
+            font.get("BaseFont").unwrap().as_name(),
+            Some(b"Helvetica".as_slice())
+        );
+    }
+
+    #[test]
     fn xobject_object_closure_handles_cyclic_references() {
         // Two objects referencing each other plus the XObject -> the cycle guard
         // (visited set) must terminate and include both.
