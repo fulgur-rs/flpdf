@@ -27,9 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::page_form_xobject::{
-    get_form_xobject_for_page, get_matrix_for_transformations, read_page_transform,
-};
+use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
@@ -75,6 +73,7 @@ pub(crate) struct OverlaySource {
 ///
 /// Returns `None` when the matrix-transformed `/BBox` is degenerate (zero width
 /// or height); the caller substitutes the identity, matching qpdf's `{}`.
+#[cfg(test)]
 fn get_matrix_for_form_xobject_placement(
     fo_bbox: Rectangle,
     fo_matrix: Matrix,
@@ -140,6 +139,7 @@ fn get_matrix_for_form_xobject_placement(
 /// [`Matrix::unparse`]); `cm` is the same six-component matrix used to place the
 /// XObject. Callers that transform per-placement annotations (qpdf's
 /// `copyAnnotations(from_page, cm, …)`) use the returned `cm` unchanged.
+#[cfg(test)]
 fn place_form_xobject(
     fo_bbox: Rectangle,
     fo_matrix: Matrix,
@@ -223,20 +223,9 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // /Fx0 and the sources). Width/height come from the dest /TrimBox, matching
     // qpdf's getMatrixForTransformations(true). Identity when the dest page has no
     // /Rotate or /UserUnit, so a non-rotated page is unaffected.
-    let dest_transform = read_page_transform(dest, dest_page_ref)?;
-    // qpdf's getMatrixForTransformations reads the box through getArrayAsRectangle
-    // (libqpdf/QPDFPageObjectHelper.cc), so the width/height are the normalized
-    // (non-negative) extents. These dims feed ONLY the tmatrix translation column
-    // (get_matrix_for_transformations puts width*scale/height*scale in positions e/f, never
-    // the a/b/c/d rotation part), and the placement centring (tx = r_cx - t_cx)
-    // absorbs that translation -- so for a reversed box this normalization is an
-    // output no-op that no byte-gate can isolate. It is kept to reproduce qpdf's
-    // computation faithfully, NOT for an observable byte difference (do not "dead
-    // code" it away).
-    let normalized_trim = normalize_rectangle(trim_box);
-    let trim_w = normalized_trim.urx - normalized_trim.llx;
-    let trim_h = normalized_trim.ury - normalized_trim.lly;
-    let tmatrix = get_matrix_for_transformations(&dest_transform, trim_w, trim_h, true);
+    // Placement computes the destination inverse transform through the
+    // canonical PageObjectHelper route below, after the destination page has
+    // been wrapped as /Fx0.
 
     // 1. Convert the destination page itself to Form XObject /Fx0.
     let fx0_ref = get_form_xobject_for_page(dest, dest_page_ref)?;
@@ -292,9 +281,16 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // from the current destination dictionary; the destination `/DR` itself
     // persists, so a still-live alias is reused without minting a new suffix.
     for (name, xref, template) in &underlay_names {
-        let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
-        let (fragment, cm) =
-            place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
+        let (fragment, cm) = place_form_xobject_canonical(
+            dest,
+            dest_page_ref,
+            *xref,
+            trim_rect,
+            true,
+            true,
+            false,
+            name,
+        )?;
         content.push_str(&fragment);
         if let Some(tpl) = template {
             // cov:ignore-start: `?` on multi-line call — the trailing `)?;` is
@@ -315,15 +311,29 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
         }
     }
     {
-        let (bbox, fmatrix) = fo_bbox_and_matrix(dest, fx0_ref)?;
-        let (fragment, _cm) =
-            place_form_xobject(bbox, fmatrix, media_rect, tmatrix, false, false, "Fx0");
+        let (fragment, _cm) = place_form_xobject_canonical(
+            dest,
+            dest_page_ref,
+            fx0_ref,
+            media_rect,
+            true,
+            false,
+            false,
+            "Fx0",
+        )?;
         content.push_str(&fragment);
     }
     for (name, xref, template) in &overlay_names {
-        let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
-        let (fragment, cm) =
-            place_form_xobject(bbox, fmatrix, trim_rect, tmatrix, true, false, name);
+        let (fragment, cm) = place_form_xobject_canonical(
+            dest,
+            dest_page_ref,
+            *xref,
+            trim_rect,
+            true,
+            true,
+            false,
+            name,
+        )?;
         content.push_str(&fragment);
         if let Some(tpl) = template {
             // cov:ignore-start: symmetric with the underlay branch above — the
@@ -900,6 +910,40 @@ fn page_box_or_err<R: Read + Seek>(
     })
 }
 
+/// Build a placement fragment through the canonical page/Form handle route.
+///
+/// This is the consumer-side counterpart of
+/// [`PageObjectHelper::get_matrix_for_form_xobject_placement`].  Keeping the
+/// content fragment here preserves overlay's naming and annotation ordering,
+/// while all page-tree inheritance, Form `/BBox`/`/Matrix` resolution, and
+/// transformation handling live in the qpdf-shaped helper API.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors qpdf placement inputs while retaining overlay naming and ordering"
+)]
+fn place_form_xobject_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    dest_page_ref: ObjectRef,
+    form_ref: ObjectRef,
+    rect: Rectangle,
+    invert_transformations: bool,
+    allow_shrink: bool,
+    allow_expand: bool,
+    name: &str,
+) -> Result<(String, Matrix)> {
+    let form = pdf.get_object_handle(form_ref);
+    let mut helper = PageObjectHelper::new(dest_page_ref, pdf);
+    let resource_name = format!("/{name}");
+    helper.place_form_xobject(
+        form,
+        &resource_name,
+        rect,
+        invert_transformations,
+        allow_shrink,
+        allow_expand,
+    )
+}
+
 /// Normalize a rectangle's corners the way qpdf's
 /// `QPDFObjectHandle::getArrayAsRectangle` does: `llx = min(x0, x2)`,
 /// `lly = min(x1, x3)`, `urx = max(x0, x2)`, `ury = max(x1, x3)`. qpdf reads all
@@ -917,6 +961,7 @@ fn normalize_rectangle(rectangle: PageBox) -> Rectangle {
 
 /// Coerce a PDF numeric object to `f64`, matching qpdf's numeric coercion
 /// (non-numeric values, including indirect references, contribute `0.0`).
+#[cfg(test)]
 fn as_f64(o: &Object) -> f64 {
     o.as_integer()
         .map(|i| i as f64)
@@ -928,6 +973,7 @@ fn as_f64(o: &Object) -> f64 {
 /// the identity when `/Matrix` is absent or not a 6+ element array. The Form
 /// XObjects built by [`get_form_xobject_for_page`] always carry a direct `/Matrix`
 /// array, so no indirect-reference resolution is needed here.
+#[cfg(test)]
 fn matrix_or_identity(dict: &Dictionary) -> Matrix {
     match dict.get("Matrix").and_then(Object::as_array) {
         Some(m) if m.len() >= 6 => Matrix::new(
@@ -951,6 +997,7 @@ fn matrix_or_identity(dict: &Dictionary) -> Matrix {
 /// transform. Non-numeric `/BBox` elements coerce to `0.0` (matching qpdf); a
 /// `/BBox` shorter than four elements is an error; an absent or malformed
 /// `/Matrix` is treated as the identity.
+#[cfg(test)]
 fn fo_bbox_and_matrix<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,

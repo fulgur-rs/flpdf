@@ -7,7 +7,7 @@
 //! flattening. The helper holds no copied page-tree state.
 
 use crate::page_tree_rebuild::{rebuild_page_tree, RebuildResult};
-use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -229,7 +229,8 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// invoking qpdf-style page-scoped pruning once for every current page.
     pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
         for page in self.get_all_pages()? {
-            crate::resources::remove_unreferenced_resources_on_page(self.pdf, page)?;
+            let mut helper = PageObjectHelper::new(page, self.pdf);
+            helper.remove_unreferenced_resources()?;
         }
         Ok(())
     }

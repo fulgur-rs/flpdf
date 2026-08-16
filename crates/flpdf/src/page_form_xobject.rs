@@ -45,8 +45,10 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
-use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Result, Stream};
+use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
+use crate::page_object_helper::PageObjectHelper;
+use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::{Error, Matrix, Object, ObjectRef, Pdf, Result};
 
 /// Maximum reference-chain depth when collecting a Form XObject's reachable
 /// object closure. Mirrors the page-tree depth guard used elsewhere; bounds the
@@ -73,55 +75,23 @@ pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<ObjectRef> {
-    // /BBox = effective TrimBox (TrimBox -> CropBox -> MediaBox), copied verbatim
-    // so the original integer/real element types are preserved (qpdf shallow-
-    // copies getTrimBox(false)).
-    let bbox = effective_box_array(pdf, page_ref)?;
-
-    // /Matrix from /Rotate + /UserUnit (getMatrixForTransformations). qpdf emits
-    // /Matrix ONLY when /Rotate (inherited) or /UserUnit (leaf) is present; width
-    // and height come from the same TrimBox rectangle used for /BBox.
-    let transform = read_page_transform(pdf, page_ref)?;
-    let (bbox_w, bbox_h) = rectangle_dimensions(&bbox);
-
-    // /Resources = effective (inheritance-resolved) resources, inserted as a
-    // direct dictionary with inner references kept (qpdf shallowCopy semantics).
-    let resources = resolve_inherited_resources(pdf, page_ref)?;
-
-    // /Group shallow-copied from the page dict when present (an indirect ref is
-    // materialized one level into a direct dict, mirroring qpdf's shallowCopy).
-    let group = page_group(pdf, page_ref)?;
-
-    // Stream data = decoded + coalesced page content, stored uncompressed.
-    let content = crate::pages::page_content_bytes(pdf, page_ref)?;
-
-    let mut dict = Dictionary::new();
-    dict.insert("Type", Object::Name(b"XObject".to_vec()));
-    dict.insert("Subtype", Object::Name(b"Form".to_vec()));
-    dict.insert("BBox", Object::Array(bbox));
-    if transform.rotate_present || transform.uu_present {
-        let matrix = get_matrix_for_transformations(&transform, bbox_w, bbox_h, false);
-        dict.insert(
-            "Matrix",
-            Object::Array(
-                matrix
-                    .get_as_matrix()
-                    .into_iter()
-                    .map(Object::Real)
-                    .collect(),
-            ),
-        );
+    let mut helper = PageObjectHelper::new(page_ref, pdf);
+    let bbox = helper.get_trim_box(false, false)?;
+    let valid_bbox = bbox
+        .as_array()
+        .map(|items| items.len() >= 4)
+        .unwrap_or(false);
+    if !valid_bbox {
+        return Err(Error::Unsupported(format!(
+            "page {page_ref} has no valid /TrimBox, /CropBox, or /MediaBox for the Form XObject /BBox"
+        )));
     }
-    if let Some(res) = resources {
-        dict.insert("Resources", Object::Dictionary(res));
-    }
-    if let Some(g) = group {
-        dict.insert("Group", g);
-    }
-
-    let new_ref = next_object_ref(pdf)?;
-    pdf.set_object(new_ref, Object::Stream(Stream::new(dict, content)));
-    Ok(new_ref)
+    let form = helper.get_form_xobject_for_page(true)?;
+    form.object_ref().ok_or_else(|| {
+        Error::Internal(
+            "canonical Form XObject was not registered as an indirect object".to_owned(),
+        )
+    })
 }
 
 /// Convert a page from `source` into a Form XObject and import it into `dest`.
@@ -569,60 +539,55 @@ pub(crate) fn xobject_object_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
 ) -> Result<BTreeSet<ObjectRef>> {
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut stack: Vec<(ObjectRef, usize)> = vec![(xobject_ref, 0)];
-    visited.insert(xobject_ref);
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "qpdf object-graph cycle detection intentionally keys on canonical handle identity"
+    )]
+    let mut visited: std::collections::HashSet<ObjectHandleIdentity> =
+        std::collections::HashSet::new();
+    let mut stack: Vec<(ObjectHandle, usize)> = vec![(pdf.get_object_handle(xobject_ref), 0)];
+    let mut refs = BTreeSet::new();
 
     while let Some((current, depth)) = stack.pop() {
         if depth >= MAX_XOBJECT_CLOSURE_DEPTH {
             return Err(Error::Unsupported(format!(
-                "Form XObject object graph exceeds depth {MAX_XOBJECT_CLOSURE_DEPTH} at {current}"
+                "Form XObject object graph exceeds depth {MAX_XOBJECT_CLOSURE_DEPTH} at {xobject_ref}"
             )));
         }
-        let obj = pdf.resolve(current)?;
-        let mut refs = Vec::new();
-        collect_object_refs(&obj, &mut refs);
-        for r in refs {
-            if visited.insert(r) {
-                stack.push((r, depth + 1));
+        if !visited.insert(current.identity_key()) {
+            continue;
+        }
+        if let Some(object_ref) = current.object_ref() {
+            refs.insert(object_ref);
+        }
+        let resolved = pdf.resolve_object_handle_to_terminal(&current)?;
+        if let Some(object_ref) = resolved.object_ref() {
+            refs.insert(object_ref);
+        }
+        let children = if let Some(stream_dict) = resolved.as_stream_dict() {
+            stream_dict
+                .as_dictionary()
+                .into_iter()
+                .flat_map(|entries| entries.into_values().collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        } else if let Some(entries) = resolved.as_dictionary() {
+            entries.into_values().collect::<Vec<_>>()
+        } else {
+            resolved.as_array().unwrap_or_default()
+        };
+        for child in children {
+            if child.object_ref().is_some()
+                || child.as_reference().is_some()
+                || child.as_dictionary().is_some()
+                || child.as_array().is_some()
+                || child.as_stream_dict().is_some()
+            {
+                stack.push((child, depth + 1));
             }
         }
     }
 
-    Ok(visited)
-}
-
-/// Collect every [`ObjectRef`] embedded directly in `obj` (one indirect object's
-/// worth) into `out`. Stream payload bytes are opaque and never contain
-/// references, so only the stream dictionary is traversed.
-fn collect_object_refs(obj: &Object, out: &mut Vec<ObjectRef>) {
-    match obj {
-        Object::Reference(r) => out.push(*r),
-        Object::Array(items) => {
-            for item in items {
-                collect_object_refs(item, out);
-            }
-        }
-        Object::Dictionary(dict) => {
-            for (_key, value) in dict.iter() {
-                collect_object_refs(value, out);
-            }
-        }
-        Object::Stream(stream) => {
-            for (_key, value) in stream.dict.iter() {
-                collect_object_refs(value, out);
-            }
-        }
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::RealLiteral { .. }
-        | Object::Name(_)
-        | Object::String(_)
-        | Object::Operator(_)
-        | Object::InlineImage(_) => {}
-    }
+    Ok(refs)
 }
 
 /// Allocate the next available object reference (`max(numbers) + 1`, generation
@@ -642,6 +607,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Stream;
 
     /// Build a valid single-object-table PDF from `(number, body)` definitions
     /// plus a `/Root` number, computing xref offsets so the bytes parse. Object
