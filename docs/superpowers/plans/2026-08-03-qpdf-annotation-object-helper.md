@@ -11,9 +11,36 @@
 ## Global Constraints
 
 - Oracle は `include/qpdf/QPDFAnnotationObjectHelper.hh` と `libqpdf/QPDFAnnotationObjectHelper.cc`（qpdf 11.9.0）。
-- qpdf public API を snake_case 化する。旧 `ObjectRef + &mut Pdf` constructor と raw-object accessor は残さない。
+- qpdf public API を snake_case 化する。raw `Object`/`Dictionary` を歩く旧実装は残さない。
+- **2026-08-16 訂正**: 当初「`ObjectRef + &mut Pdf` constructor を残さない／`AnnotationObjectHelper` は `ObjectHandle` を値で保持し `Pdf` 参照を持たない」としていたが誤り。
+  qpdf の `QPDFObjectHandle` は所有 `QPDF*` を通して transparent に dereference するため、`getAppearanceStream` 等の
+  「解決済みの型で分岐する」ロジックは resolve 能力を要求する。`ObjectHandle::get_key`/`as_stream_dict` 等は
+  「resolve は一切しない」契約（`object_handle.rs` 各所の doc）なので、`Pdf` 参照を持たない value-only helper では
+  `get_appearance_stream` を実装できない（矛盾）。Tier A1 の姉妹実装 `FormFieldObjectHelper`（`form_field_object_helper.rs`,
+  closed issue `flpdf-ceun`）が実際に採用している形— `{ field_ref: ObjectRef, field: ObjectHandle, pdf: &'a mut Pdf<R> }` を
+  保持し、各アクセサが hop ごとに `self.pdf.resolve_object_handle(&x)?` を呼ぶ — を `AnnotationObjectHelper` にも採用する。
+  よって旧 `new(annot_ref: ObjectRef, pdf: &mut Pdf<R>)` constructor シグネチャ自体は維持し、**内部実装だけ** raw
+  `Object`/`resolve_borrowed` から `ObjectHandle`/`resolve_object_handle` に置き換える。Task 1 の2件の RED テスト
+  （`AnnotationObjectHelper::new(handle)` 単一引数、`get_rect()` が `Option<PageBox>` を返す想定）はこの矛盾する
+  API 形状を specify していたため誤り — Task 2 で `new(annot_ref, pdf)` の2引数形状と非 `Option` の `get_rect`
+  （後述）に修正する。
+- 併せて Step 4 の検証コマンド（`rg -n 'Object::|resolve_borrowed|Pdf<' ...` で `Pdf<` もゼロ件を期待）から
+  `Pdf<` を除外する。`Pdf<R>` フィールドは意図的に残る。`Object::`/`resolve_borrowed` の不在のみを検証する。
+- **qpdf の fail-soft 規約への訂正**: 旧 flpdf 実装は「欠落/型不一致は `None`、不正値は `Err`」という独自の
+  strict 方針だったが、qpdf の該当アクセサ（`getSubtype`/`getRect`/`getFlags`/`getAppearanceState`）は
+  型不一致・欠落を **例外を投げず既定値で返す**（`libqpdf/QPDFObjectHandle.cc:817-836` の `getArrayAsRectangle`
+  は非配列・要素数不一致・非数値要素のいずれも `{}`（0,0,0,0）を返す。`getName`/`getIntValueAsInt` も同様に
+  type warning + 既定値）。Task 2 でこの fail-soft 契約に合わせて `get_rect` は非 `Option` の値を返し、
+  `annotation_helper_error_tests.rs` の `rect_*_errors`/`appearance_reference_not_dict_errors` 系は
+  「既定値を返す」期待に書き換える。`getArrayAsRectangle` は llx/lly/urx/ury を `min`/`max` で正規化する
+  （逆順の矩形を許容）— 旧 `parse_rect_array` にはこの正規化が無かったので追加する。
 - `QPDFFormFieldObjectHelper` の継承属性は Tier A1 に残す。
-- `ObjectHandle::materialize` を annotation helper に導入しない。
+- `ObjectHandle::materialize` を annotation helper に導入しない（値ツリー全体の所有変換であり、hop ごとの
+  resolve とは別責務）。
+- `action()`（`/A` アクション辞書アクセサ）は qpdf 11.9.0 の `QPDFAnnotationObjectHelper.hh` に対応物が無い
+  （メソッド一覧: `getSubtype`/`getRect`/`getAppearanceDictionary`/`getAppearanceState`/`getFlags`/
+  `getAppearanceStream`/`getPageContentForAppearance` の7つのみ）。本体 crate 内に呼び出し元が無いことを確認済み
+  （`rg -n '\.action\(\)' crates` は自身のテストのみ）。qpdf 忠実方針に従い削除する（`action_*` テストも削除）。
 
 ---
 
@@ -167,6 +194,71 @@ Expected: all targeted flatten tests pass.
 git add crates/flpdf/src/annotation_helper.rs crates/flpdf/src/page_annotation_flatten.rs crates/flpdf/tests/page_document_helper_tests.rs
 git commit -m "refactor: centralize annotation appearance content"
 ```
+
+### Task 4 revision (2026-08-16)
+
+`page_annotation_enum.rs::find_field_ref` (widget → owning field lookup) has
+**no qpdf correspondence in `QPDFAnnotationObjectHelper`** — its header
+comment states this responsibility lives in `QPDFAcroFormDocumentHelper`
+(`getFieldForAnnotation`, backed by `analyze()`/`traverseField()`), which is
+Tier B1 (`flpdf-2tfv`), not this issue. `find_field_ref` itself is a
+one-hop heuristic (`/FT` or `/T` present → self, else direct `/Parent`),
+not qpdf's real traversal.
+
+A more faithful port of `analyze()`/`traverseField()` (with the orphan-widget
+fallback pass) already exists, privately, in `signatures.rs::traverse_field` /
+`page_widget_annotation_refs` / `collect_signature_form_field_refs`
+(qpdf `libqpdf/QPDFAcroFormDocumentHelper.cc:204-286`). User decision
+(2026-08-16): generalize that traversal into a shared primitive **now**, as
+part of this issue, rather than deferring to `flpdf-2tfv`. This slice does
+**not** absorb `overlay_annotations.rs`/`overlay_appearance_stream.rs` or
+build the full `QPDFAcroFormDocumentHelper` surface — only
+`annotation_to_field` (`analyze()`'s cache) and `field_for_annotation`
+(`getFieldForAnnotation`).
+
+Concrete shape:
+
+1. In `acroform_document_helper.rs`, add `AcroFormDocumentHelper::
+   annotation_to_field_map(&mut self) -> Result<BTreeMap<ObjectRef,
+   ObjectRef>>` — the `analyze()` traversal (top-down from `/AcroForm/Fields`,
+   `is_field`/`is_annotation` classification, cycle/depth guard, then the
+   orphan-widget pass over every page). Add `field_for_annotation(&mut self,
+   annot_ref) -> Result<Option<ObjectRef>>` mirroring `getFieldForAnnotation`
+   (early `None` unless `annot_ref` resolves to a `/Subtype /Widget` dict,
+   matching `QPDFObjectHandle::isDictionaryOfType("", "/Widget")`).
+   **(B)-class deviation to record** (module doc + `docs/qpdf-correspondence.md`
+   ⚪ row): qpdf caches `analyze()` on the helper instance
+   (`Members::cache_valid`); `AcroFormDocumentHelper` holds no cached state
+   (existing module convention — see `fields()`/`field_infos()`), so
+   `annotation_to_field_map` recomputes the full traversal on every call.
+   Algorithm and output order are unchanged; only the "container" (recomputed
+   value vs. cached member) differs, and it does not change output bytes.
+2. Rewrite `signatures.rs::collect_signature_form_field_refs` to call
+   `annotation_to_field_map()` and take `.into_values().collect()`; delete its
+   private `traverse_field`/`page_widget_annotation_refs`/`resolve_kids_array`
+   (now redundant with the shared primitive).
+3. Task 4's consumer migration (below) calls `field_for_annotation` in place
+   of `find_field_ref`. Performance: do **not** call it once per widget across
+   a page/document (qpdf's version is O(1) amortized only because
+   `analyze()` is cached; a naive per-widget call here would rebuild the full
+   traversal per widget — O(n²)). Build `annotation_to_field_map()` once per
+   `enumerate_page_annotations` call and look up each widget in the returned
+   map directly.
+
+**Scope split (2026-08-16, post-implementation review):** step 3 above was
+implemented and then reverted before landing. `page_annotation_enum.rs`'s
+only production consumer of `.field_ref` is `flpdf-cli`'s
+`generate_missing_appearances`, which *writes* `/V` through the resolved
+field ref — swapping in `field_for_annotation`/`top_level_field` changes
+which node that write targets for grouped fields (the new primitives walk to
+the true top-level field, not the widget's direct parent), which is a
+behavior change requiring `qpdf --generate-appearances` byte/structural
+verification, not just a primitive substitution. Split out to
+`flpdf-3yn9.22`, blocked on this issue. This issue keeps `find_field_ref` as
+committed and ships only the `AnnotationObjectHelper` boundary (Task 1-2) and
+the shared `annotation_to_field_map`/`field_for_annotation`/`top_level_field`
+primitives plus `signatures.rs`'s delegation (steps 1-2 above) — both
+verified qpdf-faithful and behavior-neutral for their existing callers.
 
 ### Task 4: Absorb page annotation enumeration and migrate consumers
 

@@ -298,18 +298,6 @@ fn two_annots_print_and_non_print() -> Vec<u8> {
     ])
 }
 
-/// Resolve the object referred to by `obj`, following a single level of
-/// indirect reference when needed.
-fn resolve_one<R: std::io::Read + std::io::Seek>(
-    pdf: &mut Pdf<R>,
-    obj: Object,
-) -> flpdf::Result<Object> {
-    match obj {
-        Object::Reference(r) => pdf.resolve(r),
-        other => Ok(other),
-    }
-}
-
 // ── Tests: generate-appearances ───────────────────────────────────────────────
 
 /// `--generate-appearances` on a Tx widget adds `/AP/N`, and the uncompressed
@@ -333,30 +321,21 @@ fn generate_appearances_tx_ap_n_contains_tj() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
 
-    // /AP/N must be present after generate-appearances.
-    // Use a block to end the borrow of `pdf` before the resolve call below.
-    let n_val = {
-        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
-        let ap = helper
-            .appearance()
-            .unwrap()
-            .expect("Tx widget should have /AP after --generate-appearances");
-        ap.get("N").cloned().expect("/AP should have /N entry")
-    };
-
-    // Resolve the /N value to the XObject stream.
-    let n_obj = resolve_one(&mut pdf, n_val).unwrap();
-    let stream = n_obj
-        .as_stream()
-        .expect("/AP/N should be a Form XObject stream");
+    // /AP/N must be present after generate-appearances, and resolve to the
+    // Form XObject stream.
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let n = helper.get_appearance_stream(b"N", None).unwrap();
+    let data = n
+        .get_stream_data(DecodeLevel::Generalized)
+        .expect("Tx widget should have /AP/N after --generate-appearances");
 
     // The uncompressed content stream must contain "Tj" (the text-show operator).
-    // We use --compress-streams=n so stream.data is the raw uncompressed bytes.
+    // We use --compress-streams=n so the stream data is the raw uncompressed bytes.
     assert!(
-        stream.data.windows(2).any(|w| w == b"Tj"),
+        data.windows(2).any(|w| w == b"Tj"),
         "/AP/N content stream must contain Tj operator (observable: value rendered); \
          stream bytes: {:?}",
-        std::str::from_utf8(&stream.data).unwrap_or("<non-utf8>")
+        std::str::from_utf8(&data).unwrap_or("<non-utf8>")
     );
 }
 
@@ -381,21 +360,15 @@ fn generate_appearances_tx_reuses_existing_ap() {
     // renderer's existing-stream token-filter path.
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let n_val = {
-        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
-        let ap = helper
-            .appearance()
-            .unwrap()
-            .expect("/AP must survive --generate-appearances for widget that already has one");
-        ap.get("N").cloned().expect("/AP/N must be present")
-    };
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let n_handle = helper
+        .get_appearance_stream(b"N", None)
+        .expect("/AP must survive --generate-appearances for widget that already has one");
 
-    let n_ref = match n_val {
-        Object::Reference(object_ref) => object_ref,
-        other => panic!("/AP/N must remain an indirect stream reference, got {other:?}"),
-    };
-    let n_handle = pdf.get_object_handle(n_ref);
-    pdf.resolve_object_handle(&n_handle).unwrap();
+    assert!(
+        n_handle.object_ref().is_some(),
+        "/AP/N must remain an indirect stream reference"
+    );
     assert!(
         n_handle.as_stream_dict().is_some(),
         "/AP/N must be a stream"
@@ -441,7 +414,7 @@ fn generate_appearances_checkbox_without_ap_leaves_ap_absent() {
     let widget_ref = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
     assert!(
-        helper.appearance().unwrap().is_none(),
+        helper.get_appearance_dictionary().unwrap().is_null(),
         "qpdf leaves a button without /AP unchanged"
     );
 }
@@ -494,7 +467,7 @@ fn generate_appearances_radio_without_ap_leaves_ap_absent() {
     let widget_ref = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
     assert!(
-        helper.appearance().unwrap().is_none(),
+        helper.get_appearance_dictionary().unwrap().is_null(),
         "qpdf leaves a radio button without /AP unchanged"
     );
 }
@@ -571,22 +544,16 @@ fn generate_appearances_combo_ap_n_contains_tj() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let n_val = {
-        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
-        let ap = helper
-            .appearance()
-            .unwrap()
-            .expect("combo widget should have /AP after --generate-appearances");
-        ap.get("N").cloned().expect("/AP should have /N entry")
-    };
-
-    let n_obj = resolve_one(&mut pdf, n_val).unwrap();
-    let stream = n_obj.as_stream().expect("/AP/N for combo must be a stream");
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    let n = helper.get_appearance_stream(b"N", None).unwrap();
+    let data = n
+        .get_stream_data(DecodeLevel::Generalized)
+        .expect("combo widget should have /AP/N after --generate-appearances");
     assert!(
-        stream.data.windows(2).any(|w| w == b"Tj"),
+        data.windows(2).any(|w| w == b"Tj"),
         "combo /AP/N content stream must contain Tj (selected value rendered); \
          stream={:?}",
-        std::str::from_utf8(&stream.data).unwrap_or("<non-utf8>")
+        std::str::from_utf8(&data).unwrap_or("<non-utf8>")
     );
 }
 

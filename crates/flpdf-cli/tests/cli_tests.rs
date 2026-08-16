@@ -6896,24 +6896,12 @@ fn rewrite_generate_appearances_replaces_null_ap_n() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
-    let ap = helper
-        .appearance()
-        .unwrap()
-        .expect("widget should still have an /AP");
-    let n = ap.get("N").cloned();
-    // /N must now be a real (non-null) appearance, and resolve to a stream.
+    let n = helper.get_appearance_stream(b"N", None).unwrap();
+    // /N must now be a real (non-null) appearance, resolving to a Form XObject
+    // stream — not the original null.
     assert!(
-        matches!(n, Some(Object::Reference(_)) | Some(Object::Stream(_))),
-        "null /AP/N must be replaced by a real appearance, got {n:?}"
-    );
-    let n_resolved = match n {
-        Some(Object::Reference(r)) => pdf.resolve(r).unwrap(),
-        Some(other) => other,
-        None => panic!("/N missing"),
-    };
-    assert!(
-        matches!(n_resolved, Object::Stream(_)),
-        "/AP/N must resolve to a Form XObject stream"
+        n.as_stream_dict().is_some(),
+        "null /AP/N must be replaced by a real appearance stream"
     );
 }
 
@@ -6968,13 +6956,10 @@ fn rewrite_generate_appearances_adds_ap_n() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget = first_widget_ref(&mut pdf);
     let mut helper = AnnotationObjectHelper::new(widget, &mut pdf);
-    let ap = helper
-        .appearance()
-        .unwrap()
-        .expect("widget should have an /AP after --generate-appearances");
+    let ap = helper.get_appearance_dictionary().unwrap();
     assert!(
-        ap.get("N").is_some(),
-        "widget /AP should carry an /N normal appearance"
+        !ap.get_key(b"/N").is_null(),
+        "widget /AP should carry an /N normal appearance after --generate-appearances"
     );
 }
 
