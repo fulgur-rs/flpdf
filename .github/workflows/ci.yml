@@ -202,6 +202,30 @@ jobs:
           qpdf --version
           test "$(qpdf --version | sed -n '1p' | tr -d '\r')" = "qpdf version ${QPDF_VERSION}"
 
+      # Windows-only, and it saves nothing by itself: the same work is split
+      # into two steps so Actions times the compile and the run separately.
+      # Windows is the matrix cell that gates this workflow's wall clock (job
+      # 333s against 257s for the next slowest), and reconstructing where that
+      # time goes currently means diffing timestamps inside cargo's own output
+      # in the job log — on the run measured, ~246s compiling and linking the
+      # 162 test binaries against ~37s actually running tests and ~10s of
+      # doctests.
+      #
+      # `--all-targets` implies `--tests`, which covers the lib/bin unittest
+      # targets too, so the step below recompiles nothing and its duration is
+      # the run cost alone (verified locally: a cold `cargo build --workspace
+      # --all-targets` leaves `cargo test --workspace --no-run` with zero
+      # `Compiling` lines). Spelling it `cargo build` rather than `cargo test
+      # --no-run` also keeps the single-invocation contract in
+      # crates/flpdf-cli/tests/ci_workflow_contract.rs literally true.
+      - name: Build test binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build --workspace --all-targets
+
       - name: Run workspace test suite
         shell: bash
         run: |
