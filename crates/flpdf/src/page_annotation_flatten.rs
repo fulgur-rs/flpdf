@@ -324,12 +324,17 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     let mut flattened_count = 0;
     for data in &candidates {
         // Choose a name that doesn't collide with existing /XObject keys.
+        // Mirrors qpdf's QPDFObjectHandle::getUniqueResourceName: the
+        // counter advances past a rejected (colliding) candidate, but the
+        // accepted candidate's number is "the value used, not the next
+        // value" -- it only becomes final once this annotation is confirmed
+        // to produce content, below.
         let xobj_name = loop {
             let candidate = format!("Fxo{xobj_counter}");
-            xobj_counter += 1;
             if xobj_dict.get(candidate.as_str()).is_none() {
                 break candidate;
             }
+            xobj_counter += 1;
         };
 
         let resource_name = format!("/{xobj_name}");
@@ -366,6 +371,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         if content.is_empty() {
             continue;
         }
+        // The candidate name is now committed; the next search starts past it.
+        xobj_counter += 1;
 
         // Register the Form XObject only when qpdf produced drawing content.
         let xobject = match &data.appearance {
@@ -2290,6 +2297,74 @@ mod tests {
         assert!(
             content_str.contains("Fxo2"),
             "expected Fxo2 due to name collision, got: {content_str}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: a skipped (zero-content) candidate must not consume an /Fxo
+    // number, matching qpdf's QPDFObjectHandle::getUniqueResourceName
+    // contract ("min_suffix should be the value used, not the next value")
+    // and QPDFPageDocumentHelper.cc's `++next_fx` living inside the
+    // `!content.empty()` branch.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn skipped_annotation_does_not_consume_an_xobj_name() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body.clone());
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /AP << /N 5 0 R >> >>",
+        );
+
+        // Zero-width /BBox: get_page_content_for_appearance's transformed-bbox
+        // zero-area gate produces empty content for this one, so qpdf would
+        // never advance next_fx past the candidate it tried here.
+        let zero_area_body = make_xobj_stream([0.0, 0.0, 0.0, 20.0], b"");
+        let (n7, obj7_bytes) = obj_wrap(7, zero_area_body);
+        let (n6, obj6_bytes) = obj_dict(
+            6,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /AP << /N 7 0 R >> >>",
+        );
+
+        let (n9, obj9_bytes) = obj_wrap(9, xobj_body);
+        let (n8, obj8_bytes) = obj_dict(
+            8,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /AP << /N 9 0 R >> >>",
+        );
+
+        let bytes = build_pdf(
+            "/Annots [4 0 R 6 0 R 8 0 R]",
+            &[
+                (n4, obj4_bytes),
+                (n5, obj5_bytes),
+                (n6, obj6_bytes),
+                (n7, obj7_bytes),
+                (n8, obj8_bytes),
+                (n9, obj9_bytes),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(
+            count, 2,
+            "the zero-area annotation must be skipped, not flattened"
+        );
+
+        let content = page_content_bytes(&mut pdf, page_ref).unwrap();
+        let content_str = String::from_utf8_lossy(&content);
+        assert!(
+            content_str.contains("Fxo1"),
+            "first annotation must use Fxo1, got: {content_str}"
+        );
+        assert!(
+            content_str.contains("Fxo2"),
+            "third annotation must reuse Fxo2 (skipped candidate must not be consumed), got: {content_str}"
+        );
+        assert!(
+            !content_str.contains("Fxo3"),
+            "the skipped zero-area annotation must not have consumed a name, got: {content_str}"
         );
     }
 
