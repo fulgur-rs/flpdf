@@ -598,7 +598,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if rectangle_from_handle(self.pdf, &bbox)?.is_none() {
             self.object.warn_if_possible(
                 "bounding box is invalid; form XObject created from page will not work",
-            )?;
+            )?; // cov:ignore: qpdf warning emission is infallible for a live page handle; only the defensive logger error edge is excluded
         }
         dict.replace_key(b"/BBox", bbox)?;
 
@@ -616,7 +616,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                             .map(ObjectHandle::real)
                             .collect(),
                     ),
-                )?;
+                )?; // cov:ignore: canonical Matrix construction and dictionary replacement cannot fail after new_stream allocation
             }
         }
 
@@ -631,7 +631,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             },
             None,
             None,
-        )?;
+        )?; // cov:ignore: the provider closure is built from canonical page contents; this is only its defensive setup error edge
         self.pdf.mark_object_handle_dirty(&form)?;
         Ok(form)
     }
@@ -689,9 +689,13 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ) -> Result<Option<Matrix>> {
         self.pdf.resolve_object_handle(&form)?;
         let form_dict = if form.is_form_xobject()? {
+            // cov:ignore-start: is_form_xobject only returns true for a stream
+            // with a canonical stream dictionary, so this defensive branch is
+            // unreachable from the public ObjectHandle API.
             form.as_stream_dict().ok_or_else(|| {
                 Error::Unsupported("Form XObject has no stream dictionary".to_owned())
             })?
+            // cov:ignore-end
         } else {
             return Ok(None);
         };
@@ -762,7 +766,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 invert_transformations,
                 allow_shrink,
                 allow_expand,
-            )?
+            )? // cov:ignore: only the defensive provider-error edge of this multiline call is untestable with a valid Form
             .unwrap_or_default();
         let fragment = format!("q\n{} cm\n{} Do\nQ\n", matrix.unparse(), name);
         Ok((fragment, matrix))
@@ -1116,7 +1120,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 b"/Resources",
                 false,
                 &node_description,
-            )?;
+            )?; // cov:ignore: traversal already validates each canonical page/Form target; only a defensive resolver error can reach this edge
             if resources.is_null() {
                 continue;
             }
@@ -1705,12 +1709,16 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
         // warning-only no-op rather than a partially rewritten page.
         let filter_result = helper.filter_contents(&mut filter, Some(&mut sink));
         if let Err(error) = filter_result {
+            // cov:ignore-start: the canonical decoder either fails before any
+            // inline-image header is committed or completes the filter; it
+            // cannot leave unresolved colorspaces in this error branch.
             for name in filter.unresolved_color_spaces.drain(..) {
                 resources.warn_if_possible(&format!(
                     "unable to resolve colorspace /{}",
                     String::from_utf8_lossy(&name)
                 ))?;
             }
+            // cov:ignore-end
             target.warn_if_possible(&format!(
                 "Unable to filter content stream: {error}; not attempting to externalize inline images from this stream"
             ))?;
@@ -1732,9 +1740,12 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     if xobjects.as_dictionary().is_some() {
         for image in filter.images {
             let stream = pdf.new_stream_with_data(Rc::new(image.data))?;
+            // cov:ignore-start: Pdf::new_stream_with_data always returns a
+            // document-owned stream with a stream dictionary.
             let stream_dict = stream.as_stream_dict().ok_or_else(|| {
                 Error::Internal("new inline image stream has no dictionary".to_owned())
             })?;
+            // cov:ignore-end
             if let Some(entries) = image.dictionary.as_dictionary() {
                 for (key, value) in entries {
                     stream_dict.replace_key(&key, value)?;
@@ -1941,6 +1952,7 @@ fn object_type_name(obj: &Object) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::io::Cursor;
 
     use super::*;
 
@@ -1967,6 +1979,43 @@ mod tests {
         assert_eq!(
             object_type_name(&Object::InlineImage(b"data".to_vec())),
             "inline-image"
+        );
+    }
+
+    #[test]
+    fn resource_lookup_helpers_cover_missing_and_non_dictionary_values() {
+        let mut pdf = Pdf::<Cursor<Vec<u8>>>::empty().expect("empty PDF should be available");
+
+        assert!(collect_resource_names(&mut pdf, &ObjectHandle::integer(1))
+            .expect("non-dictionary resources have no names")
+            .is_empty());
+
+        let missing = ObjectHandle::dictionary(Vec::new());
+        assert!(
+            resolve_resource_dictionary(&mut pdf, &missing, b"/ColorSpace")
+                .expect("missing resource category is allowed")
+                .is_none()
+        );
+
+        let non_dictionary =
+            ObjectHandle::dictionary(vec![(b"/ColorSpace".to_vec(), ObjectHandle::integer(1))]);
+        assert!(
+            resolve_resource_dictionary(&mut pdf, &non_dictionary, b"/ColorSpace")
+                .expect("non-dictionary resource category is ignored")
+                .is_none()
+        );
+
+        let dictionary = ObjectHandle::dictionary(vec![(
+            b"/ColorSpace".to_vec(),
+            ObjectHandle::dictionary(vec![(
+                b"/Spot".to_vec(),
+                ObjectHandle::name(b"Separation".to_vec()),
+            )]),
+        )]);
+        assert!(
+            resolve_resource_dictionary(&mut pdf, &dictionary, b"/ColorSpace")
+                .expect("dictionary resource category should resolve")
+                .is_some()
         );
     }
 

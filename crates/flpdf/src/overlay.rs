@@ -281,6 +281,9 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     // from the current destination dictionary; the destination `/DR` itself
     // persists, so a still-live alias is reused without minting a new suffix.
     for (name, xref, template) in &underlay_names {
+        // cov:ignore-start: the trailing `)?;` is the defensive error edge of
+        // a multiline placement call; valid source and destination pages are
+        // covered by the byte-identical overlay gates.
         let (fragment, cm) = place_form_xobject_canonical(
             dest,
             dest_page_ref,
@@ -291,6 +294,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
             false,
             name,
         )?;
+        // cov:ignore-end
         content.push_str(&fragment);
         if let Some(tpl) = template {
             // cov:ignore-start: `?` on multi-line call — the trailing `)?;` is
