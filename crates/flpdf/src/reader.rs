@@ -8488,6 +8488,12 @@ mod tests {
             .parse_object_stream_entry_from_handle(&malformed_header, 7)
             .is_err());
 
+        let negative_object_number =
+            ObjectHandle::stream(direct_dict.clone(), Rc::new(b"-1 0".to_vec()));
+        assert!(source_pdf
+            .parse_object_stream_entry_from_handle(&negative_object_number, 7)
+            .is_err());
+
         let too_large_object_number =
             ObjectHandle::stream(direct_dict, Rc::new(b"4294967296 0".to_vec()));
         assert!(source_pdf
