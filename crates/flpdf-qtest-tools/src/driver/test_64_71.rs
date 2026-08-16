@@ -69,7 +69,7 @@ fn dict_key<R: Read + Seek>(
 /// GAP(`QPDFPageObjectHelper::getFormXObjectForPage` /
 /// `QPDFPageObjectHelper::placeFormXObject`): both exist inside flpdf --
 /// [`crate`]-external code just cannot reach them. `page_form_xobject::
-/// page_to_form_xobject` mirrors `getFormXObjectForPage` but its whole module
+/// get_form_xobject_for_page` mirrors `getFormXObjectForPage` but its whole module
 /// is absent from `flpdf::lib`'s `pub use` list (`lib.rs` has no
 /// `page_form_xobject` line at all); `overlay::place_form_xobject` mirrors
 /// `placeFormXObject`'s placement-fragment computation but is a private
@@ -79,7 +79,7 @@ fn dict_key<R: Read + Seek>(
 /// underlay/overlay/base-page roles (`overlay.rs`'s
 /// `apply_overlays_to_page`) rather than exposing them as the free
 /// parameters this test needs per call. This is an export-visibility gap,
-/// not an unimplemented feature: were `page_to_form_xobject` and a
+/// not an unimplemented feature: were `get_form_xobject_for_page` and a
 /// `pub` `place_form_xobject` (or equivalent) taking explicit
 /// `allow_shrink`/`allow_expand` made reachable from this crate, the per-page
 /// loop below would become a direct, gap-free port.

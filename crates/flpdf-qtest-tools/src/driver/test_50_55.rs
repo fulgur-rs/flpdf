@@ -410,7 +410,7 @@ pub(crate) fn run_test_55<R: Read + Seek>(
     // trailer's `/QTest` with the finished array, then writes `a.pdf` in
     // QDF/static-ID mode (`libqpdf/QPDFPageObjectHelper.cc`). flpdf's
     // page-to-Form-XObject conversion exists (`page_form_xobject.rs`,
-    // `page_to_form_xobject`) but that module is declared
+    // `get_form_xobject_for_page`) but that module is declared
     // `pub(crate) mod page_form_xobject` (`lib.rs:136`), so it is
     // unreachable from this crate. Since the array this test's entire
     // output depends on can never be built, nothing below this point --

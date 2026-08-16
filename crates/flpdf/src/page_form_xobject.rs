@@ -36,7 +36,7 @@
 //! The XObject stream holds the page's decoded, coalesced content bytes
 //! uncompressed; the writer applies compression on output.
 
-// The two entry points (`page_to_form_xobject`, `import_page_as_form_xobject`)
+// The two entry points (`get_form_xobject_for_page`, `import_page_as_form_xobject`)
 // and their private helpers are consumed by the overlay/underlay content-wiring
 // and CLI layers, which are not yet implemented. Until those call sites land,
 // allow the unused-code lint at the module level (exercised by unit tests here).
@@ -69,7 +69,7 @@ const MAX_XOBJECT_CLOSURE_DEPTH: usize = DEFAULT_MAX_PAGE_TREE_DEPTH;
 ///   when a required box rectangle is malformed, or when the object-number space
 ///   is exhausted.
 /// - Any error propagated from [`Pdf::resolve`] or content extraction.
-pub(crate) fn page_to_form_xobject<R: Read + Seek>(
+pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<ObjectRef> {
@@ -100,7 +100,7 @@ pub(crate) fn page_to_form_xobject<R: Read + Seek>(
     dict.insert("Subtype", Object::Name(b"Form".to_vec()));
     dict.insert("BBox", Object::Array(bbox));
     if transform.rotate_present || transform.uu_present {
-        let matrix = transformation_matrix(&transform, bbox_w, bbox_h, false);
+        let matrix = get_matrix_for_transformations(&transform, bbox_w, bbox_h, false);
         dict.insert(
             "Matrix",
             Object::Array(
@@ -149,7 +149,7 @@ where
 {
     // 1. Build the Form XObject inside the source document (qpdf order:
     //    getFormXObjectForPage runs on the source page first).
-    let xobject_ref = page_to_form_xobject(source, source_page_ref)?;
+    let xobject_ref = get_form_xobject_for_page(source, source_page_ref)?;
 
     // 2. Compute the XObject's reachable object closure.
     let closure = xobject_object_closure(source, xobject_ref)?;
@@ -204,7 +204,7 @@ where
     let mut xobject_refs = Vec::with_capacity(source_page_refs.len());
     let mut union: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in source_page_refs {
-        let xobject_ref = page_to_form_xobject(source, page_ref)?;
+        let xobject_ref = get_form_xobject_for_page(source, page_ref)?; // cov:ignore: import_pages_as_form_xobjects has no callers yet (pre-existing gap, unrelated to this rename)
         union.extend(xobject_object_closure(source, xobject_ref)?);
         xobject_refs.push(xobject_ref);
     }
@@ -510,7 +510,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
 /// `invert` inverts the destination-page transform (used by overlay placement):
 /// `scale` becomes `1/scale` (identity when `scale == 0`) and `rotate` becomes
 /// `360 - rotate` before the switch.
-pub(crate) fn transformation_matrix(
+pub(crate) fn get_matrix_for_transformations(
     t: &PageTransform,
     width: f64,
     height: f64,
@@ -732,7 +732,7 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let expected_content = crate::pages::page_content_bytes(&mut pdf, page_ref).unwrap();
 
-        let xref = page_to_form_xobject(&mut pdf, page_ref).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, page_ref).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let dict = &stream.dict;
 
@@ -785,7 +785,7 @@ mod tests {
         // TrimBox != MediaBox; with one real (fractional) coordinate so element
         // types are preserved verbatim.
         let mut pdf = open(one_page_doc("/TrimBox [10 10 500.5 600]", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
         // Verbatim copy: integers stay integers, real stays real.
@@ -813,7 +813,7 @@ mod tests {
             ],
             1,
         ));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
         assert_eq!(
@@ -829,7 +829,7 @@ mod tests {
         // reference-resolution arm of resolve_rect_array.
         let trimbox = (6u32, "[1 2 3 4]");
         let mut pdf = open(one_page_doc("/TrimBox 6 0 R", "x", &[trimbox]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
         assert_eq!(numbers(bbox), vec![1, 2, 3, 4]);
@@ -839,7 +839,7 @@ mod tests {
     fn page_to_form_xobject_rejects_short_box_array() {
         // A rectangle with < 4 elements is malformed.
         let mut pdf = open(one_page_doc("/TrimBox [0 0 5]", "x", &[]));
-        let err = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0));
+        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -847,7 +847,7 @@ mod tests {
     fn page_to_form_xobject_rejects_non_array_box() {
         // A /TrimBox that is a name, not an array, is malformed.
         let mut pdf = open(one_page_doc("/TrimBox /NotARect", "x", &[]));
-        let err = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0));
+        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -857,7 +857,7 @@ mod tests {
         // array — exercises the reference-arm error path in inherited_box_array.
         let bad = (6u32, "<< /Type /Foo >>");
         let mut pdf = open(one_page_doc("/CropBox 6 0 R", "x", &[bad]));
-        let err = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0));
+        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -875,7 +875,7 @@ mod tests {
             ],
             1,
         ));
-        let err = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0));
+        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -885,7 +885,7 @@ mod tests {
         // as 0.0 (the array is still copied verbatim into /BBox). /Rotate 0 keeps
         // /Matrix present so the identity assertion is exercised.
         let mut pdf = open(one_page_doc("/TrimBox [0 0 /X 100] /Rotate 0", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
         assert!(matches!(bbox[2], Object::Name(_)));
@@ -919,7 +919,7 @@ mod tests {
     fn page_to_form_xobject_rotate_90_matrix() {
         // MediaBox 0 0 612 792, /Rotate 90 -> matrix [0 -1 1 0 0 width].
         let mut pdf = open(one_page_doc("/Rotate 90", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let matrix = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         // width = urx - llx = 612 - 0 = 612.
@@ -930,13 +930,13 @@ mod tests {
     fn page_to_form_xobject_rotate_180_and_270() {
         // 180 -> [-1 0 0 -1 width height]; 270 -> [0 1 -1 0 height 0].
         let mut pdf = open(one_page_doc("/Rotate 180", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![-1, 0, 0, -1, 612, 792]);
 
         let mut pdf = open(one_page_doc("/Rotate 270", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![0, 1, -1, 0, 792, 0]);
@@ -948,7 +948,7 @@ mod tests {
         // /Matrix — the identity. (Absence of /Rotate omits it; this guards that
         // the presence check, not the value, drives emission.)
         let mut pdf = open(one_page_doc("/Rotate 0", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![1, 0, 0, 1, 0, 0]);
@@ -971,7 +971,7 @@ mod tests {
             ],
             1,
         ));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![0, -1, 1, 0, 0, 612]);
@@ -982,7 +982,7 @@ mod tests {
         // /UserUnit 2 with no /Rotate: qpdf emits /Matrix with the scale folded in
         // (rotate-0 default branch -> [scale 0 0 scale 0 0]).
         let mut pdf = open(one_page_doc("/UserUnit 2", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![2, 0, 0, 2, 0, 0]);
@@ -992,7 +992,7 @@ mod tests {
     fn page_to_form_xobject_userunit_and_rotate_90() {
         // /UserUnit 2 /Rotate 90 on 612x792 -> [0 -2 2 0 0 width*scale=1224].
         let mut pdf = open(one_page_doc("/UserUnit 2 /Rotate 90", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![0, -2, 2, 0, 0, 1224]);
@@ -1003,7 +1003,7 @@ mod tests {
         // A present-but-non-integer /Rotate is non-null, so /Matrix is emitted;
         // qpdf treats a non-integer rotation as 0 -> identity.
         let mut pdf = open(one_page_doc("/Rotate /X", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![1, 0, 0, 1, 0, 0]);
@@ -1014,7 +1014,7 @@ mod tests {
         // A present-but-non-numeric /UserUnit is non-null, so /Matrix is emitted;
         // qpdf uses scale 1.0 when /UserUnit is not a number.
         let mut pdf = open(one_page_doc("/UserUnit /X", "x", &[]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let m = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(m), vec![1, 0, 0, 1, 0, 0]);
@@ -1027,7 +1027,7 @@ mod tests {
         // the original inner entries (observed in qpdf 11.9.0 overlay output).
         let group_obj = (6u32, "<< /Type /Group /S /Transparency /CS /DeviceRGB >>");
         let mut pdf = open(one_page_doc("/Group 6 0 R", "x", &[group_obj]));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let group = stream
             .dict
@@ -1057,7 +1057,7 @@ mod tests {
             "x",
             &[],
         ));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let group = stream.dict.get("Group").unwrap().as_dict().unwrap();
         assert_eq!(
@@ -1070,7 +1070,7 @@ mod tests {
     fn page_to_form_xobject_rejects_non_page() {
         // Object 2 is /Type /Pages, not /Page -> content extraction fails.
         let mut pdf = open(one_page_doc("", "x", &[]));
-        let err = page_to_form_xobject(&mut pdf, ObjectRef::new(2, 0));
+        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(2, 0));
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
             ],
             1,
         ));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let closure = xobject_object_closure(&mut pdf, xref).unwrap();
         assert!(closure.contains(&xref));
         assert!(closure.contains(&ObjectRef::new(4, 0)));
@@ -1280,7 +1280,7 @@ mod tests {
         objs.push(((total + 1) as u32, "<< /Leaf true >>".to_string()));
         let borrowed: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
         let mut pdf = open(build_pdf(&borrowed, 1));
-        let xref = page_to_form_xobject(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let err = xobject_object_closure(&mut pdf, xref);
         assert!(matches!(err, Err(Error::Unsupported(_))));
     }
@@ -1389,7 +1389,7 @@ mod tests {
         );
     }
 
-    // ---- transformation_matrix (invert scale==0 guard) ---------------------
+    // ---- get_matrix_for_transformations (invert scale==0 guard) ---------------------
 
     #[test]
     fn transformation_matrix_invert_zero_scale_is_identity() {
@@ -1402,7 +1402,7 @@ mod tests {
             scale: 0.0,
         };
         assert_eq!(
-            transformation_matrix(&t, 612.0, 792.0, true),
+            get_matrix_for_transformations(&t, 612.0, 792.0, true),
             Matrix::default()
         );
     }
