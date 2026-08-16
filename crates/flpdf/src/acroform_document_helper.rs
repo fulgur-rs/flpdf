@@ -1766,6 +1766,28 @@ mod tests {
     }
 
     #[test]
+    fn top_level_field_stops_at_non_dictionary_parent() {
+        // 5's /Parent is an indirect reference to 6, but 6 doesn't resolve to
+        // a dictionary. qpdf's getTopLevelField advances onto /Parent's
+        // target unconditionally (`libqpdf/QPDFFormFieldObjectHelper.cc:34-45`
+        // — no dictionary check before the `top_field = top_field.getKey(
+        // "/Parent")` assignment) and only checks dict-ness at the top of the
+        // *next* iteration (`getKeyIfDict`), so the walk stops on 6 itself
+        // rather than backing up to 5.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(6, 0)))])),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
+
+        let top = AcroFormDocumentHelper::new(&mut pdf)
+            .top_level_field(ObjectRef::new(5, 0))
+            .unwrap();
+        assert_eq!(top, ObjectRef::new(6, 0));
+    }
+
+    #[test]
     fn annotation_to_field_map_orphan_widget_self_maps() {
         // A widget on a page's /Annots that /AcroForm/Fields never reaches
         // becomes its own field (qpdf's orphan-widget fallback).
