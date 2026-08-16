@@ -121,14 +121,20 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+use crate::content_stream::{
+    parse_content_stream_data, ObjectHandleParserCallbacks, ParseControl, ParserCallbacks,
+};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_rotate::resolve_inherited_rotate;
-use crate::pages::{resolve_inherited_resources, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::pipeline::Pipeline;
 use crate::ref_chain::resolve_ref_chain;
+use crate::token_filter::TokenFilter;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // PageBox — a typed rectangle
@@ -450,9 +456,95 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         page.get_page_contents()
     }
 
+    /// Add a canonical stream to the beginning or end of `/Contents`.
+    ///
+    /// Mirrors `QPDFPageObjectHelper::addPageContents`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:449-452`).
+    pub fn add_page_contents(&mut self, contents: ObjectHandle, first: bool) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.add_page_contents(contents, first)?;
+        self.pdf.mark_object_handle_dirty(&page)
+    }
+
+    /// Rotate the page in the live object graph.
+    ///
+    /// Mirrors `QPDFPageObjectHelper::rotatePage`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:455-458`).
+    pub fn rotate_page(&mut self, angle: i32, relative: bool) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.rotate_page(angle, relative)?;
+        self.pdf.mark_object_handle_dirty(&page)
+    }
+
+    /// Coalesce the page's content streams into one lazy provider-backed stream.
+    pub fn coalesce_content_streams(&mut self) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.coalesce_content_streams()?;
+        self.pdf.mark_object_handle_dirty(&page)
+    }
+
+    /// Parse the page contents through canonical ObjectHandle parser callbacks.
+    pub fn parse_page_contents<C: ObjectHandleParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+    ) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.parse_page_contents(callbacks)
+    }
+
+    /// qpdf's old name for [`Self::parse_page_contents`].
+    pub fn parse_contents<C: ObjectHandleParserCallbacks>(
+        &mut self,
+        callbacks: &mut C,
+    ) -> Result<()> {
+        self.parse_page_contents(callbacks)
+    }
+
+    /// Apply a lexical token filter to decoded page contents.
+    pub fn filter_page_contents<'b>(
+        &mut self,
+        filter: &'b mut dyn TokenFilter,
+        next: Option<&'b mut dyn Pipeline>,
+    ) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.filter_page_contents(filter, next)
+    }
+
+    /// qpdf's old name for [`Self::filter_page_contents`].
+    pub fn filter_contents<'b>(
+        &mut self,
+        filter: &'b mut dyn TokenFilter,
+        next: Option<&'b mut dyn Pipeline>,
+    ) -> Result<()> {
+        self.filter_page_contents(filter, next)
+    }
+
+    /// Pipe decoded page contents into a pipeline.
+    pub fn pipe_page_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.pipe_page_contents(pipeline)
+    }
+
+    /// qpdf's old name for [`Self::pipe_page_contents`].
+    pub fn pipe_contents(&mut self, pipeline: &mut dyn Pipeline) -> Result<()> {
+        self.pipe_page_contents(pipeline)
+    }
+
+    /// Attach a lazy token filter to the page's content stream.
+    pub fn add_content_token_filter(&mut self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
+        let page = self.resolved_page_handle()?;
+        page.add_content_token_filter(filter)?;
+        self.pdf.mark_object_handle_dirty(&page)
+    }
+
     // -----------------------------------------------------------------------
     // resources
     // -----------------------------------------------------------------------
+
+    /// Return the effective `/Resources` dictionary handle.
+    pub fn get_resources(&mut self, copy_if_shared: bool) -> Result<ObjectHandle> {
+        self.get_attribute(b"/Resources", copy_if_shared)
+    }
 
     /// Return the effective `/Resources` dictionary for this page, walking up
     /// the `/Parent` chain until one is found.
@@ -460,7 +552,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Returns `Ok(None)` when no node in the inheritance chain carries a
     /// `/Resources` entry.
     ///
-    /// This delegates to [`crate::pages::resolve_inherited_resources`].
+    /// This delegates to the canonical [`Self::get_resources`] handle route.
     ///
     /// # Errors
     ///
@@ -484,8 +576,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn resources(&mut self) -> Result<Option<Dictionary>> {
-        self.ensure_leaf_page()?;
-        resolve_inherited_resources(self.pdf, self.page_ref)
+        let value = self.get_resources(false)?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        match value.materialize()? {
+            Object::Dictionary(dictionary) => Ok(Some(dictionary)),
+            other => Err(Error::Unsupported(format!(
+                "/Resources on page {} has unexpected type {}",
+                self.page_ref,
+                object_type_name(&other)
+            ))),
+        }
     }
 
     // -----------------------------------------------------------------------

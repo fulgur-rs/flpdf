@@ -6,10 +6,11 @@
 //! inheritance resolution and per-page mutation round-trips.
 
 use flpdf::{
-    apply_rotate_to_pages, pages, Error, Object, ObjectRef, PageBox, PageObjectHelper, Pdf,
-    RotateMode, RotateOp,
+    apply_rotate_to_pages, pages, Error, Object, ObjectHandle, ObjectRef, PageBox,
+    PageObjectHelper, Pdf, RotateMode, RotateOp,
 };
 use std::io::Cursor;
+use std::rc::Rc;
 
 mod common;
 use common::write_default;
@@ -171,6 +172,29 @@ fn get_page_contents_returns_canonical_stream_handles() {
 }
 
 #[test]
+fn add_page_contents_uses_canonical_handles_and_preserves_order() {
+    let first_body = b"Q";
+    let (num, extra) = make_stream_object(4, first_body);
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R",
+        &[(num, extra)],
+    );
+    let mut pdf = open(bytes);
+    let new_contents =
+        ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(b"q".to_vec()));
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    helper
+        .add_page_contents(new_contents.clone(), true)
+        .expect("adding a stream should use the live page handle");
+    let contents = helper.get_page_contents().unwrap();
+    assert_eq!(contents.len(), 2);
+    assert!(contents[0].is_same_object_as(&new_contents));
+    assert_eq!(contents[1].object_ref(), Some(ObjectRef::new(4, 0)));
+}
+
+#[test]
 fn content_stream_objects_concatenates_array_contents() {
     // Two-element /Contents array — objects from both streams appear.
     let body1 = b"q";
@@ -252,6 +276,20 @@ fn resources_inherits_from_parent() {
         res.unwrap().get("ProcSet").is_some(),
         "expected /ProcSet in inherited Resources"
     );
+}
+
+#[test]
+fn get_resources_returns_the_live_inherited_handle() {
+    let resources = (4u32, b"4 0 obj\n<< /ProcSet [/PDF] >>\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 612 792] /Resources 4 0 R", "", &[resources]);
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let handle = helper
+        .get_resources(false)
+        .expect("inherited resources should resolve");
+    assert_eq!(handle.object_ref(), Some(ObjectRef::new(4, 0)));
+    assert!(handle.as_dictionary().is_some());
 }
 
 #[test]
