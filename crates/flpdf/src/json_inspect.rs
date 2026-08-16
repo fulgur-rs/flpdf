@@ -1043,7 +1043,14 @@ pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json
     let page_count = crate::pages::page_refs(pdf)?.len();
     let entries = {
         let mut helper = crate::page_label_document_helper::PageLabelDocumentHelper::new(pdf);
-        if !helper.has_page_labels()? || page_count == 0 {
+        // qpdf's doJSONPageLabels gates only on hasPageLabels(): for a
+        // zero-page document that still has /PageLabels,
+        // getLabelsForPageRange(0, -1, 0, ...) still unconditionally pushes
+        // one reconstructed leading label before its per-page loop (which
+        // then never executes for end_idx < start_idx) --
+        // QPDFPageLabelDocumentHelper.cc:54-90. A page-count shortcut here
+        // would diverge from that single-entry output.
+        if !helper.has_page_labels()? {
             return Ok(Json::make_array());
         }
 
@@ -6386,6 +6393,52 @@ mod tests {
         };
         catalog.insert("PageLabels", pagelabels);
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+    }
+
+    // ── 35b. /PageLabels present on a zero-page document → one fabricated
+    //         leading entry, not an empty array ────────────────────────────
+    //
+    // QPDFPageLabelDocumentHelper::getLabelsForPageRange(0, -1, 0, ...)
+    // unconditionally pushes a reconstructed label for index 0 *before* its
+    // per-page loop runs (QPDFPageLabelDocumentHelper.cc:65-90); the loop
+    // itself (`for i = start_idx+1; i <= end_idx; ++i`) simply never
+    // executes when end_idx (npages - 1 = -1) < start_idx + 1. A page-count
+    // shortcut in the JSON builder must not skip that leading entry.
+
+    #[test]
+    fn pagelabels_present_on_zero_page_document_yields_one_entry() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /PageLabels 3 0 R >>\nendobj\n",
+        );
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let off3 = bytes.len();
+        bytes.extend_from_slice(b"3 0 obj\n<< /Nums [0 << /S /D /St 1 >>] >>\nendobj\n");
+        let xref_start = bytes.len();
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open zero-page fixture");
+
+        let result = build_pagelabels_section(&mut pdf).expect("build_pagelabels_section failed");
+        let serde_json::Value::Array(arr) = &result else {
+            panic!("expected Array, got {result:?}"); // cov:ignore: build_pagelabels_section always returns json_array(..)
+        };
+        assert_eq!(
+            arr.len(),
+            1,
+            "a zero-page document with /PageLabels must still yield qpdf's \
+             one fabricated leading entry, got {arr:?}"
+        );
+        let entry = object_pairs(&arr[0]);
+        assert_eq!(entry[0], ("index".to_string(), number(0)));
     }
 
     // ── 36. No /PageLabels → empty array ─────────────────────────────────────
