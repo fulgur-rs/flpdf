@@ -5988,6 +5988,9 @@ mod tests {
         stream_dict.insert("DecodeParms", Object::Array(Vec::new()));
         pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
             .expect("missing DecodeParms entry must be accepted");
+        stream_dict.insert("DecodeParms", Object::Dictionary(Dictionary::new()));
+        pdf.resolve_explicit_crypt_filter_prefixes(&stream_dict)
+            .expect("dictionary DecodeParms must be accepted");
 
         let cycle_ref = ObjectRef::new(5, 0);
         let cycle_handle = pdf.get_object_handle(cycle_ref);
