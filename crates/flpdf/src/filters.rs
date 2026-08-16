@@ -3,9 +3,9 @@ use std::borrow::Cow;
 
 use crate::ascii_hex;
 use crate::object_handle::ObjectHandle;
-use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::pipeline::test_support::ascii85_fixture_bytes;
+use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
