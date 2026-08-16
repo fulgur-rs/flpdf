@@ -5,8 +5,8 @@ use cbc::Encryptor;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    load_xref_and_trailer, parse_object, EncryptMethod, EncryptParams, EncryptedError, Error,
-    Object, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
+    load_xref_and_trailer, parse_object, DecodeLevel, EncryptMethod, EncryptParams, EncryptedError,
+    Error, Object, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
 };
 use md5::{Digest, Md5};
 use std::fs::File;
@@ -686,7 +686,7 @@ fn v4_uses_separate_stream_and_string_crypt_filters() {
 }
 
 #[test]
-fn v4_explicit_crypt_filter_decrypts_at_filter_slot_before_flate() {
+fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_first() {
     let mut pdf = Pdf::open(std::io::Cursor::new(
         encrypted_v4_explicit_crypt_filter_fixture(false, false),
     ))
@@ -711,7 +711,7 @@ fn v4_explicit_crypt_filter_decrypts_at_filter_slot_before_flate() {
 }
 
 #[test]
-fn v4_explicit_crypt_filter_decrypts_at_filter_slot_after_flate() {
+fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_last() {
     let mut pdf = Pdf::open(std::io::Cursor::new(
         encrypted_v4_explicit_crypt_filter_fixture(false, true),
     ))
@@ -732,6 +732,23 @@ fn v4_explicit_crypt_filter_decrypts_at_filter_slot_after_flate() {
     assert_eq!(
         stream.dict.get("DecodeParms"),
         Some(&Object::Array(vec![Object::Null]))
+    );
+}
+
+#[test]
+fn canonical_stream_pipeline_decrypts_before_an_ascii_hex_filter() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(
+        encrypted_v4_explicit_crypt_filter_ascii_hex_fixture(),
+    ))
+    .unwrap();
+    let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+    assert_eq!(
+        stream
+            .get_stream_data(DecodeLevel::Generalized)
+            .expect("canonical stream pipeline must decrypt before ASCIIHex")
+            .as_slice(),
+        b"explicit crypt ASCIIHex stream"
     );
 }
 
@@ -1612,6 +1629,51 @@ fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate:
     encrypted_v4_explicit_crypt_filter_fixture_with_length(identity, crypt_after_flate, true)
 }
 
+fn encrypted_v4_explicit_crypt_filter_ascii_hex_fixture() -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = fixed_r4_u_entry(true);
+
+    let mut ascii_hex = Vec::new();
+    for byte in b"explicit crypt ASCIIHex stream" {
+        ascii_hex.extend_from_slice(format!("{byte:02x}").as_bytes());
+    }
+    let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
+    let encrypted = aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &ascii_hex);
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Data 4 0 R >>\nendobj\n");
+    let obj2_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+    let obj4_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} /Filter [/ASCIIHexDecode /Crypt] /DecodeParms [null << /Name /StdCF >>] >>\nstream\n",
+            encrypted.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&encrypted);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n0000000000 65535 f \n{obj4_offset:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESV2 /Length 128 >> >> /StmF /Identity /StrF /Identity >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}
+
 fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
     identity: bool,
     crypt_after_flate: bool,
@@ -1631,23 +1693,15 @@ fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
 
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
-    let stream_data = if crypt_after_flate {
-        if identity {
-            encoder.write_all(b"explicit crypt stream").unwrap();
-        } else {
-            let encrypted =
-                aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], b"explicit crypt stream");
-            encoder.write_all(&encrypted).unwrap();
-        }
-        encoder.finish().unwrap()
+    encoder.write_all(b"explicit crypt stream").unwrap();
+    let compressed = encoder.finish().unwrap();
+    let stream_data = if identity {
+        compressed
     } else {
-        encoder.write_all(b"explicit crypt stream").unwrap();
-        let compressed = encoder.finish().unwrap();
-        if identity {
-            compressed
-        } else {
-            aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &compressed)
-        }
+        // qpdf prepends stream decryption before it constructs the filter
+        // chain, so the ciphertext is the encrypted Flate representation even
+        // when /Crypt appears after /FlateDecode in the dictionary.
+        aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &compressed)
     };
     let decode_parms = if identity { "Identity" } else { "StdCF" };
     let (filters, decode_parms_array) = if crypt_after_flate {
