@@ -4180,10 +4180,10 @@ mod tests {
             return;
         };
         if !qpdf_version.status.success()
-            || !String::from_utf8_lossy(&qpdf_version.stdout)
+            || String::from_utf8_lossy(&qpdf_version.stdout)
                 .lines()
                 .next()
-                .is_some_and(|line| line.trim() == "qpdf version 11.9.0")
+                .is_none_or(|line| line.trim() != "qpdf version 11.9.0")
         {
             eprintln!("skipping qpdf 11.9.0 xref allocation oracle: unexpected qpdf version");
             return;
