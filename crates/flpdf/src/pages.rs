@@ -14,6 +14,8 @@ pub mod repair;
 
 use crate::filters::decode_stream_data;
 use crate::pipeline::buffer::Buffer;
+#[cfg(test)]
+use crate::pipeline::test_support::ascii85_fixture_bytes;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result, Stream};
 use std::collections::BTreeSet;
@@ -968,19 +970,14 @@ mod tests {
     ///
     /// PDF semantics: Filter = [/FlateDecode /ASCII85Decode] means the *decode* pipeline
     /// applies filters left-to-right, so during decode the reader first FlateDecode-decompresses,
-    /// then ASCII85Decode-decodes.  To produce bytes that round-trip correctly we therefore
-    /// *encode* in the reverse order: first ASCII85Decode-encode, then FlateDecode-compress.
-    /// We encode each step manually (single-name dicts) rather than using encode_stream_data
-    /// with an Array dict, because encode_stream_data applies Array filters in the same
-    /// left-to-right order as decode (which is the inverse of what we need here).
+    /// then ASCII85Decode-decodes. To produce bytes that round-trip correctly we therefore
+    /// *encode* in the reverse order: first ASCII85 fixture-encode, then FlateDecode-compress.
     ///
     /// This exercises the Array branch in decode_stream_data_with_filters_and_crypt
     /// (filters.rs L78-96).
     fn chained_filter_stream_object_bytes(num: u32, body: &[u8]) -> Vec<u8> {
-        // Step 1: ASCII85Decode-encode (encode is the inverse of ASCII85Decode decode)
-        let mut a85_dict = Dictionary::new();
-        a85_dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
-        let after_a85 = encode_stream_data(&a85_dict, body).unwrap();
+        // Step 1: ASCII85 fixture-encode for the decoder-only test route.
+        let after_a85 = ascii85_fixture_bytes(body);
 
         // Step 2: FlateDecode-compress
         let mut flate_dict = Dictionary::new();
