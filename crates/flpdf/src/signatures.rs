@@ -8,7 +8,7 @@
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json_inspect::decode_pdf_text_string;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, DEFAULT_MAX_ACROFORM_DEPTH};
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -209,7 +209,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 /// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`,
 /// page, and field-tree objects (surfaced by [`Pdf::resolve`]), and
 /// [`Error::Unsupported`] when the field-tree traversal depth limit
-/// ([`DEFAULT_MAX_ACROFORM_DEPTH`]) is exceeded.
+/// ([`crate::DEFAULT_MAX_ACROFORM_DEPTH`]) is exceeded.
 pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let mut changed = remove_security_restrictions(pdf)?;
 
@@ -292,175 +292,17 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
 /// `QPDFAcroFormDocumentHelper::analyze` + `traverseField` +
 /// `getFormFields` (qpdf 11.9.0).
 ///
-/// Returns an empty set when the catalog `/AcroForm` is absent, is not a
-/// dictionary, or carries no `/Fields` key — in which case qpdf's `analyze`
-/// returns before its page `/Annots` orphan-widget pass, so that pass is
-/// skipped here too.
+/// Delegates to [`crate::AcroFormDocumentHelper::annotation_to_field_map`]
+/// (the shared `analyze()` port, `libqpdf/QPDFAcroFormDocumentHelper.cc:
+/// 235-286`) and takes the distinct field values — `field_to_annotations`'s
+/// key set is exactly `annotation_to_field`'s value set.
 fn collect_signature_form_field_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> Result<BTreeSet<ObjectRef>> {
-    let mut form_field_keys: BTreeSet<ObjectRef> = BTreeSet::new();
-    // The ObjGens of annotation nodes already associated with a field (qpdf's
-    // annotation_to_field key set), so the orphan pass skips them.
-    let mut annotations_seen: BTreeSet<ObjectRef> = BTreeSet::new();
-
-    let Some((_, acroform)) = resolve_catalog_acroform(pdf)? else {
-        return Ok(form_field_keys);
-    };
-    let Some(fields_obj) = acroform.get("Fields").cloned() else {
-        return Ok(form_field_keys);
-    };
-    // A present-but-non-array /Fields is treated as empty (qpdf warns and uses
-    // an empty array), but the orphan pass below still runs.
-    let fields = resolve_array(pdf, fields_obj)?;
-
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-    for field in fields {
-        if let Object::Reference(field_ref) = field {
-            traverse_field(
-                pdf,
-                field_ref,
-                None,
-                0,
-                &mut visited,
-                &mut form_field_keys,
-                &mut annotations_seen,
-            )?;
-        }
-    }
-
-    // Orphan page-widget pass: a /Subtype /Widget annotation reachable from a
-    // page /Annots that was not associated with a field during the /Fields
-    // traversal becomes its own form field.
-    for page_ref in crate::pages::page_refs(pdf)? {
-        for annot_ref in page_widget_annotation_refs(pdf, page_ref)? {
-            if annotations_seen.insert(annot_ref) {
-                form_field_keys.insert(annot_ref);
-            }
-        }
-    }
-
-    Ok(form_field_keys)
-}
-
-/// One node of qpdf's `traverseField`: classify `field_ref` as a field and/or
-/// annotation, recording the owning form-field ref when it is an annotation,
-/// and recurse into an array `/Kids`.
-fn traverse_field<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field_ref: ObjectRef,
-    parent_ref: Option<ObjectRef>,
-    depth: usize,
-    visited: &mut BTreeSet<ObjectRef>,
-    form_field_keys: &mut BTreeSet<ObjectRef>,
-    annotations_seen: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
-        return Err(Error::Unsupported(format!(
-            "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH} at {field_ref}"
-        )));
-    }
-    // Non-dictionary fields/annotations are ignored (qpdf warns and skips).
-    let Object::Dictionary(dict) = pdf.resolve(field_ref)? else {
-        return Ok(());
-    };
-    // Loop guard, keyed on the object ref (qpdf's ObjGen visited set).
-    if !visited.insert(field_ref) {
-        return Ok(());
-    }
-
-    // A terminal field that looks like an annotation is an annotation (merged
-    // widget/field). A node with an array /Kids groups sub-fields instead.
-    let mut is_annotation = false;
-    let mut is_field = depth == 0;
-
-    if let Some(kids) = resolve_kids_array(pdf, &dict)? {
-        is_field = true;
-        for kid in kids {
-            if let Object::Reference(kid_ref) = kid {
-                traverse_field(
-                    pdf,
-                    kid_ref,
-                    Some(field_ref),
-                    depth + 1,
-                    visited,
-                    form_field_keys,
-                    annotations_seen,
-                )?;
-            }
-        }
-    } else {
-        if dict.get("Parent").is_some() {
-            is_field = true;
-        }
-        if dict.get("Subtype").is_some() || dict.get("Rect").is_some() || dict.get("AP").is_some() {
-            is_annotation = true;
-        }
-    }
-
-    if is_annotation {
-        // our_field = is_field ? field : parent. `is_field` is false only when
-        // depth > 0, where the caller always supplies a parent, so the
-        // fallback is never reached.
-        let our_field = if is_field {
-            field_ref
-        } else {
-            parent_ref.unwrap_or(field_ref)
-        };
-        form_field_keys.insert(our_field);
-        annotations_seen.insert(field_ref);
-    }
-
-    Ok(())
-}
-
-/// Resolve a dictionary's `/Kids` value to its array items, following one
-/// indirect reference. Returns `None` when `/Kids` is absent or does not
-/// resolve to an array (qpdf's `kids.isArray()` gate), distinguishing that from
-/// an empty array (`Some(vec![])`).
-fn resolve_kids_array<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &Dictionary,
-) -> Result<Option<Vec<Object>>> {
-    match dict.get("Kids").cloned() {
-        Some(Object::Array(items)) => Ok(Some(items)),
-        Some(Object::Reference(kids_ref)) => match pdf.resolve(kids_ref)? {
-            Object::Array(items) => Ok(Some(items)),
-            _ => Ok(None),
-        },
-        _ => Ok(None),
-    }
-}
-
-/// Return the object refs of the `/Subtype /Widget` annotations in a leaf
-/// page's `/Annots` array, mirroring qpdf's `getWidgetAnnotationsForPage`
-/// (`QPDFPageObjectHelper::getAnnotations("/Widget")`). An indirect `/Annots`
-/// array is resolved; non-reference entries are skipped.
-fn page_widget_annotation_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<Vec<ObjectRef>> {
-    let annots_obj = match pdf.resolve(page_ref)? {
-        Object::Dictionary(page) => page.get("Annots").cloned(),
-        _ => None,
-    };
-    let Some(annots_obj) = annots_obj else {
-        return Ok(Vec::new());
-    };
-
-    let mut widgets = Vec::new();
-    for annot in resolve_array(pdf, annots_obj)? {
-        let Object::Reference(annot_ref) = annot else {
-            continue;
-        };
-        if let Object::Dictionary(annot_dict) = pdf.resolve(annot_ref)? {
-            if matches!(annot_dict.get("Subtype"), Some(Object::Name(name)) if name.as_slice() == b"Widget")
-            {
-                widgets.push(annot_ref);
-            }
-        }
-    }
-    Ok(widgets)
+    Ok(crate::AcroFormDocumentHelper::new(pdf)
+        .annotation_to_field_map()?
+        .into_values()
+        .collect())
 }
 
 /// Write an updated `/AcroForm` dictionary back to wherever it lives.
@@ -899,203 +741,7 @@ fn certificate_entry<R: Read + Seek>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    // Minimal valid PDF; nodes are supplied via set_object refs (catalog unused).
-    fn empty_pdf() -> Pdf<Cursor<Vec<u8>>> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"%PDF-1.4\n");
-        let off1 = bytes.len() as u64;
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
-        let xref = bytes.len() as u64;
-        bytes.extend_from_slice(
-            format!(
-                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        Pdf::open(Cursor::new(bytes)).expect("open")
-    }
-
-    // Build a dictionary from (key, Object) pairs for the traverse-based
-    // enumeration unit tests below.
-    fn dict_value(pairs: Vec<(&str, Object)>) -> Dictionary {
-        let mut d = Dictionary::new();
-        for (k, v) in pairs {
-            d.insert(k, v);
-        }
-        d
-    }
-
-    fn dict(pairs: Vec<(&str, Object)>) -> Object {
-        Object::Dictionary(dict_value(pairs))
-    }
-
-    fn refs_vec(pairs: &[u32]) -> Vec<Object> {
-        pairs
-            .iter()
-            .map(|n| Object::Reference(ObjectRef::new(*n, 0)))
-            .collect()
-    }
-
-    fn refs(pairs: &[u32]) -> Object {
-        Object::Array(refs_vec(pairs))
-    }
-
-    #[test]
-    fn traverse_field_visited_guard_breaks_kids_cycle() {
-        // 5 -> /Kids [6] -> /Kids [5]: the loop guard must stop re-descending 5.
-        let mut pdf = empty_pdf();
-        pdf.set_object(ObjectRef::new(5, 0), dict(vec![("Kids", refs(&[6]))]));
-        pdf.set_object(ObjectRef::new(6, 0), dict(vec![("Kids", refs(&[5]))]));
-
-        let mut visited = BTreeSet::new();
-        let mut keys = BTreeSet::new();
-        let mut annots = BTreeSet::new();
-        traverse_field(
-            &mut pdf,
-            ObjectRef::new(5, 0),
-            None,
-            0,
-            &mut visited,
-            &mut keys,
-            &mut annots,
-        )
-        .unwrap();
-
-        assert!(visited.contains(&ObjectRef::new(5, 0)));
-        assert!(visited.contains(&ObjectRef::new(6, 0)));
-        // Neither node is an annotation, so no form-field key is recorded.
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn traverse_field_ignores_non_dictionary_node() {
-        // A non-dictionary field/annotation is skipped without visiting it.
-        let mut pdf = empty_pdf();
-        pdf.set_object(ObjectRef::new(5, 0), Object::Integer(7));
-
-        let mut visited = BTreeSet::new();
-        let mut keys = BTreeSet::new();
-        let mut annots = BTreeSet::new();
-        traverse_field(
-            &mut pdf,
-            ObjectRef::new(5, 0),
-            None,
-            0,
-            &mut visited,
-            &mut keys,
-            &mut annots,
-        )
-        .unwrap();
-
-        assert!(keys.is_empty());
-        assert!(!visited.contains(&ObjectRef::new(5, 0)));
-    }
-
-    #[test]
-    fn traverse_field_errs_past_depth_limit() {
-        let mut pdf = empty_pdf();
-        pdf.set_object(ObjectRef::new(5, 0), dict(vec![]));
-
-        let mut visited = BTreeSet::new();
-        let mut keys = BTreeSet::new();
-        let mut annots = BTreeSet::new();
-        let err = traverse_field(
-            &mut pdf,
-            ObjectRef::new(5, 0),
-            None,
-            DEFAULT_MAX_ACROFORM_DEPTH + 1,
-            &mut visited,
-            &mut keys,
-            &mut annots,
-        );
-        assert!(matches!(err, Err(Error::Unsupported(_))));
-    }
-
-    #[test]
-    fn resolve_kids_array_resolves_indirect_and_rejects_non_array() {
-        let mut pdf = empty_pdf();
-        pdf.set_object(ObjectRef::new(9, 0), refs(&[6, 7]));
-        pdf.set_object(ObjectRef::new(10, 0), Object::Integer(1));
-
-        // Direct array.
-        let direct = dict_value(vec![("Kids", refs(&[6]))]);
-        assert_eq!(
-            resolve_kids_array(&mut pdf, &direct).unwrap(),
-            Some(refs_vec(&[6]))
-        );
-
-        // Indirect reference to an array.
-        let indirect = dict_value(vec![("Kids", Object::Reference(ObjectRef::new(9, 0)))]);
-        assert_eq!(
-            resolve_kids_array(&mut pdf, &indirect).unwrap(),
-            Some(refs_vec(&[6, 7]))
-        );
-
-        // Indirect reference to a non-array resolves to None.
-        let non_array = dict_value(vec![("Kids", Object::Reference(ObjectRef::new(10, 0)))]);
-        assert_eq!(resolve_kids_array(&mut pdf, &non_array).unwrap(), None);
-
-        // Absent /Kids, and a direct non-array /Kids, both yield None.
-        assert_eq!(
-            resolve_kids_array(&mut pdf, &dict_value(vec![])).unwrap(),
-            None
-        );
-        let name_kids = dict_value(vec![("Kids", Object::Name(b"x".to_vec()))]);
-        assert_eq!(resolve_kids_array(&mut pdf, &name_kids).unwrap(), None);
-    }
-
-    #[test]
-    fn page_widget_annotation_refs_filters_widgets_and_edge_entries() {
-        let mut pdf = empty_pdf();
-        // page /Annots mixes: a widget, a non-widget, a non-dict, and a direct
-        // (non-reference) entry — only the widget ref is returned.
-        pdf.set_object(
-            ObjectRef::new(3, 0),
-            dict(vec![(
-                "Annots",
-                Object::Array(vec![
-                    Object::Reference(ObjectRef::new(5, 0)),
-                    Object::Reference(ObjectRef::new(6, 0)),
-                    Object::Reference(ObjectRef::new(7, 0)),
-                    Object::Integer(99),
-                ]),
-            )]),
-        );
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            dict(vec![("Subtype", Object::Name(b"Widget".to_vec()))]),
-        );
-        pdf.set_object(
-            ObjectRef::new(6, 0),
-            dict(vec![("Subtype", Object::Name(b"Link".to_vec()))]),
-        );
-        pdf.set_object(ObjectRef::new(7, 0), Object::Integer(0));
-
-        let widgets = page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        assert_eq!(widgets, vec![ObjectRef::new(5, 0)]);
-    }
-
-    #[test]
-    fn page_widget_annotation_refs_handles_non_dict_page_and_missing_annots() {
-        let mut pdf = empty_pdf();
-        // A non-dictionary page yields no widgets.
-        pdf.set_object(ObjectRef::new(3, 0), Object::Integer(1));
-        assert!(page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0))
-            .unwrap()
-            .is_empty());
-
-        // A page dictionary without /Annots yields no widgets.
-        pdf.set_object(
-            ObjectRef::new(3, 0),
-            dict(vec![("Type", Object::Name(b"Page".to_vec()))]),
-        );
-        assert!(page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0))
-            .unwrap()
-            .is_empty());
-    }
-}
+// `traverse_field`/`resolve_kids_array`/`page_widget_annotation_refs` and
+// their unit tests moved to `acroform_document_helper.rs` alongside the
+// shared `analyze()` port those functions became
+// (`AcroFormDocumentHelper::annotation_to_field_map`/`field_for_annotation`).

@@ -149,6 +149,155 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(out)
     }
 
+    /// Build the qpdf `analyze()` annotation→field map: for every widget
+    /// annotation reachable from `/AcroForm/Fields` (recursively via
+    /// `/Kids`), the field dictionary that owns it, plus every widget
+    /// annotation on any page not reachable that way, self-mapped as its own
+    /// field (the "orphan widget" fallback).
+    ///
+    /// Mirrors `QPDFAcroFormDocumentHelper::analyze`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:235-286`), specifically the
+    /// `annotation_to_field` half of its cache (the `field_to_annotations`/
+    /// `field_to_name`/`name_to_fields` halves serve other consumers not
+    /// needed here).
+    ///
+    /// qpdf caches this on the helper instance (`Members::cache_valid`) so
+    /// repeated per-widget lookups are O(1) amortized. This helper holds no
+    /// cached state (see [`Self::fields`]), so the full traversal recomputes
+    /// on every call — a caller doing multiple lookups within one operation
+    /// should call this once and index the returned map directly rather than
+    /// calling [`Self::field_for_annotation`] per widget. Algorithm and
+    /// output order are unchanged from qpdf; only the container (recomputed
+    /// value vs. cached member) differs, and it does not change output
+    /// bytes.
+    ///
+    /// Returns an empty map when the catalog `/AcroForm` is absent, is not a
+    /// dictionary, or carries no `/Fields` key — in which case qpdf's
+    /// `analyze` returns before its page `/Annots` orphan-widget pass, so
+    /// that pass is skipped here too. A present-but-non-array `/Fields` is
+    /// treated as empty (qpdf warns and uses an empty array), but the orphan
+    /// pass below still runs in that case.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] when a field-tree node is not a dictionary,
+    ///   or when the field-tree depth limit is exceeded.
+    /// - Any error from [`Pdf::resolve`].
+    pub fn annotation_to_field_map(&mut self) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
+        let mut annotation_to_field = BTreeMap::new();
+
+        let Some(acroform) = self.acroform_dict()? else {
+            return Ok(annotation_to_field);
+        };
+        let Some(fields_obj) = acroform.get("Fields").cloned() else {
+            return Ok(annotation_to_field);
+        };
+        let fields = resolve_array_value(self.pdf, Some(fields_obj))?.unwrap_or_default();
+
+        let mut visited = BTreeSet::new();
+        for item in fields {
+            if let Object::Reference(field_ref) = item {
+                traverse_field(
+                    self.pdf,
+                    field_ref,
+                    None,
+                    0,
+                    &mut visited,
+                    &mut annotation_to_field,
+                )?;
+            }
+        }
+
+        // Orphan page-widget pass: a /Subtype /Widget annotation reachable
+        // from a page /Annots that was not associated with a field during
+        // the /Fields traversal becomes its own form field.
+        for page_ref in crate::pages::page_refs(self.pdf)? {
+            for annot_ref in page_widget_annotation_refs(self.pdf, page_ref)? {
+                annotation_to_field.entry(annot_ref).or_insert(annot_ref);
+            }
+        }
+
+        Ok(annotation_to_field)
+    }
+
+    /// Return the field that owns `annot_ref`, mirroring
+    /// `QPDFAcroFormDocumentHelper::getFieldForAnnotation`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:218-232`).
+    ///
+    /// Returns `Ok(None)` immediately, without building
+    /// [`Self::annotation_to_field_map`], when `annot_ref` does not resolve
+    /// to a dictionary with `/Subtype /Widget`
+    /// (`QPDFObjectHandle::isDictionaryOfType("", "/Widget")`).
+    ///
+    /// For repeated per-widget lookups (e.g. enumerating every widget on a
+    /// page or in a document), prefer building
+    /// [`Self::annotation_to_field_map`] once — see its doc for why a
+    /// per-widget call to this method would be O(n²) instead of qpdf's
+    /// cached O(1) amortized.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::annotation_to_field_map`]'s errors.
+    pub fn field_for_annotation(&mut self, annot_ref: ObjectRef) -> Result<Option<ObjectRef>> {
+        let is_widget = self
+            .pdf
+            .resolve_borrowed(annot_ref)?
+            .as_dict()
+            .is_some_and(|dict| {
+                matches!(
+                    dict.get("Subtype"),
+                    Some(Object::Name(name)) if name.as_slice() == b"Widget"
+                )
+            });
+        if !is_widget {
+            return Ok(None);
+        }
+        Ok(self.annotation_to_field_map()?.get(&annot_ref).copied())
+    }
+
+    /// Walk `/Parent` from `start` up to the top-level field — the node with
+    /// no `/Parent`, or whose `/Parent` does not resolve to a dictionary via
+    /// an indirect reference.
+    ///
+    /// Mirrors `QPDFFormFieldObjectHelper::getTopLevelField`
+    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:36-47`). This is
+    /// [`Self::field_for_annotation`]'s natural composition partner: qpdf's
+    /// `getFormFieldsForPage` calls `getFieldForAnnotation(annot).
+    /// getTopLevelField()` for exactly this reason — `getFieldForAnnotation`
+    /// alone can return a "separated" widget's own ref (see that method's
+    /// doc), and callers that want the human-meaningful named field walk the
+    /// rest of the way up here.
+    ///
+    /// Cycle-guarded on the visited [`ObjectRef`] set, returning the last
+    /// node reached before a repeat — matching qpdf's `QPDFObjGen::set`
+    /// guard for the common indirect-`/Parent` case. A **direct** (inline)
+    /// `/Parent` value stops the walk immediately rather than being
+    /// followed, unlike qpdf's `QPDFObjectHandle`-native walk, which would
+    /// continue onto it — this crate has no live-identity tracking for an
+    /// arbitrarily long direct-only `/Parent` chain (see
+    /// [`crate::form_field_object_helper`]'s module doc for the same gap in
+    /// its own `/Parent` walk). A direct `/Parent` on a field is a
+    /// degenerate case that cannot come from parsing real PDF bytes (`/Parent`
+    /// must be indirect for two or more kids to share a field).
+    ///
+    /// # Errors
+    ///
+    /// Any error from [`Pdf::resolve`].
+    pub fn top_level_field(&mut self, start: ObjectRef) -> Result<ObjectRef> {
+        let mut current = start;
+        let mut seen = BTreeSet::new();
+        while seen.insert(current) {
+            let Some(dict) = self.pdf.resolve_borrowed(current)?.as_dict() else {
+                break;
+            };
+            match dict.get("Parent") {
+                Some(Object::Reference(parent_ref)) => current = *parent_ref,
+                _ => break,
+            }
+        }
+        Ok(current)
+    }
+
     /// Return the field's inherited `/V` value.
     ///
     /// # Errors
@@ -1098,6 +1247,114 @@ fn is_pdf_name_delimiter(byte: u8) -> bool {
         )
 }
 
+/// One node of qpdf's `traverseField`: classify `field_ref` as a field
+/// and/or annotation, recording the owning form-field ref when it is an
+/// annotation, and recurse into an array `/Kids`.
+///
+/// Mirrors `libqpdf/QPDFAcroFormDocumentHelper.cc:288-362`.
+fn traverse_field<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    parent_ref: Option<ObjectRef>,
+    depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+    annotation_to_field: &mut BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<()> {
+    if depth > DEFAULT_MAX_ACROFORM_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH} at {field_ref}"
+        )));
+    }
+    // Non-dictionary fields/annotations are ignored (qpdf warns and skips).
+    let Some(dict) = pdf.resolve_borrowed(field_ref)?.as_dict().cloned() else {
+        return Ok(());
+    };
+    // Loop guard, keyed on the object ref (qpdf's ObjGen visited set).
+    if !visited.insert(field_ref) {
+        return Ok(());
+    }
+
+    // A terminal field that looks like an annotation is an annotation
+    // (merged widget/field). A node with an array /Kids groups sub-fields
+    // instead.
+    let mut is_annotation = false;
+    let mut is_field = depth == 0;
+
+    if let Some(kids) = resolve_array_value(pdf, dict.get("Kids").cloned())? {
+        is_field = true;
+        for kid in kids {
+            if let Object::Reference(kid_ref) = kid {
+                traverse_field(
+                    pdf,
+                    kid_ref,
+                    Some(field_ref),
+                    depth + 1,
+                    visited,
+                    annotation_to_field,
+                )?;
+            }
+        }
+    } else {
+        if dict.get("Parent").is_some() {
+            is_field = true;
+        }
+        if dict.get("Subtype").is_some() || dict.get("Rect").is_some() || dict.get("AP").is_some() {
+            is_annotation = true;
+        }
+    }
+
+    if is_annotation {
+        // our_field = is_field ? field : parent. `is_field` is false only
+        // when depth > 0, where the caller always supplies a parent, so the
+        // fallback is never reached.
+        let our_field = if is_field {
+            field_ref
+        } else {
+            parent_ref.unwrap_or(field_ref)
+        };
+        annotation_to_field.insert(field_ref, our_field);
+    }
+
+    Ok(())
+}
+
+/// Return the object refs of the `/Subtype /Widget` annotations in a leaf
+/// page's `/Annots` array, mirroring qpdf's `getWidgetAnnotationsForPage`
+/// (`QPDFPageObjectHelper::getAnnotations("/Widget")`). An indirect
+/// `/Annots` array is resolved; non-reference entries are skipped.
+fn page_widget_annotation_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Vec<ObjectRef>> {
+    let annots_value = pdf
+        .resolve_borrowed(page_ref)?
+        .as_dict()
+        .and_then(|page| page.get("Annots").cloned());
+    let Some(annots) = resolve_array_value(pdf, annots_value)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut widgets = Vec::new();
+    for annot in annots {
+        let Object::Reference(annot_ref) = annot else {
+            continue;
+        };
+        let is_widget = pdf
+            .resolve_borrowed(annot_ref)?
+            .as_dict()
+            .is_some_and(|dict| {
+                matches!(
+                    dict.get("Subtype"),
+                    Some(Object::Name(name)) if name.as_slice() == b"Widget"
+                )
+            });
+        if is_widget {
+            widgets.push(annot_ref);
+        }
+    }
+    Ok(widgets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1109,6 +1366,35 @@ mod tests {
             dict.insert(*key, value.clone());
         }
         dict
+    }
+
+    // Minimal valid PDF; nodes are supplied via set_object refs (catalog
+    // unused). Used by the `traverse_field`/`page_widget_annotation_refs`
+    // unit tests below, which need arbitrary refs independent of any fixture
+    // file's own object numbering.
+    fn empty_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{off1:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(std::io::Cursor::new(bytes)).expect("open")
+    }
+
+    fn refs_vec(nums: &[u32]) -> Vec<Object> {
+        nums.iter()
+            .map(|n| Object::Reference(ObjectRef::new(*n, 0)))
+            .collect()
+    }
+
+    fn refs(nums: &[u32]) -> Object {
+        Object::Array(refs_vec(nums))
     }
 
     /// Build `depth` levels of single-element arrays wrapping `Object::Null`.
@@ -1269,6 +1555,306 @@ mod tests {
                 &renames
             ),
             Object::String(b"/Other 9 Tf /Helv2 10 Tf".to_vec())
+        );
+    }
+
+    // ── traverse_field / page_widget_annotation_refs (analyze() port) ──────
+
+    #[test]
+    fn traverse_field_visited_guard_breaks_kids_cycle() {
+        // 5 -> /Kids [6] -> /Kids [5]: the loop guard must stop re-descending 5.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Kids", refs(&[6]))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Dictionary(dict(&[("Kids", refs(&[5]))])),
+        );
+
+        let mut visited = BTreeSet::new();
+        let mut annotation_to_field = BTreeMap::new();
+        traverse_field(
+            &mut pdf,
+            ObjectRef::new(5, 0),
+            None,
+            0,
+            &mut visited,
+            &mut annotation_to_field,
+        )
+        .unwrap();
+
+        assert!(visited.contains(&ObjectRef::new(5, 0)));
+        assert!(visited.contains(&ObjectRef::new(6, 0)));
+        // Neither node is an annotation, so no field is recorded.
+        assert!(annotation_to_field.is_empty());
+    }
+
+    #[test]
+    fn traverse_field_ignores_non_dictionary_node() {
+        // A non-dictionary field/annotation is skipped without visiting it.
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(5, 0), Object::Integer(7));
+
+        let mut visited = BTreeSet::new();
+        let mut annotation_to_field = BTreeMap::new();
+        traverse_field(
+            &mut pdf,
+            ObjectRef::new(5, 0),
+            None,
+            0,
+            &mut visited,
+            &mut annotation_to_field,
+        )
+        .unwrap();
+
+        assert!(annotation_to_field.is_empty());
+        assert!(!visited.contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn traverse_field_errs_past_depth_limit() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(dict(&[])));
+
+        let mut visited = BTreeSet::new();
+        let mut annotation_to_field = BTreeMap::new();
+        let err = traverse_field(
+            &mut pdf,
+            ObjectRef::new(5, 0),
+            None,
+            DEFAULT_MAX_ACROFORM_DEPTH + 1,
+            &mut visited,
+            &mut annotation_to_field,
+        );
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn page_widget_annotation_refs_filters_widgets_and_edge_entries() {
+        let mut pdf = empty_pdf();
+        // page /Annots mixes: a widget, a non-widget, a non-dict, and a direct
+        // (non-reference) entry — only the widget ref is returned.
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[(
+                "Annots",
+                Object::Array(vec![
+                    Object::Reference(ObjectRef::new(5, 0)),
+                    Object::Reference(ObjectRef::new(6, 0)),
+                    Object::Reference(ObjectRef::new(7, 0)),
+                    Object::Integer(99),
+                ]),
+            )])),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Dictionary(dict(&[("Subtype", Object::Name(b"Link".to_vec()))])),
+        );
+        pdf.set_object(ObjectRef::new(7, 0), Object::Integer(0));
+
+        let widgets = page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(widgets, vec![ObjectRef::new(5, 0)]);
+    }
+
+    #[test]
+    fn page_widget_annotation_refs_handles_non_dict_page_and_missing_annots() {
+        let mut pdf = empty_pdf();
+        // A non-dictionary page yields no widgets.
+        pdf.set_object(ObjectRef::new(3, 0), Object::Integer(1));
+        assert!(page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .is_empty());
+
+        // A page dictionary without /Annots yields no widgets.
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[("Type", Object::Name(b"Page".to_vec()))])),
+        );
+        assert!(page_widget_annotation_refs(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn annotation_to_field_map_merged_and_separated_widgets() {
+        // AcroForm /Fields [7 8]; 7 is a merged field+widget (top-level,
+        // /Subtype /Widget directly on it); 8 is a parent field with /Kids
+        // [9], where 9 is a separated widget (/Parent 8, no /FT/T of its own).
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7, 8]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![])),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("FT", Object::Name(b"Tx".to_vec())),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Dictionary(dict(&[("Kids", refs(&[9]))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(8, 0))),
+            ])),
+        );
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let map = helper.annotation_to_field_map().unwrap();
+        assert_eq!(map.get(&ObjectRef::new(7, 0)), Some(&ObjectRef::new(7, 0)));
+        // `annotation_to_field` maps a separated widget with its own
+        // /Parent to itself, not its structural parent — qpdf's real
+        // `traverseField`: `is_field` is true here because /Parent is
+        // present, so `our_field = field` (9), matching
+        // `libqpdf/QPDFAcroFormDocumentHelper.cc:343-347`. Callers that want
+        // the named field walk the rest of the way with
+        // `top_level_field` (see the next test).
+        assert_eq!(map.get(&ObjectRef::new(9, 0)), Some(&ObjectRef::new(9, 0)));
+        assert_eq!(
+            helper.top_level_field(ObjectRef::new(9, 0)).unwrap(),
+            ObjectRef::new(8, 0)
+        );
+        // A merged top-level field/widget has no /Parent: top_level_field is
+        // a no-op.
+        assert_eq!(
+            helper.top_level_field(ObjectRef::new(7, 0)).unwrap(),
+            ObjectRef::new(7, 0)
+        );
+    }
+
+    #[test]
+    fn top_level_field_stops_at_cycle() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(6, 0)))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(5, 0)))])),
+        );
+        // Must terminate rather than looping forever.
+        let top = AcroFormDocumentHelper::new(&mut pdf)
+            .top_level_field(ObjectRef::new(5, 0))
+            .unwrap();
+        assert!(top == ObjectRef::new(5, 0) || top == ObjectRef::new(6, 0));
+    }
+
+    #[test]
+    fn annotation_to_field_map_orphan_widget_self_maps() {
+        // A widget on a page's /Annots that /AcroForm/Fields never reaches
+        // becomes its own field (qpdf's orphan-widget fallback).
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", Object::Array(vec![]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                ("Annots", refs(&[5])),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
+        );
+
+        let map = AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .unwrap();
+        assert_eq!(map.get(&ObjectRef::new(5, 0)), Some(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn field_for_annotation_non_widget_returns_none_without_traversal() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Subtype", Object::Name(b"Link".to_vec()))])),
+        );
+        assert_eq!(
+            AcroFormDocumentHelper::new(&mut pdf)
+                .field_for_annotation(ObjectRef::new(5, 0))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn field_for_annotation_looks_up_the_map() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(vec![])),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("FT", Object::Name(b"Tx".to_vec())),
+            ])),
+        );
+        assert_eq!(
+            AcroFormDocumentHelper::new(&mut pdf)
+                .field_for_annotation(ObjectRef::new(7, 0))
+                .unwrap(),
+            Some(ObjectRef::new(7, 0))
         );
     }
 }
