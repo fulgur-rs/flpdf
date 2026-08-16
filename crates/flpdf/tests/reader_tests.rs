@@ -12,6 +12,7 @@ use md5::{Digest, Md5};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
+use std::process::Command;
 
 mod common;
 use common::{write_with_settings, WriterTestSettings};
@@ -2202,16 +2203,68 @@ fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
 }
 
 #[test]
+#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
 fn resolves_compressed_entry_declared_in_extended_object_stream() {
-    let mut pdf = Pdf::open(std::io::Cursor::new(objstm_extends_chain_pdf())).unwrap();
+    let fixture = objstm_extends_chain_pdf();
+    assert_qpdf_object_contains(&fixture, 2, "null");
+    assert_qpdf_object_contains(&fixture, 3, "99");
 
-    assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
-        Object::Integer(42)
-    );
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+
+    assert_eq!(pdf.resolve(ObjectRef::new(2, 0)).unwrap(), Object::Null);
     assert_eq!(
         pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
         Object::Integer(99)
+    );
+}
+
+#[test]
+#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
+fn objstm_direct_container_qpdf_contract() {
+    let fixture = objstm_direct_container_pdf();
+    assert_qpdf_object_contains(&fixture, 2, "null");
+    assert_qpdf_object_contains(&fixture, 3, "null");
+    assert_qpdf_object_contains(&fixture, 10, "/V 100");
+    assert_qpdf_object_contains(&fixture, 11, "/V 200");
+    assert_qpdf_object_contains(&fixture, 12, "/V 300");
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        Object::Null,
+        "a header object number, not the xref field2, controls materialization"
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        Object::Null,
+        "a header object number, not the xref field2, controls materialization"
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0)).unwrap(),
+        parse_object(b"<< /V 100 >>").unwrap()
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        parse_object(b"<< /V 200 >>").unwrap()
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        parse_object(b"<< /V 300 >>").unwrap(),
+        "a child xref entry must resolve against the child container directly"
+    );
+}
+
+#[test]
+#[ignore = "RED oracle: enable with the direct object-number reader cutover"]
+fn objstm_direct_container_rejects_effective_xref_source_mismatch() {
+    let fixture = objstm_direct_container_pdf_with_child_source(4);
+    assert_qpdf_object_contains(&fixture, 12, "null");
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        Object::Null,
+        "a child header must not be used when effective xref points at another stream"
     );
 }
 
@@ -2366,6 +2419,109 @@ fn objstm_extends_chain_pdf() -> Vec<u8> {
     ))
 }
 
+fn objstm_direct_container_pdf() -> Vec<u8> {
+    objstm_direct_container_pdf_with_child_source(5)
+}
+
+fn objstm_direct_container_pdf_with_child_source(child_source: u32) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let obj1_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let (parent_data, parent_first) =
+        encode_plain_objstm(&[(10, b"<< /V 100 >>"), (11, b"<< /V 200 >>")]);
+    let parent_offset = bytes.len();
+    let parent_header = format!(
+        "4 0 obj\n<< /Type /ObjStm /N 2 /First {parent_first} /Length {} >>\nstream\n",
+        parent_data.len()
+    );
+    bytes.extend_from_slice(parent_header.as_bytes());
+    bytes.extend_from_slice(&parent_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let (child_data, child_first) = encode_plain_objstm(&[(12, b"<< /V 300 >>")]);
+    let child_offset = bytes.len();
+    let child_header = format!(
+        "5 0 obj\n<< /Type /ObjStm /N 1 /First {child_first} /Length {} /Extends 4 0 R >>\nstream\n",
+        child_data.len()
+    );
+    bytes.extend_from_slice(child_header.as_bytes());
+    bytes.extend_from_slice(&child_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_stream_offset = bytes.len();
+    let mut xref_entries = Vec::new();
+    append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, obj1_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 5, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 1);
+    append_xref_stream_entry(&mut xref_entries, 1, parent_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, child_offset as u32, 0);
+    append_xref_stream_entry(&mut xref_entries, 1, xref_stream_offset as u32, 0);
+    for _ in 7..10 {
+        append_xref_stream_entry(&mut xref_entries, 0, 0, 0);
+    }
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 0);
+    append_xref_stream_entry(&mut xref_entries, 2, 4, 1);
+    append_xref_stream_entry(&mut xref_entries, 2, child_source, 0);
+
+    let xref_stream = format!(
+        "6 0 obj\n<< /Type /XRef /Size 13 /Root 1 0 R /W [1 3 1] /Index [0 13] /Length {} >>\nstream\n",
+        xref_entries.len()
+    );
+    bytes.extend_from_slice(xref_stream.as_bytes());
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_stream_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn assert_qpdf_object_contains(fixture: &[u8], object_number: u32, expected: &str) {
+    let Some(output) = qpdf_show_object(fixture, object_number) else {
+        return;
+    };
+    assert!(
+        output.contains(expected),
+        "qpdf --show-object={object_number} output {output:?} must contain {expected:?}"
+    );
+}
+
+fn qpdf_show_object(fixture: &[u8], object_number: u32) -> Option<String> {
+    let version = match Command::new("qpdf").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("qpdf --version failed to start: {error}"),
+    };
+    assert!(
+        version.status.success(),
+        "qpdf --version failed: {}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let version_line = String::from_utf8_lossy(&version.stdout);
+    if version_line
+        .lines()
+        .next()
+        .is_none_or(|line| line.trim() != "qpdf version 11.9.0")
+    {
+        return None;
+    }
+
+    let directory = tempfile::tempdir().expect("create qpdf differential fixture directory");
+    let input = directory.path().join("fixture.pdf");
+    std::fs::write(&input, fixture).expect("write qpdf differential fixture");
+    let output = Command::new("qpdf")
+        .arg(format!("--show-object={object_number}"))
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-object");
+    assert!(
+        output.status.success(),
+        "qpdf --show-object={object_number} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn decode_hex_fixture(hex: &str) -> Vec<u8> {
     let digits: Vec<u8> = hex
         .bytes()
@@ -2409,6 +2565,25 @@ fn encode_flate_objstm(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
     let encoded = encoder.finish().unwrap();
 
     (encoded, header.len())
+}
+
+fn encode_plain_objstm(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+    let mut header = String::new();
+    let mut body = Vec::new();
+
+    for (index, (number, object_data)) in members.iter().enumerate() {
+        let offset = body.len();
+        header.push_str(&format!("{number} {offset} "));
+        body.extend_from_slice(object_data);
+        if index + 1 < members.len() {
+            body.push(b'\n');
+        }
+    }
+
+    let header_len = header.len();
+    let mut data = header.into_bytes();
+    data.extend_from_slice(&body);
+    (data, header_len)
 }
 
 fn append_xref_stream_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
