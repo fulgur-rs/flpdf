@@ -151,6 +151,15 @@ fn build_pdf_with_filter_array(
     pdf_bytes
 }
 
+fn ascii_hex_encode(input: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(input.len() * 2 + 1);
+    for byte in input {
+        encoded.extend_from_slice(format!("{byte:02x}").as_bytes());
+    }
+    encoded.push(b'>');
+    encoded
+}
+
 // ---------------------------------------------------------------------------
 // Helper: run `show-stream 4 0` against a PDF file and return stdout bytes.
 // ---------------------------------------------------------------------------
@@ -323,7 +332,12 @@ fn cli_show_stream_ascii85_flate_chain() {
 #[test]
 fn cli_show_stream_flate_ascii_hex_chain() {
     let raw = b"FlateDecode+ASCIIHexDecode content for CLI consistency test";
-    let pdf_bytes = build_pdf_with_filter_array(raw, &[b"FlateDecode", b"ASCIIHexDecode"], None);
+    let mut flate_dict = Dictionary::new();
+    flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let encoded = filters::encode_stream_data(&flate_dict, &ascii_hex_encode(raw))
+        .expect("encode Flate wrapper");
+    let pdf_bytes =
+        build_pdf_with_prefiltered_stream(&encoded, "[/FlateDecode /ASCIIHexDecode]", None);
 
     let tmp = tempdir().unwrap();
     let pdf_path = tmp.path().join("flate-asciihex.pdf");
