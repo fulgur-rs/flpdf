@@ -1044,6 +1044,7 @@ impl<R: Read + Seek> Pdf<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json::Json;
     use crate::ObjectRef;
     use std::io::Cursor;
 
@@ -2678,5 +2679,251 @@ mod tests {
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
         let err = helper.remove_pages(0, usize::MAX).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    // ---- live-qpdf 11.9.0 oracle: get_label_for_page / get_labels_for_page_range ----
+    //
+    // `QPDFJob::doJSONPageLabels` (`QPDFJob.cc:1095-1116`) serializes exactly
+    // `getLabelsForPageRange`'s entries with `getJSON(json_version)` and no
+    // schema transformation, so `qpdf --json=2 --json-key=pagelabels` is a
+    // faithful window onto the raw label dictionaries these two functions
+    // build. This does not wire flpdf's own `--json` output (that CLI wiring
+    // is `flpdf-q28i`'s scope) — it is a test-only observation of qpdf's
+    // internal state via its own JSON serializer.
+    //
+    // `getLabelsForPageRange`'s `skip_first` redundancy-skip branch needs a
+    // non-empty accumulator from a prior call, which `doJSONPageLabels`
+    // never provides (it always starts from an empty `Vec`) — so no oracle
+    // here exercises it. It stays covered by the existing hand-derived
+    // `merge_adjacent_ranges`/`labels_for_page_range_*` unit tests above.
+
+    use std::process::Command;
+
+    /// A 7-page PDF whose `/PageLabels /Nums` covers, at indices 0-5: an
+    /// `/S`-only range, a range with none of `/S`/`/P`/`/St`, an `/St`-only
+    /// range, a `/P`-only range, an unrecognized `/S` name, and a range with
+    /// an explicit empty `/P ()` alongside `/S`/`/St`. Page 6 has no
+    /// explicit `/Nums` entry, exercising the `/St` offset-addition path
+    /// (`QPDFPageLabelDocumentHelper.cc:38-40`).
+    fn qpdf_pagelabels_probe_pdf() -> Vec<u8> {
+        let npages = 7u32;
+        let mut bodies: Vec<Vec<u8>> =
+            vec![b"<< /Type /Catalog /Pages 2 0 R /PageLabels 10 0 R >>".to_vec()];
+        let kids = (0..npages)
+            .map(|i| format!("{} 0 R", 3 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        bodies.push(format!("<< /Type /Pages /Kids [{kids}] /Count {npages} >>").into_bytes());
+        for _ in 0..npages {
+            bodies.push(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_vec());
+        }
+        // obj 10 (/PageLabels), right after the 7 pages (obj 3..=9).
+        bodies.push(
+            b"<< /Nums [\
+              0 << /S /r >> \
+              1 << >> \
+              2 << /St 9 >> \
+              3 << /P (Ch-) >> \
+              4 << /S /Z >> \
+              5 << /S /D /P () /St 2 >> \
+              ] >>"
+                .to_vec(),
+        );
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::with_capacity(bodies.len());
+        for (index, body) in bodies.iter().enumerate() {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = bytes.len();
+        let total = bodies.len() + 1;
+        bytes.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for offset in &offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    /// Run `qpdf --json=2 --json-key=pagelabels` and return the parsed
+    /// `"pagelabels"` array.
+    fn qpdf_json_pagelabels(path: &std::path::Path) -> Json {
+        let qpdf = Command::new("/usr/bin/qpdf")
+            .arg("--json=2")
+            .arg("--json-key=pagelabels")
+            .arg(path)
+            .output()
+            .expect("run pinned qpdf pagelabels oracle");
+        let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+        assert!(
+            qpdf.status.success(),
+            "qpdf --json=2 --json-key=pagelabels failed: {qpdf_stderr}"
+        );
+        let document = Json::parse(&qpdf.stdout).expect("parse qpdf JSON output");
+        document.get_dict_item("pagelabels")
+    }
+
+    /// Compare a raw label dictionary built by flpdf against qpdf's JSON
+    /// rendering of the same dictionary (`getJSON`'s `/S`/`/P`/`/St` shape).
+    ///
+    /// ASCII-only: qpdf's JSON writer switches non-UTF-8-representable text
+    /// strings from a `u:` prefix to a base64 `b:` prefix, which this helper
+    /// does not decode.
+    fn assert_label_matches_qpdf_json(
+        flpdf_label: &ObjectHandle,
+        qpdf_label: &Json,
+        context: &str,
+    ) {
+        let qpdf_s = qpdf_label.get_dict_item("/S");
+        if qpdf_s.is_null() {
+            assert!(
+                !flpdf_label.try_has_key(b"/S").unwrap(),
+                "{context}: /S must be absent"
+            );
+        } else {
+            let name = qpdf_s.get_string().expect("qpdf /S is a JSON string");
+            let expected = name.strip_prefix(b"/").expect("qpdf name starts with /");
+            assert_eq!(
+                flpdf_label
+                    .try_get_key(b"/S")
+                    .unwrap()
+                    .try_as_name()
+                    .unwrap()
+                    .as_deref(),
+                Some(expected),
+                "{context}: /S mismatch"
+            );
+        }
+
+        let qpdf_p = qpdf_label.get_dict_item("/P");
+        if qpdf_p.is_null() {
+            assert!(
+                !flpdf_label.try_has_key(b"/P").unwrap(),
+                "{context}: /P must be absent"
+            );
+        } else {
+            let string = qpdf_p.get_string().expect("qpdf /P is a JSON string");
+            let expected = string
+                .strip_prefix(b"u:")
+                .expect("fixture /P values are ASCII (qpdf u: prefix)");
+            assert_eq!(
+                flpdf_label
+                    .try_get_key(b"/P")
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some(expected),
+                "{context}: /P mismatch"
+            );
+        }
+
+        let qpdf_st = qpdf_label
+            .get_dict_item("/St")
+            .get_number()
+            .expect("qpdf /St is always present");
+        let qpdf_st: i64 = std::str::from_utf8(&qpdf_st)
+            .unwrap()
+            .parse()
+            .expect("qpdf /St is an integer");
+        assert_eq!(
+            flpdf_label.try_get_key(b"/St").unwrap().as_integer(),
+            Some(qpdf_st),
+            "{context}: /St mismatch"
+        );
+    }
+
+    #[test]
+    fn get_labels_for_page_range_matches_pinned_qpdf_json_oracle() {
+        let bytes = qpdf_pagelabels_probe_pdf();
+        let directory = tempfile::tempdir().expect("temporary qpdf oracle directory");
+        let path = directory.path().join("pagelabels-probe.pdf");
+        std::fs::write(&path, &bytes).expect("write qpdf oracle fixture");
+
+        let pagelabels = qpdf_json_pagelabels(&path);
+        let mut expected: Vec<(i64, Json)> = Vec::new();
+        pagelabels.for_each_array_item(|entry| {
+            let index = entry
+                .get_dict_item("index")
+                .get_number()
+                .and_then(|bytes| std::str::from_utf8(&bytes).ok()?.parse::<i64>().ok())
+                .expect("qpdf pagelabels[].index is an integer");
+            expected.push((index, entry.get_dict_item("label")));
+        });
+        // Only explicit /Nums indices (0..=5) get an entry: getLabelsForPageRange
+        // gates non-leading pages on hasIndex, unlike get_label_for_page's
+        // inherited-range lookup. Page 6 has no explicit entry.
+        assert_eq!(
+            expected.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..=5).collect::<Vec<_>>(),
+            "qpdf pagelabels index list"
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open");
+        let mut helper = pdf.page_labels();
+        let mut actual: Vec<(i64, ObjectHandle)> = Vec::new();
+        helper
+            .get_labels_for_page_range(0, 6, 0, &mut actual)
+            .expect("get_labels_for_page_range");
+
+        assert_eq!(actual.len(), expected.len(), "entry count");
+        for ((actual_index, actual_label), (expected_index, expected_label)) in
+            actual.iter().zip(expected.iter())
+        {
+            assert_eq!(actual_index, expected_index, "index");
+            assert_label_matches_qpdf_json(
+                actual_label,
+                expected_label,
+                &format!("index {actual_index}"),
+            );
+        }
+    }
+
+    #[test]
+    fn get_label_for_page_matches_pinned_qpdf_json_oracle_for_every_page() {
+        let bytes = qpdf_pagelabels_probe_pdf();
+        let directory = tempfile::tempdir().expect("temporary qpdf oracle directory");
+        let input_path = directory.path().join("pagelabels-probe.pdf");
+        std::fs::write(&input_path, &bytes).expect("write qpdf oracle fixture");
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open");
+        let mut helper = pdf.page_labels();
+
+        for page_idx in 0i64..7 {
+            let output_path = directory.path().join(format!("page-{page_idx}.pdf"));
+            let extract = Command::new("/usr/bin/qpdf")
+                .arg("--empty")
+                .arg("--pages")
+                .arg(&input_path)
+                .arg((page_idx + 1).to_string()) // qpdf --pages page numbers are 1-based.
+                .arg("--")
+                .arg(&output_path)
+                .output()
+                .expect("run pinned qpdf page extraction");
+            let extract_stderr = String::from_utf8_lossy(&extract.stderr);
+            assert!(
+                extract.status.success(),
+                "qpdf page {page_idx} extraction failed: {extract_stderr}"
+            );
+
+            let entries = qpdf_json_pagelabels(&output_path);
+            let mut expected_label = None;
+            entries.for_each_array_item(|entry| {
+                expected_label = Some(entry.get_dict_item("label"));
+            });
+            let expected_label =
+                expected_label.expect("single-page extraction always has an effective label");
+
+            let actual = helper
+                .get_label_for_page(page_idx)
+                .expect("get_label_for_page")
+                .expect("every page in this fixture has an effective label");
+            assert_label_matches_qpdf_json(&actual, &expected_label, &format!("page {page_idx}"));
+        }
     }
 }
