@@ -397,7 +397,7 @@ impl BootstrapHandleDocument {
         Ok((value.0, parsed_offset))
     }
 
-    fn resolve_object_stream(&self, stream_number: u32) -> Result<()> {
+    fn resolve_objects_in_stream(&self, stream_number: u32) -> Result<()> {
         if !self
             .resolved_object_streams
             .borrow_mut()
@@ -564,7 +564,7 @@ impl DocumentResolver for BootstrapHandleDocument {
             // catch-and-null fallback, and the `resolving` guard removal
             // just past this match, both still run on this path.
             Some(XrefEntry::Compressed { stream, .. }) => {
-                match self.resolve_object_stream(stream) {
+                match self.resolve_objects_in_stream(stream) {
                     Ok(()) => {
                         if handle.is_resolved() {
                             self.resolving.borrow_mut().remove(&object_ref);
@@ -885,7 +885,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
     /// cache population (QPDF.cc:1756-1833). This stays in the bootstrap
     /// context: the later canonical resolver and the legacy Pdf route are
     /// deliberately not reachable from here.
-    fn resolve_object_stream(&mut self, stream_number: u32) -> Result<()> {
+    fn resolve_objects_in_stream(&mut self, stream_number: u32) -> Result<()> {
         if !self.cache.mark_object_stream_resolved(stream_number) {
             return Ok(());
         }
@@ -1073,7 +1073,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
             }
             Some(XrefEntry::Free { .. }) | None => Object::Null,
             Some(XrefEntry::Compressed { stream, .. }) => {
-                if let Err(error) = self.resolve_object_stream(stream) {
+                if let Err(error) = self.resolve_objects_in_stream(stream) {
                     let diagnostic_offset = match &error {
                         Error::Parse { offset, .. } => Some(*offset as u64),
                         _ => None,
@@ -3643,7 +3643,7 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.message.contains("duplicated key /Value")));
         object_stream_document
-            .resolve_object_stream(8)
+            .resolve_objects_in_stream(8)
             .expect("object stream is resolved once");
 
         let mut wrong_type_bytes = b" \n".to_vec();
@@ -3742,7 +3742,7 @@ mod tests {
             XrefLoadOptions::default(),
         );
         let out_of_range = out_of_range_document
-            .resolve_object_stream(8)
+            .resolve_objects_in_stream(8)
             .expect_err("object-stream member offset must be bounded");
         assert!(out_of_range.to_string().contains("out of range"));
 
@@ -3779,7 +3779,7 @@ mod tests {
             XrefLoadOptions::default(),
         );
         let invalid_filter = invalid_filter_document
-            .resolve_object_stream(8)
+            .resolve_objects_in_stream(8)
             .expect_err("unsupported object-stream filter must be reported");
         assert!(invalid_filter.to_string().contains("NoSuchFilter"));
 
@@ -3940,7 +3940,7 @@ mod tests {
             .any(|diagnostic| diagnostic.message.contains("/N is not an integer")));
         // The recursion guard must not leak on this path: `resolve_indirect`
         // must remove `object_ref` from `resolving` even when
-        // `resolve_object_stream` returns `Err`.
+        // `resolve_objects_in_stream` returns `Err`.
         assert!(!document.resolving.borrow().contains(&ObjectRef::new(2, 0)));
     }
 
@@ -3956,7 +3956,7 @@ mod tests {
             XrefLoadOptions::default(),
         );
         let error = context
-            .resolve_object_stream(5)
+            .resolve_objects_in_stream(5)
             .expect_err("plain object is not an object stream");
         assert!(error.to_string().contains("not a stream"));
     }
