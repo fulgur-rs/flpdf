@@ -4394,6 +4394,42 @@ impl ObjectHandle {
         )
     }
 
+    /// Replace a stream's dictionary while retaining the stream object's
+    /// identity and payload/provider.
+    ///
+    /// This is qpdf's `QPDF_Stream::replaceDict` boundary
+    /// (`libqpdf/QPDF_Stream.cc:688-693`), used by
+    /// `QPDF::JSONReactor::dictionaryItem` for `stream.dict`
+    /// (`libqpdf/QPDF_json.cc:629-637`). The replacement is attached through
+    /// the same containment bookkeeping as ordinary dictionary mutations; the
+    /// caller owns the document dirty-mark decision.
+    pub(crate) fn replace_stream_dict(&self, dictionary: ObjectHandle) -> Result<()> {
+        self.try_dereference()?;
+        dictionary.try_dereference()?;
+        if dictionary.as_dictionary().is_none() {
+            return Err(Error::System(
+                "operation for stream dictionary attempted with a non-dictionary".to_owned(),
+            ));
+        }
+        self.check_key_value_ownership(&dictionary)?;
+
+        let previous = self.with_value_mut(|value| match value {
+            Some(ObjectValue::Stream { stream_dict, .. }) => {
+                Some(std::mem::replace(stream_dict, dictionary.clone()))
+            }
+            _ => None,
+        });
+        let Some(previous) = previous else {
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {}",
+                self.type_name()
+            )));
+        };
+        self.detach_child_from_state_owners(&previous);
+        self.attach_child_to_state_owners(&dictionary);
+        Ok(())
+    }
+
     /// Apply the filter and length dictionary mutations shared by qpdf's
     /// buffer and provider `QPDF_Stream::replaceStreamData` overloads
     /// (`libqpdf/QPDF_Stream.cc:640-684`).

@@ -1009,6 +1009,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .clone()
     }
 
+    /// Return qpdf's `reserveObjectIfNotExists` result for one object identity.
+    ///
+    /// A source xref entry (including a resolver-created default free row) is
+    /// already an object-cache candidate and therefore receives the ordinary
+    /// unresolved canonical handle. Only a genuinely new identity gets the
+    /// reserved construction sentinel that JSON input later normalizes to
+    /// null when no object definition replaces it
+    /// (`libqpdf/QPDF.cc:1935-1943`).
+    pub(crate) fn reserve_object_if_not_exists(&self, object_ref: ObjectRef) -> ObjectHandle {
+        if self.registered_handle(object_ref).is_some()
+            || self.xref_entry(object_ref).is_some()
+            || self.has_default_xref_entry(object_ref)
+        {
+            return self.get_object_handle(object_ref);
+        }
+
+        let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
+        let reserved = ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id, resolver);
+        let previous = self
+            .core
+            .borrow_mut()
+            .object_cache
+            .insert(object_ref, reserved.clone());
+        previous.unwrap_or(reserved)
+    }
+
     /// Construct a direct value with this document's weak context, matching
     /// the resolver-bearing handles minted by [`Self::get_object_handle`].
     /// qpdf stores the same owning `QPDF*` on every non-null value created by
@@ -1469,6 +1495,87 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///
     pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) -> Result<()> {
         self.push_warning_with_offset(Some(offset), None, message)
+    }
+
+    /// Emit a warning from qpdf's JSON input reactor.
+    ///
+    /// `QPDF::warn(qpdf_e_json, object, offset, message)` formats the PDF
+    /// description outside the `(obj:... from input, offset N)` object
+    /// context (`libqpdf/QPDF.cc:488-505`; `libqpdf/QPDFExc.cc:19-49`). The
+    /// ordinary offset sink cannot express that shape without duplicating the
+    /// filename or moving the offset into the message, so JSON input keeps a
+    /// dedicated routing door here.
+    pub(crate) fn push_json_warning(
+        &self,
+        input_name: &str,
+        object: &str,
+        offset: i64,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let message = message.into();
+        let (logger, suppress_warnings, description) = {
+            let mut core = self.core.borrow_mut();
+            let mut object = object.to_owned();
+            if input_name != core.description {
+                object.push_str(" from ");
+                object.push_str(input_name);
+            }
+            let offset_text = if offset > 0 {
+                format!(", offset {offset}")
+            } else {
+                String::new()
+            };
+            let detail = if object.is_empty() {
+                if offset > 0 {
+                    format!("offset {offset}: {message}")
+                } else {
+                    message.clone()
+                }
+            } else {
+                format!("{object}{offset_text}: {message}")
+            };
+            core.repair_diagnostics.push(Diagnostic::warning(
+                detail,
+                (offset >= 0).then_some(offset as u64),
+            ));
+            (
+                core.logger.clone(),
+                core.suppress_warnings,
+                core.description.clone(),
+            )
+        };
+        if suppress_warnings {
+            return Ok(());
+        }
+
+        let mut object = object.to_owned();
+        if input_name != description {
+            object.push_str(" from ");
+            object.push_str(input_name);
+        }
+        let offset_text = if offset > 0 {
+            format!(", offset {offset}")
+        } else {
+            String::new()
+        };
+        let what = if object.is_empty() {
+            if offset > 0 {
+                if description.is_empty() {
+                    format!("offset {offset}: {message}")
+                } else {
+                    format!("{description} (offset {offset}): {message}")
+                }
+            } else if description.is_empty() {
+                message
+            } else {
+                format!("{description}: {message}")
+            }
+        } else if description.is_empty() {
+            format!("{object}{offset_text}: {message}")
+        } else {
+            format!("{description} ({object}{offset_text}): {message}")
+        };
+        logger.warn(format!("WARNING: {what}\n"))
     }
 
     /// Emit a warning raised while parsing a canonical ObjStm member.
@@ -4531,6 +4638,113 @@ mod tests {
             output.lock().unwrap().as_slice(),
             b"WARNING: input.pdf (object 5 0, offset 123): expected endobj\n"
         );
+    }
+
+    #[test]
+    fn json_warning_location_omits_wrapping_parens_for_empty_description() {
+        // `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`) only wraps the
+        // object/offset detail in parentheses when a non-empty filename
+        // precedes it. With an empty filename and no object, a positive
+        // offset must stand alone as "offset N: message", not
+        // "(offset N): message" -- the previously-buggy shape.
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false, // already_reconstructed
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, String::new()),
+            0,
+        );
+
+        for (object, offset, message, expected) in [
+            ("", 0, "zero offset", "WARNING: zero offset\n"),
+            (
+                "",
+                5,
+                "positive offset",
+                "WARNING: offset 5: positive offset\n",
+            ),
+            (
+                "obj:1 0 R",
+                0,
+                "object only",
+                "WARNING: obj:1 0 R: object only\n",
+            ),
+            (
+                "obj:1 0 R",
+                5,
+                "object and offset",
+                "WARNING: obj:1 0 R, offset 5: object and offset\n",
+            ),
+        ] {
+            output.lock().unwrap().clear();
+            resolver
+                .push_json_warning("", object, offset, message)
+                .unwrap();
+            assert_eq!(
+                output.lock().unwrap().as_slice(),
+                expected.as_bytes(),
+                "object={object:?} offset={offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_warning_location_wraps_object_and_offset_for_named_description() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false, // already_reconstructed
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, "document.pdf".to_owned()),
+            0,
+        );
+
+        for (object, offset, message, expected) in [
+            ("", 0, "zero offset", "WARNING: document.pdf: zero offset\n"),
+            (
+                "",
+                5,
+                "positive offset",
+                "WARNING: document.pdf (offset 5): positive offset\n",
+            ),
+            (
+                "obj:1 0 R",
+                0,
+                "object only",
+                "WARNING: document.pdf (obj:1 0 R): object only\n",
+            ),
+            (
+                "obj:1 0 R",
+                5,
+                "object and offset",
+                "WARNING: document.pdf (obj:1 0 R, offset 5): object and offset\n",
+            ),
+        ] {
+            output.lock().unwrap().clear();
+            resolver
+                .push_json_warning("document.pdf", object, offset, message)
+                .unwrap();
+            assert_eq!(
+                output.lock().unwrap().as_slice(),
+                expected.as_bytes(),
+                "object={object:?} offset={offset}"
+            );
+        }
     }
 
     type CapturedWarnings = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
