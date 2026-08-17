@@ -50,11 +50,6 @@ use crate::page_object_helper::PageObjectHelper;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::{Error, Matrix, Object, ObjectRef, Pdf, Result};
 
-/// Maximum reference-chain depth when collecting a Form XObject's reachable
-/// object closure. Mirrors the page-tree depth guard used elsewhere; bounds the
-/// DFS so a malformed, deeply-nested document cannot overflow the stack.
-const MAX_XOBJECT_CLOSURE_DEPTH: usize = DEFAULT_MAX_PAGE_TREE_DEPTH;
-
 /// Convert the page at `page_ref` into a Form XObject within the same document,
 /// insert it as a new object, and return its [`ObjectRef`].
 ///
@@ -107,9 +102,8 @@ pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] when the source page cannot be converted, when the
-///   reachable closure exceeds the depth guard, or when the destination object-
-///   number space is exhausted.
+/// - [`Error::Unsupported`] when the source page cannot be converted or when
+///   the destination object-number space is exhausted.
 /// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
 pub(crate) fn import_page_as_form_xobject<RS, RT>(
     dest: &mut Pdf<RT>,
@@ -158,10 +152,9 @@ where
 ///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] when a source page cannot be converted, when a
-///   reachable closure exceeds the depth guard, when the destination object-
-///   number space is exhausted, or when an imported XObject is unexpectedly
-///   absent from the copy map.
+/// - [`Error::Unsupported`] when a source page cannot be converted, when the
+///   destination object-number space is exhausted, or when an imported XObject
+///   is unexpectedly absent from the copy map.
 /// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
 pub(crate) fn import_pages_as_form_xobjects<RS, RT>(
     dest: &mut Pdf<RT>,
@@ -537,7 +530,8 @@ fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<O
 
 /// Compute the transitive reachable object closure of the Form XObject at
 /// `xobject_ref` (the XObject itself plus every object reachable through its
-/// references). Bounded DFS with a visited set (cycle guard) and a depth limit.
+/// references). Iterative DFS with canonical-handle identity as the cycle
+/// guard.
 pub(crate) fn xobject_object_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
@@ -548,15 +542,10 @@ pub(crate) fn xobject_object_closure<R: Read + Seek>(
     )]
     let mut visited: std::collections::HashSet<ObjectHandleIdentity> =
         std::collections::HashSet::new();
-    let mut stack: Vec<(ObjectHandle, usize)> = vec![(pdf.get_object_handle(xobject_ref), 0)];
+    let mut stack: Vec<ObjectHandle> = vec![pdf.get_object_handle(xobject_ref)];
     let mut refs = BTreeSet::new();
 
-    while let Some((current, depth)) = stack.pop() {
-        if depth >= MAX_XOBJECT_CLOSURE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "Form XObject object graph exceeds depth {MAX_XOBJECT_CLOSURE_DEPTH} at {xobject_ref}"
-            )));
-        }
+    while let Some(current) = stack.pop() {
         if !visited.insert(current.identity_key()) {
             continue;
         }
@@ -585,7 +574,7 @@ pub(crate) fn xobject_object_closure<R: Read + Seek>(
                 || child.as_array().is_some()
                 || child.as_stream_dict().is_some()
             {
-                stack.push((child, depth + 1));
+                stack.push(child);
             }
         }
     }
@@ -1303,10 +1292,11 @@ mod tests {
     }
 
     #[test]
-    fn xobject_object_closure_errors_when_ref_chain_too_deep() {
-        // A linear reference chain deeper than MAX_XOBJECT_CLOSURE_DEPTH must
-        // error rather than overflow the stack.
-        let total = MAX_XOBJECT_CLOSURE_DEPTH + 5;
+    fn xobject_object_closure_accepts_long_acyclic_ref_chain() {
+        // A linear indirect-reference chain may be deeper than the page-tree
+        // depth guard. qpdf's copyForeignObject has no fixed reference-hop
+        // budget; identity-based cycle detection is the applicable guard.
+        let total = DEFAULT_MAX_PAGE_TREE_DEPTH + 5;
         let mut objs: Vec<(u32, String)> = vec![
             (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
             (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
@@ -1325,8 +1315,8 @@ mod tests {
         let borrowed: Vec<(u32, &str)> = objs.iter().map(|(n, b)| (*n, b.as_str())).collect();
         let mut pdf = open(build_pdf(&borrowed, 1));
         let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        let err = xobject_object_closure(&mut pdf, xref);
-        assert!(matches!(err, Err(Error::Unsupported(_))));
+        let closure = xobject_object_closure(&mut pdf, xref).unwrap();
+        assert!(closure.contains(&ObjectRef::new((total + 1) as u32, 0)));
     }
 
     // ---- inherited_rotate_attribute (edge arms) ----------------------------
