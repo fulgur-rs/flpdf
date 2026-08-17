@@ -164,14 +164,21 @@ fn enumerate_page_annotations_with_cache<R: Read + Seek>(
 
     for annotation in annotations {
         // Step 2: read /Subtype and /Rect via AnnotationObjectHelper (dropped
-        // after each call). /Rect presence is checked directly rather than
-        // via `get_rect`'s qpdf-faithful fail-soft default (which cannot
-        // distinguish an absent `/Rect` from a present-but-degenerate one),
-        // preserving this module's existing "no /Rect -> None" contract for
-        // its `page_annotation_flatten.rs` consumer.
-        let raw_subtype =
-            AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?;
-        let subtype = (!raw_subtype.is_empty()).then_some(raw_subtype);
+        // after each call). Both keys' presence is checked directly rather
+        // than via their accessor's qpdf-faithful fail-soft default (which
+        // cannot distinguish an absent key from a present-but-degenerate
+        // one -- `get_subtype`'s default is qpdf's non-empty
+        // `"QPDFFakeName"` sentinel, not an empty name), preserving this
+        // module's existing "no /Subtype or /Rect -> None" contract for its
+        // `page_annotation_flatten.rs` consumer.
+        let subtype_value =
+            pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Subtype")?)?;
+        let has_subtype_key = !subtype_value.is_null();
+        let subtype = has_subtype_key
+            .then(|| {
+                AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()
+            })
+            .transpose()?;
         let rect_value =
             pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
         let has_rect_key = !rect_value.is_null();
