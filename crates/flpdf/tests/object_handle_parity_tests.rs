@@ -181,6 +181,29 @@ fn dictionary_handle_lookup_and_writer_use_one_canonical_slash() {
     assert_eq!(dictionary.unparse_resolved(), b"<< /A#20B 7 >>");
 }
 
+#[test]
+fn make_resources_indirect_promotes_direct_values_through_the_public_api() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let resources = ObjectHandle::dictionary(vec![
+        (
+            b"/Font".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(1))]),
+        ),
+        (
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        ),
+    ]);
+
+    resources
+        .make_resources_indirect(&mut pdf)
+        .expect("promote direct resource values");
+
+    assert!(resources.get_key(b"/Font").get_key(b"/F1").is_indirect());
+    assert!(resources.get_key(b"/Font").is_direct());
+    assert!(resources.get_key(b"/ProcSet").is_direct());
+}
+
 /// A dangling indirect handle (a ref absent from the fixture's xref table)
 /// resolves to null without erroring, and its parsed offset stays the
 /// no-offset sentinel (this task does not populate parsed offsets).

@@ -60,6 +60,7 @@
 //! | --- | --- | --- |
 //! | `QPDFObjectHandle::TokenFilter`, `QPDFObjectHandle::ParserCallbacks` (`include/qpdf/QPDFObjectHandle.hh:129-227`) | [`crate::token_filter::TokenFilter`], [`crate::content_stream::ObjectHandleParserCallbacks`], [`crate::content_stream::ParseControl`] | `object_handle_content_parser_tests.rs`: token-filter output/discard/EOF and parser callback lifecycle tests |
 //! | `parseContentStream`, `pipeContentStreams`, `addTokenFilter`, `parsePageContents`, `filterPageContents`, `pipePageContents`, `addContentTokenFilter`, `filterAsContents`, `parseAsContents` (`include/qpdf/QPDFObjectHandle.hh:421-473`) | [`ObjectHandle::parse_page_contents`], [`ObjectHandle::parse_as_contents`], [`ObjectHandle::filter_page_contents`], [`ObjectHandle::filter_as_contents`], [`ObjectHandle::pipe_page_contents`], [`ObjectHandle::pipe_content_streams`], [`ObjectHandle::add_token_filter`], [`ObjectHandle::add_content_token_filter`], `ObjectHandle::parse_content_stream_handles` (private orchestration for `parseContentStream`) | `object_handle_content_parser_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
+//! | `makeResourcesIndirect` (`include/qpdf/QPDFObjectHandle.hh:789-793`; `libqpdf/QPDFObjectHandle.cc:1042-1060`) | [`ObjectHandle::make_resources_indirect`] | `object_handle::mutation_tests::make_resources_indirect_promotes_direct_second_level_values_only` and `acroform_document_helper::tests::prepare_foreign_resource_plan_indirectizes_both_dr_second_level_values` |
 //! | `getUniqueResourceName` (`include/qpdf/QPDFObjectHandle.hh:837-850`) | [`ObjectHandle::get_unique_resource_name`] | `object_handle_content_shape_tests.rs::unique_resource_name_uses_the_supplied_prefix_and_suffix_cursor` and related shape tests |
 //! | `getPageContents`, `addPageContents`, `rotatePage`, `coalesceContentStreams` (`include/qpdf/QPDFObjectHandle.hh:1242-1254`) | [`ObjectHandle::get_page_contents`], [`ObjectHandle::add_page_contents`], [`ObjectHandle::rotate_page`], [`ObjectHandle::coalesce_content_streams`] | `object_handle_content_shape_tests.rs` and `object_handle_page_content_pipeline_tests.rs` |
 //! | `isFormXObject`, `isImage` (`include/qpdf/QPDFObjectHandle.hh:1328-1334`) | [`ObjectHandle::is_form_xobject`], [`ObjectHandle::is_image`] | `object_handle_content_shape_tests.rs::form_and_image_classification_matches_qpdf` |
@@ -3716,6 +3717,49 @@ impl ObjectHandle {
             // Any other shape combination for an existing rtype: untouched,
             // matching qpdf's own fallthrough (neither the dictionary nor
             // the array arm matches, and there is no further branch).
+        }
+        Ok(())
+    }
+
+    /// Make every direct value in every dictionary-valued top-level resource
+    /// category indirect, mirroring `QPDFObjectHandle::makeResourcesIndirect`
+    /// (`libqpdf/QPDFObjectHandle.cc:1042-1060`). The category dictionaries
+    /// themselves are not promoted and the walk does not recurse into a
+    /// promoted value. qpdf registers the existing `QPDFObject` allocation
+    /// with `QPDF::makeIndirectObject` (`libqpdf/QPDF.cc:1882-1894`), so the
+    /// Rust path uses the canonical in-place promotion primitive rather than a
+    /// shallow or materialized clone.
+    ///
+    /// `owning_pdf` is mutable because promotion updates its canonical object
+    /// registry and the live dictionary mutation must be reported to its
+    /// writer dirty-set. This corresponds to qpdf's
+    /// `init_dr_map` call order, which performs this normalization before
+    /// `mergeResources` (`libqpdf/QPDFAcroFormDocumentHelper.cc:775-800`).
+    pub fn make_resources_indirect<R: std::io::Read + std::io::Seek + 'static>(
+        &self,
+        owning_pdf: &mut crate::Pdf<R>,
+    ) -> Result<()> {
+        let Some(top_entries) = self.try_as_dictionary()? else {
+            return Ok(());
+        };
+
+        for (_resource_type, category) in top_entries {
+            let Some(category_entries) = category.try_as_dictionary()? else {
+                continue;
+            };
+            let mut changed = false;
+            for (name, value) in category_entries {
+                if value.is_indirect() {
+                    continue;
+                }
+                let indirect = owning_pdf.make_indirect_from_object_handle(value)?;
+                category.replace_key(&name, indirect)?;
+                changed = true;
+            }
+            if changed {
+                let dirty_result = owning_pdf.mark_object_handle_dirty(&category);
+                dirty_result?; // cov:ignore: successful ? continuation has no llvm-cov region; call is covered on the prior line
+            } // cov:ignore: branch closing brace has no llvm-cov region after successful ? continuation
         }
         Ok(())
     }
@@ -18003,6 +18047,68 @@ mod mutation_tests {
         dict.merge_resources(&scalar, None).expect("merge");
         assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
         assert!(dict.get_key(b"/B").is_null());
+    }
+
+    #[test]
+    fn make_resources_indirect_promotes_direct_second_level_values_only() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let direct_font = ObjectHandle::integer(1);
+        let direct_font_alias = direct_font.clone();
+        let direct_nested =
+            ObjectHandle::dictionary(vec![(b"/Child".to_vec(), ObjectHandle::integer(2))]);
+        let direct_nested_alias = direct_nested.clone();
+        let already_indirect = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(3))
+            .expect("allocate an already-indirect resource");
+        let direct_category = ObjectHandle::dictionary(vec![
+            (b"/F1".to_vec(), direct_font),
+            (b"/F2".to_vec(), already_indirect.clone()),
+            (b"/Nested".to_vec(), direct_nested),
+        ]);
+        let resources = ObjectHandle::dictionary(vec![
+            (b"/Font".to_vec(), direct_category),
+            (
+                b"/ProcSet".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+            ),
+        ]);
+
+        resources
+            .make_resources_indirect(&mut pdf)
+            .expect("promote direct resource values");
+
+        let font = resources.get_key(b"/Font");
+        let promoted_font = font.get_key(b"/F1");
+        assert!(promoted_font.is_indirect());
+        assert!(direct_font_alias.is_indirect());
+        assert!(promoted_font.is_same_object_as(&direct_font_alias));
+        assert_eq!(promoted_font.as_integer(), Some(1));
+        assert!(font.get_key(b"/F2").is_same_object_as(&already_indirect));
+
+        let promoted_nested = font.get_key(b"/Nested");
+        assert!(promoted_nested.is_indirect());
+        assert!(direct_nested_alias.is_indirect());
+        assert!(promoted_nested.is_same_object_as(&direct_nested_alias));
+        assert!(promoted_nested.get_key(b"/Child").is_direct());
+
+        assert!(
+            font.is_direct(),
+            "the category dictionary itself stays direct"
+        );
+        assert!(resources.get_key(b"/ProcSet").is_direct());
+    }
+
+    #[test]
+    fn make_resources_indirect_is_a_noop_for_non_dictionary_receivers() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let value = ObjectHandle::integer(1);
+
+        value
+            .make_resources_indirect(&mut pdf)
+            .expect("non-dictionary receivers are ignored");
+
+        assert!(value.is_direct());
+        assert_eq!(value.as_integer(), Some(1));
     }
 
     // qpdf privatizes an incoming resource value with `shallowCopy`
