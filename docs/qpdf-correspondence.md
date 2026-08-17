@@ -211,7 +211,7 @@ paths and Windows directory-open failures for both metadata helpers.
 | `QPDFXRefEntry.cc` | 51 | `xref_entry.rs`（`XrefEntry` = free / uncompressed / compressed の 3 variant）。consumer は `xref.rs` / `reader.rs` / `cache.rs` / `writer.rs` / `writer/{object_streams,plain/plan}.rs` / `linearization/{writer,plan}.rs` | ✅ `flpdf-qxba.9.2` で完全 cutover（`XrefOffset` 削除）。`xref.rs` 側に型定義は残っていない |
 | `PDFVersion.cc` | 68 | `pdf_version.rs` の `PdfVersion` | ✅ |
 | `QPDFMatrix.cc` | 140 | `matrix.rs` の `Matrix` / `Rectangle` | ✅ |
-| `QPDFObjectHandle::mergeResources` / `shallowCopy` | `QPDFObjectHandle.cc:1063-1147,2072-2079` | `object_handle.rs:3692` + `page_annotation_flatten.rs:666-740`（widget appearance の既定リソース consumer） | ✅ live `ObjectHandle::merge_resources` を使用。missing category は top-level が direct の shallow copy になり、nested indirect child は handle を保持する。`overlay_annotations.rs` の `merge_resources_shallow` は別責務の name-conflict overlay merge として残る |
+| `QPDFObjectHandle::mergeResources` / `shallowCopy` | `QPDFObjectHandle.cc:1063-1147,2072-2079` | `object_handle.rs:3692` + `page_annotation_flatten.rs:666-740`（widget appearance の既定リソース consumer） | ✅ live `ObjectHandle::merge_resources` を使用。missing category は top-level が direct の shallow copy になり、nested indirect child は handle を保持する。array の `isScalar` 判定と unique-name pool の second-level dictionary 判定は qpdf と同じく各 nested handle を解決し、解決エラーを伝播する。`overlay_annotations.rs` の `merge_resources_shallow` は別責務の name-conflict overlay merge として残る |
 
 ## 2. パース / 読み取り
 
