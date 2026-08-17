@@ -142,7 +142,7 @@ struct AcroFormCache {
 
 /// The objects produced by qpdf's
 /// `QPDFAcroFormDocumentHelper::transformAnnotations`
-/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:699-1060`).
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:699-1014`).
 ///
 /// `old_fields` identifies source top-level fields that must be removed before
 /// the transformed copies are installed. `new_fields` contains the copied
