@@ -23,10 +23,13 @@
 //!    references to the dest AcroForm `/DR`, and append the transformed annots
 //!    to the destination page `/Annots`. Returns the list of new top-level
 //!    field dest refs added by this placement.
-//! 4. The caller passes the collected top-level field handles to
-//!    [`crate::AcroFormDocumentHelper::add_and_rename_form_fields`] once per
-//!    destination page after all placements. That canonical helper performs
-//!    qpdf's frozen-cache rename pass and appends to `/AcroForm/Fields`.
+//! 4. The caller passes this placement's new top-level field handles to
+//!    [`crate::AcroFormDocumentHelper::add_and_rename_form_fields`]
+//!    immediately after this placement, not batched across every placement
+//!    on the destination page: qpdf's `copyAnnotations`
+//!    (`libqpdf/QPDFPageObjectHelper.cc:1030`) finalizes each placement's
+//!    fields before the next placement's frozen-cache rename pass runs, so a
+//!    later placement observes an earlier placement's renames.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
