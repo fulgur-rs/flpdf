@@ -218,6 +218,9 @@ fn flatten_annotations_on_page<R: Read + Seek>(
                 continue;
             }
             let Some(annot_ref) = annot_ref else {
+                if qpdf_flag_contract && has_appearance {
+                    to_remove.push(annotation.clone());
+                }
                 continue;
             };
             match resolve_ap_n(pdf, annot_ref)? {
@@ -1675,6 +1678,15 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+        // qpdf's flattenAnnotationsForPage drops an annotation whose selected
+        // appearance is unusable but whose /AP dictionary is present
+        // (QPDFPageDocumentHelper.cc: "ignore annotation with no appearance"),
+        // regardless of whether the annotation itself is direct or indirect.
+        let page = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+        assert!(
+            page.as_dict().unwrap().get("Annots").is_none(),
+            "a direct annotation with an unusable legacy-bridge appearance must be dropped"
         );
     }
 
