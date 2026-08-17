@@ -272,6 +272,62 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(annotation_to_field)
     }
 
+    /// Return the distinct live handles represented by qpdf's
+    /// `field_to_annotations` map, which is the source of
+    /// `QPDFAcroFormDocumentHelper::getFormFields`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:163-174`).
+    ///
+    /// The ref-valued public map is only a projection for legacy callers. A
+    /// mutating consumer must retain these canonical handles so a later edit
+    /// cannot fall back to a stale materialized [`Object`].
+    pub(crate) fn form_field_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+        let mut fields = BTreeMap::new();
+        for field in self.canonical_annotation_to_field_map()?.into_values() {
+            if let Some(field_ref) = field.object_ref() {
+                fields.entry(field_ref).or_insert(field);
+            }
+        }
+        Ok(fields.into_values().collect())
+    }
+
+    /// Remove selected top-level fields from the live `/AcroForm /Fields`
+    /// array, mirroring qpdf's `removeFormFields`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:112-151`).
+    ///
+    /// The array handle is mutated in place. This preserves an indirect
+    /// `/Fields` holder and lets owner-aware dirty marking handle a direct
+    /// array nested in an indirect `/AcroForm` object.
+    pub(crate) fn remove_form_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) -> Result<bool> {
+        let Some(acroform) = self.canonical_acroform()? else {
+            return Ok(false);
+        };
+        let fields = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+        let Some(items) = fields.as_array() else {
+            return Ok(false);
+        };
+
+        let indexes: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                item.object_ref()
+                    .filter(|field_ref| to_remove.contains(field_ref))
+                    .map(|_| index)
+            })
+            .collect();
+        if indexes.is_empty() {
+            return Ok(false);
+        }
+
+        for index in indexes.iter().rev().copied() {
+            fields.erase_array_item(index)?;
+        }
+        self.pdf.mark_object_handle_dirty(&fields)?;
+        Ok(true)
+    }
+
     /// Return the live field handle for a widget annotation, mirroring
     /// `QPDFAcroFormDocumentHelper::getFieldForAnnotation`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:218-232`).
