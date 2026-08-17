@@ -1164,18 +1164,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(created)
     }
 
-    // GAP(QPDFObjectHandle::makeResourcesIndirect): qpdf's `init_dr_map`
-    // (`QPDFAcroFormDocumentHelper.cc:772-800`) calls
-    // `dr.makeResourcesIndirect(this->qpdf)` and
-    // `from_dr.makeResourcesIndirect(this->qpdf)` before `mergeResources`,
-    // making every direct second-level resource entry (e.g. each `/Font`
-    // sub-key) indirect first. flpdf has no equivalent primitive anywhere in
-    // the workspace (same gap already recorded at
-    // `crates/flpdf-qtest-tools/src/driver/test_56_63.rs:296`), so a foreign
-    // field whose `/DR` sub-resources were direct in either document merges
-    // with different indirect-object numbering than qpdf's output. Tracked
-    // as a prerequisite before this path becomes reachable from a public
-    // caller.
     fn prepare_foreign_resource_plan<RS: Read + Seek>(
         &mut self,
         source_resources: Option<ObjectHandle>,
@@ -1183,12 +1171,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ) -> Result<ForeignResourcePlan> {
         let destination_resources = self.canonical_get_or_create_acroform_resources()?;
         let mut conflicts = ResourceConflicts::new();
+        destination_resources.make_resources_indirect(self.pdf)?;
         // A missing source `/DR` mirrors qpdf's null `from_dr`
         // (`QPDFAcroFormDocumentHelper.cc:730-732`): the destination `/DR`
         // still gets created/promoted above, but there is nothing to merge.
         if let Some(source_resources) = source_resources {
             let source_resources = ensure_foreign_indirect(source, source_resources)?;
             let source_resources = self.pdf.copy_foreign_object(&source_resources)?;
+            source_resources.make_resources_indirect(self.pdf)?;
             destination_resources.merge_resources(&source_resources, Some(&mut conflicts))?;
         }
         self.pdf.mark_object_handle_dirty(&destination_resources)?;
@@ -5077,6 +5067,45 @@ mod tests {
         let created = helper.canonical_get_or_create_acroform_resources().unwrap();
         assert!(created.object_ref().is_some());
         assert!(created.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn prepare_foreign_resource_plan_indirectizes_both_dr_second_level_values() {
+        let mut target = empty_pdf();
+        let target_root = target.get_object_handle(ObjectRef::new(1, 0));
+        target_root.try_dereference().unwrap();
+        target_root
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/DR".to_vec(),
+                    ObjectHandle::dictionary(vec![(
+                        b"/Font".to_vec(),
+                        ObjectHandle::dictionary(vec![(
+                            b"/F0".to_vec(),
+                            ObjectHandle::integer(10),
+                        )]),
+                    )]),
+                )]),
+            )
+            .unwrap();
+
+        let source_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(11))]),
+        )]);
+        let mut source = empty_pdf();
+        let plan = AcroFormDocumentHelper::new(&mut target)
+            .prepare_foreign_resource_plan(Some(source_resources), &mut source)
+            .unwrap();
+
+        let font = plan.destination_resources.try_get_key(b"/Font").unwrap();
+        assert!(
+            font.is_direct(),
+            "qpdf keeps the category dictionary direct"
+        );
+        assert!(font.try_get_key(b"/F0").unwrap().is_indirect());
+        assert!(font.try_get_key(b"/F1").unwrap().is_indirect());
     }
 
     #[test]
