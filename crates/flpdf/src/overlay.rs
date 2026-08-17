@@ -389,10 +389,15 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     }
     dest.set_object(dest_page_ref, Object::Dictionary(page_dict));
 
-    // 6. Finalize: append the accumulated new top-level fields to
-    //    /AcroForm/Fields, renaming /T on FQN collision with existing dest
-    //    fields (qpdf's addAndRenameFormFields).
-    crate::overlay_annotations::add_and_rename_form_fields(dest, new_top_fields)?;
+    // 6. Finalize through the canonical ObjectHandle helper: qpdf's
+    // addAndRenameFormFields analyzes the destination once, freezes that
+    // qualified-name cache during the BFS rename pass, and appends all copied
+    // fields only after the pass (`QPDFAcroFormDocumentHelper.cc:62-110`).
+    let new_top_field_handles = new_top_fields
+        .into_iter()
+        .map(|field_ref| dest.get_object_handle(field_ref))
+        .collect();
+    crate::AcroFormDocumentHelper::new(dest).add_and_rename_form_fields(new_top_field_handles)?;
 
     Ok(())
 }
@@ -1610,11 +1615,9 @@ mod byte_gate {
     /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
     /// indirect reference (`/Fields 5 0 R`) instead of a direct array —
     /// a valid PDF shape. Exercises
-    /// `read_existing_top_field_refs`'s Reference branch,
-    /// `collect_fully_qualified_names`'s indirect-`/Kids` handling on
-    /// the same axis, and `add_and_rename_form_fields`'s indirect-Fields
-    /// append (updates the array object in place rather than storing a
-    /// new direct array on the AcroForm).
+    /// the canonical helper's indirect `/Fields` append (updates the array
+    /// object in place rather than storing a new direct array on the
+    /// AcroForm).
     ///
     /// Fixture: `fxo-red-indirect-fields.pdf` is fxo-red with a hand-added
     /// `/AcroForm { /Fields <ref> }` whose Fields ref points at a
@@ -1676,9 +1679,9 @@ mod byte_gate {
     /// every placement (the source page is repeated onto all 16 dest
     /// pages, so the rename runs 16 times: "Text Box 1+1", "Text Box 1+2",
     /// ...). Also exercises `ensure_dest_acroform_dr`'s existing-`/DR`
-    /// short-circuit, `add_and_rename_form_fields`'s reference-`/AcroForm`
-    /// / reference-`/Fields` paths, `collect_fully_qualified_names` over
-    /// the pre-existing field, and the tail of `duplicate_field_tree` that
+    /// short-circuit, the canonical helper's reference-`/AcroForm` and
+    /// reference-`/Fields` paths over the pre-existing field, and the tail of
+    /// `duplicate_field_tree` that
     /// leaves an existing dest `/DR` untouched.
     ///
     /// Fixture: `fxo-red-with-existing-acroform.pdf` is fxo-red with a
