@@ -198,8 +198,10 @@ fn json_dictionary_key(key: &[u8]) -> Result<Vec<u8>> {
     if key.starts_with(b"n:/") && key.len() > 3 {
         let parsed = ObjectHandle::parse(&key[2..])?;
         let name = parsed.as_name().ok_or_else(|| {
+            // cov:ignore-start: a successful parse of slash-prefixed input cannot yield a non-name
             Error::Internal("PDF dictionary key parser returned a non-name".into())
-        })?;
+            // cov:ignore-end
+        })?; // cov:ignore: same parser invariant
         let mut canonical = Vec::with_capacity(name.len() + 1);
         canonical.push(b'/');
         canonical.extend_from_slice(&name);
