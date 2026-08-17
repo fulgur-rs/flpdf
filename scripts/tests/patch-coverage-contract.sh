@@ -21,14 +21,14 @@ make_fixture_repo() {
   git -C "${fixture_repo}" config user.name contract
   printf '%s\n' base >"${fixture_repo}/README"
   git -C "${fixture_repo}" add README scripts/patch-coverage.sh
-  git -C "${fixture_repo}" commit --no-gpg-sign -qm base
+  git -C "${fixture_repo}" commit --no-gpg-sign --no-verify -qm base
   local base_commit
   base_commit="$(git -C "${fixture_repo}" rev-parse HEAD)"
 
   printf '%s\n' "${source_body}" >"${fixture_repo}/${source_path}"
   : >"${fixture_repo}/report.lcov"
   git -C "${fixture_repo}" add "${source_path}" report.lcov
-  git -C "${fixture_repo}" commit --no-gpg-sign -qm change
+  git -C "${fixture_repo}" commit --no-gpg-sign --no-verify -qm change
 
   printf '%s\n%s\n' "${fixture_repo}" "${base_commit}"
 }
