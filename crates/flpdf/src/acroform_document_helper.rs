@@ -567,13 +567,19 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             override_q: source_defaults.quadding != target_defaults.quadding,
             source_default_q: source_defaults.quadding,
         };
-        let foreign_resources = if source_defaults.resources.is_some()
-            && source_annotations
-                .iter()
-                .any(|(_, top_field)| top_field.is_some())
+        // qpdf's `init_dr_map` (`QPDFAcroFormDocumentHelper.cc:772-800`) is
+        // gated only on there being a field to copy (`foreign` plus at least
+        // one field object in the traversal queue), not on the source having
+        // a `/DR` at all: `from_dr` stays `QPDFObjectHandle::newNull()` when
+        // absent, and `makeResourcesIndirect`/`mergeResources` are safe
+        // no-ops on a null handle. The destination `/AcroForm/DR` still gets
+        // created/promoted to an indirect dictionary either way.
+        let foreign_resources = if source_annotations
+            .iter()
+            .any(|(_, top_field)| top_field.is_some())
         {
-            let source_resources = source_defaults.resources.clone().expect("checked above");
-            let plan = self.prepare_foreign_resource_plan(source_resources, source)?;
+            let plan =
+                self.prepare_foreign_resource_plan(source_defaults.resources.clone(), source)?;
             Some(plan)
         } else {
             None
@@ -754,6 +760,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if resources.renames.is_empty() {
             return Ok(());
         }
+        // qpdf's `adjustDefaultAppearances` decodes `/DA` via `getUTF8Value()`
+        // before tokenizing it as content-stream syntax
+        // (`QPDFAcroFormDocumentHelper.cc:596`), rather than tokenizing the
+        // raw stored bytes; the filtered result is then written back as raw
+        // bytes via `newString`, not re-encoded through `newUnicodeString`
+        // (`:609`).
+        let default_appearance = decode_field_name(&default_appearance).into_bytes();
         let Some(rewritten) = replace_resource_names(&default_appearance, &resources.renames)?
         else {
             let warning = "Unable to parse /DA while remapping foreign AcroForm resources";
@@ -1000,16 +1013,33 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(created)
     }
 
+    // GAP(QPDFObjectHandle::makeResourcesIndirect): qpdf's `init_dr_map`
+    // (`QPDFAcroFormDocumentHelper.cc:772-800`) calls
+    // `dr.makeResourcesIndirect(this->qpdf)` and
+    // `from_dr.makeResourcesIndirect(this->qpdf)` before `mergeResources`,
+    // making every direct second-level resource entry (e.g. each `/Font`
+    // sub-key) indirect first. flpdf has no equivalent primitive anywhere in
+    // the workspace (same gap already recorded at
+    // `crates/flpdf-qtest-tools/src/driver/test_56_63.rs:296`), so a foreign
+    // field whose `/DR` sub-resources were direct in either document merges
+    // with different indirect-object numbering than qpdf's output. Tracked
+    // as a prerequisite before this path becomes reachable from a public
+    // caller.
     fn prepare_foreign_resource_plan<RS: Read + Seek>(
         &mut self,
-        source_resources: ObjectHandle,
+        source_resources: Option<ObjectHandle>,
         source: &mut Pdf<RS>,
     ) -> Result<ForeignResourcePlan> {
-        let source_resources = ensure_foreign_indirect(source, source_resources)?;
-        let source_resources = self.pdf.copy_foreign_object(&source_resources)?;
         let destination_resources = self.canonical_get_or_create_acroform_resources()?;
         let mut conflicts = ResourceConflicts::new();
-        destination_resources.merge_resources(&source_resources, Some(&mut conflicts))?;
+        // A missing source `/DR` mirrors qpdf's null `from_dr`
+        // (`QPDFAcroFormDocumentHelper.cc:730-732`): the destination `/DR`
+        // still gets created/promoted above, but there is nothing to merge.
+        if let Some(source_resources) = source_resources {
+            let source_resources = ensure_foreign_indirect(source, source_resources)?;
+            let source_resources = self.pdf.copy_foreign_object(&source_resources)?;
+            destination_resources.merge_resources(&source_resources, Some(&mut conflicts))?;
+        }
         self.pdf.mark_object_handle_dirty(&destination_resources)?;
         Ok(ForeignResourcePlan {
             destination_resources,
@@ -4105,6 +4135,124 @@ mod tests {
     }
 
     #[test]
+    fn foreign_transform_resets_field_dr_even_when_source_has_no_document_level_dr() {
+        // qpdf's `init_dr_map` (`QPDFAcroFormDocumentHelper.cc:772-800`) is
+        // gated only on there being a field to copy, not on the source
+        // having a document-level `/DR`: `from_dr` stays null and
+        // `mergeResources` no-ops on it, but the destination `/AcroForm/DR`
+        // still gets created/promoted, and the copied field's own `/DR` (if
+        // it has one) still gets reset to point at it
+        // (`QPDFAcroFormDocumentHelper.cc:928-930`, unconditional on
+        // `dr_map.empty()`).
+        let mut source = empty_pdf();
+        source.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7]))])),
+                ),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                ("Annots", refs(&[9])),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("T", Object::String(b"field".to_vec())),
+                // The field carries its own /DR even though the source
+                // document's /AcroForm has none at all.
+                ("DR", Object::Reference(ObjectRef::new(10, 0))),
+                ("Kids", refs(&[9])),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(7, 0))),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(10),
+                        Object::Integer(20),
+                        Object::Integer(30),
+                        Object::Integer(40),
+                    ]),
+                ),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(10, 0),
+            Object::Dictionary(dict(&[(
+                "Font",
+                Object::Dictionary(dict(&[("Fsrc", Object::Integer(1))])),
+            )])),
+        );
+
+        let source_annots = source
+            .get_object_handle(ObjectRef::new(3, 0))
+            .try_get_key(b"/Annots")
+            .unwrap();
+        let mut target = empty_pdf();
+        target.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    // The destination also has no /DR yet -- it must be
+                    // created, not left absent.
+                    Object::Dictionary(dict(&[("Fields", Object::Array(Vec::new()))])),
+                ),
+            ])),
+        );
+        target.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+
+        let transformed = AcroFormDocumentHelper::new(&mut target)
+            .transform_annotations_from(source_annots, Matrix::default(), &mut source)
+            .unwrap();
+        let copied_field = &transformed.new_fields[0];
+        let target_dr = target
+            .get_object_handle(ObjectRef::new(1, 0))
+            .try_get_key(b"/AcroForm")
+            .unwrap()
+            .try_get_key(b"/DR")
+            .unwrap();
+        assert!(
+            target_dr.object_ref().is_some(),
+            "destination /AcroForm/DR must be created even when the source has none"
+        );
+        assert_eq!(
+            copied_field.try_get_key(b"/DR").unwrap().object_ref(),
+            target_dr.object_ref(),
+            "the copied field's own /DR must be reset to the destination's canonical /DR"
+        );
+    }
+
+    #[test]
     fn copy_field_tree_skips_stream_kids() {
         let mut pdf = empty_pdf();
         pdf.set_object(
@@ -4189,6 +4337,45 @@ mod tests {
         assert_eq!(
             invalid.try_get_key(b"/DA").unwrap().as_string(),
             Some(b"/Fsrc 10 Tf [".to_vec())
+        );
+    }
+
+    #[test]
+    fn adjust_foreign_field_resources_decodes_a_utf16_da_before_rewriting() {
+        // qpdf's `adjustDefaultAppearances` decodes `/DA` via `getUTF8Value()`
+        // before tokenizing it (`QPDFAcroFormDocumentHelper.cc:596`), then
+        // writes the filtered result back as raw bytes via `newString`
+        // (`:609`), not re-encoded through `newUnicodeString`. A `/DA` stored
+        // as UTF-16BE (the qpdf-oracle-mandatory case for non-PDFDocEncoded
+        // text) must decode correctly before the resource-name tokenizer
+        // ever sees it.
+        let mut pdf = empty_pdf();
+        let destination_resources = ObjectHandle::dictionary(Vec::new());
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"Fsrc".to_vec(), b"Fsrc_1".to_vec());
+        let plan = ForeignResourcePlan {
+            destination_resources,
+            renames,
+        };
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+
+        // UTF-16BE (with BOM) encoding of "/Fsrc 10 Tf".
+        let utf16_da: Vec<u8> = vec![
+            0xfe, 0xff, 0x00, 0x2f, 0x00, 0x46, 0x00, 0x73, 0x00, 0x72, 0x00, 0x63, 0x00, 0x20,
+            0x00, 0x31, 0x00, 0x30, 0x00, 0x20, 0x00, 0x54, 0x00, 0x66,
+        ];
+        let field =
+            ObjectHandle::dictionary(vec![(b"/DA".to_vec(), ObjectHandle::string(utf16_da))]);
+        helper
+            .adjust_foreign_field_resources(&field, &plan)
+            .unwrap();
+        assert_eq!(
+            field.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Fsrc_1 10 Tf".to_vec()),
+            "a UTF-16BE-encoded /DA must decode before rewriting, not corrupt the tokenizer input"
         );
     }
 
