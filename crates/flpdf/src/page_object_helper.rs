@@ -1399,19 +1399,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(result)
     }
 
-    /// Return indirect annotation references using qpdf's filtered,
-    /// fail-soft enumeration boundary. This is the canonical consumer API for
-    /// ref-based helpers such as `AnnotationObjectHelper`; direct annotation
-    /// dictionaries remain available through [`Self::get_annotation_handles`].
+    /// Return canonical annotation handles using qpdf's filtered, fail-soft
+    /// enumeration boundary. Direct and indirect annotation dictionaries are
+    /// both retained, matching the `QPDFAnnotationObjectHelper` values
+    /// returned by qpdf.
     pub fn get_annotations_filtered(
         &mut self,
         only_subtype: Option<&[u8]>,
-    ) -> Result<Vec<ObjectRef>> {
-        Ok(self
-            .get_annotation_handles(only_subtype)?
-            .into_iter()
-            .filter_map(|annotation| annotation.object_ref())
-            .collect())
+    ) -> Result<Vec<ObjectHandle>> {
+        self.get_annotation_handles(only_subtype)
     }
 
     // -----------------------------------------------------------------------

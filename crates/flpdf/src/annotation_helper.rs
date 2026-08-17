@@ -98,6 +98,14 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         Self { annot, pdf }
     }
 
+    /// Construct a helper from the canonical annotation handle returned by
+    /// [`crate::PageObjectHelper::get_annotation_handles`]. This preserves
+    /// direct annotation dictionaries, which have no [`ObjectRef`], as qpdf's
+    /// `QPDFAnnotationObjectHelper` does.
+    pub fn from_object_handle(annot: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+        Self { annot, pdf }
+    }
+
     /// Resolve `self.annot` and return the key's resolved child handle.
     fn resolved_key(&mut self, key: &[u8]) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle(&self.annot)?;

@@ -2,10 +2,10 @@
 //! Per-page annotation enumeration and widget-to-field linkage.
 //!
 //! [`enumerate_page_annotations`] reads the canonical `/Annots` handle list of
-//! a leaf page, projects indirect entries to the ref-based public result, and
-//! resolves each annotation's `/Subtype` and `/Rect` via
-//! [`AnnotationObjectHelper`], and for Widget annotations resolves the owning
-//! AcroForm field object.
+//! a leaf page, preserves direct and indirect entries in the public result,
+//! and resolves each annotation's `/Subtype` and `/Rect` via
+//! [`AnnotationObjectHelper`]. For Widget annotations it also resolves the
+//! owning AcroForm field object when an indirect identity is available.
 //!
 //! [`enumerate_document_annotations`] is a convenience wrapper that applies
 //! [`enumerate_page_annotations`] to every leaf page in the document.
@@ -28,7 +28,7 @@
 
 use crate::page_object_helper::PageBox;
 use crate::{
-    AcroFormDocumentHelper, AnnotationObjectHelper, Object, ObjectRef, PageObjectHelper, Pdf,
+    AcroFormDocumentHelper, AnnotationObjectHelper, ObjectHandle, ObjectRef, PageObjectHelper, Pdf,
     Result,
 };
 use std::collections::BTreeMap;
@@ -40,10 +40,11 @@ use std::io::{Read, Seek};
 
 /// An annotation enumerated from a leaf page's `/Annots` array, together with
 /// its classification and (for Widget annotations) the linked AcroForm field.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct EnumeratedAnnotation {
-    /// Indirect reference to the annotation dictionary.
-    pub annot_ref: ObjectRef,
+    /// Canonical handle to the annotation dictionary. Direct dictionaries are
+    /// retained here because they have no indirect [`ObjectRef`].
+    pub annotation: ObjectHandle,
 
     /// The `/Subtype` name bytes, resolved from the annotation dictionary
     /// (e.g. `b"Widget"`, `b"Link"`, `b"Text"`, `b"Highlight"`).
@@ -60,12 +61,22 @@ pub struct EnumeratedAnnotation {
     /// `true` when `subtype == Some(b"Widget")`.
     pub is_widget: bool,
 
-    /// For Widget annotations: the top-level [`ObjectRef`] of the AcroForm
-    /// field that qpdf associates with this widget.
+    /// For indirect Widget annotations: the top-level [`ObjectRef`] of the
+    /// AcroForm field that qpdf associates with this widget.
     ///
     /// `None` for non-Widget annotations, or when qpdf's AcroForm analysis has
     /// no field association for the widget.
     pub field_ref: Option<ObjectRef>,
+}
+
+impl PartialEq for EnumeratedAnnotation {
+    fn eq(&self, other: &Self) -> bool {
+        self.annotation.is_same_object_as(&other.annotation)
+            && self.subtype == other.subtype
+            && self.rect == other.rect
+            && self.is_widget == other.is_widget
+            && self.field_ref == other.field_ref
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -78,9 +89,8 @@ pub struct EnumeratedAnnotation {
 /// # Algorithm
 ///
 /// 1. Call [`PageObjectHelper::get_annotations_filtered`] to obtain the
-///    ordered indirect annotation [`ObjectRef`] projection from the canonical
-///    `/Annots` handle list.
-/// 2. For each ref, use [`AnnotationObjectHelper`] to read `/Subtype` and
+///    ordered canonical annotation handles from the `/Annots` list.
+/// 2. For each handle, use [`AnnotationObjectHelper`] to read `/Subtype` and
 ///    `/Rect`.
 /// 3. Determine [`EnumeratedAnnotation::is_widget`].
 /// 4. For Widget annotations, resolve the qpdf field association and walk it
@@ -108,8 +118,8 @@ pub struct EnumeratedAnnotation {
 ///     let annots = enumerate_page_annotations(&mut pdf, page_ref)?;
 ///     for a in &annots {
 ///         println!(
-///             "annot {} subtype={:?} is_widget={}",
-///             a.annot_ref,
+///             "annot {:?} subtype={:?} is_widget={}",
+///             a.annotation.object_ref(),
 ///             a.subtype.as_deref().map(|s| String::from_utf8_lossy(s).into_owned()),
 ///             a.is_widget,
 ///         );
@@ -142,30 +152,31 @@ fn enumerate_page_annotations_with_cache<R: Read + Seek>(
     page_ref: ObjectRef,
     field_refs_by_annotation: &mut Option<BTreeMap<ObjectRef, ObjectRef>>,
 ) -> Result<Vec<EnumeratedAnnotation>> {
-    // Step 1: obtain annotation refs (PageObjectHelper is dropped after this call).
-    let annot_refs = {
+    // Step 1: obtain canonical annotation handles (PageObjectHelper is
+    // dropped after this call). Direct dictionaries must remain in this list.
+    let annotations = {
         let mut page_helper = PageObjectHelper::new(page_ref, pdf);
         page_helper.get_annotations_filtered(None)?
     };
 
-    let mut result = Vec::with_capacity(annot_refs.len());
+    let mut result = Vec::with_capacity(annotations.len());
     let mut has_widget = false;
 
-    for annot_ref in annot_refs {
+    for annotation in annotations {
         // Step 2: read /Subtype and /Rect via AnnotationObjectHelper (dropped
         // after each call). /Rect presence is checked directly rather than
         // via `get_rect`'s qpdf-faithful fail-soft default (which cannot
         // distinguish an absent `/Rect` from a present-but-degenerate one),
         // preserving this module's existing "no /Rect -> None" contract for
         // its `page_annotation_flatten.rs` consumer.
-        let raw_subtype = AnnotationObjectHelper::new(annot_ref, pdf).get_subtype()?;
+        let raw_subtype =
+            AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?;
         let subtype = (!raw_subtype.is_empty()).then_some(raw_subtype);
-        let has_rect_key = pdf
-            .resolve_borrowed(annot_ref)?
-            .as_dict()
-            .is_some_and(|d| !matches!(d.get("Rect"), None | Some(Object::Null)));
+        let rect_value =
+            pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
+        let has_rect_key = !rect_value.is_null();
         let rect = has_rect_key
-            .then(|| AnnotationObjectHelper::new(annot_ref, pdf).get_rect())
+            .then(|| AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_rect())
             .transpose()?;
 
         // Step 3: classify.
@@ -173,7 +184,7 @@ fn enumerate_page_annotations_with_cache<R: Read + Seek>(
         has_widget |= is_widget;
 
         result.push(EnumeratedAnnotation {
-            annot_ref,
+            annotation,
             subtype,
             rect,
             is_widget,
@@ -193,7 +204,10 @@ fn enumerate_page_annotations_with_cache<R: Read + Seek>(
             .expect("populated immediately above");
         for annotation in &mut result {
             if annotation.is_widget {
-                annotation.field_ref = map.get(&annotation.annot_ref).copied();
+                annotation.field_ref = annotation
+                    .annotation
+                    .object_ref()
+                    .and_then(|annot_ref| map.get(&annot_ref).copied());
             }
         }
     }
@@ -270,7 +284,7 @@ pub fn enumerate_document_annotations<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectRef, Pdf};
+    use crate::{Object, ObjectHandle, ObjectRef, Pdf};
     use std::io::Cursor;
 
     // -----------------------------------------------------------------------
@@ -395,7 +409,10 @@ mod tests {
         assert_eq!(annots.len(), 3);
 
         // First: Widget
-        assert_eq!(annots[0].annot_ref, ObjectRef::new(4, 0));
+        assert_eq!(
+            annots[0].annotation.object_ref(),
+            Some(ObjectRef::new(4, 0))
+        );
         assert_eq!(annots[0].subtype.as_deref(), Some(b"Widget" as &[u8]));
         assert!(annots[0].is_widget);
         // Merged widget — field_ref should be annot itself
@@ -403,17 +420,46 @@ mod tests {
         assert_eq!(annots[0].rect, Some(PageBox::new(10.0, 20.0, 100.0, 30.0)));
 
         // Second: Link
-        assert_eq!(annots[1].annot_ref, ObjectRef::new(5, 0));
+        assert_eq!(
+            annots[1].annotation.object_ref(),
+            Some(ObjectRef::new(5, 0))
+        );
         assert_eq!(annots[1].subtype.as_deref(), Some(b"Link" as &[u8]));
         assert!(!annots[1].is_widget);
         assert_eq!(annots[1].field_ref, None);
 
         // Third: Text (no rect)
-        assert_eq!(annots[2].annot_ref, ObjectRef::new(6, 0));
+        assert_eq!(
+            annots[2].annotation.object_ref(),
+            Some(ObjectRef::new(6, 0))
+        );
         assert_eq!(annots[2].subtype.as_deref(), Some(b"Text" as &[u8]));
         assert!(!annots[2].is_widget);
         assert_eq!(annots[2].field_ref, None);
         assert_eq!(annots[2].rect, None);
+    }
+
+    #[test]
+    fn direct_annotation_dictionary_is_enumerated_without_projection_loss() {
+        let obj4: &[u8] =
+            b"4 0 obj\n<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] >>\nendobj\n";
+        let bytes = build_pdf(
+            Some("[<< /Type /Annot /Subtype /Text /Rect [10 10 20 20] >> 4 0 R]"),
+            &[(4, obj4)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annotations = enumerate_page_annotations(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+
+        assert_eq!(annotations.len(), 2);
+        assert!(annotations[0].annotation.is_direct());
+        assert_eq!(annotations[0].annotation.object_ref(), None);
+        assert_eq!(annotations[0].subtype.as_deref(), Some(b"Text" as &[u8]));
+        assert_eq!(
+            annotations[1].annotation.object_ref(),
+            Some(ObjectRef::new(4, 0))
+        );
+        assert_eq!(annotations[1].subtype.as_deref(), Some(b"Link" as &[u8]));
     }
 
     // -----------------------------------------------------------------------
@@ -847,7 +893,7 @@ mod tests {
     #[test]
     fn enumerated_annotation_clone_and_eq() {
         let a = EnumeratedAnnotation {
-            annot_ref: ObjectRef::new(4, 0),
+            annotation: ObjectHandle::new_indirect_unresolved(ObjectRef::new(4, 0), 0),
             subtype: Some(b"Widget".to_vec()),
             rect: Some(PageBox::new(0.0, 0.0, 100.0, 20.0)),
             is_widget: true,

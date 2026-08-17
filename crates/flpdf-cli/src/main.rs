@@ -3411,8 +3411,10 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
     for (_page_ref, annots) in enumerate_document_annotations(pdf)? {
         for annot in annots {
             if annot.is_widget {
-                if let Some(field_ref) = field_refs_by_annotation.get(&annot.annot_ref).copied() {
-                    candidates.push((field_ref, annot.annot_ref));
+                if let Some(annot_ref) = annot.annotation.object_ref() {
+                    if let Some(field_ref) = field_refs_by_annotation.get(&annot_ref).copied() {
+                        candidates.push((field_ref, annot_ref));
+                    }
                 }
             }
         }
