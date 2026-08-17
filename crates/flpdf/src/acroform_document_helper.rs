@@ -572,10 +572,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .iter()
                 .any(|(_, top_field)| top_field.is_some())
         {
-            Some(self.prepare_foreign_resource_plan(
-                source_defaults.resources.clone().expect("checked above"),
-                source,
-            )?)
+            let source_resources = source_defaults.resources.clone().expect("checked above");
+            let plan = self.prepare_foreign_resource_plan(source_resources, source)?;
+            Some(plan)
         } else {
             None
         };
@@ -757,15 +756,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
         let Some(rewritten) = replace_resource_names(&default_appearance, &resources.renames)?
         else {
-            field.warn_if_possible(
-                "Unable to parse /DA while remapping foreign AcroForm resources",
-            )?;
+            let warning = "Unable to parse /DA while remapping foreign AcroForm resources";
+            field.warn_if_possible(warning)?;
             return Ok(());
         };
         if rewritten != default_appearance {
             field.replace_key(b"/DA", ObjectHandle::string(rewritten))?;
             self.pdf.mark_object_handle_dirty(field)?;
-        }
+        } // cov:ignore: LLVM maps this replacement-branch closing edge separately
         Ok(())
     }
 
@@ -4104,6 +4102,143 @@ mod tests {
             .unwrap()
             .as_integer()
             .is_some());
+    }
+
+    #[test]
+    fn copy_field_tree_skips_stream_kids() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Kids", refs(&[6, 7]))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(Dictionary::new()));
+
+        let top = pdf.get_object_handle(ObjectRef::new(5, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let copied = helper.copy_field_tree(&top, &mut HashMap::new()).unwrap();
+        let kids = copied
+            .try_get_key(b"/Kids")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        assert_eq!(kids.len(), 2);
+    }
+
+    #[test]
+    fn foreign_field_resource_adjustment_handles_empty_and_invalid_da() {
+        let mut pdf = empty_pdf();
+        let destination_resources = ObjectHandle::dictionary(Vec::new());
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"Fsrc".to_vec(), b"Fsrc_1".to_vec());
+        let plan = ForeignResourcePlan {
+            destination_resources: destination_resources.clone(),
+            renames,
+        };
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+
+        let field = ObjectHandle::dictionary(vec![
+            (b"/DR".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            (
+                b"/DA".to_vec(),
+                ObjectHandle::string(b"/Fsrc 10 Tf".to_vec()),
+            ),
+        ]);
+        helper
+            .adjust_foreign_field_resources(&field, &plan)
+            .unwrap();
+        assert!(field
+            .try_get_key(b"/DR")
+            .unwrap()
+            .is_same_object_as(&destination_resources));
+        assert_eq!(
+            field.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Fsrc_1 10 Tf".to_vec())
+        );
+
+        let empty_plan = ForeignResourcePlan {
+            destination_resources: destination_resources.clone(),
+            renames: ResourceRenames::new(),
+        };
+        let unchanged = ObjectHandle::dictionary(vec![(
+            b"/DA".to_vec(),
+            ObjectHandle::string(b"/Fsrc 10 Tf".to_vec()),
+        )]);
+        helper
+            .adjust_foreign_field_resources(&unchanged, &empty_plan)
+            .unwrap();
+        assert_eq!(
+            unchanged.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Fsrc 10 Tf".to_vec())
+        );
+
+        let invalid = ObjectHandle::dictionary(vec![(
+            b"/DA".to_vec(),
+            ObjectHandle::string(b"/Fsrc 10 Tf [".to_vec()),
+        )]);
+        helper
+            .adjust_foreign_field_resources(&invalid, &plan)
+            .unwrap();
+        assert_eq!(
+            invalid.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Fsrc 10 Tf [".to_vec())
+        );
+    }
+
+    #[test]
+    fn canonical_acroform_resources_reuse_indirect_promote_direct_or_create() {
+        let mut pdf = empty_pdf();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let indirect_dr = helper
+            .pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        let root_seed = helper.pdf.get_object_handle(ObjectRef::new(1, 0));
+        let root = helper
+            .pdf
+            .resolve_object_handle_to_terminal(&root_seed)
+            .unwrap();
+        root.replace_key(
+            b"/AcroForm",
+            ObjectHandle::dictionary(vec![(b"/DR".to_vec(), indirect_dr.clone())]),
+        )
+        .unwrap();
+        let reused = helper.canonical_get_or_create_acroform_resources().unwrap();
+        assert_eq!(reused.object_ref(), indirect_dr.object_ref());
+        drop(helper);
+
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[(
+                "AcroForm",
+                Object::Dictionary(dict(&[("DR", Object::Dictionary(Dictionary::new()))])),
+            )])),
+        );
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let promoted = helper.canonical_get_or_create_acroform_resources().unwrap();
+        assert!(promoted.object_ref().is_some());
+        drop(helper);
+
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[(
+                "AcroForm",
+                Object::Dictionary(dict(&[("Fields", Object::Array(Vec::new()))])),
+            )])),
+        );
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let created = helper.canonical_get_or_create_acroform_resources().unwrap();
+        assert!(created.object_ref().is_some());
+        assert!(created.as_dictionary().is_some());
     }
 
     #[test]
