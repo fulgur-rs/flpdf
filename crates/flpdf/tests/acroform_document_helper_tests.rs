@@ -1468,6 +1468,9 @@ fn set_need_appearances_replaces_true_and_removes_false() {
     assert!(!pdf.acroform().get_need_appearances().unwrap());
     let acroform = pdf.resolve(ObjectRef::new(4, 0)).unwrap();
     assert_eq!(acroform.as_dict().unwrap().get("NeedAppearances"), None);
+
+    // qpdf's removeKey is also a no-op when the key is already absent.
+    pdf.acroform().set_need_appearances(false).unwrap();
 }
 
 #[test]
@@ -1507,6 +1510,35 @@ fn generate_appearances_if_needed_updates_widgets_and_clears_marker() {
         .and_then(Object::as_ref_id)
         .expect("generated widget normal appearance");
     assert!(pdf.resolve(normal).unwrap().as_stream().is_some());
+}
+
+#[test]
+fn generate_appearances_if_needed_synchronizes_checkbox_value() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+            ),
+            (4, "<< /Fields [5 0 R] /NeedAppearances true >>"),
+            (
+                5,
+                "<< /Subtype /Widget /FT /Btn /Ff 0 /V /On /AS /Off /Rect [0 0 20 20] /P 3 0 R >>",
+            ),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+    pdf.acroform().generate_appearances_if_needed().unwrap();
+
+    assert!(!pdf.acroform().get_need_appearances().unwrap());
+    let widget = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
+    let widget = widget.as_dict().unwrap();
+    assert!(matches!(widget.get("V"), Some(Object::Name(name)) if name == b"Yes"));
+    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
 }
 
 #[test]

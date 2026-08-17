@@ -1382,7 +1382,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     if form_field.is_checkbox()? || form_field.is_radio_button()? {
                         let value = form_field.field_value()?.unwrap_or_else(ObjectHandle::null);
                         form_field.set_value(value, false)?;
-                    }
+                    } // cov:ignore: llvm-cov maps this covered branch closing brace to a zero-count structural region
                 } else {
                     form_field.generate_appearance_for_handle(widget)?;
                 }
@@ -2943,10 +2943,11 @@ mod tests {
             Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
         );
 
-        let map = AcroFormDocumentHelper::new(&mut pdf)
-            .annotation_to_field_map()
-            .unwrap();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let map = helper.annotation_to_field_map().unwrap();
         assert!(map.is_empty());
+        helper.generate_appearances_if_needed().unwrap();
+        assert!(!helper.get_need_appearances().unwrap());
     }
 
     #[test]
@@ -2957,6 +2958,16 @@ mod tests {
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn appearance_marker_helpers_without_root_are_noops() {
+        let mut pdf = rootless_pdf();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+
+        assert!(!helper.has_acro_form().unwrap());
+        assert!(!helper.get_need_appearances().unwrap());
+        helper.set_need_appearances(false).unwrap();
     }
 
     #[test]

@@ -873,7 +873,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 mod tests {
     use super::mark_field_node_seen;
     use crate::object_handle::ObjectHandle;
-    use crate::ObjectRef;
+    use crate::{ObjectRef, Pdf};
     use std::collections::BTreeSet;
 
     #[test]
@@ -913,5 +913,21 @@ mod tests {
             &mut direct_seen,
             &other_direct
         ));
+    }
+
+    #[test]
+    fn direct_field_has_no_top_level_object_reference() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut helper = super::FormFieldObjectHelper::from_object_handle(
+            ObjectHandle::dictionary(Vec::new()),
+            &mut pdf,
+        );
+
+        let error = helper
+            .get_top_level_field()
+            .expect_err("direct field cannot report an indirect top-level reference");
+        assert!(
+            matches!(error, crate::Error::Unsupported(message) if message.contains("no ObjectRef"))
+        );
     }
 }
