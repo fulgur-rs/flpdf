@@ -2434,6 +2434,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Test: the bridge path (already-supplied /BBox+/Matrix) still resolves
+    // /Rect on its own and returns empty content when /Rect is missing
+    // -----------------------------------------------------------------------
+    #[test]
+    fn bridge_appearance_with_geometry_and_missing_rect_returns_empty() {
+        // AppearanceContentOverrides::with_geometry has no qpdf counterpart
+        // (a flpdf-only legacy-bridge fallback supplying already-normalized
+        // /BBox and /Matrix values), so it resolves /Rect on its own instead
+        // of short-circuiting alongside /BBox. A missing /Rect must still
+        // yield empty content, matching qpdf's rect_obj.isRectangle() check.
+        let (n5, obj5_bytes) = obj_wrap(
+            5,
+            b"<< /Type /XObject /Subtype /Form /Length 0 >>\nstream\n\nendstream\n".to_vec(),
+        );
+        let (n4, obj4_bytes) =
+            obj_dict(4, "<< /Type /Annot /Subtype /Widget /AP << /N 5 0 R >> >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let annotation = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        let content = AnnotationObjectHelper::from_object_handle(annotation, &mut pdf)
+            .get_page_content_for_selected_appearance_with_geometry(
+                "/Fxo1",
+                ObjectRef::new(5, 0),
+                0,
+                0,
+                0,
+                crate::annotation_helper::AppearanceContentOverrides::with_geometry(
+                    Rectangle::new(0.0, 0.0, 10.0, 10.0),
+                    Matrix::default(),
+                    0,
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            content.is_empty(),
+            "a missing /Rect must still short-circuit even when /BBox/Matrix are bridge-supplied"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test: degenerate transformed BBox (zero-area matrix) is skipped (line 175)
     // -----------------------------------------------------------------------
     #[test]
