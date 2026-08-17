@@ -177,9 +177,17 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
     if acroform.as_dictionary().is_some() && acroform.try_has_key(b"/SigFlags")? {
         // QPDF::removeSecurityRestrictions replaces the key whenever qpdf's
         // visible hasKey test succeeds, including an already-zero integer.
+        // `changed` is an flpdf-only signal with no qpdf analog (qpdf's
+        // removeSecurityRestrictions returns void), so it only reports a
+        // change when the prior value was not already the integer 0 that
+        // qpdf writes back.
+        let previous =
+            pdf.resolve_object_handle_to_terminal(&acroform.try_get_key(b"/SigFlags")?)?;
         acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
         pdf.mark_object_handle_dirty(&acroform)?;
-        changed = true;
+        if previous.as_integer() != Some(0) {
+            changed = true;
+        }
     }
 
     Ok(changed)
@@ -243,8 +251,18 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         to_remove.insert(field_ref);
 
         let mut field_changed = false;
+        // qpdf's removeKey erases the raw dictionary entry unconditionally
+        // (`QPDF_Dictionary::removeKey`), regardless of whether its value is
+        // null. `try_has_key`'s qpdf-`hasKey`-matching null-collapsing would
+        // leave a present `/V null`/`/SV null`/`/Lock null`/`/FT null` entry
+        // behind, so raw entry presence is checked instead, the same way as
+        // the `/Perms` removal above.
+        let entries = field.as_dictionary();
         for key in [b"/FT".as_slice(), b"/V", b"/SV", b"/Lock"] {
-            if field.try_has_key(key)? {
+            let present = entries
+                .as_ref()
+                .is_some_and(|entries| entries.keys().any(|k| k.as_slice() == key));
+            if present {
                 field.remove_key(key);
                 field_changed = true;
             }

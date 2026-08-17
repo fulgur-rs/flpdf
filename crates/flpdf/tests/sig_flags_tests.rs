@@ -95,6 +95,22 @@ fn build_unsigned_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Catalog with an `/AcroForm` that already has `/SigFlags 0` and no
+/// `/Perms` and no `/Sig` fields: qpdf still replaces `/SigFlags` with the
+/// same value, but nothing observable changes.
+fn build_acroform_sig_flags_already_zero_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [] /SigFlags 0 >>"),
+    ];
+    build_pdf(&objects)
+}
+
 /// Catalog with an `/AcroForm` (indirect) that has `/Fields` but no `/SigFlags`.
 fn build_acroform_without_sig_flags_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
@@ -314,6 +330,26 @@ fn build_disable_sig_field_only_pdf() -> Vec<u8> {
             b"<< /FT /Sig /T (Approval) /V 6 0 R /SV << /Type /SV >> /Lock << /Type /SigFieldLock >> /Rect [0 0 0 0] >>",
         ),
         (6, b"<< /Type /Sig /ByteRange [0 10 20 30] >>"),
+    ];
+    build_pdf(&objects)
+}
+
+/// A `/Sig` field whose `/V`, `/SV`, and `/Lock` are explicitly present but
+/// null-valued. qpdf's `removeKey` erases these raw entries unconditionally,
+/// regardless of their value.
+fn build_disable_sig_field_null_valued_keys_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [5 0 R] /SigFlags 3 >>"),
+        (
+            5,
+            b"<< /FT /Sig /T (Approval) /V null /SV null /Lock null /Rect [0 0 0 0] >>",
+        ),
     ];
     build_pdf(&objects)
 }
@@ -577,6 +613,17 @@ fn remove_security_restrictions_is_noop_without_perms_or_sigflags() {
 }
 
 #[test]
+fn remove_security_restrictions_reports_no_change_when_sigflags_already_zero() {
+    // qpdf's QPDF::removeSecurityRestrictions still calls replaceKey
+    // unconditionally, but flpdf's changed flag is its own contract (qpdf's
+    // function returns void) and must not report a change when nothing
+    // observable differs.
+    let mut pdf = open(build_acroform_sig_flags_already_zero_pdf());
+    assert!(!remove_security_restrictions(&mut pdf).unwrap());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
 fn remove_security_restrictions_zeros_sigflags_without_perms() {
     // AcroForm /SigFlags present but no catalog /Perms -> changed via SigFlags only.
     let mut pdf = open(build_signed_acroform_pdf());
@@ -626,6 +673,23 @@ fn disable_digital_signatures_strips_sig_field_keys_and_erases_from_fields() {
     assert!(acroform_fields(&mut pdf).is_empty());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
     assert!(pdf.signatures().unwrap().is_empty());
+}
+
+#[test]
+fn disable_digital_signatures_removes_null_valued_sig_field_keys() {
+    // qpdf's removeKey erases /V, /SV, /Lock even when their stored value is
+    // null; a hasKey-style null-collapsing check must not leave them behind.
+    let mut pdf = open(build_disable_sig_field_null_valued_keys_pdf());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    let f5 = ObjectRef::new(5, 0);
+    assert!(!has_entry(&mut pdf, f5, "FT"));
+    assert!(!has_entry(&mut pdf, f5, "V"));
+    assert!(!has_entry(&mut pdf, f5, "SV"));
+    assert!(!has_entry(&mut pdf, f5, "Lock"));
+    assert!(
+        has_entry(&mut pdf, f5, "T"),
+        "/T (field name) must be preserved"
+    );
 }
 
 #[test]
