@@ -19,12 +19,14 @@
 //! The qpdf document-helper entry point applies this to every leaf page with
 //! its caller-supplied required and forbidden annotation-flag masks.
 
+use crate::object_handle::ObjectHandleIdentity;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
-    AnnotationObjectHelper, Dictionary, Error, Matrix, Object, ObjectHandle, ObjectRef,
-    PageObjectHelper, Pdf, Rectangle, Result, Stream,
+    AcroFormDocumentHelper, AnnotationObjectHelper, Dictionary, Error, Matrix, Object,
+    ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Rectangle, Result, Stream,
 };
+use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -578,6 +580,10 @@ fn flatten_annotations<R: Read + Seek>(pdf: &mut Pdf<R>, mode: FlattenMode) -> R
 }
 
 /// qpdf `QPDFPageDocumentHelper::flattenAnnotations` boundary.
+#[allow(
+    clippy::mutable_key_type,
+    reason = "the association set keys only on canonical ObjectHandle allocation identity"
+)]
 pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_refs: &[ObjectRef],
@@ -586,11 +592,29 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
 ) -> Result<()> {
     let need_appearances = acroform_need_appearances(pdf)?;
     let default_resources = acroform_default_resources(pdf)?;
+    // qpdf resolves the Widget's field helper from one cached
+    // AcroFormDocumentHelper analysis before asking it for `/DR`. Build the
+    // same live-identity set once, before page/resource mutation begins, so
+    // every page uses the same qpdf association boundary without an O(pages²)
+    // re-analysis.
+    let field_annotation_ids = if !need_appearances && default_resources.is_some() {
+        Some(acroform_annotation_identities(pdf)?)
+    } else {
+        None
+    };
     for &page_ref in page_refs {
         materialize_page_resources(pdf, page_ref)?;
         if !need_appearances {
             if let Some(default_resources) = default_resources.as_ref() {
-                merge_widget_default_resources_on_page(pdf, page_ref, default_resources)?;
+                let field_annotation_ids = field_annotation_ids
+                    .as_ref()
+                    .expect("default resources require the association set");
+                merge_widget_default_resources_on_page_with_associations(
+                    pdf,
+                    page_ref,
+                    default_resources,
+                    field_annotation_ids,
+                )?;
             }
         }
         let page_rotate = direct_page_rotate(pdf, page_ref)?;
@@ -790,10 +814,56 @@ fn resolve_matched_category_handles<R: Read + Seek>(
     Ok(dirty_arrays)
 }
 
+/// Return the live Widget identities that qpdf's AcroForm analysis associates
+/// with a field. This includes qpdf's orphan-Widget self-association when a
+/// visible `/AcroForm/Fields` key exists, but is empty when that key is absent
+/// (`QPDFAcroFormDocumentHelper.cc:241-282`).
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity hashes only the retained canonical allocation pointer"
+)]
+fn acroform_annotation_identities<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<HashSet<ObjectHandleIdentity>> {
+    let mut helper = AcroFormDocumentHelper::new(pdf);
+    let identities: HashSet<_> = helper
+        .canonical_annotation_to_field_handles()?
+        .into_iter()
+        .map(|(annotation, _field)| annotation.identity_key())
+        .collect();
+    Ok(identities)
+}
+
+/// Test-facing convenience wrapper that uses the same association analysis as
+/// the production flatten path.
+#[cfg(test)]
+#[allow(
+    clippy::mutable_key_type,
+    reason = "the test wrapper preserves the production canonical identity set"
+)]
 fn merge_widget_default_resources_on_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     default_resources: &ObjectHandle,
+) -> Result<()> {
+    let field_annotation_ids = acroform_annotation_identities(pdf)?;
+    merge_widget_default_resources_on_page_with_associations(
+        pdf,
+        page_ref,
+        default_resources,
+        &field_annotation_ids,
+    )
+}
+
+#[allow(
+    clippy::mutable_key_type,
+    reason = "the merge gate compares only canonical ObjectHandle allocation identity"
+)]
+fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    default_resources: &ObjectHandle,
+    field_annotation_ids: &HashSet<ObjectHandleIdentity>,
 ) -> Result<()> {
     for annotation in page_annotation_handles(pdf, page_ref)? {
         let mut annotation_helper =
@@ -816,6 +886,14 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
                 }
             },
         };
+        if !field_annotation_ids.contains(&annotation.identity_key()) {
+            // qpdf still obtains the appearance stream before asking the null
+            // field helper for `/DR`. Keep that ordering so an inline `/AP/N`
+            // is materialized by the compatibility boundary even when
+            // `analyze()` skipped the orphan-widget fallback because
+            // `/AcroForm/Fields` is absent; only the `/DR` merge is gated.
+            continue;
+        }
         pdf.resolve_object_handle(&appearance)?;
         let Some(appearance_dict) = appearance.as_stream_dict() else {
             continue; // cov:ignore: selected appearance must be a stream
@@ -1321,6 +1399,7 @@ mod tests {
     #[test]
     fn qpdf_flatten_merges_an_indirect_default_resource_category() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
         let mut appearance = Dictionary::new();
@@ -1364,8 +1443,68 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_flatten_skips_default_resources_for_widget_without_acroform_fields() {
+        // qpdf's AcroForm analyze returns before the orphan-widget fallback
+        // when /AcroForm has no visible /Fields key
+        // (QPDFAcroFormDocumentHelper.cc:241-245). Its
+        // getFieldForAnnotation therefore returns a null field helper, whose
+        // getDefaultResources does not read /AcroForm/DR. A page Widget in
+        // this shape must not receive the document default resources.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut font_category = Dictionary::new();
+        font_category.insert("F1", Object::Reference(ObjectRef::new(7, 0)));
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(font_category));
+        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(Dictionary::new()));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert("Font", Object::Reference(ObjectRef::new(6, 0)));
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+
+        // Keep `/AcroForm/DR` present while omitting `/Fields`, which is the
+        // qpdf shape where `analyze()` skips the orphan-widget fallback.
+        let mut acroform = Dictionary::new();
+        acroform.insert("DR", Object::Reference(ObjectRef::new(6, 0)));
+        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
+        };
+        catalog.insert("AcroForm", Object::Dictionary(acroform));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            resources.get("Font"),
+            Some(&Object::Dictionary(Dictionary::new())),
+            "an unassociated Widget must not inherit /AcroForm/DR"
+        );
+    }
+
+    #[test]
     fn qpdf_flatten_rejects_a_direct_stream_when_installing_a_missing_resource_category() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance = Dictionary::new();
         appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
         pdf.set_object(
@@ -1401,6 +1540,44 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_document_flatten_propagates_default_resource_merge_error() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "Font",
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(Vec::new()));
+        acroform.insert("DR", Object::Dictionary(default_resources));
+        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
+        };
+        catalog.insert("AcroForm", Object::Dictionary(acroform));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        let error = flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3)
+            .expect_err("production flatten must propagate the DR merge failure");
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "stream objects cannot be cloned"
+        ));
+    }
+
+    #[test]
     fn qpdf_flatten_privatizes_an_indirect_appearance_resources_before_merging() {
         // qpdf privatizes an indirect appearance /Resources before merging DR
         // in (`QPDFPageDocumentHelper.cc:108-113`): `isIndirect()` triggers a
@@ -1412,6 +1589,7 @@ mod tests {
         // appearance must hold its own privatized copy, and the original
         // shared object must be untouched.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R 6 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut shared_resources = Dictionary::new();
         shared_resources.insert("Font", Object::Reference(ObjectRef::new(20, 0)));
         pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(shared_resources));
@@ -1499,6 +1677,7 @@ mod tests {
         // resolved every destination category unconditionally, this
         // malformed value would be touched even though qpdf never would be.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
         appearance_resources.insert("ColorSpace", Object::Reference(ObjectRef::new(8, 0)));
@@ -1550,6 +1729,7 @@ mod tests {
         // non-resolving scalar check that misclassifies it as non-scalar
         // before the `if !is_scalar(&item) { continue; }` gate.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert(
             "ProcSet",
@@ -1611,6 +1791,7 @@ mod tests {
         // rewrite path in both resolve_matched_category_handles and
         // resolve_array_item_handles.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
         let mut appearance = Dictionary::new();
@@ -1691,6 +1872,7 @@ mod tests {
         // branch. The mutated array's own indirect owner must be marked
         // dirty explicitly so the writer observes the merged content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         pdf.set_object(
             ObjectRef::new(9, 0),
             Object::Array(vec![Object::Name(b"PDF".to_vec())]),
@@ -1753,6 +1935,7 @@ mod tests {
         // dirty, the second resolve would still return the pre-merge
         // snapshot instead of live content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         pdf.set_object(
             ObjectRef::new(9, 0),
             Object::Array(vec![Object::Name(b"PDF".to_vec())]),
@@ -1826,6 +2009,7 @@ mod tests {
         // a dictionary before even checking whether the destination had the
         // category.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         // qpdf's `mergeResources` is a no-op unless the appearance stream
         // already has a (possibly empty) `/Resources` dictionary --
         // `getKey("/Resources")` on an absent key returns a null handle, and
@@ -1879,6 +2063,7 @@ mod tests {
         // the source scalars the destination doesn't already carry, keeping
         // the destination's own items untouched.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert(
             "ProcSet",
@@ -1934,6 +2119,7 @@ mod tests {
         // are arrays; any other combination leaves the destination category
         // exactly as it already was.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert("ProcSet", Object::Integer(7));
         let mut appearance = Dictionary::new();
@@ -1976,6 +2162,7 @@ mod tests {
         // non-scalar item such as a nested array or dictionary is excluded
         // from the merge entirely, on either side.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        register_acroform_fields(&mut pdf, &[]);
         let mut appearance_resources = Dictionary::new();
         appearance_resources.insert(
             "ProcSet",
@@ -2165,6 +2352,10 @@ mod tests {
         dr.insert("Font", Object::Dictionary(dr_fonts));
         pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(dr));
         let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+        );
         acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
         pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
         let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
@@ -2174,6 +2365,16 @@ mod tests {
         pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(root));
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(12, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("appearance must retain privatized resources"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+            panic!("appearance must retain Font resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
         let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
             panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
         };
@@ -2240,6 +2441,26 @@ mod tests {
             format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    /// Register `widget_refs` in `/AcroForm/Fields` so qpdf's
+    /// `AcroFormDocumentHelper::analyze` associates them with a field (the
+    /// precondition `merge_widget_default_resources_on_page` now requires
+    /// before merging `/AcroForm/DR`). Uses a synthetic high object number
+    /// for the `/AcroForm` dict so it never collides with a fixture's own
+    /// numbering.
+    fn register_acroform_fields<R: Read + Seek>(pdf: &mut Pdf<R>, widget_refs: &[ObjectRef]) {
+        let mut acroform = Dictionary::new();
+        acroform.insert(
+            "Fields",
+            Object::Array(widget_refs.iter().copied().map(Object::Reference).collect()),
+        );
+        pdf.set_object(ObjectRef::new(900, 0), Object::Dictionary(acroform));
+        let mut catalog = Dictionary::new();
+        catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
+        catalog.insert("Pages", Object::Reference(ObjectRef::new(2, 0)));
+        catalog.insert("AcroForm", Object::Reference(ObjectRef::new(900, 0)));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
     }
 
     /// Build a minimal Form XObject stream with given /BBox.
