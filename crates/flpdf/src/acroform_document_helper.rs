@@ -730,7 +730,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 let current_name = self
                     .pdf
                     .resolve_object_handle_to_terminal(&field.try_get_key(b"/T")?)?;
-                let mut partial = current_name.as_string().unwrap_or_default();
+                // qpdf appends to the *decoded* name (`getUTF8Value() + append`,
+                // `QPDFAcroFormDocumentHelper.cc:99-103`), not the raw stored
+                // bytes -- a `/T` stored as UTF-16BE or PDFDocEncoded would
+                // otherwise have the ASCII suffix appended mid-codepoint.
+                let raw = current_name.as_string().unwrap_or_default();
+                let mut partial = decode_field_name(&raw).into_bytes();
                 partial.extend_from_slice(&append);
                 // cov:ignore-start: LLVM maps this multiline mutation to a defensive continuation edge.
                 field.replace_key(
@@ -1494,7 +1499,7 @@ fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Resu
                 transformed
                     .get_as_matrix()
                     .into_iter()
-                    .map(ObjectHandle::real)
+                    .map(qpdf_real)
                     .collect(),
             ),
         )?;
@@ -1623,7 +1628,7 @@ fn transformed_annotation_rectangle<R: Read + Seek>(
             transformed.ury,
         ]
         .into_iter()
-        .map(ObjectHandle::real)
+        .map(qpdf_real)
         .collect(),
     ))
 }
@@ -1650,6 +1655,20 @@ fn is_pure_widget_annotation(field: &Dictionary) -> bool {
 
 fn decode_field_name(name: &[u8]) -> String {
     decode_pdf_text_string(name).unwrap_or_else(|| String::from_utf8_lossy(name).into_owned())
+}
+
+/// Pre-round `v` so `ObjectHandle::real(rounded)`'s writer output (Rust's
+/// shortest-roundtrip `f64::to_string`) matches qpdf's
+/// `QUtil::double_to_string(v, 6, trim=true)` -- the default `newReal(double)`
+/// precision used by every `newFromRectangle`/`newFromMatrix` array element
+/// (`libqpdf/QUtil.cc:349-369`). Same round-trip trick as
+/// `overlay_annotations.rs`'s `qpdf_real`, adapted to return an
+/// [`ObjectHandle`] instead of the legacy [`Object`] type.
+fn qpdf_real(v: f64) -> ObjectHandle {
+    let s = format!("{v:.6}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    let rounded: f64 = trimmed.parse().unwrap_or(0.0);
+    ObjectHandle::real(rounded)
 }
 
 fn source_field_copy_set<RS: Read + Seek>(
@@ -2866,6 +2885,70 @@ mod tests {
     }
 
     #[test]
+    fn transform_annotations_rounds_generated_matrix_and_rect_reals_to_qpdf_precision() {
+        // qpdf's `newReal(double)` default (`decimal_places = 0`) rounds to
+        // six decimal places (`QUtil::double_to_string`, `QUtil.cc:349-369`),
+        // not Rust's shortest-roundtrip `f64::to_string`. A 1/3 scale factor
+        // produces a repeating decimal that distinguishes the two.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(
+                dict(&[
+                    ("Subtype", Object::Name(b"Form".to_vec())),
+                    ("Length", Object::Integer(0)),
+                ]),
+                Vec::new(),
+            )),
+        );
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Text".to_vec())),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(1),
+                        Object::Integer(1),
+                    ]),
+                ),
+                (
+                    "AP",
+                    Object::Dictionary(dict(&[("N", Object::Reference(ObjectRef::new(5, 0)))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(10, 0),
+            Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]),
+        );
+
+        let old_annots = pdf.get_object_handle(ObjectRef::new(10, 0));
+        let third = 1.0 / 3.0;
+        let transformed = AcroFormDocumentHelper::new(&mut pdf)
+            .transform_annotations(old_annots, Matrix::new(third, 0.0, 0.0, third, 0.0, 0.0))
+            .unwrap();
+        let copied = transformed.new_annotations[0].clone();
+
+        let rect = copied.try_get_key(b"/Rect").unwrap();
+        assert_eq!(rect.unparse(), b"[ 0 0 0.333333 0.333333 ]");
+
+        let normal = copied
+            .try_get_key(b"/AP")
+            .unwrap()
+            .try_get_key(b"/N")
+            .unwrap();
+        let matrix = normal
+            .as_stream_dict()
+            .unwrap()
+            .try_get_key(b"/Matrix")
+            .unwrap();
+        assert_eq!(matrix.unparse(), b"[ 0.333333 0 0 0.333333 0 0 ]");
+    }
+
+    #[test]
     fn transform_annotations_handles_non_arrays_and_stream_annotations() {
         let mut pdf = empty_pdf();
         let mut helper = AcroFormDocumentHelper::new(&mut pdf);
@@ -3089,6 +3172,53 @@ mod tests {
         assert_eq!(
             second.try_get_key(b"/T").unwrap().as_string(),
             Some(b"field+1".to_vec())
+        );
+    }
+
+    #[test]
+    fn add_and_rename_form_fields_decodes_utf16_names_before_appending_a_suffix() {
+        // qpdf appends the suffix to the *decoded* name
+        // (`getUTF8Value() + append`, `QPDFAcroFormDocumentHelper.cc:99-103`),
+        // not the raw stored bytes. "名" (U+540D) has no PDFDocEncoding
+        // representation, so a proper writer stores it as UTF-16BE with a
+        // byte-order mark.
+        let utf16_name: Vec<u8> = vec![0xfe, 0xff, 0x54, 0x0d];
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[("T", Object::String(utf16_name.clone()))])),
+        );
+
+        let field =
+            ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(utf16_name))]);
+        AcroFormDocumentHelper::new(&mut pdf)
+            .add_and_rename_form_fields(vec![field.clone()])
+            .unwrap();
+
+        let renamed = field.try_get_key(b"/T").unwrap().as_string().unwrap();
+        assert_eq!(
+            decode_pdf_text_string(&renamed).as_deref(),
+            Some("名+1"),
+            "renamed /T must decode to the original text plus the ASCII \
+             suffix, not mid-codepoint-corrupted bytes: {renamed:?}"
         );
     }
 
