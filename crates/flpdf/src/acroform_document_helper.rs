@@ -280,14 +280,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// The ref-valued public map is only a projection for legacy callers. A
     /// mutating consumer must retain these canonical handles so a later edit
     /// cannot fall back to a stale materialized [`Object`].
-    pub(crate) fn form_field_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+    pub(crate) fn form_field_handles(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
         let mut fields = BTreeMap::new();
         for field in self.canonical_annotation_to_field_map()?.into_values() {
             if let Some(field_ref) = field.object_ref() {
                 fields.entry(field_ref).or_insert(field);
             }
         }
-        Ok(fields.into_values().collect())
+        Ok(fields)
     }
 
     /// Remove selected top-level fields from the live `/AcroForm /Fields`

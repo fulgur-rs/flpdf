@@ -228,10 +228,7 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
     let form_fields = crate::AcroFormDocumentHelper::new(pdf).form_field_handles()?;
 
     let mut to_remove = BTreeSet::new();
-    for field in form_fields {
-        let Some(field_ref) = field.object_ref() else {
-            continue;
-        };
+    for (field_ref, field) in form_fields {
         let field_type = {
             let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
             helper.field_type()?
