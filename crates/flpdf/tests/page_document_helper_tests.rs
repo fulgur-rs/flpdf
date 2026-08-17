@@ -1044,8 +1044,29 @@ fn helper_flatten_annotations_resolves_widget_appearance_before_need_appearances
     if Command::new("qpdf").arg("--version").output().is_ok() {
         let dir = tempfile::tempdir().unwrap();
         let input_path = dir.path().join("skip-widget-order.pdf");
-        let output_path = dir.path().join("skip-widget-order-qpdf.pdf");
         fs::write(&input_path, &bytes).unwrap();
+
+        // Control: NeedAppearances preserves the Widget, so object 6 stays
+        // reachable through its /AP and gets parsed while qpdf serializes
+        // *any* output for this file -- with or without flattening. This
+        // run (no --flatten-annotations at all) must emit the identical
+        // warning, proving the warning by itself is a property of
+        // reachability, not evidence that flatten's own internal
+        // processing touched /AP before its skip check.
+        let control_output_path = dir.path().join("skip-widget-order-control.pdf");
+        let control = Command::new("qpdf")
+            .arg(&input_path)
+            .arg(&control_output_path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&control.stderr).contains("unknown token while reading object"),
+            "control (no flattening) must already observe the malformed /AP target, showing \
+             the warning alone cannot isolate flatten's internal ordering: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+
+        let output_path = dir.path().join("skip-widget-order-qpdf.pdf");
         let output = Command::new("qpdf")
             .arg("--flatten-annotations=print")
             .arg(&input_path)
@@ -1059,11 +1080,20 @@ fn helper_flatten_annotations_resolves_widget_appearance_before_need_appearances
         );
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("unknown token while reading object"),
-            "qpdf must observe the malformed /AP target even under NeedAppearances: {}",
+            "qpdf must tolerate the malformed /AP target under NeedAppearances (exit 0 or 3, \
+             not fatal): {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
+    // The qpdf CLI run above only establishes that this fixture is a
+    // realistic, qpdf-tolerable input (a malformed /AP on a NeedAppearances-
+    // skipped Widget is non-fatal) -- the control proves qpdf's warning
+    // cannot isolate *when* /AP gets read, since the object is reachable
+    // regardless of flattening. The specific ordering claim (resolution
+    // happens before the skip) is instead verified directly below through
+    // flpdf's own repair diagnostics, which only records a warning if
+    // *flpdf's* flatten_annotations call itself resolved /AP.
     PageDocumentHelper::new(&mut pdf)
         .flatten_annotations(0, 0x3)
         .expect("qpdf resolves the selected appearance before skipping a Widget");
