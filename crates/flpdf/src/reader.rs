@@ -6701,6 +6701,38 @@ mod tests {
         pdf
     }
 
+    fn pdf_with_one_stream_with_null_filters(stream_data: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let stream_offset = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Length {} /Filter null /DecodeParms null >>\nstream\n",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{stream_offset:010} 00000 n \n"
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
     #[test]
     fn dropping_pdf_breaks_the_pages_parent_reference_cycle() {
         // `minimal_pdf_bytes`'s Pages node (2 0 obj) and Page (3 0 obj)
@@ -9572,6 +9604,57 @@ mod tests {
             .replace_key(b"/Nested", ObjectHandle::integer(10))
             .unwrap();
         assert_eq!(direct.get_key(b"/Nested").as_integer(), Some(9));
+    }
+
+    #[test]
+    fn resolver_copy_stream_data_replaces_destination_null_filter_and_decode_parms() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let destination = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"/Filter".to_vec(), ObjectHandle::null()),
+                (b"/DecodeParms".to_vec(), ObjectHandle::null()),
+            ]),
+            Rc::new(b"destination payload".to_vec()),
+        );
+        let source = pdf
+            .new_stream_with_data(Rc::new(b"source payload".to_vec()))
+            .expect("new source stream");
+
+        pdf.resolver
+            .copy_stream_data(&destination, &source)
+            .expect("copy stream data");
+
+        let dictionary = destination
+            .as_stream_dict()
+            .expect("destination dictionary")
+            .as_dictionary()
+            .expect("raw destination dictionary");
+        assert!(!dictionary.contains_key(b"/Filter".as_slice()));
+        assert!(!dictionary.contains_key(b"/DecodeParms".as_slice()));
+    }
+
+    #[test]
+    fn resolver_copy_stream_data_replaces_source_null_filter_and_decode_parms_during_immediate_copy(
+    ) {
+        let bytes = pdf_with_one_stream_with_null_filters(b"immediate payload");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let source = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve_object_handle(&source)
+            .expect("resolve source stream");
+        pdf.set_immediate_copy_from(true);
+        let destination = pdf.new_stream().expect("new destination stream");
+
+        pdf.resolver
+            .copy_stream_data(&destination, &source)
+            .expect("copy stream data");
+
+        let dictionary = source
+            .as_stream_dict()
+            .expect("source dictionary")
+            .as_dictionary()
+            .expect("raw source dictionary");
+        assert!(!dictionary.contains_key(b"/Filter".as_slice()));
+        assert!(!dictionary.contains_key(b"/DecodeParms".as_slice()));
     }
 
     #[test]
