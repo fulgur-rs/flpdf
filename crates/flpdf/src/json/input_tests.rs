@@ -716,6 +716,11 @@ fn json_reactor_reports_root_metadata_and_container_shape_errors() {
             "\"obj:1 0 R\" must be a dictionary",
         ),
         (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"stream":1}}]}"#
+                .as_slice(),
+            "\"stream\" must be a dictionary",
+        ),
+        (
             br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"trailer":{}}]}"#.as_slice(),
             "\"trailer\" is missing \"value\"",
         ),
@@ -818,6 +823,67 @@ fn json_reactor_handles_flag_values_and_invalid_stream_members() {
     assert!(messages
         .iter()
         .any(|message| message.contains("\"stream.dict\" must be a dictionary")));
+}
+
+fn excessive_page_tree_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let depth = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH + 1;
+    let leaf_num = 2 + depth as u32;
+    let mut offsets = Vec::with_capacity(1 + depth + 1);
+
+    offsets.push(pdf.len() as u64);
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    for level in 0..depth {
+        let this_num = 2 + level as u32;
+        let next_ref = if level + 1 == depth {
+            leaf_num
+        } else {
+            this_num + 1
+        };
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "{this_num} 0 obj\n<< /Type /Pages /Kids [{next_ref} 0 R] /Count 1 >>\nendobj\n"
+            )
+            .as_bytes(),
+        );
+    }
+    offsets.push(pdf.len() as u64);
+    pdf.extend_from_slice(
+        format!(
+            "{leaf_num} 0 obj\n<< /Type /Page /Parent {} 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            leaf_num - 1
+        )
+        .as_bytes(),
+    );
+
+    let total = offsets.len() + 1;
+    let xref_start = pdf.len() as u64;
+    pdf.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn json_reactor_propagates_page_observation_failures() {
+    for flag in ["calledgetallpages", "pushedinheritedpageresources"] {
+        let mut pdf =
+            Pdf::open(Cursor::new(excessive_page_tree_pdf_bytes())).expect("deep page-tree PDF");
+        let json = format!("{{\"qpdf\":[{{\"jsonversion\":2,\"{flag}\":true}},{{}}]}}");
+        let source = Rc::new(RefCell::new(Cursor::new(json.into_bytes())));
+        let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "pages.json", false);
+        parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON update");
+        assert!(reactor
+            .fatal_error()
+            .is_some_and(|message| message.contains("page tree depth exceeds")));
+    }
 }
 
 #[test]
