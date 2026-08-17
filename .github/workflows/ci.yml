@@ -30,6 +30,9 @@ jobs:
       - name: Check qpdf module correspondence
         run: python3 scripts/qpdf-module-docs.py --check
 
+      - name: Test patch-coverage gate contract
+        run: bash scripts/tests/patch-coverage-contract.sh
+
       - name: Install libjpeg development headers (Linux)
         run: sudo apt-get update && sudo apt-get install -y libjpeg-dev
 
