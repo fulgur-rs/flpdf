@@ -51,9 +51,10 @@ pub(crate) fn parse_indirect_reference(value: &[u8]) -> IndirectReferenceParse {
     if cursor == object_start || value.get(cursor) != Some(&b' ') {
         return IndirectReferenceParse::NoMatch;
     }
-    let Ok(object_text) = std::str::from_utf8(&value[object_start..cursor]) else {
-        return IndirectReferenceParse::NoMatch;
-    };
+    // The loop above only ever advances `cursor` past bytes matching
+    // `is_ascii_digit()`, so this slice is always valid single-byte UTF-8.
+    let object_text =
+        std::str::from_utf8(&value[object_start..cursor]).expect("ascii digit run is valid UTF-8");
 
     while value.get(cursor) == Some(&b' ') {
         cursor += 1;
@@ -65,9 +66,8 @@ pub(crate) fn parse_indirect_reference(value: &[u8]) -> IndirectReferenceParse {
     if cursor == generation_start || value.get(cursor) != Some(&b' ') {
         return IndirectReferenceParse::NoMatch;
     }
-    let Ok(generation_text) = std::str::from_utf8(&value[generation_start..cursor]) else {
-        return IndirectReferenceParse::NoMatch;
-    };
+    let generation_text = std::str::from_utf8(&value[generation_start..cursor])
+        .expect("ascii digit run is valid UTF-8");
 
     while value.get(cursor) == Some(&b' ') {
         cursor += 1;
@@ -79,12 +79,15 @@ pub(crate) fn parse_indirect_reference(value: &[u8]) -> IndirectReferenceParse {
     let object = match qpdf_string_to_int_checked(object_text) {
         QpdfIntParse::Overflow(message) => return IndirectReferenceParse::Overflow(message),
         QpdfIntParse::Value(value) => value,
-        QpdfIntParse::NoDigits => return IndirectReferenceParse::NoMatch,
+        // `object_text` is a non-empty digit run (checked above), so
+        // `qpdf_string_to_int_checked` can never report `NoDigits` here.
+        QpdfIntParse::NoDigits => return IndirectReferenceParse::NoMatch, // cov:ignore: unreachable given the digit-run precondition above
     };
     let generation = match qpdf_string_to_int_checked(generation_text) {
         QpdfIntParse::Overflow(message) => return IndirectReferenceParse::Overflow(message),
         QpdfIntParse::Value(value) => value,
-        QpdfIntParse::NoDigits => return IndirectReferenceParse::NoMatch,
+        // Same precondition as the object number, one line up.
+        QpdfIntParse::NoDigits => return IndirectReferenceParse::NoMatch, // cov:ignore: unreachable given the digit-run precondition above
     };
 
     if object == 0 {
@@ -609,9 +612,14 @@ where
         } else {
             match json_value_to_handle(self.pdf, value) {
                 Ok(result) => result,
+                // Number, Bool, and Null are the only kinds left; Bool and
+                // Null never fail, and a Number's only failure mode is
+                // invalid UTF-8 bytes -- unreachable here because the real
+                // JSON tokenizer only ever populates a `Number` token from
+                // JSON's ASCII number grammar.
                 Err(error) => {
-                    self.fatal(error.to_string());
-                    self.pdf.resolver.direct_object_handle(ObjectValue::Null)
+                    self.fatal(error.to_string()); // cov:ignore: unreachable -- see comment above
+                    self.pdf.resolver.direct_object_handle(ObjectValue::Null) // cov:ignore: unreachable -- see comment above
                 }
             }
         };
@@ -769,8 +777,12 @@ where
                     self.saw_json_version = true;
                     let mut overflow = None;
                     let okay = value.get_number().is_some_and(|number| {
+                        // The JSON tokenizer only ever populates a `Number`
+                        // token from JSON's number grammar (ASCII digits,
+                        // sign, `.`, `e`/`E`), so this can never fail when
+                        // driven through real parsing.
                         let Ok(text) = std::str::from_utf8(&number) else {
-                            return false;
+                            return false; // cov:ignore: unreachable -- JSON number tokens are always ASCII
                         };
                         match qpdf_string_to_int_checked(text) {
                             QpdfIntParse::Value(2) => true,

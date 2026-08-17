@@ -130,6 +130,34 @@ fn qpdf_json_validators_report_overflow_instead_of_no_match() {
         }
         other => panic!("expected Overflow, got {other:?}"),
     }
+
+    // The generation number goes through the exact same
+    // `QUtil::string_to_int` conversion as the object number
+    // (`is_indirect_object`, `QPDF_json.cc:66-104` calls it for both), so
+    // it must overflow the same way.
+    match parse_indirect_reference(b"52 4294967296 R") {
+        IndirectReferenceParse::Overflow(message) => {
+            assert_eq!(
+                message,
+                "integer out of range converting 4294967296 from a 8-byte \
+                 signed type to a 4-byte signed type"
+            );
+        }
+        other => panic!("expected Overflow, got {other:?}"),
+    }
+}
+
+#[test]
+fn qpdf_json_validators_reject_a_generation_too_large_for_flpdf_object_ref() {
+    // qpdf's generation is a bare `int` with no upper bound beyond i32
+    // (`is_indirect_object` only checks `obj > 0`, never `gen`'s range).
+    // flpdf's `ObjectRef` generation is `u16`, matching the PDF xref
+    // table's actual generation width; a generation that fits i32 but not
+    // u16 has no flpdf-representable identity, so it is not a match here.
+    assert_eq!(
+        parse_indirect_reference(b"52 99999 R"),
+        IndirectReferenceParse::NoMatch
+    );
 }
 
 #[test]
@@ -211,6 +239,18 @@ fn qpdf_json_value_factory_preserves_real_literals_and_never_rejects_non_finite_
             .as_real_literal(),
         Some((f64::INFINITY, b"1e9999".to_vec()))
     );
+}
+
+#[test]
+fn qpdf_json_value_factory_rejects_non_utf8_number_bytes() {
+    // `Json::make_number` accepts arbitrary bytes, bypassing the real JSON
+    // tokenizer's number grammar (which only ever produces ASCII). This
+    // exercises `json_number_to_handle`'s own UTF-8 guard, which real
+    // parsing can never reach.
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let error =
+        json_value_to_handle(&mut pdf, &Json::make_number(b"\xff\xfe")).expect_err("non-UTF-8");
+    assert!(error.to_string().contains("invalid JSON number"));
 }
 
 #[test]
