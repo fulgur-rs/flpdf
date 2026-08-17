@@ -2497,8 +2497,10 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFObjectHandle.cc:978-989`). A non-dictionary receiver
     /// yields null. qpdf additionally raises
     /// `typeWarning("dictionary", "returning null for attempted key
-    /// retrieval")` at `:984`, and gives its null a child description naming
-    /// the key.
+    /// retrieval")` at `:984`, and gives that null the
+    /// `" -> null returned from getting key $VD from non-Dictionary"`
+    /// child description. A dictionary's missing-key null instead carries
+    /// the key-specific description from `QPDF_Dictionary::getKey`.
     ///
     /// `key` must be qpdf's decoded, canonical dictionary key including its
     /// leading `/` (for example, `/Type`). Lookup is exact; a slashless key is
@@ -2516,10 +2518,16 @@ impl ObjectHandle {
         });
         if let Some(child) = child {
             Ok(child)
+        } else if !is_dictionary {
+            self.type_warning("dictionary", "returning null for attempted key retrieval")?;
+            let null = ObjectHandle::null();
+            null.set_child_description(
+                self,
+                " -> null returned from getting key $VD from non-Dictionary",
+                "",
+            );
+            Ok(null)
         } else {
-            if !is_dictionary {
-                self.type_warning("dictionary", "returning null for attempted key retrieval")?;
-            }
             let key_str = String::from_utf8_lossy(key);
             let null = ObjectHandle::null();
             let var_descr = if key_str.starts_with('/') {
@@ -2539,10 +2547,17 @@ impl ObjectHandle {
     /// `QPDF_Dictionary::hasKey`.
     pub(crate) fn try_has_key(&self, key: &[u8]) -> Result<bool> {
         self.try_dereference()?;
-        let child = self.with_value(|value| match value {
-            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
-            _ => None,
+        let (is_dictionary, child) = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
+            _ => (false, None),
         });
+        if !is_dictionary {
+            self.type_warning(
+                "dictionary",
+                "returning false for a key containment request",
+            )?;
+            return Ok(false);
+        }
         match child {
             Some(child) => Ok(!child.try_is_null()?),
             None => Ok(false),
@@ -18060,9 +18075,13 @@ mod mutation_tests {
     }
 
     #[test]
-    fn has_key_on_a_non_dictionary_handle_is_false() {
+    fn try_has_key_on_a_non_dictionary_handle_reports_qpdf_type_warning() {
         let scalar = ObjectHandle::integer(1);
-        assert!(!scalar.has_key(b"/A"));
+        assert!(matches!(
+            scalar.try_has_key(b"/A"),
+            Err(crate::Error::System(message))
+                if message == "operation for dictionary attempted on object of type integer: returning false for a key containment request"
+        ));
     }
 
     #[test]
@@ -19768,6 +19787,35 @@ pub(crate) mod warning_emission_tests {
         assert_eq!(
             warnings(&recorder),
             ["object 3 0: operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn try_has_key_on_a_non_dictionary_emits_qpdf_warning_and_returns_false() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        assert!(!handle.try_has_key(b"/A").unwrap());
+
+        assert_eq!(
+            warnings(&recorder),
+            ["object 3 0: operation for dictionary attempted on object of type integer: returning false for a key containment request"]
+        );
+    }
+
+    #[test]
+    fn try_get_key_on_a_non_dictionary_uses_qpdf_null_context_description() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        let null = handle.try_get_key(b"/A").unwrap();
+
+        assert!(null.is_null());
+        assert_eq!(
+            null.description(),
+            "object 3 0 -> null returned from getting key  from non-Dictionary"
+        );
+        assert_eq!(
+            warnings(&recorder),
+            ["object 3 0: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"]
         );
     }
 
