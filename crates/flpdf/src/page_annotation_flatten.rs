@@ -2422,14 +2422,11 @@ mod tests {
 
         flatten_annotations_qpdf(&mut pdf, &[page_ref], 0, 0).unwrap();
 
+        let diagnostics = pdf.repair_diagnostics().entries().to_vec();
         assert!(
-            pdf.repair_diagnostics()
-                .entries()
-                .iter()
-                .all(|d| !d.message.contains("object 6")),
+            diagnostics.iter().all(|d| !d.message.contains("object 6")),
             "a non-rectangle /BBox must short-circuit before /Rect (object 6) is ever \
-             resolved: {:?}",
-            pdf.repair_diagnostics().entries()
+             resolved: {diagnostics:?}"
         );
     }
 
