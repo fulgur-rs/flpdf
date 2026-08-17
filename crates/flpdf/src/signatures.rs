@@ -179,13 +179,18 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         // visible hasKey test succeeds, including an already-zero integer.
         // `changed` is an flpdf-only signal with no qpdf analog (qpdf's
         // removeSecurityRestrictions returns void), so it only reports a
-        // change when the prior value was not already the integer 0 that
-        // qpdf writes back.
-        let previous =
-            pdf.resolve_object_handle_to_terminal(&acroform.try_get_key(b"/SigFlags")?)?;
+        // change when something observable actually differs: an indirect
+        // `/SigFlags` becomes a direct integer either way (the old indirect
+        // target may be garbage-collected on a full rewrite), so only a
+        // prior value that was *already* a direct integer 0 counts as
+        // unchanged.
+        let previous = acroform.try_get_key(b"/SigFlags")?;
+        let previous_resolved = pdf.resolve_object_handle_to_terminal(&previous)?;
+        let already_zero =
+            previous.object_ref().is_none() && previous_resolved.as_integer() == Some(0);
         acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
         pdf.mark_object_handle_dirty(&acroform)?;
-        if previous.as_integer() != Some(0) {
+        if !already_zero {
             changed = true;
         }
     }

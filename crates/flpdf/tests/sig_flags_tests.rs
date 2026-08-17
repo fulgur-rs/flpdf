@@ -111,6 +111,24 @@ fn build_acroform_sig_flags_already_zero_pdf() -> Vec<u8> {
     build_pdf(&objects)
 }
 
+/// Catalog with an `/AcroForm` whose `/SigFlags` is an *indirect* reference
+/// to an object holding integer `0`. Even though the resolved value is
+/// already zero, replacing it with a direct integer 0 is an observable
+/// structural change (and may orphan the old indirect target).
+fn build_acroform_sig_flags_indirect_zero_pdf() -> Vec<u8> {
+    let objects: Vec<(u32, &[u8])> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (
+            2,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        ),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [] /SigFlags 5 0 R >>"),
+        (5, b"0"),
+    ];
+    build_pdf(&objects)
+}
+
 /// Catalog with an `/AcroForm` (indirect) that has `/Fields` but no `/SigFlags`.
 fn build_acroform_without_sig_flags_pdf() -> Vec<u8> {
     let objects: Vec<(u32, &[u8])> = vec![
@@ -620,6 +638,16 @@ fn remove_security_restrictions_reports_no_change_when_sigflags_already_zero() {
     // observable differs.
     let mut pdf = open(build_acroform_sig_flags_already_zero_pdf());
     assert!(!remove_security_restrictions(&mut pdf).unwrap());
+    assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
+}
+
+#[test]
+fn remove_security_restrictions_reports_a_change_for_an_indirect_zero_sigflags() {
+    // Replacing an indirect /SigFlags (even one resolving to 0) with a
+    // direct integer 0 is an observable structural change, unlike an
+    // already-direct zero.
+    let mut pdf = open(build_acroform_sig_flags_indirect_zero_pdf());
+    assert!(remove_security_restrictions(&mut pdf).unwrap());
     assert_eq!(acroform_sig_flags(&mut pdf).unwrap(), Some(0));
 }
 
