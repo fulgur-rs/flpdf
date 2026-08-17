@@ -1266,6 +1266,25 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(current)
     }
 
+    /// Return whether the catalog visibly contains an `/AcroForm` entry.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::hasAcroForm`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:32-36`): the entry need not
+    /// resolve to a dictionary, but a missing, direct-null, or dangling-null
+    /// value is treated as absent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors while resolving the catalog handle.
+    pub fn has_acro_form(&mut self) -> Result<bool> {
+        let Some(root_ref) = self.pdf.root_ref() else {
+            return Ok(false);
+        };
+        self.pdf
+            .get_object_handle(root_ref)
+            .try_has_key(b"/AcroForm")
+    }
+
     /// Return the field's inherited `/V` value.
     ///
     /// # Errors
@@ -1275,6 +1294,102 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// - Any error from [`Pdf::resolve`].
     pub fn field_value(&mut self, field_ref: ObjectRef) -> Result<Option<ObjectHandle>> {
         FormFieldObjectHelper::new(field_ref, self.pdf).field_value()
+    }
+
+    /// Return qpdf's `/AcroForm /NeedAppearances` value.
+    ///
+    /// Missing, malformed, or non-boolean values read as `false`, matching
+    /// `QPDFAcroFormDocumentHelper::getNeedAppearances`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:365-374`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors while resolving the catalog and AcroForm handles.
+    pub fn get_need_appearances(&mut self) -> Result<bool> {
+        let Some(acroform) = self.canonical_acroform()? else {
+            return Ok(false);
+        };
+        let value = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/NeedAppearances")?)?;
+        Ok(value.as_boolean() == Some(true))
+    }
+
+    /// Set or remove `/AcroForm /NeedAppearances`.
+    ///
+    /// `true` replaces the entry with a direct boolean. `false` removes the
+    /// entry unconditionally. A missing or non-dictionary `/AcroForm` is a
+    /// qpdf-style no-op, matching `setNeedAppearances`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:376-391`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors while resolving the catalog and AcroForm handles, or
+    /// while marking a live handle dirty after mutation.
+    pub fn set_need_appearances(&mut self, value: bool) -> Result<()> {
+        let Some(acroform) = self.canonical_acroform()? else {
+            return Ok(());
+        };
+        if value {
+            acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true))?;
+            self.pdf.mark_object_handle_dirty(&acroform)
+        } else {
+            let present = acroform.as_dictionary().is_some_and(|entries| {
+                entries
+                    .keys()
+                    .any(|key| key.as_slice() == b"/NeedAppearances")
+            });
+            acroform.remove_key(b"/NeedAppearances");
+            if present {
+                self.pdf.mark_object_handle_dirty(&acroform)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Generate appearances when `/NeedAppearances` is true, then remove the
+    /// marker.
+    ///
+    /// Pages and Widget annotations are visited in qpdf's document order. Each
+    /// Widget is resolved through the cached AcroForm annotation-to-field map;
+    /// text and choice fields use the canonical appearance renderer, while
+    /// checkbox and radio fields reset their value through the form-field
+    /// helper so their `/AS` state agrees with `/V`. Other button fields are
+    /// intentionally left untouched, matching qpdf's
+    /// `generateAppearancesIfNeeded` (`libqpdf/QPDFAcroFormDocumentHelper.cc:393-417`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors while resolving the page tree, widget associations,
+    /// fields, or generated appearance streams.
+    pub fn generate_appearances_if_needed(&mut self) -> Result<()> {
+        if !self.get_need_appearances()? {
+            return Ok(());
+        }
+
+        for page_ref in crate::pages::page_refs(self.pdf)? {
+            let widgets = {
+                let mut page = PageObjectHelper::new(page_ref, self.pdf);
+                page.get_annotation_handles(Some(b"/Widget"))?
+            };
+            for widget in widgets {
+                let Some(field) = self.canonical_field_for_annotation(widget.clone())? else {
+                    continue;
+                };
+                let mut form_field = FormFieldObjectHelper::from_object_handle(field, self.pdf);
+                if form_field.field_type()?.as_deref() == Some(b"/Btn") {
+                    if form_field.is_checkbox()? || form_field.is_radio_button()? {
+                        let value = form_field.field_value()?.unwrap_or_else(ObjectHandle::null);
+                        form_field.set_value(value, false)?;
+                    } // cov:ignore: llvm-cov maps this covered branch closing brace to a zero-count structural region
+                } else {
+                    form_field.generate_appearance_for_handle(widget)?;
+                }
+            }
+        }
+
+        self.set_need_appearances(false)
     }
 
     /// Set the field's direct `/V` value.
@@ -2828,10 +2943,11 @@ mod tests {
             Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
         );
 
-        let map = AcroFormDocumentHelper::new(&mut pdf)
-            .annotation_to_field_map()
-            .unwrap();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let map = helper.annotation_to_field_map().unwrap();
         assert!(map.is_empty());
+        helper.generate_appearances_if_needed().unwrap();
+        assert!(!helper.get_need_appearances().unwrap());
     }
 
     #[test]
@@ -2842,6 +2958,16 @@ mod tests {
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn appearance_marker_helpers_without_root_are_noops() {
+        let mut pdf = rootless_pdf();
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+
+        assert!(!helper.has_acro_form().unwrap());
+        assert!(!helper.get_need_appearances().unwrap());
+        helper.set_need_appearances(false).unwrap();
     }
 
     #[test]
