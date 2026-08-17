@@ -294,7 +294,7 @@ fn radio_widget_without_ap() -> Vec<u8> {
 fn combo_widget_without_ap() -> Vec<u8> {
     assemble_pdf(&[
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
-          /AcroForm << /Fields [4 0 R] /DR << >> /DA (/Helv 10 Tf 0 g) >> >>\nendobj\n"
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 10 Tf 0 g) >> >>\nendobj\n"
             .to_vec(),
         b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
         b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
@@ -344,6 +344,33 @@ fn two_annots_print_and_non_print() -> Vec<u8> {
 
 // ── Tests: generate-appearances ───────────────────────────────────────────────
 
+/// qpdf's `generateAppearancesIfNeeded` returns before scanning pages when
+/// `/NeedAppearances` is absent or false. The CLI option must preserve that
+/// gate rather than treating the option as an unconditional renderer switch.
+#[test]
+fn generate_appearances_without_need_marker_is_a_noop() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("tx-no-marker.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_widget_without_ap()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let widget_ref = first_widget_ref(&mut pdf);
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
+    assert!(
+        helper.get_appearance_dictionary().unwrap().is_null(),
+        "qpdf leaves a widget without /AP unchanged when /NeedAppearances is false"
+    );
+}
+
 /// `--generate-appearances` on a Tx widget adds `/AP/N`, and the uncompressed
 /// content stream of that XObject contains a `Tj` operator (the value text is
 /// rendered).
@@ -352,7 +379,7 @@ fn generate_appearances_tx_ap_n_contains_tj() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("tx.pdf");
     let output = temp.path().join("out.pdf");
-    std::fs::write(&input, tx_widget_without_ap()).unwrap();
+    std::fs::write(&input, tx_widget_without_ap_needing_appearances()).unwrap();
 
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -686,7 +713,7 @@ fn generate_then_flatten_all_do_in_content() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("tx_no_ap.pdf");
     let output = temp.path().join("out.pdf");
-    std::fs::write(&input, tx_widget_without_ap()).unwrap();
+    std::fs::write(&input, tx_widget_without_ap_needing_appearances()).unwrap();
 
     Command::cargo_bin("flpdf")
         .unwrap()

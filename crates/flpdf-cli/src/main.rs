@@ -17,8 +17,7 @@ use flpdf::{
     thread_bead_p::drop_thread_bead_dangling_p, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    check_reader_with_options_and_limits, enumerate_document_annotations, filters,
-    flatten_rotation_on_pages, fonts,
+    check_reader_with_options_and_limits, filters, flatten_rotation_on_pages, fonts,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path, LinearizationCheckError,
@@ -27,10 +26,10 @@ use flpdf::{
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
     parse_pdf_version, AcroFormDocumentHelper, CompressStreams, CopyEncryptionSource,
-    EncryptMethod, EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object,
-    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
-    PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
-    RemoveUnreferencedResources, Severity, StreamDataMode,
+    EncryptMethod, EncryptParams, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg,
+    ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf, PdfOpenOptions, PdfVersion,
+    PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources,
+    Severity, StreamDataMode,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list_with_sink,
@@ -3256,7 +3255,6 @@ fn run_rewrite(
         // generate first, flatten second).
         if generate_appearances {
             generate_missing_appearances(&mut pdf)?;
-            clear_need_appearances_after_generation(&mut pdf)?;
         }
 
         // Step 5: flatten annotations into page content (--flatten-annotations).
@@ -3373,79 +3371,10 @@ fn run_rewrite(
     Ok(())
 }
 
-/// Generate or update `/AP` `/N` appearance streams for widget annotations
-/// (`--generate-appearances`).
-///
-/// Walks every page's `/Annots`. Every button field re-applies its current
-/// value so `/AS` stays synchronized with `/V`; non-button widgets whose
-/// `/FT` is `Tx` or `Ch` render through the canonical helper, which creates a
-/// missing `/AP` `/N` or updates an existing stream.
-///
-/// Review-pattern compliance:
-/// - #2 (indirect references): `/FT` is read via
-///   [`FormFieldObjectHelper::field_type`], which resolves references and the
-///   inheritable field tree internally.
-/// - #4 (graph traversal): targets are limited to the known `/Annots` positions
-///   surfaced by [`enumerate_document_annotations`] rather than a brute-force
-///   scan of all live objects.
-///
-/// The page-enumeration facade projects each widget to its top-level field for
-/// callers that need the document field tree. qpdf's appearance pass instead
-/// consumes `getFieldForAnnotation` directly, so this route uses the canonical
-/// annotation-to-field map before it starts mutating any widget.
-///
-/// The candidate `ObjectRef`s are collected up front into an owned `Vec` so the
-/// per-widget mutation loop holds a single `&mut pdf` borrow at a time.
+/// Route `--generate-appearances` through qpdf's
+/// `QPDFAcroFormDocumentHelper::generateAppearancesIfNeeded` boundary.
 fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    // qpdf's `generateAppearancesIfNeeded` resolves each widget through
-    // `getFieldForAnnotation`, not through the top-level field projection used
-    // by page annotation enumeration. Build that map once before collecting
-    // candidates so nested terminal widgets retain their local `/V`.
-    let field_refs_by_annotation = {
-        let mut helper = AcroFormDocumentHelper::new(pdf);
-        helper.annotation_to_field_map()?
-    };
-
-    // Collect candidate widget refs first (the enumeration borrows `pdf`).
-    let mut candidates: Vec<(ObjectRef, ObjectRef)> = Vec::new();
-    for (_page_ref, annots) in enumerate_document_annotations(pdf)? {
-        for annot in annots {
-            if annot.is_widget {
-                if let Some(annot_ref) = annot.annotation.object_ref() {
-                    if let Some(field_ref) = field_refs_by_annotation.get(&annot_ref).copied() {
-                        candidates.push((field_ref, annot_ref));
-                    }
-                }
-            }
-        }
-    }
-
-    for (field_ref, widget_ref) in candidates {
-        // qpdf routes every /Btn through setV(getValue()), regardless of
-        // whether /AP/N exists. set_value owns checkbox/radio synchronization
-        // and intentionally ignores pushbuttons and invalid values.
-        let is_button = FormFieldObjectHelper::new(field_ref, pdf)
-            .field_type()?
-            .as_deref()
-            == Some(b"/Btn");
-        if is_button {
-            let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
-            let value = helper.value()?.unwrap_or_else(ObjectHandle::null);
-            helper.set_value(value, false)?;
-            continue;
-        }
-
-        FormFieldObjectHelper::new(field_ref, pdf).generate_appearance_for(widget_ref)?;
-    }
-
-    Ok(())
-}
-
-/// qpdf clears `/NeedAppearances` after it has generated appearance streams.
-/// Keep an absent or already-false key unchanged, so the explicit CLI pass
-/// does not introduce a catalog mutation when qpdf would have returned early.
-fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    FormFieldObjectHelper::clear_need_appearances_after_generation(pdf)?;
+    AcroFormDocumentHelper::new(pdf).generate_appearances_if_needed()?;
     Ok(())
 }
 
@@ -6223,32 +6152,6 @@ mod tests {
                 .map(|stream| stream.data.as_slice()),
             Some(&b"\r<0g"[..])
         );
-    }
-
-    #[test]
-    fn clear_need_appearances_removes_an_indirect_true_value() {
-        let mut pdf = Pdf::open_mem_owned(
-            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
-        )
-        .unwrap();
-        let root_ref = pdf.root_ref().unwrap();
-        let mut root = pdf.resolve(root_ref).unwrap().into_dict().unwrap();
-        root.insert("AcroForm", Object::Reference(ObjectRef::new(100, 0)));
-        pdf.set_object(root_ref, Object::Dictionary(root));
-
-        let mut acroform = Dictionary::new();
-        acroform.insert("NeedAppearances", Object::Reference(ObjectRef::new(102, 0)));
-        pdf.set_object(ObjectRef::new(100, 0), Object::Dictionary(acroform));
-        pdf.set_object(ObjectRef::new(102, 0), Object::Boolean(true));
-
-        clear_need_appearances_after_generation(&mut pdf).unwrap();
-
-        let acroform = pdf
-            .resolve(ObjectRef::new(100, 0))
-            .unwrap()
-            .into_dict()
-            .expect("AcroForm must remain a dictionary");
-        assert!(acroform.get("NeedAppearances").is_none());
     }
 
     #[cfg(unix)]

@@ -6817,11 +6817,12 @@ fn rotated_page_pdf() -> Vec<u8> {
     ])
 }
 
-/// Single-page AcroForm PDF with one Tx widget that carries `/V` but no `/AP`.
+/// Single-page AcroForm PDF with one Tx widget that carries `/V` but no `/AP`
+/// and requests qpdf-style appearance generation with `/NeedAppearances true`.
 fn tx_form_pdf_without_ap() -> Vec<u8> {
     assemble_pdf(&[
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm \
-          << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+          << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
             .to_vec(),
         b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
         b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
@@ -6858,10 +6859,12 @@ fn tx_form_pdf_with_ap() -> Vec<u8> {
 
 /// Single-page AcroForm PDF with one Tx widget whose `/AP` `/N` is explicitly
 /// `null` (must be treated as absent — a real appearance should be generated).
+/// The document also sets `/NeedAppearances true`, which is qpdf's generation
+/// gate.
 fn tx_form_pdf_with_null_ap_n() -> Vec<u8> {
     assemble_pdf(&[
         b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm \
-          << /Fields [4 0 R] /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+          << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
             .to_vec(),
         b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
         b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \

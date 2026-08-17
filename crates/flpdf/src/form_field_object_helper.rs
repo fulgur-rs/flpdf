@@ -81,7 +81,7 @@ fn direct_parent_cycle_error(field_ref: ObjectRef) -> Error {
 /// Typed access helper for a PDF AcroForm field or widget annotation
 /// dictionary.
 pub struct FormFieldObjectHelper<'a, R: Read + Seek + 'static> {
-    field_ref: ObjectRef,
+    field_ref: Option<ObjectRef>,
     field: ObjectHandle,
     pdf: &'a mut Pdf<R>,
 }
@@ -95,7 +95,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     pub fn new(field_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
         let field = pdf.get_object_handle(field_ref);
         Self {
-            field_ref,
+            field_ref: Some(field_ref),
+            field,
+            pdf,
+        }
+    }
+
+    /// Construct a helper from a live field handle, preserving direct-object
+    /// identity for qpdf's orphan-Widget fallback.
+    pub(crate) fn from_object_handle(field: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+        Self {
+            field_ref: field.object_ref(),
             field,
             pdf,
         }
@@ -114,9 +124,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return the top-level field and whether it differs from this field.
     pub fn get_top_level_field(&mut self) -> Result<(ObjectRef, bool)> {
+        let Some(field_ref) = self.field_ref else {
+            return Err(Error::Unsupported(
+                "direct field has no ObjectRef top-level identity".to_string(),
+            ));
+        };
         let mut current = self.field.clone();
         let mut seen = Vec::new();
-        let mut top = self.field_ref;
+        let mut top = field_ref;
         let mut is_different = false;
         let mut depth = 0;
 
@@ -131,7 +146,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
                 return Err(Error::Unsupported(format!(
                     "field tree depth exceeds maximum of {} at {}",
-                    DEFAULT_MAX_PAGE_TREE_DEPTH, self.field_ref
+                    DEFAULT_MAX_PAGE_TREE_DEPTH, field_ref
                 )));
             }
 
@@ -263,7 +278,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
         while mark_field_node_seen(&mut seen, &current) {
             if !mark_direct_node_seen(&mut direct_seen, &current) {
-                return Err(direct_parent_cycle_error(self.field_ref));
+                return Err(direct_parent_cycle_error(
+                    self.field_ref.unwrap_or(ObjectRef::new(0, 0)),
+                ));
             }
             let node = self.resolved(current.clone())?;
             if node.as_dictionary().is_none() {
@@ -448,13 +465,27 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Generate a normal appearance for `widget_ref` from this field's value.
     pub fn generate_appearance_for(&mut self, widget_ref: ObjectRef) -> Result<Option<ObjectRef>> {
+        let widget = self.pdf.get_object_handle(widget_ref);
+        self.generate_appearance_for_handle(widget)
+    }
+
+    /// Generate a normal appearance for a live Widget handle from this
+    /// field's value. This is the handle-native counterpart of
+    /// [`Self::generate_appearance_for`] and also accepts direct orphan
+    /// widgets.
+    pub(crate) fn generate_appearance_for_handle(
+        &mut self,
+        widget: ObjectHandle,
+    ) -> Result<Option<ObjectRef>> {
         match self.field_type()?.as_deref() {
             Some(b"/Tx") => {
-                rendering::render_text_field_canonical(self.pdf, self.field_ref, widget_ref)
+                rendering::render_text_field_canonical_handles(self.pdf, self.field.clone(), widget)
             }
-            Some(b"/Ch") => {
-                rendering::render_choice_field_canonical(self.pdf, self.field_ref, widget_ref)
-            }
+            Some(b"/Ch") => rendering::render_choice_field_canonical_handles(
+                self.pdf,
+                self.field.clone(),
+                widget,
+            ),
             _ => Ok(None),
         }
     }
@@ -481,18 +512,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn set_need_appearances(&mut self) -> Result<()> {
-        let root = self.pdf.trailer_key_handle(b"Root");
-        self.pdf.resolve_object_handle(&root)?;
-        if root.is_null() {
-            return Ok(());
-        }
-        let acroform = root.get_key(b"/AcroForm");
-        self.pdf.resolve_object_handle(&acroform)?;
-        if acroform.as_dictionary().is_none() {
-            return Ok(());
-        }
-        acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true))?;
-        self.pdf.mark_object_handle_dirty(&acroform)
+        crate::AcroFormDocumentHelper::new(self.pdf).set_need_appearances(true)
     }
 
     fn set_checkbox_value(&mut self, checked: bool) -> Result<()> {
@@ -792,7 +812,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 return Ok(None);
             }
             if !mark_direct_node_seen(&mut direct_seen, &current) {
-                return Err(direct_parent_cycle_error(self.field_ref));
+                return Err(direct_parent_cycle_error(
+                    self.field_ref.unwrap_or(ObjectRef::new(0, 0)),
+                ));
             }
 
             let node = self.resolved(current)?;

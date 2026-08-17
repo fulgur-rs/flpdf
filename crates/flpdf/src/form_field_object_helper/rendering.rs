@@ -168,12 +168,22 @@ fn resolve_appearance_bbox_canonical<R: Read + Seek>(
 }
 
 /// Resolve the standard-14 font named by a field's document-level `/DR`.
+#[cfg(test)]
 fn lookup_dr_basefont_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
     resource_name: &[u8],
 ) -> Result<Option<StandardFont>> {
-    let resources = FormFieldObjectHelper::new(field_ref, pdf).default_resources()?;
+    let field = pdf.get_object_handle(field_ref);
+    lookup_dr_basefont_canonical_handles(pdf, field, resource_name)
+}
+
+fn lookup_dr_basefont_canonical_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: ObjectHandle,
+    resource_name: &[u8],
+) -> Result<Option<StandardFont>> {
+    let resources = FormFieldObjectHelper::from_object_handle(field, pdf).default_resources()?;
     let Some(resources) = resources else {
         return Ok(None);
     };
@@ -293,15 +303,14 @@ impl TokenFilter for AppearanceTokenFilter {
 /// freshly built stream is never linked into the widget's `/AP/N`. `None`
 /// keeps that outcome visible to the caller instead of returning a stream
 /// ref the widget does not actually reference.
-fn install_normal_appearance_canonical<R: Read + Seek>(
+fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    widget_ref: ObjectRef,
+    widget: ObjectHandle,
     content: Vec<u8>,
     bbox_w: f64,
     bbox_h: f64,
     font_resource: (Vec<u8>, Vec<u8>),
 ) -> Result<Option<ObjectRef>> {
-    let widget = pdf.get_object_handle(widget_ref);
     pdf.resolve_object_handle(&widget)?;
     let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
 
@@ -400,18 +409,29 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
 
 /// Canonical Tx appearance generation. Graph reads and writes stay on the
 /// field/widget handles; only the appearance content itself is a byte buffer.
+#[cfg(test)]
 pub(crate) fn render_text_field_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
-    let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
+    let field = pdf.get_object_handle(field_ref);
+    let widget = pdf.get_object_handle(widget_ref);
+    render_text_field_canonical_handles(pdf, field, widget)
+}
+
+/// Canonical Tx appearance generation from live field and Widget handles.
+pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: ObjectHandle,
+    widget: ObjectHandle,
+) -> Result<Option<ObjectRef>> {
+    let field_type = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).field_type()?;
     if field_type.as_deref() != Some(b"/Tx") {
         return Ok(None);
     }
 
-    let value = FormFieldObjectHelper::new(field_ref, pdf).value_as_string()?;
-    let widget = pdf.get_object_handle(widget_ref);
+    let value = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).value_as_string()?;
     pdf.resolve_object_handle(&widget)?;
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
@@ -422,7 +442,7 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
         return Ok(None);
     }
 
-    let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+    let mut helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
     let default_appearance = helper.default_appearance()?;
     let da = parse_default_appearance(default_appearance.as_bytes());
     drop(helper);
@@ -431,7 +451,8 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
     let standard_font = if let Some(font) = StandardFont::from_base_name(&font_name) {
         font
     } else {
-        lookup_dr_basefont_canonical(pdf, field_ref, &font_name)?.unwrap_or(StandardFont::Helvetica)
+        lookup_dr_basefont_canonical_handles(pdf, field.clone(), &font_name)?
+            .unwrap_or(StandardFont::Helvetica)
     };
     // qpdf's ValueSetter ignores quadding and uses 11pt when the /DA Tf
     // operand is absent or auto-sized (`QPDFFormFieldObjectHelper.cc:797-860`).
@@ -445,9 +466,9 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
         font_size,
         true,
     );
-    install_normal_appearance_canonical(
+    install_normal_appearance_canonical_handles(
         pdf,
-        widget_ref,
+        widget,
         content,
         bbox_w,
         bbox_h,
@@ -457,17 +478,28 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
 
 /// Canonical Ch appearance generation. Choice values and option entries are
 /// projected from live handles before the existing pure content builder runs.
+#[cfg(test)]
 pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
-    let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
+    let field = pdf.get_object_handle(field_ref);
+    let widget = pdf.get_object_handle(widget_ref);
+    render_choice_field_canonical_handles(pdf, field, widget)
+}
+
+/// Canonical Ch appearance generation from live field and Widget handles.
+pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: ObjectHandle,
+    widget: ObjectHandle,
+) -> Result<Option<ObjectRef>> {
+    let field_type = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).field_type()?;
     if field_type.as_deref() != Some(b"/Ch") {
         return Ok(None);
     }
 
-    let widget = pdf.get_object_handle(widget_ref);
     pdf.resolve_object_handle(&widget)?;
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
@@ -478,7 +510,7 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
         return Ok(None);
     }
 
-    let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+    let mut helper = FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
     let default_appearance = helper.default_appearance()?;
     let da = parse_default_appearance(default_appearance.as_bytes());
     // qpdf's `getFlags()` returns a signed C++ `int` and tests the combo
@@ -509,7 +541,8 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
     let standard_font = if let Some(font) = StandardFont::from_base_name(&font_name) {
         font
     } else {
-        lookup_dr_basefont_canonical(pdf, field_ref, &font_name)?.unwrap_or(StandardFont::Helvetica)
+        lookup_dr_basefont_canonical_handles(pdf, field.clone(), &font_name)?
+            .unwrap_or(StandardFont::Helvetica)
     };
     // qpdf's ValueSetter starts from the Tf operand in /DA. A missing or
     // auto-sized Tf uses its source default of 11pt; it does not invent a
@@ -527,9 +560,9 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
         font_size,
         flags & 0x20000 != 0,
     );
-    install_normal_appearance_canonical(
+    install_normal_appearance_canonical_handles(
         pdf,
-        widget_ref,
+        widget,
         content,
         bbox_w,
         bbox_h,
