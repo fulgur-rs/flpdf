@@ -330,6 +330,13 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// `/Root` as listed in the trailer, when present.
     pub fn root_ref(&self) -> Option<ObjectRef> {
+        // The JSON importer and canonical writer mutate the live trailer
+        // handle after construction. Once that handle exists it is qpdf's
+        // authoritative trailer; the legacy dictionary is only the
+        // construction-time snapshot and cannot observe those mutations.
+        if let Some(trailer) = &self.trailer_handle_memo {
+            return trailer.get_key(b"/Root").object_ref();
+        }
         self.trailer.get_ref("Root")
     }
 }
