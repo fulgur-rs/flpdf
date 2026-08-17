@@ -693,29 +693,6 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
     Ok((!resources.is_null()).then_some(resources))
 }
 
-fn resolve_resource_category_handles<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    resources: &ObjectHandle,
-) -> Result<()> {
-    // qpdf's mergeResources asks isDictionary() of each category value,
-    // which dereferences indirect handles. Parsed children are already
-    // canonical handles; only the Pdf::set_object compatibility boundary
-    // can leave a resolved bare-reference redirect that needs this bounded
-    // terminal chase before the canonical primitive inspects its shape.
-    let mut changed = false;
-    for (category, value) in resources.as_dictionary().unwrap_or_default() {
-        let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
-        if !terminal.is_same_object_as(&value) {
-            resources.replace_key(&category, terminal)?;
-            changed = true;
-        }
-    }
-    if changed {
-        pdf.mark_object_handle_dirty(resources)?;
-    }
-    Ok(())
-}
-
 /// Resolve every item of an array-shaped resource category, matching
 /// qpdf's own dereferencing.
 ///
@@ -743,48 +720,65 @@ fn resolve_array_item_handles<R: Read + Seek>(
     Ok(())
 }
 
-/// Resolve exactly the destination resource categories
-/// [`ObjectHandle::merge_resources`] will inspect, and pre-resolve array
-/// items for any category that will undergo an array-merge.
+/// Resolve exactly what [`ObjectHandle::merge_resources`] will inspect, one
+/// DR category at a time in DR's own iteration order, and pre-resolve
+/// array items for a category that will undergo an array-merge.
 ///
 /// qpdf's `mergeResources` (`QPDFObjectHandle.cc:1080`,
-/// `for (auto const& o_top: other.ditems())`) iterates only the *source*
-/// (DR)'s own top-level categories; a destination category DR does not
-/// also have is never inspected. Resolving every destination category
-/// unconditionally -- as opposed to only the ones DR shares -- would abort
-/// or warn on an unrelated malformed category (for example a destination
-/// `/ColorSpace` when DR has only `/Font`) that qpdf itself never touches.
+/// `for (auto const& o_top: other.ditems())`) is a single loop over the
+/// *source* (DR)'s own top-level categories, in DR's key order (a
+/// `std::map`, so qpdf's own order is lexicographic by key -- matching
+/// this dictionary's `BTreeMap` iteration order). For each category it
+/// resolves that source value, then -- only if the destination already
+/// has that same key -- resolves and processes the destination value,
+/// before moving to the next category. Splitting source and matching-
+/// destination resolution into two whole-dictionary passes (as an
+/// earlier revision of this function did) changes which malformed object
+/// is reached first on doubly-malformed input, altering the diagnostics
+/// and the propagated error qpdf would produce; interleaving per category
+/// here keeps that order faithful. A destination category DR does not
+/// also have is never inspected -- resolving every destination category
+/// unconditionally would abort or warn on an unrelated malformed category
+/// (for example a destination `/ColorSpace` when DR has only `/Font`)
+/// that qpdf itself never touches.
 ///
 /// Returns the destination's own indirect array-shaped matched
-/// categories, so the caller can mark them dirty after the merge: qpdf's
-/// array branch, unlike its dictionary branch, mutates a shared indirect
-/// array in place rather than privatizing it first
-/// (`QPDFObjectHandle.cc:1130-1147` has no `isIndirect()`/`shallowCopy()`
-/// step the way the dictionary branch does at `:1093`), and
-/// [`ObjectHandle::merge_resources`] correctly mirrors that -- so the
-/// caller, which alone holds `&mut Pdf`, must mark the mutated array's own
-/// indirect owner dirty explicitly.
+/// categories, so the caller can mark them dirty *before* calling
+/// [`ObjectHandle::merge_resources`]: qpdf's array branch, unlike its
+/// dictionary branch, mutates a shared indirect array in place rather
+/// than privatizing it first (`QPDFObjectHandle.cc:1130-1147` has no
+/// `isIndirect()`/`shallowCopy()` step the way the dictionary branch does
+/// at `:1093`), and [`ObjectHandle::merge_resources`] correctly mirrors
+/// that. Because a later category can still fail after an earlier
+/// array-shaped category was already mutated (entries merged before the
+/// failing one stay installed, per that method's own `# Errors` doc), the
+/// caller must mark every returned array dirty regardless of whether the
+/// merge call that follows ultimately succeeds.
 fn resolve_matched_category_handles<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     resources: &ObjectHandle,
     default_resources: &ObjectHandle,
 ) -> Result<Vec<ObjectHandle>> {
     let mut dirty_arrays = Vec::new();
-    let source_entries = default_resources.as_dictionary().unwrap_or_default();
-    for (category, value) in resources.as_dictionary().unwrap_or_default() {
-        let Some(source_value) = source_entries.get(&category) else {
+    let dest_entries = resources.as_dictionary().unwrap_or_default();
+    for (category, source_value) in default_resources.as_dictionary().unwrap_or_default() {
+        let source_terminal = pdf.resolve_object_handle_to_terminal(&source_value)?;
+        if !source_terminal.is_same_object_as(&source_value) {
+            default_resources.replace_key(&category, source_terminal.clone())?;
+        }
+        let Some(dest_value) = dest_entries.get(&category) else {
             continue; // cov:ignore: qpdf's merge never inspects a destination-only category
         };
-        let was_indirect = value.is_indirect();
-        let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
-        if !terminal.is_same_object_as(&value) {
-            resources.replace_key(&category, terminal.clone())?;
+        let dest_was_indirect = dest_value.is_indirect();
+        let dest_terminal = pdf.resolve_object_handle_to_terminal(dest_value)?;
+        if !dest_terminal.is_same_object_as(dest_value) {
+            resources.replace_key(&category, dest_terminal.clone())?;
         }
-        if terminal.as_array().is_some() && source_value.as_array().is_some() {
-            resolve_array_item_handles(pdf, &terminal)?;
-            resolve_array_item_handles(pdf, source_value)?;
-            if was_indirect {
-                dirty_arrays.push(terminal);
+        if dest_terminal.as_array().is_some() && source_terminal.as_array().is_some() {
+            resolve_array_item_handles(pdf, &dest_terminal)?;
+            resolve_array_item_handles(pdf, &source_terminal)?;
+            if dest_was_indirect {
+                dirty_arrays.push(dest_terminal);
             }
         }
     }
@@ -861,19 +855,21 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
         if default_resources.as_dictionary().is_none() {
             continue; // cov:ignore: malformed AcroForm DR is ignored like qpdf
         }
-        // Source side: every one of DR's own categories is inspected by
-        // merge_resources (QPDFObjectHandle.cc:1080), including ones absent
-        // from the destination (shallow-copied wholesale), so all of DR's
-        // categories must be resolved here.
-        resolve_resource_category_handles(pdf, &default_resources)?;
-        // Destination side: only categories DR also has are ever inspected
-        // (see resolve_matched_category_handles's doc).
+        // See resolve_matched_category_handles's doc for why this resolves
+        // source and matching-destination categories interleaved, one DR
+        // category at a time, rather than in two whole-dictionary passes.
         let dirty_arrays = resolve_matched_category_handles(pdf, &resources, &default_resources)?;
-        resources.merge_resources(&default_resources, None)?;
+        // Mark every handle the upcoming merge will touch dirty *before*
+        // calling it: entries merged before a later category's failure
+        // stay installed in the live handle graph (matching qpdf's own
+        // partial-mutation-on-exception behavior, documented on
+        // merge_resources's `# Errors`), so the dirty marks must already be
+        // in place before that fallible call, not only after it returns.
         pdf.mark_object_handle_dirty(&resources)?;
-        for array in dirty_arrays {
-            pdf.mark_object_handle_dirty(&array)?;
+        for array in &dirty_arrays {
+            pdf.mark_object_handle_dirty(array)?;
         }
+        resources.merge_resources(&default_resources, None)?;
     }
     Ok(())
 }
@@ -1603,12 +1599,11 @@ mod tests {
     fn qpdf_flatten_terminal_chases_a_holder_redirect_category_and_array_item() {
         // A `Pdf::set_object` bare-reference holder redirect (an entry
         // whose own resolved value is itself another reference, never
-        // produced by a real parser -- see resolve_resource_category_
-        // handles's doc) on both a DR category and an array item inside
-        // it: resolve_object_handle_to_terminal must chase past the
-        // redirect, and the terminal must differ in identity from the
-        // original holder, exercising the replace_key/set_array_item
-        // rewrite path in both resolve_resource_category_handles and
+        // produced by a real parser) on both a DR category and an array
+        // item inside it: resolve_object_handle_to_terminal must chase
+        // past the redirect, and the terminal must differ in identity from
+        // the original holder, exercising the replace_key/set_array_item
+        // rewrite path in both resolve_matched_category_handles and
         // resolve_array_item_handles.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         let mut appearance_resources = Dictionary::new();
@@ -1732,6 +1727,87 @@ mod tests {
                 Object::Name(b"Text".to_vec())
             ],
             "the merged indirect array must be reachable through pdf.resolve after the merge"
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_keeps_an_earlier_indirect_array_merge_dirty_after_a_later_category_fails() {
+        // merge_resources documents that entries merged before a later
+        // category's failure stay installed in the live handle graph,
+        // matching an exception unwinding out of qpdf's own loop. DR's
+        // categories are visited in key order ("/ProcSet" < "/XObject"),
+        // so the indirect /ProcSet array is merged (and mutated) first,
+        // then /XObject -- a direct stream, absent from the destination --
+        // fails installation via shallow_copy's stream rejection.
+        //
+        // mark_object_handle_mutated (reader.rs) evicts the object's
+        // legacy_materialized_memo entry as its cache-invalidation step; a
+        // prior pdf.resolve() populates that cache, so this test warms it
+        // *before* the merge and re-resolves *after* -- if the /ProcSet
+        // mutation that ran before the /XObject failure was never marked
+        // dirty, the second resolve would still return the pre-merge
+        // snapshot instead of live content.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+        );
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("ProcSet", Object::Reference(ObjectRef::new(9, 0)));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Name(b"Text".to_vec())]),
+        );
+        default_resources.insert(
+            "XObject",
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+
+        // Warm pdf.resolve's cache with the pre-merge snapshot.
+        let Object::Array(proc_set_before) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(proc_set_before, vec![Object::Name(b"PDF".to_vec())]);
+
+        let error = merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &default_resources,
+        )
+        .expect_err("the direct-stream /XObject category must still fail after /ProcSet merges");
+        assert!(matches!(
+            &error,
+            Error::System(message) if message == "stream objects cannot be cloned"
+        ));
+
+        let Object::Array(proc_set_after) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            proc_set_after,
+            vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Name(b"Text".to_vec())
+            ],
+            "the /ProcSet merge that ran before the /XObject failure must invalidate the \
+             pre-merge pdf.resolve() snapshot, not return it stale"
         );
     }
 
