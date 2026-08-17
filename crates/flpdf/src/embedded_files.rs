@@ -109,15 +109,16 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
-        if !catalog.has_key(b"/Names") {
-            return Ok(None);
-        }
-        let names_seed = catalog.get_key(b"/Names");
+        // Keep qpdf's getKey -> terminal-resolution order here. The public
+        // has_key facade must resolve the child to test nullness, which would
+        // move name-tree repair diagnostics before the tree walker sees the
+        // malformed child.
+        let names_seed = catalog.try_get_key(b"/Names")?;
         let names = self.pdf.resolve_object_handle_to_terminal(&names_seed)?;
-        if names.try_as_dictionary()?.is_none() || !names.has_key(b"/EmbeddedFiles") {
+        if names.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
-        let root_seed = names.get_key(b"/EmbeddedFiles");
+        let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
         let root = self.pdf.resolve_object_handle_to_terminal(&root_seed)?;
         if root.try_as_dictionary()?.is_none() {
             return Ok(None);

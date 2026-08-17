@@ -957,7 +957,9 @@ mod tests {
         assert!(source_stream
             .as_stream_dict()
             .expect("source stream dictionary")
-            .has_key(b"/IndirectNull"));
+            .try_get_key(b"/IndirectNull")
+            .expect("read source stream dictionary entry")
+            .is_null());
 
         let mut target = minimal_pdf();
         let target_stream = target.new_stream().expect("target stream");

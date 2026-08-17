@@ -344,7 +344,12 @@ impl LiveDictionary {
 
     fn get(&self, key: &str) -> Option<ObjectHandle> {
         let key = self.actual_key(key);
-        self.handle.has_key(&key).then(|| self.handle.get_key(&key))
+        let value = self.handle.try_get_key(&key).ok();
+        // Keep a resolved-missing child in the tree walk. `resolved_array`
+        // uses that state to emit qpdf's structural `/Names` or `/Kids`
+        // error; filtering it as ordinary null would incorrectly turn a
+        // malformed indirect child into an empty node.
+        value.filter(|value| !value.is_null() || value.is_missing())
     }
 
     fn insert(&self, key: &str, value: ObjectHandle) -> Result<()> {
@@ -359,7 +364,12 @@ impl LiveDictionary {
 
     fn contains(&self, key: &str) -> bool {
         let key = self.actual_key(key);
-        self.handle.has_key(&key)
+        self.handle
+            .try_get_key(&key)
+            .ok()
+            // See `get`: a missing child is still a structural key for the
+            // next qpdf-shaped validation step.
+            .is_some_and(|value| !value.is_null() || value.is_missing())
     }
 
     fn mark_dirty<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
