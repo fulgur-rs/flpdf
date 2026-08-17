@@ -5,9 +5,11 @@ use super::input::{
     inline_stream_data_provider, json_value_to_handle, parse_indirect_reference, parse_object_key,
     JsonReactor,
 };
-use super::Json;
+use super::{Json, Reactor};
 use crate::json::parse_reader;
-use crate::{Error, ObjectHandle, ObjectRef, Pdf};
+use crate::pipeline::test_support::NthWriteFailure;
+use crate::pipeline::PipelineHandle;
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
 use std::cell::RefCell;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -379,7 +381,9 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
                 "unknown": {"ignored": true}
             },
             {
-                "obj:1 0 R": {"value": {"/Type": "/Catalog", "/Pages": "2 0 R"}},
+                "obj:1 0 R": {
+                    "value": {"/Type": "/Catalog", "/Pages": "2 0 R", "/Binary": "b:00ff"}
+                },
                 "obj:2 0 R": {"value": [1, true]},
                 "obj:3 0 R": {
                     "stream": {"dict": {"/Length": 3}, "data": "YWJj", "unknown": false}
@@ -416,6 +420,12 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
             .get(b"/Pages".as_slice())
             .and_then(ObjectHandle::object_ref),
         Some(ObjectRef::new(2, 0))
+    );
+    assert_eq!(
+        catalog_dict
+            .get(b"/Binary".as_slice())
+            .and_then(|value| value.as_string()),
+        Some(vec![0, 0xff])
     );
 
     let array = pdf.get_object_handle(ObjectRef::new(2, 0));
@@ -681,4 +691,304 @@ fn json_reactor_rejects_top_level_scalar_and_array_as_runtime_errors() {
             Some("QPDF JSON must be a dictionary")
         );
     }
+}
+
+#[test]
+fn json_reactor_reports_root_metadata_and_container_shape_errors() {
+    let cases = [
+        (br#"{}"#.as_slice(), "\"qpdf\" object was not seen"),
+        (br#"{"qpdf":1}"#.as_slice(), "\"qpdf\" must be an array"),
+        (
+            br#"{"qpdf":[1,{}]}"#.as_slice(),
+            "\"qpdf[0]\" must be a dictionary",
+        ),
+        (
+            br#"{"qpdf":[{},1]}"#.as_slice(),
+            "\"qpdf[1]\" must be a dictionary",
+        ),
+        (
+            br#"{"qpdf":[{}, {}, {}]}"#.as_slice(),
+            "\"qpdf\" must have two elements",
+        ),
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":1,"trailer":1}]}"#
+                .as_slice(),
+            "\"obj:1 0 R\" must be a dictionary",
+        ),
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"trailer":{}}]}"#.as_slice(),
+            "\"trailer\" is missing \"value\"",
+        ),
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"trailer":{"stream":1}}]}"#
+                .as_slice(),
+            "the trailer may not be a stream",
+        ),
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.x"},{"trailer":{"value":{}}}]}"#
+                .as_slice(),
+            "invalid PDF version",
+        ),
+    ];
+
+    for (json, expected) in cases {
+        let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "shape.json", true);
+        parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+        assert!(reactor.any_errors(), "expected an error for {json:?}");
+        drop(reactor);
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "expected {expected:?} in diagnostics for {json:?}: {:?}",
+            pdf.repair_diagnostics().entries()
+        );
+    }
+}
+
+#[test]
+fn json_reactor_handles_flag_values_and_invalid_stream_members() {
+    let json = br#"{
+        "qpdf": [
+            {
+                "jsonversion": 2,
+                "pdfversion": "1.3",
+                "calledgetallpages": false,
+                "pushedinheritedpageresources": false
+            },
+            {
+                "obj:1 0 R": {
+                    "stream": {
+                        "dict": 1,
+                        "data": 1,
+                        "datafile": 1
+                    }
+                },
+                "trailer": {"value": {}}
+            }
+        ]
+    }"#;
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "shape.json", true);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+    assert!(reactor.any_errors());
+    drop(reactor);
+
+    let invalid_flags = br#"{
+        "qpdf": [
+            {
+                "jsonversion": 2,
+                "pdfversion": "1.3",
+                "calledgetallpages": "yes",
+                "pushedinheritedpageresources": 1
+            },
+            {"trailer": {"value": {}}}
+        ]
+    }"#;
+    let source = Rc::new(RefCell::new(Cursor::new(invalid_flags.to_vec())));
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "shape.json", false);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON update");
+    assert!(reactor.any_errors());
+    drop(reactor);
+
+    let messages: Vec<_> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect();
+    assert!(messages
+        .iter()
+        .any(|message| message.contains("calledgetallpages must be a boolean")));
+    assert!(messages
+        .iter()
+        .any(|message| message.contains("pushedinheritedpageresources must be a boolean")));
+    assert!(messages.iter().any(|message| message
+        .contains("new \"stream\" must have exactly one of \"data\" or \"datafile\"")));
+    assert!(messages
+        .iter()
+        .any(|message| message.contains("\"stream.data\" must be a string")));
+    assert!(messages
+        .iter()
+        .any(|message| message.contains("\"stream.datafile\" must be a string")));
+    assert!(messages
+        .iter()
+        .any(|message| message.contains("\"stream.dict\" must be a dictionary")));
+}
+
+#[test]
+fn json_reactor_handles_factory_and_dictionary_key_failures() {
+    let cases = [
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"value":"n:/A#"}}]}"#.as_slice(),
+            "PDF name",
+        ),
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"value":1e9999}}]}"#.as_slice(),
+            "invalid JSON number",
+        ),
+        (
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"value":{"n:/A#":1}}}]}"#.as_slice(),
+            "invalid",
+        ),
+    ];
+
+    for (json, _expected) in cases {
+        let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "factory.json", true);
+        parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+        assert!(reactor.any_errors() || reactor.fatal_error().is_some());
+        assert!(
+            reactor.fatal_error().is_some(),
+            "factory failure must be fatal"
+        );
+        drop(reactor);
+    }
+}
+
+#[test]
+fn json_reactor_rejects_an_indirect_object_value() {
+    let json = br#"{
+        "qpdf": [
+            {"jsonversion": 2, "pdfversion": "1.3"},
+            {
+                "obj:1 0 R": {"value": "12 0 R"},
+                "trailer": {"value": {}}
+            }
+        ]
+    }"#;
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "indirect.json", true);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+    assert!(reactor.any_errors());
+    drop(reactor);
+    assert!(pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic
+            .message
+            .contains("value of an object may not be an indirect object reference")));
+}
+
+#[test]
+fn json_reactor_captures_callback_failures_and_uninitialized_callbacks() {
+    let source = Rc::new(RefCell::new(Cursor::new(Vec::new())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "callbacks.json", false);
+    assert!(Reactor::dictionary_item(
+        &mut reactor,
+        b"ignored",
+        &Json::make_number("1")
+    ));
+    drop(reactor);
+
+    let source = Rc::new(RefCell::new(Cursor::new(Vec::new())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "callbacks.json", false);
+    assert!(Reactor::array_item(&mut reactor, &Json::make_number("1")));
+    drop(reactor);
+
+    let source = Rc::new(RefCell::new(Cursor::new(Vec::new())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "callbacks.json", false);
+    Reactor::container_end(&mut reactor, &Json::default());
+    drop(reactor);
+
+    let source = Rc::new(RefCell::new(Cursor::new(Vec::new())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "callbacks.json", false);
+    Reactor::top_level_scalar(&mut reactor);
+    Reactor::array_start(&mut reactor);
+    assert_eq!(
+        reactor.fatal_error(),
+        Some("QPDF JSON must be a dictionary")
+    );
+}
+
+#[test]
+fn json_reactor_propagates_warning_logger_failures() {
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(
+        crate::pipeline::test_support::NthWriteFailure::new(1),
+    )));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    pdf.set_logger(logger);
+    let json = br#"{}"#;
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "failure.json", true);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+    assert!(reactor.any_errors());
+    assert!(reactor
+        .fatal_error()
+        .is_some_and(|message| message.contains("sink write failure 1")));
+}
+
+#[test]
+fn json_warning_route_preserves_qpdf_context_and_suppression() {
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(usize::MAX))));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    pdf.set_logger(logger);
+    pdf.resolver
+        .push_json_warning("", "", 5, "positive")
+        .expect("warning delivery");
+    pdf.resolver
+        .push_json_warning("", "", 0, "zero")
+        .expect("warning delivery");
+    pdf.resolver
+        .push_json_warning("", "obj:1 0 R", -1, "negative")
+        .expect("warning delivery");
+    pdf.resolver
+        .push_json_warning("", "obj:1 0 R", 5, "object")
+        .expect("warning delivery");
+    pdf.set_suppress_warnings(true);
+    pdf.resolver
+        .push_json_warning("", "", 0, "suppressed")
+        .expect("suppressed warning collection");
+    assert!(pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message == "suppressed"));
+
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(usize::MAX))));
+    let options = PdfOpenOptions {
+        logger: Some(logger),
+        description: "document.pdf".to_owned(),
+        ..PdfOpenOptions::default()
+    };
+    let pdf_bytes = include_bytes!("../../../../tests/fixtures/minimal.pdf").to_vec();
+    let pdf = Pdf::open_with_options(Cursor::new(pdf_bytes), options).expect("minimal PDF");
+    pdf.resolver
+        .push_json_warning("document.pdf", "", 5, "named positive")
+        .expect("warning delivery");
+    pdf.resolver
+        .push_json_warning("document.pdf", "", 0, "named zero")
+        .expect("warning delivery");
+    pdf.resolver
+        .push_json_warning("document.pdf", "obj:1 0 R", 5, "named object")
+        .expect("warning delivery");
+}
+
+#[test]
+fn json_reactor_handles_stream_dictionary_boundary_errors() {
+    let stream = ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+    let error = stream
+        .replace_stream_dict(ObjectHandle::integer(1))
+        .expect_err("non-dictionary replacement");
+    assert!(error.to_string().contains("non-dictionary"));
+
+    let scalar = ObjectHandle::integer(1);
+    let error = scalar
+        .replace_stream_dict(ObjectHandle::dictionary(Vec::new()))
+        .expect_err("scalar replacement");
+    assert!(error.to_string().contains("operation for stream"));
 }
