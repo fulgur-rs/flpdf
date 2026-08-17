@@ -524,22 +524,24 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return;
         }
 
-        let annotation_ids: Vec<ObjectHandleIdentity> = cache
-            .annotation_to_field
-            .iter()
-            .filter_map(|(annotation, field)| {
-                removed
-                    .contains(&field.identity_key())
-                    .then_some(annotation.clone())
-            })
-            .collect();
+        // qpdf's removeFormFields walks the forward association list, not the
+        // reverse map. The forward list can be stale after a warm-cache
+        // reassociation, and that stale entry is intentionally observable in
+        // the cache cleanup semantics (QPDFAcroFormDocumentHelper.cc:124-131).
+        let mut annotation_ids = Vec::new();
+        for field in &removed {
+            if let Some(annotations) = cache.field_to_annotations.remove(field) {
+                annotation_ids.extend(
+                    annotations
+                        .into_iter()
+                        .map(|annotation| annotation.identity_key()),
+                );
+            } // cov:ignore: successful association branch closing brace has no llvm-cov region
+        }
         for annotation in annotation_ids {
             cache.annotation_to_field.remove(&annotation);
             cache.annotation_handles.remove(&annotation);
         }
-        cache
-            .field_to_annotations
-            .retain(|field, _| !removed.contains(field));
         cache
             .field_handles
             .retain(|field, _| !removed.contains(field));
@@ -3757,6 +3759,43 @@ mod tests {
             .iter()
             .any(|(annotation, _)| annotation.object_ref() == Some(ObjectRef::new(4, 0))));
         assert!(helper.cache.is_some(), "qpdf preserves a warm cache");
+    }
+
+    #[test]
+    fn remove_cached_fields_erases_annotations_from_removed_forward_owner() {
+        let mut pdf = empty_pdf();
+        let field_one = pdf.get_object_handle(ObjectRef::new(4, 0));
+        let field_two = pdf.get_object_handle(ObjectRef::new(7, 0));
+        let annotation = pdf.get_object_handle(ObjectRef::new(9, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+
+        let mut cache = AcroFormCache::default();
+        record_association(&mut cache, annotation.clone(), field_one.clone());
+        // qpdf's traverseField appends to the forward map and overwrites the
+        // reverse map. A warm-cache reassociation therefore leaves the same
+        // annotation in field one's stale forward list while the reverse map
+        // points at field two.
+        record_association(&mut cache, annotation.clone(), field_two.clone());
+        helper.cache = Some(cache);
+
+        helper.remove_cached_fields(&BTreeSet::from([ObjectRef::new(4, 0)]));
+
+        let cache = helper
+            .cache
+            .as_ref()
+            .expect("qpdf keeps the association cache warm after removal");
+        assert!(!cache
+            .annotation_to_field
+            .contains_key(&annotation.identity_key()));
+        assert!(!cache
+            .annotation_handles
+            .contains_key(&annotation.identity_key()));
+        assert!(!cache
+            .field_to_annotations
+            .contains_key(&field_one.identity_key()));
+        assert!(cache
+            .field_to_annotations
+            .contains_key(&field_two.identity_key()));
     }
 
     #[test]
