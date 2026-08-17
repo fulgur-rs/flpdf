@@ -1540,6 +1540,44 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_document_flatten_propagates_default_resource_merge_error() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "Font",
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(Vec::new()));
+        acroform.insert("DR", Object::Dictionary(default_resources));
+        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
+        };
+        catalog.insert("AcroForm", Object::Dictionary(acroform));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        let error = flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3)
+            .expect_err("production flatten must propagate the DR merge failure");
+        assert!(matches!(
+            error,
+            Error::System(message) if message == "stream objects cannot be cloned"
+        ));
+    }
+
+    #[test]
     fn qpdf_flatten_privatizes_an_indirect_appearance_resources_before_merging() {
         // qpdf privatizes an indirect appearance /Resources before merging DR
         // in (`QPDFPageDocumentHelper.cc:108-113`): `isIndirect()` triggers a
