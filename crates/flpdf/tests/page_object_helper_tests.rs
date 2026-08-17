@@ -858,6 +858,37 @@ fn page_helper_remove_unreferenced_resources_prunes_canonical_categories() {
 }
 
 #[test]
+fn page_helper_resource_pruning_uses_flat_names_across_categories() {
+    let (num, extra) = make_stream_object(4, b"/Shared Do");
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Contents 4 0 R /Resources << /Font << /Shared << >> >> \
+         /XObject << /Shared << >> >> >>",
+        &[(num, extra)],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("page helper should use qpdf's flat resource-name set");
+
+    let resources = helper.get_resources(false).unwrap();
+    assert!(resources
+        .get_key(b"/Font")
+        .as_dictionary()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key == b"/Shared"));
+    assert!(resources
+        .get_key(b"/XObject")
+        .as_dictionary()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key == b"/Shared"));
+}
+
+#[test]
 fn page_helper_resource_pruning_preserves_resources_when_content_is_incomplete() {
     let (num, extra) = make_stream_object(4, b"/F1 12 Tf [");
     let bytes = build_pdf_with_extras(
@@ -932,6 +963,42 @@ fn form_helper_remove_unreferenced_resources_prunes_form_categories() {
         .expect("Form font category should remain a dictionary");
     assert!(fonts.iter().any(|(key, _)| key == b"/F1"));
     assert!(!fonts.iter().any(|(key, _)| key == b"/F2"));
+}
+
+#[test]
+fn form_helper_resource_pruning_uses_flat_names_across_categories() {
+    let form_body = b"/Shared Do";
+    let mut form = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+         /Resources << /Font << /Shared << >> >> /XObject << /Shared << >> >> >> \
+         /Length {} >>\nstream\n",
+        form_body.len()
+    )
+    .into_bytes();
+    form.extend_from_slice(form_body);
+    form.extend_from_slice(b"\nendstream\nendobj\n");
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 100 100]", "", &[(5, form)]);
+    let mut pdf = open(bytes);
+    let form_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("Form helper should use qpdf's flat resource-name set");
+
+    let resources = helper.get_resources(false).unwrap();
+    assert!(resources
+        .get_key(b"/Font")
+        .as_dictionary()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key == b"/Shared"));
+    assert!(resources
+        .get_key(b"/XObject")
+        .as_dictionary()
+        .unwrap()
+        .iter()
+        .any(|(key, _)| key == b"/Shared"));
 }
 
 #[test]

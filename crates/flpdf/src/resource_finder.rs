@@ -15,6 +15,7 @@ pub(crate) type ResourceNamesByType = BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeS
 #[derive(Debug, Default)]
 pub(crate) struct ResourceFinder {
     last_name: Option<(Vec<u8>, usize)>,
+    names: BTreeSet<Vec<u8>>,
     names_by_resource_type: ResourceNamesByType,
     had_diagnostics: bool,
     pending_operands: bool,
@@ -22,6 +23,13 @@ pub(crate) struct ResourceFinder {
 }
 
 impl ResourceFinder {
+    /// Return qpdf `ResourceFinder::getNames()` semantics: one flat set of
+    /// names referenced by any resource-consuming operator, regardless of
+    /// resource category.
+    pub(crate) fn names(&self) -> &BTreeSet<Vec<u8>> {
+        &self.names
+    }
+
     pub(crate) fn names_by_resource_type(&self) -> &ResourceNamesByType {
         &self.names_by_resource_type
     }
@@ -48,12 +56,14 @@ impl ResourceFinder {
         name: &[u8],
         offset: usize,
     ) -> bool {
-        Self::insert_resource_name(
+        let inserted = Self::insert_resource_name(
             &mut self.names_by_resource_type,
             resource_type,
             name,
             offset,
-        )
+        );
+        self.names.insert(name.to_vec());
+        inserted
     }
 
     fn insert_resource_name(
@@ -79,12 +89,18 @@ impl ResourceFinder {
     }
 
     fn record_last_name(&mut self, resource_type: &[u8]) {
-        let (Some((name, offset)), names_by_resource_type) =
-            (&self.last_name, &mut self.names_by_resource_type)
-        else {
+        let Some((name, offset)) = self.last_name.as_ref() else {
             return;
         };
-        Self::insert_resource_name(names_by_resource_type, resource_type, name, *offset);
+        let name = name.clone();
+        let offset = *offset;
+        Self::insert_resource_name(
+            &mut self.names_by_resource_type,
+            resource_type,
+            &name,
+            offset,
+        );
+        self.names.insert(name);
     }
 
     pub(crate) fn handle_object_borrowed(
@@ -247,6 +263,19 @@ mod tests {
     }
 
     #[test]
+    fn names_are_flat_across_resource_types() {
+        let finder = find(b"/Shared 12 Tf /Shared Do").expect("content should parse");
+
+        assert_eq!(finder.names().len(), 1);
+        assert!(finder.names().contains(b"Shared".as_slice()));
+        assert!(
+            finder.names_by_resource_type()[b"Font".as_slice()].contains_key(b"Shared".as_slice())
+        );
+        assert!(finder.names_by_resource_type()[b"XObject".as_slice()]
+            .contains_key(b"Shared".as_slice()));
+    }
+
+    #[test]
     fn canonical_callbacks_cover_inline_image_and_diagnostic_events() {
         let mut finder = ResourceFinder::default();
         let inline = ObjectHandle::inline_image(b"payload".to_vec());
@@ -279,12 +308,7 @@ mod tests {
         let mut finder = ResourceFinder::default();
         parse_content_stream_data_recovering_inline_image_eof(input, &mut finder).unwrap();
         let mut records = String::new();
-        let flat_names = finder
-            .names_by_resource_type()
-            .values()
-            .flat_map(|by_name| by_name.keys())
-            .collect::<BTreeSet<_>>();
-        for name in flat_names {
+        for name in finder.names() {
             writeln!(records, "name\t{}", qpdf_name_hex(name)).unwrap();
         }
         for (resource_type, names) in finder.names_by_resource_type() {
