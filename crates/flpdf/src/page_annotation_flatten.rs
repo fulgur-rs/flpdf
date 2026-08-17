@@ -137,12 +137,6 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     for annotation in annotations {
         let annot_ref = annotation.object_ref();
-        if skip_widgets
-            && AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?
-                == b"Widget"
-        {
-            continue;
-        }
         // qpdf resolves the selected appearance stream before reading /F:
         // `QPDFAnnotationObjectHelper::getPageContentForAppearance`'s own
         // top gate is `getAppearanceStream("/N").isStream()`
@@ -158,6 +152,17 @@ fn flatten_annotations_on_page<R: Read + Seek>(
                 helper.get_appearance_stream(b"N", None)?,
             )
         };
+
+        // qpdf resolves /AP/N before reading /Subtype, including when
+        // NeedAppearances causes a Widget to be skipped
+        // (`QPDFPageDocumentHelper.cc:97-105`). Keep this order so a skipped
+        // Widget still observes the canonical appearance-resolution boundary.
+        if skip_widgets
+            && AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?
+                == b"Widget"
+        {
+            continue;
+        }
 
         // Read /F through the canonical helper. A zero result is also
         // qpdf's fail-soft value for absent/non-integer /F. Only a detected

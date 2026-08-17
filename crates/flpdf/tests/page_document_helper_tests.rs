@@ -999,6 +999,68 @@ fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
 }
 
 #[test]
+fn helper_flatten_annotations_resolves_widget_appearance_before_need_appearances_skip() {
+    let bytes = build_pdf(
+        "/Annots [5 0 R]",
+        &[
+            (
+                5,
+                b"5 0 obj\n<< /Type /Annot /Subtype /Widget /AP 6 0 R >>\nendobj\n".to_vec(),
+            ),
+            (6, b"6 0 obj\nnot-a-pdf-object\nendobj\n".to_vec()),
+        ],
+    );
+    let mut pdf = open(bytes.clone());
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("skip-widget-order.pdf");
+        let output_path = dir.path().join("skip-widget-order-qpdf.pdf");
+        fs::write(&input_path, &bytes).unwrap();
+        let output = Command::new("qpdf")
+            .arg("--flatten-annotations=print")
+            .arg(&input_path)
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 3)),
+            "qpdf did not produce an oracle result: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown token while reading object"),
+            "qpdf must observe the malformed /AP target: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut acroform = Dictionary::new();
+    acroform.insert("NeedAppearances", Object::Boolean(true));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("AcroForm", Object::Dictionary(acroform));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .expect("qpdf resolves the selected appearance before skipping a Widget");
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(
+        page.get("Annots").is_some(),
+        "NeedAppearances must still preserve the skipped Widget"
+    );
+    assert!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("unknown token while reading object")),
+        "the skipped Widget's malformed /AP target must have been resolved"
+    );
+}
+
+#[test]
 fn helper_flatten_annotations_defers_widget_rect_validation_past_resource_merge() {
     let mut pdf = open(build_pdf(
         "/Annots [5 0 R]",
