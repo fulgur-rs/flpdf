@@ -1659,12 +1659,11 @@ fn get_annotations_filtered_by_subtype_uses_canonical_annotation_handles() {
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
 
-    assert_eq!(
-        helper
-            .get_annotations_filtered(Some(b"Text"))
-            .expect("filtered annotation enumeration should resolve handles"),
-        vec![ObjectRef::new(4, 0)]
-    );
+    let annotations = helper
+        .get_annotations_filtered(Some(b"Text"))
+        .expect("filtered annotation enumeration should resolve handles");
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(annotations[0].object_ref(), Some(ObjectRef::new(4, 0)));
 }
 
 #[test]
@@ -1691,6 +1690,29 @@ fn get_annotation_handles_preserves_direct_annotations() {
         Some(b"Text".to_vec())
     );
     assert_eq!(handles[1].object_ref(), Some(ObjectRef::new(4, 0)));
+}
+
+#[test]
+fn get_annotations_filtered_preserves_direct_annotations() {
+    let annot4 = (
+        4u32,
+        b"4 0 obj\n<< /Type /Annot /Subtype /Link >>\nendobj\n".to_vec(),
+    );
+    let bytes = build_pdf_with_extras(
+        "/MediaBox [0 0 612 792]",
+        "/Annots [<< /Type /Annot /Subtype /Text >> 4 0 R]",
+        &[annot4],
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+
+    let annotations = helper
+        .get_annotations_filtered(None)
+        .expect("filtered qpdf annotation enumeration should retain direct dictionaries");
+    assert_eq!(annotations.len(), 2);
+    assert!(annotations[0].is_direct());
+    assert_eq!(annotations[0].object_ref(), None);
+    assert_eq!(annotations[1].object_ref(), Some(ObjectRef::new(4, 0)));
 }
 
 #[test]

@@ -29,5 +29,8 @@ pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> O
         "fixture must have exactly one Widget annotation, found {}",
         widgets.len()
     );
-    widgets[0].annot_ref
+    widgets[0]
+        .annotation
+        .object_ref()
+        .expect("fixture Widget annotation must be indirect")
 }

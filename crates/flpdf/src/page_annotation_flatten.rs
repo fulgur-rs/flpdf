@@ -87,14 +87,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     mode: FlattenMode,
 ) -> Result<usize> {
     // ── Step 1: enumerate annotations without reading /Rect ──────────────
-    // qpdf's page helper obtains canonical annotation handles first; this
-    // compatibility consumer projects them to indirect refs because the
-    // downstream appearance/flag API is ref-based. The annotation helper
-    // validates /Rect only after the flags gate in
-    // getPageContentForAppearance. Keep this route lazy instead of using
-    // enumerate_page_annotations, whose public projection intentionally
-    // materializes /Rect for its callers.
-    let annot_refs = page_annotation_refs(pdf, page_ref)?;
+    // qpdf's page helper obtains canonical annotation handles first. Keep
+    // those exact handles through the eligibility and removal paths: direct
+    // annotation dictionaries have no ObjectRef and must not be projected
+    // away before the appearance/flag gate. The annotation helper validates
+    // /Rect only after that gate, so this route stays lazy instead of using
+    // enumerate_page_annotations, whose public result materializes /Rect.
+    let annotations = page_annotation_handles(pdf, page_ref)?;
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───
     enum AppearanceTarget {
@@ -103,14 +102,15 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     }
 
     struct AnnotData {
-        annot_ref: ObjectRef,
+        annotation: ObjectHandle,
         appearance: AppearanceTarget,
         flags: i64,
     }
 
     let mut candidates: Vec<AnnotData> = Vec::new();
-    // Track annot_refs that should be removed from /Annots (same set).
-    let mut to_remove: Vec<ObjectRef> = Vec::new();
+    // Track the exact annotation handles that should be removed from /Annots.
+    // This preserves direct dictionaries as well as indirect annotations.
+    let mut to_remove: Vec<ObjectHandle> = Vec::new();
     #[cfg(test)]
     let (qpdf_flag_contract, skip_widgets, page_rotate, required_flags, forbidden_flags) =
         match mode {
@@ -135,18 +135,30 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             } => (true, skip_widgets, page_rotate, required, forbidden),
         };
 
-    for annot_ref in annot_refs {
-        if skip_widgets && AnnotationObjectHelper::new(annot_ref, pdf).get_subtype()? == b"Widget" {
+    for annotation in annotations {
+        let annot_ref = annotation.object_ref();
+        if skip_widgets
+            && AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?
+                == b"Widget"
+        {
             continue;
         }
         // Read /F through the canonical helper first. A zero result is also
         // qpdf's fail-soft value for absent/non-integer /F. Only a detected
         // Pdf::set_object holder redirect may use the compatibility bridge.
-        let canonical_flags = AnnotationObjectHelper::new(annot_ref, pdf).get_flags()?;
-        let legacy_flag_redirect =
-            canonical_flags == 0 && has_bare_reference_redirect(pdf, annot_ref, "F")?;
+        let canonical_flags =
+            AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_flags()?;
+        let legacy_flag_redirect = match annot_ref {
+            Some(annot_ref) if canonical_flags == 0 => {
+                has_bare_reference_redirect(pdf, annot_ref, "F")?
+            }
+            _ => false,
+        };
         let flags = if legacy_flag_redirect {
-            read_annot_flags(pdf, annot_ref)?
+            read_annot_flags(
+                pdf,
+                annot_ref.expect("legacy redirect requires an annotation ref"),
+            )?
         } else {
             canonical_flags
         };
@@ -161,7 +173,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // Once /AP is present, a missing selected /N stream is itself a
         // flattening/removal outcome (for example an unchecked checkbox).
         let (appearance_dictionary, appearance) = {
-            let mut helper = AnnotationObjectHelper::new(annot_ref, pdf);
+            let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
             (
                 helper.get_appearance_dictionary()?,
                 helper.get_appearance_stream(b"N", None)?,
@@ -173,17 +185,20 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             // A bare-reference value is the in-memory holder shape, not a
             // qpdf parsed object. Ask the bridge whether its terminal value
             // is actually null before deciding whether to prune it.
-            annotation_has_appearance_dictionary(pdf, annot_ref)?
+            annotation_has_appearance_dictionary(pdf, &annotation)?
         } else {
             true
         };
-        let legacy_appearance_redirect = has_bare_reference_redirect(pdf, annot_ref, "AP")?
-            || has_bare_reference_redirect_in_handle(pdf, &appearance_dictionary, b"/N")?
-            || if let Some(appearance_ref) = appearance_dictionary.object_ref() {
-                has_bare_reference_redirect(pdf, appearance_ref, "N")?
-            } else {
-                false
-            };
+        let legacy_appearance_redirect =
+            match annot_ref {
+                Some(annot_ref) => has_bare_reference_redirect(pdf, annot_ref, "AP")?,
+                None => false,
+            } || has_bare_reference_redirect_in_handle(pdf, &appearance_dictionary, b"/N")?
+                || if let Some(appearance_ref) = appearance_dictionary.object_ref() {
+                    has_bare_reference_redirect(pdf, appearance_ref, "N")?
+                } else {
+                    false
+                };
         let appearance = if appearance.as_stream_dict().is_some() {
             if let Some(appearance_ref) = appearance.object_ref() {
                 let legacy_geometry_redirect =
@@ -200,15 +215,18 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         } else {
             if !legacy_appearance_redirect {
                 if qpdf_flag_contract && has_appearance {
-                    to_remove.push(annot_ref);
+                    to_remove.push(annotation.clone());
                 }
                 continue;
             }
+            let Some(annot_ref) = annot_ref else {
+                continue;
+            };
             match resolve_ap_n(pdf, annot_ref)? {
                 Some(appearance_ref) => AppearanceTarget::Bridge(appearance_ref),
                 None => {
                     if qpdf_flag_contract && has_appearance {
-                        to_remove.push(annot_ref);
+                        to_remove.push(annotation.clone());
                     }
                     continue;
                 }
@@ -231,12 +249,12 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
         if !eligible {
             if qpdf_flag_contract {
-                to_remove.push(annot_ref);
+                to_remove.push(annotation.clone());
             }
             continue;
         }
         if qpdf_flag_contract {
-            to_remove.push(annot_ref);
+            to_remove.push(annotation.clone());
         }
 
         // The retained test-only legacy modes predate qpdf's direct flag API
@@ -244,14 +262,14 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // behavior. The qpdf-shaped helper owns the rectangle and appearance
         // geometry calculation for both paths.
         if !qpdf_flag_contract {
-            let has_rect = pdf
-                .resolve_borrowed(annot_ref)?
-                .as_dict()
-                .is_some_and(|dict| !matches!(dict.get("Rect"), None | Some(Object::Null)));
+            let rect_value =
+                pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
+            let has_rect = !rect_value.is_null();
             if !has_rect {
                 continue;
             }
-            let rect = AnnotationObjectHelper::new(annot_ref, pdf).get_rect()?;
+            let rect =
+                AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_rect()?;
             let (llx, urx) = if rect.llx <= rect.urx {
                 (rect.llx, rect.urx)
             } else {
@@ -268,7 +286,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         }
 
         candidates.push(AnnotData {
-            annot_ref,
+            annotation,
             appearance,
             flags,
         });
@@ -286,7 +304,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             )));
             // cov:ignore-end
         };
-        replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
+        replace_pruned_annots(
+            pdf,
+            page_ref,
+            &mut page_dict,
+            &to_remove,
+            qpdf_flag_contract,
+        )?;
         if qpdf_flag_contract {
             // qpdf wraps the page whenever the annotation array changed, even
             // if every selected appearance produced empty drawing content.
@@ -341,30 +365,34 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
         let resource_name = format!("/{xobj_name}");
         let content_result = match &data.appearance {
-            AppearanceTarget::Canonical(_) => AnnotationObjectHelper::new(data.annot_ref, pdf)
-                .get_page_content_for_appearance(
-                    &resource_name,
-                    page_rotate,
-                    required_flags,
-                    forbidden_flags,
-                ),
+            AppearanceTarget::Canonical(_) => {
+                AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
+                    .get_page_content_for_appearance(
+                        &resource_name,
+                        page_rotate,
+                        required_flags,
+                        forbidden_flags,
+                    )
+            }
             AppearanceTarget::Bridge(appearance_ref) => {
                 // This branch is limited to Pdf::set_object holder chains.
                 // The bridge normalizes only input values; qpdf placement,
                 // flag gating, stream mutation, and emitted content remain
                 // owned by AnnotationObjectHelper.
                 match read_xobj_bbox_and_matrix(pdf, *appearance_ref)? {
-                    (Some(bbox), matrix) => AnnotationObjectHelper::new(data.annot_ref, pdf)
-                        .get_page_content_for_selected_appearance_with_geometry(
-                            &resource_name,
-                            *appearance_ref,
-                            page_rotate,
-                            required_flags,
-                            forbidden_flags,
-                            crate::annotation_helper::AppearanceContentOverrides::with_geometry(
-                                bbox, matrix, data.flags,
-                            ),
-                        ),
+                    (Some(bbox), matrix) => {
+                        AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
+                            .get_page_content_for_selected_appearance_with_geometry(
+                                &resource_name,
+                                *appearance_ref,
+                                page_rotate,
+                                required_flags,
+                                forbidden_flags,
+                                crate::annotation_helper::AppearanceContentOverrides::with_geometry(
+                                    bbox, matrix, data.flags,
+                                ),
+                            )
+                    }
                     (None, _) => Ok(Vec::new()),
                 }
             }
@@ -388,7 +416,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         append_bytes.extend_from_slice(&content);
         flattened_count += 1;
         if !qpdf_flag_contract {
-            to_remove.push(data.annot_ref);
+            to_remove.push(data.annotation.clone());
         }
     }
 
@@ -400,7 +428,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             )));
             // cov:ignore-end
         };
-        replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
+        replace_pruned_annots(
+            pdf,
+            page_ref,
+            &mut page_dict,
+            &to_remove,
+            qpdf_flag_contract,
+        )?;
         if qpdf_flag_contract {
             add_qpdf_flatten_contents(pdf, &mut page_dict, Vec::new())?; // cov:ignore: covered structurally by indirect-contents public fixture
         } // cov:ignore: llvm-cov maps the tested qpdf wrapper branch to this synthetic closing brace
@@ -434,7 +468,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     page_dict.insert("Resources", Object::Dictionary(resources_dict));
 
     // ── Step 8: Remove flattened annotations from /Annots ─────────────────
-    replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
+    replace_pruned_annots(
+        pdf,
+        page_ref,
+        &mut page_dict,
+        &to_remove,
+        qpdf_flag_contract,
+    )?;
 
     pdf.set_object(page_ref, Object::Dictionary(page_dict));
 
@@ -443,12 +483,13 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
 fn replace_pruned_annots<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
     page_dict: &mut Dictionary,
-    to_remove: &[ObjectRef],
+    to_remove: &[ObjectHandle],
     preserve_indirect_holder: bool,
 ) -> Result<()> {
     let old_annots = page_dict.get("Annots").cloned();
-    let new_annots = build_pruned_annots_array(pdf, page_dict, to_remove)?;
+    let new_annots = build_pruned_annots_array(pdf, page_ref, to_remove)?;
     if new_annots.is_empty() {
         page_dict.remove("Annots");
     } else if preserve_indirect_holder {
@@ -500,16 +541,10 @@ fn add_content_stream<R: Read + Seek>(pdf: &mut Pdf<R>, data: Vec<u8>) -> Result
 
 fn annotation_has_appearance_dictionary<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    annot_ref: ObjectRef,
+    annotation: &ObjectHandle,
 ) -> Result<bool> {
-    let Object::Dictionary(annot) = pdf.resolve(annot_ref)? else {
-        // cov:ignore: enumerator yields resolved annotation dictionaries
-        return Ok(false); // cov:ignore: enumerator yields resolved annotation dictionaries
-    };
-    let Some(ap) = annot.get("AP").cloned() else {
-        return Ok(false);
-    };
-    Ok(!matches!(resolve_ref_chain(pdf, &ap)?.0, Object::Null))
+    let appearance = pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/AP")?)?;
+    Ok(!appearance.is_null())
 }
 
 /// Flatten eligible annotations on every leaf page in the document.
@@ -606,17 +641,17 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     Ok(())
 }
 
-/// Return only the annotation references on a page.
+/// Return the canonical annotation handles on a page.
 ///
 /// qpdf's `QPDFPageObjectHelper::getAnnotations` does not inspect annotation
 /// fields such as `/Rect`; those are read later by
 /// `QPDFAnnotationObjectHelper::getPageContentForAppearance`, after the
-/// flags gate. Keep the resource-merge prepass on this refs-only boundary as
-/// well, so an excluded widget cannot materialize `/Rect` before that gate.
-fn page_annotation_refs<R: Read + Seek>(
+/// flags gate. Keep the handle-native result here so direct dictionaries are
+/// available to every flattening consumer.
+fn page_annotation_handles<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> Result<Vec<ObjectRef>> {
+) -> Result<Vec<ObjectHandle>> {
     let mut page_helper = PageObjectHelper::new(page_ref, pdf);
     page_helper.get_annotations_filtered(None)
 }
@@ -643,11 +678,22 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
     page_ref: ObjectRef,
     default_resources: &Object,
 ) -> Result<()> {
-    for annot_ref in page_annotation_refs(pdf, page_ref)? {
-        if AnnotationObjectHelper::new(annot_ref, pdf).get_subtype()? != b"Widget" {
+    for annotation in page_annotation_handles(pdf, page_ref)? {
+        if AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf).get_subtype()?
+            != b"Widget"
+        {
             continue; // cov:ignore: non-widget annotations do not merge default resources
         }
-        let Some(appearance_ref) = resolve_ap_n(pdf, annot_ref)? else {
+        let appearance = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf)
+            .get_appearance_stream(b"N", None)?;
+        let appearance_ref = match appearance.object_ref() {
+            Some(appearance_ref) => Some(appearance_ref),
+            None => match annotation.object_ref() {
+                Some(annot_ref) => resolve_ap_n(pdf, annot_ref)?,
+                None => None,
+            },
+        };
+        let Some(appearance_ref) = appearance_ref else {
             continue; // cov:ignore: widget without selected appearance has no merge target
         };
         let Object::Stream(mut appearance) = pdf.resolve(appearance_ref)? else {
@@ -980,33 +1026,49 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
     Ok((Some(Rectangle::from(bbox_vals)), ap_matrix))
 }
 
-/// Build the pruned `/Annots` array, removing all refs in `to_remove`.
+/// Build the pruned `/Annots` array, removing the exact handles in
+/// `to_remove`.
 ///
-/// Resolves the existing `/Annots` value (which may be an indirect reference)
-/// from `page_dict`. Returns a direct array without the removed entries.
+/// Resolves the live page handle rather than projecting the array through
+/// `ObjectRef`s. Direct dictionaries are therefore compared by canonical
+/// handle identity and materialized only at the final legacy page-dictionary
+/// write boundary; indirect entries retain their original references.
 fn build_pruned_annots_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_dict: &Dictionary,
-    to_remove: &[ObjectRef],
+    page_ref: ObjectRef,
+    to_remove: &[ObjectHandle],
 ) -> Result<Vec<Object>> {
-    let annots_val = match page_dict.get("Annots").cloned() {
-        None | Some(Object::Null) => return Ok(Vec::new()),
-        Some(v) => v,
-    };
-    let annots_arr = match resolve_ref_chain(pdf, &annots_val)?.0 {
-        Object::Array(a) => a,
-        _ => return Ok(Vec::new()),
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    let annots = pdf.resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+    let Some(annots_arr) = annots.as_array() else {
+        return Ok(Vec::new());
     };
 
-    let pruned: Vec<Object> = annots_arr
-        .into_iter()
-        .filter(|entry| match entry {
-            Object::Reference(r) => !to_remove.contains(r),
-            _ => true, // keep non-ref entries (unusual, but don't drop them)
-        })
-        .collect();
+    let mut pruned = Vec::with_capacity(annots_arr.len());
+    for entry in annots_arr {
+        if annotation_is_marked_for_removal(&entry, to_remove) {
+            continue;
+        }
+        if let Some(object_ref) = entry.object_ref() {
+            pruned.push(Object::Reference(object_ref));
+        } else {
+            pruned.push(entry.materialize()?);
+        }
+    }
 
     Ok(pruned)
+}
+
+/// Return whether an annotation handle is one of the qpdf removal candidates.
+///
+/// Kept as a small named predicate so the identity rule remains visible at
+/// the canonical-handle boundary rather than being replaced by an
+/// `ObjectRef`-only comparison.
+fn annotation_is_marked_for_removal(annotation: &ObjectHandle, to_remove: &[ObjectHandle]) -> bool {
+    to_remove
+        .iter()
+        .any(|candidate| candidate.is_same_object_as(annotation))
 }
 
 /// Allocate the next unused indirect-object reference.
@@ -1513,6 +1575,29 @@ mod tests {
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
             1
         );
+        assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .windows(2)
+            .any(|window| window == b"Do"));
+    }
+
+    #[test]
+    fn flatten_annotations_preserves_direct_annotation_handle_until_removal() {
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let bytes = build_pdf(
+            "/Annots [<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] /AP << /N 5 0 R >> >>]",
+            &[obj_wrap(5, xobj_body)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(
+            flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
+            1
+        );
+        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must remain a dictionary");
+        };
+        assert!(page.get("Annots").is_none());
         assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
             .unwrap()
             .windows(2)
@@ -3200,8 +3285,7 @@ mod tests {
         let bytes = build_pdf("", &[]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-        let page_dict = Dictionary::new();
-        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[]).unwrap();
+        let result = build_pruned_annots_array(&mut pdf, ObjectRef::new(3, 0), &[]).unwrap();
         assert!(result.is_empty(), "no /Annots should return empty vec");
     }
 
@@ -3224,10 +3308,15 @@ mod tests {
             ]),
         );
 
-        let mut page_dict = Dictionary::new();
+        let page_ref = ObjectRef::new(3, 0);
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref).unwrap() else {
+            panic!("fixture page must be a dictionary");
+        };
         page_dict.insert("Annots", Object::Reference(arr_ref));
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
 
-        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[annot_ref]).unwrap();
+        let remove_handle = pdf.get_object_handle(annot_ref);
+        let result = build_pruned_annots_array(&mut pdf, page_ref, &[remove_handle]).unwrap();
         assert_eq!(result.len(), 1, "one annot should be pruned");
         assert_eq!(result[0], Object::Reference(keep_ref));
     }
@@ -3241,10 +3330,14 @@ mod tests {
         let bad_ref = ObjectRef::new(20, 0);
         pdf.set_object(bad_ref, Object::Integer(42));
 
-        let mut page_dict = Dictionary::new();
+        let page_ref = ObjectRef::new(3, 0);
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref).unwrap() else {
+            panic!("fixture page must be a dictionary");
+        };
         page_dict.insert("Annots", Object::Reference(bad_ref));
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
 
-        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[]).unwrap();
+        let result = build_pruned_annots_array(&mut pdf, page_ref, &[]).unwrap();
         assert!(result.is_empty(), "ref → non-array should return empty");
     }
 
@@ -3254,10 +3347,14 @@ mod tests {
         let bytes = build_pdf("", &[]);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-        let mut page_dict = Dictionary::new();
+        let page_ref = ObjectRef::new(3, 0);
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref).unwrap() else {
+            panic!("fixture page must be a dictionary");
+        };
         page_dict.insert("Annots", Object::Integer(99));
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
 
-        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[]).unwrap();
+        let result = build_pruned_annots_array(&mut pdf, page_ref, &[]).unwrap();
         assert!(
             result.is_empty(),
             "direct non-array /Annots should return empty"
@@ -3273,7 +3370,10 @@ mod tests {
         let keep_ref = ObjectRef::new(11, 0);
         let remove_ref = ObjectRef::new(10, 0);
 
-        let mut page_dict = Dictionary::new();
+        let page_ref = ObjectRef::new(3, 0);
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref).unwrap() else {
+            panic!("fixture page must be a dictionary");
+        };
         page_dict.insert(
             "Annots",
             Object::Array(vec![
@@ -3283,7 +3383,9 @@ mod tests {
             ]),
         );
 
-        let result = build_pruned_annots_array(&mut pdf, &page_dict, &[remove_ref]).unwrap();
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+        let remove_handle = pdf.get_object_handle(remove_ref);
+        let result = build_pruned_annots_array(&mut pdf, page_ref, &[remove_handle]).unwrap();
         assert_eq!(result.len(), 2, "non-ref entries should be kept");
         assert_eq!(result[0], Object::Integer(42));
         assert_eq!(result[1], Object::Reference(keep_ref));
