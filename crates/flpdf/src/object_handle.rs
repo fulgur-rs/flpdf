@@ -11009,7 +11009,11 @@ pub(crate) mod identity_tests {
         assert_eq!(entries.get(b"/A".as_slice()).unwrap().as_integer(), Some(1));
 
         let scalar = ObjectHandle::integer(1);
-        assert!(!scalar.try_has_key(b"/A").unwrap());
+        assert!(matches!(
+            scalar.try_has_key(b"/A"),
+            Err(Error::System(message))
+                if message == "operation for dictionary attempted on object of type integer: returning false for a key containment request"
+        ));
     }
 
     #[test]
