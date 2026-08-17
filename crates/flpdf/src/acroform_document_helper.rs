@@ -988,6 +988,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             if let Some(value) = appearance.as_string() {
                 return Ok(decode_field_name(&value).into_bytes());
             }
+            if !appearance.is_null() {
+                break;
+            }
             let parent = self
                 .pdf
                 .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
@@ -1012,6 +1015,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 .resolve_object_handle_to_terminal(&current.try_get_key(b"/Q")?)?;
             if let Some(value) = quadding.as_integer() {
                 return Ok(value);
+            }
+            if !quadding.is_null() {
+                break;
             }
             let parent = self
                 .pdf
@@ -5190,6 +5196,119 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(helper.effective_field_quadding(&cycle).unwrap(), 0);
+    }
+
+    #[test]
+    fn effective_field_appearance_stops_at_non_string_inheritable_value() {
+        // qpdf's getInheritableFieldValue stops at the first non-null value,
+        // while getDefaultAppearance falls back to AcroForm /DA when that
+        // value is not a string (QPDFFormFieldObjectHelper.cc:66-84, 197-210).
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Catalog".to_vec())),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("DA", Object::String(b"/FAcro 10 Tf".to_vec()))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[
+                ("DA", Object::Integer(7)),
+                ("Parent", Object::Reference(ObjectRef::new(6, 0))),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Dictionary(dict(&[("DA", Object::String(b"/Fparent 10 Tf".to_vec()))])),
+        );
+
+        let field = pdf.get_object_handle(ObjectRef::new(5, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        assert_eq!(
+            helper.effective_field_appearance(&field).unwrap(),
+            b"/FAcro 10 Tf".to_vec()
+        );
+    }
+
+    #[test]
+    fn effective_field_quadding_stops_at_non_integer_inheritable_value() {
+        // qpdf's getQuadding falls back to AcroForm /Q when the first
+        // non-null inheritable value is not an integer
+        // (QPDFFormFieldObjectHelper.cc:66-84, 214-227).
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Catalog".to_vec())),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Q", Object::Integer(2))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[
+                ("Q", Object::String(b"wrong-type".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(6, 0))),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Dictionary(dict(&[("Q", Object::Integer(1))])),
+        );
+
+        let field = pdf.get_object_handle(ObjectRef::new(5, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        assert_eq!(helper.effective_field_quadding(&field).unwrap(), 2);
+    }
+
+    #[test]
+    fn effective_field_defaults_inherit_through_direct_and_indirect_null_values() {
+        // QPDF_Dictionary::hasKey uses QPDFObjectHandle::isNull, so a direct
+        // null and an indirect reference resolving to null are both absent
+        // for field inheritance (QPDF_Dictionary.cc:98-101;
+        // QPDFObjectHandle.cc:353-356).
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[
+                ("DA", Object::Null),
+                ("Q", Object::Null),
+                ("Parent", Object::Reference(ObjectRef::new(6, 0))),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Dictionary(dict(&[
+                ("DA", Object::String(b"/Fparent 10 Tf".to_vec())),
+                ("Q", Object::Integer(1)),
+            ])),
+        );
+        pdf.set_object(ObjectRef::new(7, 0), Object::Null);
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Dictionary(dict(&[
+                ("DA", Object::Reference(ObjectRef::new(7, 0))),
+                ("Q", Object::Reference(ObjectRef::new(7, 0))),
+                ("Parent", Object::Reference(ObjectRef::new(6, 0))),
+            ])),
+        );
+
+        let direct_null = pdf.get_object_handle(ObjectRef::new(5, 0));
+        let indirect_null = pdf.get_object_handle(ObjectRef::new(8, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        for field in [&direct_null, &indirect_null] {
+            assert_eq!(
+                helper.effective_field_appearance(field).unwrap(),
+                b"/Fparent 10 Tf".to_vec()
+            );
+            assert_eq!(helper.effective_field_quadding(field).unwrap(), 1);
+        }
     }
 
     #[test]
