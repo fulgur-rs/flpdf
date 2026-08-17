@@ -35,6 +35,8 @@
 //!   goal. qpdf exposes `flattenRotation` only through its C++ API (no CLI), so
 //!   there is no qpdf oracle; correctness is asserted via invariants in tests.
 
+use crate::object_handle::ObjectHandle;
+use crate::page_object_helper::PageObjectHelper;
 use crate::pages::{
     next_page_parent, page_parent_entries, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
@@ -522,55 +524,91 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
         // Materialize /Rotate = 0 on the leaf (never inherited).
         page_dict.insert("Rotate", Object::Integer(0));
 
-        // Transform annotation /Rect rectangles.
-        flatten_annotation_rects(pdf, &page_dict, m)?;
-
+        // Write the page snapshot before mutating annotation handles. Direct
+        // annotation dictionaries are owned by this live page graph; writing
+        // afterward from the stale `page_dict` would discard their mutations.
         pdf.set_object(page_ref, Object::Dictionary(page_dict));
+
+        // Transform annotation /Rect rectangles through qpdf's live handle
+        // route. `QPDFPageObjectHelper::flattenRotation` delegates annotation
+        // traversal to the handle-preserving AcroForm path rather than
+        // projecting `/Annots` members to indirect refs.
+        flatten_annotation_rects(pdf, page_ref, m)?;
     }
     Ok(())
 }
 
-/// Transform every annotation's `/Rect` on this page by `m`. Reads `/Annots`
-/// from `page_dict`; each entry is an indirect reference to an annotation dict.
+/// Transform every annotation's `/Rect` on this page by `m`.
+///
+/// qpdf's `QPDFPageObjectHelper::getAnnotations` preserves both direct and
+/// indirect array members (`libqpdf/QPDFPageObjectHelper.cc:439-454`). Keep
+/// that identity through the mutation so a direct dictionary is written back
+/// through its containing page owner.
 ///
 /// CAVEAT: `/QuadPoints` and the appearance `/AP` `/Matrix` are intentionally
 /// left untouched (see [`flatten_rotation_on_pages`]).
 fn flatten_annotation_rects<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_dict: &Dictionary,
+    page_ref: ObjectRef,
     m: Matrix,
 ) -> Result<()> {
-    // `/Annots` may be a direct array or an indirect reference to one; resolve
-    // the reference before treating it as an array.
-    let Some(annots_obj) = page_dict.get("Annots").cloned() else {
-        return Ok(());
+    let annotations = {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.get_annotations_filtered(None)?
     };
-    let annots_obj = match annots_obj {
-        Object::Reference(r) => pdf.resolve(r)?,
-        other => other,
-    };
-    let Object::Array(annots) = annots_obj else {
-        return Ok(());
-    };
-    for entry in annots {
-        let Object::Reference(annot_ref) = entry else {
+    for annotation in annotations {
+        let annotation = pdf.resolve_object_handle_to_terminal(&annotation)?;
+        let rect = pdf.resolve_object_handle_to_terminal(&annotation.get_key(b"/Rect"))?;
+        let Some(rect) = object_handle_to_pagebox(pdf, &rect)? else {
             continue;
         };
-        let Object::Dictionary(mut ad) = pdf.resolve(annot_ref)? else {
-            continue;
-        };
-        if let Some(rect_obj) = ad.get("Rect").cloned() {
-            let resolved = match rect_obj {
-                Object::Reference(r) => pdf.resolve(r)?,
-                other => other,
-            };
-            if let Some(b) = object_to_pagebox(&resolved) {
-                ad.insert("Rect", pagebox_to_object(transform_box(m, b)));
-                pdf.set_object(annot_ref, Object::Dictionary(ad));
-            }
-        }
+        annotation.replace_key(b"/Rect", pagebox_to_handle(transform_box(m, rect)))?;
+        pdf.mark_object_handle_dirty(&annotation)?;
     }
     Ok(())
+}
+
+/// Parse a live handle rectangle `[x1 y1 x2 y2]` into a normalized `PageBox`.
+/// Values may be direct or indirect integers/reals; malformed rectangles are
+/// ignored, matching the previous fail-soft consumer boundary.
+fn object_handle_to_pagebox<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object: &ObjectHandle,
+) -> Result<Option<PageBox>> {
+    let object = pdf.resolve_object_handle_to_terminal(object)?;
+    let Some(items) = object.as_array() else {
+        return Ok(None);
+    };
+    if items.len() != 4 {
+        return Ok(None);
+    }
+    let mut values = [0.0_f64; 4];
+    for (index, item) in items.iter().enumerate() {
+        let item = pdf.resolve_object_handle_to_terminal(item)?;
+        let Some(value) = item
+            .as_integer()
+            .map(|value| value as f64)
+            .or_else(|| item.as_real())
+        else {
+            return Ok(None);
+        };
+        values[index] = value;
+    }
+    Ok(Some(PageBox::new(
+        values[0].min(values[2]),
+        values[1].min(values[3]),
+        values[0].max(values[2]),
+        values[1].max(values[3]),
+    )))
+}
+
+fn pagebox_to_handle(b: PageBox) -> ObjectHandle {
+    ObjectHandle::array(vec![
+        ObjectHandle::real(b.llx),
+        ObjectHandle::real(b.lly),
+        ObjectHandle::real(b.urx),
+        ObjectHandle::real(b.ury),
+    ])
 }
 
 /// Allocate a fresh indirect-object reference (the new-object idiom used across
@@ -1493,6 +1531,32 @@ mod tests {
         ])
     }
 
+    /// 1-page PDF with one direct annotation and one indirect annotation in
+    /// the same `/Annots` array. qpdf's `getAnnotations` preserves both
+    /// handles (`QPDFPageObjectHelper.cc:439-454`), so flattening must update
+    /// both rectangles.
+    fn build_single_page_with_direct_and_indirect_annots() -> Vec<u8> {
+        assemble_pdf(&[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            ),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            ),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 4 0 R /Rotate 90 /Annots [<< /Type /Annot /Subtype /Text /Rect [10 20 60 40] >> 5 0 R] >>".to_string(),
+            ),
+            (4, content_obj_body("BT (x) Tj ET")),
+            (
+                5,
+                "<< /Type /Annot /Subtype /Text /Rect [20 30 70 50] >>".to_string(),
+            ),
+        ])
+    }
+
     #[test]
     fn flatten_transforms_annotation_rect() {
         let bytes = build_single_page_with_annot("[0 0 200 300]", 90, "[10 20 60 40]");
@@ -1508,6 +1572,93 @@ mod tests {
         };
         let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
+    }
+
+    #[test]
+    fn malformed_annotation_rect_handles_are_ignored() {
+        let mut pdf = Pdf::open(Cursor::new(build_single_page_with_annot(
+            "[0 0 200 300]",
+            0,
+            "[10 20 60 40]",
+        )))
+        .unwrap();
+
+        assert!(
+            object_handle_to_pagebox(&mut pdf, &ObjectHandle::integer(1))
+                .unwrap()
+                .is_none()
+        );
+        assert!(object_handle_to_pagebox(
+            &mut pdf,
+            &ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(2),
+                ObjectHandle::integer(3),
+            ])
+        )
+        .unwrap()
+        .is_none());
+        assert!(object_handle_to_pagebox(
+            &mut pdf,
+            &ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::integer(2),
+                ObjectHandle::string(b"not-a-number".to_vec()),
+                ObjectHandle::integer(4),
+            ])
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn flatten_transforms_direct_and_indirect_annotation_rects() {
+        let bytes = build_single_page_with_direct_and_indirect_annots();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        let indirect_annot = ObjectRef::new(5, 0);
+        flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
+
+        let page_dict = pdf
+            .resolve(page)
+            .unwrap()
+            .into_dict()
+            .expect("not a page dict");
+        let annots = page_dict
+            .get("Annots")
+            .and_then(Object::as_array)
+            .expect("/Annots must remain an array");
+        let direct = annots[0]
+            .as_dict()
+            .expect("first annotation must remain a direct dictionary");
+        let direct_rect = object_to_pagebox(direct.get("Rect").unwrap()).unwrap();
+        assert_eq!(
+            (
+                direct_rect.llx,
+                direct_rect.lly,
+                direct_rect.urx,
+                direct_rect.ury
+            ),
+            (20.0, 140.0, 40.0, 190.0),
+            "direct annotation Rect must be transformed"
+        );
+
+        let indirect = pdf
+            .resolve(indirect_annot)
+            .unwrap()
+            .into_dict()
+            .expect("indirect annotation must remain a dictionary");
+        let indirect_rect = object_to_pagebox(indirect.get("Rect").unwrap()).unwrap();
+        assert_eq!(
+            (
+                indirect_rect.llx,
+                indirect_rect.lly,
+                indirect_rect.urx,
+                indirect_rect.ury
+            ),
+            (30.0, 130.0, 50.0, 180.0),
+            "indirect annotation Rect must be transformed"
+        );
     }
 
     /// 1-page PDF whose `/Annots` is an *indirect reference* to the array (obj 6),
