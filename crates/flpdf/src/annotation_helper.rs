@@ -418,20 +418,30 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
             return Ok(Vec::new());
         }
 
-        let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
-            return Ok(Vec::new());
-        };
-
-        let (bbox, matrix) = match overrides.geometry {
-            Some((bbox, matrix)) => (bbox, matrix),
+        // qpdf's `if (!(bbox_obj.isRectangle() && rect_obj.isRectangle()))`
+        // (`QPDFAnnotationObjectHelper.cc:161-163`) short-circuits: `/BBox`
+        // is dereferenced first, and a malformed `/BBox` means `/Rect` is
+        // never touched at all. `overrides.geometry` has no qpdf
+        // counterpart (a flpdf-only legacy-bridge fallback supplying
+        // already-normalized values), so it resolves `/Rect` on its own.
+        let (rect, bbox, matrix) = match overrides.geometry {
+            Some((bbox, matrix)) => {
+                let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
+                    return Ok(Vec::new());
+                };
+                (rect, bbox, matrix)
+            }
             None => {
                 let bbox_handle = appearance_dict.get_key(b"/BBox");
                 let Some(bbox) = self.rectangle_from_handle(&bbox_handle)? else {
                     return Ok(Vec::new());
                 };
+                let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
+                    return Ok(Vec::new());
+                };
                 let matrix_handle = appearance_dict.get_key(b"/Matrix");
                 let matrix = self.matrix_from_handle(&matrix_handle)?.unwrap_or_default();
-                (bbox, matrix)
+                (rect, bbox, matrix)
             }
         };
 
