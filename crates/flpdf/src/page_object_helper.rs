@@ -709,7 +709,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             .pdf
             .resolve_object_handle_to_terminal(&form_dict.try_get_key(b"/Matrix")?)?;
         let form_matrix = matrix_from_handle(self.pdf, &form_matrix)?.unwrap_or_default();
-        let transform = self.get_matrix_for_transformations(invert_transformations)?;
+        let transform = if invert_transformations {
+            self.get_matrix_for_transformations(true)?
+        } else {
+            Matrix::default()
+        };
 
         let mut work = Matrix::default();
         work.concat(transform);
