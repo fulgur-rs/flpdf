@@ -517,49 +517,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     fn set_checkbox_value(&mut self, checked: bool) -> Result<()> {
         let annotation = self.appearance_annotation(self.field.clone())?;
-        if annotation.is_none() {
-            if let Some(state) = self.update_direct_checkbox_kid(checked)? {
-                self.set_field_attribute(b"/V", ObjectHandle::name(state))?;
-                return Ok(());
-            }
-        }
-
-        let annotation_dictionary = annotation.as_ref().map(|(_, dictionary)| dictionary);
-        let on_value = self.checkbox_state(annotation_dictionary, checked)?;
+        let on_value = self.checkbox_state(annotation.as_ref(), checked)?;
         let value = ObjectHandle::name(on_value);
         self.set_field_attribute(b"/V", value.clone())?;
-        if let Some((annotation_ref, _)) = annotation {
-            let annotation = self.pdf.get_object_handle(annotation_ref);
+        if let Some(annotation) = annotation {
             self.set_direct_attribute(&annotation, b"/AS", value)?;
         }
         Ok(())
-    }
-
-    /// qpdf permits direct widget dictionaries in `/Kids`; mutate the first
-    /// such child with a usable appearance.
-    fn update_direct_checkbox_kid(&mut self, checked: bool) -> Result<Option<Vec<u8>>> {
-        let field = self.dictionary_handle_for(self.field.clone())?;
-        let Some(field) = field else {
-            return Ok(None);
-        };
-        let kids = field.get_key(b"/Kids");
-        self.pdf.resolve_object_handle(&kids)?;
-        let Some(items) = kids.as_array() else {
-            return Ok(None);
-        };
-        for kid in items {
-            if !kid.is_direct() {
-                continue;
-            }
-            self.pdf.resolve_object_handle(&kid)?;
-            if kid.as_dictionary().is_none() || !self.has_non_null_appearance(&kid)? {
-                continue;
-            }
-            let state = self.checkbox_state(Some(&kid), checked)?;
-            self.set_direct_attribute(&kid, b"/AS", ObjectHandle::name(state.clone()))?;
-            return Ok(Some(state));
-        }
-        Ok(None)
     }
 
     fn checkbox_state(
@@ -658,13 +622,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         })
     }
 
-    fn appearance_annotation(
-        &mut self,
-        start: ObjectHandle,
-    ) -> Result<Option<(ObjectRef, ObjectHandle)>> {
+    /// Locate the widget annotation to mutate `/AS` on: the field itself if
+    /// it carries a non-null `/AP`, else the first `/Kids` child that does.
+    /// Mirrors qpdf's `setCheckBoxValue` (`QPDFFormFieldObjectHelper.cc:416-462`),
+    /// which operates on the resulting `QPDFObjectHandle` (`annot`) directly
+    /// regardless of whether it is a direct or indirect object -- unlike an
+    /// earlier version of this helper, this must not require an object
+    /// number, or a direct field/widget's `/AS` silently never gets synced.
+    fn appearance_annotation(&mut self, start: ObjectHandle) -> Result<Option<ObjectHandle>> {
         let field = self.resolved(start)?;
         if self.has_non_null_appearance(&field)? {
-            return Ok(field.object_ref().map(|reference| (reference, field)));
+            return Ok(Some(field));
         }
 
         let kids = self.resolved(field.get_key(b"/Kids"))?;
@@ -672,18 +640,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(None);
         };
         for kid in items {
-            let is_direct = kid.is_direct();
             let kid = self.resolved(kid)?;
             if kid.as_dictionary().is_none() {
                 continue;
             }
             if self.has_non_null_appearance(&kid)? {
-                if is_direct {
-                    // Direct widgets are selected by the direct-child path so
-                    // their array owner is dirtied together with the widget.
-                    return Ok(None);
-                }
-                return Ok(kid.object_ref().map(|reference| (reference, kid)));
+                return Ok(Some(kid));
             }
         }
         Ok(None)
@@ -928,6 +890,43 @@ mod tests {
             .expect_err("direct field cannot report an indirect top-level reference");
         assert!(
             matches!(error, crate::Error::Unsupported(message) if message.contains("no ObjectRef"))
+        );
+    }
+
+    #[test]
+    fn set_checkbox_value_syncs_as_for_a_direct_merged_field_widget() {
+        // qpdf's `setCheckBoxValue` (`QPDFFormFieldObjectHelper.cc:416-462`)
+        // operates on `this->oh` directly with no dependency on whether it
+        // has an object number -- a checkbox where the field and widget are
+        // merged into one direct dictionary (no /Kids, /AP on the field
+        // itself) must still get /AS synced, not just /V.
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let field = ObjectHandle::dictionary(vec![
+            (b"/FT".to_vec(), ObjectHandle::name(b"Btn".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::dictionary(vec![
+                        (b"/Off".to_vec(), ObjectHandle::null()),
+                        (b"/Chosen".to_vec(), ObjectHandle::null()),
+                    ]),
+                )]),
+            ),
+        ]);
+        let mut helper = super::FormFieldObjectHelper::from_object_handle(field.clone(), &mut pdf);
+        helper
+            .set_value(ObjectHandle::name(b"On".to_vec()), true)
+            .expect("set direct merged checkbox value");
+
+        assert_eq!(
+            field.try_get_key(b"/V").unwrap().as_name(),
+            Some(b"Chosen".to_vec())
+        );
+        assert_eq!(
+            field.try_get_key(b"/AS").unwrap().as_name(),
+            Some(b"Chosen".to_vec()),
+            "a direct merged field/widget checkbox must have /AS synced, not just /V"
         );
     }
 }
