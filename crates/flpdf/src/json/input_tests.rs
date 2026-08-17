@@ -1,8 +1,55 @@
-//! qpdf correspondence: tests for the JSON input value boundary in `libqpdf/QPDF_json.cc:65-209, 732-793`.
+//! qpdf correspondence: tests for the JSON input value and deferred stream provider boundaries.
+//! (`libqpdf/QPDF_json.cc:65-231, 732-793`; `libqpdf/QUtil.cc:642-663`).
 
-use super::input::{json_value_to_handle, parse_indirect_reference, parse_object_key};
+use super::input::{
+    inline_stream_data_provider, json_value_to_handle, parse_indirect_reference, parse_object_key,
+};
 use super::Json;
-use crate::{ObjectRef, Pdf};
+use crate::{Error, ObjectRef, Pdf};
+use std::cell::RefCell;
+use std::fs;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::rc::Rc;
+
+struct CountingReader {
+    cursor: Cursor<Vec<u8>>,
+    read_calls: usize,
+    seek_calls: usize,
+    fail_read: bool,
+    fail_seek: bool,
+}
+
+impl CountingReader {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            cursor: Cursor::new(bytes.to_vec()),
+            read_calls: 0,
+            seek_calls: 0,
+            fail_read: false,
+            fail_seek: false,
+        }
+    }
+}
+
+impl Read for CountingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.read_calls += 1;
+        if self.fail_read {
+            return Err(std::io::Error::other("instrumented read failure"));
+        }
+        self.cursor.read(buffer)
+    }
+}
+
+impl Seek for CountingReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.seek_calls += 1;
+        if self.fail_seek {
+            return Err(std::io::Error::other("instrumented seek failure"));
+        }
+        self.cursor.seek(position)
+    }
+}
 
 #[test]
 fn qpdf_json_validators_accept_only_qpdf_reference_shapes() {
@@ -146,4 +193,176 @@ fn qpdf_json_value_factory_rejects_non_qpdf_real_literals() {
     let error = json_value_to_handle(&mut pdf, &Json::make_number("1e+")).expect_err("real");
 
     assert!(error.to_string().contains("invalid JSON number"));
+}
+
+#[test]
+fn inline_stream_provider_is_lazy_and_decodes_only_when_piped() {
+    let source = Rc::new(RefCell::new(CountingReader::new(br#"{"data":"TWFu"}"#)));
+    let value = {
+        let mut reader = source.borrow_mut();
+        Json::parse_reader(&mut *reader, None)
+            .expect("JSON input")
+            .get_dict_item("data")
+    };
+    assert_eq!((value.start(), value.end()), (8, 14));
+    let parsed_reads = source.borrow().read_calls;
+    let parsed_seeks = source.borrow().seek_calls;
+    let provider = inline_stream_data_provider(Rc::clone(&source), &value)
+        .expect("inline provider registration");
+
+    assert_eq!(source.borrow().read_calls, parsed_reads);
+    assert_eq!(source.borrow().seek_calls, parsed_seeks);
+
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf.new_stream().expect("new stream");
+    stream
+        .replace_stream_data_provider(provider, None, None)
+        .expect("provider replacement");
+    assert_eq!(source.borrow().read_calls, parsed_reads);
+    assert_eq!(source.borrow().seek_calls, parsed_seeks);
+
+    for _ in 0..2 {
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("pipe inline provider")
+                .as_slice(),
+            b"Man"
+        );
+    }
+    assert!(source.borrow().read_calls > parsed_reads);
+    assert_eq!(source.borrow().seek_calls, parsed_seeks + 2);
+}
+
+#[test]
+fn inline_stream_provider_reports_source_and_decode_failures_at_pipe_time() {
+    for (fail_read, fail_seek) in [(true, false), (false, true)] {
+        let source = Rc::new(RefCell::new(CountingReader::new(b"\"TWFu\"")));
+        source.borrow_mut().fail_read = fail_read;
+        source.borrow_mut().fail_seek = fail_seek;
+        let value = Json::make_string("TWFu");
+        value.set_start(0);
+        value.set_end(6);
+        let provider = inline_stream_data_provider(Rc::clone(&source), &value)
+            .expect("inline provider registration");
+        let pdf = Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("new stream");
+        stream
+            .replace_stream_data_provider(provider, None, None)
+            .expect("provider replacement");
+
+        assert!(matches!(stream.get_raw_stream_data(), Err(Error::Io(_))));
+    }
+
+    let source = Rc::new(RefCell::new(CountingReader::new(b"\"@@@@\"")));
+    let value = Json::make_string("@@@@");
+    value.set_start(0);
+    value.set_end(6);
+    let provider = inline_stream_data_provider(source, &value).expect("provider registration");
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf.new_stream().expect("new stream");
+    stream
+        .replace_stream_data_provider(provider, None, None)
+        .expect("provider replacement");
+    assert!(matches!(
+        stream.get_raw_stream_data(),
+        Err(Error::System(message)) if message.contains("base64 decode: invalid input")
+    ));
+}
+
+#[test]
+fn inline_stream_provider_finishes_when_source_ends_before_the_json_range() {
+    let source = Rc::new(RefCell::new(CountingReader::new(b"\"TW")));
+    let value = Json::make_string("TWFu");
+    value.set_start(0);
+    value.set_end(6);
+    let provider = inline_stream_data_provider(source, &value).expect("provider registration");
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf.new_stream().expect("new stream");
+    stream
+        .replace_stream_data_provider(provider, None, None)
+        .expect("provider replacement");
+
+    assert_eq!(
+        stream
+            .get_raw_stream_data()
+            .expect("pipe truncated inline provider")
+            .as_slice(),
+        b"M"
+    );
+}
+
+#[test]
+fn inline_stream_provider_rejects_an_invalid_json_string_range() {
+    let source = Rc::new(RefCell::new(CountingReader::new(b"")));
+    for (start, end, message) in [
+        (2, 2, "JSON string length < 0"),
+        (i64::MAX, i64::MAX, "JSON string start overflow"),
+        (0, i64::MIN, "JSON string end underflow"),
+        (i64::MIN, i64::MAX, "JSON string length is out of range"),
+        (-2, 2, "JSON string start is negative"),
+    ] {
+        let value = Json::make_string("TWFu");
+        value.set_start(start);
+        value.set_end(end);
+        let error = inline_stream_data_provider(Rc::clone(&source), &value)
+            .expect_err("invalid range must fail before provider registration");
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[test]
+fn datafile_stream_provider_opens_only_when_piped() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("stream.bin");
+    let provider = super::input::datafile_stream_data_provider(path.clone());
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf.new_stream().expect("new stream");
+    stream
+        .replace_stream_data_provider(provider, None, None)
+        .expect("provider replacement");
+    assert!(!path.exists(), "registration must not open datafile");
+
+    fs::write(&path, b"external bytes").expect("create datafile after registration");
+    assert_eq!(
+        stream
+            .get_raw_stream_data()
+            .expect("pipe datafile provider")
+            .as_slice(),
+        b"external bytes"
+    );
+}
+
+#[test]
+fn datafile_stream_provider_reports_missing_file_at_pipe_time() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("missing.bin");
+    let provider = super::input::datafile_stream_data_provider(path.clone());
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf.new_stream().expect("new stream");
+    stream
+        .replace_stream_data_provider(provider, None, None)
+        .expect("provider replacement");
+
+    assert!(matches!(
+        stream.get_raw_stream_data(),
+        Err(Error::System(message)) if message.starts_with("open ")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn datafile_stream_provider_reports_read_failure_at_pipe_time() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let provider = super::input::datafile_stream_data_provider(directory.path());
+    let pdf = Pdf::empty().expect("empty PDF");
+    let stream = pdf.new_stream().expect("new stream");
+    stream
+        .replace_stream_data_provider(provider, None, None)
+        .expect("provider replacement");
+
+    assert!(matches!(
+        stream.get_raw_stream_data(),
+        Err(Error::System(message)) if message.starts_with("failure reading file ")
+    ));
 }

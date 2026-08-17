@@ -1,16 +1,23 @@
-//! qpdf correspondence: `QPDF_json.cc` validators and `JSONReactor::makeObject`.
-//! value construction (`libqpdf/QPDF_json.cc:65-209, 732-793`).
+//! qpdf correspondence: `QPDF_json.cc` validators, deferred stream providers, and `JSONReactor::makeObject` value construction.
+//! (`libqpdf/QPDF_json.cc:65-209, 212-231, 732-793`; `libqpdf/QUtil.cc:642-663`).
 //!
 //! This is the canonical value boundary for the JSON input importer. It builds
 //! document-owned `ObjectHandle` values and never routes through the legacy
 //! `Object`/`Pdf::set_object` representation.
 
-use std::io::{Read, Seek};
+use std::cell::RefCell;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::value::format_qpdf_real;
 use super::Json;
-use crate::object_handle::ObjectValue;
+use crate::object_handle::{ObjectValue, StreamDataProvider};
+use crate::pipeline::{Base64Action, Pipeline, PlBase64};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
+
+const STREAM_PROVIDER_BUFFER_SIZE: usize = 8192;
 
 /// Parse qpdf's exact JSON indirect-reference spelling.
 ///
@@ -67,6 +74,139 @@ pub(crate) fn parse_object_key(value: &[u8]) -> Option<ObjectRef> {
     value
         .strip_prefix(b"obj:")
         .and_then(parse_indirect_reference)
+}
+
+/// Create qpdf's lazy provider for a JSON `stream.data` string.
+///
+/// This ports `QPDF_json.cc:212-231`. The parser records a string's source
+/// extent including its quotes, so the provider seeks to `start + 1` and
+/// reads through `end - 1` only when the stream is piped. The source bytes
+/// are fed incrementally to qpdf's Base64 decoder; decoded data is never
+/// materialized in a `Vec`.
+pub(crate) fn inline_stream_data_provider<R: Read + Seek + 'static>(
+    source: Rc<RefCell<R>>,
+    value: &Json,
+) -> Result<Rc<dyn StreamDataProvider>> {
+    let (start, length) = inline_data_range(value)?;
+
+    Ok(Rc::new(InlineStreamDataProvider {
+        source,
+        start,
+        length,
+    }))
+}
+
+struct InlineStreamDataProvider<R: Read + Seek + 'static> {
+    source: Rc<RefCell<R>>,
+    start: u64,
+    length: u64,
+}
+
+impl<R: Read + Seek + 'static> StreamDataProvider for InlineStreamDataProvider<R> {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        let mut decode = PlBase64::new("base64-decode", pipeline, Base64Action::Decode);
+        let mut source = self.source.borrow_mut();
+        source.seek(SeekFrom::Start(self.start))?;
+        let mut remaining = self.length;
+        let mut buffer = [0_u8; STREAM_PROVIDER_BUFFER_SIZE];
+        while remaining > 0 {
+            let requested = remaining.min(STREAM_PROVIDER_BUFFER_SIZE as u64) as usize;
+            let len = loop {
+                match source.read(&mut buffer[..requested]) {
+                    Ok(len) => break len,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            if len == 0 {
+                break;
+            }
+            decode.write(&buffer[..len]).map_err(Error::from)?;
+            remaining -= len as u64;
+        }
+        decode.finish().map_err(Error::from)
+    }
+}
+
+fn inline_data_range(value: &Json) -> Result<(u64, u64)> {
+    let start = value
+        .start()
+        .checked_add(1)
+        .ok_or_else(|| Error::Internal("QPDF_json: JSON string start overflow".into()))?;
+    let end = value
+        .end()
+        .checked_sub(1)
+        .ok_or_else(|| Error::Internal("QPDF_json: JSON string end underflow".into()))?;
+    if end < start {
+        return Err(Error::Internal(
+            "QPDF_json: JSON string length < 0".to_owned(),
+        ));
+    }
+    let length = end
+        .checked_sub(start)
+        .ok_or_else(|| Error::Internal("QPDF_json: JSON string length is out of range".into()))?;
+    let length = u64::try_from(length)
+        .map_err(|_| Error::Internal("QPDF_json: JSON string length is out of range".into()))?;
+    let start = u64::try_from(start)
+        .map_err(|_| Error::Internal("QPDF_json: JSON string start is negative".into()))?;
+    Ok((start, length))
+}
+
+/// Create qpdf's lazy provider for a JSON `stream.datafile` value.
+///
+/// This ports `QUtil::file_provider` (`libqpdf/QUtil.cc:642-663`). Opening
+/// the named file is deliberately inside the callback, so registration never
+/// touches the filesystem. Each invocation opens and streams the file again,
+/// preserving qpdf's repeatable provider boundary while the file is stable.
+pub(crate) fn datafile_stream_data_provider(
+    filename: impl Into<PathBuf>,
+) -> Rc<dyn StreamDataProvider> {
+    Rc::new(DatafileStreamDataProvider {
+        filename: filename.into(),
+    })
+}
+
+struct DatafileStreamDataProvider {
+    filename: PathBuf,
+}
+
+impl StreamDataProvider for DatafileStreamDataProvider {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        let mut file = File::open(&self.filename)
+            .map_err(|error| Error::System(format!("open {}: {error}", self.filename.display())))?;
+        let mut buffer = [0_u8; STREAM_PROVIDER_BUFFER_SIZE];
+        loop {
+            let read = loop {
+                match file.read(&mut buffer) {
+                    Ok(read) => break Ok(read),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => break Err(error),
+                }
+            };
+            match read {
+                Ok(0) => break,
+                Ok(len) => pipeline.write(&buffer[..len]).map_err(Error::from)?,
+                Err(_error) => {
+                    pipeline.finish().map_err(Error::from)?;
+                    return Err(Error::System(format!(
+                        "failure reading file {}",
+                        self.filename.display()
+                    )));
+                }
+            }
+        }
+        pipeline.finish().map_err(Error::from)
+    }
 }
 
 /// Convert one JSON value to a canonical document-owned handle.
