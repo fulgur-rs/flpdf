@@ -937,11 +937,15 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
         panic!("appearance must remain a stream");
     };
-    let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-        panic!("appearance must retain a resource dictionary");
+    let Some(Object::Reference(resources_ref)) = appearance.dict.get("Resources") else {
+        panic!("appearance must retain its live resources reference");
+    };
+    assert_eq!(*resources_ref, ObjectRef::new(12, 0));
+    let Object::Dictionary(resources) = pdf.resolve(ObjectRef::new(13, 0)).unwrap() else {
+        panic!("referenced resources must remain a dictionary");
     };
     let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
-        panic!("appearance must retain font resources");
+        panic!("referenced resources must retain font resources");
     };
     assert_eq!(fonts.get("F1"), Some(&Object::Integer(41)));
     assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
