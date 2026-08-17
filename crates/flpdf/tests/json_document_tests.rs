@@ -104,6 +104,49 @@ impl Seek for FailingReader {
     }
 }
 
+/// A `Read + Seek` whose relative seek (`SeekFrom::Current`, what
+/// `Seek::stream_position`'s default implementation uses) fails while
+/// absolute seeks still succeed -- an unusual but valid `Seek`
+/// implementation that must not make `import_json` silently substitute `0`
+/// for the source's actual starting position.
+struct FlakyCurrentSeekReader(Cursor<Vec<u8>>);
+
+impl Read for FlakyCurrentSeekReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl Seek for FlakyCurrentSeekReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if matches!(position, SeekFrom::Current(_)) {
+            return Err(io::Error::other("relative seek unsupported"));
+        }
+        self.0.seek(position)
+    }
+}
+
+#[test]
+fn import_propagates_a_stream_position_failure_instead_of_assuming_zero() {
+    let mut bytes = b"prefix".to_vec();
+    let json_start = bytes.len() as u64;
+    bytes.extend_from_slice(UPDATE_JSON);
+    let mut cursor = Cursor::new(bytes);
+    cursor.set_position(json_start);
+    let source = FlakyCurrentSeekReader(cursor);
+
+    let mut pdf = Pdf::empty().expect("empty document");
+    let error = pdf
+        .update_from_json(source, "flaky.json")
+        .expect_err("a stream_position failure must propagate, not default to offset 0");
+
+    assert!(matches!(
+        error,
+        Error::System(ref message)
+            if message.starts_with("flaky.json: ") && message.contains("relative seek unsupported")
+    ));
+}
+
 #[test]
 fn create_from_json_reads_inline_stream_data_when_the_source_starts_past_a_prefix() {
     // The tokenizer records offsets from its own first byte, not from the

@@ -104,9 +104,14 @@ where
         // `source`'s absolute position (see `JsonReactor::with_stream_data_base_offset`),
         // so a caller-supplied reader that starts mid-stream (e.g. JSON
         // embedded after a prefix) needs this correction before any deferred
-        // inline stream read seeks back into it.
+        // inline stream read seeks back into it. A failure here must not
+        // silently substitute `0`: that would reintroduce the same corrupted
+        // read for a `Seek` implementation whose relative `stream_position`
+        // fails while absolute seeks still succeed.
         let mut source = source;
-        let base_offset = source.stream_position().unwrap_or(0);
+        let base_offset = source
+            .stream_position()
+            .map_err(|error| Error::System(format!("{input_name}: {error}")))?;
         let source = Rc::new(RefCell::new(source));
         let mut reactor = JsonReactor::new(
             self,
