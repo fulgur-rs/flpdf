@@ -12,7 +12,7 @@ make_fixture_repo() {
   local fixture_repo="${fixture_root}/${name}"
 
   mkdir -p "$(dirname "${fixture_repo}/${source_path}")" "${fixture_repo}/scripts"
-  cp "${repo_root}/scripts/patch-coverage.sh" \
+  cp -f "${repo_root}/scripts/patch-coverage.sh" \
     "${fixture_repo}/scripts/patch-coverage.sh"
   chmod +x "${fixture_repo}/scripts/patch-coverage.sh"
 
@@ -21,19 +21,22 @@ make_fixture_repo() {
   git -C "${fixture_repo}" config user.name contract
   printf '%s\n' base >"${fixture_repo}/README"
   git -C "${fixture_repo}" add README scripts/patch-coverage.sh
-  git -C "${fixture_repo}" commit -qm base
+  git -C "${fixture_repo}" commit --no-gpg-sign -qm base
   local base_commit
   base_commit="$(git -C "${fixture_repo}" rev-parse HEAD)"
 
   printf '%s\n' "${source_body}" >"${fixture_repo}/${source_path}"
   : >"${fixture_repo}/report.lcov"
   git -C "${fixture_repo}" add "${source_path}" report.lcov
-  git -C "${fixture_repo}" commit -qm change
+  git -C "${fixture_repo}" commit --no-gpg-sign -qm change
 
-  printf '%s %s\n' "${fixture_repo}" "${base_commit}"
+  printf '%s\n%s\n' "${fixture_repo}" "${base_commit}"
 }
 
-read -r test_repo test_base < <(
+{
+  IFS= read -r test_repo
+  IFS= read -r test_base
+} < <(
   make_fixture_repo \
     test-only \
     crates/flpdf/src/json/input_tests.rs \
@@ -49,7 +52,10 @@ if ! test_output="$(
 fi
 [[ "${test_output}" == *"PASS (no executable changed lines)"* ]]
 
-read -r production_repo production_base < <(
+{
+  IFS= read -r production_repo
+  IFS= read -r production_base
+} < <(
   make_fixture_repo \
     production \
     crates/flpdf/src/json/input.rs \
