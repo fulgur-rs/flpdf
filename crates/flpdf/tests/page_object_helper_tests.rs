@@ -459,6 +459,46 @@ fn form_xobject_placement_uses_canonical_form_and_page_handles() {
 }
 
 #[test]
+fn form_xobject_placement_does_not_invert_page_transformations_when_disabled() {
+    let bytes = build_single_page_pdf(
+        "/MediaBox [0 0 100 100]",
+        "/TrimBox [0 0 100 100] /Rotate 90 /UserUnit 2",
+    );
+    let mut pdf = open(bytes);
+    let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+    let form = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(100),
+                    ObjectHandle::integer(100),
+                ]),
+            ),
+        ]),
+        Rc::new(Vec::new()),
+    );
+
+    assert_eq!(
+        helper
+            .get_matrix_for_form_xobject_placement(
+                form,
+                Rectangle::new(0.0, 0.0, 100.0, 100.0),
+                false,
+                true,
+                false,
+            )
+            .unwrap(),
+        Some(Matrix::default()),
+        "qpdf skips the destination page transform when inversion is disabled"
+    );
+}
+
+#[test]
 fn form_xobject_placement_handles_qpdf_fallback_and_scaling_boundaries() {
     let bytes = build_single_page_pdf("/MediaBox [0 0 100 100]", "/TrimBox [0 0 100 100]");
     let mut pdf = open(bytes);
