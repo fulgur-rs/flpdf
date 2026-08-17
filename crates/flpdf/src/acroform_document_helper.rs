@@ -886,15 +886,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     /// Append copied top-level fields to `/AcroForm/Fields`, reusing qpdf's
     /// suffix for every copied field that has the same colliding fully
-    /// qualified name (`QPDFAcroFormDocumentHelper.cc:62-110`).
-    #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
+    /// qualified name. The analyzed `name_to_fields` cache is deliberately
+    /// frozen until all copied fields have been renamed and only then added
+    /// to `/Fields`, matching qpdf's `addAndRenameFormFields`
+    /// (`QPDFAcroFormDocumentHelper.cc:62-110`, cache construction at
+    /// `:235-362`). Fully-qualified names follow
+    /// `QPDFFormFieldObjectHelper::getFullyQualifiedName`
+    /// (`QPDFFormFieldObjectHelper.cc:104-127`).
+    #[allow(clippy::mutable_key_type)]
     pub(crate) fn add_and_rename_form_fields(&mut self, fields: Vec<ObjectHandle>) -> Result<()> {
         if fields.is_empty() {
             return Ok(());
         }
 
         self.analyze()?;
-        let mut existing_names: BTreeSet<String> = self
+        let existing_names: BTreeSet<String> = self
             .cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache")
@@ -962,11 +968,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 // cov:ignore-end
                 self.pdf.mark_object_handle_dirty(&field)?;
             }
-            let mut final_name = old_name;
-            if !append.is_empty() {
-                final_name.push_str(std::str::from_utf8(&append).unwrap_or_default());
-            }
-            existing_names.insert(final_name);
         }
 
         let acroform = self.canonical_get_or_create_acroform()?;
@@ -3247,6 +3248,110 @@ mod tests {
         let renamed = pdf.get_object_handle(copied_field_ref);
         let renamed_name = renamed.try_get_key(b"/T").unwrap().as_string().unwrap();
         assert_eq!(renamed_name, b"field+1");
+    }
+
+    #[test]
+    fn add_and_rename_form_fields_reuses_suffix_for_shared_source_name() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[4]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        for field_ref in [4, 7, 8] {
+            pdf.set_object(
+                ObjectRef::new(field_ref, 0),
+                Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+            );
+        }
+
+        let copied_fields = [7, 8]
+            .into_iter()
+            .map(|field_ref| pdf.get_object_handle(ObjectRef::new(field_ref, 0)))
+            .collect();
+        AcroFormDocumentHelper::new(&mut pdf)
+            .add_and_rename_form_fields(copied_fields)
+            .unwrap();
+
+        for field_ref in [7, 8] {
+            let field = pdf.get_object_handle(ObjectRef::new(field_ref, 0));
+            assert_eq!(
+                field.try_get_key(b"/T").unwrap().as_string(),
+                Some(b"name+1".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn add_and_rename_form_fields_freezes_existing_names_until_after_bfs() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[4]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Dictionary(dict(&[("T", Object::String(b"name+1".to_vec()))])),
+        );
+
+        let copied_fields = [7, 8]
+            .into_iter()
+            .map(|field_ref| pdf.get_object_handle(ObjectRef::new(field_ref, 0)))
+            .collect();
+        AcroFormDocumentHelper::new(&mut pdf)
+            .add_and_rename_form_fields(copied_fields)
+            .unwrap();
+
+        let first = pdf
+            .get_object_handle(ObjectRef::new(7, 0))
+            .try_get_key(b"/T")
+            .unwrap()
+            .as_string();
+        let second = pdf
+            .get_object_handle(ObjectRef::new(8, 0))
+            .try_get_key(b"/T")
+            .unwrap()
+            .as_string();
+        // qpdf checks only the pre-add analyze() cache during this pass. The
+        // first copied field therefore becomes name+1, while the distinct
+        // source name name+1 is not rechecked against that newly planned name.
+        assert_eq!(first, Some(b"name+1".to_vec()));
+        assert_eq!(second, Some(b"name+1".to_vec()));
     }
 
     #[test]

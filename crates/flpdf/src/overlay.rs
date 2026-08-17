@@ -162,6 +162,29 @@ fn place_form_xobject(
     (fragment, cm)
 }
 
+/// Finalize one placement's newly copied top-level fields through the
+/// canonical ObjectHandle helper, mirroring qpdf's `copyAnnotations`
+/// (`QPDFPageObjectHelper.cc:1030`), which calls `addAndRenameFormFields`
+/// once per placement rather than batching across every placement on a
+/// page. Calling this once per placement — instead of once per
+/// destination page — lets a later placement's frozen-cache analysis see
+/// the fields an earlier placement on the same page already added,
+/// matching qpdf's trailing `addFormField` cache update
+/// (`QPDFAcroFormDocumentHelper.cc:105-108`).
+fn finalize_placement_fields<R: Read + Seek>(
+    dest: &mut Pdf<R>,
+    added: Vec<ObjectRef>,
+) -> Result<()> {
+    if added.is_empty() {
+        return Ok(());
+    }
+    let handles = added
+        .into_iter()
+        .map(|field_ref| dest.get_object_handle(field_ref))
+        .collect();
+    crate::AcroFormDocumentHelper::new(dest).add_and_rename_form_fields(handles)
+}
+
 /// Apply an ordered list of overlay/underlay `sources` to the destination page
 /// at `dest_page_ref`, mirroring qpdf's `QPDFJob::doUnderOverlayForPage`.
 ///
@@ -265,15 +288,22 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     //    template (if any) is applied through
     //    [`crate::overlay_annotations::apply_placement`], mirroring qpdf's
     //    `dest_page.copyAnnotations(from_page, cm, dest_afdh, from_afdh)` at
-    //    `QPDFJob::doUnderOverlayForPage` line 1899. New top-level fields
-    //    accumulate across placements and are appended to /AcroForm/Fields
-    //    (with +N rename on FQN collision) once at the end.
+    //    `QPDFJob::doUnderOverlayForPage` line 1899. Each placement's newly
+    //    copied top-level fields are appended to /AcroForm/Fields (with +N
+    //    rename on FQN collision) immediately after that same placement,
+    //    not batched across placements: qpdf's `copyAnnotations`
+    //    (`QPDFPageObjectHelper.cc:1030`) calls `addAndRenameFormFields`
+    //    once per placement, and its trailing `addFormField` walk
+    //    (`QPDFAcroFormDocumentHelper.cc:105-108`) updates the qualified-name
+    //    cache before the next placement's BFS rename pass reads it — so two
+    //    placements landing on the same destination page must observe each
+    //    other's renames, which only happens if each placement finalizes
+    //    through its own `add_and_rename_form_fields` call.
     // Placement rects mirror qpdf's getTrimBox()/getMediaBox().getArrayAsRectangle()
     // in doUnderOverlayForPage: corners normalized before scaling/centring.
     let trim_rect = normalize_rectangle(trim_box);
     let media_rect = normalize_rectangle(media_box);
     let mut content = String::new();
-    let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut dest_acroform_dr: Option<ObjectRef> = None;
     // `dr_map` is threaded through every page so the current placement's
     // rename table reaches field and appearance-stream rewriting. qpdf
@@ -302,7 +332,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
             // returns Err. All shipped byte gates exercise apply_placement on
             // valid input, and every plausible failure is a malformed-PDF path
             // whose own error-return is already excluded below.
-            let mut added = crate::overlay_annotations::apply_placement(
+            let added = crate::overlay_annotations::apply_placement(
                 dest,
                 dest_page_ref,
                 tpl,
@@ -311,7 +341,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 dr_map,
             )?;
             // cov:ignore-end
-            new_top_fields.append(&mut added);
+            finalize_placement_fields(dest, added)?;
         }
     }
     {
@@ -349,7 +379,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
         if let Some(tpl) = template {
             // cov:ignore-start: symmetric with the underlay branch above — the
             // trailing `)?;` is defensive on apply_placement error.
-            let mut added = crate::overlay_annotations::apply_placement(
+            let added = crate::overlay_annotations::apply_placement(
                 dest,
                 dest_page_ref,
                 tpl,
@@ -358,7 +388,7 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
                 dr_map,
             )?;
             // cov:ignore-end
-            new_top_fields.append(&mut added);
+            finalize_placement_fields(dest, added)?;
         }
     }
 
@@ -388,11 +418,6 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
         page_dict.insert("Annots", annots);
     }
     dest.set_object(dest_page_ref, Object::Dictionary(page_dict));
-
-    // 6. Finalize: append the accumulated new top-level fields to
-    //    /AcroForm/Fields, renaming /T on FQN collision with existing dest
-    //    fields (qpdf's addAndRenameFormFields).
-    crate::overlay_annotations::add_and_rename_form_fields(dest, new_top_fields)?;
 
     Ok(())
 }
@@ -1541,6 +1566,55 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
+    /// Two `--overlay` specs from the same source, both targeting
+    /// destination page 1 — the distinguishing shape between per-placement
+    /// and per-page finalization of `addAndRenameFormFields`. The qpdf
+    /// 11.9.0 real-CLI probe `qpdf fxo-red.pdf --overlay
+    /// form-fields-and-annotations.pdf --to=1 -- --overlay
+    /// form-fields-and-annotations.pdf --to=1 -- --qdf --static-id
+    /// --no-original-object-ids out.pdf` renames the second placement's
+    /// fields "Text Box 1+1"/"Text Box 2+1"/"r1+1": qpdf's `copyAnnotations`
+    /// (`QPDFPageObjectHelper.cc:1030`) calls `addAndRenameFormFields` once
+    /// per placement, and the trailing `addFormField` walk
+    /// (`QPDFAcroFormDocumentHelper.cc:105-108`) updates the qualified-name
+    /// cache before the second placement's BFS rename pass reads it. The
+    /// sibling `..._fxo_red_repeat1_...` test above repeats one placement
+    /// across 16 distinct destination pages and does not exercise this: each
+    /// page gets its own fresh `AcroFormDocumentHelper::new(dest).analyze()`
+    /// regardless of whether finalization is per-placement or per-page, so
+    /// only two placements landing on the *same* page tell them apart.
+    #[test]
+    fn overlay_copy_annotations_two_specs_same_page_is_byte_identical_qdf() {
+        let mut dest = fixture("fxo-red.pdf");
+        let mut src1 = fixture("form-fields-and-annotations.pdf");
+        let src2 = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src1).get_version();
+        let mut specs = vec![
+            OverlaySpec {
+                source: src1,
+                kind: OverlayKind::Overlay,
+                from: pr(""),
+                to: pr("1"),
+                repeat: None,
+            },
+            OverlaySpec {
+                source: src2,
+                kind: OverlayKind::Overlay,
+                from: pr(""),
+                to: pr("1"),
+                repeat: None,
+            },
+        ];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        assert_byte_identical(&actual, "overlay-copy-annotations-two-specs-same-page.pdf");
+    }
+
     /// Overlay a source that mixes two edge shapes into its page's
     /// `/Annots` array:
     /// - one widget (obj 3, "Text Box 1") carries an explicit `/P`
@@ -1610,11 +1684,9 @@ mod byte_gate {
     /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
     /// indirect reference (`/Fields 5 0 R`) instead of a direct array —
     /// a valid PDF shape. Exercises
-    /// `read_existing_top_field_refs`'s Reference branch,
-    /// `collect_fully_qualified_names`'s indirect-`/Kids` handling on
-    /// the same axis, and `add_and_rename_form_fields`'s indirect-Fields
-    /// append (updates the array object in place rather than storing a
-    /// new direct array on the AcroForm).
+    /// the canonical helper's indirect `/Fields` append (updates the array
+    /// object in place rather than storing a new direct array on the
+    /// AcroForm).
     ///
     /// Fixture: `fxo-red-indirect-fields.pdf` is fxo-red with a hand-added
     /// `/AcroForm { /Fields <ref> }` whose Fields ref points at a
@@ -1676,9 +1748,9 @@ mod byte_gate {
     /// every placement (the source page is repeated onto all 16 dest
     /// pages, so the rename runs 16 times: "Text Box 1+1", "Text Box 1+2",
     /// ...). Also exercises `ensure_dest_acroform_dr`'s existing-`/DR`
-    /// short-circuit, `add_and_rename_form_fields`'s reference-`/AcroForm`
-    /// / reference-`/Fields` paths, `collect_fully_qualified_names` over
-    /// the pre-existing field, and the tail of `duplicate_field_tree` that
+    /// short-circuit, the canonical helper's reference-`/AcroForm` and
+    /// reference-`/Fields` paths over the pre-existing field, and the tail of
+    /// `duplicate_field_tree` that
     /// leaves an existing dest `/DR` untouched.
     ///
     /// Fixture: `fxo-red-with-existing-acroform.pdf` is fxo-red with a
