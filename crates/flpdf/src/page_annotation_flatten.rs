@@ -143,7 +143,23 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         {
             continue;
         }
-        // Read /F through the canonical helper first. A zero result is also
+        // qpdf resolves the selected appearance stream before reading /F:
+        // `QPDFAnnotationObjectHelper::getPageContentForAppearance`'s own
+        // top gate is `getAppearanceStream("/N").isStream()`
+        // (`QPDFAnnotationObjectHelper.cc:80-82`), and `getFlags()` runs
+        // only after that (`:143`). qpdf only retains annotations without
+        // any appearance dictionary; once /AP is present, a missing
+        // selected /N stream is itself a flattening/removal outcome (for
+        // example an unchecked checkbox).
+        let (appearance_dictionary, appearance) = {
+            let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+            (
+                helper.get_appearance_dictionary()?,
+                helper.get_appearance_stream(b"N", None)?,
+            )
+        };
+
+        // Read /F through the canonical helper. A zero result is also
         // qpdf's fail-soft value for absent/non-integer /F. Only a detected
         // Pdf::set_object holder redirect may use the compatibility bridge.
         let canonical_flags =
@@ -167,16 +183,6 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         #[cfg(test)]
         let no_view = (flags & FLAG_NO_VIEW) != 0;
 
-        // qpdf only retains annotations without any appearance dictionary.
-        // Once /AP is present, a missing selected /N stream is itself a
-        // flattening/removal outcome (for example an unchecked checkbox).
-        let (appearance_dictionary, appearance) = {
-            let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
-            (
-                helper.get_appearance_dictionary()?,
-                helper.get_appearance_stream(b"N", None)?,
-            )
-        };
         let has_appearance = if appearance_dictionary.is_null() {
             false
         } else if appearance_dictionary.as_reference().is_some() {
@@ -2385,6 +2391,86 @@ mod tests {
 
         let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
         assert_eq!(count, 0, "XObject without /BBox should be skipped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: an invalid /BBox short-circuits before /Rect is ever dereferenced
+    // -----------------------------------------------------------------------
+    #[test]
+    fn invalid_bbox_short_circuits_before_rect_is_dereferenced() {
+        // qpdf's `if (!(bbox_obj.isRectangle() && rect_obj.isRectangle()))`
+        // (`QPDFAnnotationObjectHelper.cc:161-163`) short-circuits on `&&`:
+        // /BBox is dereferenced first, and a non-rectangle /BBox means
+        // /Rect is never touched at all. Object 6's body is malformed (a
+        // bare `6 0 R` with no valid object syntax, producing an "expected
+        // endobj" repair warning if it is ever resolved) -- resolving it
+        // would be directly observable via `repair_diagnostics()`.
+        let no_bbox_xobj = "<< /Type /XObject /Subtype /Form /Length 0 >>\nstream\n\nendstream\n";
+        let (n5, obj5_bytes) = obj_wrap(5, no_bbox_xobj.as_bytes().to_vec());
+        let (n6, obj6_bytes) = obj_wrap(6, b"6 0 R".to_vec());
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect 6 0 R /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf(
+            "/Annots [4 0 R]",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n6, obj6_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        flatten_annotations_qpdf(&mut pdf, &[page_ref], 0, 0).unwrap();
+
+        let diagnostics = pdf.repair_diagnostics().entries().to_vec();
+        assert!(
+            diagnostics.iter().all(|d| !d.message.contains("object 6")),
+            "a non-rectangle /BBox must short-circuit before /Rect (object 6) is ever \
+             resolved: {diagnostics:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: the bridge path (already-supplied /BBox+/Matrix) still resolves
+    // /Rect on its own and returns empty content when /Rect is missing
+    // -----------------------------------------------------------------------
+    #[test]
+    fn bridge_appearance_with_geometry_and_missing_rect_returns_empty() {
+        // AppearanceContentOverrides::with_geometry has no qpdf counterpart
+        // (a flpdf-only legacy-bridge fallback supplying already-normalized
+        // /BBox and /Matrix values), so it resolves /Rect on its own instead
+        // of short-circuiting alongside /BBox. A missing /Rect must still
+        // yield empty content, matching qpdf's rect_obj.isRectangle() check.
+        let (n5, obj5_bytes) = obj_wrap(
+            5,
+            b"<< /Type /XObject /Subtype /Form /Length 0 >>\nstream\n\nendstream\n".to_vec(),
+        );
+        let (n4, obj4_bytes) =
+            obj_dict(4, "<< /Type /Annot /Subtype /Widget /AP << /N 5 0 R >> >>");
+
+        let bytes = build_pdf("", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let annotation = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        let content = AnnotationObjectHelper::from_object_handle(annotation, &mut pdf)
+            .get_page_content_for_selected_appearance_with_geometry(
+                "/Fxo1",
+                ObjectRef::new(5, 0),
+                0,
+                0,
+                0,
+                crate::annotation_helper::AppearanceContentOverrides::with_geometry(
+                    Rectangle::new(0.0, 0.0, 10.0, 10.0),
+                    Matrix::default(),
+                    0,
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            content.is_empty(),
+            "a missing /Rect must still short-circuit even when /BBox/Matrix are bridge-supplied"
+        );
     }
 
     // -----------------------------------------------------------------------
