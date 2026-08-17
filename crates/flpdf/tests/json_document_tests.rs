@@ -105,6 +105,32 @@ impl Seek for FailingReader {
 }
 
 #[test]
+fn create_from_json_reads_inline_stream_data_when_the_source_starts_past_a_prefix() {
+    // The tokenizer records offsets from its own first byte, not from the
+    // reader's absolute position (`Parser::pos` starts at `0` regardless of
+    // where the caller's cursor already was), so a source positioned past an
+    // unrelated prefix must still resolve deferred inline stream reads to
+    // the correct bytes rather than seeking `prefix.len()` bytes short.
+    let mut bytes = b"garbage prefix that is not part of the JSON document".to_vec();
+    let json_start = bytes.len() as u64;
+    bytes.extend_from_slice(
+        br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"stream":{"dict":{},"data":"SGVsbG8="}},"trailer":{"value":{}}}]}"#,
+    );
+    let mut source = Cursor::new(bytes);
+    source.set_position(json_start);
+
+    let mut pdf = Pdf::create_from_json(source, "prefixed.json").expect("create");
+    let stream = pdf.get_object_handle(ObjectRef::new(1, 0));
+    assert_eq!(
+        stream
+            .get_raw_stream_data()
+            .expect("stream data")
+            .as_slice(),
+        b"Hello"
+    );
+}
+
+#[test]
 fn create_from_json_uses_qpdf_rootless_seed_and_complete_metadata() {
     let mut pdf = Pdf::create_from_json(Cursor::new(ROOTLESS_COMPLETE_JSON), "rootless.json")
         .expect("complete JSON should create a document");
@@ -252,6 +278,26 @@ fn import_fatal_reactor_errors_use_the_same_qpdf_exception_boundary() {
     assert!(
         matches!(error, Error::System(message) if message == "scalar.json: QPDF JSON must be a dictionary")
     );
+}
+
+#[test]
+fn import_reports_a_recorded_fatal_over_a_later_parser_error() {
+    // qpdf's reactor throws immediately at the fatal condition
+    // (`QPDF_json.cc:353,463`), unwinding out of `JSON::parse` before the
+    // tokenizer can ever see `}` mismatching the just-opened `[`. flpdf's
+    // reactor records the fatal but lets the tokenizer keep running, so it
+    // goes on to raise its own, later, and therefore qpdf-unreachable
+    // "unexpected dictionary end delimiter" syntax error -- the recorded
+    // fatal must still be what the caller sees.
+    let mut pdf = Pdf::empty().expect("empty document");
+    let error = pdf
+        .update_from_json(Cursor::new(b"[}".as_slice()), "malformed.json")
+        .expect_err("top-level array followed by a mismatched delimiter must fail");
+
+    assert!(matches!(
+        error,
+        Error::System(message) if message == "malformed.json: QPDF JSON must be a dictionary"
+    ));
 }
 
 #[test]

@@ -331,7 +331,7 @@ fn inline_stream_provider_is_lazy_and_decodes_only_when_piped() {
     assert_eq!((value.start(), value.end()), (8, 14));
     let parsed_reads = source.borrow().read_calls;
     let parsed_seeks = source.borrow().seek_calls;
-    let provider = inline_stream_data_provider(Rc::clone(&source), &value)
+    let provider = inline_stream_data_provider(Rc::clone(&source), &value, 0)
         .expect("inline provider registration");
 
     assert_eq!(source.borrow().read_calls, parsed_reads);
@@ -367,7 +367,7 @@ fn inline_stream_provider_reports_source_and_decode_failures_at_pipe_time() {
         let value = Json::make_string("TWFu");
         value.set_start(0);
         value.set_end(6);
-        let provider = inline_stream_data_provider(Rc::clone(&source), &value)
+        let provider = inline_stream_data_provider(Rc::clone(&source), &value, 0)
             .expect("inline provider registration");
         let pdf = Pdf::empty().expect("empty PDF");
         let stream = pdf.new_stream().expect("new stream");
@@ -382,7 +382,7 @@ fn inline_stream_provider_reports_source_and_decode_failures_at_pipe_time() {
     let value = Json::make_string("@@@@");
     value.set_start(0);
     value.set_end(6);
-    let provider = inline_stream_data_provider(source, &value).expect("provider registration");
+    let provider = inline_stream_data_provider(source, &value, 0).expect("provider registration");
     let pdf = Pdf::empty().expect("empty PDF");
     let stream = pdf.new_stream().expect("new stream");
     stream
@@ -400,7 +400,7 @@ fn inline_stream_provider_finishes_when_source_ends_before_the_json_range() {
     let value = Json::make_string("TWFu");
     value.set_start(0);
     value.set_end(6);
-    let provider = inline_stream_data_provider(source, &value).expect("provider registration");
+    let provider = inline_stream_data_provider(source, &value, 0).expect("provider registration");
     let pdf = Pdf::empty().expect("empty PDF");
     let stream = pdf.new_stream().expect("new stream");
     stream
@@ -429,7 +429,7 @@ fn inline_stream_provider_rejects_an_invalid_json_string_range() {
         let value = Json::make_string("TWFu");
         value.set_start(start);
         value.set_end(end);
-        let error = inline_stream_data_provider(Rc::clone(&source), &value)
+        let error = inline_stream_data_provider(Rc::clone(&source), &value, 0)
             .expect_err("invalid range must fail before provider registration");
         assert!(error.to_string().contains(message), "{error}");
     }

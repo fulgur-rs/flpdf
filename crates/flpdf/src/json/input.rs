@@ -114,11 +114,23 @@ pub(crate) fn parse_object_key(value: &[u8]) -> IndirectReferenceParse {
 /// reads through `end - 1` only when the stream is piped. The source bytes
 /// are fed incrementally to qpdf's Base64 decoder; decoded data is never
 /// materialized in a `Vec`.
+///
+/// `base_offset` is the source's own stream position when parsing began: the
+/// tokenizer tracks offsets from its own first byte (`Parser::pos` starts at
+/// `0`), not from the source's absolute position, so a caller-supplied
+/// reader that was not already at the start needs this correction before the
+/// provider seeks back into `source` later. qpdf's `InputSource` abstraction
+/// (`libqpdf/QPDF_json.cc:212-230` reads through `is`) does not have this gap
+/// because every `InputSource` implementation normalizes its own offset `0`
+/// to its logical start; flpdf's `Read + Seek` substitute for `InputSource`
+/// has no such normalization, so the caller boundary (`json/document.rs`)
+/// supplies it explicitly instead.
 pub(crate) fn inline_stream_data_provider<R: Read + Seek + 'static>(
     source: Rc<RefCell<R>>,
     value: &Json,
+    base_offset: u64,
 ) -> Result<Rc<dyn StreamDataProvider>> {
-    let (start, length) = inline_data_range(value)?;
+    let (start, length) = inline_data_range(value, base_offset)?;
 
     Ok(Rc::new(InlineStreamDataProvider {
         source,
@@ -164,7 +176,7 @@ impl<R: Read + Seek + 'static> StreamDataProvider for InlineStreamDataProvider<R
     }
 }
 
-fn inline_data_range(value: &Json) -> Result<(u64, u64)> {
+fn inline_data_range(value: &Json, base_offset: u64) -> Result<(u64, u64)> {
     let start = value
         .start()
         .checked_add(1)
@@ -185,6 +197,9 @@ fn inline_data_range(value: &Json) -> Result<(u64, u64)> {
         .map_err(|_| Error::Internal("QPDF_json: JSON string length is out of range".into()))?;
     let start = u64::try_from(start)
         .map_err(|_| Error::Internal("QPDF_json: JSON string start is negative".into()))?;
+    let start = start
+        .checked_add(base_offset)
+        .ok_or_else(|| Error::Internal("QPDF_json: JSON string start overflow".into()))?;
     Ok((start, length))
 }
 
@@ -443,6 +458,7 @@ where
     stack: Vec<StackFrame>,
     next_obj: Option<ObjectHandle>,
     next_state: ReactorState,
+    stream_data_base_offset: u64,
 }
 
 impl<'a, P, S> JsonReactor<'a, P, S>
@@ -487,7 +503,20 @@ where
             stack: Vec::new(),
             next_obj: None,
             next_state: ReactorState::Top,
+            stream_data_base_offset: 0,
         }
+    }
+
+    /// The source's own stream position when parsing began, added to every
+    /// offset the tokenizer records before it is used to seek back into the
+    /// source for a deferred inline stream read. Only [`super::document`]'s
+    /// public entry points need this: their `source` is caller-supplied and
+    /// may not already be positioned at its own logical start, unlike every
+    /// other construction path in this module (all of which parse a source
+    /// they control from position `0`).
+    pub(crate) fn with_stream_data_base_offset(mut self, offset: u64) -> Self {
+        self.stream_data_base_offset = offset;
+        self
     }
 
     pub(crate) fn any_errors(&self) -> bool {
@@ -941,7 +970,11 @@ where
                             current.replace_stream_data(Rc::new(Vec::new()), None, None);
                             self.mark_dirty(&current);
                         } else {
-                            match inline_stream_data_provider(self.source.clone(), value) {
+                            match inline_stream_data_provider(
+                                self.source.clone(),
+                                value,
+                                self.stream_data_base_offset,
+                            ) {
                                 Ok(provider) => {
                                     // cov:ignore-start: parser-created stream handles are always indirect and same-Pdf
                                     if let Err(error) =

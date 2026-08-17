@@ -100,13 +100,21 @@ where
         S: Read + Seek + 'static,
     {
         let input_name = input_name.into();
+        // The tokenizer records offsets from its own first byte, not from
+        // `source`'s absolute position (see `JsonReactor::with_stream_data_base_offset`),
+        // so a caller-supplied reader that starts mid-stream (e.g. JSON
+        // embedded after a prefix) needs this correction before any deferred
+        // inline stream read seeks back into it.
+        let mut source = source;
+        let base_offset = source.stream_position().unwrap_or(0);
         let source = Rc::new(RefCell::new(source));
         let mut reactor = JsonReactor::new(
             self,
             Rc::clone(&source),
             input_name.clone(),
             must_be_complete,
-        );
+        )
+        .with_stream_data_base_offset(base_offset);
 
         // Drop the source borrow before inspecting the reactor. Providers keep
         // the Rc alive after this scope, but never run while registration is
@@ -116,10 +124,18 @@ where
             parse_reader(&mut *source, Some(&mut reactor))
         };
 
-        if let Err(error) = parsed {
+        // qpdf's reactor throws immediately at the fatal condition
+        // (`QPDF_json.cc:353,463`, etc.), unwinding out of `JSON::parse`
+        // before the tokenizer can observe any later syntax error. flpdf's
+        // reactor instead records the fatal and lets the tokenizer keep
+        // running (subsequent reactor callbacks become no-ops, but parsing
+        // itself does not stop) -- so a recorded fatal must be checked, and
+        // reported, before any later-and-therefore-qpdf-unreachable parser
+        // error `parsed` might carry from continuing past that point.
+        if let Some(error) = reactor.fatal_error() {
             return Err(Error::System(format!("{input_name}: {error}")));
         }
-        if let Some(error) = reactor.fatal_error() {
+        if let Err(error) = parsed {
             return Err(Error::System(format!("{input_name}: {error}")));
         }
         if reactor.any_errors() {
