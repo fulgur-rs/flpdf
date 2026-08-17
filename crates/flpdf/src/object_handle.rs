@@ -3664,6 +3664,36 @@ impl ObjectHandle {
     /// - any other existing-`rtype` shape combination (mismatched types,
     ///   or neither dictionary nor array) leaves that entry untouched.
     ///
+    /// # Preconditions
+    ///
+    /// Unlike qpdf, this method does not dereference handles before inspecting
+    /// their types. Callers must resolve the receiver, `other`, and the
+    /// top-level resource-category handles whose shapes this merge will
+    /// inspect before calling it. qpdf's corresponding accessors resolve on
+    /// every call (`QPDFObjectHandle.cc:252-267,426-434`), while this port's
+    /// non-fallible `as_dictionary`, `as_array`, `get_key`, and `has_key`
+    /// accessors intentionally do not. Passing an unresolved indirect handle
+    /// therefore can make a qpdf-dictionary look non-dictionary here and
+    /// silently select the no-op path. This is a caller contract; it does not
+    /// change the method's behavior or add an implicit resolution boundary.
+    ///
+    /// The gap goes one level deeper than the categories themselves. For an
+    /// array-shaped `rtype`, the member check (`is_scalar`) is also
+    /// non-resolving, while qpdf's `isScalar()` dereferences on every call
+    /// (`QPDFObjectHandle.cc:449-452`, itself composed of `isBool`/`isInteger`/
+    /// `isName`/`isNull`/`isReal`/`isString`, each following the same
+    /// `dereference() && ...` pattern, e.g. `isBool` at `:338-341`) — an
+    /// unresolved indirect scalar array item is silently excluded from the
+    /// union instead of being merged. For a dictionary-shaped `rtype`, the
+    /// unique-name pool (`get_resource_names`/`try_get_resource_names`)
+    /// checks each second-level value with a non-resolving `as_dictionary`,
+    /// while qpdf's `getResourceNames()` calls `val.isDictionary()`, which
+    /// also dereferences (`QPDFObjectHandle.cc:1156-1170`, `isDictionary()`
+    /// itself at `:431-434`) — an unresolved indirect second-level
+    /// dictionary value is silently excluded from the pool, which can select
+    /// a name qpdf would have rejected as already taken. Neither gap is
+    /// closed by a caller-side contract today.
+    ///
     /// The uniqueness pool for a freshly minted name is
     /// `this_val.getResourceNames()`'s own "second-level keys" definition
     /// (`libqpdf/QPDFObjectHandle.cc:1156-1170`) applied to the *inner*
