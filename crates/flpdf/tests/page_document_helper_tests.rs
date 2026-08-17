@@ -205,6 +205,39 @@ fn pdf_with_need_appearances_and_unread_default_resources() -> Vec<u8> {
     out
 }
 
+/// A page with one /NeedAppearances-gated Widget whose /AP points at a
+/// malformed object, /AcroForm present from the catalog onward -- so the
+/// same bytes exercise qpdf's real Widget-skip path when run through the
+/// qpdf CLI directly, unlike constructing the AcroForm only on a separately
+/// parsed in-memory `Pdf`.
+fn pdf_with_need_appearances_and_malformed_widget_ap() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+        ),
+        (4, "<< /NeedAppearances true >>"),
+        (5, "<< /Type /Annot /Subtype /Widget /AP 6 0 R >>"),
+        (6, "not-a-pdf-object"),
+    ] {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for number in 1..=6 {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 /// A direct intermediate /Pages node whose /Kids array is an indirect holder.
 /// qpdf dereferences that holder through the document before classifying the
 /// child as a page.
@@ -995,6 +1028,88 @@ fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
         pdf.repair_diagnostics().entries().is_empty(),
         "a malformed /DR that is never needed must not be resolved: {:?}",
         pdf.repair_diagnostics().entries()
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_resolves_widget_appearance_before_need_appearances_skip() {
+    // The oracle input must itself carry /AcroForm /NeedAppearances true, not
+    // just the separately parsed in-memory Pdf below: qpdf only enters its
+    // Widget-skip branch (QPDFPageDocumentHelper.cc:100-103) when
+    // NeedAppearances is genuinely set, and a warning from a run that never
+    // takes that branch would only prove ordinary appearance resolution, not
+    // that it happens before the skip.
+    let bytes = pdf_with_need_appearances_and_malformed_widget_ap();
+    let mut pdf = open(bytes.clone());
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("skip-widget-order.pdf");
+        fs::write(&input_path, &bytes).unwrap();
+
+        // Control: NeedAppearances preserves the Widget, so object 6 stays
+        // reachable through its /AP and gets parsed while qpdf serializes
+        // *any* output for this file -- with or without flattening. This
+        // run (no --flatten-annotations at all) must emit the identical
+        // warning, proving the warning by itself is a property of
+        // reachability, not evidence that flatten's own internal
+        // processing touched /AP before its skip check.
+        let control_output_path = dir.path().join("skip-widget-order-control.pdf");
+        let control = Command::new("qpdf")
+            .arg(&input_path)
+            .arg(&control_output_path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&control.stderr).contains("unknown token while reading object"),
+            "control (no flattening) must already observe the malformed /AP target, showing \
+             the warning alone cannot isolate flatten's internal ordering: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+
+        let output_path = dir.path().join("skip-widget-order-qpdf.pdf");
+        let output = Command::new("qpdf")
+            .arg("--flatten-annotations=print")
+            .arg(&input_path)
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 3)),
+            "qpdf did not produce an oracle result: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown token while reading object"),
+            "qpdf must tolerate the malformed /AP target under NeedAppearances (exit 0 or 3, \
+             not fatal): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The qpdf CLI run above only establishes that this fixture is a
+    // realistic, qpdf-tolerable input (a malformed /AP on a NeedAppearances-
+    // skipped Widget is non-fatal) -- the control proves qpdf's warning
+    // cannot isolate *when* /AP gets read, since the object is reachable
+    // regardless of flattening. The specific ordering claim (resolution
+    // happens before the skip) is instead verified directly below through
+    // flpdf's own repair diagnostics, which only records a warning if
+    // *flpdf's* flatten_annotations call itself resolved /AP.
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .expect("qpdf resolves the selected appearance before skipping a Widget");
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(
+        page.get("Annots").is_some(),
+        "NeedAppearances must still preserve the skipped Widget"
+    );
+    assert!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("unknown token while reading object")),
+        "the skipped Widget's malformed /AP target must have been resolved"
     );
 }
 
