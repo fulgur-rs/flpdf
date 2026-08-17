@@ -6,9 +6,9 @@
 //! - [`Pdf`] is the parsed-but-lazy document handle. [`Pdf::open`] reads the trailer
 //!   and cross-reference table, then resolves objects on demand via [`Pdf::resolve`].
 //! - [`Object`], [`Dictionary`], [`Stream`], and [`ObjectRef`] are the data model.
-//! - [`pages`], [`outline`], and [`fonts`] are traversal helpers built on top of
-//!   `Pdf`. They mirror the read-only inspection surface that `qpdf --show-pages`,
-//!   `--show-outline`, and `--show-fonts` provide.
+//! - [`pages`] and [`outline`] are traversal helpers built on top of `Pdf`. They
+//!   mirror the read-only inspection surface that `qpdf --show-pages` and
+//!   `--show-outline` provide.
 //! - [`PdfWriter`] configures the one fresh full-rewrite output with qpdf-shaped
 //!   settings.
 //! - [`check_reader`] reports diagnostics gathered during parsing/repair, returning a
@@ -102,7 +102,6 @@ pub mod engine;
 pub mod error;
 pub mod filespec_helper;
 pub mod filters;
-pub mod fonts;
 pub mod form_field_object_helper;
 pub mod job;
 pub mod json;

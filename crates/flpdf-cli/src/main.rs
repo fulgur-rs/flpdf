@@ -17,7 +17,7 @@ use flpdf::{
     thread_bead_p::drop_thread_bead_dangling_p, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    check_reader_with_options_and_limits, filters, flatten_rotation_on_pages, fonts,
+    check_reader_with_options_and_limits, filters, flatten_rotation_on_pages,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path, LinearizationCheckError,
@@ -303,8 +303,6 @@ struct Cli {
     #[arg(long)]
     show_outline: bool,
     #[arg(long)]
-    show_fonts: bool,
-    #[arg(long)]
     show_npages: bool,
     #[arg(long)]
     show_pages: bool,
@@ -331,7 +329,7 @@ struct Cli {
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
               "dump_object",
               "show_info", "show_catalog", "show_metadata", "show_outline",
-              "show_fonts", "show_npages", "show_pages", "show_linearization", "output",
+              "show_npages", "show_pages", "show_linearization", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption_from",
               "add_attachment", "remove_attachment", "list_attachments",
@@ -451,7 +449,7 @@ struct Cli {
     #[arg(long = "remove-restrictions",
           conflicts_with_all = [
               "check", "dump_object", "show_info", "show_catalog",
-              "show_metadata", "show_outline", "show_fonts",
+              "show_metadata", "show_outline",
               "show_npages", "show_pages", "show_linearization",
           ])]
     remove_restrictions: bool,
@@ -472,7 +470,7 @@ struct Cli {
     #[arg(long = "decrypt",
           conflicts_with_all = [
               "check", "dump_object", "show_info", "show_catalog",
-              "show_metadata", "show_outline", "show_fonts",
+              "show_metadata", "show_outline",
               "show_npages", "show_pages", "show_linearization",
           ])]
     decrypt: bool,
@@ -524,7 +522,7 @@ struct Cli {
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
               "check", "dump_object", "show_info", "show_catalog",
-              "show_metadata", "show_outline", "show_fonts",
+              "show_metadata", "show_outline",
               "show_npages", "show_pages", "show_linearization",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
@@ -691,7 +689,7 @@ struct Cli {
         // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
             "check", "dump_object", "show_info", "show_catalog",
-            "show_metadata", "show_outline", "show_fonts",
+            "show_metadata", "show_outline",
             "show_npages", "show_pages", "show_linearization",
             "remove_restrictions", "decrypt",
             "copy_encryption_from",
@@ -717,7 +715,7 @@ struct Cli {
         conflicts_with_all = [
             "encrypt",
             "check", "dump_object", "show_info", "show_catalog",
-            "show_metadata", "show_outline", "show_fonts",
+            "show_metadata", "show_outline",
             "show_npages", "show_pages", "show_linearization",
             "remove_restrictions", "decrypt",
         ],
@@ -1702,7 +1700,6 @@ fn main() {
                     && !args.show_catalog
                     && !args.show_metadata
                     && !args.show_outline
-                    && !args.show_fonts
                     && !args.show_npages
                     && !args.show_pages
                     && !args.show_linearization
@@ -1742,8 +1739,6 @@ fn main() {
         run_show_metadata(args.input, args.repair, &args.password)
     } else if args.show_outline {
         run_show_outline(args.input, args.repair, &args.password)
-    } else if args.show_fonts {
-        run_show_fonts(args.input, args.repair, &args.password)
     } else if args.show_npages {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
@@ -4892,48 +4887,6 @@ fn run_show_outline(
     for (index, (depth, _id, item)) in tree.preorder().enumerate() {
         println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, item.title);
     }
-    finish_operation_warnings(&pdf, false)
-}
-
-fn run_show_fonts(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-
-    let font_refs = match fonts::font_entries(&mut pdf) {
-        Ok(font_refs) => font_refs,
-        Err(error) => {
-            eprintln!("Warning: {error}");
-            Default::default()
-        }
-    };
-
-    println!("Fonts:");
-    if font_refs.is_empty() {
-        println!("  <none>");
-        return finish_operation_warnings(&pdf, false);
-    }
-
-    for (name, font_obj) in font_refs {
-        let font_name = String::from_utf8_lossy(&name);
-        if let Object::Dictionary(dict) = font_obj {
-            println!("  /{}", font_name);
-            if let Some(font_type) = dict.get("Type") {
-                println!("    type: {}", object_to_pdf(font_type));
-            }
-            if let Some(subtype) = dict.get("Subtype") {
-                println!("    subtype: {}", object_to_pdf(subtype));
-            }
-            if let Some(base_font) = dict.get("BaseFont") {
-                println!("    base_font: {}", object_to_pdf(base_font));
-            }
-        } else {
-            println!("  /{}", font_name);
-            println!("    type: <invalid>");
-            println!("    subtype: <invalid>");
-            println!("    base_font: <invalid>");
-        }
-    }
-
     finish_operation_warnings(&pdf, false)
 }
 

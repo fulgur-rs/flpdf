@@ -2989,30 +2989,6 @@ fn json_and_side_files_complete_before_warning_exit_three() {
 }
 
 #[test]
-fn show_fonts_prints_summary() {
-    let fixture = fixture_with_metadata_outline_and_fonts();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-fonts", fixture.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("F1"))
-        .stdout(predicate::str::contains("F2"));
-}
-
-#[test]
-fn show_fonts_prints_inline_dictionary_fonts() {
-    let fixture = fixture_with_inline_font_dictionary();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-fonts", fixture.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("FDirect"))
-        .stdout(predicate::str::contains("type: /Font"));
-}
-
-#[test]
 fn show_npages_prints_total_pages() {
     let fixture = fixture_with_nested_pages();
 
@@ -3232,54 +3208,6 @@ fn fixture_with_unresolvable_outline() -> tempfile::NamedTempFile {
         .unwrap();
     bytes[start + b"3 0 obj\n".len()] = b'@';
     std::fs::write(fixture.path(), bytes).unwrap();
-    fixture
-}
-
-fn fixture_with_inline_font_dictionary() -> tempfile::NamedTempFile {
-    let mut fixture = tempfile::NamedTempFile::new().unwrap();
-
-    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
-    let object2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n";
-    let object3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /FDirect << /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >> >> >> /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n";
-    let content_data = b"HelloPDF\n";
-    let object4 = format!(
-        "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
-        content_data.len(),
-        String::from_utf8_lossy(content_data)
-    )
-    .into_bytes();
-
-    let mut offsets = Vec::new();
-    let objects: Vec<Vec<u8>> = vec![
-        object1.to_vec(),
-        object2.to_vec(),
-        object3.to_vec(),
-        object4.to_vec(),
-    ];
-
-    let mut bytes = b"%PDF-1.7\n".to_vec();
-    for object in &objects {
-        offsets.push(bytes.len());
-        bytes.extend_from_slice(object);
-    }
-
-    let start_xref = bytes.len();
-    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
-    bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
-    for &offset in &offsets {
-        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
-    }
-    bytes.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
-            objects.len() + 1,
-            start_xref
-        )
-        .as_bytes(),
-    );
-
-    fixture.as_file_mut().write_all(&bytes).unwrap();
-
     fixture
 }
 
