@@ -617,10 +617,11 @@ where
                 // invalid UTF-8 bytes -- unreachable here because the real
                 // JSON tokenizer only ever populates a `Number` token from
                 // JSON's ASCII number grammar.
+                // cov:ignore-start: unreachable -- see comment above
                 Err(error) => {
-                    self.fatal(error.to_string()); // cov:ignore: unreachable -- see comment above
-                    self.pdf.resolver.direct_object_handle(ObjectValue::Null) // cov:ignore: unreachable -- see comment above
-                }
+                    self.fatal(error.to_string());
+                    self.pdf.resolver.direct_object_handle(ObjectValue::Null)
+                } // cov:ignore-end
             }
         };
 
