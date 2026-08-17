@@ -29,6 +29,8 @@
 | `crates/flpdf/src/job/json.rs` | correspondence | QPDFJob.cc writeJSON output selection and stream-prefix resolution |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command orchestration with only JSON output selection currently exposed |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
+| `crates/flpdf/src/json/input.rs` | correspondence | \`QPDF_json.cc\` validators and \`JSONReactor::makeObject\` |
+| `crates/flpdf/src/json/input_tests.rs` | correspondence | tests for the JSON input value boundary in \`libqpdf/QPDF_json.cc:65-209, 732-793\` |
 | `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
 | `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities |
 | `crates/flpdf/src/json/parser.rs` | correspondence | JSON.cc parser state machine and Reactor event responsibilities |

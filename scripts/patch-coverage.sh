@@ -323,6 +323,15 @@ def is_declaration_only_file(relpath):
             return False
     return not in_multiline_use
 
+# Unit-test modules are compiled only under `cfg(test)`. cargo llvm-cov does
+# not emit an SF record for the source file when it measures the workspace,
+# and coverage of the test harness itself is not production-line coverage.
+# Keep the changed-line gate focused on production source while still treating
+# an unmeasured production file as a stale/incomplete report below.
+def is_test_only_file(relpath):
+    name = os.path.basename(relpath)
+    return name in ("test.rs", "tests.rs") or name.endswith("_test.rs") or name.endswith("_tests.rs")
+
 # 4. Classify changed lines per crate group.
 groups = {"gate": {}, "report": {}}
 marker_errors = {}
@@ -333,6 +342,8 @@ for relpath, lines in added.items():
     elif any(relpath.startswith(p) for p in REPORT_PREFIXES):
         grp = "report"
     else:
+        continue
+    if grp == "gate" and is_test_only_file(relpath):
         continue
     excl, errs = excluded_lines(relpath)
     if errs:
