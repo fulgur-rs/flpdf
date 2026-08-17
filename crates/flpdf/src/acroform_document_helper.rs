@@ -513,9 +513,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// `copy_foreign_object` owns the source-to-target graph copy and keeps
     /// source identity stable across the field-tree and annotation passes.
-    /// Source/destination `/DA`, `/Q`, and `/DR` reconciliation is deliberately
-    /// a later slice; this method is the graph/field/appearance foundation for
-    /// the qpdf `copyAnnotations` route.
+    /// Source/destination `/DA` and `/Q` defaults are reconciled by pinning
+    /// the source value onto a copied field that has no explicit value of
+    /// its own, matching qpdf's `adjustInheritedFields`; `/DR` reconciliation
+    /// remains a later slice.
     #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
     pub(crate) fn transform_annotations_from<RS: Read + Seek>(
         &mut self,
@@ -682,21 +683,24 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             let kids_holder = self
                 .pdf
                 .resolve_object_handle_to_terminal(&copied.try_get_key(b"/Kids")?)?;
-            let Some(kids) = kids_holder.try_as_array()? else {
-                continue;
-            };
-            for (index, kid) in kids.into_iter().enumerate() {
-                let kid = self.pdf.resolve_object_handle_to_terminal(&kid)?;
-                if kid.as_stream_dict().is_some() {
-                    kid.warn_if_possible("ignoring AcroForm field that's a stream")?;
-                    continue;
+            // qpdf's `if (kids.isArray()) { ... }` (`QPDFAcroFormDocumentHelper.cc:900-909`)
+            // is a plain conditional, not an early exit: a terminal field with
+            // no `/Kids` still falls through to the unconditional
+            // `adjustInheritedFields` call below (`:914-917`).
+            if let Some(kids) = kids_holder.try_as_array()? {
+                for (index, kid) in kids.into_iter().enumerate() {
+                    let kid = self.pdf.resolve_object_handle_to_terminal(&kid)?;
+                    if kid.as_stream_dict().is_some() {
+                        kid.warn_if_possible("ignoring AcroForm field that's a stream")?;
+                        continue;
+                    }
+                    let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
+                        continue; // cov:ignore: copy_transform_object returns None only for streams filtered immediately above
+                    };
+                    kids_holder.set_array_item(index, copied_kid.clone())?;
+                    self.pdf.mark_object_handle_dirty(&kids_holder)?;
+                    queue.push_back((kid, copied_kid));
                 }
-                let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
-                    continue; // cov:ignore: copy_transform_object returns None only for streams filtered immediately above
-                };
-                kids_holder.set_array_item(index, copied_kid.clone())?;
-                self.pdf.mark_object_handle_dirty(&kids_holder)?;
-                queue.push_back((kid, copied_kid));
             }
             if let Some(inherited_overrides) = inherited_overrides {
                 self.adjust_inherited_field(&copied, inherited_overrides)?;
@@ -3738,6 +3742,104 @@ mod tests {
         assert_eq!(
             copied_field.try_get_key(b"/DA").unwrap().as_string(),
             Some(b"/Fsrc 10 Tf".to_vec())
+        );
+        assert_eq!(
+            copied_field.try_get_key(b"/Q").unwrap().as_integer(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn foreign_transform_pins_defaults_on_a_merged_terminal_field_without_kids() {
+        // qpdf's `if (kids.isArray()) { ... }` (`QPDFAcroFormDocumentHelper.cc:900-909`)
+        // is a plain conditional, not an early exit -- a merged field/widget
+        // with no /Kids array still falls through to the unconditional
+        // `adjustInheritedFields` call (`:914-917`). The other DA/Q test
+        // above only exercises an interior node that HAS /Kids, which does
+        // not distinguish the two.
+        let mut source = empty_pdf();
+        source.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[
+                        ("Fields", refs(&[7])),
+                        ("DA", Object::String(b"/Fsrc 10 Tf".to_vec())),
+                        ("Q", Object::Integer(1)),
+                    ])),
+                ),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                ("Annots", refs(&[7])),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("FT", Object::Name(b"Tx".to_vec())),
+                ("T", Object::String(b"field".to_vec())),
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(10),
+                        Object::Integer(20),
+                        Object::Integer(30),
+                        Object::Integer(40),
+                    ]),
+                ),
+            ])),
+        );
+        let source_annots = source
+            .get_object_handle(ObjectRef::new(3, 0))
+            .try_get_key(b"/Annots")
+            .unwrap();
+
+        let mut target = empty_pdf();
+        target.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[(
+                "AcroForm",
+                Object::Dictionary(dict(&[
+                    ("Fields", Object::Array(Vec::new())),
+                    ("DA", Object::String(b"/Fdst 10 Tf".to_vec())),
+                    ("Q", Object::Integer(2)),
+                ])),
+            )])),
+        );
+
+        let transformed = AcroFormDocumentHelper::new(&mut target)
+            .transform_annotations_from(source_annots, Matrix::default(), &mut source)
+            .unwrap();
+        let copied_field = &transformed.new_fields[0];
+        assert!(
+            copied_field
+                .try_get_key(b"/Kids")
+                .unwrap()
+                .try_as_array()
+                .unwrap()
+                .is_none(),
+            "fixture must stay a merged terminal field with no /Kids"
+        );
+        assert_eq!(
+            copied_field.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Fsrc 10 Tf".to_vec()),
+            "a terminal field with no /Kids must still receive the pinned source default"
         );
         assert_eq!(
             copied_field.try_get_key(b"/Q").unwrap().as_integer(),
