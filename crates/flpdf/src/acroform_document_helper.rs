@@ -481,7 +481,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     transformed.old_fields.insert(top_ref);
                 }
                 if copied_field_trees.insert(top_field.identity_key()) {
-                    let copied_top = self.copy_field_tree(&top_field, &mut orig_to_copy, None)?;
+                    let copied_top = self.copy_field_tree(&top_field, &mut orig_to_copy)?;
                     if let Some(copied_ref) = copied_top.object_ref() {
                         if added_new_fields.insert(copied_ref) {
                             transformed.new_fields.push(copied_top);
@@ -569,7 +569,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 let source_top_field = ensure_foreign_indirect(source, source_top_field)?;
                 let copied_source_top = self.pdf.copy_foreign_object(&source_top_field)?;
                 if copied_field_trees.insert(copied_source_top.identity_key()) {
-                    let copied_top = self.copy_field_tree(
+                    let copied_top = self.copy_field_tree_with_overrides(
                         &copied_source_top,
                         &mut orig_to_copy,
                         Some(&inherited_overrides),
@@ -639,6 +639,15 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     #[allow(dead_code, clippy::mutable_key_type)]
     fn copy_field_tree(
+        &mut self,
+        top_field: &ObjectHandle,
+        orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+    ) -> Result<ObjectHandle> {
+        self.copy_field_tree_with_overrides(top_field, orig_to_copy, None)
+    }
+
+    #[allow(dead_code, clippy::mutable_key_type)]
+    fn copy_field_tree_with_overrides(
         &mut self,
         top_field: &ObjectHandle,
         orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
