@@ -663,6 +663,19 @@ fn page_annotation_handles<R: Read + Seek>(
     page_helper.get_annotations_filtered(None)
 }
 
+/// Returns the AcroForm `/DR` handle, unresolved.
+///
+/// qpdf never reads `/DR` eagerly: `ff.getDefaultResources()`
+/// (`QPDFFormFieldObjectHelper.cc:191-193`, a bare `getKey("/DR")` with no
+/// dereference) is only ever called from inside
+/// `flattenAnnotationsForPage`'s per-annotation loop
+/// (`QPDFPageDocumentHelper.cc:108,115`), gated on `process`, which is
+/// `false` for every Widget whenever `/NeedAppearances` is true
+/// (`:100-103`) -- so a malformed or unreadable indirect `/DR` is never
+/// even touched in that case. Resolving here unconditionally would abort
+/// or warn during flattening even when `/NeedAppearances` means the value
+/// is never needed; the caller must resolve lazily, only once it knows
+/// resource merging will actually run.
 fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<ObjectHandle>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None); // cov:ignore: a parsed Pdf always has a root reference
@@ -677,15 +690,7 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
         return Ok(None); // cov:ignore: malformed AcroForm is ignored like qpdf
     }
     let resources = acroform.try_get_key(b"/DR")?;
-    pdf.resolve_object_handle(&resources)?;
-    if resources.as_dictionary().is_some() {
-        return Ok(Some(resources));
-    }
-    // Keep the existing narrow holder-chain compatibility boundary for
-    // Pdf::set_object-created references, while parsed indirect dictionaries
-    // retain their canonical indirect handle above.
-    let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
-    Ok(resources.as_dictionary().is_some().then_some(resources))
+    Ok((!resources.is_null()).then_some(resources))
 }
 
 fn resolve_resource_category_handles<R: Read + Seek>(
@@ -709,6 +714,81 @@ fn resolve_resource_category_handles<R: Read + Seek>(
         pdf.mark_object_handle_dirty(resources)?;
     }
     Ok(())
+}
+
+/// Resolve every item of an array-shaped resource category, matching
+/// qpdf's own dereferencing.
+///
+/// `isScalar()` (`QPDFObjectHandle.cc:450-453`) dereferences before
+/// checking, so an unresolved indirect array item would otherwise be
+/// misclassified as non-scalar by [`ObjectHandle::merge_resources`]'s
+/// non-resolving `is_scalar` check and silently dropped from
+/// dedup/append, instead of being recognized as already present (or
+/// carried across) by value.
+fn resolve_array_item_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    array: &ObjectHandle,
+) -> Result<()> {
+    let mut changed = false;
+    for (index, item) in array.as_array().unwrap_or_default().into_iter().enumerate() {
+        let terminal = pdf.resolve_object_handle_to_terminal(&item)?;
+        if !terminal.is_same_object_as(&item) {
+            array.set_array_item(index, terminal)?;
+            changed = true;
+        }
+    }
+    if changed {
+        pdf.mark_object_handle_dirty(array)?;
+    }
+    Ok(())
+}
+
+/// Resolve exactly the destination resource categories
+/// [`ObjectHandle::merge_resources`] will inspect, and pre-resolve array
+/// items for any category that will undergo an array-merge.
+///
+/// qpdf's `mergeResources` (`QPDFObjectHandle.cc:1080`,
+/// `for (auto const& o_top: other.ditems())`) iterates only the *source*
+/// (DR)'s own top-level categories; a destination category DR does not
+/// also have is never inspected. Resolving every destination category
+/// unconditionally -- as opposed to only the ones DR shares -- would abort
+/// or warn on an unrelated malformed category (for example a destination
+/// `/ColorSpace` when DR has only `/Font`) that qpdf itself never touches.
+///
+/// Returns the destination's own indirect array-shaped matched
+/// categories, so the caller can mark them dirty after the merge: qpdf's
+/// array branch, unlike its dictionary branch, mutates a shared indirect
+/// array in place rather than privatizing it first
+/// (`QPDFObjectHandle.cc:1130-1147` has no `isIndirect()`/`shallowCopy()`
+/// step the way the dictionary branch does at `:1093`), and
+/// [`ObjectHandle::merge_resources`] correctly mirrors that -- so the
+/// caller, which alone holds `&mut Pdf`, must mark the mutated array's own
+/// indirect owner dirty explicitly.
+fn resolve_matched_category_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    resources: &ObjectHandle,
+    default_resources: &ObjectHandle,
+) -> Result<Vec<ObjectHandle>> {
+    let mut dirty_arrays = Vec::new();
+    let source_entries = default_resources.as_dictionary().unwrap_or_default();
+    for (category, value) in resources.as_dictionary().unwrap_or_default() {
+        let Some(source_value) = source_entries.get(&category) else {
+            continue; // cov:ignore: qpdf's merge never inspects a destination-only category
+        };
+        let was_indirect = value.is_indirect();
+        let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
+        if !terminal.is_same_object_as(&value) {
+            resources.replace_key(&category, terminal.clone())?;
+        }
+        if terminal.as_array().is_some() && source_value.as_array().is_some() {
+            resolve_array_item_handles(pdf, &terminal)?;
+            resolve_array_item_handles(pdf, source_value)?;
+            if was_indirect {
+                dirty_arrays.push(terminal);
+            }
+        }
+    }
+    Ok(dirty_arrays)
 }
 
 fn merge_widget_default_resources_on_page<R: Read + Seek>(
@@ -774,14 +854,26 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
         if resources.as_dictionary().is_none() {
             continue; // cov:ignore: malformed appearance resources are ignored
         }
-        pdf.resolve_object_handle(default_resources)?;
+        // Lazy: qpdf only ever reads /DR from inside this same per-widget
+        // merge path (see acroform_default_resources's doc), so resolving
+        // it earlier than this would touch a value flattening may not need.
+        let default_resources = pdf.resolve_object_handle_to_terminal(default_resources)?;
         if default_resources.as_dictionary().is_none() {
             continue; // cov:ignore: malformed AcroForm DR is ignored like qpdf
         }
-        resolve_resource_category_handles(pdf, &resources)?;
-        resolve_resource_category_handles(pdf, default_resources)?;
-        resources.merge_resources(default_resources, None)?;
+        // Source side: every one of DR's own categories is inspected by
+        // merge_resources (QPDFObjectHandle.cc:1080), including ones absent
+        // from the destination (shallow-copied wholesale), so all of DR's
+        // categories must be resolved here.
+        resolve_resource_category_handles(pdf, &default_resources)?;
+        // Destination side: only categories DR also has are ever inspected
+        // (see resolve_matched_category_handles's doc).
+        let dirty_arrays = resolve_matched_category_handles(pdf, &resources, &default_resources)?;
+        resources.merge_resources(&default_resources, None)?;
         pdf.mark_object_handle_dirty(&resources)?;
+        for array in dirty_arrays {
+            pdf.mark_object_handle_dirty(&array)?;
+        }
     }
     Ok(())
 }
@@ -1394,6 +1486,252 @@ mod tests {
         assert_eq!(
             original_font, expected_original_font,
             "shared font dictionary must not gain DR's Helv entry"
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_ignores_a_malformed_destination_category_absent_from_dr() {
+        // qpdf's mergeResources (QPDFObjectHandle.cc:1080) iterates only
+        // DR's own categories; a destination-only category is never
+        // inspected. The appearance's /Resources here has a malformed
+        // indirect /ColorSpace that DR does not have -- if flattening
+        // resolved every destination category unconditionally, this
+        // malformed value would be touched even though qpdf never would be.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+        appearance_resources.insert("ColorSpace", Object::Reference(ObjectRef::new(8, 0)));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        // Object 8 is never a valid PDF object body -- if this ever gets
+        // resolved, the read fails.
+        pdf.set_object(ObjectRef::new(8, 0), Object::Name(Vec::new()));
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        let mut default_resources = Dictionary::new();
+        default_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .expect("an unrelated destination-only category must never be touched");
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            resources.get("ColorSpace"),
+            Some(&Object::Reference(ObjectRef::new(8, 0))),
+            "the unrelated malformed category must be left exactly as-is"
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_appends_an_indirect_scalar_item_from_dr() {
+        // qpdf's isScalar() (QPDFObjectHandle.cc:450-453) dereferences
+        // before checking, so an indirect scalar item present only in DR's
+        // array is recognized as scalar and appended (as its own reference,
+        // per unparse()'s indirect-identity-preserving key,
+        // QPDFObjectHandle.cc:1575-1583) -- not silently dropped by a
+        // non-resolving scalar check that misclassifies it as non-scalar
+        // before the `if !is_scalar(&item) { continue; }` gate.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        pdf.set_object(ObjectRef::new(8, 0), Object::Name(b"Text".to_vec()));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Reference(ObjectRef::new(8, 0))]),
+        );
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Array(proc_set)) = resources.get("ProcSet") else {
+            panic!("fixture appearance must retain ProcSet"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            proc_set,
+            &vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Reference(ObjectRef::new(8, 0)),
+            ],
+            "DR's indirect scalar item must be appended, not dropped"
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_terminal_chases_a_holder_redirect_category_and_array_item() {
+        // A `Pdf::set_object` bare-reference holder redirect (an entry
+        // whose own resolved value is itself another reference, never
+        // produced by a real parser -- see resolve_resource_category_
+        // handles's doc) on both a DR category and an array item inside
+        // it: resolve_object_handle_to_terminal must chase past the
+        // redirect, and the terminal must differ in identity from the
+        // original holder, exercising the replace_key/set_array_item
+        // rewrite path in both resolve_resource_category_handles and
+        // resolve_array_item_handles.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        // DR's /Font category is a holder redirect: 10 -> 11 -> dict.
+        let mut fonts = Dictionary::new();
+        fonts.insert("Helv", Object::Integer(42));
+        pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(fonts));
+        pdf.set_object(
+            ObjectRef::new(10, 0),
+            Object::Reference(ObjectRef::new(11, 0)),
+        );
+        // A /ProcSet array item is also a holder redirect: 20 -> 21 -> name.
+        pdf.set_object(ObjectRef::new(21, 0), Object::Name(b"Text".to_vec()));
+        pdf.set_object(
+            ObjectRef::new(20, 0),
+            Object::Reference(ObjectRef::new(21, 0)),
+        );
+        let mut default_resources = Dictionary::new();
+        default_resources.insert("Font", Object::Reference(ObjectRef::new(10, 0)));
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Reference(ObjectRef::new(20, 0))]),
+        );
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+        // The appearance's own /ProcSet must already have an array category
+        // for the array-merge branch (and thus resolve_array_item_handles)
+        // to run at all -- reuse the destination-array-category shape.
+        let Object::Stream(mut appearance_obj) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Object::Dictionary(mut resources) = appearance_obj.dict.remove("Resources").unwrap()
+        else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        resources.insert("ProcSet", Object::Array(Vec::new()));
+        appearance_obj
+            .dict
+            .insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(ObjectRef::new(5, 0), Object::Stream(appearance_obj));
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+            panic!("fixture appearance must retain Font resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
+        let Some(Object::Array(proc_set)) = resources.get("ProcSet") else {
+            panic!("fixture appearance must retain ProcSet"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(proc_set, &vec![Object::Reference(ObjectRef::new(21, 0))]);
+    }
+
+    #[test]
+    fn qpdf_flatten_marks_an_indirect_array_category_dirty_after_merge() {
+        // qpdf's array branch (QPDFObjectHandle.cc:1130-1147) mutates a
+        // shared indirect destination array in place, unlike its dictionary
+        // branch. The mutated array's own indirect owner must be marked
+        // dirty explicitly so the writer observes the merged content.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+        );
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("ProcSet", Object::Reference(ObjectRef::new(9, 0)));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Name(b"Text".to_vec())]),
+        );
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .unwrap();
+
+        let Object::Array(proc_set) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            proc_set,
+            vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Name(b"Text".to_vec())
+            ],
+            "the merged indirect array must be reachable through pdf.resolve after the merge"
         );
     }
 

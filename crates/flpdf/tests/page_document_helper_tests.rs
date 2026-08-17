@@ -987,6 +987,15 @@ fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
         page.get("Annots").is_some(),
         "qpdf skips widgets before it needs their malformed /AcroForm/DR"
     );
+    // qpdf only reads /DR from inside the per-widget merge loop, gated on
+    // !NeedAppearances (QPDFPageDocumentHelper.cc:100-115) -- with
+    // NeedAppearances true, /DR must never be resolved, so its malformed
+    // content must never surface a repair diagnostic.
+    assert!(
+        pdf.repair_diagnostics().entries().is_empty(),
+        "a malformed /DR that is never needed must not be resolved: {:?}",
+        pdf.repair_diagnostics().entries()
+    );
 }
 
 #[test]
