@@ -989,6 +989,35 @@ fn form_helper_resource_pruning_handles_missing_nested_and_indirect_resources() 
 }
 
 #[test]
+fn form_helper_resource_pruning_preserves_resources_when_a_name_is_unresolved() {
+    let body = b"BT /Fmissing 12 Tf (text) Tj ET";
+    let mut form = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+         /Resources << /Font << /F1 << >> /F2 << >> >> >> /Length {} >>\nstream\n",
+        body.len()
+    )
+    .into_bytes();
+    form.extend_from_slice(body);
+    form.extend_from_slice(b"\nendstream\nendobj\n");
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 100 100]", "", &[(5, form)]);
+    let mut pdf = open(bytes);
+    let form_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("an unresolved Form resource name is warning-free and must veto pruning");
+    let fonts = helper
+        .get_resources(false)
+        .unwrap()
+        .get_key(b"/Font")
+        .as_dictionary()
+        .unwrap();
+    assert!(fonts.iter().any(|(key, _)| key == b"/F1"));
+    assert!(fonts.iter().any(|(key, _)| key == b"/F2"));
+}
+
+#[test]
 fn form_helper_resource_pruning_is_a_noop_without_resources() {
     let form_body = b"q Q";
     let mut form = format!(

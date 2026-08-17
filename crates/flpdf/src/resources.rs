@@ -172,7 +172,10 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         return Ok(());
     }
 
-    for category in [b"/Font".as_slice(), b"/XObject".as_slice()] {
+    let categories = [b"/Font".as_slice(), b"/XObject".as_slice()];
+    let mut dictionaries = Vec::new();
+    let mut known_names = BTreeSet::new();
+    for category in categories {
         let value = resources.get_key(category);
         if value.is_null() {
             continue;
@@ -185,6 +188,32 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         } else {
             value
         };
+        let Some(entries) = dictionary.as_dictionary() else {
+            continue;
+        };
+        known_names.extend(
+            entries
+                .keys()
+                .map(|key| key.strip_prefix(b"/").unwrap_or(key.as_slice()).to_vec()),
+        );
+        dictionaries.push((category, dictionary));
+    }
+
+    // qpdf treats an unresolved Font/XObject name as a veto when this target
+    // has a Resources dictionary. The known-name set is intentionally shared
+    // across both categories, matching ResourceFinder::getNames() in qpdf.
+    let local_unresolved = categories
+        .iter()
+        .filter_map(|category| finder.names_by_resource_type().get(&category[1..]))
+        .flat_map(|entries| entries.keys())
+        .filter(|name| !known_names.contains(*name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !local_unresolved.is_empty() && resources.as_dictionary().is_some() {
+        return Ok(());
+    }
+
+    for (category, dictionary) in dictionaries {
         let Some(entries) = dictionary.as_dictionary() else {
             continue;
         };
