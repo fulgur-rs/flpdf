@@ -877,8 +877,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
             ))
         })?;
 
-        let filter = stream_copy_dictionary_value(&destination_dict, b"/Filter");
-        let decode_parms = stream_copy_dictionary_value(&destination_dict, b"/DecodeParms");
+        let filter = Some(stream_copy_dictionary_value(&destination_dict, b"/Filter")?);
+        let decode_parms = stream_copy_dictionary_value(&destination_dict, b"/DecodeParms")?;
+        let decode_parms = Some(decode_parms);
         let mut source_data = source.as_stream_data();
         let source_immediate_copy = source
             .context()
@@ -895,8 +896,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let raw_data = source.get_raw_stream_data()?;
             source.replace_stream_data(
                 raw_data,
-                stream_copy_dictionary_value(&source_dict, b"/Filter"),
-                stream_copy_dictionary_value(&source_dict, b"/DecodeParms"),
+                Some(stream_copy_dictionary_value(&source_dict, b"/Filter")?),
+                Some(stream_copy_dictionary_value(&source_dict, b"/DecodeParms")?),
             );
             source_data = source.as_stream_data();
         }
@@ -3636,8 +3637,14 @@ fn read_live_header_integer(token: Token) -> Result<i64> {
         .ok_or_else(|| Error::parse(token.start, "invalid integer"))
 }
 
-fn stream_copy_dictionary_value(dictionary: &ObjectHandle, key: &[u8]) -> Option<ObjectHandle> {
-    dictionary.has_key(key).then(|| dictionary.get_key(key))
+/// Fetch a stream-copy dictionary value with qpdf's initialized-null semantics.
+///
+/// `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2216-2276`) always passes
+/// `getKey("/Filter")` and `getKey("/DecodeParms")` into
+/// `QPDF_Stream::replaceStreamData`; a missing key is therefore an initialized
+/// contextual null, not the preserve-existing sentinel used by other callers.
+fn stream_copy_dictionary_value(dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
+    dictionary.try_get_key(key)
 }
 
 /// Lets the parser mint a canonical handle for a nested `N G R` through the
