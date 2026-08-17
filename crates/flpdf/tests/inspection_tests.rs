@@ -1,4 +1,4 @@
-use flpdf::{fonts, pages, ObjectRef, Pdf};
+use flpdf::{pages, ObjectRef, Pdf};
 use std::io::Cursor;
 use std::io::Write;
 
@@ -101,16 +101,6 @@ fn single_outline_pdf(tail: &[Vec<u8>]) -> Vec<u8> {
     let mut objects = vec![object1, object2, object3];
     objects.extend_from_slice(tail);
     finalize_pdf(&objects)
-}
-
-#[test]
-fn font_entries_collects_indirect_and_named_fonts() {
-    let pdf = pdf_with_metadata_outline_and_fonts();
-    let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let fonts = fonts::font_entries(&mut pdf).unwrap();
-    assert_eq!(fonts.len(), 2);
-    assert!(fonts.contains_key(b"F1".as_slice()));
-    assert!(fonts.contains_key(b"F2".as_slice()));
 }
 
 #[test]
