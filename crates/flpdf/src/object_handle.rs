@@ -2819,39 +2819,39 @@ impl ObjectHandle {
         })
     }
 
-    /// The value at `key` if this handle's value is a dictionary and `key`
-    /// is present, or a direct null handle otherwise (a missing key, or
-    /// this handle not being a dictionary at all) — mirrors
-    /// `QPDFObjectHandle::getKey`'s own "returns null for a missing key or
-    /// a non-dictionary handle" contract (`libqpdf/QPDFObjectHandle.cc:979-988`).
-    /// Unlike
-    /// [`Self::as_dictionary`], this never snapshots the whole dictionary —
-    /// it returns the one live child handle directly, so a caller that only
-    /// needs one key does not pay for every sibling. `key` must be qpdf's
-    /// decoded, canonical dictionary key including its leading `/` (for
-    /// example, `/Type`); lookup is exact and slashless keys are missing.
-    /// Never performs resolution itself.
+    /// Return qpdf's live child handle for `key`, or a contextual null for a
+    /// missing key/non-dictionary receiver.
+    ///
+    /// This non-fallible convenience facade is intentionally not the
+    /// canonical Rust route: it delegates to the internal `try_get_key` route
+    /// and panics when lazy resolution or qpdf's type warning would return an
+    /// error. Callers that need the error boundary must use the fallible
+    /// `try_get_key` route. The normal successful behavior mirrors
+    /// `QPDFObjectHandle::getKey` (`libqpdf/QPDFObjectHandle.cc:978-989`),
+    /// including the parent-context description on a missing-key null from
+    /// `QPDF_Dictionary::getKey` (`libqpdf/QPDF_Dictionary.cc:103-115`).
+    ///
+    /// `key` must be qpdf's decoded, canonical dictionary key including its
+    /// leading `/` (for example, `/Type`); lookup is exact and slashless
+    /// keys are missing.
     pub fn get_key(&self, key: &[u8]) -> ObjectHandle {
-        self.with_value(|value| match value {
-            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
-            _ => None,
-        })
-        .unwrap_or_else(ObjectHandle::null)
+        self.try_get_key(key)
+            .unwrap_or_else(|error| panic!("ObjectHandle::get_key failed: {error}"))
     }
 
-    /// True if this handle's value is a dictionary that has `key`, distinct
-    /// from [`Self::get_key`] returning a null handle for `key` (which
-    /// cannot tell a missing key apart from one whose value is genuinely
-    /// null) — mirrors `QPDFObjectHandle::hasKey`
-    /// (`libqpdf/QPDFObjectHandle.cc:966-976`). `key` must be qpdf's decoded,
-    /// canonical dictionary key including its leading `/`; lookup is exact and
-    /// slashless keys are absent. `false` for a non-dictionary handle. Never
-    /// performs resolution itself.
+    /// Return whether qpdf considers `key` visible in this dictionary.
+    ///
+    /// This non-fallible convenience facade delegates to the internal
+    /// `try_has_key` route and panics on lazy-resolution/type-warning errors;
+    /// use the fallible `try_has_key` route when the error must be propagated.
+    /// A present value that resolves to null is absent, matching
+    /// `QPDF_Dictionary::hasKey` (`libqpdf/QPDF_Dictionary.cc:97-101`) and
+    /// `QPDFObjectHandle::hasKey` (`libqpdf/QPDFObjectHandle.cc:966-976`).
+    /// `key` must be qpdf's decoded, canonical dictionary key including its
+    /// leading `/`; lookup is exact and slashless keys are absent.
     pub fn has_key(&self, key: &[u8]) -> bool {
-        self.with_value(|value| match value {
-            Some(ObjectValue::Dictionary(entries)) => entries.contains_key(key),
-            _ => false,
-        })
+        self.try_has_key(key)
+            .unwrap_or_else(|error| panic!("ObjectHandle::has_key failed: {error}"))
     }
 
     /// Insert or overwrite `key` in this handle's dictionary with `value`,
@@ -3669,10 +3669,11 @@ impl ObjectHandle {
     /// The receiver, `other`, and the top-level resource-category handles
     /// still use this port's intentionally non-fallible shape accessors, so
     /// callers must resolve those handles before calling this method. This
-    /// preserves the existing precondition for `as_dictionary`, `as_array`,
-    /// `get_key`, and `has_key`, which do not perform hidden I/O and determine
-    /// the outer merge shape. Inside a confirmed array or dictionary category,
-    /// however, nested type inspection follows qpdf: `isScalar()` resolves
+    /// preserves the existing precondition for `as_dictionary` and `as_array`,
+    /// which do not perform hidden I/O and determine the outer merge shape.
+    /// Dictionary key lookup inside a confirmed category uses the fallible
+    /// qpdf-shaped accessors and propagates resolution errors. Nested type
+    /// inspection follows qpdf: `isScalar()` resolves
     /// every array item (`QPDFObjectHandle.cc:449-452`, with the scalar
     /// accessors following the same `dereference() && ...` pattern, e.g.
     /// `isBool` at `:338-341`), and `getResourceNames()` resolves each
@@ -3715,11 +3716,11 @@ impl ObjectHandle {
             return Ok(());
         };
         for (rtype, other_val) in other_entries {
-            if !self.has_key(&rtype) {
+            if !self.try_has_key(&rtype)? {
                 self.replace_key(&rtype, other_val.shallow_copy()?)?;
                 continue;
             }
-            let mut this_val = self.get_key(&rtype);
+            let mut this_val = self.try_get_key(&rtype)?;
             if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
                 if this_val.is_indirect() {
                     let privatized = this_val.shallow_copy()?;
@@ -16943,9 +16944,13 @@ mod mutation_tests {
     }
 
     #[test]
-    fn get_key_on_a_non_dictionary_handle_returns_a_direct_null_handle() {
+    fn try_get_key_on_a_non_dictionary_handle_reports_qpdf_type_warning() {
         let scalar = ObjectHandle::integer(5);
-        assert!(scalar.get_key(b"/A").is_null());
+        assert!(matches!(
+            scalar.try_get_key(b"/A"),
+            Err(crate::Error::System(message))
+                if message == "operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"
+        ));
     }
 
     #[test]
@@ -17020,7 +17025,7 @@ mod mutation_tests {
         dict.replace_key(b"/Null", indirect_null.clone()).unwrap();
 
         let retained = dict.get_key(b"/Null");
-        assert!(dict.has_key(b"/Null"));
+        assert!(!dict.has_key(b"/Null"));
         assert!(retained.is_indirect());
         assert!(retained.is_null());
         assert!(retained.is_same_object_as(&indirect_null));
@@ -17035,7 +17040,7 @@ mod mutation_tests {
         dict.replace_key(b"/Dangling", dangling.clone()).unwrap();
 
         let retained = dict.get_key(b"/Dangling");
-        assert!(dict.has_key(b"/Dangling"));
+        assert!(!dict.has_key(b"/Dangling"));
         assert!(retained.is_indirect());
         assert!(retained.is_null());
         assert!(retained.is_same_object_as(&dangling));
@@ -18033,10 +18038,25 @@ mod mutation_tests {
     }
 
     #[test]
-    fn has_key_distinguishes_a_present_null_value_from_a_missing_key() {
+    fn has_key_omits_a_present_null_value_like_qpdf() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
-        assert!(dict.has_key(b"/A"));
+        assert!(!dict.has_key(b"/A"));
         assert!(!dict.has_key(b"/Missing"));
+    }
+
+    #[test]
+    fn get_key_missing_key_carries_parent_context_like_qpdf() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let missing = dict.get_key(b"/Missing");
+        let error = missing
+            .try_get_keys()
+            .expect_err("missing-key null should retain its dictionary context");
+        assert!(matches!(
+            error,
+            crate::Error::System(ref message)
+                if message
+                    == " -> dictionary key /Missing: operation for dictionary attempted on object of type null: treating as empty"
+        ));
     }
 
     #[test]
@@ -18618,7 +18638,7 @@ mod mutation_tests {
             .unwrap();
         assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
         indirect.remove_key(b"/A");
-        assert!(indirect.get_key(b"/A").is_null());
+        assert!(indirect.try_get_key(b"/A").unwrap().is_null());
     }
 
     #[test]
@@ -18689,7 +18709,7 @@ mod mutation_tests {
             .replace_key(b"/A", ObjectHandle::integer(1))
             .unwrap(); // must not panic
         indirect.remove_key(b"/A"); // must not panic
-        assert!(indirect.get_key(b"/A").is_null());
+        assert!(indirect.try_get_key(b"/A").is_err());
     }
 
     #[test]
