@@ -10,7 +10,7 @@ use crate::json::parse_reader;
 use crate::pipeline::test_support::NthWriteFailure;
 use crate::pipeline::PipelineHandle;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::rc::Rc;
@@ -51,6 +51,26 @@ impl Seek for CountingReader {
         if self.fail_seek {
             return Err(std::io::Error::other("instrumented seek failure"));
         }
+        self.cursor.seek(position)
+    }
+}
+
+struct ToggleReader {
+    cursor: Cursor<Vec<u8>>,
+    fail: Rc<Cell<bool>>,
+}
+
+impl Read for ToggleReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.fail.get() {
+            return Err(std::io::Error::other("instrumented source failure"));
+        }
+        self.cursor.read(buffer)
+    }
+}
+
+impl Seek for ToggleReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
         self.cursor.seek(position)
     }
 }
@@ -869,6 +889,44 @@ fn excessive_page_tree_pdf_bytes() -> Vec<u8> {
             .as_bytes(),
     );
     pdf
+}
+
+fn malformed_object_pdf_bytes() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.3\n".to_vec();
+    let object_offset = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /A [\nendobj\n");
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn json_reactor_reports_a_lazy_source_object_resolution_error() {
+    let json = br#"{
+        "qpdf": [
+            {"jsonversion": 2, "pdfversion": "1.3"},
+            {
+                "obj:1 0 R": {"value": 1},
+                "trailer": {"value": {}}
+            }
+        ]
+    }"#;
+    let fail = Rc::new(Cell::new(false));
+    let reader = ToggleReader {
+        cursor: Cursor::new(malformed_object_pdf_bytes()),
+        fail: Rc::clone(&fail),
+    };
+    let mut pdf = Pdf::open(reader).expect("PDF xref");
+    fail.set(true);
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "broken.json", true);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+    assert!(reactor.fatal_error().is_some());
 }
 
 #[test]
