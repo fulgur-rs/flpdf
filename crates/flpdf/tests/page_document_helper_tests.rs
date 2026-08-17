@@ -934,17 +934,42 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
+    // qpdf privatizes an indirect appearance /Resources before merging DR in
+    // (`QPDFPageDocumentHelper.cc:108-113`): the merge target becomes a
+    // direct, private copy embedded in the appearance's own dict, so the
+    // merge never mutates the original (possibly shared) indirect object.
     let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
         panic!("appearance must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-        panic!("appearance must retain a resource dictionary");
+        panic!("appearance must hold a privatized, direct resources dictionary");
     };
     let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
-        panic!("appearance must retain font resources");
+        panic!("privatized resources must retain merged font resources");
     };
     assert_eq!(fonts.get("F1"), Some(&Object::Integer(41)));
     assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
+
+    // The original indirect resources object (and its indirect Font
+    // sub-dictionary) must be untouched: privatization means the merge
+    // writes into the copy, never the shared original.
+    let Object::Dictionary(original_resources) = pdf.resolve(ObjectRef::new(13, 0)).unwrap() else {
+        panic!("original referenced resources must remain a dictionary");
+    };
+    assert_eq!(
+        original_resources.get("Font"),
+        Some(&Object::Reference(ObjectRef::new(7, 0))),
+        "original resources object must keep its own indirect Font reference, unmerged"
+    );
+    let Object::Dictionary(original_fonts) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
+        panic!("original font dictionary must remain a dictionary");
+    };
+    let mut expected_original_fonts = Dictionary::new();
+    expected_original_fonts.insert("F1", Object::Integer(41));
+    assert_eq!(
+        original_fonts, expected_original_fonts,
+        "original shared font dictionary must not gain DR's Helv entry"
+    );
 }
 
 #[test]
@@ -961,6 +986,15 @@ fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
     assert!(
         page.get("Annots").is_some(),
         "qpdf skips widgets before it needs their malformed /AcroForm/DR"
+    );
+    // qpdf only reads /DR from inside the per-widget merge loop, gated on
+    // !NeedAppearances (QPDFPageDocumentHelper.cc:100-115) -- with
+    // NeedAppearances true, /DR must never be resolved, so its malformed
+    // content must never surface a repair diagnostic.
+    assert!(
+        pdf.repair_diagnostics().entries().is_empty(),
+        "a malformed /DR that is never needed must not be resolved: {:?}",
+        pdf.repair_diagnostics().entries()
     );
 }
 
