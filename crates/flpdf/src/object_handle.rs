@@ -3666,33 +3666,17 @@ impl ObjectHandle {
     ///
     /// # Preconditions
     ///
-    /// Unlike qpdf, this method does not dereference handles before inspecting
-    /// their types. Callers must resolve the receiver, `other`, and the
-    /// top-level resource-category handles whose shapes this merge will
-    /// inspect before calling it. qpdf's corresponding accessors resolve on
-    /// every call (`QPDFObjectHandle.cc:252-267,426-434`), while this port's
-    /// non-fallible `as_dictionary`, `as_array`, `get_key`, and `has_key`
-    /// accessors intentionally do not. Passing an unresolved indirect handle
-    /// therefore can make a qpdf-dictionary look non-dictionary here and
-    /// silently select the no-op path. This is a caller contract; it does not
-    /// change the method's behavior or add an implicit resolution boundary.
-    ///
-    /// The gap goes one level deeper than the categories themselves. For an
-    /// array-shaped `rtype`, the member check (`is_scalar`) is also
-    /// non-resolving, while qpdf's `isScalar()` dereferences on every call
-    /// (`QPDFObjectHandle.cc:449-452`, itself composed of `isBool`/`isInteger`/
-    /// `isName`/`isNull`/`isReal`/`isString`, each following the same
-    /// `dereference() && ...` pattern, e.g. `isBool` at `:338-341`) — an
-    /// unresolved indirect scalar array item is silently excluded from the
-    /// union instead of being merged. For a dictionary-shaped `rtype`, the
-    /// unique-name pool (`get_resource_names`/`try_get_resource_names`)
-    /// checks each second-level value with a non-resolving `as_dictionary`,
-    /// while qpdf's `getResourceNames()` calls `val.isDictionary()`, which
-    /// also dereferences (`QPDFObjectHandle.cc:1156-1170`, `isDictionary()`
-    /// itself at `:431-434`) — an unresolved indirect second-level
-    /// dictionary value is silently excluded from the pool, which can select
-    /// a name qpdf would have rejected as already taken. Neither gap is
-    /// closed by a caller-side contract today.
+    /// The receiver, `other`, and the top-level resource-category handles
+    /// still use this port's intentionally non-fallible shape accessors, so
+    /// callers must resolve those handles before calling this method. This
+    /// preserves the existing precondition for `as_dictionary`, `as_array`,
+    /// `get_key`, and `has_key`, which do not perform hidden I/O and determine
+    /// the outer merge shape. Inside a confirmed array or dictionary category,
+    /// however, nested type inspection follows qpdf: `isScalar()` resolves
+    /// every array item (`QPDFObjectHandle.cc:449-452`, with the scalar
+    /// accessors following the same `dereference() && ...` pattern, e.g.
+    /// `isBool` at `:338-341`), and `getResourceNames()` resolves each
+    /// second-level value through `isDictionary()` (`:1156-1170,431-434`).
     ///
     /// The uniqueness pool for a freshly minted name is
     /// `this_val.getResourceNames()`'s own "second-level keys" definition
@@ -3720,6 +3704,8 @@ impl ObjectHandle {
     /// must be in a valid PDF — fails here too. Entries merged before the
     /// failing one stay installed, matching an exception unwinding out of
     /// qpdf's own loop.
+    /// Also propagates lazy-resolution errors from nested array items and
+    /// second-level dictionary values inspected by the qpdf-shaped helpers.
     pub fn merge_resources(
         &self,
         other: &ObjectHandle,
@@ -3742,7 +3728,7 @@ impl ObjectHandle {
                 }
                 merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut())?;
             } else if this_val.as_array().is_some() && other_val.as_array().is_some() {
-                merge_resource_array(&this_val, &other_val);
+                merge_resource_array(&this_val, &other_val)?;
             }
             // Any other shape combination for an existing rtype: untouched,
             // matching qpdf's own fallthrough (neither the dictionary nor
@@ -3799,7 +3785,7 @@ impl ObjectHandle {
     /// This ports `QPDFObjectHandle::getUniqueResourceName`
     /// (`libqpdf/QPDFObjectHandle.cc:1175-1192`). When `resource_names` is
     /// absent, the names are collected from the second-level dictionary keys
-    /// exactly as the private `get_resource_names` helper does. `min_suffix` is left at
+    /// exactly as the private `try_get_resource_names` helper does. `min_suffix` is left at
     /// the suffix that was selected, rather than advanced past it, so callers
     /// can reuse the cursor for a later insertion. The `usize`/byte-vector
     /// representation is the Rust spelling of qpdf's `int`/`std::string`
@@ -9970,7 +9956,7 @@ fn merge_resource_subdict(
         };
         if og_to_name.is_none() {
             og_to_name = Some(build_og_to_name(this_val));
-            rnames = get_resource_names(this_val);
+            rnames = try_get_resource_names(this_val)?;
         }
         let reused = rval
             .object_ref()
@@ -9999,19 +9985,18 @@ fn merge_resource_subdict(
 // `libqpdf/QPDFObjectHandle.cc:1130-1146`): union `other_val`'s scalar
 // items into `this_val` by unparsed text, appending only what is not
 // already present.
-fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) {
+fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) -> Result<()> {
     let Some(other_items) = other_val.as_array() else {
-        return; // cov:ignore: caller already confirmed other_val.as_array().is_some()
+        return Ok(()); // cov:ignore: caller already confirmed other_val.as_array().is_some()
     };
-    let mut scalars: std::collections::BTreeSet<Vec<u8>> = this_val
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(is_scalar)
-        .map(|item| item.unparse())
-        .collect();
+    let mut scalars = std::collections::BTreeSet::new();
+    for item in this_val.as_array().into_iter().flatten() {
+        if is_scalar(&item)? {
+            scalars.insert(item.unparse());
+        }
+    }
     for item in other_items {
-        if !is_scalar(&item) {
+        if !is_scalar(&item)? {
             continue;
         }
         let text = item.unparse();
@@ -10019,6 +10004,7 @@ fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) {
             append_array_item(this_val, item);
         }
     }
+    Ok(())
 }
 
 fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
@@ -10036,17 +10022,18 @@ fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
     }
 }
 
-// Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:450-453`): bool,
-// integer, name, null, real, or string. Checks only already-resolved/
-// direct state, matching every other accessor in this file's "no hidden
-// I/O" rule.
-fn is_scalar(handle: &ObjectHandle) -> bool {
-    handle.as_boolean().is_some()
+// Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:449-452`): dereference
+// first, then test bool, integer, name, null, real, or string. qpdf performs
+// this dereference for every array item rather than relying on a caller-side
+// resolution precondition.
+fn is_scalar(handle: &ObjectHandle) -> Result<bool> {
+    handle.try_dereference()?;
+    Ok(handle.as_boolean().is_some()
         || handle.as_integer().is_some()
         || handle.as_name().is_some()
         || handle.is_null()
         || handle.as_real().is_some()
-        || handle.as_string().is_some()
+        || handle.as_string().is_some())
 }
 
 // Mirrors `mergeResources`'s local `make_og_to_name` lambda
@@ -10069,19 +10056,8 @@ fn build_og_to_name(dict: &ObjectHandle) -> std::collections::HashMap<ObjectRef,
 // belonging to a dictionary-valued entry of `dict` -- i.e. `dict`'s own
 // *grandchildren's* keys, not `dict`'s own keys. See `merge_resources`'s
 // own doc comment for why this is the correct level to port here despite
-// looking mismatched against its call site.
-fn get_resource_names(dict: &ObjectHandle) -> std::collections::BTreeSet<Vec<u8>> {
-    let mut result = std::collections::BTreeSet::new();
-    if let Some(entries) = dict.as_dictionary() {
-        for (_, value) in entries {
-            if let Some(sub_entries) = value.as_dictionary() {
-                result.extend(sub_entries.into_keys());
-            }
-        }
-    } // cov:ignore: control-flow marker — llvm-cov instrumentation artifact; the body above is exercised by merge_resources_mints_a_second_unique_name_when_the_first_candidate_is_taken
-    result
-}
-
+// looking mismatched against its call site. The receiver and every value are
+// dereferenced before their dictionary shape is inspected, as qpdf does.
 fn try_get_resource_names(dict: &ObjectHandle) -> Result<std::collections::BTreeSet<Vec<u8>>> {
     dict.try_dereference()?;
     let mut result = std::collections::BTreeSet::new();
@@ -18333,6 +18309,58 @@ mod mutation_tests {
     }
 
     #[test]
+    fn merge_resources_resolves_indirect_scalar_array_items_before_union() {
+        // qpdf's `isScalar()` dereferences every array item before the
+        // unparsed-text union (`QPDFObjectHandle.cc:1130-1146,449-452`).
+        let (destination_item, destination_resolver) =
+            crate::object_handle::identity_tests::resolver_bearing_handle(ObjectValue::Name(
+                b"PDF".to_vec(),
+            ));
+        let dest = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![destination_item.clone()]),
+        )]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
+        )]);
+
+        dest.merge_resources(&other, None)
+            .expect("indirect scalar array items merge");
+
+        let items = dest
+            .get_key(b"/ProcSet")
+            .as_array()
+            .expect("merged ProcSet remains an array");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].ptr_eq(&destination_item));
+        assert_eq!(items[0].as_name(), Some(b"PDF".to_vec()));
+        assert_eq!(items[1].as_name(), Some(b"Text".to_vec()));
+        drop(destination_resolver);
+    }
+
+    #[test]
+    fn merge_resources_propagates_indirect_array_item_resolution_errors() {
+        // A qpdf accessor failure escapes mergeResources; it is not converted
+        // into a non-scalar skip (`QPDFObjectHandle.cc:1130-1146`).
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(91, 0), -1);
+        let dest =
+            ObjectHandle::dictionary(vec![(b"ProcSet".to_vec(), ObjectHandle::array(vec![]))]);
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![unresolved]),
+        )]);
+
+        let error = dest
+            .merge_resources(&other, None)
+            .expect_err("array item resolution failure must propagate");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "object 91 0 belongs to a dropped PDF"
+        ));
+    }
+
+    #[test]
     fn merge_resources_array_union_records_the_destination_owner() {
         let owner_ref = ObjectRef::new(7, 0);
         let owner =
@@ -18737,20 +18765,20 @@ mod mutation_tests {
 
     #[test]
     fn is_scalar_covers_every_disjunct() {
-        assert!(is_scalar(&ObjectHandle::boolean(true)));
-        assert!(is_scalar(&ObjectHandle::integer(1)));
-        assert!(is_scalar(&ObjectHandle::name(b"N".to_vec())));
-        assert!(is_scalar(&ObjectHandle::null()));
-        assert!(is_scalar(&ObjectHandle::real(1.0)));
-        assert!(is_scalar(&ObjectHandle::string(b"S".to_vec())));
-        assert!(!is_scalar(&ObjectHandle::array(vec![])));
+        assert!(is_scalar(&ObjectHandle::boolean(true)).unwrap());
+        assert!(is_scalar(&ObjectHandle::integer(1)).unwrap());
+        assert!(is_scalar(&ObjectHandle::name(b"N".to_vec())).unwrap());
+        assert!(is_scalar(&ObjectHandle::null()).unwrap());
+        assert!(is_scalar(&ObjectHandle::real(1.0)).unwrap());
+        assert!(is_scalar(&ObjectHandle::string(b"S".to_vec())).unwrap());
+        assert!(!is_scalar(&ObjectHandle::array(vec![])).unwrap());
     }
 
     #[test]
     fn merge_resources_mints_a_second_unique_name_when_the_first_candidate_is_taken() {
         // this_val (the Font sub-dict itself) has a nested dictionary-valued
         // entry ("Widths") whose own key happens to be "F1_1" --
-        // get_resource_names is called ON this_val (see merge_resources's
+        // try_get_resource_names is called ON this_val (see merge_resources's
         // own doc comment on why it is this level, not dest's), so its
         // "grandchildren" pool picks this up, forcing unique_resource_name
         // past its first candidate.
@@ -18776,6 +18804,62 @@ mod mutation_tests {
             dest.get_key(b"/Font").get_key(new_name).as_integer(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn merge_resources_resolves_nested_dictionary_values_for_unique_names() {
+        // qpdf's getResourceNames() calls isDictionary() on every value,
+        // which dereferences an indirect nested dictionary before collecting
+        // its keys (`QPDFObjectHandle.cc:1156-1170,431-434`).
+        let (indirect_widths, resolver) =
+            crate::object_handle::identity_tests::resolver_bearing_handle(ObjectValue::Dictionary(
+                [(b"F1_1".to_vec(), ObjectHandle::integer(0))]
+                    .into_iter()
+                    .collect(),
+            ));
+        let this_font = ObjectHandle::dictionary(vec![
+            (b"F1".to_vec(), ObjectHandle::integer(1)),
+            (b"Widths".to_vec(), indirect_widths.clone()),
+        ]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+
+        dest.merge_resources(&other, Some(&mut conflicts))
+            .expect("nested dictionary value resolves");
+
+        let new_name = conflicts
+            .get(b"/Font".as_slice())
+            .and_then(|m| m.get(b"/F1".as_slice()))
+            .expect("F1 conflict recorded");
+        assert_eq!(new_name, b"/F1_2");
+        assert!(dest
+            .get_key(b"/Font")
+            .get_key(b"/Widths")
+            .ptr_eq(&indirect_widths));
+        drop(resolver);
+    }
+
+    #[test]
+    fn merge_resources_propagates_nested_dictionary_resolution_errors() {
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(92, 0), -1);
+        let this_font = ObjectHandle::dictionary(vec![
+            (b"F1".to_vec(), ObjectHandle::integer(1)),
+            (b"Widths".to_vec(), unresolved),
+        ]);
+        let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
+        let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
+        let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
+        let mut conflicts = std::collections::BTreeMap::new();
+
+        let error = dest
+            .merge_resources(&other, Some(&mut conflicts))
+            .expect_err("nested dictionary resolution failure must propagate");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "object 92 0 belongs to a dropped PDF"
+        ));
     }
 }
 
