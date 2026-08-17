@@ -18,7 +18,10 @@ HOOK_PATH = ROOT / "scripts" / "codex-hooks" / "qpdf_module_docs.py"
 class QpdfModuleDocsHookTests(unittest.TestCase):
     def test_project_hook_registers_synchronous_post_tool_use_checker(self):
         config = json.loads((ROOT / ".codex/hooks.json").read_text(encoding="utf-8"))
-        group = config["hooks"]["PostToolUse"][0]
+        post_tool_use = config["hooks"]["PostToolUse"]
+        self.assertEqual(1, len(post_tool_use))
+        group = post_tool_use[0]
+        self.assertEqual(1, len(group["hooks"]))
         command_hook = group["hooks"][0]
 
         self.assertEqual("^(Bash|apply_patch)$", group["matcher"])
@@ -26,6 +29,9 @@ class QpdfModuleDocsHookTests(unittest.TestCase):
         self.assertIn("git rev-parse --show-toplevel", command_hook["command"])
         self.assertIn("scripts/codex-hooks/qpdf_module_docs.py", command_hook["command"])
         self.assertEqual(30, command_hook["timeout"])
+        self.assertEqual(
+            "Checking qpdf module documentation", command_hook["statusMessage"]
+        )
         self.assertNotIn("async", command_hook)
 
     @contextmanager
