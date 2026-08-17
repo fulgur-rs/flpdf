@@ -1018,6 +1018,38 @@ fn form_helper_resource_pruning_preserves_resources_when_a_name_is_unresolved() 
 }
 
 #[test]
+fn form_helper_resource_pruning_preserves_resources_for_null_resource_names() {
+    let body = b"BT /Fmissing 12 Tf /Fmissing2 12 Tf ET";
+    let mut form = format!(
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+         /Resources << /Font << /Fmissing null /Fmissing2 7 0 R /Funused << >> >> >> \
+         /Length {} >>\nstream\n",
+        body.len()
+    )
+    .into_bytes();
+    form.extend_from_slice(body);
+    form.extend_from_slice(b"\nendstream\nendobj\n");
+    let null_object = (7u32, b"7 0 obj\nnull\nendobj\n".to_vec());
+    let bytes = build_pdf_with_extras("/MediaBox [0 0 100 100]", "", &[(5, form), null_object]);
+    let mut pdf = open(bytes);
+    let form_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+    let mut helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
+
+    helper
+        .remove_unreferenced_resources()
+        .expect("null resource entries must not hide unresolved names");
+    let fonts = helper
+        .get_resources(false)
+        .unwrap()
+        .get_key(b"/Font")
+        .as_dictionary()
+        .unwrap();
+    assert!(fonts.iter().any(|(key, _)| key == b"/Fmissing"));
+    assert!(fonts.iter().any(|(key, _)| key == b"/Fmissing2"));
+    assert!(fonts.iter().any(|(key, _)| key == b"/Funused"));
+}
+
+#[test]
 fn form_helper_resource_pruning_is_a_noop_without_resources() {
     let form_body = b"q Q";
     let mut form = format!(

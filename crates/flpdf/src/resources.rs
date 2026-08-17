@@ -188,15 +188,16 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         } else {
             value
         };
-        let Some(entries) = dictionary.as_dictionary() else {
+        let Some(_) = dictionary.as_dictionary() else {
             continue;
         };
+        let live_keys = dictionary.try_get_keys()?;
         known_names.extend(
-            entries
-                .keys()
+            live_keys
+                .iter()
                 .map(|key| key.strip_prefix(b"/").unwrap_or(key.as_slice()).to_vec()),
         );
-        dictionaries.push((category, dictionary));
+        dictionaries.push((category, dictionary, live_keys));
     }
 
     // qpdf treats an unresolved Font/XObject name as a veto when this target
@@ -210,10 +211,11 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         .cloned()
         .collect::<BTreeSet<_>>();
     if !local_unresolved.is_empty() && resources.as_dictionary().is_some() {
+        pdf.mark_object_handle_dirty(&resources)?;
         return Ok(());
     }
 
-    for (category, dictionary) in dictionaries {
+    for (category, dictionary, live_keys) in dictionaries {
         let Some(entries) = dictionary.as_dictionary() else {
             continue;
         };
@@ -225,6 +227,7 @@ fn prune_canonical_resource_target<R: Read + Seek>(
             .unwrap_or_default();
         let remove = entries
             .keys()
+            .filter(|key| live_keys.contains(*key))
             .filter(|key| {
                 let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
                 !names.iter().any(|used| used.as_slice() == name)
@@ -2006,6 +2009,62 @@ mod tests {
         out
     }
 
+    /// Build a reachable Form XObject whose `/Font` category is indirect and
+    /// whose content references an undeclared font name. The canonical Form
+    /// pruning path must shallow-copy `/Font` and dirty the Form owner before
+    /// the unresolved-name veto returns.
+    fn build_form_with_indirect_font_pdf() -> Vec<u8> {
+        let content = b"BT /Fmissing 12 Tf (text) Tj ET";
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
+
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                   /Resources << /XObject << /Fm 5 0 R >> >> >>"
+                    .to_vec(),
+            ),
+            (7, b"<< /F1 << >> /F2 << >> >>".to_vec()),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, out.len() as u64);
+            out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            out.extend_from_slice(&body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+
+        offsets.insert(5, out.len() as u64);
+        out.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+                 /Resources << /Font 7 0 R >> /Length {} >>\nstream\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(content);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_start = out.len() as u64;
+        let total = 8u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for number in 1..total {
+            if let Some(offset) = offsets.get(&number) {
+                out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+            } else {
+                out.extend_from_slice(b"0000000000 65535 f \n");
+            }
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
     /// Run a prune in `mode` and return the `/Font` sub-dictionary keys of the
     /// terminal `/Resources` object `terminal_obj`.
     fn font_keys_after_prune(
@@ -2055,6 +2114,22 @@ mod tests {
         assert!(
             !keys.contains(&"F2".to_string()),
             "F2 (unused) must be pruned from the terminal dict: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_form_resource_veto_marks_indirect_category_copy_dirty() {
+        let mut pdf =
+            Pdf::open(Cursor::new(build_form_with_indirect_font_pdf())).expect("PDF should parse");
+        let form_ref = ObjectRef::new(5, 0);
+        let form = pdf.get_object_handle(form_ref);
+        assert!(!pdf.is_dirty(form_ref));
+
+        prune_canonical_resource_target(&mut pdf, form).expect("prune should succeed");
+
+        assert!(
+            pdf.is_dirty(form_ref),
+            "privatizing an indirect category before the veto must dirty its Form owner"
         );
     }
 
