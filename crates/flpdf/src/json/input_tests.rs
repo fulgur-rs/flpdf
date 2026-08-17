@@ -52,6 +52,62 @@ fn qpdf_json_value_factory_builds_scalars_and_pdf_string_forms() {
             .as_string(),
         Some(crate::pdf_string::new_unicode_string(b"hello"))
     );
+    assert!(json_value_to_handle(&mut pdf, &Json::make_string("b:0g"))
+        .expect("invalid binary string")
+        .is_null());
+    assert_eq!(
+        json_value_to_handle(&mut pdf, &Json::make_string("n:/Name"))
+            .expect("encoded name")
+            .as_name(),
+        Some(b"Name".to_vec())
+    );
+    assert!(
+        json_value_to_handle(&mut pdf, &Json::make_string("unknown"))
+            .expect("unknown string")
+            .is_null()
+    );
+}
+
+#[test]
+fn qpdf_json_value_factory_preserves_real_literals_and_rejects_non_finite_numbers() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+
+    assert_eq!(
+        json_value_to_handle(&mut pdf, &Json::make_number("1.5"))
+            .expect("real")
+            .as_real_literal(),
+        Some((1.5, b"1.5".to_vec()))
+    );
+    assert_eq!(
+        json_value_to_handle(&mut pdf, &Json::make_number("1e+2"))
+            .expect("scientific real")
+            .as_real(),
+        Some(100.0)
+    );
+    let error =
+        json_value_to_handle(&mut pdf, &Json::make_number("1e9999")).expect_err("non-finite real");
+    assert!(error.to_string().contains("invalid JSON number"));
+}
+
+#[test]
+fn qpdf_json_value_factory_rejects_uninitialized_values_and_decodes_name_keys() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let error = json_value_to_handle(&mut pdf, &Json::default()).expect_err("uninitialized");
+    assert!(error
+        .to_string()
+        .contains("JSON value has no initialized qpdf value kind"));
+
+    let object = Json::parse(br#"{"n:/Name": 1}"#).expect("JSON");
+    let dictionary = json_value_to_handle(&mut pdf, &object)
+        .expect("dictionary")
+        .as_dictionary()
+        .expect("dictionary handle");
+    assert_eq!(
+        dictionary
+            .get(b"/Name".as_slice())
+            .and_then(|value| value.as_integer()),
+        Some(1)
+    );
 }
 
 #[test]
