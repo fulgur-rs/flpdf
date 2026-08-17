@@ -1275,10 +1275,12 @@ struct RewriteCommand {
     /// Generate appearance streams for form fields that lack them
     /// (qpdf `--generate-appearances`).
     ///
-    /// Form fields whose widgets have no `/AP` `/N` appearance are rendered
-    /// from their current value (`/V`) and default appearance (`/DA`). Useful
-    /// before `--flatten-annotations` so value-only fields are not dropped.
-    /// Requires a full rewrite of the document.
+    /// Only runs if the document's `/AcroForm` indicates its appearances are
+    /// out of date (`/NeedAppearances true`); otherwise this is a no-op.
+    /// When it runs, form fields whose widgets have no `/AP` `/N` appearance
+    /// are rendered from their current value (`/V`) and default appearance
+    /// (`/DA`). Useful before `--flatten-annotations` so value-only fields
+    /// are not dropped. Requires a full rewrite of the document.
     #[arg(
         long = "generate-appearances",
         help = "Generate appearance streams for form fields that lack them"
