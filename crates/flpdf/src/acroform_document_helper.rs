@@ -10,11 +10,12 @@ use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity, ResourceConflicts};
 use crate::page_object_helper::PageObjectHelper;
+use crate::pdf_string::utf8_value;
 use crate::ref_chain::resolve_ref_chain;
 use crate::resource_replacer::{replace_resource_names, ResourceRenames};
 use crate::{
-    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, Matrix, Object,
-    ObjectRef, Pdf, Rectangle, Result, DEFAULT_MAX_ACROFORM_DEPTH,
+    copy_objects, Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
+    DEFAULT_MAX_ACROFORM_DEPTH,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -2210,7 +2211,12 @@ fn is_pure_widget_annotation(field: &Dictionary) -> bool {
 }
 
 fn decode_field_name(name: &[u8]) -> String {
-    decode_pdf_text_string(name).unwrap_or_else(|| String::from_utf8_lossy(name).into_owned())
+    // qpdf's getUTF8Value path delegates to pdf_doc_to_utf8, which replaces
+    // undefined PDFDocEncoding bytes with U+FFFD
+    // (QPDF_String.cc:162-172; QUtil.cc:1772-1788). The JSON decoder
+    // intentionally returns None for such bytes, so it is not the right
+    // fallback for field names.
+    String::from_utf8_lossy(&utf8_value(name)).into_owned()
 }
 
 /// Pre-round `v` so `ObjectHandle::real(rounded)`'s writer output (Rust's
@@ -2678,6 +2684,7 @@ fn is_pdf_name_delimiter(byte: u8) -> bool {
 mod tests {
     use super::*;
     use crate::object::{Stream, MAX_INLINE_DEPTH};
+    use crate::pdf_string::decode_pdf_text_string;
     use std::rc::Rc;
 
     fn dict(entries: &[(&str, Object)]) -> Dictionary {
@@ -4183,6 +4190,11 @@ mod tests {
             "renamed /T must decode to the original text plus the ASCII \
              suffix, not mid-codepoint-corrupted bytes: {renamed:?}"
         );
+    }
+
+    #[test]
+    fn decode_field_name_matches_qpdf_for_undefined_pdfdoc_bytes() {
+        assert_eq!(decode_field_name(&[b'A', 0x7f, 0x9f, 0xad, 0x80]), "A���•");
     }
 
     #[test]
