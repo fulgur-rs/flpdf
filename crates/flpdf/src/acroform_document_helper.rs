@@ -8,18 +8,45 @@
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object::MAX_INLINE_DEPTH;
-use crate::object_handle::ObjectHandle;
+use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
     copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, Object, ObjectRef, Pdf,
     Result, DEFAULT_MAX_ACROFORM_DEPTH,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 type AcroFormInheritedEntries = Vec<(Vec<u8>, Object)>;
 type FieldCopySet = BTreeSet<ObjectRef>;
+
+fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field: ObjectHandle) {
+    let annotation_identity = annotation.identity_key();
+    cache
+        .annotation_handles
+        .entry(annotation_identity.clone())
+        .or_insert_with(|| annotation.clone());
+    cache
+        .annotation_to_field
+        .insert(annotation_identity, field.clone());
+
+    let field_identity = field.identity_key();
+    cache
+        .field_handles
+        .entry(field_identity.clone())
+        .or_insert_with(|| field.clone());
+    let annotations = cache
+        .field_to_annotations
+        .entry(field_identity)
+        .or_default();
+    if !annotations
+        .iter()
+        .any(|candidate| candidate.is_same_object_as(&annotation))
+    {
+        annotations.push(annotation);
+    }
+}
 
 /// Effective metadata for one AcroForm field-tree node.
 ///
@@ -61,21 +88,53 @@ struct FieldInheritance {
     max_len: Option<i64>,
 }
 
+/// The live association cache built by qpdf's
+/// `QPDFAcroFormDocumentHelper::analyze`.
+///
+/// The maps are keyed by [`ObjectHandleIdentity`] rather than by a
+/// materialized [`Object`] or by [`ObjectRef`]. This preserves qpdf's shared
+/// object identity for both indirect fields and direct page annotations. The
+/// handle maps retain the canonical values needed to project the cache to
+/// legacy ref-valued APIs.
+#[derive(Default)]
+struct AcroFormCache {
+    annotation_to_field: HashMap<ObjectHandleIdentity, ObjectHandle>,
+    annotation_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
+    field_to_annotations: HashMap<ObjectHandleIdentity, Vec<ObjectHandle>>,
+    field_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
+    field_to_name: HashMap<ObjectHandleIdentity, String>,
+    name_to_fields: BTreeMap<String, Vec<ObjectHandle>>,
+}
+
 /// High-level helper for a document's `/AcroForm`.
 ///
 /// Construct with [`AcroFormDocumentHelper::new`] or [`Pdf::acroform`]. The
-/// helper holds no cached field state; methods re-read the live document so
-/// prior mutations are immediately visible.
+/// helper lazily caches qpdf's field/annotation association analysis. The
+/// cache retains live [`ObjectHandle`] identities, so association consumers do
+/// not fall back to stale materialized objects. Call
+/// [`Self::invalidate_cache`] after manually changing the field tree,
+/// AcroForm dictionary, or page annotations, matching qpdf's cache contract.
 ///
 /// For a runnable walkthrough see `examples/list_form_fields.rs`.
 pub struct AcroFormDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
+    cache: Option<AcroFormCache>,
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Create a new helper borrowing `pdf` mutably.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
-        Self { pdf }
+        Self { pdf, cache: None }
+    }
+
+    /// Invalidate the cached field/annotation associations.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::invalidateCache`
+    /// (`include/qpdf/QPDFAcroFormDocumentHelper.hh:72-78`). It is required
+    /// after external mutation of `/AcroForm`, the field tree, or page
+    /// annotations when the mutation can change their association.
+    pub fn invalidate_cache(&mut self) {
+        self.cache = None;
     }
 
     /// Return all field-tree object refs in preorder.
@@ -158,19 +217,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// Mirrors `QPDFAcroFormDocumentHelper::analyze`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:235-286`), specifically the
-    /// `annotation_to_field` half of its cache (the `field_to_annotations`/
-    /// `field_to_name`/`name_to_fields` halves serve other consumers not
-    /// needed here).
+    /// `annotation_to_field` half of its cache. The same analysis also fills
+    /// qpdf's reverse annotation and qualified-name indexes for later
+    /// consumers.
     ///
     /// qpdf caches this on the helper instance (`Members::cache_valid`) so
-    /// repeated per-widget lookups are O(1) amortized. This helper holds no
-    /// cached state (see [`Self::fields`]), so the full traversal recomputes
-    /// on every call — a caller doing multiple lookups within one operation
-    /// should call this once and index the returned map directly rather than
-    /// calling [`Self::get_field_for_annotation`] per widget. Algorithm and
-    /// output order are unchanged from qpdf; only the container (recomputed
-    /// value vs. cached member) differs, and it does not change output
-    /// bytes.
+    /// repeated per-widget lookups are O(1) amortized. This method is the
+    /// ref-valued projection for existing callers; crate consumers use the
+    /// canonical handle cache directly.
     ///
     /// Returns an empty map when the catalog `/AcroForm` is absent, is not a
     /// dictionary, or carries no `/Fields` key — in which case qpdf's
@@ -184,13 +238,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// - Any error while resolving the live object graph or enumerating pages.
     pub fn annotation_to_field_map(&mut self) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
         Ok(self
-            .canonical_annotation_to_field_map()?
+            .canonical_annotation_to_field_handles()?
             .into_iter()
-            .filter_map(|(annotation_ref, field)| {
-                field
-                    .object_ref()
-                    .map(|field_ref| (annotation_ref, field_ref))
-            })
+            .filter_map(|(annotation, field)| Some((annotation.object_ref()?, field.object_ref()?)))
             .collect())
     }
 
@@ -219,57 +269,85 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .and_then(|field| field.object_ref()))
     }
 
-    /// Build the qpdf `analyze()` map while retaining the live canonical
-    /// [`ObjectHandle`] identity for every indirect annotation and field.
+    /// Build the qpdf `analyze()` associations while retaining live canonical
+    /// [`ObjectHandle`] identity for both indirect and direct annotations.
     ///
     /// The public ref-valued [`Self::annotation_to_field_map`] method is kept
     /// for existing callers, but it is now a projection of this route. This
     /// is important for qpdf parity: `QPDFObjectHandle::replaceKey` mutates a
     /// shared object allocation, so a later helper lookup must not consult a
     /// stale `Object` materialization of the same object.
-    fn canonical_annotation_to_field_map(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
-        let mut annotation_to_field = BTreeMap::new();
+    pub(crate) fn canonical_annotation_to_field_handles(
+        &mut self,
+    ) -> Result<Vec<(ObjectHandle, ObjectHandle)>> {
+        self.analyze()?;
+        let cache = self
+            .cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache");
+        let mut associations: Vec<_> = cache
+            .annotation_to_field
+            .iter()
+            .filter_map(|(identity, field)| {
+                cache
+                    .annotation_handles
+                    .get(identity)
+                    .map(|annotation| (annotation.clone(), field.clone()))
+            })
+            .collect();
+        associations.sort_by_key(|(annotation, _)| annotation.object_ref());
+        Ok(associations)
+    }
+
+    fn analyze(&mut self) -> Result<()> {
+        if self.cache.is_some() {
+            return Ok(());
+        }
+
+        let mut cache = AcroFormCache::default();
         let Some(acroform) = self.canonical_acroform()? else {
-            return Ok(annotation_to_field);
+            self.cache = Some(cache);
+            return Ok(());
         };
         // Mirrors qpdf's combined `acroform.isDictionary() && acroform.hasKey("/Fields")`
         // guard (`QPDFAcroFormDocumentHelper.cc:241-243`): an `/AcroForm` dictionary
         // without a `/Fields` key skips both the field traversal and the
         // orphan-widget fallback below, not just the traversal.
         if !acroform.try_has_key(b"/Fields")? {
-            return Ok(annotation_to_field);
+            self.cache = Some(cache);
+            return Ok(());
         }
+
         let fields = self
             .pdf
             .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
         if let Some(fields) = fields.as_array() {
             let mut visited = BTreeSet::new();
-            let map = &mut annotation_to_field;
             for field in fields {
-                self.traverse_field_handles(field, None, 0, &mut visited, map)?;
+                self.traverse_field_handles(field, None, 0, &mut visited, &mut cache)?;
             }
         }
 
         // qpdf's orphan-widget fallback walks the canonical page annotation
         // route and associates an otherwise-unreachable widget with itself.
-        // Direct page annotations have no ObjGen in this ref-valued facade and
-        // are intentionally left for the handle-native consumers.
+        // Keep direct annotations here: their live identity is the only stable
+        // key available, and qpdf's handle-native route also retains them.
         for page_ref in crate::pages::page_refs(self.pdf)? {
             let widgets = {
                 let mut page = PageObjectHelper::new(page_ref, self.pdf);
                 page.get_annotation_handles(Some(b"/Widget"))?
             };
             for annotation in widgets {
-                let Some(annotation_ref) = annotation.object_ref() else {
-                    continue;
-                };
-                annotation_to_field
-                    .entry(annotation_ref)
-                    .or_insert_with(|| annotation.clone());
+                let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
+                let identity = annotation.identity_key();
+                if !cache.annotation_to_field.contains_key(&identity) {
+                    record_association(&mut cache, annotation.clone(), annotation);
+                }
             }
         }
 
-        Ok(annotation_to_field)
+        self.cache = Some(cache);
+        Ok(())
     }
 
     /// Return the distinct live handles represented by qpdf's
@@ -281,10 +359,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// mutating consumer must retain these canonical handles so a later edit
     /// cannot fall back to a stale materialized [`Object`].
     pub(crate) fn form_field_handles(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
+        self.analyze()?;
+        let cache = self
+            .cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache");
         let mut fields = BTreeMap::new();
-        for field in self.canonical_annotation_to_field_map()?.into_values() {
-            if let Some(field_ref) = field.object_ref() {
-                fields.entry(field_ref).or_insert(field);
+        for identity in cache.field_to_annotations.keys() {
+            if let Some(field) = cache.field_handles.get(identity) {
+                let Some(field_ref) = field.object_ref() else {
+                    continue;
+                };
+                fields.entry(field_ref).or_insert_with(|| field.clone());
             }
         }
         Ok(fields)
@@ -325,6 +411,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             fields.erase_array_item(index)?;
         }
         self.pdf.mark_object_handle_dirty(&fields)?;
+        self.invalidate_cache();
         Ok(true)
     }
 
@@ -339,13 +426,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if !annotation.try_is_dictionary_of_type(b"", b"Widget")? {
             return Ok(None);
         }
-        let annotation_ref = annotation.object_ref();
-        let Some(annotation_ref) = annotation_ref else {
-            return Ok(None);
-        };
+        self.analyze()?;
         Ok(self
-            .canonical_annotation_to_field_map()?
-            .remove(&annotation_ref))
+            .cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache")
+            .annotation_to_field
+            .get(&annotation.identity_key())
+            .cloned())
     }
 
     fn canonical_acroform(&mut self) -> Result<Option<ObjectHandle>> {
@@ -369,7 +457,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         parent: Option<ObjectHandle>,
         depth: usize,
         visited: &mut BTreeSet<ObjectRef>,
-        map: &mut BTreeMap<ObjectRef, ObjectHandle>,
+        cache: &mut AcroFormCache,
     ) -> Result<()> {
         if depth > DEFAULT_MAX_ACROFORM_DEPTH {
             return Ok(());
@@ -392,7 +480,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             is_field = true;
             let parent = Some(field.clone());
             for kid in kids {
-                self.traverse_field_handles(kid, parent.clone(), depth + 1, visited, map)?;
+                self.traverse_field_handles(kid, parent.clone(), depth + 1, visited, cache)?;
             }
             is_annotation = false;
         } else {
@@ -404,11 +492,25 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         if is_annotation {
             let owning_field = if is_field {
-                field
+                field.clone()
             } else {
                 parent.unwrap_or_else(|| field.clone())
             };
-            map.insert(field_ref, owning_field);
+            record_association(cache, field.clone(), owning_field);
+        }
+
+        if is_field && field.try_has_key(b"/T")? {
+            let name = FormFieldObjectHelper::new(field_ref, self.pdf).fully_qualified_name()?;
+            cache
+                .field_to_name
+                .insert(field.identity_key(), name.clone());
+            let fields = cache.name_to_fields.entry(name).or_default();
+            if !fields
+                .iter()
+                .any(|candidate| candidate.is_same_object_as(&field))
+            {
+                fields.push(field);
+            }
         }
         Ok(())
     }
@@ -622,6 +724,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
         }
 
+        self.invalidate_cache();
         Ok(copied_top)
     }
 
@@ -681,6 +784,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         catalog.insert("AcroForm", Object::Reference(new_ref));
         self.pdf.set_object(new_ref, Object::Dictionary(acroform));
         self.pdf.set_object(root_ref, Object::Dictionary(catalog));
+        self.invalidate_cache();
         Ok(new_ref)
     }
 
@@ -2089,5 +2193,121 @@ mod tests {
             .canonical_field_for_annotation(annotation)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn canonical_annotation_handles_include_a_direct_orphan_widget() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", Object::Array(Vec::new()))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "Annots",
+                    Object::Array(vec![Object::Dictionary(dict(&[
+                        ("Type", Object::Name(b"Annot".to_vec())),
+                        ("Subtype", Object::Name(b"Widget".to_vec())),
+                    ]))]),
+                ),
+            ])),
+        );
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let associations = helper
+            .canonical_annotation_to_field_handles()
+            .expect("canonical handle association analysis");
+        let (annotation, field) = associations
+            .iter()
+            .find(|(annotation, _)| annotation.is_direct())
+            .expect("the direct page Widget must be retained");
+        assert!(annotation.is_same_object_as(field));
+        assert!(helper
+            .form_field_handles()
+            .expect("legacy form-field projection")
+            .is_empty());
+    }
+
+    #[test]
+    fn canonical_annotation_cache_requires_explicit_invalidation_after_page_mutation() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", Object::Array(Vec::new()))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "Annots",
+                    Object::Array(vec![Object::Dictionary(dict(&[
+                        ("Type", Object::Name(b"Annot".to_vec())),
+                        ("Subtype", Object::Name(b"Widget".to_vec())),
+                    ]))]),
+                ),
+            ])),
+        );
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        assert_eq!(
+            helper
+                .canonical_annotation_to_field_handles()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let page = helper.pdf.get_object_handle(ObjectRef::new(3, 0));
+        page.replace_key(b"/Annots", ObjectHandle::array(Vec::new()))
+            .unwrap();
+
+        // qpdf deliberately keeps the analyzed association cache stable until
+        // invalidateCache() is called by the mutating owner.
+        assert_eq!(
+            helper
+                .canonical_annotation_to_field_handles()
+                .unwrap()
+                .len(),
+            1
+        );
+        helper.invalidate_cache();
+        assert!(helper
+            .canonical_annotation_to_field_handles()
+            .unwrap()
+            .is_empty());
     }
 }
