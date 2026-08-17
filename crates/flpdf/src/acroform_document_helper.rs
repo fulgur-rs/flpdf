@@ -49,6 +49,15 @@ fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field
     }
 }
 
+// qpdf's traverseField (QPDFAcroFormDocumentHelper.cc:349-361) never drops an
+// emptied name_to_fields bucket on rename -- only removeFormFields does that
+// cleanup. Pruning it here anyway is required, not cosmetic: the collision
+// check in add_and_rename_form_fields tests existing_names via key presence
+// (name_to_fields.keys()), not qpdf's emptiness check
+// (!getFieldsWithQualifiedName(name).empty(), :89). A stale empty key left
+// behind by the literal qpdf behavior would poison that presence check and
+// rename fields qpdf would leave alone. Do not remove this pruning to chase
+// closer C++ literalism.
 fn record_field_name(cache: &mut AcroFormCache, field: ObjectHandle, name: String) {
     let identity = field.identity_key();
     if let Some(old_name) = cache.field_to_name.insert(identity, name.clone()) {
@@ -185,6 +194,19 @@ pub struct AcroFormDocumentHelper<'a, R: Read + Seek + 'static> {
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// Create a new helper borrowing `pdf` mutably.
+    // qpdf's QPDFAcroFormDocumentHelper constructor eagerly calls analyze()
+    // (QPDFAcroFormDocumentHelper.cc:14-21, with an explicit comment there on
+    // avoiding an "unstable configuration"), so its cache is always valid.
+    // This constructor is lazy (cache: None) instead. That gap was harmless
+    // before the mutators below started maintaining the cache incrementally,
+    // since every mutator used to nuke it anyway. It has teeth now: a caller
+    // that mutates the field-tree graph directly (bypassing this helper's
+    // mutators) between construction and first use would see a fresher cache
+    // than qpdf's eager analyze() would have captured, where qpdf would
+    // require an explicit invalidateCache() to observe the same mutation. No
+    // current caller holds a warm helper across such a mutation (every
+    // production call site constructs, does one mutation, and drops), so
+    // this is not yet observable -- worth closing before one does.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
         Self { pdf, cache: None }
     }
