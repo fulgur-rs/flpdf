@@ -951,6 +951,7 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     );
     pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(dr));
     let mut acroform = Dictionary::new();
+    acroform.insert("Fields", Object::Array(Vec::new()));
     acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
     pdf.set_object(
         ObjectRef::new(6, 0),
@@ -1209,6 +1210,7 @@ fn helper_flatten_annotations_reuses_a_materialized_inline_appearance() {
     let mut dr = Dictionary::new();
     dr.insert("Font", Object::Dictionary(fonts));
     let mut acroform = Dictionary::new();
+    acroform.insert("Fields", Object::Array(Vec::new()));
     acroform.insert("DR", Object::Dictionary(dr));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(acroform));
     let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
