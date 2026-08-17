@@ -32,6 +32,23 @@ const CATALOG_COMPLETE_JSON: &[u8] = br#"{
   ]
 }"#;
 
+const CATALOG_WITH_EXTENSION_LEVEL_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.7"},
+    {
+      "obj:1 0 R": {
+        "value": {
+          "/Extensions": {"/ADBE": {"/BaseVersion": "/1.7", "/ExtensionLevel": 8}},
+          "/Pages": "2 0 R",
+          "/Type": "/Catalog"
+        }
+      },
+      "obj:2 0 R": {"value": {"/Count": 0, "/Kids": [], "/Type": "/Pages"}},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 3}}
+    }
+  ]
+}"#;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat/json-input")
@@ -103,10 +120,29 @@ fn create_from_json_uses_qpdf_rootless_seed_and_complete_metadata() {
 
 #[test]
 fn create_from_json_exposes_the_imported_canonical_trailer_to_page_primitives() {
-    let pdf = Pdf::create_from_json(Cursor::new(CATALOG_COMPLETE_JSON), "catalog.json")
+    let mut pdf = Pdf::create_from_json(Cursor::new(CATALOG_COMPLETE_JSON), "catalog.json")
         .expect("catalog JSON should create a document");
 
     assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+    // `trailer_key_handle` must observe the same live trailer as `root_ref`,
+    // matching its own doc's claimed equivalence to `trailer_handle().get_key(key)`
+    // -- both routes are backed by the same canonical handle the JSON importer
+    // installs, not the pre-import construction-time snapshot.
+    assert_eq!(
+        pdf.trailer_key_handle(b"Root").object_ref(),
+        Some(ObjectRef::new(1, 0))
+    );
+}
+
+#[test]
+fn create_from_json_exposes_the_imported_root_to_adobe_extension_level() {
+    let mut pdf = Pdf::create_from_json(
+        Cursor::new(CATALOG_WITH_EXTENSION_LEVEL_JSON),
+        "extension.json",
+    )
+    .expect("catalog JSON should create a document");
+
+    assert_eq!(pdf.adobe_extension_level(), Some(8));
 }
 
 #[test]

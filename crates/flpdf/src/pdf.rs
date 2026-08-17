@@ -247,7 +247,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `--check` version banner and the extension level qpdf accumulates into
     /// its `max_input_version`.
     pub fn adobe_extension_level(&mut self) -> Option<i64> {
-        let root_ref = self.trailer().get_ref("Root")?;
+        let root_ref = self.root_ref()?;
         let catalog = self.resolve(root_ref).ok()?;
         let extensions = resolve_object_value(self, catalog.as_dict()?.get("Extensions")?.clone())?;
         let adbe = resolve_object_value(self, extensions.as_dict()?.get("ADBE")?.clone())?;
@@ -258,6 +258,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// The trailer dictionary (or the dictionary attached to the trailing xref stream
     /// for cross-reference-stream documents). This is where you'd reach for `/Root`,
     /// `/Info`, `/Size`, `/ID`, etc.
+    ///
+    /// This is a construction-time snapshot: it does not reflect trailer
+    /// changes made through [`Pdf::create_from_json`] or
+    /// [`Pdf::update_from_json`]. Use [`Pdf::root_ref`] or
+    /// [`Pdf::trailer_key_handle`] for `/Root`- and key-level reads that stay
+    /// current after those calls.
     pub fn trailer(&self) -> &Dictionary {
         &self.trailer
     }
@@ -313,6 +319,29 @@ impl<R: Read + Seek> Pdf<R> {
     /// cheap enough to relift on every call, and every caller today needs at
     /// most one key per `Pdf`.
     pub fn trailer_key_handle(&mut self, key: &[u8]) -> ObjectHandle {
+        // The JSON importer and canonical writer mutate the live trailer
+        // handle after construction (see `Pdf::root_ref`'s identical
+        // reasoning): once that handle exists *and is a genuine dictionary*
+        // it is qpdf's authoritative trailer, so a key lookup must go
+        // through it rather than the construction-time legacy snapshot. A
+        // `trailer_handle_memo` populated by `Pdf::trailer_handle`'s own
+        // whole-tree-degraded-to-null fallback carries no key information at
+        // all, so it must not be treated as authoritative here -- that would
+        // reintroduce the exact whole-tree coupling this method exists to
+        // avoid. `try_get_key` (not the panicking `get_key`) is used because
+        // the degrade-to-null fallback in `trailer_handle` produces a bare
+        // handle with no `Pdf` context to route a type-mismatch warning
+        // through.
+        if let Some(trailer) = &self.trailer_handle_memo {
+            if !trailer.is_null() {
+                let mut name = Vec::with_capacity(key.len() + 1);
+                name.push(b'/');
+                name.extend_from_slice(key);
+                return trailer
+                    .try_get_key(&name)
+                    .unwrap_or_else(|_| ObjectHandle::null());
+            }
+        }
         let Some(value) = self.trailer.get(key).cloned() else {
             return ObjectHandle::null();
         };
@@ -331,11 +360,23 @@ impl<R: Read + Seek> Pdf<R> {
     /// `/Root` as listed in the trailer, when present.
     pub fn root_ref(&self) -> Option<ObjectRef> {
         // The JSON importer and canonical writer mutate the live trailer
-        // handle after construction. Once that handle exists it is qpdf's
-        // authoritative trailer; the legacy dictionary is only the
-        // construction-time snapshot and cannot observe those mutations.
+        // handle after construction. Once that handle exists *and is a
+        // genuine dictionary* it is qpdf's authoritative trailer; the legacy
+        // dictionary is only the construction-time snapshot and cannot
+        // observe those mutations. A `trailer_handle_memo` populated by
+        // `Pdf::trailer_handle`'s own whole-tree-degraded-to-null fallback
+        // carries no key information, so it falls through to the legacy
+        // snapshot instead (matching `Pdf::trailer_key_handle`'s identical
+        // reasoning). `try_get_key`, not the panicking `get_key`, because
+        // that degrade-to-null fallback is a bare handle with no `Pdf`
+        // context to route a type-mismatch warning through.
         if let Some(trailer) = &self.trailer_handle_memo {
-            return trailer.get_key(b"/Root").object_ref();
+            if !trailer.is_null() {
+                return trailer
+                    .try_get_key(b"/Root")
+                    .ok()
+                    .and_then(|handle| handle.object_ref());
+            }
         }
         self.trailer.get_ref("Root")
     }

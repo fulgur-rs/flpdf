@@ -11154,6 +11154,30 @@ mod tests {
     }
 
     #[test]
+    fn root_ref_survives_a_trailer_handle_degraded_to_null() {
+        // Mirrors `trailer_key_handle_survives_an_unrelated_sibling_entrys_deep_nesting`:
+        // once `trailer_handle` has degraded the whole-tree walk to a bare,
+        // context-less null handle, `root_ref` must fall back to the legacy
+        // snapshot rather than calling `get_key`/`try_get_key` on that null
+        // handle (which previously panicked -- the null handle has no `Pdf`
+        // context to route the resulting type-mismatch warning through).
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let root = pdf.trailer.get_ref("Root");
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
+        let mut nested = Object::Integer(1);
+        for _ in 0..depth {
+            nested = Object::Array(vec![nested]);
+        }
+        pdf.trailer.insert("Deep", nested);
+
+        assert!(
+            pdf.trailer_handle().is_null(),
+            "sanity: the whole-trailer walk does degrade here"
+        );
+        assert_eq!(pdf.root_ref(), root);
+    }
+
+    #[test]
     fn trailer_key_handle_is_null_for_a_missing_key() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.trailer_key_handle(b"NoSuchKey");
