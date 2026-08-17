@@ -92,21 +92,14 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
         if dictionary.as_dictionary().is_none() {
             continue;
         }
-        let category_name = &category[1..];
-        let names = finder
-            .names_by_resource_type()
-            .get(category_name)
-            .map(|entries| entries.keys().cloned().collect::<BTreeSet<_>>())
-            .unwrap_or_default();
+        let names = finder.names();
         let remove = dictionary
             .as_dictionary()
             .into_iter()
             .flat_map(|entries| entries.into_keys())
             .filter(|name| {
                 let resource_name = name.strip_prefix(b"/").unwrap_or(name.as_slice());
-                !names
-                    .iter()
-                    .any(|used_name| used_name.as_slice() == resource_name)
+                !names.contains(resource_name)
                     && !unresolved
                         .iter()
                         .any(|unresolved_name| unresolved_name.as_slice() == resource_name)
@@ -215,22 +208,17 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         return Ok(());
     }
 
-    for (category, dictionary, live_keys) in dictionaries {
+    for (_category, dictionary, live_keys) in dictionaries {
         let Some(entries) = dictionary.as_dictionary() else {
             continue;
         };
-        let category_name = &category[1..];
-        let names = finder
-            .names_by_resource_type()
-            .get(category_name)
-            .map(|entries| entries.keys().cloned().collect::<BTreeSet<_>>())
-            .unwrap_or_default();
+        let names = finder.names();
         let remove = entries
             .keys()
             .filter(|key| live_keys.contains(*key))
             .filter(|key| {
                 let name = key.strip_prefix(b"/").unwrap_or(key.as_slice());
-                !names.iter().any(|used| used.as_slice() == name)
+                !names.contains(name)
             })
             .cloned()
             .collect::<Vec<_>>();
