@@ -16,6 +16,18 @@ HOOK_PATH = ROOT / "scripts" / "codex-hooks" / "qpdf_module_docs.py"
 
 
 class QpdfModuleDocsHookTests(unittest.TestCase):
+    def test_project_hook_registers_synchronous_post_tool_use_checker(self):
+        config = json.loads((ROOT / ".codex/hooks.json").read_text(encoding="utf-8"))
+        group = config["hooks"]["PostToolUse"][0]
+        command_hook = group["hooks"][0]
+
+        self.assertEqual("^(Bash|apply_patch)$", group["matcher"])
+        self.assertEqual("command", command_hook["type"])
+        self.assertIn("git rev-parse --show-toplevel", command_hook["command"])
+        self.assertIn("scripts/codex-hooks/qpdf_module_docs.py", command_hook["command"])
+        self.assertEqual(30, command_hook["timeout"])
+        self.assertNotIn("async", command_hook)
+
     @contextmanager
     def synthetic_repository(self, classification: str):
         with tempfile.TemporaryDirectory() as temporary_directory:
