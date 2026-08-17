@@ -223,9 +223,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///
     /// qpdf caches this on the helper instance (`Members::cache_valid`) so
     /// repeated per-widget lookups are O(1) amortized. This method is the
-    /// ref-valued projection for existing callers; the canonical handle cache
-    /// is available to crate consumers through
-    /// [`Self::canonical_annotation_to_field_handles`].
+    /// ref-valued projection for existing callers; crate consumers use the
+    /// canonical handle cache directly.
     ///
     /// Returns an empty map when the catalog `/AcroForm` is absent, is not a
     /// dictionary, or carries no `/Fields` key — in which case qpdf's
