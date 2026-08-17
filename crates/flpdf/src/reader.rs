@@ -1935,6 +1935,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// transient free-row state (`QPDF.cc:686-708`, `:1187-1210`).
     #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
+        // Refresh the legacy cache before removing the canonical value, or an
+        // old object-stream entry can incorrectly retain provenance (mirrors
+        // `replace_object_handle`'s identical precondition above).
+        self.synchronize_legacy_resolution_state();
+        // qpdf's removeObject changes only the requested cache slot; already
+        // resolved members of an ObjStm remain live in their own cache slots.
+        // Promote those compatibility-cache values before the removal drops
+        // the source container.
+        self.promote_resolved_object_stream_members(object_ref)?;
         self.resolver.remove_object(object_ref)?;
         self.qpdf_parsed_xref_stream_refs.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -12147,6 +12156,41 @@ mod tests {
         assert!(
             member.as_dictionary().is_some(),
             "replacing the source ObjStm via the handle-shaped setter must not turn an \
+             already-resolved member into null"
+        );
+    }
+
+    #[test]
+    fn remove_object_handle_promotes_resolved_objstm_members_before_removing_container() {
+        // Same qpdf invariant as
+        // `replace_object_handle_promotes_resolved_objstm_members_before_replacing_container`,
+        // exercised through the handle-shaped removal primitive:
+        // `QPDF::removeObject` only erases the requested cache slot, so an
+        // already-resolved ObjStm member must be promoted to its own live
+        // handle before the source container's canonical value is removed.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(path).expect("open ObjStm fixture"),
+        ))
+        .expect("open ObjStm fixture");
+        let member_ref = ObjectRef::new(7, 0);
+
+        assert!(matches!(
+            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            Object::Dictionary(_)
+        ));
+
+        pdf.remove_object_handle(ObjectRef::new(1, 0))
+            .expect("remove canonical object");
+
+        let member = pdf.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("cached ObjStm member must survive source-container removal");
+        assert!(
+            member.as_dictionary().is_some(),
+            "removing the source ObjStm via the handle-shaped primitive must not turn an \
              already-resolved member into null"
         );
     }
