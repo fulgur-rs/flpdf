@@ -1,3 +1,5 @@
+//! qpdf correspondence: tests for the JSON input value boundary in `libqpdf/QPDF_json.cc:65-209, 732-793`.
+
 use super::input::{json_value_to_handle, parse_indirect_reference, parse_object_key};
 use super::Json;
 use crate::{ObjectRef, Pdf};

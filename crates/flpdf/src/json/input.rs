@@ -1,4 +1,4 @@
-//! qpdf correspondence: `QPDF_json.cc` validators and `JSONReactor::makeObject`
+//! qpdf correspondence: `QPDF_json.cc` validators and `JSONReactor::makeObject`.
 //! value construction (`libqpdf/QPDF_json.cc:65-209, 732-793`).
 //!
 //! This is the canonical value boundary for the JSON input importer. It builds
