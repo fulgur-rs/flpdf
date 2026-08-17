@@ -12,10 +12,10 @@ use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
-    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, Object, ObjectRef, Pdf,
-    Result, DEFAULT_MAX_ACROFORM_DEPTH,
+    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, Matrix, Object,
+    ObjectRef, Pdf, Rectangle, Result, DEFAULT_MAX_ACROFORM_DEPTH,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
 
 type AcroFormInheritedEntries = Vec<(Vec<u8>, Object)>;
@@ -104,6 +104,23 @@ struct AcroFormCache {
     field_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
     field_to_name: HashMap<ObjectHandleIdentity, String>,
     name_to_fields: BTreeMap<String, Vec<ObjectHandle>>,
+}
+
+/// The objects produced by qpdf's
+/// `QPDFAcroFormDocumentHelper::transformAnnotations`
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:699-1060`).
+///
+/// `old_fields` identifies source top-level fields that must be removed before
+/// the transformed copies are installed. `new_fields` contains the copied
+/// top-level fields that the caller adds to the destination AcroForm. The
+/// annotation vector is kept separate because qpdf installs it on the page
+/// independently of the field-tree update.
+#[allow(dead_code)] // consumed by the follow-up PageObjectHelper facade slice
+#[derive(Debug, Default)]
+pub(crate) struct AnnotationTransformResult {
+    pub(crate) new_annotations: Vec<ObjectHandle>,
+    pub(crate) new_fields: Vec<ObjectHandle>,
+    pub(crate) old_fields: BTreeSet<ObjectRef>,
 }
 
 /// High-level helper for a document's `/AcroForm`.
@@ -413,6 +430,384 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         self.pdf.mark_object_handle_dirty(&fields)?;
         self.invalidate_cache();
         Ok(true)
+    }
+
+    /// Copy annotations into fresh indirect objects and transform their
+    /// rectangles, mirroring qpdf's same-document annotation route.
+    ///
+    /// This slice covers same-document field-tree and appearance-stream
+    /// copying. Foreign-document defaults, `/DR` resource remapping, and the
+    /// public page-level facade remain in subsequent `flpdf-2tfv` slices; no
+    /// page-level caller switches from the legacy bridge until those slices
+    /// are complete.
+    #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
+    pub(crate) fn transform_annotations(
+        &mut self,
+        old_annots: ObjectHandle,
+        cm: Matrix,
+    ) -> Result<AnnotationTransformResult> {
+        let mut transformed = AnnotationTransformResult::default();
+        let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();
+        let mut copied_field_trees = HashSet::<ObjectHandleIdentity>::new();
+        let mut added_new_fields = BTreeSet::new();
+        let Some(annotations) = old_annots.try_as_array()? else {
+            return Ok(transformed);
+        };
+
+        for annotation in annotations {
+            let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
+            if annotation.as_stream_dict().is_some() {
+                annotation.warn_if_possible("ignoring annotation that's a stream")?;
+                continue;
+            }
+
+            if let Some(field) = self.canonical_field_for_annotation(annotation.clone())? {
+                let top_field = self.canonical_top_level_field(field.clone())?;
+                if let Some(top_ref) = top_field.object_ref() {
+                    transformed.old_fields.insert(top_ref);
+                }
+                if copied_field_trees.insert(top_field.identity_key()) {
+                    let copied_top = self.copy_field_tree(&top_field, &mut orig_to_copy)?;
+                    if let Some(copied_ref) = copied_top.object_ref() {
+                        if added_new_fields.insert(copied_ref) {
+                            transformed.new_fields.push(copied_top);
+                        }
+                    }
+                }
+                // The field walk normally copied this already. This lookup
+                // also covers a merged field whose widget is the top node.
+                let _ = self.copy_transform_object(&field, &mut orig_to_copy)?;
+            }
+
+            let copied = self
+                .copy_transform_object(&annotation, &mut orig_to_copy)?
+                .expect("stream annotations are filtered before copying");
+            copy_and_transform_appearance_streams(self.pdf, &copied, cm)?;
+            let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
+            copied.replace_key(b"/Rect", rect)?;
+            self.pdf.mark_object_handle_dirty(&copied)?;
+            transformed.new_annotations.push(copied);
+        }
+
+        Ok(transformed)
+    }
+
+    /// Copy annotations from a different PDF, then apply the same per-place
+    /// duplication and geometry transform as [`Self::transform_annotations`].
+    ///
+    /// `copy_foreign_object` owns the source-to-target graph copy and keeps
+    /// source identity stable across the field-tree and annotation passes.
+    /// Source/destination `/DA`, `/Q`, and `/DR` reconciliation is deliberately
+    /// a later slice; this method is the graph/field/appearance foundation for
+    /// the qpdf `copyAnnotations` route.
+    #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
+    pub(crate) fn transform_annotations_from<RS: Read + Seek>(
+        &mut self,
+        old_annots: ObjectHandle,
+        cm: Matrix,
+        source: &mut Pdf<RS>,
+    ) -> Result<AnnotationTransformResult> {
+        let mut transformed = AnnotationTransformResult::default();
+        let source_annotations = {
+            let mut source_helper = AcroFormDocumentHelper::new(source);
+            let old_annots = source_helper
+                .pdf
+                .resolve_object_handle_to_terminal(&old_annots)?;
+            let Some(annotations) = old_annots.try_as_array()? else {
+                return Ok(transformed);
+            };
+            let mut source_annotations = Vec::with_capacity(annotations.len());
+            for annotation in annotations {
+                let annotation = source_helper
+                    .pdf
+                    .resolve_object_handle_to_terminal(&annotation)?;
+                if annotation.as_stream_dict().is_some() {
+                    annotation.warn_if_possible("ignoring annotation that's a stream")?;
+                    continue;
+                }
+                let top_field = source_helper
+                    .canonical_field_for_annotation(annotation.clone())?
+                    .map(|field| source_helper.canonical_top_level_field(field))
+                    .transpose()?;
+                source_annotations.push((annotation, top_field));
+            }
+            source_annotations
+        };
+
+        let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();
+        let mut copied_field_trees = HashSet::<ObjectHandleIdentity>::new();
+        let mut added_new_fields = BTreeSet::new();
+        for (source_annotation, source_top_field) in source_annotations {
+            let source_annotation = ensure_foreign_indirect(source, source_annotation)?;
+            let copied_source_annotation = self.pdf.copy_foreign_object(&source_annotation)?;
+
+            if let Some(source_top_field) = source_top_field {
+                let source_top_field = ensure_foreign_indirect(source, source_top_field)?;
+                let copied_source_top = self.pdf.copy_foreign_object(&source_top_field)?;
+                if copied_field_trees.insert(copied_source_top.identity_key()) {
+                    let copied_top = self.copy_field_tree(&copied_source_top, &mut orig_to_copy)?;
+                    if let Some(copied_ref) = copied_top.object_ref() {
+                        if added_new_fields.insert(copied_ref) {
+                            transformed.new_fields.push(copied_top);
+                        }
+                    }
+                }
+            }
+
+            let copied = self
+                .copy_transform_object(&copied_source_annotation, &mut orig_to_copy)?
+                .expect("stream annotations are filtered before copying");
+            copy_and_transform_appearance_streams(self.pdf, &copied, cm)?;
+            let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
+            copied.replace_key(b"/Rect", rect)?;
+            self.pdf.mark_object_handle_dirty(&copied)?;
+            transformed.new_annotations.push(copied);
+        }
+
+        Ok(transformed)
+    }
+
+    #[allow(dead_code, clippy::mutable_key_type)]
+    fn copy_transform_object(
+        &mut self,
+        source: &ObjectHandle,
+        orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+    ) -> Result<Option<ObjectHandle>> {
+        let source = self.pdf.resolve_object_handle_to_terminal(source)?;
+        let identity = source.identity_key();
+        if let Some(copied) = orig_to_copy.get(&identity) {
+            return Ok(Some(copied.clone()));
+        }
+        if source.as_stream_dict().is_some() {
+            source.warn_if_possible("ignoring annotation that's a stream")?;
+            return Ok(None);
+        }
+        let copied = self
+            .pdf
+            .make_indirect_object_handle(source.shallow_copy()?)?;
+        orig_to_copy.insert(identity, copied.clone());
+        Ok(Some(copied))
+    }
+
+    #[allow(dead_code, clippy::mutable_key_type)]
+    fn canonical_top_level_field(&mut self, start: ObjectHandle) -> Result<ObjectHandle> {
+        let mut current = self.pdf.resolve_object_handle_to_terminal(&start)?;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.identity_key()) {
+                return Ok(current);
+            }
+            let parent = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+            if parent.is_null() || parent.as_dictionary().is_none() {
+                return Ok(current);
+            }
+            current = parent;
+        }
+    }
+
+    #[allow(dead_code, clippy::mutable_key_type)]
+    fn copy_field_tree(
+        &mut self,
+        top_field: &ObjectHandle,
+        orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+    ) -> Result<ObjectHandle> {
+        let copied_top = self
+            .copy_transform_object(top_field, orig_to_copy)?
+            .ok_or_else(|| Error::Unsupported("AcroForm top-level field is a stream".into()))?;
+        let mut queue = VecDeque::from([(top_field.clone(), copied_top.clone())]);
+        let mut seen = HashSet::new();
+
+        while let Some((source, copied)) = queue.pop_front() {
+            let source = self.pdf.resolve_object_handle_to_terminal(&source)?;
+            if !seen.insert(source.identity_key()) {
+                continue;
+            }
+
+            let parent = self
+                .pdf
+                .resolve_object_handle_to_terminal(&copied.try_get_key(b"/Parent")?)?;
+            if !parent.is_null() {
+                if let Some(parent_copy) = orig_to_copy.get(&parent.identity_key()) {
+                    copied.replace_key(b"/Parent", parent_copy.clone())?;
+                    self.pdf.mark_object_handle_dirty(&copied)?;
+                } else {
+                    parent.warn_if_possible(
+                        "while traversing an AcroForm field, found a parent that had not been seen",
+                    )?;
+                }
+            }
+
+            let kids_holder = self
+                .pdf
+                .resolve_object_handle_to_terminal(&copied.try_get_key(b"/Kids")?)?;
+            let Some(kids) = kids_holder.try_as_array()? else {
+                continue;
+            };
+            for (index, kid) in kids.into_iter().enumerate() {
+                let kid = self.pdf.resolve_object_handle_to_terminal(&kid)?;
+                if kid.as_stream_dict().is_some() {
+                    kid.warn_if_possible("ignoring AcroForm field that's a stream")?;
+                    continue;
+                }
+                let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
+                    continue;
+                };
+                kids_holder.set_array_item(index, copied_kid.clone())?;
+                self.pdf.mark_object_handle_dirty(&kids_holder)?;
+                queue.push_back((kid, copied_kid));
+            }
+        }
+
+        Ok(copied_top)
+    }
+
+    /// Append copied top-level fields to `/AcroForm/Fields`, reusing qpdf's
+    /// suffix for every copied field that has the same colliding fully
+    /// qualified name (`QPDFAcroFormDocumentHelper.cc:62-110`).
+    #[allow(dead_code, clippy::mutable_key_type)] // caller cutover lands with the A3 facade
+    pub(crate) fn add_and_rename_form_fields(&mut self, fields: Vec<ObjectHandle>) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        self.analyze()?;
+        let mut existing_names: BTreeSet<String> = self
+            .cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache")
+            .name_to_fields
+            .keys()
+            .cloned()
+            .collect();
+        let mut renames = BTreeMap::<String, Vec<u8>>::new();
+        let mut seen = HashSet::new();
+        let mut queue: VecDeque<ObjectHandle> = fields.iter().cloned().collect();
+
+        while let Some(field) = queue.pop_front() {
+            let field = self.pdf.resolve_object_handle_to_terminal(&field)?;
+            if !seen.insert(field.identity_key()) {
+                continue;
+            }
+
+            let kids = self
+                .pdf
+                .resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
+            if let Some(kids) = kids.try_as_array()? {
+                queue.extend(kids);
+            }
+
+            if !field.try_has_key(b"/T")? {
+                continue;
+            }
+            let old_name = self.canonical_fully_qualified_name(field.clone())?;
+            let append = if let Some(append) = renames.get(&old_name) {
+                append.clone()
+            } else {
+                let mut append = Vec::new();
+                let mut candidate = old_name.clone();
+                let mut suffix = 0_u32;
+                while existing_names.contains(&candidate) {
+                    suffix = suffix.checked_add(1).ok_or_else(|| {
+                        Error::Unsupported("field name suffix space exhausted".into())
+                    })?;
+                    append = format!("+{suffix}").into_bytes();
+                    candidate = old_name.clone();
+                    candidate.push_str(std::str::from_utf8(&append).unwrap_or_default());
+                }
+                renames.insert(old_name.clone(), append.clone());
+                append
+            };
+
+            if !append.is_empty() {
+                let current_name = self
+                    .pdf
+                    .resolve_object_handle_to_terminal(&field.try_get_key(b"/T")?)?;
+                let mut partial = current_name.as_string().unwrap_or_default();
+                partial.extend_from_slice(&append);
+                field.replace_key(
+                    b"/T",
+                    ObjectHandle::string(crate::pdf_string::new_unicode_string(&partial)),
+                )?;
+                self.pdf.mark_object_handle_dirty(&field)?;
+            }
+            let mut final_name = old_name;
+            if !append.is_empty() {
+                final_name.push_str(std::str::from_utf8(&append).unwrap_or_default());
+            }
+            existing_names.insert(final_name);
+        }
+
+        let acroform = self.canonical_get_or_create_acroform()?;
+        let fields_array = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+        let fields_array = if fields_array.as_array().is_some() {
+            fields_array
+        } else {
+            let replacement = ObjectHandle::array(Vec::new());
+            acroform.replace_key(b"/Fields", replacement.clone())?;
+            self.pdf.mark_object_handle_dirty(&acroform)?;
+            replacement
+        };
+        for field in fields {
+            fields_array.append_array_item(field)?;
+        }
+        self.pdf.mark_object_handle_dirty(&fields_array)?;
+        self.pdf.mark_object_handle_dirty(&acroform)?;
+        self.invalidate_cache();
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn canonical_get_or_create_acroform(&mut self) -> Result<ObjectHandle> {
+        let root_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+        let root = self.pdf.get_object_handle(root_ref);
+        let root = self.pdf.resolve_object_handle_to_terminal(&root)?;
+        let acroform = self
+            .pdf
+            .resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+        if acroform.as_dictionary().is_some() {
+            return Ok(acroform);
+        }
+
+        let created = self
+            .pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(Vec::new()),
+            )]))?;
+        root.replace_key(b"/AcroForm", created.clone())?;
+        self.pdf.mark_object_handle_dirty(&root)?;
+        Ok(created)
+    }
+
+    #[allow(dead_code, clippy::mutable_key_type)]
+    fn canonical_fully_qualified_name(&mut self, start: ObjectHandle) -> Result<String> {
+        let mut current = self.pdf.resolve_object_handle_to_terminal(&start)?;
+        let mut seen = HashSet::new();
+        let mut parts = Vec::new();
+        loop {
+            if !seen.insert(current.identity_key()) {
+                break;
+            }
+            let partial = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/T")?)?;
+            if let Some(name) = partial.as_string() {
+                parts.push(decode_field_name(&name));
+            }
+            let parent = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+            if parent.is_null() || parent.as_dictionary().is_none() {
+                break;
+            }
+            current = parent;
+        }
+        parts.reverse();
+        Ok(parts.join("."))
     }
 
     /// Return the live field handle for a widget annotation, mirroring
@@ -1028,6 +1423,103 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
+#[allow(dead_code)]
+fn copy_and_transform_appearance_streams<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    annotation: &ObjectHandle,
+    cm: Matrix,
+) -> Result<()> {
+    let appearance = annotation.try_get_key(b"/AP")?;
+    appearance.try_dereference()?;
+    if appearance.as_dictionary().is_none() {
+        return Ok(());
+    }
+
+    for key in appearance.try_get_keys()? {
+        let entry = appearance.try_get_key(&key)?;
+        entry.try_dereference()?;
+        if entry.as_stream_dict().is_some() {
+            let copied = entry.copy_stream()?;
+            transform_appearance_stream_matrix(&copied, cm)?;
+            pdf.mark_object_handle_dirty(&copied)?;
+            appearance.replace_key(&key, copied)?;
+            pdf.mark_object_handle_dirty(&appearance)?;
+            continue;
+        }
+        if entry.as_dictionary().is_none() {
+            continue;
+        }
+        for state in entry.try_get_keys()? {
+            let stream = entry.try_get_key(&state)?;
+            stream.try_dereference()?;
+            if stream.as_stream_dict().is_some() {
+                let copied = stream.copy_stream()?;
+                transform_appearance_stream_matrix(&copied, cm)?;
+                pdf.mark_object_handle_dirty(&copied)?;
+                entry.replace_key(&state, copied)?;
+                pdf.mark_object_handle_dirty(&entry)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn transform_appearance_stream_matrix(stream: &ObjectHandle, cm: Matrix) -> Result<()> {
+    let Some(dictionary) = stream.as_stream_dict() else {
+        return Ok(());
+    };
+    let matrix = dictionary.try_get_key(b"/Matrix")?;
+    matrix.try_dereference()?;
+    let had_matrix = matrix.as_array().is_some();
+    let mut transformed = if had_matrix {
+        matrix_from_handle(&matrix).unwrap_or_default()
+    } else {
+        Matrix::default()
+    };
+    transformed.concat(cm);
+    if had_matrix || transformed != Matrix::default() {
+        dictionary.replace_key(
+            b"/Matrix",
+            ObjectHandle::array(
+                transformed
+                    .get_as_matrix()
+                    .into_iter()
+                    .map(ObjectHandle::real)
+                    .collect(),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn matrix_from_handle(handle: &ObjectHandle) -> Option<Matrix> {
+    let items = handle.as_array()?;
+    if items.len() != 6 {
+        return None;
+    }
+    let mut numbers = [0.0; 6];
+    for (index, item) in items.iter().enumerate() {
+        numbers[index] = item
+            .as_integer()
+            .map(|value| value as f64)
+            .or_else(|| item.as_real())?;
+    }
+    Some(Matrix::from(numbers))
+}
+
+#[allow(dead_code)]
+fn ensure_foreign_indirect<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    handle: ObjectHandle,
+) -> Result<ObjectHandle> {
+    if handle.object_ref().is_some() {
+        return Ok(handle);
+    }
+    source.make_indirect_object_handle(handle)
+}
+
 /// Resolve one level of indirection for a metadata leaf value. A resolved
 /// `Object::Null` (freed/unknown ref) is treated as absent to match
 /// `inherited_object`'s existing Null handling. A direct (non-reference)
@@ -1073,6 +1565,57 @@ fn inherited_integer<R: Read + Seek>(
     Ok(deref_leaf(pdf, field.get(key).cloned())?
         .as_ref()
         .and_then(Object::as_integer))
+}
+
+#[allow(dead_code)]
+fn transformed_annotation_rectangle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    annotation: &ObjectHandle,
+    cm: Matrix,
+) -> Result<ObjectHandle> {
+    let rect = pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
+    let rectangle = match rect.try_as_array()? {
+        Some(items) if items.len() == 4 => {
+            let mut numbers = [0.0; 4];
+            let mut valid = true;
+            for (index, item) in items.iter().enumerate() {
+                let item = pdf.resolve_object_handle_to_terminal(item)?;
+                if let Some(number) = item
+                    .as_integer()
+                    .map(|value| value as f64)
+                    .or_else(|| item.as_real())
+                {
+                    numbers[index] = number;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                Rectangle::new(
+                    numbers[0].min(numbers[2]),
+                    numbers[1].min(numbers[3]),
+                    numbers[0].max(numbers[2]),
+                    numbers[1].max(numbers[3]),
+                )
+            } else {
+                Rectangle::default()
+            }
+        }
+        _ => Rectangle::default(),
+    };
+    let transformed = cm.transform_rectangle(rectangle);
+    Ok(ObjectHandle::array(
+        [
+            transformed.llx,
+            transformed.lly,
+            transformed.urx,
+            transformed.ury,
+        ]
+        .into_iter()
+        .map(ObjectHandle::real)
+        .collect(),
+    ))
 }
 
 fn is_pure_widget_annotation(field: &Dictionary) -> bool {
@@ -2075,6 +2618,296 @@ mod tests {
             .annotation_to_field_map()
             .expect("a malformed indirect /AcroForm must degrade to an empty map, not Err");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn transform_annotations_copies_and_transforms_a_plain_annotation() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Text".to_vec())),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(1),
+                        Object::Integer(2),
+                        Object::Integer(11),
+                        Object::Integer(22),
+                    ]),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
+        );
+
+        let old_annots = pdf.get_object_handle(ObjectRef::new(6, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let transformed = helper
+            .transform_annotations(old_annots, crate::Matrix::new(2.0, 0.0, 0.0, 2.0, 3.0, 4.0))
+            .unwrap();
+
+        assert!(transformed.new_fields.is_empty());
+        assert!(transformed.old_fields.is_empty());
+        assert_eq!(transformed.new_annotations.len(), 1);
+        let copied = &transformed.new_annotations[0];
+        assert_ne!(copied.object_ref(), Some(ObjectRef::new(5, 0)));
+        let rect = copied
+            .try_get_key(b"/Rect")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        let coordinates: Vec<_> = rect
+            .iter()
+            .map(|item| {
+                item.as_integer()
+                    .map(|value| value as f64)
+                    .or_else(|| item.as_real())
+            })
+            .collect();
+        assert_eq!(
+            coordinates,
+            vec![Some(5.0), Some(8.0), Some(25.0), Some(48.0)]
+        );
+    }
+
+    #[test]
+    fn transform_annotations_copies_a_widget_field_tree_and_rewrites_parent_links() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                ("Annots", refs(&[9])),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("FT", Object::Name(b"Tx".to_vec())),
+                ("T", Object::String(b"field".to_vec())),
+                ("Kids", refs(&[9])),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(7, 0))),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(10),
+                        Object::Integer(20),
+                        Object::Integer(30),
+                        Object::Integer(40),
+                    ]),
+                ),
+            ])),
+        );
+        let old_annots = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let old_annots = old_annots
+            .try_get_key(b"/Annots")
+            .expect("page annotations");
+
+        let transformed = AcroFormDocumentHelper::new(&mut pdf)
+            .transform_annotations(old_annots, Matrix::default())
+            .unwrap();
+
+        assert_eq!(
+            transformed.old_fields,
+            BTreeSet::from([ObjectRef::new(7, 0)])
+        );
+        assert_eq!(transformed.new_fields.len(), 1);
+        assert_eq!(transformed.new_annotations.len(), 1);
+        let copied_field = transformed.new_fields[0].clone();
+        let copied_widget = transformed.new_annotations[0].clone();
+        assert_ne!(copied_field.object_ref(), Some(ObjectRef::new(7, 0)));
+        assert_ne!(copied_widget.object_ref(), Some(ObjectRef::new(9, 0)));
+
+        let copied_parent = copied_widget.try_get_key(b"/Parent").unwrap().object_ref();
+        assert_eq!(copied_parent, copied_field.object_ref());
+        let copied_kids = copied_field
+            .try_get_key(b"/Kids")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied_kids[0].object_ref(), copied_widget.object_ref());
+
+        let copied_field_ref = copied_field.object_ref().unwrap();
+        {
+            let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+            helper
+                .add_and_rename_form_fields(vec![copied_field.clone()])
+                .unwrap();
+        }
+        let renamed = pdf.get_object_handle(copied_field_ref);
+        let renamed_name = renamed.try_get_key(b"/T").unwrap().as_string().unwrap();
+        assert_eq!(renamed_name, b"field+1");
+    }
+
+    #[test]
+    fn transform_annotations_copies_appearance_streams_and_concatenates_matrix() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(
+                dict(&[
+                    ("Subtype", Object::Name(b"Form".to_vec())),
+                    (
+                        "Matrix",
+                        Object::Array(vec![
+                            Object::Integer(1),
+                            Object::Integer(0),
+                            Object::Integer(0),
+                            Object::Integer(1),
+                            Object::Integer(2),
+                            Object::Integer(3),
+                        ]),
+                    ),
+                    ("Length", Object::Integer(0)),
+                ]),
+                Vec::new(),
+            )),
+        );
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Text".to_vec())),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(1),
+                        Object::Integer(2),
+                        Object::Integer(11),
+                        Object::Integer(22),
+                    ]),
+                ),
+                (
+                    "AP",
+                    Object::Dictionary(dict(&[("N", Object::Reference(ObjectRef::new(5, 0)))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(10, 0),
+            Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]),
+        );
+
+        let old_annots = pdf.get_object_handle(ObjectRef::new(10, 0));
+        let transformed = AcroFormDocumentHelper::new(&mut pdf)
+            .transform_annotations(old_annots, Matrix::new(2.0, 0.0, 0.0, 2.0, 1.0, 1.0))
+            .unwrap();
+        let copied = transformed.new_annotations[0].clone();
+        let ap = copied.try_get_key(b"/AP").unwrap();
+        let normal = ap.try_get_key(b"/N").unwrap();
+        assert_ne!(normal.object_ref(), Some(ObjectRef::new(5, 0)));
+        let matrix = normal
+            .as_stream_dict()
+            .unwrap()
+            .try_get_key(b"/Matrix")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        let matrix: Vec<_> = matrix
+            .iter()
+            .map(|item| {
+                item.as_integer()
+                    .map(|value| value as f64)
+                    .or_else(|| item.as_real())
+            })
+            .collect();
+        assert_eq!(
+            matrix,
+            vec![
+                Some(2.0),
+                Some(0.0),
+                Some(0.0),
+                Some(2.0),
+                Some(3.0),
+                Some(4.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn transform_annotations_from_copies_a_foreign_annotation_before_transforming_it() {
+        let mut source = empty_pdf();
+        source.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Link".to_vec())),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(1),
+                        Object::Integer(2),
+                        Object::Integer(11),
+                        Object::Integer(22),
+                    ]),
+                ),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(10, 0),
+            Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]),
+        );
+        let source_annots = source.get_object_handle(ObjectRef::new(10, 0));
+        let source_annotation = source.get_object_handle(ObjectRef::new(9, 0));
+
+        let mut target = empty_pdf();
+        let transformed = AcroFormDocumentHelper::new(&mut target)
+            .transform_annotations_from(
+                source_annots,
+                Matrix::new(2.0, 0.0, 0.0, 2.0, 3.0, 4.0),
+                &mut source,
+            )
+            .unwrap();
+
+        let copied = &transformed.new_annotations[0];
+        assert_ne!(copied.object_ref(), source_annotation.object_ref());
+        let rect = copied
+            .try_get_key(b"/Rect")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        let coordinates: Vec<_> = rect
+            .iter()
+            .map(|item| {
+                item.as_integer()
+                    .map(|value| value as f64)
+                    .or_else(|| item.as_real())
+            })
+            .collect();
+        assert_eq!(
+            coordinates,
+            vec![Some(5.0), Some(8.0), Some(25.0), Some(48.0)]
+        );
     }
 
     #[test]
