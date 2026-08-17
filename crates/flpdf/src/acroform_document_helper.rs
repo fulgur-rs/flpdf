@@ -472,8 +472,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         if added_new_fields.insert(copied_ref) {
                             transformed.new_fields.push(copied_top);
                         }
+                        // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts; insertion path is exercised above.
                     }
-                    // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts; insertion path is exercised above.
                 }
                 // cov:ignore-end
                 // The field walk normally copied this already. This lookup
@@ -552,8 +552,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         if added_new_fields.insert(copied_ref) {
                             transformed.new_fields.push(copied_top);
                         }
+                        // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts; insertion path is exercised above.
                     }
-                    // cov:ignore-start: inner-if closing braces are llvm-cov region artifacts; insertion path is exercised above.
                 }
                 // cov:ignore-end
             }
