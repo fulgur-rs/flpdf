@@ -87,13 +87,17 @@ fn annotation_subtype_returns_name_bytes() {
 }
 
 #[test]
-fn annotation_subtype_absent_returns_empty() {
+fn annotation_subtype_absent_returns_the_qpdf_fake_name_sentinel() {
+    // qpdf's `getSubtype` unconditionally calls `getName()`, which returns
+    // the dummy name `"/QPDFFakeName"` (leading `/` stripped by this
+    // crate's convention) rather than an empty string when `/Subtype` is
+    // absent (`libqpdf/QPDFObjectHandle.cc:634-643`).
     let bytes = build_annotation_pdf("/Rect [0 0 100 100]");
     let mut pdf = open(bytes);
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
-        Vec::<u8>::new()
+        b"QPDFFakeName".to_vec()
     );
 }
 
@@ -119,7 +123,7 @@ fn annotation_subtype_follows_indirect_name() {
 }
 
 #[test]
-fn annotation_subtype_indirect_non_name_returns_empty() {
+fn annotation_subtype_indirect_non_name_returns_the_qpdf_fake_name_sentinel() {
     let bytes = build_pdf(vec![
         (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
         (2, b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>".to_vec()),
@@ -135,7 +139,7 @@ fn annotation_subtype_indirect_non_name_returns_empty() {
 
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
-        Vec::<u8>::new()
+        b"QPDFFakeName".to_vec()
     );
 }
 
@@ -953,7 +957,7 @@ fn annotation_helper_on_non_dict_returns_defaults() {
     let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(
         annot.get_subtype().expect("get_subtype()"),
-        Vec::<u8>::new()
+        b"QPDFFakeName".to_vec()
     );
     assert_eq!(
         annot.get_rect().expect("get_rect()"),

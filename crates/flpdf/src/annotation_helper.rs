@@ -17,10 +17,12 @@
 //!   without walking any `/Parent` chain (per ISO 32000-1 §12.5, these keys
 //!   are not inheritable).
 //! - Accessors are **fail-soft**, matching qpdf: a missing key or a value of
-//!   the wrong type yields a default (empty name, zero flags, a
-//!   `(0, 0, 0, 0)` rectangle, a null handle) rather than an error. Only an
-//!   I/O, parse, filter, or decryption failure while resolving an
-//!   [`ObjectHandle`] surfaces as `Err`.
+//!   the wrong type yields a default (zero flags, a `(0, 0, 0, 0)` rectangle,
+//!   a null handle) rather than an error. Only an I/O, parse, filter, or
+//!   decryption failure while resolving an [`ObjectHandle`] surfaces as
+//!   `Err`. [`AnnotationObjectHelper::get_subtype`] is the one exception:
+//!   qpdf's own `getSubtype` skips the type check its siblings perform, so
+//!   it defaults to qpdf's dummy-name sentinel rather than an empty name.
 //! - `/Rect` reuses [`PageBox`] from [`crate::page_object_helper`].
 //!
 //! # Examples
@@ -88,6 +90,13 @@ impl AppearanceContentOverrides {
     }
 }
 
+/// qpdf's `QPDFObjectHandle::getName` dummy-name sentinel
+/// (`libqpdf/QPDFObjectHandle.cc:634-643`), returned in place of an error
+/// when a name accessor runs on a non-name value. The crate's own name
+/// accessors strip the leading `/` that qpdf's C++ literal `"/QPDFFakeName"`
+/// carries.
+const QPDF_FAKE_NAME: &[u8] = b"QPDFFakeName";
+
 impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// Construct a new helper for the annotation at `annot_ref`.
     ///
@@ -124,9 +133,14 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// `b"Widget"`, etc. (ISO 32000-1 Table 169).
     ///
     /// Mirrors `QPDFAnnotationObjectHelper::getSubtype`
-    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:14-17`): returns an empty
-    /// `Vec` when `/Subtype` is absent or not a name, never an error for
-    /// that reason.
+    /// (`libqpdf/QPDFAnnotationObjectHelper.cc:14-17`), which unconditionally
+    /// calls `QPDFObjectHandle::getName` without checking the key's type
+    /// first (unlike this crate's [`Self::get_appearance_state`] and
+    /// [`Self::get_flags`]). When `/Subtype` is absent or not a name,
+    /// `getName` returns qpdf's dummy-name sentinel `"QPDFFakeName"` (with
+    /// its leading `/` stripped, matching this crate's other name
+    /// accessors) rather than an empty `Vec`, and never an error for that
+    /// reason.
     ///
     /// # Errors
     ///
@@ -149,7 +163,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         Ok(self
             .resolved_key(b"/Subtype")?
             .as_name()
-            .unwrap_or_default())
+            .unwrap_or_else(|| QPDF_FAKE_NAME.to_vec()))
     }
 
     // -----------------------------------------------------------------------
