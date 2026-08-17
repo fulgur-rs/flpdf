@@ -742,16 +742,38 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
             continue; // cov:ignore: selected appearance must be a stream
         };
         let resources = appearance_dict.try_get_key(b"/Resources")?;
-        pdf.resolve_object_handle(&resources)?;
-        let resources = if resources.as_dictionary().is_some() {
-            resources
+        // qpdf privatizes an indirect appearance /Resources before merging DR
+        // in (`QPDFPageDocumentHelper.cc:108-113`): the merge target must be
+        // a private, direct copy so `mergeResources` -- which mutates its
+        // receiver in place -- never writes into an object another
+        // appearance stream (or anything else) might also reference. This
+        // runs unconditionally on any indirect /Resources, even a malformed
+        // (non-dictionary) one: qpdf's own `isIndirect()` check precedes any
+        // dictionary check, and `mergeResources` itself is a safe no-op on a
+        // non-dictionary receiver (`QPDFObjectHandle.cc:1066-1068`).
+        //
+        // `is_indirect()` is read before resolution -- it reflects how
+        // /Resources was *stored*, matching qpdf's `getKey` result -- but
+        // `shallow_copy` (unlike qpdf's self-resolving `shallowCopy`) reads
+        // whatever value is already resolved and does not fetch on its own,
+        // so the handle must be resolved to its terminal value first.
+        let was_indirect = resources.is_indirect();
+        let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
+        let resources = if was_indirect {
+            let privatized = resources.shallow_copy()?;
+            appearance_dict.replace_key(b"/Resources", privatized.clone())?;
+            // Mark the owning appearance stream dirty immediately: a
+            // malformed (non-dictionary) privatized value still falls
+            // through to the `continue` below, and the /Resources rewrite
+            // must persist even on that path.
+            pdf.mark_object_handle_dirty(&appearance)?;
+            privatized
         } else {
-            let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
-            if resources.as_dictionary().is_none() {
-                continue; // cov:ignore: malformed appearance resources are ignored
-            }
             resources
         };
+        if resources.as_dictionary().is_none() {
+            continue; // cov:ignore: malformed appearance resources are ignored
+        }
         pdf.resolve_object_handle(default_resources)?;
         if default_resources.as_dictionary().is_none() {
             continue; // cov:ignore: malformed AcroForm DR is ignored like qpdf
@@ -1283,6 +1305,96 @@ mod tests {
             error,
             Error::System(message) if message == "stream objects cannot be cloned"
         ));
+    }
+
+    #[test]
+    fn qpdf_flatten_privatizes_an_indirect_appearance_resources_before_merging() {
+        // qpdf privatizes an indirect appearance /Resources before merging DR
+        // in (`QPDFPageDocumentHelper.cc:108-113`): `isIndirect()` triggers a
+        // `shallowCopy()` that becomes a fresh direct value on the
+        // appearance's own dict, so `mergeResources` -- which mutates its
+        // receiver in place -- never writes into an object another
+        // appearance (or anything else) might also reference. Two widgets
+        // share one indirect /Resources object here; after the merge each
+        // appearance must hold its own privatized copy, and the original
+        // shared object must be untouched.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R 6 0 R]", &[]))).unwrap();
+        let mut shared_resources = Dictionary::new();
+        shared_resources.insert("Font", Object::Reference(ObjectRef::new(20, 0)));
+        pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(shared_resources));
+        let mut shared_font = Dictionary::new();
+        shared_font.insert("F1", Object::Integer(41));
+        pdf.set_object(ObjectRef::new(20, 0), Object::Dictionary(shared_font));
+
+        let mut appearance1 = Dictionary::new();
+        appearance1.insert("Resources", Object::Reference(ObjectRef::new(9, 0)));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance1, Vec::new())),
+        );
+        let mut ap1 = Dictionary::new();
+        ap1.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget1 = Dictionary::new();
+        widget1.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget1.insert("AP", Object::Dictionary(ap1));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget1));
+
+        let mut appearance2 = Dictionary::new();
+        appearance2.insert("Resources", Object::Reference(ObjectRef::new(9, 0)));
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Stream(Stream::new(appearance2, Vec::new())),
+        );
+        let mut ap2 = Dictionary::new();
+        ap2.insert("N", Object::Reference(ObjectRef::new(7, 0)));
+        let mut widget2 = Dictionary::new();
+        widget2.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget2.insert("AP", Object::Dictionary(ap2));
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(widget2));
+
+        let mut fonts = Dictionary::new();
+        fonts.insert("Helv", Object::Integer(42));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert("Font", Object::Dictionary(fonts));
+        let default_resources = pdf
+            .lift_object_to_handle(&Object::Dictionary(default_resources))
+            .unwrap();
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .unwrap();
+
+        for appearance_ref in [ObjectRef::new(5, 0), ObjectRef::new(7, 0)] {
+            let Object::Stream(appearance) = pdf.resolve(appearance_ref).unwrap() else {
+                panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+            };
+            let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+                panic!("resources must be privatized"); // cov:ignore: fixture invariant
+            };
+            let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+                panic!("resources must retain merged fonts"); // cov:ignore: fixture invariant
+            };
+            assert_eq!(fonts.get("F1"), Some(&Object::Integer(41)));
+            assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
+        }
+
+        let Object::Dictionary(original_resources) = pdf.resolve(ObjectRef::new(9, 0)).unwrap()
+        else {
+            panic!("original shared resources must remain a dictionary"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            original_resources.get("Font"),
+            Some(&Object::Reference(ObjectRef::new(20, 0))),
+            "shared resources object must keep its own indirect Font reference, unmerged"
+        );
+        let Object::Dictionary(original_font) = pdf.resolve(ObjectRef::new(20, 0)).unwrap() else {
+            panic!("original shared font dictionary must remain a dictionary"); // cov:ignore: fixture invariant
+        };
+        let mut expected_original_font = Dictionary::new();
+        expected_original_font.insert("F1", Object::Integer(41));
+        assert_eq!(
+            original_font, expected_original_font,
+            "shared font dictionary must not gain DR's Helv entry"
+        );
     }
 
     #[test]
