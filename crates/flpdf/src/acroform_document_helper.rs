@@ -232,6 +232,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.canonical_acroform()? else {
             return Ok(annotation_to_field);
         };
+        // Mirrors qpdf's combined `acroform.isDictionary() && acroform.hasKey("/Fields")`
+        // guard (`QPDFAcroFormDocumentHelper.cc:241-243`): an `/AcroForm` dictionary
+        // without a `/Fields` key skips both the field traversal and the
+        // orphan-widget fallback below, not just the traversal.
+        if !acroform.try_has_key(b"/Fields")? {
+            return Ok(annotation_to_field);
+        }
         let fields = self
             .pdf
             .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
@@ -1724,6 +1731,50 @@ mod tests {
             .annotation_to_field_map()
             .unwrap();
         assert_eq!(map.get(&ObjectRef::new(5, 0)), Some(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn annotation_to_field_map_skips_orphan_widget_fallback_without_fields_key() {
+        // qpdf's analyze() (QPDFAcroFormDocumentHelper.cc:241-243) returns
+        // before the field traversal AND the orphan-widget fallback when
+        // /AcroForm lacks a /Fields key entirely -- a page-level orphan
+        // widget must NOT be self-mapped in that case.
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("NeedAppearances", Object::Boolean(true))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                ("Annots", refs(&[5])),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
+        );
+
+        let map = AcroFormDocumentHelper::new(&mut pdf)
+            .annotation_to_field_map()
+            .unwrap();
+        assert!(map.is_empty());
     }
 
     #[test]
