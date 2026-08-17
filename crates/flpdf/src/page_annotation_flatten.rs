@@ -719,25 +719,53 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
         };
         for (category, source) in default_resources.iter() {
             let (source, _) = resolve_ref_chain(pdf, source)?;
-            let Object::Dictionary(source) = source else {
-                continue; // cov:ignore: qpdf ignores non-dictionary default resource categories
+            let Some(existing) = resources.get(category).cloned() else {
+                // qpdf `replaceKey(rtype, other_val.shallowCopy())`: a category
+                // absent from the destination is installed wholesale,
+                // regardless of its type (QPDFObjectHandle.cc:1144-1146).
+                resources.insert(category, source);
+                continue;
             };
-            let mut destination = match resources.remove(category) {
-                Some(Object::Dictionary(dict)) => dict,
-                Some(Object::Reference(reference)) => {
-                    match resolve_ref_chain(pdf, &Object::Reference(reference))?.0 {
-                        Object::Dictionary(dict) => dict,
-                        _ => Dictionary::new(), // cov:ignore: malformed category holder is replaced
+            let (existing, _) = resolve_ref_chain(pdf, &existing)?;
+            match (existing, source) {
+                (Object::Dictionary(mut destination), Object::Dictionary(source)) => {
+                    for (name, value) in source.iter() {
+                        if destination.get(name).is_none() {
+                            destination.insert(name, value.clone());
+                        }
                     }
+                    resources.insert(category, Object::Dictionary(destination));
                 }
-                _ => Dictionary::new(), // cov:ignore: absent or invalid category is materialized
-            };
-            for (name, value) in source.iter() {
-                if destination.get(name).is_none() {
-                    destination.insert(name, value.clone());
+                (Object::Array(mut destination), Object::Array(source)) => {
+                    // qpdf's array branch (QPDFObjectHandle.cc:1130-1147):
+                    // dedupe by scalar identity, then append names/values from
+                    // `source` the destination doesn't already carry. Used for
+                    // array-shaped categories such as `/ProcSet`.
+                    let mut seen = Vec::with_capacity(destination.len());
+                    for item in &destination {
+                        let Some(key) = resource_array_scalar_key(pdf, item)? else {
+                            continue;
+                        };
+                        seen.push(key);
+                    }
+                    for item in source {
+                        let Some(key) = resource_array_scalar_key(pdf, &item)? else {
+                            continue;
+                        };
+                        if seen.contains(&key) {
+                            continue;
+                        }
+                        seen.push(key);
+                        destination.push(item);
+                    }
+                    resources.insert(category, Object::Array(destination));
                 }
+                // Neither both-dictionary nor both-array: qpdf's `if`/`else
+                // if` ladder falls through without touching `this_val`
+                // (QPDFObjectHandle.cc:1083-1147), so the destination category
+                // is left exactly as it already was.
+                _ => {}
             }
-            resources.insert(category, Object::Dictionary(destination));
         }
         appearance
             .dict
@@ -745,6 +773,35 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
         pdf.set_object(appearance_ref, Object::Stream(appearance));
     }
     Ok(())
+}
+
+/// A resource-array item's dedup/append identity, mirroring qpdf's
+/// `isScalar()` gate on `QPDFObjectHandle::mergeResources`'s array branch
+/// (`QPDFObjectHandle.cc:1130-1147`): scalar-ness is decided on the
+/// *resolved* value, but the returned key is the original (possibly
+/// indirect) `item`, matching `unparse()`'s indirect-identity-preserving
+/// serialization used there for equality. Non-scalar items (arrays,
+/// dictionaries, streams) are excluded from both the dedup set and the
+/// merge, exactly as `other_item.isScalar()` gates qpdf's `appendItem` call.
+fn resource_array_scalar_key<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    item: &Object,
+) -> Result<Option<Object>> {
+    let (resolved, _) = resolve_ref_chain(pdf, item)?;
+    let is_scalar = match resolved {
+        Object::Null
+        | Object::Boolean(_)
+        | Object::Integer(_)
+        | Object::Real(_)
+        | Object::RealLiteral { .. }
+        | Object::Name(_)
+        | Object::String(_) => true,
+        Object::Array(_) | Object::Dictionary(_) | Object::Stream(_) | Object::Reference(_) => {
+            false
+        }
+        Object::Operator(_) | Object::InlineImage(_) => false, // cov:ignore: content-stream-only variants never appear inside a parsed resource array
+    };
+    Ok(is_scalar.then(|| item.clone()))
 }
 
 fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
@@ -1229,6 +1286,214 @@ mod tests {
         assert_eq!(
             fonts.get("F1"),
             Some(&Object::Reference(ObjectRef::new(7, 0)))
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_installs_an_array_default_resource_category_absent_from_the_appearance() {
+        // qpdf `replaceKey(rtype, other_val.shallowCopy())`
+        // (QPDFObjectHandle.cc:1144-1146): a category absent from the
+        // destination is installed wholesale, regardless of its type. Before
+        // this fix, an array-shaped `/DR` category such as `/ProcSet` was
+        // silently dropped because the merge loop required the source to be
+        // a dictionary before even checking whether the destination had the
+        // category.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        // qpdf's `mergeResources` is a no-op unless the appearance stream
+        // already has a (possibly empty) `/Resources` dictionary --
+        // `getKey("/Resources")` on an absent key returns a null handle, and
+        // `mergeResources` returns immediately when the receiver isn't a
+        // dictionary (QPDFObjectHandle.cc:1063-1069).
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Name(b"Text".to_vec()),
+            ]),
+        );
+
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &Object::Dictionary(default_resources),
+        )
+        .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must gain a resources dictionary"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            resources.get("ProcSet"),
+            Some(&Object::Array(vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Name(b"Text".to_vec())
+            ]))
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_merges_an_array_default_resource_category_deduping_existing_scalars() {
+        // qpdf's array branch (QPDFObjectHandle.cc:1130-1147): append only
+        // the source scalars the destination doesn't already carry, keeping
+        // the destination's own items untouched.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Name(b"Text".to_vec()),
+            ]),
+        );
+
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &Object::Dictionary(default_resources),
+        )
+        .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            resources.get("ProcSet"),
+            Some(&Object::Array(vec![
+                Object::Name(b"PDF".to_vec()),
+                Object::Name(b"Text".to_vec())
+            ])),
+            "the existing /PDF entry must not duplicate, and /Text must be appended"
+        );
+    }
+
+    #[test]
+    fn qpdf_flatten_leaves_a_type_mismatched_default_resource_category_untouched() {
+        // qpdf's `if`/`else if` ladder (QPDFObjectHandle.cc:1083-1147) only
+        // mutates `this_val` when both sides are dictionaries or both sides
+        // are arrays; any other combination leaves the destination category
+        // exactly as it already was.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("ProcSet", Object::Integer(7));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+        );
+
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &Object::Dictionary(default_resources),
+        )
+        .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(resources.get("ProcSet"), Some(&Object::Integer(7)));
+    }
+
+    #[test]
+    fn qpdf_flatten_array_merge_excludes_non_scalar_items() {
+        // qpdf's array branch only considers `isScalar()` items for both the
+        // dedup set and the append (QPDFObjectHandle.cc:1130-1147); a
+        // non-scalar item such as a nested array or dictionary is excluded
+        // from the merge entirely, on either side.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Array(vec![Object::Integer(1)])]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Dictionary(Dictionary::new())]),
+        );
+
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &Object::Dictionary(default_resources),
+        )
+        .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            resources.get("ProcSet"),
+            Some(&Object::Array(vec![Object::Array(vec![Object::Integer(
+                1
+            )])])),
+            "the existing non-scalar item survives; the source's non-scalar item is not appended"
         );
     }
 
