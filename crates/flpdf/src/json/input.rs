@@ -20,24 +20,40 @@ use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 
 const STREAM_PROVIDER_BUFFER_SIZE: usize = 8192;
 
+/// Outcome of matching qpdf's `N G R` indirect-reference shape
+/// (`is_indirect_object`, `libqpdf/QPDF_json.cc:66-104`).
+///
+/// Once the digit/space/`R` shape matches, qpdf unconditionally calls
+/// `QUtil::string_to_int` on both the object and generation digit runs.
+/// That conversion can itself overflow and throw (see
+/// [`qpdf_string_to_int_checked`]), which is a fatal error, not "this
+/// string isn't an indirect reference" -- callers must not collapse
+/// [`Overflow`](IndirectReferenceParse::Overflow) into
+/// [`NoMatch`](IndirectReferenceParse::NoMatch).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IndirectReferenceParse {
+    NoMatch,
+    Overflow(String),
+    Reference(ObjectRef),
+}
+
 /// Parse qpdf's exact JSON indirect-reference spelling.
 ///
 /// This intentionally accepts only ASCII spaces between the three tokens,
 /// matching `QPDF_json.cc:is_indirect_object`: tabs and other JSON whitespace
 /// are not accepted by this validator.
-pub(crate) fn parse_indirect_reference(value: &[u8]) -> Option<ObjectRef> {
+pub(crate) fn parse_indirect_reference(value: &[u8]) -> IndirectReferenceParse {
     let mut cursor = 0;
     let object_start = cursor;
     while value.get(cursor).is_some_and(|byte| byte.is_ascii_digit()) {
         cursor += 1;
     }
     if cursor == object_start || value.get(cursor) != Some(&b' ') {
-        return None;
+        return IndirectReferenceParse::NoMatch;
     }
-    let object = std::str::from_utf8(&value[object_start..cursor])
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
+    let Ok(object_text) = std::str::from_utf8(&value[object_start..cursor]) else {
+        return IndirectReferenceParse::NoMatch;
+    };
 
     while value.get(cursor) == Some(&b' ') {
         cursor += 1;
@@ -47,34 +63,45 @@ pub(crate) fn parse_indirect_reference(value: &[u8]) -> Option<ObjectRef> {
         cursor += 1;
     }
     if cursor == generation_start || value.get(cursor) != Some(&b' ') {
-        return None;
+        return IndirectReferenceParse::NoMatch;
     }
-    let generation = std::str::from_utf8(&value[generation_start..cursor])
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
+    let Ok(generation_text) = std::str::from_utf8(&value[generation_start..cursor]) else {
+        return IndirectReferenceParse::NoMatch;
+    };
 
     while value.get(cursor) == Some(&b' ') {
         cursor += 1;
     }
     if value.get(cursor) != Some(&b'R') || cursor + 1 != value.len() {
-        return None;
+        return IndirectReferenceParse::NoMatch;
     }
 
+    let object = match qpdf_string_to_int_checked(object_text) {
+        QpdfIntParse::Overflow(message) => return IndirectReferenceParse::Overflow(message),
+        QpdfIntParse::Value(value) => value,
+        QpdfIntParse::NoDigits => return IndirectReferenceParse::NoMatch,
+    };
+    let generation = match qpdf_string_to_int_checked(generation_text) {
+        QpdfIntParse::Overflow(message) => return IndirectReferenceParse::Overflow(message),
+        QpdfIntParse::Value(value) => value,
+        QpdfIntParse::NoDigits => return IndirectReferenceParse::NoMatch,
+    };
+
     if object == 0 {
-        return None;
+        return IndirectReferenceParse::NoMatch;
     }
-    Some(ObjectRef::new(
-        u32::try_from(object).ok()?,
-        u16::try_from(generation).ok()?,
-    ))
+    let (Ok(object), Ok(generation)) = (u32::try_from(object), u16::try_from(generation)) else {
+        return IndirectReferenceParse::NoMatch;
+    };
+    IndirectReferenceParse::Reference(ObjectRef::new(object, generation))
 }
 
 /// Parse qpdf's `obj:N G R` object-key spelling.
-pub(crate) fn parse_object_key(value: &[u8]) -> Option<ObjectRef> {
-    value
-        .strip_prefix(b"obj:")
-        .and_then(parse_indirect_reference)
+pub(crate) fn parse_object_key(value: &[u8]) -> IndirectReferenceParse {
+    match value.strip_prefix(b"obj:") {
+        Some(rest) => parse_indirect_reference(rest),
+        None => IndirectReferenceParse::NoMatch,
+    }
 }
 
 /// Create qpdf's lazy provider for a JSON `stream.data` string.
@@ -273,19 +300,23 @@ fn json_number_to_handle<R: Read + Seek + 'static>(
             .direct_object_handle(ObjectValue::Integer(integer)));
     }
 
-    let real = text
-        .parse::<f64>()
-        .map_err(|_| Error::Unsupported("invalid JSON number".into()))?;
-    if !real.is_finite() {
-        return Err(Error::Unsupported("invalid JSON number".into()));
-    }
+    // qpdf's real branch (QPDF_json.cc:750-764) reformats scientific
+    // notation through std::stod, but a stod failure -- including overflow
+    // to infinity -- is caught and the original text is kept unchanged:
+    // qpdf never rejects a syntactically valid JSON number here. A
+    // non-scientific literal is never even attempted: its original text
+    // becomes the Real's value verbatim, regardless of magnitude.
     let literal = if text.contains(['e', 'E']) {
-        format_qpdf_real(real)
+        match text.parse::<f64>() {
+            Ok(value) if value.is_finite() => format_qpdf_real(value),
+            _ => text.to_owned(),
+        }
     } else {
         text.to_owned()
     };
+    let value = text.parse::<f64>().unwrap_or(f64::NAN);
     Ok(pdf.resolver.direct_object_handle(ObjectValue::RealLiteral {
-        value: real,
+        value,
         literal: literal.into_bytes(),
     }))
 }
@@ -294,8 +325,12 @@ fn json_string_to_handle<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     string: &[u8],
 ) -> Result<ObjectHandle> {
-    if let Some(object_ref) = parse_indirect_reference(string) {
-        return Ok(pdf.resolver.reserve_object_if_not_exists(object_ref));
+    match parse_indirect_reference(string) {
+        IndirectReferenceParse::Reference(object_ref) => {
+            return Ok(pdf.resolver.reserve_object_if_not_exists(object_ref));
+        }
+        IndirectReferenceParse::Overflow(message) => return Err(Error::System(message)),
+        IndirectReferenceParse::NoMatch => {}
     }
 
     if let Some(unicode) = string.strip_prefix(b"u:") {
@@ -732,11 +767,23 @@ where
                 }
                 b"jsonversion" => {
                     self.saw_json_version = true;
-                    if value
-                        .get_number()
-                        .and_then(|number| qpdf_string_to_int(&number))
-                        != Some(2)
-                    {
+                    let mut overflow = None;
+                    let okay = value.get_number().is_some_and(|number| {
+                        let Ok(text) = std::str::from_utf8(&number) else {
+                            return false;
+                        };
+                        match qpdf_string_to_int_checked(text) {
+                            QpdfIntParse::Value(2) => true,
+                            QpdfIntParse::Overflow(message) => {
+                                overflow = Some(message);
+                                true
+                            }
+                            QpdfIntParse::Value(_) | QpdfIntParse::NoDigits => false,
+                        }
+                    });
+                    if let Some(message) = overflow {
+                        self.fatal(message);
+                    } else if !okay {
                         self.error(
                             value.start(),
                             "invalid JSON version (must be numeric value 2)",
@@ -774,21 +821,28 @@ where
                     self.saw_trailer = true;
                     self.cur_object = "trailer".to_owned();
                     self.set_next_state_if_dictionary("trailer", value, ReactorState::Trailer);
-                } else if let Some(object_ref) = parse_object_key(key) {
-                    self.cur_object = String::from_utf8_lossy(key).into_owned();
-                    if self.set_next_state_if_dictionary(
-                        &self.cur_object.clone(),
-                        value,
-                        ReactorState::ObjectTop,
-                    ) {
-                        self.next_obj =
-                            Some(self.pdf.resolver.reserve_object_if_not_exists(object_ref));
-                    }
                 } else {
-                    self.error(
-                        value.start(),
-                        "object key should be \"trailer\" or \"obj:n n R\"",
-                    );
+                    match parse_object_key(key) {
+                        IndirectReferenceParse::Reference(object_ref) => {
+                            self.cur_object = String::from_utf8_lossy(key).into_owned();
+                            if self.set_next_state_if_dictionary(
+                                &self.cur_object.clone(),
+                                value,
+                                ReactorState::ObjectTop,
+                            ) {
+                                self.next_obj = Some(
+                                    self.pdf.resolver.reserve_object_if_not_exists(object_ref),
+                                );
+                            }
+                        }
+                        IndirectReferenceParse::Overflow(message) => self.fatal(message),
+                        IndirectReferenceParse::NoMatch => {
+                            self.error(
+                                value.start(),
+                                "object key should be \"trailer\" or \"obj:n n R\"",
+                            );
+                        }
+                    }
                 }
             }
             ReactorState::ObjectTop => {
@@ -813,7 +867,10 @@ where
                                 return; // cov:ignore: stream objects originate from an indirect obj:N G R key
                             };
                             match self.pdf.replace_object_handle(object_ref, replacement) {
-                                Ok(target) => self.next_obj = Some(target),
+                                Ok(target) => {
+                                    self.set_object_description(&target, value);
+                                    self.next_obj = Some(target);
+                                }
                                 Err(error) => self.fatal(error.to_string()), // cov:ignore: replacement is a same-Pdf canonical stream value
                             }
                         } else {
@@ -1037,8 +1094,10 @@ where
 }
 
 fn is_qpdf_json_string(value: &[u8]) -> bool {
-    if parse_indirect_reference(value).is_some()
-        || value.starts_with(b"u:")
+    if !matches!(
+        parse_indirect_reference(value),
+        IndirectReferenceParse::NoMatch
+    ) || value.starts_with(b"u:")
         || value.starts_with(b"n:/") && value.len() > 3
     {
         return true;
@@ -1061,34 +1120,78 @@ fn validate_pdf_version(value: &[u8]) -> Option<String> {
     String::from_utf8(value.to_vec()).ok()
 }
 
-fn qpdf_string_to_int(value: &[u8]) -> Option<i64> {
-    let text = std::str::from_utf8(value).ok()?;
-    let text = text.strip_prefix('+').unwrap_or(text);
-    let (negative, digits) = text
+/// Result of qpdf's two-stage decimal-integer conversion
+/// (`QUtil::string_to_int`, `libqpdf/QUtil.cc:373-393`): `strtoll` parses a
+/// leading digit run into an i64 (`string_to_ll`), then `QIntC::to_int`
+/// narrows that i64 to i32. Both stages throw an uncaught `std::range_error`
+/// on overflow in qpdf (`include/qpdf/QIntC.hh:87-109`); callers must
+/// surface [`Overflow`](QpdfIntParse::Overflow) as a fatal error rather than
+/// silently treating the value as absent or mismatched.
+#[derive(Debug, PartialEq, Eq)]
+enum QpdfIntParse {
+    /// No leading digit was found. qpdf's own call sites only reach
+    /// `string_to_int` once their own shape check has already guaranteed a
+    /// digit is present, so this variant has no qpdf-side counterpart.
+    NoDigits,
+    Overflow(String),
+    Value(i32),
+}
+
+fn qpdf_string_to_int_checked(text: &str) -> QpdfIntParse {
+    let stripped = text.strip_prefix('+').unwrap_or(text);
+    let (negative, digits) = stripped
         .strip_prefix('-')
-        .map_or((false, text), |digits| (true, digits));
+        .map_or((false, stripped), |digits| (true, digits));
     let digits_end = digits
         .bytes()
         .position(|byte| !byte.is_ascii_digit())
         .unwrap_or(digits.len());
     if digits_end == 0 {
-        return None;
+        return QpdfIntParse::NoDigits;
     }
-    let magnitude = digits[..digits_end].parse::<i64>().ok()?;
-    if negative {
-        magnitude.checked_neg()
-    } else {
-        Some(magnitude)
+    let Ok(magnitude) = digits[..digits_end].parse::<i64>() else {
+        return QpdfIntParse::Overflow(format!(
+            "overflow/underflow converting {text} to 64-bit integer"
+        ));
+    };
+    // `magnitude` is parsed from a non-negative digit run, so it is always
+    // in `0..=i64::MAX` and negating it can never overflow i64.
+    let value = if negative { -magnitude } else { magnitude };
+    match i32::try_from(value) {
+        Ok(value) => QpdfIntParse::Value(value),
+        Err(_) => QpdfIntParse::Overflow(format!(
+            "integer out of range converting {value} from a 8-byte signed type to a 4-byte signed type"
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::qpdf_string_to_int;
+    use super::{qpdf_string_to_int_checked, QpdfIntParse};
 
     #[test]
-    fn qpdf_string_to_int_handles_empty_and_negative_values() {
-        assert_eq!(qpdf_string_to_int(b"-"), None);
-        assert_eq!(qpdf_string_to_int(b"-42"), Some(-42));
+    fn qpdf_string_to_int_checked_handles_empty_and_negative_values() {
+        assert_eq!(qpdf_string_to_int_checked("-"), QpdfIntParse::NoDigits);
+        assert_eq!(qpdf_string_to_int_checked("-42"), QpdfIntParse::Value(-42));
+    }
+
+    #[test]
+    fn qpdf_string_to_int_checked_overflows_at_i64_stage() {
+        assert_eq!(
+            qpdf_string_to_int_checked("99999999999999999999"),
+            QpdfIntParse::Overflow(
+                "overflow/underflow converting 99999999999999999999 to 64-bit integer".into()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_string_to_int_checked_overflows_at_i32_narrowing_stage() {
+        assert_eq!(
+            qpdf_string_to_int_checked("4294967296"),
+            QpdfIntParse::Overflow(
+                "integer out of range converting 4294967296 from a 8-byte signed type to a 4-byte signed type".into()
+            )
+        );
     }
 }

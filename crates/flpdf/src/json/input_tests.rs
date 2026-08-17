@@ -3,7 +3,7 @@
 
 use super::input::{
     inline_stream_data_provider, json_value_to_handle, parse_indirect_reference, parse_object_key,
-    JsonReactor,
+    IndirectReferenceParse, JsonReactor,
 };
 use super::{Json, Reactor};
 use crate::json::parse_reader;
@@ -79,16 +79,57 @@ impl Seek for ToggleReader {
 fn qpdf_json_validators_accept_only_qpdf_reference_shapes() {
     assert_eq!(
         parse_indirect_reference(b"52  20  R"),
-        Some(ObjectRef::new(52, 20))
+        IndirectReferenceParse::Reference(ObjectRef::new(52, 20))
     );
-    assert_eq!(parse_indirect_reference(b"0 0 R"), None);
-    assert_eq!(parse_indirect_reference(b"52 20 R trailing"), None);
-    assert_eq!(parse_indirect_reference(b"52 20R"), None);
+    assert_eq!(
+        parse_indirect_reference(b"0 0 R"),
+        IndirectReferenceParse::NoMatch
+    );
+    assert_eq!(
+        parse_indirect_reference(b"52 20 R trailing"),
+        IndirectReferenceParse::NoMatch
+    );
+    assert_eq!(
+        parse_indirect_reference(b"52 20R"),
+        IndirectReferenceParse::NoMatch
+    );
     assert_eq!(
         parse_object_key(b"obj:12 13 R"),
-        Some(ObjectRef::new(12, 13))
+        IndirectReferenceParse::Reference(ObjectRef::new(12, 13))
     );
-    assert_eq!(parse_object_key(b"12 13 R"), None);
+    assert_eq!(
+        parse_object_key(b"12 13 R"),
+        IndirectReferenceParse::NoMatch
+    );
+}
+
+#[test]
+fn qpdf_json_validators_report_overflow_instead_of_no_match() {
+    // Shape matches `N G R`, but the object number overflows qpdf's i32
+    // `QUtil::string_to_int` narrowing stage (`QIntC.hh:87-109`). qpdf
+    // throws an uncaught `std::range_error` here instead of returning
+    // `false`, so this must not be conflated with "not a reference".
+    match parse_indirect_reference(b"4294967296 0 R") {
+        IndirectReferenceParse::Overflow(message) => {
+            assert_eq!(
+                message,
+                "integer out of range converting 4294967296 from a 8-byte \
+                 signed type to a 4-byte signed type"
+            );
+        }
+        other => panic!("expected Overflow, got {other:?}"),
+    }
+
+    // Overflows qpdf's i64 `strtoll` stage itself (`QUtil.cc:373-386`).
+    match parse_indirect_reference(b"99999999999999999999 0 R") {
+        IndirectReferenceParse::Overflow(message) => {
+            assert_eq!(
+                message,
+                "overflow/underflow converting 99999999999999999999 to 64-bit integer"
+            );
+        }
+        other => panic!("expected Overflow, got {other:?}"),
+    }
 }
 
 #[test]
@@ -142,7 +183,7 @@ fn qpdf_json_value_factory_builds_scalars_and_pdf_string_forms() {
 }
 
 #[test]
-fn qpdf_json_value_factory_preserves_real_literals_and_rejects_non_finite_numbers() {
+fn qpdf_json_value_factory_preserves_real_literals_and_never_rejects_non_finite_numbers() {
     let mut pdf = Pdf::empty().expect("empty PDF");
 
     assert_eq!(
@@ -157,9 +198,19 @@ fn qpdf_json_value_factory_preserves_real_literals_and_rejects_non_finite_number
             .as_real(),
         Some(100.0)
     );
-    let error =
-        json_value_to_handle(&mut pdf, &Json::make_number("1e9999")).expect_err("non-finite real");
-    assert!(error.to_string().contains("invalid JSON number"));
+
+    // qpdf's real branch (`QPDF_json.cc:750-764`) only reformats scientific
+    // notation through `std::stod`, and catches a `stod` failure --
+    // including overflow to infinity -- keeping the original literal
+    // unchanged. `QPDF_Real::create` (`QPDF_Real.cc:17-20`) never validates
+    // the text numerically, so qpdf never rejects a syntactically valid
+    // JSON number here, however large.
+    assert_eq!(
+        json_value_to_handle(&mut pdf, &Json::make_number("1e9999"))
+            .expect("overflowing scientific real is preserved, not rejected")
+            .as_real_literal(),
+        Some((f64::INFINITY, b"1e9999".to_vec()))
+    );
 }
 
 #[test]
@@ -212,11 +263,20 @@ fn qpdf_json_value_factory_builds_nested_canonical_handles() {
 }
 
 #[test]
-fn qpdf_json_value_factory_rejects_non_qpdf_real_literals() {
+fn qpdf_json_value_factory_preserves_unparseable_scientific_notation_literals() {
     let mut pdf = Pdf::empty().expect("empty PDF");
-    let error = json_value_to_handle(&mut pdf, &Json::make_number("1e+")).expect_err("real");
 
-    assert!(error.to_string().contains("invalid JSON number"));
+    // "1e+" is not a valid `f64` literal (`std::stod` would also fail on
+    // it), but per the same oracle evidence as Finding C
+    // (`QPDF_json.cc:750-764`, `QPDF_Real.cc:17-20`) a `stod` failure is
+    // caught and the original text is kept unchanged: qpdf never rejects a
+    // syntactically-present JSON number as a Real, however malformed its
+    // scientific notation.
+    let handle =
+        json_value_to_handle(&mut pdf, &Json::make_number("1e+")).expect("preserved, not rejected");
+    let (value, literal) = handle.as_real_literal().expect("real literal");
+    assert!(value.is_nan());
+    assert_eq!(literal, b"1e+");
 }
 
 #[test]
@@ -462,6 +522,14 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
             .as_slice(),
         b"abc"
     );
+    // A brand-new stream (built by the `!is_stream` branch of the "stream"
+    // key handler, matching `replace_object`'s "value" sibling) must carry
+    // the same JSON-input description as any other freshly-set object,
+    // not the generic "object N G" fallback used for a handle that never
+    // received a description at all.
+    assert!(stream
+        .description()
+        .contains("input.json, obj:3 0 R at offset"));
 
     let trailer = pdf.trailer_handle();
     trailer.try_dereference().expect("trailer resolves");
@@ -539,6 +607,33 @@ fn json_reactor_records_qpdf_validation_errors_and_ignores_unknown_keys() {
 }
 
 #[test]
+fn json_reactor_treats_jsonversion_overflow_as_fatal_not_a_soft_error() {
+    // qpdf's `jsonversion` handler calls `QUtil::string_to_int` directly on
+    // the raw number text (`QPDF_json.cc:518-531`). Once the shape check
+    // (`value.getNumber`) accepts the token, an overflow there is an
+    // uncaught `std::range_error`, not qpdf's own "invalid JSON version"
+    // soft warning -- the two must not be conflated.
+    let json = br#"{
+        "qpdf": [
+            {"jsonversion": 99999999999999999999, "pdfversion": "1.3"},
+            {}
+        ]
+    }"#;
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "input.json", true);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON input");
+    let fatal = reactor
+        .fatal_error()
+        .expect("jsonversion overflow must be fatal");
+    assert!(
+        fatal.contains("overflow/underflow converting"),
+        "unexpected fatal message: {fatal}"
+    );
+    assert!(!reactor.any_errors(), "must not also record a soft error");
+}
+
+#[test]
 fn json_reactor_validates_object_and_stream_shapes() {
     let json = br#"{
         "qpdf": [
@@ -607,6 +702,33 @@ fn json_reactor_rejects_malformed_object_keys_and_preserves_omitted_objects() {
     assert!(messages
         .iter()
         .any(|message| { message.contains("object key should be \"trailer\" or \"obj:n n R\"") }));
+}
+
+#[test]
+fn json_reactor_treats_object_key_overflow_as_fatal_not_a_soft_error() {
+    // "obj:4294967296 0 R" has the exact `obj:N G R` shape
+    // (`is_obj_key`/`is_indirect_object`, `QPDF_json.cc:66-113`), but the
+    // object number overflows qpdf's i32 `QUtil::string_to_int` narrowing
+    // stage. qpdf's own validator throws an uncaught `std::range_error` at
+    // that point instead of returning `false`, so this key must not be
+    // treated as merely "not `trailer` or `obj:n n R`".
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let json = br#"{
+        "qpdf": [
+            {"jsonversion": 2},
+            {"obj:4294967296 0 R": {"value": 1}}
+        ]
+    }"#;
+    let source = Rc::new(RefCell::new(Cursor::new(json.to_vec())));
+    let mut reactor = JsonReactor::new(&mut pdf, Rc::clone(&source), "update.json", false);
+    parse_reader(&mut *source.borrow_mut(), Some(&mut reactor)).expect("JSON update");
+    let fatal = reactor
+        .fatal_error()
+        .expect("object key overflow must be fatal");
+    assert!(
+        fatal.contains("integer out of range converting"),
+        "unexpected fatal message: {fatal}"
+    );
 }
 
 #[test]
@@ -952,8 +1074,8 @@ fn json_reactor_handles_factory_and_dictionary_key_failures() {
             "PDF name",
         ),
         (
-            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"value":1e9999}}]}"#.as_slice(),
-            "invalid JSON number",
+            br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"value":"4294967296 0 R"}}]}"#.as_slice(),
+            "integer out of range",
         ),
         (
             br#"{"qpdf":[{"jsonversion":2,"pdfversion":"1.3"},{"obj:1 0 R":{"value":{"n:/A#":1}}}]}"#.as_slice(),
