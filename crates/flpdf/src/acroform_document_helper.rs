@@ -123,6 +123,20 @@ pub(crate) struct AnnotationTransformResult {
     pub(crate) old_fields: BTreeSet<ObjectRef>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct AcroFormDefaults {
+    default_appearance: Vec<u8>,
+    quadding: i64,
+}
+
+#[derive(Clone, Debug)]
+struct InheritedFieldOverrides {
+    override_da: bool,
+    source_default_da: Vec<u8>,
+    override_q: bool,
+    source_default_q: i64,
+}
+
 /// High-level helper for a document's `/AcroForm`.
 ///
 /// Construct with [`AcroFormDocumentHelper::new`] or [`Pdf::acroform`]. The
@@ -467,7 +481,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     transformed.old_fields.insert(top_ref);
                 }
                 if copied_field_trees.insert(top_field.identity_key()) {
-                    let copied_top = self.copy_field_tree(&top_field, &mut orig_to_copy)?;
+                    let copied_top = self.copy_field_tree(&top_field, &mut orig_to_copy, None)?;
                     if let Some(copied_ref) = copied_top.object_ref() {
                         if added_new_fields.insert(copied_ref) {
                             transformed.new_fields.push(copied_top);
@@ -510,8 +524,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         source: &mut Pdf<RS>,
     ) -> Result<AnnotationTransformResult> {
         let mut transformed = AnnotationTransformResult::default();
-        let source_annotations = {
+        let (source_defaults, source_annotations) = {
             let mut source_helper = AcroFormDocumentHelper::new(source);
+            let source_defaults = source_helper.canonical_acroform_defaults()?;
             let old_annots = source_helper
                 .pdf
                 .resolve_object_handle_to_terminal(&old_annots)?;
@@ -533,7 +548,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     .transpose()?;
                 source_annotations.push((annotation, top_field));
             }
-            source_annotations
+            (source_defaults, source_annotations)
+        };
+        let target_defaults = self.canonical_acroform_defaults()?;
+        let inherited_overrides = InheritedFieldOverrides {
+            override_da: source_defaults.default_appearance != target_defaults.default_appearance,
+            source_default_da: source_defaults.default_appearance,
+            override_q: source_defaults.quadding != target_defaults.quadding,
+            source_default_q: source_defaults.quadding,
         };
 
         let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();
@@ -547,7 +569,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 let source_top_field = ensure_foreign_indirect(source, source_top_field)?;
                 let copied_source_top = self.pdf.copy_foreign_object(&source_top_field)?;
                 if copied_field_trees.insert(copied_source_top.identity_key()) {
-                    let copied_top = self.copy_field_tree(&copied_source_top, &mut orig_to_copy)?;
+                    let copied_top = self.copy_field_tree(
+                        &copied_source_top,
+                        &mut orig_to_copy,
+                        Some(&inherited_overrides),
+                    )?;
                     if let Some(copied_ref) = copied_top.object_ref() {
                         if added_new_fields.insert(copied_ref) {
                             transformed.new_fields.push(copied_top);
@@ -616,6 +642,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         &mut self,
         top_field: &ObjectHandle,
         orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
+        inherited_overrides: Option<&InheritedFieldOverrides>,
     ) -> Result<ObjectHandle> {
         let copied_top = self
             .copy_transform_object(top_field, orig_to_copy)?
@@ -662,9 +689,114 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 self.pdf.mark_object_handle_dirty(&kids_holder)?;
                 queue.push_back((kid, copied_kid));
             }
+            if let Some(inherited_overrides) = inherited_overrides {
+                self.adjust_inherited_field(&copied, inherited_overrides)?;
+            }
         }
 
         Ok(copied_top)
+    }
+
+    /// Pin foreign-copied inherited `/DA` and `/Q` values when the source and
+    /// destination document defaults differ, matching qpdf's
+    /// `adjustInheritedFields` (`QPDFAcroFormDocumentHelper.cc:442-484`).
+    #[allow(clippy::mutable_key_type)]
+    fn adjust_inherited_field(
+        &mut self,
+        field: &ObjectHandle,
+        overrides: &InheritedFieldOverrides,
+    ) -> Result<()> {
+        if overrides.override_da && !self.field_has_explicit_value(field, b"/DA")? {
+            let current = self.effective_field_appearance(field)?;
+            if current != overrides.source_default_da {
+                field.replace_key(
+                    b"/DA",
+                    ObjectHandle::string(crate::pdf_string::new_unicode_string(
+                        &overrides.source_default_da,
+                    )),
+                )?;
+                self.pdf.mark_object_handle_dirty(field)?;
+            }
+        }
+        if overrides.override_q && !self.field_has_explicit_value(field, b"/Q")? {
+            let current = self.effective_field_quadding(field)?;
+            if current != overrides.source_default_q {
+                field.replace_key(b"/Q", ObjectHandle::integer(overrides.source_default_q))?;
+                self.pdf.mark_object_handle_dirty(field)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn field_has_explicit_value(&mut self, start: &ObjectHandle, key: &[u8]) -> Result<bool> {
+        let mut current = self.pdf.resolve_object_handle_to_terminal(start)?;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.identity_key()) {
+                return Ok(false);
+            }
+            if current.try_has_key(key)? {
+                return Ok(true);
+            }
+            let parent = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+            if parent.is_null() || parent.as_dictionary().is_none() {
+                return Ok(false);
+            }
+            current = parent;
+        }
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn effective_field_appearance(&mut self, start: &ObjectHandle) -> Result<Vec<u8>> {
+        let mut current = self.pdf.resolve_object_handle_to_terminal(start)?;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.identity_key()) {
+                break;
+            }
+            let appearance = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/DA")?)?;
+            if let Some(value) = appearance.as_string() {
+                return Ok(decode_field_name(&value).into_bytes());
+            }
+            let parent = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+            if parent.is_null() || parent.as_dictionary().is_none() {
+                break;
+            }
+            current = parent;
+        }
+        Ok(self.canonical_acroform_defaults()?.default_appearance)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn effective_field_quadding(&mut self, start: &ObjectHandle) -> Result<i64> {
+        let mut current = self.pdf.resolve_object_handle_to_terminal(start)?;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(current.identity_key()) {
+                break;
+            }
+            let quadding = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Q")?)?;
+            if let Some(value) = quadding.as_integer() {
+                return Ok(value);
+            }
+            let parent = self
+                .pdf
+                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+            if parent.is_null() || parent.as_dictionary().is_none() {
+                break;
+            }
+            current = parent;
+        }
+        Ok(self.canonical_acroform_defaults()?.quadding)
     }
 
     /// Append copied top-level fields to `/AcroForm/Fields`, reusing qpdf's
@@ -794,6 +926,25 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         root.replace_key(b"/AcroForm", created.clone())?;
         self.pdf.mark_object_handle_dirty(&root)?;
         Ok(created)
+    }
+
+    fn canonical_acroform_defaults(&mut self) -> Result<AcroFormDefaults> {
+        let Some(acroform) = self.canonical_acroform()? else {
+            return Ok(AcroFormDefaults::default());
+        };
+        let appearance = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/DA")?)?;
+        let quadding = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Q")?)?;
+        Ok(AcroFormDefaults {
+            default_appearance: appearance
+                .as_string()
+                .map(|value| decode_field_name(&value).into_bytes())
+                .unwrap_or_default(),
+            quadding: quadding.as_integer().unwrap_or(0),
+        })
     }
 
     #[allow(dead_code, clippy::mutable_key_type)]
@@ -3491,6 +3642,95 @@ mod tests {
         assert_eq!(
             coordinates,
             vec![Some(5.0), Some(8.0), Some(25.0), Some(48.0)]
+        );
+    }
+
+    #[test]
+    fn foreign_transform_pins_source_acroform_da_and_q_when_destination_defaults_differ() {
+        let mut source = empty_pdf();
+        source.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[
+                        ("Fields", refs(&[7])),
+                        ("DA", Object::String(b"/Fsrc 10 Tf".to_vec())),
+                        ("Q", Object::Integer(1)),
+                    ])),
+                ),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", refs(&[3])),
+                ("Count", Object::Integer(1)),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(3, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Page".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(2, 0))),
+                ("Annots", refs(&[9])),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("FT", Object::Name(b"Tx".to_vec())),
+                ("T", Object::String(b"field".to_vec())),
+                ("Kids", refs(&[9])),
+            ])),
+        );
+        source.set_object(
+            ObjectRef::new(9, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(7, 0))),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(10),
+                        Object::Integer(20),
+                        Object::Integer(30),
+                        Object::Integer(40),
+                    ]),
+                ),
+            ])),
+        );
+        let source_annots = source
+            .get_object_handle(ObjectRef::new(3, 0))
+            .try_get_key(b"/Annots")
+            .unwrap();
+
+        let mut target = empty_pdf();
+        target.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[(
+                "AcroForm",
+                Object::Dictionary(dict(&[
+                    ("Fields", Object::Array(Vec::new())),
+                    ("DA", Object::String(b"/Fdst 10 Tf".to_vec())),
+                    ("Q", Object::Integer(2)),
+                ])),
+            )])),
+        );
+
+        let transformed = AcroFormDocumentHelper::new(&mut target)
+            .transform_annotations_from(source_annots, Matrix::default(), &mut source)
+            .unwrap();
+        let copied_field = &transformed.new_fields[0];
+        assert_eq!(
+            copied_field.try_get_key(b"/DA").unwrap().as_string(),
+            Some(b"/Fsrc 10 Tf".to_vec())
+        );
+        assert_eq!(
+            copied_field.try_get_key(b"/Q").unwrap().as_integer(),
+            Some(1)
         );
     }
 
