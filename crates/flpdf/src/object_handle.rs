@@ -3663,6 +3663,19 @@ impl ObjectHandle {
     /// - any other existing-`rtype` shape combination (mismatched types,
     ///   or neither dictionary nor array) leaves that entry untouched.
     ///
+    /// # Preconditions
+    ///
+    /// Unlike qpdf, this method does not dereference handles before inspecting
+    /// their types. Callers must resolve the receiver, `other`, and the
+    /// top-level resource-category handles whose shapes this merge will
+    /// inspect before calling it. qpdf's corresponding accessors resolve on
+    /// every call (`QPDFObjectHandle.cc:252-267,426-434`), while this port's
+    /// non-fallible `as_dictionary`, `as_array`, `get_key`, and `has_key`
+    /// accessors intentionally do not. Passing an unresolved indirect handle
+    /// therefore can make a qpdf-dictionary look non-dictionary here and
+    /// silently select the no-op path. This is a caller contract; it does not
+    /// change the method's behavior or add an implicit resolution boundary.
+    ///
     /// The uniqueness pool for a freshly minted name is
     /// `this_val.getResourceNames()`'s own "second-level keys" definition
     /// (`libqpdf/QPDFObjectHandle.cc:1156-1170`) applied to the *inner*
