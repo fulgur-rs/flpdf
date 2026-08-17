@@ -8,6 +8,7 @@
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json_inspect::decode_pdf_text_string;
+use crate::object_handle::ObjectHandle;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -154,22 +155,46 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(false);
     };
-    let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
+    let root = pdf.get_object_handle(root_ref);
+    let catalog = pdf.resolve_object_handle_to_terminal(&root)?;
+    if catalog.as_dictionary().is_none() {
         return Ok(false);
-    };
+    }
+
     let mut changed = false;
-    if catalog.remove("Perms").is_some() {
-        pdf.set_object(root_ref, Object::Dictionary(catalog));
+    // qpdf calls removeKey unconditionally. Inspect the raw live dictionary
+    // entries so a present null-valued /Perms key is removed as well.
+    if catalog
+        .as_dictionary()
+        .is_some_and(|entries| entries.keys().any(|key| key == b"/Perms"))
+    {
+        catalog.remove_key(b"/Perms");
+        pdf.mark_object_handle_dirty(&catalog)?;
         changed = true;
     }
-    if let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? {
-        if acroform.get("SigFlags").is_some() && sig_flags_from_acroform_dict(&acroform) != Some(0)
-        {
-            acroform.insert("SigFlags", Object::Integer(0));
-            write_back_acroform(pdf, home, acroform);
+
+    let acroform = pdf.resolve_object_handle_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
+    if acroform.as_dictionary().is_some() && acroform.try_has_key(b"/SigFlags")? {
+        // QPDF::removeSecurityRestrictions replaces the key whenever qpdf's
+        // visible hasKey test succeeds, including an already-zero integer.
+        // `changed` is an flpdf-only signal with no qpdf analog (qpdf's
+        // removeSecurityRestrictions returns void), so it only reports a
+        // change when something observable actually differs: an indirect
+        // `/SigFlags` becomes a direct integer either way (the old indirect
+        // target may be garbage-collected on a full rewrite), so only a
+        // prior value that was *already* a direct integer 0 counts as
+        // unchanged.
+        let previous = acroform.try_get_key(b"/SigFlags")?;
+        let previous_resolved = pdf.resolve_object_handle_to_terminal(&previous)?;
+        let already_zero =
+            previous.object_ref().is_none() && previous_resolved.as_integer() == Some(0);
+        acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
+        pdf.mark_object_handle_dirty(&acroform)?;
+        if !already_zero {
             changed = true;
         }
     }
+
     Ok(changed)
 }
 
@@ -213,11 +238,14 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let mut changed = remove_security_restrictions(pdf)?;
 
-    let form_fields = collect_signature_form_field_refs(pdf)?;
+    let form_fields = crate::AcroFormDocumentHelper::new(pdf).form_field_handles()?;
 
-    let mut to_remove: Vec<ObjectRef> = Vec::new();
-    for field_ref in form_fields {
-        let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
+    let mut to_remove = BTreeSet::new();
+    for (field_ref, field) in form_fields {
+        let field_type = {
+            let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+            helper.field_type()?
+        };
         if field_type.as_deref() != Some(b"/Sig") {
             continue;
         }
@@ -225,21 +253,27 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         // before attempting removeKey. A field whose /FT//V live on a
         // non-terminal parent has nothing of its own to strip, but is still
         // recorded (removeFormFields then finds it absent from /Fields).
-        to_remove.push(field_ref);
+        to_remove.insert(field_ref);
 
-        // `field_type` above resolved this ref through the field tree, so it is
-        // always a dictionary here.
-        let Object::Dictionary(mut dict) = pdf.resolve(field_ref)? else {
-            continue; // cov:ignore: a /Sig form-field ref always resolves to a dictionary
-        };
         let mut field_changed = false;
-        for key in ["FT", "V", "SV", "Lock"] {
-            if dict.remove(key).is_some() {
+        // qpdf's removeKey erases the raw dictionary entry unconditionally
+        // (`QPDF_Dictionary::removeKey`), regardless of whether its value is
+        // null. `try_has_key`'s qpdf-`hasKey`-matching null-collapsing would
+        // leave a present `/V null`/`/SV null`/`/Lock null`/`/FT null` entry
+        // behind, so raw entry presence is checked instead, the same way as
+        // the `/Perms` removal above.
+        let entries = field.as_dictionary();
+        for key in [b"/FT".as_slice(), b"/V", b"/SV", b"/Lock"] {
+            let present = entries
+                .as_ref()
+                .is_some_and(|entries| entries.keys().any(|k| k.as_slice() == key));
+            if present {
+                field.remove_key(key);
                 field_changed = true;
             }
         }
         if field_changed {
-            pdf.set_object(field_ref, Object::Dictionary(dict));
+            pdf.mark_object_handle_dirty(&field)?;
             changed = true;
             // The old /V target is intentionally not deleted here. qpdf's
             // disableDigitalSignatures only strips the field keys and lets the
@@ -250,59 +284,11 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         }
     }
 
-    // removeFormFields: erase the recorded refs from the top-level /AcroForm
-    // /Fields array. qpdf runs this unconditionally; with an empty `to_remove`
-    // nothing matches and the array is left untouched. Only refs that are
-    // actually top-level /Fields entries are dropped; a field reachable only via
-    // a parent's /Kids is unaffected.
-    let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? else {
-        return Ok(changed);
-    };
-    let Some(fields_obj) = acroform.get("Fields").cloned() else {
-        return Ok(changed);
-    };
-    // qpdf erases items from the original /Fields array handle. Capture whether
-    // /Fields is stored indirectly before `resolve_array` consumes the value: an
-    // indirect array stays indirect (the array object is mutated in place, so
-    // the /AcroForm /Fields entry keeps its reference), while a direct array
-    // stays direct (rewritten inside the /AcroForm dictionary).
-    let fields_ref = fields_obj.as_ref_id();
-    let fields = resolve_array(pdf, fields_obj)?;
-    let original_len = fields.len();
-    let new_fields: Vec<Object> = fields
-        .into_iter()
-        .filter(|f| !matches!(f, Object::Reference(r) if to_remove.contains(r)))
-        .collect();
-    if new_fields.len() != original_len {
-        match fields_ref {
-            Some(fields_ref) => pdf.set_object(fields_ref, Object::Array(new_fields)),
-            None => {
-                acroform.insert("Fields", Object::Array(new_fields));
-                write_back_acroform(pdf, home, acroform);
-            }
-        }
+    if crate::AcroFormDocumentHelper::new(pdf).remove_form_fields(&to_remove)? {
         changed = true;
     }
 
     Ok(changed)
-}
-
-/// Collect the object refs of every AcroForm form field, mirroring the
-/// `field_to_annotations` map keys built by qpdf's
-/// `QPDFAcroFormDocumentHelper::analyze` + `traverseField` +
-/// `getFormFields` (qpdf 11.9.0).
-///
-/// Delegates to [`crate::AcroFormDocumentHelper::annotation_to_field_map`]
-/// (the shared `analyze()` port, `libqpdf/QPDFAcroFormDocumentHelper.cc:
-/// 235-286`) and takes the distinct field values — `field_to_annotations`'s
-/// key set is exactly `annotation_to_field`'s value set.
-fn collect_signature_form_field_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<BTreeSet<ObjectRef>> {
-    Ok(crate::AcroFormDocumentHelper::new(pdf)
-        .annotation_to_field_map()?
-        .into_values()
-        .collect())
 }
 
 /// Write an updated `/AcroForm` dictionary back to wherever it lives.

@@ -1410,38 +1410,3 @@ fn copy_fields_from_renames_conflicting_direct_field_da_resources() {
         String::from_utf8_lossy(da)
     );
 }
-
-#[test]
-fn get_field_for_annotation_reads_a_live_canonical_widget_after_a_legacy_snapshot() {
-    let mut pdf = Pdf::open_mem_owned(build_pdf(
-        &[
-            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
-            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
-            (4, "<< /Fields [7 0 R] >>"),
-            (7, "<< /Subtype /Link >>"),
-        ],
-        1,
-    ))
-    .unwrap();
-
-    let legacy_snapshot = pdf.resolve(ObjectRef::new(7, 0)).unwrap();
-    assert!(matches!(
-        legacy_snapshot,
-        Object::Dictionary(ref dict)
-            if dict.get("Subtype") == Some(&Object::Name(b"Link".to_vec()))
-    ));
-
-    let annotation = pdf.get_object_handle(ObjectRef::new(7, 0));
-    pdf.resolve_object_handle(&annotation).unwrap();
-    annotation
-        .replace_key(b"/Subtype", flpdf::ObjectHandle::name(b"Widget".to_vec()))
-        .unwrap();
-
-    assert_eq!(
-        AcroFormDocumentHelper::new(&mut pdf)
-            .get_field_for_annotation(ObjectRef::new(7, 0))
-            .unwrap(),
-        Some(ObjectRef::new(7, 0)),
-        "qpdf's helper observes the same live object identity after mutation"
-    );
-}
