@@ -49,6 +49,30 @@ fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field
     }
 }
 
+fn record_field_name(cache: &mut AcroFormCache, field: ObjectHandle, name: String) {
+    let identity = field.identity_key();
+    if let Some(old_name) = cache.field_to_name.insert(identity, name.clone()) {
+        if old_name != name {
+            let mut remove_name = false;
+            if let Some(fields) = cache.name_to_fields.get_mut(&old_name) {
+                fields.retain(|candidate| !candidate.is_same_object_as(&field));
+                remove_name = fields.is_empty();
+            } // cov:ignore: structural close of the qpdf old-name entry branch
+            if remove_name {
+                cache.name_to_fields.remove(&old_name);
+            }
+        } // cov:ignore: structural close of the qpdf old-name change branch
+    }
+
+    let fields = cache.name_to_fields.entry(name).or_default();
+    if !fields
+        .iter()
+        .any(|candidate| candidate.is_same_object_as(&field))
+    {
+        fields.push(field);
+    }
+}
+
 /// Effective metadata for one AcroForm field-tree node.
 ///
 /// Values are materialized from the current node plus inherited field-tree
@@ -414,6 +438,97 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(fields)
     }
 
+    /// Return the field references with the given fully qualified name.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::getFieldsWithQualifiedName`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:173-183`). The result is
+    /// derived from the live-handle cache, so a name changed through
+    /// [`Self::set_form_field_name`] is reflected without rebuilding the
+    /// document graph.
+    pub fn get_fields_with_qualified_name(&mut self, name: &str) -> Result<BTreeSet<ObjectRef>> {
+        self.analyze()?;
+        Ok(self
+            .cache
+            .as_ref()
+            .expect("analyze always installs an AcroForm cache")
+            .name_to_fields
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(ObjectHandle::object_ref)
+            .collect())
+    }
+
+    /// Set a field's partial name and update the warm qualified-name cache.
+    ///
+    /// This mirrors `QPDFAcroFormDocumentHelper::setFormFieldName`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:153-160`). The supplied name
+    /// is encoded as a PDF Unicode string by
+    /// [`FormFieldObjectHelper::set_field_attribute_string`].
+    pub fn set_form_field_name(&mut self, field_ref: ObjectRef, name: &str) -> Result<()> {
+        self.analyze()?;
+        let field = self.pdf.get_object_handle(field_ref);
+        {
+            let mut field_helper =
+                FormFieldObjectHelper::from_object_handle(field.clone(), self.pdf);
+            field_helper.set_field_attribute_string(b"/T", name)?;
+        }
+        self.update_cached_field(field)
+    }
+
+    fn remove_cached_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) {
+        let Some(cache) = self.cache.as_mut() else {
+            return;
+        };
+
+        let mut removed = Vec::<ObjectHandleIdentity>::new();
+        for field in cache
+            .field_handles
+            .values()
+            .chain(cache.name_to_fields.values().flatten())
+        {
+            if field
+                .object_ref()
+                .is_some_and(|field_ref| to_remove.contains(&field_ref))
+            {
+                let identity = field.identity_key();
+                if !removed.iter().any(|candidate| candidate == &identity) {
+                    removed.push(identity);
+                }
+            }
+        }
+        if removed.is_empty() {
+            return;
+        }
+
+        let annotation_ids: Vec<ObjectHandleIdentity> = cache
+            .annotation_to_field
+            .iter()
+            .filter_map(|(annotation, field)| {
+                removed
+                    .contains(&field.identity_key())
+                    .then_some(annotation.clone())
+            })
+            .collect();
+        for annotation in annotation_ids {
+            cache.annotation_to_field.remove(&annotation);
+            cache.annotation_handles.remove(&annotation);
+        }
+        cache
+            .field_to_annotations
+            .retain(|field, _| !removed.contains(field));
+        cache
+            .field_handles
+            .retain(|field, _| !removed.contains(field));
+        cache
+            .field_to_name
+            .retain(|field, _| !removed.contains(field));
+        cache.name_to_fields.retain(|_, fields| {
+            fields.retain(|field| !removed.contains(&field.identity_key()));
+            !fields.is_empty()
+        });
+    }
+
     /// Remove selected top-level fields from the live `/AcroForm /Fields`
     /// array, mirroring qpdf's `removeFormFields`
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:112-151`).
@@ -441,6 +556,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                     .map(|_| index)
             })
             .collect();
+        self.remove_cached_fields(to_remove);
         if indexes.is_empty() {
             return Ok(false);
         }
@@ -449,7 +565,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             fields.erase_array_item(index)?;
         }
         self.pdf.mark_object_handle_dirty(&fields)?;
-        self.invalidate_cache();
         Ok(true)
     }
 
@@ -982,13 +1097,25 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             self.pdf.mark_object_handle_dirty(&acroform)?;
             replacement
         };
-        for field in fields {
-            fields_array.append_array_item(field)?;
+        for field in &fields {
+            fields_array.append_array_item(field.clone())?;
         }
         self.pdf.mark_object_handle_dirty(&fields_array)?;
         self.pdf.mark_object_handle_dirty(&acroform)?;
-        self.invalidate_cache();
+        for field in fields {
+            self.update_cached_field(field)?;
+        }
         Ok(())
+    }
+
+    fn update_cached_field(&mut self, field: ObjectHandle) -> Result<()> {
+        let Some(mut cache) = self.cache.take() else {
+            return Ok(());
+        };
+        let mut visited = BTreeSet::new();
+        let result = self.traverse_field_handles(field, None, 0, &mut visited, &mut cache);
+        self.cache = Some(cache);
+        result
     }
 
     #[allow(dead_code)]
@@ -1210,16 +1337,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         if is_field && field.try_has_key(b"/T")? {
             let name = FormFieldObjectHelper::new(field_ref, self.pdf).fully_qualified_name()?;
-            cache
-                .field_to_name
-                .insert(field.identity_key(), name.clone());
-            let fields = cache.name_to_fields.entry(name).or_default();
-            if !fields
-                .iter()
-                .any(|candidate| candidate.is_same_object_as(&field))
-            {
-                fields.push(field);
-            }
+            record_field_name(cache, field, name);
         }
         Ok(())
     }
@@ -3352,6 +3470,274 @@ mod tests {
         // source name name+1 is not rechecked against that newly planned name.
         assert_eq!(first, Some(b"name+1".to_vec()));
         assert_eq!(second, Some(b"name+1".to_vec()));
+    }
+
+    #[test]
+    fn add_and_rename_form_fields_updates_a_warm_name_cache_incrementally() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[4]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        for field_ref in [4, 7] {
+            pdf.set_object(
+                ObjectRef::new(field_ref, 0),
+                Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+            );
+        }
+
+        let copied = pdf.get_object_handle(ObjectRef::new(7, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        helper
+            .update_cached_field(copied.clone())
+            .expect("a cold helper has no cache to update");
+        assert!(helper.cache.is_none());
+        helper
+            .canonical_annotation_to_field_handles()
+            .expect("warm the qpdf name cache");
+        helper
+            .add_and_rename_form_fields(vec![copied.clone()])
+            .expect("append and rename the copied field");
+
+        let cache = helper
+            .cache
+            .as_ref()
+            .expect("qpdf addFormField keeps the analyzed cache valid");
+        let renamed = cache
+            .name_to_fields
+            .get("name+1")
+            .expect("incremental name index contains the renamed field");
+        assert!(renamed.iter().any(|field| field.is_same_object_as(&copied)));
+    }
+
+    #[test]
+    fn add_and_rename_form_fields_handles_nested_cyclic_trees_once() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[4]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("T", Object::String(b"name".to_vec())),
+                ("Kids", refs(&[8])),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Dictionary(dict(&[
+                ("T", Object::String(b"child".to_vec())),
+                ("Parent", Object::Reference(ObjectRef::new(7, 0))),
+                ("Kids", refs(&[7])),
+            ])),
+        );
+
+        let copied = pdf.get_object_handle(ObjectRef::new(7, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        helper
+            .canonical_annotation_to_field_handles()
+            .expect("warm the qpdf name cache");
+        helper
+            .add_and_rename_form_fields(vec![copied])
+            .expect("walk the nested cycle once");
+
+        let cache = helper
+            .cache
+            .as_ref()
+            .expect("qpdf preserves the analyzed cache");
+        assert_eq!(cache.name_to_fields["name+1"].len(), 1);
+        assert_eq!(cache.name_to_fields["name+1.child"].len(), 1);
+    }
+
+    #[test]
+    fn set_form_field_name_updates_both_warm_qualified_name_indexes() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[4, 7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        for field_ref in [4, 7] {
+            pdf.set_object(
+                ObjectRef::new(field_ref, 0),
+                Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+            );
+        }
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        helper
+            .canonical_annotation_to_field_handles()
+            .expect("warm the qpdf name cache");
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("name")
+                .expect("read the warm qualified-name cache"),
+            BTreeSet::from([ObjectRef::new(4, 0), ObjectRef::new(7, 0)])
+        );
+
+        helper
+            .set_form_field_name(ObjectRef::new(7, 0), "renamed")
+            .expect("rename the field through the qpdf mutation route");
+
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("name")
+                .expect("read the old qualified-name cache"),
+            BTreeSet::from([ObjectRef::new(4, 0)])
+        );
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("renamed")
+                .expect("read the new qualified-name cache"),
+            BTreeSet::from([ObjectRef::new(7, 0)])
+        );
+
+        helper
+            .set_form_field_name(ObjectRef::new(4, 0), "other")
+            .expect("rename the final field under the old qualified name");
+        assert!(helper
+            .get_fields_with_qualified_name("name")
+            .expect("read the removed qualified-name cache entry")
+            .is_empty());
+        assert!(helper.cache.is_some(), "qpdf preserves a warm cache");
+    }
+
+    #[test]
+    fn remove_form_fields_prunes_a_warm_association_and_name_cache() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[4, 7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Dictionary(dict(&[
+                ("T", Object::String(b"name".to_vec())),
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                (
+                    "Rect",
+                    Object::Array(vec![
+                        Object::Integer(0),
+                        Object::Integer(0),
+                        Object::Integer(1),
+                        Object::Integer(1),
+                    ]),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
+        );
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let associations = helper
+            .canonical_annotation_to_field_handles()
+            .expect("warm the qpdf association and name caches");
+        assert!(associations.iter().any(|(annotation, field)| {
+            annotation.object_ref() == Some(ObjectRef::new(4, 0))
+                && field.object_ref() == Some(ObjectRef::new(4, 0))
+        }));
+
+        assert!(helper
+            .remove_form_fields(&BTreeSet::from([ObjectRef::new(4, 0)]))
+            .expect("remove the selected top-level field"));
+
+        let cache = helper
+            .cache
+            .as_ref()
+            .expect("qpdf preserves a warm cache after removal");
+        assert_eq!(
+            cache
+                .name_to_fields
+                .get("name")
+                .into_iter()
+                .flatten()
+                .filter_map(ObjectHandle::object_ref)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([ObjectRef::new(7, 0)])
+        );
+        assert!(!cache
+            .annotation_to_field
+            .values()
+            .any(|field| field.object_ref() == Some(ObjectRef::new(4, 0))));
+
+        assert!(!helper
+            .remove_form_fields(&BTreeSet::from([ObjectRef::new(99, 0)]))
+            .expect("removing an uncached field is a no-op"));
+
+        assert_eq!(
+            helper
+                .get_fields_with_qualified_name("name")
+                .expect("read the pruned qualified-name cache"),
+            BTreeSet::from([ObjectRef::new(7, 0)])
+        );
+        assert!(!helper
+            .canonical_annotation_to_field_handles()
+            .expect("read the pruned association cache")
+            .iter()
+            .any(|(annotation, _)| annotation.object_ref() == Some(ObjectRef::new(4, 0))));
+        assert!(helper.cache.is_some(), "qpdf preserves a warm cache");
     }
 
     #[test]
