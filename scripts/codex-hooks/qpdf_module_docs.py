@@ -14,6 +14,7 @@ _CHECKER_PATH = Path("scripts/qpdf-module-docs.py")
 _SOURCE_ROOT = Path("crates/flpdf/src")
 _GENERIC_DIAGNOSTIC = "qpdf module documentation check failed"
 _MAX_DIAGNOSTIC_LENGTH = 4000
+_TRUNCATION_SUFFIX = "..."
 
 
 def _repository_root(cwd: str | None) -> Path | None:
@@ -56,7 +57,10 @@ def _feedback(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
     """Translate a checker failure into the Codex PostToolUse response format."""
     diagnostic = result.stderr or result.stdout or _GENERIC_DIAGNOSTIC
     if len(diagnostic) > _MAX_DIAGNOSTIC_LENGTH:
-        diagnostic = diagnostic[:_MAX_DIAGNOSTIC_LENGTH] + "..."
+        diagnostic = (
+            diagnostic[: _MAX_DIAGNOSTIC_LENGTH - len(_TRUNCATION_SUFFIX)]
+            + _TRUNCATION_SUFFIX
+        )
 
     return {
         "decision": "block",

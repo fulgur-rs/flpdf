@@ -81,6 +81,25 @@ class QpdfModuleDocsHookTests(unittest.TestCase):
             feedback["reason"],
         )
 
+    def test_oversized_checker_diagnostic_is_limited_with_ellipsis(self):
+        with self.synthetic_repository(
+            "//! qpdf correspondence: valid module."
+        ) as (root, cwd):
+            (root / "scripts" / "qpdf-module-docs.py").write_text(
+                "import sys\n"
+                "sys.stderr.write('x' * 4001)\n"
+                "raise SystemExit(1)\n"
+            )
+            result = self.run_hook(root, cwd)
+
+        self.assertEqual(0, result.returncode)
+        feedback = json.loads(result.stdout)
+        diagnostic = feedback["reason"].removeprefix(
+            "qpdf module documentation check failed:\n"
+        )
+        self.assertEqual(4000, len(diagnostic))
+        self.assertEqual("x" * 3997 + "...", diagnostic)
+
     def test_non_repository_is_silent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
