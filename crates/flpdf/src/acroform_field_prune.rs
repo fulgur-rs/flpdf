@@ -117,22 +117,30 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<()> {
     // ── Step 1: collect widget handles found on retained pages ─────────────
-    // Walk each retained page's /Annots array through the canonical helper.
-    // For every entry whose resolved /Subtype is /Widget, retain the live
-    // handle AND the new page ref it lives on (first-occurrence rule:
-    // ref_map[old][0], matching the /P update rule used by outline_dest_remap
-    // for /Dest).
+    // Walk *every* retained page's /Annots array through the canonical
+    // helper, including every duplicate-selection occurrence -- not just
+    // ref_map[old][0]. For every entry whose resolved /Subtype is /Widget,
+    // retain the live handle AND the new page ref it lives on.
     //
-    // Note: widgets added by *duplicate* page selections share their
+    // An *indirect* widget on a duplicate page selection shares its
     // ObjectHandle identity with the original page's widget
-    // (rebuild_page_tree clones only the *page dictionary*, not sub-objects
-    // like annotation dicts).
+    // (rebuild_page_tree leaves indirect sub-objects shared, only the page
+    // dictionary itself is cloned per duplicate); collect_page_widgets's own
+    // `.or_insert` on that identity naturally keeps the first occurrence's
+    // page, matching the /P update rule used by outline_dest_remap for
+    // /Dest. A *direct* widget, however, is embedded inside the deep-cloned
+    // page dictionary (`page_tree_rebuild.rs`'s own doc: "deep-clone the
+    // post-materialization page dictionary"), so each duplicate occurrence
+    // gets its own distinct direct widget with its own distinct identity --
+    // visiting only the first occurrence would leave every later
+    // occurrence's /P dangling at its pre-rebuild value. Visiting every
+    // occurrence lets collect_page_widgets's identity-keyed map do the
+    // right thing for both shapes.
     let mut widget_to_page = WidgetPageMap::new();
-    for (&_old_page, new_refs) in &result.ref_map {
-        let Some(&new_page) = new_refs.first() else {
-            continue;
-        };
-        collect_page_widgets(pdf, new_page, &mut widget_to_page)?;
+    for new_refs in result.ref_map.values() {
+        for &new_page in new_refs {
+            collect_page_widgets(pdf, new_page, &mut widget_to_page)?;
+        }
     }
 
     // ── Step 3: locate and process /AcroForm ──────────────────────────────
@@ -694,6 +702,44 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(3, 0))),
             "direct page widget /P must be updated through its owner"
         );
+    }
+
+    #[test]
+    fn duplicate_page_selection_updates_every_direct_widget_occurrence() {
+        // qpdf precedent (`--pages in.pdf 1,1`): a duplicate page selection
+        // deep-clones the page dictionary per occurrence
+        // (page_tree_rebuild.rs's own doc), so a *direct* widget on that
+        // page is a genuinely distinct object per occurrence -- unlike an
+        // indirect widget, which stays the same shared object regardless of
+        // which occurrence references it. Selecting the same source page
+        // twice must update /P on both occurrences' own widget, not just
+        // the first.
+        let mut pdf = open(build_direct_widget_page_pdf());
+        let page_ref = ObjectRef::new(3, 0);
+        let result = rebuild_page_tree(&mut pdf, &[page_ref, page_ref]).unwrap();
+        assert_eq!(
+            result.new_kids.len(),
+            2,
+            "both occurrences of the duplicate selection must produce a leaf"
+        );
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        for (index, &new_page) in result.new_kids.iter().enumerate() {
+            let page = dict_of(&mut pdf, new_page);
+            let annots = page
+                .get("Annots")
+                .and_then(Object::as_array)
+                .unwrap_or_else(|| panic!("occurrence {index} page /Annots must remain an array"));
+            let widget = annots[0]
+                .as_dict()
+                .unwrap_or_else(|| panic!("occurrence {index} widget must be direct")); // cov:ignore: fixture invariant
+            assert_eq!(
+                widget.get("P"),
+                Some(&Object::Reference(new_page)),
+                "occurrence {index}'s direct widget /P must point at its own page {new_page}, \
+                 not a stale or shared reference"
+            );
+        }
     }
 
     #[test]
