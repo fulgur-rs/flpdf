@@ -737,17 +737,20 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
                     // array-shaped categories such as `/ProcSet`.
                     let mut seen = Vec::with_capacity(destination.len());
                     for item in &destination {
-                        if let Some(key) = resource_array_scalar_key(pdf, item)? {
-                            seen.push(key);
-                        }
+                        let Some(key) = resource_array_scalar_key(pdf, item)? else {
+                            continue;
+                        };
+                        seen.push(key);
                     }
                     for item in source {
-                        if let Some(key) = resource_array_scalar_key(pdf, &item)? {
-                            if !seen.contains(&key) {
-                                seen.push(key);
-                                destination.push(item);
-                            }
+                        let Some(key) = resource_array_scalar_key(pdf, &item)? else {
+                            continue;
+                        };
+                        if seen.contains(&key) {
+                            continue;
                         }
+                        seen.push(key);
+                        destination.push(item);
                     }
                     resources.insert(category, Object::Array(destination));
                 }
@@ -779,17 +782,20 @@ fn resource_array_scalar_key<R: Read + Seek>(
     item: &Object,
 ) -> Result<Option<Object>> {
     let (resolved, _) = resolve_ref_chain(pdf, item)?;
-    Ok(matches!(
-        resolved,
+    let is_scalar = match resolved {
         Object::Null
-            | Object::Boolean(_)
-            | Object::Integer(_)
-            | Object::Real(_)
-            | Object::RealLiteral { .. }
-            | Object::Name(_)
-            | Object::String(_)
-    )
-    .then(|| item.clone()))
+        | Object::Boolean(_)
+        | Object::Integer(_)
+        | Object::Real(_)
+        | Object::RealLiteral { .. }
+        | Object::Name(_)
+        | Object::String(_) => true,
+        Object::Array(_) | Object::Dictionary(_) | Object::Stream(_) | Object::Reference(_) => {
+            false
+        }
+        Object::Operator(_) | Object::InlineImage(_) => false, // cov:ignore: content-stream-only variants never appear inside a parsed resource array
+    };
+    Ok(is_scalar.then(|| item.clone()))
 }
 
 fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
@@ -1431,6 +1437,58 @@ mod tests {
             panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
         };
         assert_eq!(resources.get("ProcSet"), Some(&Object::Integer(7)));
+    }
+
+    #[test]
+    fn qpdf_flatten_array_merge_excludes_non_scalar_items() {
+        // qpdf's array branch only considers `isScalar()` items for both the
+        // dedup set and the append (QPDFObjectHandle.cc:1130-1147); a
+        // non-scalar item such as a nested array or dictionary is excluded
+        // from the merge entirely, on either side.
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Array(vec![Object::Integer(1)])]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert(
+            "ProcSet",
+            Object::Array(vec![Object::Dictionary(Dictionary::new())]),
+        );
+
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &Object::Dictionary(default_resources),
+        )
+        .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            resources.get("ProcSet"),
+            Some(&Object::Array(vec![Object::Array(vec![Object::Integer(
+                1
+            )])])),
+            "the existing non-scalar item survives; the source's non-scalar item is not appended"
+        );
     }
 
     #[test]
