@@ -1,18 +1,19 @@
-//! qpdf correspondence: `QPDF_json.cc` validators, deferred stream providers, and `JSONReactor::makeObject` value construction.
-//! (`libqpdf/QPDF_json.cc:65-209, 212-231, 732-793`; `libqpdf/QUtil.cc:642-663`).
+//! qpdf correspondence: `QPDF_json.cc` JSONReactor state machine, validators, deferred stream providers, and `makeObject` value construction.
+//! (`libqpdf/QPDF_json.cc:233-832`; `libqpdf/QUtil.cc:642-663`).
 //!
 //! This is the canonical value boundary for the JSON input importer. It builds
 //! document-owned `ObjectHandle` values and never routes through the legacy
 //! `Object`/`Pdf::set_object` representation.
 
 use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use super::value::format_qpdf_real;
-use super::Json;
+use super::{Json, Reactor};
 use crate::object_handle::{ObjectValue, StreamDataProvider};
 use crate::pipeline::{Base64Action, Pipeline, PlBase64};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
@@ -294,7 +295,7 @@ fn json_string_to_handle<R: Read + Seek + 'static>(
     string: &[u8],
 ) -> Result<ObjectHandle> {
     if let Some(object_ref) = parse_indirect_reference(string) {
-        return Ok(pdf.get_object_handle(object_ref));
+        return Ok(pdf.resolver.reserve_object_if_not_exists(object_ref));
     }
 
     if let Some(unicode) = string.strip_prefix(b"u:") {
@@ -348,4 +349,727 @@ fn json_dictionary_key(key: &[u8]) -> Result<Vec<u8>> {
         return Ok(canonical);
     }
     Ok(crate::object_handle::canonical_dictionary_key(key))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReactorState {
+    Top,
+    Qpdf,
+    QpdfMeta,
+    Objects,
+    Trailer,
+    ObjectTop,
+    Stream,
+    Object,
+    Ignore,
+}
+
+struct StackFrame {
+    state: ReactorState,
+    object: Option<ObjectHandle>,
+}
+
+/// Incremental qpdf JSON v2 importer state machine.
+///
+/// The parser calls dictionary/array item callbacks before it starts the child
+/// container. `next_obj` and `next_state` therefore mirror qpdf's reactor
+/// hand-off: `make_object` installs an empty canonical container, and
+/// `container_start` puts that same handle on the stack before the child
+/// members arrive. The importer owns this route; it never calls the legacy
+/// `Pdf::set_object` bridge.
+pub(crate) struct JsonReactor<'a, P, S>
+where
+    P: Read + Seek + 'static,
+    S: Read + Seek + 'static,
+{
+    pdf: &'a mut Pdf<P>,
+    source: Rc<RefCell<S>>,
+    input_name: String,
+    must_be_complete: bool,
+    fatal_error: Option<String>,
+    errors: bool,
+    saw_qpdf: bool,
+    saw_qpdf_meta: bool,
+    saw_objects: bool,
+    saw_json_version: bool,
+    saw_pdf_version: bool,
+    saw_trailer: bool,
+    cur_object: String,
+    saw_value: bool,
+    saw_stream: bool,
+    saw_dict: bool,
+    saw_data: bool,
+    saw_datafile: bool,
+    this_stream_needs_data: bool,
+    reserved: BTreeSet<ObjectRef>,
+    stack: Vec<StackFrame>,
+    next_obj: Option<ObjectHandle>,
+    next_state: ReactorState,
+}
+
+impl<'a, P, S> JsonReactor<'a, P, S>
+where
+    P: Read + Seek + 'static,
+    S: Read + Seek + 'static,
+{
+    pub(crate) fn new(
+        pdf: &'a mut Pdf<P>,
+        source: Rc<RefCell<S>>,
+        input_name: impl Into<String>,
+        must_be_complete: bool,
+    ) -> Self {
+        let reserved = pdf
+            .resolver
+            .all_object_handles()
+            .into_iter()
+            .filter(|handle| handle.is_reserved())
+            .filter_map(|handle| handle.object_ref())
+            .collect();
+        Self {
+            pdf,
+            source,
+            input_name: input_name.into(),
+            must_be_complete,
+            fatal_error: None,
+            errors: false,
+            saw_qpdf: false,
+            saw_qpdf_meta: false,
+            saw_objects: false,
+            saw_json_version: false,
+            saw_pdf_version: false,
+            saw_trailer: false,
+            cur_object: String::new(),
+            saw_value: false,
+            saw_stream: false,
+            saw_dict: false,
+            saw_data: false,
+            saw_datafile: false,
+            this_stream_needs_data: false,
+            reserved,
+            stack: Vec::new(),
+            next_obj: None,
+            next_state: ReactorState::Top,
+        }
+    }
+
+    pub(crate) fn any_errors(&self) -> bool {
+        self.errors
+    }
+
+    pub(crate) fn fatal_error(&self) -> Option<&str> {
+        self.fatal_error.as_deref()
+    }
+
+    fn fatal(&mut self, message: impl Into<String>) {
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(message.into());
+        }
+    }
+
+    fn error(&mut self, offset: i64, message: impl Into<String>) {
+        self.errors = true;
+        let result = self.pdf.resolver.push_json_warning(
+            &self.input_name,
+            &self.cur_object,
+            offset,
+            message,
+        );
+        if let Err(error) = result {
+            self.fatal(error.to_string());
+        }
+    }
+
+    fn container_start(&mut self) {
+        let object = self.next_obj.take();
+        self.stack.push(StackFrame {
+            state: self.next_state,
+            object,
+        });
+    }
+
+    fn set_next_state_if_dictionary(
+        &mut self,
+        key: &str,
+        value: &Json,
+        next: ReactorState,
+    ) -> bool {
+        if value.is_dictionary() {
+            self.next_state = next;
+            true
+        } else {
+            self.error(value.start(), format!("\"{key}\" must be a dictionary"));
+            false
+        }
+    }
+
+    fn current_object(&mut self, context: &str) -> Option<ObjectHandle> {
+        let Some(object) = self.stack.last().and_then(|frame| frame.object.clone()) else {
+            self.fatal(format!("current object uninitialized in {context}"));
+            return None;
+        };
+        if let Err(error) = object.try_dereference() {
+            self.fatal(error.to_string());
+            return None;
+        }
+        Some(object)
+    }
+
+    fn mark_dirty(&mut self, handle: &ObjectHandle) {
+        if let Err(error) = self.pdf.mark_object_handle_dirty(handle) {
+            self.fatal(error.to_string());
+        }
+    }
+
+    fn set_object_description(&self, handle: &ObjectHandle, value: &Json) {
+        handle.set_description_json(
+            self.input_name.clone(),
+            self.cur_object.clone(),
+            value.start(),
+        );
+    }
+
+    fn make_empty_stream(&self) -> ObjectHandle {
+        let dictionary = self
+            .pdf
+            .resolver
+            .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
+        self.pdf.resolver.direct_object_handle(ObjectValue::Stream {
+            stream_dict: dictionary,
+            stream_data: None,
+            stream_length: 0,
+            stream_provider: None,
+        })
+    }
+
+    fn make_object(&mut self, value: &Json) -> ObjectHandle {
+        let result = if value.is_dictionary() {
+            let result = self
+                .pdf
+                .resolver
+                .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
+            self.next_obj = Some(result.clone());
+            self.next_state = ReactorState::Object;
+            result
+        } else if value.is_array() {
+            let result = self
+                .pdf
+                .resolver
+                .direct_object_handle(ObjectValue::Array(Vec::new()));
+            self.next_obj = Some(result.clone());
+            self.next_state = ReactorState::Object;
+            result
+        } else if let Some(string) = value.get_string() {
+            if !is_qpdf_json_string(&string) {
+                self.error(value.start(), "unrecognized string value");
+                self.pdf.resolver.direct_object_handle(ObjectValue::Null)
+            } else {
+                match json_value_to_handle(self.pdf, value) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.fatal(error.to_string());
+                        self.pdf.resolver.direct_object_handle(ObjectValue::Null)
+                    }
+                }
+            }
+        } else {
+            match json_value_to_handle(self.pdf, value) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.fatal(error.to_string());
+                    self.pdf.resolver.direct_object_handle(ObjectValue::Null)
+                }
+            }
+        };
+
+        if result.description().is_empty() {
+            self.set_object_description(&result, value);
+        }
+        result
+    }
+
+    fn replace_object(&mut self, replacement: ObjectHandle, value: &Json) {
+        if replacement.is_indirect() {
+            self.error(
+                replacement.get_parsed_offset(),
+                "the value of an object may not be an indirect object reference",
+            );
+            return;
+        }
+        let Some(target) = self.current_object("st_object_top") else {
+            return;
+        };
+        let Some(object_ref) = target.object_ref() else {
+            self.fatal("current object has no indirect identity in st_object_top");
+            return;
+        };
+        match self.pdf.replace_object_handle(object_ref, replacement) {
+            Ok(target) => {
+                self.next_obj = Some(target.clone());
+                self.set_object_description(&target, value);
+            }
+            Err(error) => self.fatal(error.to_string()),
+        }
+    }
+
+    fn normalize_dangling_reserved(&mut self) {
+        let dangling: Vec<ObjectRef> = self
+            .pdf
+            .resolver
+            .all_object_handles()
+            .into_iter()
+            .filter(|handle| handle.is_reserved())
+            .filter_map(|handle| handle.object_ref())
+            .filter(|object_ref| !self.reserved.contains(object_ref))
+            .collect();
+        for object_ref in dangling {
+            if let Err(error) = self
+                .pdf
+                .replace_object_handle(object_ref, ObjectHandle::null())
+            {
+                self.fatal(error.to_string());
+                return;
+            }
+        }
+    }
+
+    fn finish_container(&mut self, from_state: ReactorState, value: &Json) {
+        if self.stack.is_empty() {
+            self.fatal("JSONReactor::containerEnd stack is empty");
+            return;
+        }
+        self.stack.pop();
+        if self.stack.is_empty() {
+            if !self.saw_qpdf {
+                self.error(0, "\"qpdf\" object was not seen");
+            } else {
+                if !self.saw_json_version {
+                    self.error(0, "\"qpdf[0].jsonversion\" was not seen");
+                }
+                if self.must_be_complete && !self.saw_pdf_version {
+                    self.error(0, "\"qpdf[0].pdfversion\" was not seen");
+                }
+                if !self.saw_objects {
+                    self.error(0, "\"qpdf[1]\" was not seen");
+                } else if self.must_be_complete && !self.saw_trailer {
+                    self.error(0, "\"qpdf[1].trailer\" was not seen");
+                }
+            }
+        } else if from_state == ReactorState::Trailer && !self.saw_value {
+            self.error(value.start(), "\"trailer\" is missing \"value\"");
+        } else if from_state == ReactorState::ObjectTop {
+            if self.saw_value == self.saw_stream {
+                self.error(
+                    value.start(),
+                    "object must have exactly one of \"value\" or \"stream\"",
+                );
+            }
+            if self.saw_stream {
+                if !self.saw_dict {
+                    self.error(value.start(), "\"stream\" is missing \"dict\"");
+                }
+                if self.saw_data == self.saw_datafile {
+                    if self.this_stream_needs_data {
+                        self.error(
+                            value.start(),
+                            "new \"stream\" must have exactly one of \"data\" or \"datafile\"",
+                        );
+                    } else if self.saw_datafile {
+                        self.error(
+                            value.start(),
+                            "existing \"stream\" may at most one of \"data\" or \"datafile\"",
+                        );
+                    }
+                }
+            }
+        } else if from_state == ReactorState::Qpdf {
+            self.normalize_dangling_reserved();
+        }
+
+        if self
+            .stack
+            .last()
+            .is_some_and(|frame| frame.state == ReactorState::Objects)
+        {
+            self.cur_object.clear();
+            self.saw_dict = false;
+            self.saw_data = false;
+            self.saw_datafile = false;
+            self.saw_value = false;
+            self.saw_stream = false;
+        }
+    }
+
+    fn dictionary_item_impl(&mut self, key: &[u8], value: &Json) {
+        let state = self.stack.last().map(|frame| frame.state);
+        let Some(state) = state else {
+            self.fatal("stack is empty in dictionaryItem");
+            return;
+        };
+        self.next_state = ReactorState::Ignore;
+        match state {
+            ReactorState::Ignore => {}
+            ReactorState::Top => {
+                if key == b"qpdf" {
+                    self.saw_qpdf = true;
+                    if value.is_array() {
+                        self.next_state = ReactorState::Qpdf;
+                    } else {
+                        self.error(value.start(), "\"qpdf\" must be an array");
+                    }
+                }
+            }
+            ReactorState::QpdfMeta => match key {
+                b"pdfversion" => {
+                    self.saw_pdf_version = true;
+                    let valid = value
+                        .get_string()
+                        .and_then(|version| validate_pdf_version(&version));
+                    if let Some(version) = valid {
+                        self.pdf.version = version;
+                    } else {
+                        self.error(value.start(), "invalid PDF version (must be \"x.y\")");
+                    }
+                }
+                b"jsonversion" => {
+                    self.saw_json_version = true;
+                    if value
+                        .get_number()
+                        .and_then(|number| qpdf_string_to_int(&number))
+                        != Some(2)
+                    {
+                        self.error(
+                            value.start(),
+                            "invalid JSON version (must be numeric value 2)",
+                        );
+                    }
+                }
+                b"pushedinheritedpageresources" => match value.get_bool() {
+                    Some(true) if !self.must_be_complete => {
+                        if let Err(error) = crate::PageDocumentHelper::new(self.pdf)
+                            .push_inherited_attributes_to_pages()
+                        {
+                            self.fatal(error.to_string());
+                        }
+                    }
+                    Some(_) => {}
+                    None => self.error(
+                        value.start(),
+                        "pushedinheritedpageresources must be a boolean",
+                    ),
+                },
+                b"calledgetallpages" => match value.get_bool() {
+                    Some(true) if !self.must_be_complete => {
+                        if let Err(error) = crate::PageDocumentHelper::new(self.pdf).get_all_pages()
+                        {
+                            self.fatal(error.to_string());
+                        }
+                    }
+                    Some(_) => {}
+                    None => self.error(value.start(), "calledgetallpages must be a boolean"),
+                },
+                _ => {}
+            },
+            ReactorState::Objects => {
+                if key == b"trailer" {
+                    self.saw_trailer = true;
+                    self.cur_object = "trailer".to_owned();
+                    self.set_next_state_if_dictionary("trailer", value, ReactorState::Trailer);
+                } else if let Some(object_ref) = parse_object_key(key) {
+                    self.cur_object = String::from_utf8_lossy(key).into_owned();
+                    if self.set_next_state_if_dictionary(
+                        &self.cur_object.clone(),
+                        value,
+                        ReactorState::ObjectTop,
+                    ) {
+                        self.next_obj =
+                            Some(self.pdf.resolver.reserve_object_if_not_exists(object_ref));
+                    }
+                } else {
+                    self.error(
+                        value.start(),
+                        "object key should be \"trailer\" or \"obj:n n R\"",
+                    );
+                }
+            }
+            ReactorState::ObjectTop => {
+                let Some(current) = self.current_object("st_object_top") else {
+                    return;
+                };
+                if key == b"value" {
+                    self.saw_value = true;
+                    let replacement = self.make_object(value);
+                    self.replace_object(replacement, value);
+                    self.next_state = ReactorState::Object;
+                } else if key == b"stream" {
+                    self.saw_stream = true;
+                    if self.set_next_state_if_dictionary("stream", value, ReactorState::Stream) {
+                        self.this_stream_needs_data = false;
+                        let is_stream = current.as_stream_dict().is_some();
+                        if !is_stream {
+                            self.this_stream_needs_data = true;
+                            let replacement = self.make_empty_stream();
+                            let Some(object_ref) = current.object_ref() else {
+                                self.fatal("current object has no indirect identity in stream");
+                                return;
+                            };
+                            match self.pdf.replace_object_handle(object_ref, replacement) {
+                                Ok(target) => self.next_obj = Some(target),
+                                Err(error) => self.fatal(error.to_string()),
+                            }
+                        } else {
+                            self.next_obj = Some(current);
+                        }
+                    }
+                }
+            }
+            ReactorState::Trailer => {
+                if key == b"value" {
+                    self.saw_value = true;
+                    if self.set_next_state_if_dictionary(
+                        "trailer.value",
+                        value,
+                        ReactorState::Object,
+                    ) {
+                        let trailer = self.make_object(value);
+                        self.pdf.trailer_handle_memo = Some(trailer.clone());
+                        self.set_object_description(&trailer, value);
+                    }
+                } else if key == b"stream" {
+                    self.error(value.start(), "the trailer may not be a stream");
+                }
+            }
+            ReactorState::Stream => {
+                let Some(current) = self.current_object("st_stream") else {
+                    return;
+                };
+                if current.as_stream_dict().is_none() {
+                    self.fatal("current object is not stream in st_stream");
+                    return;
+                }
+                match key {
+                    b"dict" => {
+                        self.saw_dict = true;
+                        if self.set_next_state_if_dictionary(
+                            "stream.dict",
+                            value,
+                            ReactorState::Object,
+                        ) {
+                            let dictionary = self.make_object(value);
+                            if let Err(error) = current.replace_stream_dict(dictionary) {
+                                self.fatal(error.to_string());
+                            } else {
+                                self.mark_dirty(&current);
+                            }
+                        }
+                    }
+                    b"data" => {
+                        self.saw_data = true;
+                        if value.get_string().is_none() {
+                            self.error(value.start(), "\"stream.data\" must be a string");
+                            current.replace_stream_data(Rc::new(Vec::new()), None, None);
+                            self.mark_dirty(&current);
+                        } else {
+                            match inline_stream_data_provider(self.source.clone(), value) {
+                                Ok(provider) => {
+                                    if let Err(error) =
+                                        current.replace_stream_data_provider(provider, None, None)
+                                    {
+                                        self.fatal(error.to_string());
+                                    } else {
+                                        self.mark_dirty(&current);
+                                    }
+                                }
+                                Err(error) => self.fatal(error.to_string()),
+                            }
+                        }
+                    }
+                    b"datafile" => {
+                        self.saw_datafile = true;
+                        let Some(filename) = value.get_string() else {
+                            self.error(
+                                value.start(),
+                                "\"stream.datafile\" must be a string containing a file name",
+                            );
+                            current.replace_stream_data(Rc::new(Vec::new()), None, None);
+                            self.mark_dirty(&current);
+                            return;
+                        };
+                        let provider = datafile_stream_data_provider(PathBuf::from(
+                            String::from_utf8_lossy(&filename).into_owned(),
+                        ));
+                        if let Err(error) =
+                            current.replace_stream_data_provider(provider, None, None)
+                        {
+                            self.fatal(error.to_string());
+                        } else {
+                            self.mark_dirty(&current);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ReactorState::Object => {
+                let Some(current) = self.current_object("st_object") else {
+                    return;
+                };
+                let dictionary = current.as_stream_dict().unwrap_or_else(|| current.clone());
+                if dictionary.as_dictionary().is_none() {
+                    if let Err(error) =
+                        dictionary.type_warning("dictionary", "ignoring key replacement request")
+                    {
+                        self.fatal(error.to_string());
+                    }
+                    return;
+                }
+                let key = match json_dictionary_key(key) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        self.fatal(error.to_string());
+                        return;
+                    }
+                };
+                let value = self.make_object(value);
+                if let Err(error) = dictionary.replace_key(&key, value) {
+                    self.fatal(error.to_string());
+                } else {
+                    self.mark_dirty(&dictionary);
+                }
+            }
+            ReactorState::Qpdf => {}
+        }
+    }
+
+    fn array_item_impl(&mut self, value: &Json) {
+        let state = self.stack.last().map(|frame| frame.state);
+        let Some(state) = state else {
+            self.fatal("stack is empty in arrayItem");
+            return;
+        };
+        self.next_state = ReactorState::Ignore;
+        match state {
+            ReactorState::Qpdf => {
+                if !self.saw_qpdf_meta {
+                    self.saw_qpdf_meta = true;
+                    self.set_next_state_if_dictionary("qpdf[0]", value, ReactorState::QpdfMeta);
+                } else if !self.saw_objects {
+                    self.saw_objects = true;
+                    self.set_next_state_if_dictionary("qpdf[1]", value, ReactorState::Objects);
+                } else {
+                    self.error(value.start(), "\"qpdf\" must have two elements");
+                }
+            }
+            ReactorState::Object => {
+                let Some(current) = self.current_object("st_object array item") else {
+                    return;
+                };
+                let item = self.make_object(value);
+                if let Err(error) = current.append_array_item(item) {
+                    self.fatal(error.to_string());
+                } else {
+                    self.mark_dirty(&current);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a, P, S> Reactor for JsonReactor<'a, P, S>
+where
+    P: Read + Seek + 'static,
+    S: Read + Seek + 'static,
+{
+    fn dictionary_start(&mut self) {
+        if self.fatal_error.is_none() {
+            self.container_start();
+        }
+    }
+
+    fn array_start(&mut self) {
+        if self.fatal_error.is_some() {
+            return;
+        }
+        if self.stack.is_empty() {
+            self.fatal("QPDF JSON must be a dictionary");
+        } else {
+            self.container_start();
+        }
+    }
+
+    fn container_end(&mut self, value: &Json) {
+        if self.fatal_error.is_none() {
+            let state = self.stack.last().map(|frame| frame.state);
+            if let Some(state) = state {
+                self.finish_container(state, value);
+            } else {
+                self.fatal("JSONReactor::containerEnd stack is empty");
+            }
+        }
+    }
+
+    fn top_level_scalar(&mut self) {
+        if self.fatal_error.is_none() {
+            self.fatal("QPDF JSON must be a dictionary");
+        }
+    }
+
+    fn dictionary_item(&mut self, key: &[u8], value: &Json) -> bool {
+        if self.fatal_error.is_none() {
+            self.dictionary_item_impl(key, value);
+        }
+        true
+    }
+
+    fn array_item(&mut self, value: &Json) -> bool {
+        if self.fatal_error.is_none() {
+            self.array_item_impl(value);
+        }
+        true
+    }
+}
+
+fn is_qpdf_json_string(value: &[u8]) -> bool {
+    if parse_indirect_reference(value).is_some()
+        || value.starts_with(b"u:")
+        || value.starts_with(b"n:/") && value.len() > 3
+    {
+        return true;
+    }
+    if let Some(binary) = value.strip_prefix(b"b:") {
+        return binary.len() % 2 == 0 && binary.iter().all(u8::is_ascii_hexdigit);
+    }
+    value.len() > 1 && value[0] == b'/'
+}
+
+fn validate_pdf_version(value: &[u8]) -> Option<String> {
+    let dot = value.iter().position(|byte| *byte == b'.')?;
+    if dot == 0
+        || dot + 1 == value.len()
+        || !value[..dot].iter().all(u8::is_ascii_digit)
+        || !value[dot + 1..].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    String::from_utf8(value.to_vec()).ok()
+}
+
+fn qpdf_string_to_int(value: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(value).ok()?;
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let (negative, digits) = text
+        .strip_prefix('-')
+        .map_or((false, text), |digits| (true, digits));
+    let digits_end = digits
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(digits.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let magnitude = digits[..digits_end].parse::<i64>().ok()?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
 }
