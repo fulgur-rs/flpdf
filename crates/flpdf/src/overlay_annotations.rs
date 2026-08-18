@@ -435,14 +435,14 @@ impl DrMap {
     /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:770-777`) to force each
     /// category's sub-dictionary to exist (unshared) in an appearance
     /// stream's own `/Resources` before renaming; see
-    /// [`crate::overlay_appearance_stream::adjust_appearance_stream`].
+    /// [`crate::overlay_appearance_stream::adjust_appearance_stream_handle`].
     pub(crate) fn categories(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.by_name.keys()
     }
 
     /// Record an additional `old -> new` rename under `category`, alongside
     /// whatever that category already holds. Used by
-    /// [`crate::overlay_appearance_stream::adjust_appearance_stream`] to
+    /// [`crate::overlay_appearance_stream::adjust_appearance_stream_handle`] to
     /// extend a **per-call, cloned** copy of this map (never the shared one
     /// threaded through every placement on a destination page) with the
     /// extra rename produced when privatizing one appearance stream's own
@@ -534,7 +534,7 @@ pub(crate) fn apply_placement<R: Read + Seek>(
     // placement on the whole destination document, but both maps are
     // rebuilt at their qpdf call boundaries. `by_name` — the per-call
     // rename table [`adjust_default_appearance`] and
-    // `crate::overlay_appearance_stream::adjust_appearance_stream` consult
+    // `crate::overlay_appearance_stream::adjust_appearance_stream_handle` consult
     // for THIS placement's fields/AP streams — must not leak from a prior
     // placement into one that never repopulates it below. An
     // annotation-only placement (no top-level field at all, so the
@@ -1609,7 +1609,7 @@ fn merge_resources_shallow<R: Read + Seek>(
 /// resource-name pool.
 ///
 /// Also reused by
-/// [`crate::overlay_appearance_stream::adjust_appearance_stream`] to mint a
+/// [`crate::overlay_appearance_stream::adjust_appearance_stream_handle`] to mint a
 /// stream-local unique name for the rare case where an appearance stream's
 /// own (private) `/Resources` already has a *different* entry under a
 /// `DrMap` rename's target name (`libqpdf/QPDFAcroFormDocumentHelper.cc:791-807`'s
