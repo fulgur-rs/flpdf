@@ -71,6 +71,9 @@ pub enum JsonJobError {
     /// A failure reported by the delegated JSON serializer or output pipeline.
     #[error(transparent)]
     Output(#[from] JsonOutputError),
+    /// A failure while emitting the shared qpdf warning completion state.
+    #[error(transparent)]
+    Completion(#[from] crate::Error),
 }
 
 /// Write qpdf JSON v2 output after resolving command-level stream options.

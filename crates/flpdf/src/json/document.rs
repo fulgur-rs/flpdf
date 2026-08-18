@@ -44,14 +44,27 @@ impl Pdf<Cursor<Vec<u8>>> {
     where
         S: Read + Seek + 'static,
     {
+        Self::create_from_json_with_options(source, input_name, PdfOpenOptions::default())
+    }
+
+    /// Create a PDF from complete JSON with explicit qpdf document options.
+    ///
+    /// The options are applied to the rootless seed before the JSON reactor
+    /// starts, so a caller-owned logger observes import-time warnings just as
+    /// it observes warnings from later object resolution. This is the
+    /// document half of `QPDFJob::createQPDF` (`QPDFJob.cc:429-462`,
+    /// `QPDFJob.cc:1708`).
+    pub fn create_from_json_with_options<S>(
+        source: S,
+        input_name: impl Into<String>,
+        mut options: PdfOpenOptions,
+    ) -> Result<Self>
+    where
+        S: Read + Seek + 'static,
+    {
         let input_name = input_name.into();
-        let mut pdf = Self::open_mem_owned_with_options(
-            JSON_PDF.to_vec(),
-            PdfOpenOptions {
-                description: input_name.clone(),
-                ..PdfOpenOptions::default()
-            },
-        )?; // cov:ignore: the qpdf rootless seed is a fixed, valid in-memory PDF
+        options.description = input_name.clone();
+        let mut pdf = Self::open_mem_owned_with_options(JSON_PDF.to_vec(), options)?; // cov:ignore: the qpdf rootless seed is a fixed, valid in-memory PDF
         pdf.import_json(source, input_name, true)?;
         Ok(pdf)
     }
