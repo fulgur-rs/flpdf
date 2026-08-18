@@ -4880,6 +4880,17 @@ mod tests {
             Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
         );
         xobjects.insert("Im", Object::Reference(image_ref));
+        let no_subtype_ref = ObjectRef::new(100, 0);
+        pdf.set_object(
+            no_subtype_ref,
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+        xobjects.insert("NoSubtype", Object::Reference(no_subtype_ref));
+        let form_ref = ObjectRef::new(101, 0);
+        let mut form_dict = Dictionary::new();
+        form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        pdf.set_object(form_ref, Object::Stream(Stream::new(form_dict, Vec::new())));
+        xobjects.insert("Form", Object::Reference(form_ref));
         let mut resources = Dictionary::new();
         resources.insert("XObject", Object::Dictionary(xobjects));
 
@@ -4935,6 +4946,24 @@ mod tests {
         assert!(collect_image_refs(&mut pdf, page_ref)
             .expect("collect images")
             .is_empty());
+    }
+
+    #[test]
+    fn collect_image_refs_propagates_invalid_resources_error() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+            panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        page.insert("Resources", Object::Integer(7));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let error = collect_image_refs(&mut pdf, page_ref).expect_err("invalid resources");
+        assert!(
+            matches!(&error, ConvertError::PdfError(message) if message.contains("/Resources entry")),
+            "unexpected error: {error:?}"
+        );
     }
 
     // ── 29. three-page.pdf: length and pageposfrom1 sequence ─────────────────
@@ -9543,6 +9572,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_pdf_date_zero_offset_is_utc() {
+        assert_eq!(
+            parse_pdf_date(b"D:20260202120000+00'00'"),
+            Some("2026-02-02T12:00:00Z".to_string())
+        );
+    }
+
+    #[test]
     fn parse_pdf_date_no_tz() {
         // No timezone → Z
         assert_eq!(
@@ -10034,6 +10071,42 @@ mod tests {
             serde_json::Value::String("AESv2".into())
         );
         assert_eq!(get("key"), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn encrypt_section_legacy_v2_uses_rc4_methods() {
+        let mut pdf = load_encrypted_r4_pdf();
+        let encrypt_ref = match pdf.trailer().get("Encrypt") {
+            Some(Object::Reference(reference)) => *reference,
+            other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"), // cov:ignore: fixture-shape guard
+        };
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("V", Object::Integer(2));
+        encrypt.insert("R", Object::Integer(3));
+        encrypt.insert("P", Object::Integer(-4));
+        encrypt.insert("Length", Object::Integer(128));
+        pdf.set_object(encrypt_ref, Object::Dictionary(encrypt));
+
+        let section = build_encrypt_section(&mut pdf).expect("build_encrypt_section failed");
+        let parameters = object_pairs(section)
+            .into_iter()
+            .find(|(key, _)| key == "parameters")
+            .map(|(_, value)| object_pairs(value))
+            .expect("parameters");
+        let get = |key: &str| {
+            parameters
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| panic!("parameter {key} missing"))
+        };
+        for key in ["filemethod", "method", "streammethod", "stringmethod"] {
+            assert_eq!(
+                get(key),
+                &serde_json::Value::String("RC4".into()),
+                "legacy /V=2 {key} must use RC4"
+            );
+        }
     }
 
     #[test]

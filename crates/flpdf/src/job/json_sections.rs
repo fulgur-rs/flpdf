@@ -128,13 +128,17 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
-        if let Some(subtype_handle) = stream_dict.get(b"/Subtype".as_slice()) {
-            pdf.resolve_object_handle(subtype_handle)?;
-            if let Some(subtype) = subtype_handle.as_name() {
-                if subtype.as_slice() == b"Image" {
-                    image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
-                }
+        let is_image = match stream_dict.get(b"/Subtype".as_slice()) {
+            Some(subtype_handle) => {
+                pdf.resolve_object_handle(subtype_handle)?;
+                subtype_handle
+                    .as_name()
+                    .is_some_and(|subtype| subtype.as_slice() == b"Image")
             }
+            None => false,
+        };
+        if is_image {
+            image_refs.push(format!("{} {} R", xobj_ref.number, xobj_ref.generation));
         }
     }
     Ok(image_refs)
