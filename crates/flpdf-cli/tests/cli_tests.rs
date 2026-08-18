@@ -5487,6 +5487,30 @@ fn add_attachment_default_key_is_basename() {
 }
 
 #[test]
+fn add_attachment_missing_path_fails_before_writing_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let missing = temp.path().join("missing.txt");
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            missing.to_str().unwrap(),
+            "--key=missing",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("missing.txt"));
+    assert!(!output.exists(), "failed attachment must not create output");
+}
+
+#[test]
 fn add_attachment_repaired_input_keeps_output_and_exits_three_with_output_summary() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("damaged.pdf");
@@ -5546,7 +5570,7 @@ fn add_attachment_explicit_key_and_filename() {
 }
 
 #[test]
-fn add_attachment_non_ascii_basename_uses_ascii_fallback_and_unicode_uf() {
+fn add_attachment_non_ascii_basename_uses_qpdf_unicode_filename_for_f_and_uf() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
     let attachment = temp.path().join("レポート.pdf");
@@ -5587,8 +5611,8 @@ fn add_attachment_non_ascii_basename_uses_ascii_fallback_and_unicode_uf() {
 
     assert_eq!(
         fs_dict.get("F"),
-        Some(&Object::String(b"____.pdf".to_vec())),
-        "/F must be ASCII-safe fallback"
+        Some(&Object::String(encode_utf16be("レポート.pdf"))),
+        "/F must match qpdf's Unicode filename when no compatibility name is supplied"
     );
     assert_eq!(
         fs_dict.get("UF"),

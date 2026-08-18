@@ -1,12 +1,199 @@
-//! qpdf correspondence: `QPDFJob::doListAttachments` and `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:876-927`).
+//! qpdf correspondence: `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:876-927,2046-2090`).
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::attachment_list::format_attachment_list_with_sink;
-use crate::filespec_helper::extract_attachment;
-use crate::{Error, Pdf, Result};
+use crate::filespec_helper::{extract_attachment, format_pdf_date, FileSpec};
+use crate::{Error, ObjectHandle, Pdf, Result};
 use std::io::{Read, Seek};
+use std::path::PathBuf;
+
+/// qpdf's per-file configuration for `QPDFJob::addAttachments`.
+///
+/// The path is retained by the provider-backed embedded-file stream; the
+/// payload is not materialized by the job. `creation_date` and
+/// `modification_date` carry raw PDF date strings so an explicit qpdf date is
+/// preserved byte-for-byte. When omitted, the job supplies qpdf's current UTC
+/// PDF date at the start of the operation.
+#[derive(Debug, Clone)]
+pub struct AttachmentAddOptions {
+    /// Path whose bytes are embedded.
+    pub path: PathBuf,
+    /// `/Names /EmbeddedFiles` name-tree key.
+    pub key: Vec<u8>,
+    /// Displayed `/F` and `/UF` filename.
+    pub filename: Vec<u8>,
+    /// Optional `/EmbeddedFile /Subtype` MIME name.
+    pub mimetype: Option<Vec<u8>>,
+    /// Optional `/Filespec /Desc` text.
+    pub description: Option<Vec<u8>>,
+    /// Optional raw `/Params /CreationDate` value.
+    pub creation_date: Option<Vec<u8>>,
+    /// Optional raw `/Params /ModDate` value.
+    pub modification_date: Option<Vec<u8>>,
+    /// Replace an existing entry with the same key.
+    pub replace: bool,
+    /// Emit qpdf's `attached ... with key ...` diagnostic.
+    pub verbose: bool,
+}
+
+fn current_pdf_date() -> Vec<u8> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (seconds / 86_400) as i64;
+    let seconds_today = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format_pdf_date(
+        year,
+        month,
+        day,
+        (seconds_today / 3_600) as u8,
+        ((seconds_today / 60) % 60) as u8,
+        (seconds_today % 60) as u8,
+    )
+}
+
+// Howard Hinnant's proleptic Gregorian conversion, with the Unix epoch at
+// 1970-01-01. `current_pdf_date` supplies a non-negative Unix day count.
+fn civil_from_days(days_since_epoch: i64) -> (u16, u8, u8) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year as u16, month as u8, day as u8)
+}
 
 impl QPDFJob {
+    /// Add one or more provider-backed attachments through the shared qpdf
+    /// job lifecycle.
+    ///
+    /// This is the Rust translation of `QPDFJob::addAttachments`:
+    /// `QPDFJob.cc:2037-2087`. Page mode is changed before duplicate
+    /// detection, Filespec/EmbeddedFile objects are created through the
+    /// typed helpers, and the canonical ObjectHandle name-tree route owns the
+    /// insertion/replacement. A duplicate is reported only after all
+    /// non-duplicate entries have been processed, matching qpdf's aggregate
+    /// error boundary.
+    pub fn add_attachments<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        options: &[AttachmentAddOptions],
+    ) -> Result<()> {
+        pdf.set_logger(self.logger());
+        self.set_attachment_page_mode(pdf)?;
+
+        let mut duplicated_keys = Vec::new();
+        let default_date = current_pdf_date();
+        for option in options {
+            let exists = {
+                let mut embedded_files = pdf.embedded_files();
+                embedded_files.get_embedded_file(&option.key)?.is_some()
+            };
+            if exists && !option.replace {
+                duplicated_keys.push(option.key.clone());
+                continue;
+            }
+
+            if let Some(mimetype) = option.mimetype.as_deref() {
+                if !mimetype.contains(&b'/') {
+                    return Err(Error::System(
+                        "mime type should be specified as type/subtype".to_string(),
+                    ));
+                }
+            }
+
+            // qpdf's provider factory opens the path while constructing the
+            // EmbeddedFile so that it can compute /Params /Size and /CheckSum.
+            // Keep that failure at the job boundary to retain qpdf's `open
+            // <path>: <error>` diagnostic before the provider is installed.
+            std::fs::File::open(&option.path).map_err(|error| {
+                Error::System(format!("open {}: {error}", option.path.display()))
+            })?;
+
+            let filespec =
+                FileSpec::create_file_spec_from_path(pdf, &option.filename, &option.path)?;
+            {
+                let mut filespec_helper = FileSpec::new(filespec.clone(), pdf)?;
+                if let Some(description) = option.description.as_deref() {
+                    filespec_helper.set_description(description)?;
+                }
+                let mut embedded_file = filespec_helper
+                    .embedded_file()?
+                    .expect("FileSpec::create_file_spec_from_path must create an /EmbeddedFile");
+                let creation_date = option
+                    .creation_date
+                    .clone()
+                    .unwrap_or_else(|| default_date.clone());
+                let modification_date = option
+                    .modification_date
+                    .clone()
+                    .unwrap_or_else(|| default_date.clone());
+                embedded_file.set_creation_date(creation_date)?;
+                embedded_file.set_mod_date(modification_date)?;
+                if let Some(mimetype) = option.mimetype.as_deref() {
+                    embedded_file.set_subtype(mimetype)?;
+                }
+            }
+
+            pdf.embedded_files()
+                .replace_embedded_file(&option.key, filespec)?;
+
+            if option.verbose {
+                self.logger().info(format!(
+                    "{}: attached {} as {} with key {}\n",
+                    self.message_prefix(),
+                    option.path.display(),
+                    String::from_utf8_lossy(&option.filename),
+                    String::from_utf8_lossy(&option.key)
+                ))?;
+            }
+        }
+
+        if duplicated_keys.is_empty() {
+            return Ok(());
+        }
+
+        let keys = duplicated_keys
+            .iter()
+            .map(|key| String::from_utf8_lossy(key).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Error::System(format!(
+            "{} already has attachments with the following keys: {}; use --replace to replace or --key to specify a different key",
+            self.input_name(), keys
+        )))
+    }
+
+    /// Add one attachment through [`Self::add_attachments`].
+    pub fn add_attachment<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        options: AttachmentAddOptions,
+    ) -> Result<()> {
+        self.add_attachments(pdf, std::slice::from_ref(&options))
+    }
+
+    fn set_attachment_page_mode<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
+        let Some(root_ref) = pdf.root_ref() else {
+            return Ok(());
+        };
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve_object_handle(&root)?;
+        if root.try_get_key(b"/PageMode")?.try_is_null()? {
+            root.replace_key(b"/PageMode", ObjectHandle::name(b"UseAttachments".to_vec()))?;
+            pdf.mark_object_handle_dirty(&root)?;
+        }
+        Ok(())
+    }
+
     /// List embedded files through the shared qpdf info pipeline.
     ///
     /// `QPDFJob::doListAttachments` owns the output and warning lifecycle,
@@ -56,8 +243,13 @@ impl QPDFJob {
 #[cfg(test)]
 mod tests {
     use super::super::{JobExitCode, QPDFJob};
+    use super::AttachmentAddOptions;
+    use crate::attachment_list::list_attachment_info;
+    use crate::filespec_helper::extract_attachment;
+    use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-    use crate::{PdfOpenOptions, QPDFLogger};
+    use crate::Object;
+    use crate::{Pdf, PdfOpenOptions, QPDFLogger};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -212,5 +404,273 @@ mod tests {
             *save.lock().expect("save capture"),
             b"This is a small text attachment for PDF fixture testing.\nGenerated by flpdf test corpus setup.\n"
         );
+    }
+
+    #[test]
+    fn add_attachment_owns_page_mode_metadata_name_tree_and_verbose_diagnostic() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let attachment = dir.path().join("payload.txt");
+        std::fs::write(&attachment, b"attachment payload").expect("write payload");
+        let (mut job, info, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        job.add_attachment(
+            &mut pdf,
+            AttachmentAddOptions {
+                path: attachment.clone(),
+                key: b"payload-key".to_vec(),
+                filename: b"renamed.txt".to_vec(),
+                mimetype: Some(b"text/plain".to_vec()),
+                description: Some(b"test description".to_vec()),
+                creation_date: Some(b"D:20240101120000Z".to_vec()),
+                modification_date: Some(b"D:20240102130000Z".to_vec()),
+                replace: false,
+                verbose: true,
+            },
+        )
+        .expect("add attachment");
+
+        let root_ref = pdf.root_ref().expect("catalog root");
+        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        assert_eq!(
+            root.get("PageMode"),
+            Some(&Object::Name(b"UseAttachments".to_vec()))
+        );
+
+        let attachments = list_attachment_info(&mut pdf).expect("list attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].key, b"payload-key");
+        assert_eq!(attachments[0].display_name.as_deref(), Some("renamed.txt"));
+        assert_eq!(
+            attachments[0].mimetype.as_deref(),
+            Some(b"text/plain".as_slice())
+        );
+        assert_eq!(
+            attachments[0].description.as_deref(),
+            Some(b"test description".as_slice())
+        );
+        assert_eq!(
+            attachments[0].creation_date.as_deref(),
+            Some(b"D:20240101120000Z".as_slice())
+        );
+        assert_eq!(
+            attachments[0].modification_date.as_deref(),
+            Some(b"D:20240102130000Z".as_slice())
+        );
+
+        let info = info.lock().expect("info capture");
+        let info = String::from_utf8_lossy(&info);
+        assert!(info.contains("qpdf: attached "));
+        assert!(info.contains(" as renamed.txt with key payload-key\n"));
+    }
+
+    fn add_options(path: std::path::PathBuf, key: &[u8]) -> AttachmentAddOptions {
+        AttachmentAddOptions {
+            path,
+            key: key.to_vec(),
+            filename: b"payload.txt".to_vec(),
+            mimetype: None,
+            description: None,
+            creation_date: Some(b"D:20240101120000Z".to_vec()),
+            modification_date: Some(b"D:20240101120000Z".to_vec()),
+            replace: false,
+            verbose: false,
+        }
+    }
+
+    #[test]
+    fn add_attachment_defaults_dates_and_preserves_existing_page_mode() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let attachment = dir.path().join("payload.txt");
+        std::fs::write(&attachment, b"payload").expect("write payload");
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let root_ref = pdf.root_ref().expect("catalog root");
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve_object_handle(&root).expect("resolve catalog");
+        root.replace_key(b"/PageMode", crate::ObjectHandle::name(b"UseNone".to_vec()))
+            .expect("set existing page mode");
+        pdf.mark_object_handle_dirty(&root)
+            .expect("mark catalog dirty");
+
+        let mut options = add_options(attachment, b"payload-key");
+        options.creation_date = None;
+        options.modification_date = None;
+        job.add_attachment(&mut pdf, options)
+            .expect("add attachment");
+
+        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        assert_eq!(
+            root.get("PageMode"),
+            Some(&Object::Name(b"UseNone".to_vec()))
+        );
+
+        let attachments = list_attachment_info(&mut pdf).expect("list attachments");
+        assert!(attachments[0]
+            .creation_date
+            .as_deref()
+            .is_some_and(|date| date.starts_with(b"D:")));
+        assert_eq!(
+            attachments[0].creation_date, attachments[0].modification_date,
+            "qpdf uses one current timestamp for both default dates"
+        );
+    }
+
+    #[test]
+    fn add_attachment_aggregates_duplicate_error_and_replaces_when_requested() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, b"first").expect("write first payload");
+        std::fs::write(&second, b"second").expect("write second payload");
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "input.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        job.add_attachment(&mut pdf, add_options(first, b"duplicate"))
+            .expect("add first attachment");
+        job.add_attachment(
+            &mut pdf,
+            add_options(dir.path().join("first.txt"), b"other"),
+        )
+        .expect("add second attachment");
+        let error = job
+            .add_attachments(
+                &mut pdf,
+                &[
+                    add_options(second.clone(), b"duplicate"),
+                    add_options(second.clone(), b"other"),
+                ],
+            )
+            .expect_err("duplicate must fail without replace");
+        assert_eq!(
+            error.to_string(),
+            "input.pdf already has attachments with the following keys: duplicate, other; use --replace to replace or --key to specify a different key"
+        );
+
+        let mut replacement = add_options(second, b"duplicate");
+        replacement.replace = true;
+        job.add_attachment(&mut pdf, replacement)
+            .expect("replace attachment");
+        assert_eq!(
+            extract_attachment(&mut pdf, b"duplicate").expect("extract replacement"),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn add_attachment_rejects_mimetype_without_type_subtype_separator() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let attachment = dir.path().join("payload.txt");
+        std::fs::write(&attachment, b"payload").expect("write payload");
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+        let mut options = add_options(attachment, b"payload-key");
+        options.mimetype = Some(b"textplain".to_vec());
+
+        let error = job
+            .add_attachment(&mut pdf, options)
+            .expect_err("invalid mimetype must fail");
+        assert_eq!(
+            error.to_string(),
+            "mime type should be specified as type/subtype"
+        );
+    }
+
+    #[test]
+    fn add_attachment_propagates_verbose_info_pipeline_failure() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let attachment = dir.path().join("payload.txt");
+        std::fs::write(&attachment, b"payload").expect("write payload");
+
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(NthWriteFailure::new(1))));
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let mut options = add_options(attachment, b"payload-key");
+        options.verbose = true;
+        let error = job
+            .add_attachment(&mut pdf, options)
+            .expect_err("verbose info sink failure must propagate");
+        assert_eq!(error.to_string(), "sink write failure 1");
+    }
+
+    #[test]
+    fn add_attachments_tolerates_a_pdf_without_catalog_root() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open rootless fixture");
+        assert!(
+            pdf.root_ref().is_none(),
+            "fixture must have no catalog root"
+        );
+        let mut job = QPDFJob::new();
+        job.add_attachments(&mut pdf, &[])
+            .expect("empty add operation must tolerate missing root");
     }
 }
