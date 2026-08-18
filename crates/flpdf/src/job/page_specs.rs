@@ -20,7 +20,8 @@ use std::io::{Cursor, Read, Seek};
 /// document-level base for the output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageSpecInput {
-    /// Index of the source document in [`QPDFJob::handle_page_specs`].
+    /// Index of the source document in
+    /// [`QPDFJob::handle_page_specs`](super::QPDFJob::handle_page_specs).
     pub source_index: usize,
     /// qpdf page-range expression for this source occurrence.
     pub range: PageRange,
