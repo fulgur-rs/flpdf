@@ -5,6 +5,7 @@
 //! form annotations, reconstructs chunk-local labels, and is written as a
 //! separate output file.
 
+use super::QPDFJob;
 use crate::page_split::{chunk_output_path, digit_width};
 use crate::{
     Error, Matrix, PageDocumentHelper, PageInput, PageObjectHelper, Pdf, PdfWriter, Result,
@@ -51,7 +52,7 @@ impl SplitPageOptions {
     }
 }
 
-impl super::QPDFJob {
+impl QPDFJob {
     /// Execute qpdf's fresh-document split-pages job.
     pub fn split_pages<R: std::io::Read + std::io::Seek + 'static>(
         &mut self,
