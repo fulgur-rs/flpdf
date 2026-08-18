@@ -10,11 +10,17 @@ use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset,
-    objr_obj_annot_p::drop_objr_obj_annot_dangling_p, outline_dest_remap::remap_outline_and_dests,
-    page_collate::collate, page_combine::CombinedPlan, page_rotate::apply_rotate_to_pages,
-    page_split::split_pages, page_tree_rebuild::rebuild_page_tree,
-    struct_tree_pg::drop_struct_elem_dangling_pg, subset_prune::prune_after_subset,
-    thread_bead_p::drop_thread_bead_dangling_p, InputSpec, PageRange, RotateSpec,
+    objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
+    outline_dest_remap::remap_outline_and_dests,
+    page_collate::collate,
+    page_combine::{CombinedPage, CombinedPlan},
+    page_rotate::apply_rotate_to_pages,
+    page_split::split_pages,
+    page_tree_rebuild::rebuild_page_tree,
+    struct_tree_pg::drop_struct_elem_dangling_pg,
+    subset_prune::prune_after_subset,
+    thread_bead_p::drop_thread_bead_dangling_p,
+    InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
     check_reader_with_options_and_limits, filters, flatten_rotation_on_pages,
@@ -37,7 +43,7 @@ use flpdf::{
 };
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -338,6 +344,38 @@ struct Cli {
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
+
+    /// Treat INPUT as a qpdf JSON v2 document instead of a PDF
+    /// (qpdf `--json-input`). The imported document then follows the same
+    /// rewrite, page-operation, or JSON-output job routes as a PDF input.
+    #[arg(
+        long = "json-input",
+        conflicts_with_all = [
+            "check", "dump_object", "show_info", "show_catalog",
+            "show_metadata", "show_outline", "show_npages", "show_pages",
+            "show_linearization", "list_attachments", "show_attachment",
+            "remove_attachment", "add_attachment", "copy_attachments_from",
+        ],
+        help = "Treat INPUT as qpdf JSON v2 (qpdf --json-input)"
+    )]
+    json_input: bool,
+
+    /// Apply a partial qpdf JSON v2 update to INPUT before any other job
+    /// transformations (qpdf `--update-from-json`). qpdf requires the equals
+    /// form so the JSON path cannot be confused with the PDF input path.
+    #[arg(
+        long = "update-from-json",
+        value_name = "QPDF-JSON",
+        require_equals = true,
+        conflicts_with_all = [
+            "check", "dump_object", "show_info", "show_catalog",
+            "show_metadata", "show_outline", "show_npages", "show_pages",
+            "show_linearization", "list_attachments", "show_attachment",
+            "remove_attachment", "add_attachment", "copy_attachments_from",
+        ],
+        help = "Apply a qpdf JSON update before processing (qpdf --update-from-json)"
+    )]
+    update_from_json: Option<PathBuf>,
 
     /// Write JSON output to PATH instead of stdout.
     #[arg(
@@ -1843,6 +1881,8 @@ fn main() {
             args.output.clone(),
             args.repair,
             &args.password,
+            args.json_input,
+            args.update_from_json.as_deref(),
             true,
             args.linearize_pass1.as_deref(),
             args.remove_restrictions,
@@ -1913,6 +1953,8 @@ fn main() {
                     &output,
                     args.repair,
                     &args.password,
+                    args.json_input,
+                    args.update_from_json.as_deref(),
                     &args.page_ops,
                     &overlay_specs,
                     CliRemoveUnreferencedResources::Auto,
@@ -1933,6 +1975,8 @@ fn main() {
                     &output,
                     args.repair,
                     &args.password,
+                    args.json_input,
+                    args.update_from_json.as_deref(),
                     &args.page_ops,
                     options.clone(),
                     args.verbose,
@@ -1986,6 +2030,8 @@ fn main() {
             args.output,
             args.repair,
             &args.password,
+            args.json_input,
+            args.update_from_json.as_deref(),
             false,
             None,
             args.remove_restrictions,
@@ -2116,52 +2162,83 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         None
     };
 
-    // 5. Open PDF once and retain an identity handle for the output check.
+    // 5. Open the input once and retain an identity handle for the output
+    // check. JSON input uses the canonical complete-document importer; a
+    // partial update is applied immediately after creation/opening.
     let input_file = File::open(input).map_err(|error| json_input_open_error(input, error))?;
     let input_identity = input_file
         .try_clone()
         .map_err(|error| error_with_file(input, error.into()))?;
-    let mut pdf = open_pdf_from_file(input, input_file, cli.repair, &cli.password)?;
 
-    // 6. Write JSON incrementally.
-    //
-    // `decode_level` governs both inline `data` payloads and file-mode side files
-    // emitted by the job-owned JSON output pipeline.
+    if cli.json_input {
+        let mut pdf = open_json_pdf(input, cli.update_from_json.as_deref())?;
+        run_json_document(
+            cli,
+            &input_identity,
+            &mut standard_output,
+            &mut pdf,
+            stream_data,
+            &json_keys,
+            &json_objects,
+        )
+    } else {
+        let mut pdf = open_pdf_from_file(input, input_file, cli.repair, &cli.password)?;
+        apply_json_update(&mut pdf, cli.update_from_json.as_deref())?;
+        run_json_document(
+            cli,
+            &input_identity,
+            &mut standard_output,
+            &mut pdf,
+            stream_data,
+            &json_keys,
+            &json_objects,
+        )
+    }
+}
+
+/// Serialize an already-opened job document through the existing qpdf JSON
+/// output consumer. Keeping this generic preserves the same output path for
+/// file-backed PDF inputs and JSON-created documents.
+fn run_json_document<R: Read + Seek>(
+    cli: &Cli,
+    input_identity: &File,
+    standard_output: &mut Option<PipelineWriter>,
+    pdf: &mut Pdf<R>,
+    stream_data: JsonStreamData,
+    json_keys: &[JsonKey],
+    json_objects: &[JsonObjectSelector],
+) -> CliResult<()> {
+    // `decode_level` governs both inline `data` payloads and file-mode side
+    // files emitted by the job-owned JSON output pipeline.
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let had_open_warnings = diagnostics_start > 0;
     let json_result = if let Some(ref path) = cli.json_output {
-        match open_verified_json_output(&input_identity, path) {
-            Ok(mut file) => {
-                let options = JsonJobOptions {
-                    decode_level: DecodeLevel::Generalized,
-                    stream_data,
-                    stream_prefix: cli.json_stream_prefix.as_deref(),
-                    keys: &json_keys,
-                    objects: &json_objects,
-                };
-                write_json(
-                    &mut pdf,
-                    options,
-                    JsonJobOutput::File {
-                        filename: path,
-                        writer: &mut file,
-                    },
-                )
-            }
-            Err(error) => {
-                return Err(error);
-            }
-        }
+        let mut file = open_verified_json_output(input_identity, path)?;
+        let options = JsonJobOptions {
+            decode_level: DecodeLevel::Generalized,
+            stream_data,
+            stream_prefix: cli.json_stream_prefix.as_deref(),
+            keys: json_keys,
+            objects: json_objects,
+        };
+        write_json(
+            pdf,
+            options,
+            JsonJobOutput::File {
+                filename: path,
+                writer: &mut file,
+            },
+        )
     } else {
         let options = JsonJobOptions {
             decode_level: DecodeLevel::Generalized,
             stream_data,
             stream_prefix: cli.json_stream_prefix.as_deref(),
-            keys: &json_keys,
-            objects: &json_objects,
+            keys: json_keys,
+            objects: json_objects,
         };
         write_json(
-            &mut pdf,
+            pdf,
             options,
             JsonJobOutput::Stdout(
                 standard_output
@@ -2172,9 +2249,7 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     };
     match json_result {
         Ok(()) => {}
-        Err(JsonJobError::Output(error)) => {
-            return Err(Box::new(error));
-        }
+        Err(JsonJobError::Output(error)) => return Err(Box::new(error)),
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
     }
 
@@ -2415,6 +2490,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.output,
                         cmd.repair,
                         &cmd.password,
+                        false,
+                        None,
                         &cmd.page_ops,
                         overlay_specs,
                         remove_unref,
@@ -2427,6 +2504,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                         &cmd.output,
                         cmd.repair,
                         &cmd.password,
+                        false,
+                        None,
                         &cmd.page_ops,
                         options,
                         cmd.verbose,
@@ -2439,6 +2518,8 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 Some(cmd.output),
                 cmd.repair,
                 &cmd.password,
+                false,
+                None,
                 cmd.linearize,
                 None,
                 cmd.remove_restrictions,
@@ -3108,6 +3189,8 @@ fn run_rewrite(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
+    json_input: bool,
+    update_from_json: Option<&Path>,
     linearize: bool,
     linearize_pass1: Option<&Path>,
     remove_restrictions: bool,
@@ -3124,7 +3207,70 @@ fn run_rewrite(
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
-    let mut standard_output = prepare_pdf_standard_output(&output)?;
+    let opened = open_job_pdf(&input, repair, password, json_input, update_from_json)?;
+    match opened {
+        JobPdf::File(pdf) => run_rewrite_opened(
+            pdf,
+            &input,
+            &output,
+            repair,
+            linearize,
+            linearize_pass1,
+            remove_restrictions,
+            decrypt,
+            normalize_content,
+            coalesce_contents,
+            _remove_unref,
+            generate_appearances,
+            flatten_annotations_mode,
+            flatten_rotation,
+            overlay_specs,
+            verbose,
+            options,
+        ),
+        JobPdf::Json(pdf) => run_rewrite_opened(
+            pdf,
+            &input,
+            &output,
+            repair,
+            linearize,
+            linearize_pass1,
+            remove_restrictions,
+            decrypt,
+            normalize_content,
+            coalesce_contents,
+            _remove_unref,
+            generate_appearances,
+            flatten_annotations_mode,
+            flatten_rotation,
+            overlay_specs,
+            verbose,
+            options,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rewrite_opened<R: Read + Seek + 'static>(
+    mut pdf: Pdf<R>,
+    input: &Path,
+    output: &Path,
+    repair: bool,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+    remove_restrictions: bool,
+    decrypt: bool,
+    normalize_content: bool,
+    coalesce_contents: bool,
+    _remove_unref: CliRemoveUnreferencedResources,
+    generate_appearances: bool,
+    flatten_annotations_mode: Option<CliFlattenMode>,
+    flatten_rotation: bool,
+    overlay_specs: &[OverlaySpec],
+    verbose: bool,
+    options: WriterOptions,
+) -> CliResult<()> {
+    let mut standard_output = prepare_pdf_standard_output(output)?;
 
     // Overlay/underlay stacking mutates page dictionaries and adds objects
     // before the canonical writer plans the output. The linearized path has a
@@ -3134,7 +3280,6 @@ fn run_rewrite(
     }
 
     if linearize {
-        let mut pdf = open_pdf(&input, repair, password)?;
         // --remove-restrictions must strip signatures before the linearization
         // plan is computed: removing signature objects changes the reachable
         // first-page graph. qpdf applies this transformation before planning.
@@ -3157,7 +3302,7 @@ fn run_rewrite(
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(
             &mut pdf,
-            &output,
+            output,
             &mut standard_output,
             &options,
             true,
@@ -3171,9 +3316,8 @@ fn run_rewrite(
         }
         // On an encrypted input, `--decrypt`/`--remove-restrictions` has
         // already disabled source-encryption preservation above.
-        finish_rewrite_warnings(&input, &pdf, &normalization_last_bad, announce_file)?;
+        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file)?;
     } else {
-        let mut pdf = open_pdf(&input, repair, password)?;
         // Capture encryption state before the write for the qpdf-compatible
         // restriction diagnostic.
         let was_encrypted = pdf.is_encrypted();
@@ -3343,7 +3487,7 @@ fn run_rewrite(
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(
             &mut pdf,
-            &output,
+            output,
             &mut standard_output,
             &options,
             false,
@@ -3363,7 +3507,7 @@ fn run_rewrite(
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
         // matching qpdf's lenient handling of --remove-restrictions on
         // unencrypted files.
-        finish_rewrite_warnings(&input, &pdf, &normalization_last_bad, announce_file)?;
+        finish_rewrite_warnings(input, &pdf, &normalization_last_bad, announce_file)?;
     }
     Ok(())
 }
@@ -4025,13 +4169,15 @@ fn run_page_extraction(
     output: &std::path::Path,
     repair: bool,
     password: &PasswordArgs,
+    json_input: bool,
+    update_from_json: Option<&Path>,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
     options: WriterOptions,
     verbose: bool,
 ) -> CliResult<()> {
-    let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
+    let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     let creates_output = standard_output.is_none();
     if page_ops.empty {
         // qpdf accepts `--empty`; ignoring it would silently change which
@@ -4092,6 +4238,46 @@ fn run_page_extraction(
         .into());
     }
 
+    if json_input || update_from_json.is_some() {
+        let opened = open_job_pdf(
+            primary_input,
+            repair,
+            password,
+            json_input,
+            update_from_json,
+        )?;
+        return match opened {
+            JobPdf::File(pdf) => run_page_extraction_from_repeated_pdf(
+                pdf,
+                output,
+                repair,
+                page_ops,
+                overlay_specs,
+                remove_unref,
+                options,
+                verbose,
+                standard_output,
+                creates_output,
+                &inputs,
+                &distinct,
+            ),
+            JobPdf::Json(pdf) => run_page_extraction_from_repeated_pdf(
+                pdf,
+                output,
+                repair,
+                page_ops,
+                overlay_specs,
+                remove_unref,
+                options,
+                verbose,
+                standard_output,
+                creates_output,
+                &inputs,
+                &distinct,
+            ),
+        };
+    }
+
     // qpdf's page-operation output inherits encryption from the command's
     // primary input. A plaintext primary importing pages from an encrypted
     // secondary produces plaintext; an encrypted primary remains encrypted.
@@ -4147,9 +4333,6 @@ fn run_page_extraction(
         None => plan.flat_pages().to_vec(),
     };
 
-    // All combined pages belong to source_index files that all resolve to the
-    // same path (enforced above), so their page_refs are valid against a
-    // freshly-opened handle of that file.
     let source_path = &inputs[0].path;
     let source_password = inputs[0].password.clone();
     let mut src_pw = password.clone();
@@ -4157,35 +4340,115 @@ fn run_page_extraction(
         src_pw.password = Some(pw);
         src_pw.password_file = None;
     }
-    let mut pdf = open_pdf(&source_path.to_path_buf(), repair, &src_pw)?;
+    let pdf = open_pdf(&source_path.to_path_buf(), repair, &src_pw)?;
 
+    run_page_extraction_after_plan(
+        pdf,
+        output,
+        repair,
+        page_ops,
+        overlay_specs,
+        remove_unref,
+        options,
+        verbose,
+        standard_output,
+        creates_output,
+        primary_encrypted,
+        combined_pages,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
+    mut pdf: Pdf<R>,
+    output: &Path,
+    repair: bool,
+    page_ops: &PageOpArgs,
+    overlay_specs: &[OverlaySpec],
+    remove_unref: CliRemoveUnreferencedResources,
+    options: WriterOptions,
+    verbose: bool,
+    standard_output: Option<PipelineWriter>,
+    creates_output: bool,
+    inputs: &[InputSpec],
+    distinct: &[PathBuf],
+) -> CliResult<()> {
+    let primary_encrypted = pdf.is_encrypted();
+    if verbose {
+        let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
+        for path in distinct {
+            let fname = pages_progress_filename(path);
+            message.push_str(&format!(
+                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+            ));
+        }
+        logger_info(message)?;
+    }
+
+    let ranges = inputs.iter().map(|spec| spec.range.clone()).collect();
+    let plan = CombinedPlan::build_repeated(&mut pdf, ranges)?;
+
+    if verbose {
+        let mut message = String::from("flpdf: removing unreferenced pages from primary input\n");
+        for spec in inputs {
+            message.push_str(&format!(
+                "flpdf: adding pages from {}\n",
+                pages_progress_filename(&spec.path)
+            ));
+        }
+        logger_info(message)?;
+    }
+
+    let combined_pages = match page_ops.collate.as_deref() {
+        Some(raw) => {
+            let n = parse_collate_n(raw)?;
+            collate(&plan, n)?
+        }
+        None => plan.flat_pages().to_vec(),
+    };
+
+    run_page_extraction_after_plan(
+        pdf,
+        output,
+        repair,
+        page_ops,
+        overlay_specs,
+        remove_unref,
+        options,
+        verbose,
+        standard_output,
+        creates_output,
+        primary_encrypted,
+        combined_pages,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
+    mut pdf: Pdf<R>,
+    output: &Path,
+    repair: bool,
+    page_ops: &PageOpArgs,
+    overlay_specs: &[OverlaySpec],
+    remove_unref: CliRemoveUnreferencedResources,
+    options: WriterOptions,
+    verbose: bool,
+    mut standard_output: Option<PipelineWriter>,
+    creates_output: bool,
+    primary_encrypted: bool,
+    combined_pages: Vec<CombinedPage>,
+) -> CliResult<()> {
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
     if selected.is_empty() {
         return Err("--pages: page selection is empty".into());
     }
 
-    // Step 2: rebuild the page tree from the selected leaves.
     let result = rebuild_page_tree(&mut pdf, &selected)?;
-
-    // Step 3: --rotate, applied in argument order. In --pages mode the
-    // range indexes the OUTPUT page list (result.new_kids), matching the
-    // qpdf 11.9.0 observation documented at the top of this section.
-    // Ordering note: rotate runs after rebuild but before the remap/prune
-    // passes. This is order-independent w.r.t. those passes — rotate only
-    // mutates each leaf's /Rotate, never the /Outlines, /Names, /AcroForm,
-    // or orphaned-resource graph that steps 4–6 operate on.
     apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
 
-    // Step 3.5: /PageLabels reconstruction (qpdf `handlePageSpecs` parity).
-    // One entry per selected page, in output order (collate/duplicates
-    // included), folding away entries redundant with the running sequence.
-    // A no-op when the source has no `/PageLabels` at all.
     {
         let mut labels = pdf.page_labels();
         if labels.has_page_labels()? {
-            // `labels_for_selection` fetches /PageLabels once and computes
-            // one entry per selected page — O(N + M) vs the prior
-            // per-page `labels_for_page_range` loop's O(N × M).
             let src_indices: Vec<i64> = combined_pages
                 .iter()
                 .map(|cp| i64::from(cp.page.index_1based) - 1)
@@ -4196,54 +4459,17 @@ fn run_page_extraction(
         }
     }
 
-    // Step 4: outline / named-destination remap-or-drop (8.10).
     remap_outline_and_dests(&mut pdf, &result)?;
-
-    // Step 5: struct-tree /Pg drop (the structural-reference drop family —
-    // must run before the prune so the now-unreferenced page is swept).
     let objr_obj_targets = drop_struct_elem_dangling_pg(&mut pdf, &result)?;
-
-    // Step 6: article-thread bead /P drop (same structural-reference drop
-    // family). A bead whose /P targets a removed page has the /P dropped (the
-    // bead and its ring are kept); must also run before the prune so the
-    // now-unreferenced page is swept.
     drop_thread_bead_dangling_p(&mut pdf, &result)?;
-
-    // Step 6.5: drop the dangling /P on annotations kept alive only through a
-    // struct-tree OBJR /Obj (same structural-reference drop family). The OBJR
-    // /Obj targets were collected by Step 5's struct-tree walk. Must run before
-    // the prune so the now-unreferenced removed page is swept.
     drop_objr_obj_annot_dangling_p(&mut pdf, &result, &objr_obj_targets)?;
-
-    // Step 7: unreferenced-resource prune + xref GC (8.9).
     prune_after_subset(&mut pdf, remove_unref.into())?;
-
-    // Step 8: AcroForm field/widget prune (8.11). The single-document API
-    // boundary makes the cross-doc field-collision case unreachable here;
-    // any Unsupported it returns is propagated, not swallowed.
     prune_acroform_after_subset(&mut pdf, &result)?;
 
-    // Step 8.5: overlay/underlay page stacking. qpdf runs page-selection
-    // first, then applies overlays on the reduced page set — so the
-    // `--to`/`--from`/`--repeat` indices reference the extracted page
-    // count. Mirror that ordering by applying overlays here, after the
-    // page tree has been rebuilt and pruned.
     let mut options = options;
-    // Page-op flags reject explicit encryption/copy-encryption options above;
-    // source-encryption preservation follows the primary-input rule captured
-    // above for a single output. qpdf's QPDFJob::doSplitPages creates a fresh
-    // empty QPDF for each chunk (QPDFJob.cc:2979-2988), so the split output is
-    // cleartext unless explicit encryption options were supplied. The bytes
-    // handed to split_pages are also its per-chunk re-open source; preserving
-    // the primary /Encrypt there would make that internal re-open authenticate
-    // without the input password.
     options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
     if !overlay_specs.is_empty() {
         let mut built = build_overlay_specs(overlay_specs, repair)?;
-
-        // Propagate max input header version + Adobe extension_level
-        // from overlay sources (mirrors run_rewrite's overlay branch and
-        // qpdf QPDFJob.cc L1714/L2913).
         let initial_version = parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
         let mut max_version = PdfVersion::new(
             initial_version.major(),
@@ -4291,27 +4517,17 @@ fn run_page_extraction(
         flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
     }
 
-    // Step 9: serialize. Extraction always implies a full document rewrite.
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
-
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        // `bytes` is handed over rather than lent: the split branch is the last
-        // use of it (the `std::fs::write` below belongs to the other branch), so
-        // moving it in keeps the rewritten document resident once instead of
-        // twice for the whole of the split.
         let written = split_pages(bytes, n, output, options.deterministic_id)?;
         if verbose {
             for path in &written {
-                // cov:ignore-start: exercised by verbose split-pages subprocess integration tests
                 logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
-                // cov:ignore-end
             }
         }
     } else if let Some(writer) = standard_output.as_mut() {
-        // cov:ignore-start: exercised by binary_page_extraction_dash and verbose_page_extraction_dash subprocess integration tests
         writer.write_all(&bytes)?;
-        // cov:ignore-end
     } else {
         std::fs::write(output, &bytes)?;
         if verbose {
@@ -4366,11 +4582,32 @@ fn parse_split_n(raw: &str) -> CliResult<usize> {
 /// source document's pages directly (no page-tree rebuild); `--split-pages`
 /// chunks the rewritten output. `--collate` without `--pages` is a no-op,
 /// matching qpdf.
+#[allow(clippy::too_many_arguments)]
 fn run_rewrite_with_page_ops(
     input: &std::path::Path,
     output: &std::path::Path,
     repair: bool,
     password: &PasswordArgs,
+    json_input: bool,
+    update_from_json: Option<&Path>,
+    page_ops: &PageOpArgs,
+    options: WriterOptions,
+    verbose: bool,
+) -> CliResult<()> {
+    let opened = open_job_pdf(input, repair, password, json_input, update_from_json)?;
+    match opened {
+        JobPdf::File(pdf) => {
+            run_rewrite_with_page_ops_opened(pdf, output, page_ops, options, verbose)
+        }
+        JobPdf::Json(pdf) => {
+            run_rewrite_with_page_ops_opened(pdf, output, page_ops, options, verbose)
+        }
+    }
+}
+
+fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
+    mut pdf: Pdf<R>,
+    output: &std::path::Path,
     page_ops: &PageOpArgs,
     options: WriterOptions,
     verbose: bool,
@@ -4384,8 +4621,6 @@ fn run_rewrite_with_page_ops(
                 .into(),
         );
     }
-    let mut pdf = open_pdf(&input.to_path_buf(), repair, password)?;
-
     if !page_ops.rotate.is_empty() {
         let page_refs = pages::page_refs(&mut pdf)?;
         apply_rotate_specs(&mut pdf, &page_ops.rotate, &page_refs)?;
@@ -5232,6 +5467,57 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// Main-input variants accepted by the qpdf-shaped job boundary.
+///
+/// The JSON importer owns a `Pdf<Cursor<Vec<u8>>>` because its rootless seed
+/// is an in-memory PDF. Ordinary files keep the existing buffered-file reader.
+/// The enum is intentionally confined to this CLI boundary; every downstream
+/// consumer still receives its normal generic `Pdf<R>` and therefore uses the
+/// canonical resolver/object-handle route.
+enum JobPdf {
+    File(Pdf<BufReader<File>>),
+    Json(Pdf<Cursor<Vec<u8>>>),
+}
+
+fn apply_json_update<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    update_from_json: Option<&Path>,
+) -> CliResult<()> {
+    if let Some(path) = update_from_json {
+        let source = File::open(path).map_err(|error| json_input_open_error(path, error))?;
+        pdf.update_from_json(source, path.display().to_string())
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    }
+    Ok(())
+}
+
+/// Open the main qpdf job input and apply `--update-from-json` at the same
+/// point qpdf's `QPDFJob::createQPDF` does: immediately after input creation,
+/// before page specifications, rotations, overlays, or serialization.
+fn open_job_pdf(
+    input: &Path,
+    repair: bool,
+    password: &PasswordArgs,
+    json_input: bool,
+    update_from_json: Option<&Path>,
+) -> CliResult<JobPdf> {
+    if json_input {
+        Ok(JobPdf::Json(open_json_pdf(input, update_from_json)?))
+    } else {
+        let mut pdf = open_pdf(&input.to_path_buf(), repair, password)?;
+        apply_json_update(&mut pdf, update_from_json)?;
+        Ok(JobPdf::File(pdf))
+    }
+}
+
+fn open_json_pdf(input: &Path, update_from_json: Option<&Path>) -> CliResult<Pdf<Cursor<Vec<u8>>>> {
+    let source = File::open(input).map_err(|error| json_input_open_error(input, error))?;
+    let mut pdf = Pdf::create_from_json(source, input.display().to_string())
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    apply_json_update(&mut pdf, update_from_json)?;
+    Ok(pdf)
 }
 
 fn open_pdf(
