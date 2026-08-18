@@ -8,7 +8,9 @@
 //!   (e) No mode: nothing changes.
 
 use flpdf::resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
-use flpdf::{parse_content_operations, Dictionary, Object, ObjectRef, ParseControl, Pdf};
+use flpdf::{
+    parse_content_operations, Dictionary, Object, ObjectRef, ParseControl, Pdf, PdfOpenOptions,
+};
 use std::io::Cursor;
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
@@ -1577,7 +1579,14 @@ fn test_direct_stream_form_xobject_is_rejected_as_malformed_file_object() {
     ];
     let pdf_bytes = build_pdf_raw(&objects);
 
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open PDF with direct-stream Form");
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(pdf_bytes),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open PDF with direct-stream Form");
     let err = remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
         .expect_err("nested stream syntax must not be recovered as a file object");
     let flpdf::Error::Parse { offset, message } = err else {
@@ -1622,7 +1631,14 @@ fn test_direct_stream_form_self_recursion_is_rejected_without_dos() {
     ];
     let pdf_bytes = build_pdf_raw(&objects);
 
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open recursive direct-stream Form PDF");
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(pdf_bytes),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open recursive direct-stream Form PDF");
     let err = remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
         .expect_err("nested recursive stream syntax must fail before traversal");
     let flpdf::Error::Parse { offset, message } = err else {
@@ -2049,7 +2065,14 @@ fn earlier_xobject_resolution_error_is_not_hidden_by_later_incomplete_form() {
         (7, bad_form),
     ];
     let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
-    let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(pdf_bytes),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("open");
 
     let error = remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::Yes)
         .expect_err("the first-seen structural error must propagate");

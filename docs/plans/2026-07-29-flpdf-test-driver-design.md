@@ -338,13 +338,14 @@ unparseResolved: <…>
 
 この 20 subtest は既存の flpdf 公開 API だけで完結する — `Pdf::open_mem_with_options`
 （**`Pdf::open_mem` ではない**。後者は `Pdf::open(Cursor::new(bytes))` に委譲し
-`PdfOpenOptions::default()`（`repair: false`、strict）を使う。qpdf の `QPDF` は
+`PdfOpenOptions::default()`（`repair: true`、qpdf既定recovery）を使う。strict経路が必要なら
+`repair: false` を明示する。qpdf の `QPDF` は
 `attempt_recovery{true}` がデフォルトメンバ初期化子（`QPDF.hh:1461`）— `runtest` が
 `setAttemptRecovery(false)` を呼ぶのは `n == 0` のときだけなので、id 1（と id 3）は
 recovery 有効のまま読み込む。`repair: true` を明示した `PdfOpenOptions` で
 `open_mem_with_options` を呼ぶ） / `trailer()` /
 `resolve_borrowed()` / `Stream { pub dict, pub data }` / `decode_stream_data` /
-`write_pdf`。strict な `Pdf::open_mem` のまま実装すると、qpdf が repair で読める
+`write_pdf`。strict な `repair: false` オプションのまま実装すると、qpdf が repair で読める
 壊れた xref/trailer を持つ入力に対して test_0_1 を呼ぶ前の読込段階でエラーになり、
 `invalid test N` にも正常な test_0_1 出力にもならない — repairable な壊れ方をする
 fixture を 1 本 fixture 一覧（§7）に加えて検証する。

@@ -869,7 +869,14 @@ mod tests {
         let mut bytes = std::fs::read(fixture_path("three-page-objstm.pdf")).unwrap();
         bytes[5] = b'x';
         bytes[7] = b'y';
-        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(pdf.version(), "x.y");
 
         let plan =

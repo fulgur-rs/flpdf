@@ -4145,7 +4145,11 @@ fn build_overlay_specs(
         // for its inspection open (search for `options.allow_weak_crypto`
         // in `run_check`).
         let mut options = PdfOpenOptions {
-            repair,
+            // qpdf's recovery permission is enabled on the document by
+            // default; the absence of `--repair` must not turn it off (see
+            // `pdf_open_options`'s identical treatment for the primary
+            // document).
+            repair: repair || PdfOpenOptions::default().repair,
             allow_weak_crypto: true,
             password: spec
                 .password
@@ -5785,7 +5789,10 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
     };
 
     Ok(PdfOpenOptions {
-        repair,
+        // qpdf's recovery permission is enabled on the document by default.
+        // Keep accepting `--repair` as an explicit compatibility spelling;
+        // the absence of that flag must not turn recovery off.
+        repair: repair || PdfOpenOptions::default().repair,
         password,
         password_mode,
         allow_weak_crypto,
@@ -6342,8 +6349,11 @@ fn run_copy_attachments_from(
     let args = parse_copy_attachments_segment(tokens)?;
 
     // Open the source with its own password (independent of the target's).
+    // qpdf's recovery permission is enabled on the document by default; the
+    // absence of `--repair` must not turn it off (see `pdf_open_options`'s
+    // identical treatment for the primary document).
     let mut src_options = PdfOpenOptions {
-        repair,
+        repair: repair || PdfOpenOptions::default().repair,
         password: args.password.clone(),
         ..PdfOpenOptions::default()
     };

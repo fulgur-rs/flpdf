@@ -31,6 +31,11 @@ fn opens_pdf_without_resolving_all_objects() {
 }
 
 #[test]
+fn open_options_default_enables_qpdf_recovery() {
+    assert!(PdfOpenOptions::default().repair);
+}
+
+#[test]
 fn open_with_options_uses_empty_password_by_default() {
     let file = File::open("../../tests/fixtures/compat/encrypted-r4-three-page.pdf").unwrap();
     let pdf = Pdf::open_with_options(BufReader::new(file), PdfOpenOptions::default()).unwrap();

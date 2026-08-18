@@ -272,24 +272,20 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     default_xref_entries: BTreeSet<ObjectRef>,
     /// qpdf `m->attempt_recovery` (`QPDF.hh:1461`).
     ///
-    /// Same on/off flag, opposite default: qpdf initialises it to `true` and
+    /// Same on/off flag and default: qpdf initialises it to `true` and
     /// `QPDF::setAttemptRecovery(false)` (`QPDF.hh:234`, `QPDF.cc:334`) opts
-    /// out, whereas flpdf's
-    /// [`crate::PdfOpenOptions::repair`] defaults to `false` and
-    /// [`crate::Pdf::open_with_repair`] opts in. This records the permission
+    /// out; flpdf's [`crate::PdfOpenOptions::repair`] also defaults to `true`,
+    /// while an explicit `repair: false` opts out. This records the permission
     /// the document was opened with, not whether recovery actually ran —
     /// qpdf's own flag is likewise setter-controlled, and it tracks a
     /// reconstruct that happened in a separate member
     /// (`m->reconstructed_xref`, `QPDF.hh:1480`).
     attempt_recovery: bool,
-    /// Writer-local equivalent of qpdf's default recovery permission.
-    ///
-    /// flpdf keeps `PdfOpenOptions::repair = false` as the strict xref/header
-    /// mode, while the qpdf writer still recovers malformed stream framing
-    /// when it reads source objects. The legacy writer already did this via
-    /// its bounded file-object parser; the canonical writer toggles this
-    /// field for the duration of its plain-write walk so the cutover retains
-    /// that observable behavior without weakening direct handle resolution.
+    /// Writer-local recovery scope retained for the canonical writer's stream
+    /// framing walk. Normal document opening already defaults to qpdf's
+    /// recovery permission; an explicit strict open can still use this scoped
+    /// writer behavior until the writer-local bridge is removed at its
+    /// consumer cutover.
     writer_stream_recovery: bool,
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
     ///
@@ -9326,19 +9322,26 @@ mod tests {
     /// this fixture recurses until the stack runs out, aborting the test
     /// binary rather than failing a test.
     ///
-    /// With flpdf's default `repair = false`, the inner qpdf-style loop guard
-    /// caches the `/Length` reference as null, the stream parser reports the
-    /// unusable length, and the resolver catches that structural failure and
-    /// caches the outer stream as null. Opening the same bytes with
-    /// `repair = true` enters the canonical `recoverStreamLength` arm above,
-    /// matching qpdf's default attempt-recovery behavior.
+    /// This test deliberately opens with explicit `repair = false`: the inner
+    /// qpdf-style loop guard caches the `/Length` reference as null, the stream
+    /// parser reports the unusable length, and the resolver catches that
+    /// structural failure and caches the outer stream as null. The ordinary
+    /// default now enables the canonical `recoverStreamLength` arm, matching
+    /// qpdf's default attempt-recovery behavior.
     #[test]
     fn a_self_referential_length_takes_the_loop_branch_instead_of_recursing_forever() {
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             b"2 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
         ]);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict fixture");
         let object_ref = ObjectRef::new(2, 0);
         let handle = pdf.get_object_handle(object_ref);
 
@@ -9775,6 +9778,36 @@ mod tests {
         check(&handle, outcome, warnings)
     }
 
+    /// Variant of [`with_second_object`] for tests that pin qpdf's explicit
+    /// no-recovery path. The public default follows qpdf and enables recovery;
+    /// strict parser/null-cache assertions must opt out deliberately.
+    fn with_second_object_strict<T>(
+        body: &[u8],
+        check: impl FnOnce(&crate::ObjectHandle, Result<(), Error>, Vec<String>) -> T,
+    ) -> T {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            body.to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let outcome = handle.try_dereference();
+        let warnings = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        check(&handle, outcome, warnings)
+    }
+
     /// An object with no body at all resolves to null.
     ///
     /// qpdf: "Nothing in the PDF spec appears to allow empty objects, but they
@@ -10155,7 +10188,14 @@ mod tests {
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             b"7 0 obj\n42\nendobj\n".to_vec(),
         ]);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open mismatch fixture");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict mismatch fixture");
         let requested = pdf.get_object_handle(ObjectRef::new(2, 0));
         requested
             .try_dereference()
@@ -10307,7 +10347,7 @@ mod tests {
             body.extend_from_slice(dict);
             body.extend_from_slice(b"\nstream\nabc\nendstream\nendobj\n");
 
-            with_second_object(&body, |handle, outcome, warnings| {
+            with_second_object_strict(&body, |handle, outcome, warnings| {
                 outcome.expect("qpdf catches an unusable /Length");
                 assert!(handle.is_null());
                 assert!(warnings.iter().any(|warning| warning.contains(expected)));
@@ -10354,7 +10394,7 @@ mod tests {
             &b"2 0 obj\n<< /Length 100000 >>\nstream\nabc\nendstream\nendobj\n"[..],
             b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n",
         ] {
-            with_second_object(body, |handle, outcome, warnings| {
+            with_second_object_strict(body, |handle, outcome, warnings| {
                 outcome.expect("qpdf catches a missing endstream");
                 assert!(handle.is_null());
                 assert!(
@@ -10785,7 +10825,7 @@ mod tests {
     ///   qpdf's recovery fork rather than on its resolve-to-null one.
     #[test]
     fn an_absurd_declared_length_is_diagnosed_without_allocating_it() {
-        with_second_object(
+        with_second_object_strict(
             b"2 0 obj\n<< /Length 9223372036854775000 >>\nstream\nabc\nendstream\nendobj\n",
             |handle, outcome, warnings| {
                 outcome.expect("qpdf catches a missing endstream at the distant offset");
@@ -10796,7 +10836,7 @@ mod tests {
             },
         );
 
-        with_second_object(
+        with_second_object_strict(
             b"2 0 obj\n<< /Length 9223372036854775807 >>\nstream\nabc\nendstream\nendobj\n",
             |handle, outcome, warnings| {
                 outcome.expect("qpdf catches the seek overflow");
@@ -11115,7 +11155,14 @@ mod tests {
             format!("4 0 obj\n{}\nendobj\n", inner.len()).into_bytes(),
         ]);
 
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict fixture");
         let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
         handle
@@ -11343,7 +11390,7 @@ mod tests {
     /// link 2, which is a stream rather than an integer. qpdf reaches the same
     /// judgement (`/Length key in stream dictionary is not an integer`,
     /// `libqpdf/QPDF.cc:1379`) and then recovers the length. This test uses
-    /// flpdf's default `repair = false`, so it pins the resolver's warning/null
+    /// explicit `repair = false`, so it pins the resolver's warning/null
     /// fallback rather than the recovery arm.
     #[test]
     fn a_long_chain_of_indirect_lengths_grows_the_stack_instead_of_aborting() {
@@ -11363,8 +11410,16 @@ mod tests {
                 // recursive teardown gap tracked by flpdf-97x9. On Windows,
                 // dropping the deep graph after the assertion can overflow
                 // before the spawned thread reports the result under test.
-                let mut pdf =
-                    std::mem::ManuallyDrop::new(Pdf::open_mem_owned(bytes).expect("open"));
+                let mut pdf = std::mem::ManuallyDrop::new(
+                    Pdf::open_mem_owned_with_options(
+                        bytes,
+                        crate::PdfOpenOptions {
+                            repair: false,
+                            ..crate::PdfOpenOptions::default()
+                        },
+                    )
+                    .expect("open strict fixture"),
+                );
                 let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
                 handle

@@ -1936,6 +1936,7 @@ fn apply_pruning<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PdfOpenOptions;
     use std::io::Cursor;
 
     /// Build a 1-page PDF whose inherited `/Resources` is an indirect reference.
@@ -2428,7 +2429,14 @@ mod tests {
             "<< /Type /Page /MediaBox [0 0 612 792] >>",
             "<0g>",
         );
-        let pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("PDF should parse");
         let mut xobjects = Dictionary::new();
         xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
         let mut resources = Dictionary::new();
@@ -2501,7 +2509,14 @@ mod tests {
             "<< /Type /Page /MediaBox [0 0 612 792] >>",
             "<0g>",
         );
-        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("PDF should parse");
         let mut xobjects = Dictionary::new();
         xobjects.insert("Fm0", Object::Reference(ObjectRef::new(4, 0)));
         let mut resources = Dictionary::new();

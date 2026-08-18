@@ -401,9 +401,12 @@ pub struct EncryptionInfo {
 }
 
 /// Options for opening a PDF document.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfOpenOptions {
-    /// Enable xref/trailer repair when strict parsing fails.
+    /// Enable qpdf-style xref/trailer recovery.
+    ///
+    /// qpdf's `QPDF::attempt_recovery` defaults to `true`; set this to `false`
+    /// for the explicit strict/suppressed-recovery route.
     pub repair: bool,
     /// Never read a cross-reference stream, even where `startxref` or a
     /// `/Prev` chain points at one (qpdf `--ignore-xref-streams`).
@@ -435,6 +438,26 @@ pub struct PdfOpenOptions {
     pub suppress_warnings: bool,
     /// Input-source description used in qpdf-compatible warning prefixes.
     pub description: String,
+}
+
+impl Default for PdfOpenOptions {
+    fn default() -> Self {
+        Self {
+            // qpdf `QPDF::Members::attempt_recovery` starts enabled
+            // (`include/qpdf/QPDF.hh:1458-1462`). The opt-out is explicit,
+            // matching `QPDFJob::setQPDFOptions` when suppress-recovery is
+            // requested (`libqpdf/QPDF.cc:334-336`, `libqpdf/QPDFJob.cc:652-659`).
+            repair: true,
+            ignore_xref_streams: false,
+            password: Vec::new(),
+            password_mode: PasswordMode::default(),
+            allow_weak_crypto: false,
+            password_is_hex_key: false,
+            logger: None,
+            suppress_warnings: false,
+            description: String::new(),
+        }
+    }
 }
 
 // Stack-growth protection for this module's two recursive hubs: `lift_bounded`
@@ -7563,7 +7586,14 @@ mod tests {
     #[test]
     fn qpdf_reader_recovers_malformed_length_holder_as_invalid_once() {
         let bytes = recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n<<"));
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open malformed-holder fixture");
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict malformed-holder fixture");
         let object_ref = ObjectRef::new(1, 0);
         assert_eq!(
             pdf.resolve(object_ref)

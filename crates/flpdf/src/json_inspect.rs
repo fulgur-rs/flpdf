@@ -7332,8 +7332,14 @@ mod tests {
 
     #[test]
     fn historical_xref_stream_is_resolved_in_the_canonical_cache_at_open() {
-        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
-            .expect("open mixed xref fixture");
+        let mut pdf = crate::Pdf::open_mem_owned_with_options(
+            historical_xref_stream_trailer_pdf(),
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict mixed xref fixture");
         let stream_ref = crate::ObjectRef::new(4, 0);
 
         let handle = pdf.get_object_handle(stream_ref);
@@ -7603,8 +7609,14 @@ mod tests {
 
     #[test]
     fn qpdf_preparation_collects_refs_from_a_freed_old_xref_stream() {
-        let mut pdf = crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf())
-            .expect("open mixed xref fixture");
+        let mut pdf = crate::Pdf::open_mem_owned_with_options(
+            historical_xref_stream_trailer_pdf(),
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict mixed xref fixture");
         assert!(pdf.trailer().get("Info").is_none());
 
         let prepared = pdf
@@ -7647,9 +7659,14 @@ mod tests {
 
     #[test]
     fn qpdf_preparation_keeps_old_xref_streams_freed_at_the_same_generation() {
-        let mut pdf =
-            crate::Pdf::open_mem_owned(historical_xref_stream_trailer_pdf_with_free_generation(0))
-                .expect("open same-generation free xref stream fixture");
+        let mut pdf = crate::Pdf::open_mem_owned_with_options(
+            historical_xref_stream_trailer_pdf_with_free_generation(0),
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open strict same-generation free xref stream fixture");
         let stream_ref = crate::ObjectRef::new(4, 0);
 
         let prepared = pdf
@@ -7786,7 +7803,14 @@ mod tests {
     #[test]
     fn qpdf_preparation_deduplicates_historical_refs_in_a_repaired_prev_cycle() {
         let bytes = circular_historical_trailer_pdf();
-        assert!(crate::Pdf::open_mem_owned(bytes.clone()).is_err());
+        assert!(crate::Pdf::open_mem_owned_with_options(
+            bytes.clone(),
+            crate::PdfOpenOptions {
+                repair: false,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .is_err());
         let mut pdf = crate::Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
