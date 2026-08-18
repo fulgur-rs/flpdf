@@ -10,7 +10,7 @@
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
 use flpdf::linearization::{LinearizationPlan, RenumberMap};
-use flpdf::{filters, Object, ObjectStreamMode, Pdf};
+use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -1262,5 +1262,100 @@ fn linearize_generate_force_below_1_5_matches_disable_on_open_document_fixture()
         "an /AcroForm fixture must linearize identically under generate+force1.4 \
          and disable+force1.4 — the suppressed plan must be rebuilt in disable mode, \
          not left in generate-mode ordering"
+    );
+}
+
+/// Build a minimal one-page PDF whose content stream carries a numeric
+/// `/Length` too short for its payload, forcing qpdf's stream-framing
+/// recovery (`resolver.rs`'s `read_stream` "expected endstream" scan).
+fn build_recoverable_length_pdf() -> Vec<u8> {
+    let payload = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET";
+    let wrong_length = payload.len() - 26;
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = [0usize; 6];
+
+    offsets[1] = out.len();
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    offsets[2] = out.len();
+    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+
+    offsets[3] = out.len();
+    out.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    offsets[4] = out.len();
+    out.extend_from_slice(b"4 0 obj\n<< /Length ");
+    out.extend_from_slice(wrong_length.to_string().as_bytes());
+    out.extend_from_slice(b" >>\nstream\n");
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+
+    offsets[5] = out.len();
+    out.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+
+    let xref_offset = out.len();
+    out.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for &offset in &offsets[1..6] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n");
+    out.extend_from_slice(xref_offset.to_string().as_bytes());
+    out.extend_from_slice(b"\n%%EOF");
+    out
+}
+
+/// Regression for a content-loss bug introduced while fixing the
+/// generate-mode progress denominator (flpdf-gd66): counting the
+/// to-be-generated ObjStm containers for progress accounting
+/// (`compressible_objgens_qpdf_plan`) must run AFTER
+/// `LinearizationPlan::from_pdf_with_object_stream_mode` has entered qpdf's
+/// stream-framing recovery scope, not before it. Running it first resolves a
+/// malformed stream outside that scope, which silently degrades the object
+/// to missing/null instead of recovering it — the page's `/Contents` was
+/// dropped entirely, with no error, in a corrupted-but-qpdf-recoverable
+/// input. Confirmed byte-identical to qpdf 11.9.0's own recovered output on
+/// this fixture; qpdf recovers all 37 bytes of the payload (three warnings:
+/// "expected endstream" / "attempting to recover stream length" /
+/// "recovered stream length: 37"), and the recovered text must survive
+/// `--object-streams=generate` linearization no differently.
+#[test]
+fn linearize_generate_recovers_malformed_length_content_stream() {
+    let bytes = build_recoverable_length_pdf();
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        // Uncompressed so the recovered payload's text survives byte-for-byte
+        // into the output for a substring assertion — compression backend
+        // (miniz vs zlib) is unrelated to the bug under test.
+        compress_streams: CompressStreams::No,
+        ..WriterTestSettings::default()
+    };
+    let out = write_linearized_with_settings(&mut pdf, &settings)
+        .expect("a recoverable stream-length mismatch must not fail the write");
+
+    assert_eq!(
+        pdf.repair_diagnostics().entries().len(),
+        3,
+        "qpdf emits exactly three warnings recovering this stream: expected \
+         endstream, attempting to recover, recovered stream length"
+    );
+    assert!(
+        pdf.repair_diagnostics().entries()[2]
+            .message
+            .contains("recovered stream length: 37"),
+        "qpdf recovers the full 37-byte payload for this fixture"
+    );
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("Hello"),
+        "the page's recovered content stream text must survive \
+         --object-streams=generate linearization, not be silently dropped"
     );
 }
