@@ -354,6 +354,36 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .and_then(|field| field.object_ref()))
     }
 
+    /// Return the Widget annotations listed by a page, preserving their live
+    /// handles for qpdf-shaped consumers.
+    ///
+    /// This is the handle-native counterpart of
+    /// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage`, which is a
+    /// thin delegation to `QPDFPageObjectHelper::getAnnotations("/Widget")`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-201`).
+    pub(crate) fn get_widget_annotations_for_page(
+        &mut self,
+        page_ref: ObjectRef,
+    ) -> Result<Vec<ObjectHandle>> {
+        let mut page = PageObjectHelper::new(page_ref, self.pdf);
+        page.get_annotation_handles(Some(b"/Widget"))
+    }
+
+    /// Return the live field handle associated with a Widget annotation.
+    ///
+    /// A missing association returns qpdf's null helper, matching
+    /// `QPDFAcroFormDocumentHelper::getFieldForAnnotation` for a Widget that
+    /// cannot be associated with a field. The analysis itself supplies qpdf's
+    /// orphan-Widget self-association when possible.
+    pub(crate) fn get_field_for_annotation_handle(
+        &mut self,
+        annotation: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        Ok(self
+            .canonical_field_for_annotation(annotation)?
+            .unwrap_or_else(ObjectHandle::null))
+    }
+
     /// Build the qpdf `analyze()` associations while retaining live canonical
     /// [`ObjectHandle`] identity for both indirect and direct annotations.
     ///
