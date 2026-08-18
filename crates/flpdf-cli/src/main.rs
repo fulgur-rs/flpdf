@@ -2663,17 +2663,12 @@ fn finish_check_report(input: &Path, report: flpdf::CheckReport) -> CliResult<()
 
     if has_warnings {
         // Warnings without errors — exit 3. qpdf still prints the block above,
-        // but omits the trailing "No syntax ..." note. Pass an empty message so
-        // main() does not emit a redundant "flpdf: ..." line.
-        // qpdf 11.9.0 ends the warning-bearing run with this stderr summary.
-        logger_warn(format!(
-            "{}: operation succeeded with warnings\n",
-            progname()
-        ))?; // cov:ignore: exercised by check warning subprocess integration tests
-        return Err(Box::new(CliExitError {
-            code: ExitCode::Warnings,
-            message: String::new(),
-        }));
+        // but omits the trailing "No syntax ..." note. `--check` is inspection
+        // (`creates_output = false`), and qpdf's `writeQPDF` routes both the
+        // output and inspection arms through the same shared warning-summary
+        // block (`QPDFJob.cc:486-504`) rather than a `--check`-only path;
+        // `finish_warning_state` is that same shared boundary.
+        return finish_warning_state(true, false); // cov:ignore: exercised by check warning subprocess integration tests
     }
 
     // Clean — exit 0. qpdf closes a clean check with this two-line note; the
