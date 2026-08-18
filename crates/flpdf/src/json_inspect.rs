@@ -33,8 +33,8 @@ pub(crate) use crate::pdf_string::lossy_utf16_to_utf8;
 // available to library and test callers while the staged migration proceeds.
 pub(crate) use crate::job::checksum_to_hex;
 pub use crate::job::{
-    build_attachments_section, build_encrypt_section, build_outlines_section,
-    build_pagelabels_section, build_pages_section,
+    build_acroform_section, build_attachments_section, build_encrypt_section,
+    build_outlines_section, build_pagelabels_section, build_pages_section,
     write_qpdf_json_v2_selected_objects_to_output_with_options,
     write_qpdf_json_v2_selected_objects_with_options,
 };
