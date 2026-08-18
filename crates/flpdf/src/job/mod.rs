@@ -16,8 +16,8 @@ pub use json::{
 };
 pub(crate) use json_sections::checksum_to_hex;
 pub use json_sections::{
-    build_attachments_section, build_encrypt_section, build_outlines_section,
-    build_pagelabels_section, build_pages_section,
+    build_acroform_section, build_attachments_section, build_encrypt_section,
+    build_outlines_section, build_pagelabels_section, build_pages_section,
 };
 #[cfg(test)]
 pub(crate) use json_sections::{

@@ -1,12 +1,9 @@
-//! qpdf correspondence: `QPDFJob::doJSONPages`, `doJSONPageLabels`, `doJSONOutlines`, `doJSONAttachments`, and `doJSONEncrypt` section builders.
-//! qpdf 11.9.0 source responsibility: `QPDFJob.cc:1030-1158` and
-//! `QPDFJob.cc:1206-1325`.
+//! qpdf correspondence: `QPDFJob::doJSONPages`, `doJSONPageLabels`, `doJSONOutlines`, `doJSONAcroform`, `doJSONAttachments`, and `doJSONEncrypt` section builders.
+//! qpdf 11.9.0 source responsibility: `QPDFJob.cc:1030-1330`.
 //!
 //! These builders live below the command-level `job` boundary because qpdf
 //! constructs them from `QPDFJob::doJSON`, while the generic JSON value and
-//! stream serializers remain in [`crate::json_inspect`]. The AcroForm section
-//! is intentionally not part of this slice; its existing implementation stays
-//! in `json_inspect` until the dedicated AcroForm migration is ready.
+//! stream serializers remain in [`crate::json_inspect`].
 
 use crate::json::Json;
 use crate::json_inspect::{
@@ -201,6 +198,171 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
     }
 
     json_array(entries)
+}
+
+// ── build_acroform_section ────────────────────────────────────────────────────
+
+/// Build the qpdf JSON v2 `acroform` section.
+///
+/// qpdf emits one entry for every Widget annotation encountered in page order,
+/// not one entry for every node reachable from `/AcroForm/Fields`. The field
+/// and annotation values are projected through their corresponding helper
+/// boundaries so merged fields, inherited values, and orphan Widgets retain
+/// qpdf's live ObjectHandle identity.
+///
+/// Correspondence: `QPDFJob::doJSONAcroform`
+/// (`libqpdf/QPDFJob.cc:1159-1203`),
+/// `QPDFAcroFormDocumentHelper::getWidgetAnnotationsForPage` and
+/// `getFieldForAnnotation` (`libqpdf/QPDFAcroFormDocumentHelper.cc:197-232`),
+/// `QPDFFormFieldObjectHelper` (`libqpdf/QPDFFormFieldObjectHelper.cc:29-285`),
+/// and `QPDFAnnotationObjectHelper` (`libqpdf/QPDFAnnotationObjectHelper.cc:13-47`).
+pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
+    // qpdf's page helper repairs and snapshots the page list before the
+    // AcroForm helper starts its cached annotation-to-field analysis. Rust's
+    // mutable borrow rules require the same sequencing explicitly.
+    let page_refs = {
+        let mut page_document = crate::PageDocumentHelper::new(pdf);
+        page_document.get_all_pages()?
+    };
+
+    // Keep the helper alive for the whole page/widget walk so every lookup
+    // uses one qpdf-shaped analysis cache. The handles are collected before
+    // the field and annotation accessors borrow the Pdf again below.
+    let (has_acroform, need_appearances, widgets) = {
+        let mut acroform = crate::AcroFormDocumentHelper::new(pdf);
+        let has_acroform = acroform.has_acro_form()?;
+        let need_appearances = acroform.get_need_appearances()?;
+        let mut widgets = Vec::new();
+
+        for (page_index, page_ref) in page_refs.into_iter().enumerate() {
+            for annotation in acroform.get_widget_annotations_for_page(page_ref)? {
+                let field = acroform.get_field_for_annotation_handle(annotation.clone())?;
+                widgets.push((page_index as i64 + 1, field, annotation));
+            }
+        }
+
+        (has_acroform, need_appearances, widgets)
+    };
+
+    let fields = Json::make_array();
+    for (pageposfrom1, field, annotation) in widgets {
+        let parent = pdf_object_to_json(&field.try_get_key(b"/Parent")?)?;
+
+        let (
+            fieldtype,
+            fieldflags,
+            fullname,
+            partialname,
+            alternativename,
+            mappingname,
+            value,
+            defaultvalue,
+            quadding,
+            ischeckbox,
+            isradiobutton,
+            ischoice,
+            istext,
+            choices,
+        ) = {
+            let mut field_helper =
+                crate::FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
+            let fieldtype = field_helper.field_type()?.unwrap_or_default();
+            let fieldflags = field_helper.flags()?;
+            let fullname = field_helper.fully_qualified_name()?;
+            let partialname = field_helper.partial_name()?;
+            let alternativename = field_helper.alternative_name()?;
+            let mappingname = field_helper.mapping_name()?;
+            let value = field_helper.value()?;
+            let defaultvalue = field_helper.default_value()?;
+            let quadding = field_helper.quadding()?;
+            let ischeckbox = field_helper.is_checkbox()?;
+            let isradiobutton = field_helper.is_radio_button()?;
+            let ischoice = field_helper.is_choice()?;
+            let istext = field_helper.is_text()?;
+            let choices = field_helper.choices()?;
+
+            (
+                fieldtype,
+                fieldflags,
+                fullname,
+                partialname,
+                alternativename,
+                mappingname,
+                value,
+                defaultvalue,
+                quadding,
+                ischeckbox,
+                isradiobutton,
+                ischoice,
+                istext,
+                choices,
+            )
+        };
+
+        let value = value
+            .as_ref()
+            .map(pdf_object_to_json)
+            .transpose()?
+            .unwrap_or_else(Json::make_null);
+        let defaultvalue = defaultvalue
+            .as_ref()
+            .map(pdf_object_to_json)
+            .transpose()?
+            .unwrap_or_else(Json::make_null);
+
+        let (mut appearancestate, annotationflags) = {
+            let mut annotation_helper =
+                crate::AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
+            (
+                annotation_helper.get_appearance_state()?,
+                annotation_helper.get_flags()?,
+            )
+        };
+        // qpdf's getName() includes the leading slash. The shared annotation
+        // helper intentionally exposes raw name bytes without it, so restore
+        // qpdf's JSON spelling at this serialization boundary.
+        if !appearancestate.is_empty() {
+            appearancestate.insert(0, b'/');
+        }
+        let annotation = json_dictionary([
+            ("object", pdf_object_to_json(&annotation)?),
+            ("appearancestate", Json::make_string(&appearancestate)),
+            ("annotationflags", Json::make_int(annotationflags)),
+        ])?; // cov:ignore: fixed annotation schema keys cannot trigger JsonError
+
+        let field = json_dictionary([
+            ("object", pdf_object_to_json(&field)?),
+            ("parent", parent),
+            ("pageposfrom1", Json::make_int(pageposfrom1)),
+            ("fieldtype", Json::make_string(fieldtype)),
+            ("fieldflags", Json::make_int(fieldflags)),
+            ("fullname", Json::make_string(fullname)),
+            ("partialname", Json::make_string(partialname)),
+            ("alternativename", Json::make_string(alternativename)),
+            ("mappingname", Json::make_string(mappingname)),
+            ("value", value),
+            ("defaultvalue", defaultvalue),
+            ("quadding", Json::make_int(quadding)),
+            ("ischeckbox", Json::make_bool(ischeckbox)),
+            ("isradiobutton", Json::make_bool(isradiobutton)),
+            ("ischoice", Json::make_bool(ischoice)),
+            ("istext", Json::make_bool(istext)),
+            (
+                "choices",
+                json_array(choices.into_iter().map(Json::make_string))?,
+            ),
+            ("annotation", annotation),
+        ])?; // cov:ignore: fixed field schema keys cannot trigger JsonError
+        fields
+            .add_array_element(field)
+            .map_err(|error| ConvertError::JsonError(error.to_string()))?;
+    }
+
+    json_dictionary([
+        ("hasacroform", Json::make_bool(has_acroform)),
+        ("needappearances", Json::make_bool(need_appearances)),
+        ("fields", fields),
+    ])
 }
 
 // ── build_pagelabels_section ──────────────────────────────────────────────────

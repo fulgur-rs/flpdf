@@ -5,7 +5,7 @@
 //! | qpdf responsibility | flpdf owner |
 //! | --- | --- |
 //! | `doJSONPages`, `doJSONPageLabels`, `doJSONOutlines`, `doJSONAttachments`, `doJSONEncrypt` | `crate::job::build_*_section` |
-//! | `doJSONAcroform` | [`crate::json_inspect::build_acroform_section`] (deferred slice) |
+//! | `doJSONAcroform` | [`crate::job::build_acroform_section`] |
 //! | `doJSON` fixed order and key selection | this module |
 //! | `writeJSON` output destination and side-file prefix | [`write_json`] |
 
@@ -95,7 +95,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         b"acroform",
         keys,
         JsonKey::Acroform,
-        || crate::json_inspect::build_acroform_section(pdf),
+        || super::build_acroform_section(pdf),
     )?;
     emit_section(
         out,
