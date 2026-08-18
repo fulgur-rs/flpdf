@@ -13,8 +13,8 @@ use crate::{Error, ObjectRef, Pdf, Result, XrefEntry};
 
 use super::settings::{DecodeLevel, WriterSettings};
 use super::{
-    effective_pdf_version, emit_canonical_pdf, report_progress, ObjectStreamMode, ProgressReporter,
-    StreamDataMode, WriterOptions, WriterResult,
+    effective_pdf_version, emit_canonical_pdf, report_progress_finished, ObjectStreamMode,
+    ProgressReporter, StreamDataMode, WriterOptions, WriterResult,
 };
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 
@@ -330,8 +330,17 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         }
         self.validate_supported_settings()?;
         let mut options = self.prepared_write_options()?;
+        if let Some(reporter) = options.progress_reporter.as_ref() {
+            let object_count = usize::try_from(self.pdf.get_object_count()?).map_err(|_| {
+                Error::Unsupported("PdfWriter progress object count does not fit usize".into())
+            })?;
+            reporter.configure(object_count.saturating_mul(if self.settings.linearization {
+                2
+            } else {
+                1
+            }));
+        }
         self.write_started = true;
-        report_progress(&options, 0);
         let (bytes, result) = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
@@ -349,7 +358,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             .as_mut()
             .expect("output was checked before writing")
             .write_complete(bytes)?;
-        report_progress(&options, 100);
+        report_progress_finished(&options);
         self.result = Some(result);
         self.write_succeeded = true;
         Ok(())
