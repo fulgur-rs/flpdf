@@ -4868,7 +4868,8 @@ fn run_show_outline(
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
 
-    let tree = match pdf.outline().get_tree() {
+    let mut helper = pdf.outline();
+    let tree = match helper.get_tree() {
         Ok(tree) => tree,
         Err(error) => {
             eprintln!("Warning: {error}");
@@ -4885,7 +4886,8 @@ fn run_show_outline(
     }
 
     for (index, (depth, _id, item)) in tree.preorder().enumerate() {
-        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, item.title);
+        let title = item.title(&mut helper)?;
+        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, title);
     }
     finish_operation_warnings(&pdf, false)
 }
