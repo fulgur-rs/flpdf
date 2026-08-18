@@ -107,6 +107,17 @@ struct SiblingSeen {
 }
 
 /// High-level outline helper for a document. See module docs.
+///
+/// Named-destination lookups cache the catalog's `/Dests` dictionary and
+/// `/Names/Dests` name tree for the lifetime of *this instance*, matching
+/// qpdf's `QPDFOutlineDocumentHelper` (whose equivalent cache lives as long
+/// as the caller holds that C++ object). [`Pdf::outline`] mints a new
+/// instance on every call, so that cache only spans calls made through the
+/// same `&mut OutlineDocumentHelper` — callers that want the caching
+/// benefit across many [`crate::OutlineItem::dest`] calls (as
+/// [`crate::json_inspect::build_outlines_section`] does for a whole
+/// outline-tree walk) must hold one instance and reuse it, the same way a
+/// qpdf caller reuses one `QPDFOutlineDocumentHelper`.
 pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
     /// Cached resolved `/Dests` catalog entry, mirroring
