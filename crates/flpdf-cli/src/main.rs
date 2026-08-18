@@ -5181,19 +5181,53 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
 }
 
 fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-    let logger = cli_logger();
-    show_npages_from_pdf(&mut pdf, &logger)?;
-    finish_operation_warnings(&pdf, false)
+    run_ordinary_job_inspection(input, repair, password, |pdf, logger| {
+        show_npages_from_pdf(pdf, logger)
+    })
 }
 
 fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    run_ordinary_job_inspection(input, repair, password, |pdf, logger| {
+        show_pages_from_pdf(pdf, logger)
+    })
+}
+
+/// Run one ordinary page inspection through the shared qpdf-shaped job
+/// lifecycle. `QPDFJob::createQPDF` installs the document logger before input
+/// processing, and `writeQPDF` completes read-only inspection after the
+/// consumer (`libqpdf/QPDFJob.cc:429-516,1646-1693`).
+fn run_ordinary_job_inspection<F>(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    inspection: F,
+) -> CliResult<()>
+where
+    F: FnOnce(&mut Pdf<BufReader<File>>, &QPDFLogger) -> CliResult<()>,
+{
     let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-    let logger = cli_logger();
-    show_pages_from_pdf(&mut pdf, &logger)?;
-    finish_operation_warnings(&pdf, false)
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let options = pdf_open_options(repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let mut pdf = job
+        .open(BufReader::new(file), input.display().to_string(), options)
+        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+
+    // Keep the ordinary inspection weak-crypto advisory in the job-owned
+    // logger, matching the previous `open_pdf` route without making it a
+    // warning-exit condition.
+    if pdf.uses_weak_crypto() {
+        job.logger().warn(format!(
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
+            input.display()
+        ))?;
+    }
+
+    let logger = job.logger();
+    let status = job.inspect(&mut pdf, |pdf| inspection(pdf, &logger))?;
+    finish_job_exit_status(status)
 }
 
 fn show_npages_from_pdf<R: Read + Seek + 'static>(
