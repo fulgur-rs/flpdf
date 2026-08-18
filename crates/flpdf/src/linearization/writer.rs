@@ -3210,10 +3210,13 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
         options.object_streams
     };
 
+    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(pdf, mode)?;
     // qpdf allocates generated ObjStm placeholders before it removes page and
     // Catalog members from the mapping (QPDFWriter.cc:1970-2005, 2141-2161).
     // Count those pre-filter containers for progress even when a later filter
-    // leaves one empty and therefore absent from the emitted layout.
+    // leaves one empty and therefore absent from the emitted layout. Keep this
+    // traversal after plan construction: the plan's first qpdf-shaped graph
+    // walk establishes stream-recovery state for malformed encrypted sources.
     let generated_object_stream_count = if mode == crate::writer::ObjectStreamMode::Generate {
         let compressible = crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?;
         crate::writer::object_streams::even_split_into_streams(&compressible.eligible).len()
@@ -3221,7 +3224,6 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
         0
     };
     crate::writer::configure_progress_for_pdf(pdf, options, generated_object_stream_count, true)?;
-    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(pdf, mode)?;
     let renumber = RenumberMap::from_plan(&plan);
     write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
 }
