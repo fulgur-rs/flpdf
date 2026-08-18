@@ -26,7 +26,7 @@
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/job/json.rs` | correspondence | \`QPDFJob.cc:1545-1640\` (\`doJSON\` fixed section order) and \`QPDFJob.cc:3094-3115\` (\`writeJSON\` output/stream-prefix selection) |
-| `crates/flpdf/src/job/json_sections.rs` | correspondence | \`QPDFJob::doJSONPages\`, \`doJSONPageLabels\`, \`doJSONOutlines\`, \`doJSONAttachments\`, and \`doJSONEncrypt\` section builders |
+| `crates/flpdf/src/job/json_sections.rs` | correspondence | \`QPDFJob::doJSONPages\`, \`doJSONPageLabels\`, \`doJSONOutlines\`, \`doJSONAcroform\`, \`doJSONAttachments\`, and \`doJSONEncrypt\` section builders |
 | `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command and JSON section orchestration |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
