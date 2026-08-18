@@ -913,6 +913,145 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.pdf.mark_object_handle_dirty(&target)
     }
 
+    /// Bake the page's direct qpdf `/Rotate` value into its boxes, contents,
+    /// and annotations.
+    ///
+    /// This is `QPDFPageObjectHelper::flattenRotation`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:862-991`). qpdf intentionally reads
+    /// `/Rotate`, `/MediaBox`, and the optional page boxes directly from the
+    /// page object here; inherited values are not materialized by this method.
+    /// The page-document orchestration that calls this method remains outside
+    /// [`PageObjectHelper`]. Annotation field-tree work is delegated to
+    /// [`crate::AcroFormDocumentHelper`]'s canonical transform route.
+    pub fn flatten_rotation(&mut self) -> Result<()> {
+        self.require_page_ref()?;
+        let page = self.resolved_page_handle()?;
+
+        let rotate = page.try_get_key(b"/Rotate")?.try_as_integer()?.unwrap_or(0);
+        if !matches!(rotate, 90 | 180 | 270) {
+            return Ok(());
+        }
+
+        let media = self
+            .pdf
+            .resolve_object_handle_to_terminal(&page.try_get_key(b"/MediaBox")?)?;
+        let Some(media) = rectangle_from_handle(self.pdf, &media)? else {
+            return Ok(());
+        };
+        let matrix = flatten_rotation_matrix(rotate, media);
+
+        for key in [
+            b"/MediaBox".as_slice(),
+            b"/CropBox",
+            b"/BleedBox",
+            b"/TrimBox",
+            b"/ArtBox",
+        ] {
+            let value = self
+                .pdf
+                .resolve_object_handle_to_terminal(&page.try_get_key(key)?)?;
+            let Some(rectangle) = rectangle_from_handle(self.pdf, &value)? else {
+                continue;
+            };
+            page.replace_key(
+                key,
+                rectangle_to_handle(flatten_rotation_box(rotate, media, rectangle)),
+            )?;
+        }
+
+        let prefix = self.pdf.new_stream_with_data(Rc::new(
+            format!("q\n{} cm\n", matrix.unparse()).into_bytes(),
+        ))?;
+        self.add_page_contents(prefix, true)?;
+        let suffix = self.pdf.new_stream_with_data(Rc::new(b"\nQ\n".to_vec()))?;
+        self.add_page_contents(suffix, false)?;
+
+        page.remove_key(b"/Rotate");
+        // `getAttribute(..., false)` is qpdf's inherited lookup after the
+        // direct key is removed. If an ancestor supplied rotation, materialize
+        // the zero that masks it on this page.
+        let inherited_rotate = self.get_attribute(b"/Rotate", false)?;
+        if !inherited_rotate.is_null() {
+            page.replace_key(b"/Rotate", ObjectHandle::integer(0))?;
+        }
+        self.pdf.mark_object_handle_dirty(&page)?;
+
+        let old_annots = page.try_get_key(b"/Annots")?;
+        if old_annots.try_as_array()?.is_some() {
+            let transformed = {
+                let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+                let transformed = acroform.transform_annotations(old_annots, matrix)?;
+                acroform.remove_form_fields(&transformed.old_fields)?;
+                acroform.add_form_fields(transformed.new_fields.clone())?;
+                transformed
+            };
+            page.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
+            self.pdf.mark_object_handle_dirty(&page)?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy annotations from another page in the same document, applying
+    /// `cm` to every copied rectangle and appearance matrix.
+    ///
+    /// This is the same-document branch of qpdf's
+    /// `QPDFPageObjectHelper::copyAnnotations`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:992-1039`). The canonical AcroForm
+    /// helper owns field-tree copying and qualified-name renaming.
+    pub fn copy_annotations(&mut self, from_page: ObjectHandle, cm: Matrix) -> Result<()> {
+        let destination = self.resolved_page_handle()?;
+        self.require_page_ref()?;
+        validate_same_document_page_handle(self.pdf, &from_page)?;
+        let old_annots = self
+            .pdf
+            .resolve_object_handle_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
+        if old_annots.try_as_array()?.is_none() {
+            return Ok(());
+        }
+
+        let transformed = {
+            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+            let transformed = acroform.transform_annotations(old_annots, cm)?;
+            acroform.add_and_rename_form_fields(transformed.new_fields.clone())?;
+            transformed
+        };
+        append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
+        Ok(())
+    }
+
+    /// Copy annotations from a page owned by `source`, applying `cm` to every
+    /// copied rectangle and appearance matrix.
+    ///
+    /// This is qpdf's foreign-document `copyAnnotations` branch. The source
+    /// handle must be an indirect page handle owned by the supplied source
+    /// document; destination field/resource reconciliation remains in the
+    /// canonical [`crate::AcroFormDocumentHelper`] implementation.
+    pub fn copy_annotations_from<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        source: &mut Pdf<RS>,
+    ) -> Result<()> {
+        let destination = self.resolved_page_handle()?;
+        self.require_page_ref()?;
+        validate_foreign_page_handle(source, self.pdf, &from_page)?;
+        let old_annots =
+            source.resolve_object_handle_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
+        if old_annots.try_as_array()?.is_none() {
+            return Ok(());
+        }
+
+        let transformed = {
+            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+            let transformed = acroform.transform_annotations_from(old_annots, cm, source)?;
+            acroform.add_and_rename_form_fields(transformed.new_fields.clone())?;
+            transformed
+        };
+        append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
+        Ok(())
+    }
+
     /// Coalesce the page's content streams into one lazy provider-backed stream.
     pub fn coalesce_content_streams(&mut self) -> Result<()> {
         let (target, _) = self.resolved_attribute_target()?;
@@ -1806,6 +1945,133 @@ fn rectangle_from_handle<R: Read + Seek>(
         values[0].max(values[2]),
         values[1].max(values[3]),
     )))
+}
+
+fn flatten_rotation_matrix(rotate: i64, media: Rectangle) -> Matrix {
+    let mut matrix = Matrix::new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    match rotate {
+        90 => {
+            matrix.b = -1.0;
+            matrix.c = 1.0;
+            matrix.f = media.urx + media.llx;
+        }
+        180 => {
+            matrix.a = -1.0;
+            matrix.d = -1.0;
+            matrix.e = media.urx + media.llx;
+            matrix.f = media.ury + media.lly;
+        }
+        270 => {
+            matrix.b = 1.0;
+            matrix.c = -1.0;
+            matrix.e = media.ury + media.lly;
+        }
+        _ => {}
+    }
+    matrix
+}
+
+fn flatten_rotation_box(rotate: i64, media: Rectangle, rectangle: Rectangle) -> Rectangle {
+    let left_x = rectangle.llx - media.llx;
+    let right_x = media.urx - rectangle.urx;
+    let bottom_y = rectangle.lly - media.lly;
+    let top_y = media.ury - rectangle.ury;
+    match rotate {
+        90 => Rectangle::new(
+            media.lly + bottom_y,
+            media.llx + right_x,
+            media.ury - top_y,
+            media.urx - left_x,
+        ),
+        180 => Rectangle::new(
+            media.llx + right_x,
+            media.lly + top_y,
+            media.urx - left_x,
+            media.ury - bottom_y,
+        ),
+        270 => Rectangle::new(
+            media.lly + top_y,
+            media.llx + left_x,
+            media.ury - bottom_y,
+            media.urx - right_x,
+        ),
+        _ => rectangle,
+    }
+}
+
+fn rectangle_to_handle(rectangle: Rectangle) -> ObjectHandle {
+    ObjectHandle::array(vec![
+        ObjectHandle::real(rectangle.llx),
+        ObjectHandle::real(rectangle.lly),
+        ObjectHandle::real(rectangle.urx),
+        ObjectHandle::real(rectangle.ury),
+    ])
+}
+
+fn append_annotation_handles<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page: &ObjectHandle,
+    annotations: Vec<ObjectHandle>,
+) -> Result<()> {
+    let existing = pdf.resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+    let annots = if existing.as_array().is_some() {
+        existing
+    } else {
+        let replacement = ObjectHandle::array(Vec::new());
+        page.replace_key(b"/Annots", replacement.clone())?;
+        replacement
+    };
+    for annotation in annotations {
+        annots.append_array_item(annotation)?;
+    }
+    pdf.mark_object_handle_dirty(&annots)?;
+    pdf.mark_object_handle_dirty(page)?;
+    Ok(())
+}
+
+fn validate_same_document_page_handle<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    page: &ObjectHandle,
+) -> Result<()> {
+    if page.object_ref().is_none() {
+        return Err(Error::Unsupported(
+            "copyAnnotations: source page is a direct object".to_owned(),
+        ));
+    }
+    if page.owning_pdf_unique_id() != Some(pdf.unique_id()) {
+        return Err(Error::Unsupported(
+            "copyAnnotations: source page belongs to another Pdf".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_foreign_page_handle<RS: Read + Seek, RD: Read + Seek>(
+    source: &Pdf<RS>,
+    destination: &Pdf<RD>,
+    page: &ObjectHandle,
+) -> Result<()> {
+    if page.object_ref().is_none() {
+        return Err(Error::Unsupported(
+            "copyAnnotations: source page is a direct object".to_owned(),
+        ));
+    }
+    let Some(source_id) = page.owning_pdf_unique_id() else {
+        return Err(Error::Unsupported(
+            "copyAnnotations: source page has no owning Pdf".to_owned(),
+        ));
+    };
+    if source_id != source.unique_id() {
+        return Err(Error::Unsupported(
+            "copyAnnotations: source page belongs to a different Pdf".to_owned(),
+        ));
+    }
+    if source.unique_id() == destination.unique_id() {
+        return Err(Error::Unsupported(
+            "copyAnnotations: foreign source is the destination Pdf".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn matrix_from_handle<R: Read + Seek>(
