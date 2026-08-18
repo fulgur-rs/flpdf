@@ -4,7 +4,8 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
-    write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
+    write_json, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob,
+    UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -5807,22 +5808,20 @@ fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>, creates_output: bool)
 }
 
 fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<()> {
-    if !has_warnings {
-        return Ok(());
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    if has_warnings {
+        job.record_warnings();
     }
-    let suffix = if creates_output {
-        "; resulting file may have some problems"
-    } else {
-        ""
-    };
-    logger_warn(format!(
-        "{}: operation succeeded with warnings{suffix}\n",
-        progname()
-    ))?; // cov:ignore: exercised by warning-summary subprocess integration tests
-    Err(Box::new(CliExitError {
-        code: ExitCode::Warnings,
-        message: String::new(),
-    }))
+
+    match job.complete(creates_output)? {
+        JobExitCode::Success => Ok(()),
+        JobExitCode::Warning => Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        })),
+    }
 }
 
 fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) -> CliResult<()> {
@@ -5859,23 +5858,10 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     for &last_bad in normalization_last_bad {
         emit_content_normalization_warnings(input, last_bad)?;
     }
-    if !normalization_last_bad.is_empty() || has_repair_warnings {
-        let suffix = if creates_output {
-            "; resulting file may have some problems"
-        } else {
-            ""
-        };
-        logger_warn(format!(
-            "{}: operation succeeded with warnings{suffix}\n",
-            progname()
-        ))?; // cov:ignore: exercised by normalization-warning subprocess integration tests
-    } else {
+    if normalization_last_bad.is_empty() && !has_repair_warnings {
         return Ok(());
     }
-    Err(Box::new(CliExitError {
-        code: ExitCode::Warnings,
-        message: String::new(),
-    }))
+    finish_warning_state(true, creates_output)
 }
 
 /// Prefix a fatal error with the input path so main() renders the observed
