@@ -2052,12 +2052,10 @@ fn copy_and_transform_appearance_streams<R: Read + Seek>(
 /// Copy and transform annotation appearance streams, then apply qpdf's
 /// appearance-resource privatization for a foreign AcroForm merge.
 ///
-/// The resource-replacer implementation remains in the existing
-/// `overlay_appearance_stream` module until `flpdf-5v4a` completes its
-/// ObjectHandle cutover. The call is nevertheless made from the canonical
-/// AcroForm transform path, immediately after each copied appearance stream,
-/// which preserves qpdf's `transformAnnotations` ordering and keeps the
-/// legacy module out of page/overlay orchestration.
+/// The resource-replacer implementation is called through the canonical
+/// `ObjectHandle` path immediately after each copied appearance stream, which
+/// preserves qpdf's `transformAnnotations` ordering and keeps the old raw
+/// caller in `overlay_annotations` isolated until its own consumer cutover.
 fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annotation: &ObjectHandle,
@@ -2109,16 +2107,13 @@ fn adjust_copied_appearance_resources<R: Read + Seek>(
     let Some(renames) = renames.filter(|renames| !renames.is_empty()) else {
         return Ok(());
     };
-    let Some(ap_stream_ref) = copied.object_ref() else {
-        return Ok(()); // cov:ignore: copied appearance streams are always indirect after copy_stream; retain the defensive direct-handle guard
-    };
     let mut dr_map = crate::overlay_annotations::DrMap::new();
     for (category, category_renames) in renames {
         for (old_name, new_name) in category_renames {
             dr_map.insert_rename(category, old_name.clone(), new_name.clone());
         }
     }
-    crate::overlay_appearance_stream::adjust_appearance_stream(pdf, ap_stream_ref, &dr_map)
+    crate::overlay_appearance_stream::adjust_appearance_stream_handle(pdf, copied, &dr_map)
 }
 
 #[allow(dead_code)]
