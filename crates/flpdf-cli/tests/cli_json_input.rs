@@ -42,7 +42,7 @@ fn normalize_program_prefix(stderr: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(stderr.len());
     let lines: Vec<&[u8]> = stderr.split(|byte| *byte == b'\n').collect();
     for (index, line) in lines.iter().enumerate() {
-        let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         let line = [b"qpdf: ".as_slice(), b"flpdf: ".as_slice()]
             .iter()
             .find_map(|prefix| (*line).strip_prefix(*prefix))
