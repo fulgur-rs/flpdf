@@ -5257,12 +5257,18 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
         .args(["--json=2", "--json-key=outlines", output.to_str().unwrap()])
         .assert()
         .success();
-    let outline_txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();
-    assert!(
-        outline_txt.contains("Item1")
-            && outline_txt.contains("Item2")
-            && outline_txt.contains("Item3"),
-        "all outline items must be kept (null-out): {outline_txt}"
+    let outline_json: serde_json::Value =
+        serde_json::from_slice(&outline.get_output().stdout).unwrap();
+    let titles: Vec<&str> = outline_json["outlines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        ["Item1", "Item2", "Item3"],
+        "all outline items must be kept, in order (null-out parity)"
     );
 
     let raw = std::fs::read(&output).unwrap();
@@ -5318,8 +5324,15 @@ fn pages_extraction_keeps_all_when_full_range_selected() {
         .args(["--json=2", "--json-key=outlines", output.to_str().unwrap()])
         .assert()
         .success();
-    let txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();
-    assert!(txt.contains("Item1") && txt.contains("Item2") && txt.contains("Item3"));
+    let outline_json: serde_json::Value =
+        serde_json::from_slice(&outline.get_output().stdout).unwrap();
+    let titles: Vec<&str> = outline_json["outlines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["Item1", "Item2", "Item3"]);
 }
 
 // ── Scope-boundary errors (actionable, not swallowed) ─────────────────────
