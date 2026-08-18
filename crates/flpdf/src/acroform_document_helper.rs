@@ -707,12 +707,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             override_q: source_defaults.quadding != target_defaults.quadding,
             source_default_q: source_defaults.quadding,
         };
-        // qpdf's `init_dr_map` (`QPDFAcroFormDocumentHelper.cc:772-800`) is
-        // lazy: it runs only after the first foreign field has been copied and
-        // the field-tree BFS has reached its first object. Keep the resource
-        // plan lazy too. Besides avoiding an unnecessary destination
-        // `/AcroForm`, this preserves qpdf's object-allocation order: the
-        // foreign top field is copied before its source `/DR` is imported.
+        // qpdf copies the source `/DR` unconditionally up front, before the
+        // annotation loop, whenever the source is foreign
+        // (`QPDFAcroFormDocumentHelper.cc:729-737`); only the *merge* into
+        // the destination `/AcroForm`/`/DR` (`init_dr_map`,
+        // `QPDFAcroFormDocumentHelper.cc:772-800`) is lazy, deferred until
+        // the first field is actually copied, so an annotation-only
+        // (no-field) transform never creates a destination `/AcroForm`.
+        // flpdf defers the whole resource plan -- including the `/DR` copy
+        // -- to that same first-field point instead of copying `/DR` eagerly
+        // like qpdf does; this is an object-allocation-order divergence
+        // (qpdf allocates the copied `/DR` before any field, flpdf after),
+        // not a byte-identical one: object numbers are reassigned by the
+        // writer's own BFS-from-root traversal (`QPDFWriter.cc:1097-1119`),
+        // not by allocation order, so this timing difference does not change
+        // written output.
         let mut foreign_resources = None;
 
         let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();

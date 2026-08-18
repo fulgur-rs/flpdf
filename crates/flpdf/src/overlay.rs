@@ -583,6 +583,12 @@ where
 /// A single overlay/underlay specification: a source document, its kind, and its
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.
+///
+/// [`apply_overlay_specs`] imports source pages via
+/// [`Pdf::copy_foreign_object`], which can leave a copied Form XObject's
+/// stream data unread until `dest` is written. Keep every `source` here
+/// alive at least until `dest` has been fully written (see
+/// [`Pdf::copy_foreign_object`]'s own documented requirement).
 pub struct OverlaySpec<RS: Read + Seek + 'static> {
     /// The source document supplying the overlay/underlay pages.
     pub source: Pdf<RS>,
@@ -676,6 +682,11 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
 /// Destination pages not selected by any spec are left untouched. The specs'
 /// source documents are taken by `&mut` because importing reads (and may seek)
 /// them.
+///
+/// Imported Form XObjects are copied via [`Pdf::copy_foreign_object`] and may
+/// still depend on their `source` document at write time (see that method's
+/// doc). Keep every `spec.source` in `specs` alive until `dest` has been
+/// fully written, not just until this function returns.
 ///
 /// # Errors
 ///
@@ -3693,6 +3704,43 @@ mod tests {
         }];
         let err = apply_overlay_specs(&mut dest, &mut specs);
         assert!(matches!(err, Err(Error::Parse { .. })));
+    }
+
+    #[test]
+    fn apply_overlay_specs_source_must_outlive_the_write() {
+        // Documents the constraint on `OverlaySpec`/`apply_overlay_specs`
+        // (mirroring qpdf's own `copyForeignObject` contract,
+        // `include/qpdf/QPDF.hh:401-410`): a copied Form XObject's stream
+        // data can still be dispatched from the source `Pdf` when `dest` is
+        // written, so dropping the source first is a real, reproducible
+        // failure, not merely a hypothetical one.
+        use crate::writer::write_qpdf_to_memory;
+
+        let mut dest = open(multi_page_doc(1));
+        let mut specs = vec![spec(open(multi_page_doc(1)), OverlayKind::Overlay)];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        drop(specs);
+
+        let err = write_qpdf_to_memory(&mut dest, |_| {});
+        assert!(
+            matches!(&err, Err(Error::Internal(message))
+                if message == "pipeStreamData called for non-stream"),
+            "dropping the source before write must fail, not silently omit the stream: {err:?}"
+        );
+    }
+
+    #[test]
+    fn apply_overlay_specs_source_kept_alive_writes_successfully() {
+        // The documented-safe counterpart to the test above: keeping the
+        // source alive until after the write succeeds.
+        use crate::writer::write_qpdf_to_memory;
+
+        let mut dest = open(multi_page_doc(1));
+        let mut specs = vec![spec(open(multi_page_doc(1)), OverlayKind::Overlay)];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let out = write_qpdf_to_memory(&mut dest, |_| {}).unwrap();
+        assert!(!out.is_empty());
     }
 
     // ---- overlay_verbose_report (public inspection API) -------------------
