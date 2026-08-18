@@ -2635,7 +2635,7 @@ fn finish_check_report(input: &Path, report: flpdf::CheckReport) -> CliResult<()
         if is_weak_crypto_advisory(diagnostic) {
             continue;
         }
-        let location = check_diagnostic_location(&input, diagnostic);
+        let location = check_diagnostic_location(input, diagnostic);
         match diagnostic.severity {
             Severity::Warning => {
                 let separator = if diagnostic.message.starts_with("(object ")
@@ -2682,7 +2682,7 @@ fn finish_check_report(input: &Path, report: flpdf::CheckReport) -> CliResult<()
     // summary is present whenever the document opened, which is implied by
     // `report.valid`; the `if let` is a defensive match.
     if let Some(summary) = &report.summary {
-        print_check_block(&input, summary)?;
+        print_check_block(input, summary)?;
     }
 
     if has_warnings {
