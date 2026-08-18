@@ -6,9 +6,10 @@
 //! creation and operation dispatch are layered on top of this state in later
 //! job slices.
 
-use crate::{Pdf, PdfWriter, QPDFLogger, Result, Severity};
+use super::json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput};
+use crate::{Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, Result, Severity};
 use std::cell::RefCell;
-use std::io::{Read, Seek};
+use std::io::{Cursor, Read, Seek};
 use std::rc::Rc;
 
 type ProgressHandler = Box<dyn FnMut(u8) + 'static>;
@@ -124,6 +125,73 @@ impl QPDFJob {
         writer.register_progress_reporter(Box::new(move |percent| {
             (reporter.borrow_mut())(percent);
         }));
+    }
+
+    /// Create a complete JSON-input document with this job's logger already
+    /// installed.
+    ///
+    /// qpdf creates the rootless document and imports JSON before any later
+    /// transformations (`QPDFJob.cc:429-482`, `QPDFJob.cc:1708`). Installing
+    /// the logger in the seed options preserves import-time warning routing;
+    /// replacing it after `Pdf::create_from_json` would lose that boundary.
+    pub fn create_from_json<S>(
+        &mut self,
+        source: S,
+        input_name: impl Into<String>,
+    ) -> Result<Pdf<Cursor<Vec<u8>>>>
+    where
+        S: Read + Seek + 'static,
+    {
+        let pdf = Pdf::create_from_json_with_options(
+            source,
+            input_name,
+            PdfOpenOptions {
+                logger: Some(self.logger.clone()),
+                ..PdfOpenOptions::default()
+            },
+        )?;
+        self.record_document_warnings(&pdf);
+        Ok(pdf)
+    }
+
+    /// Apply a partial JSON update before the job's output or inspection
+    /// stage, matching qpdf's update-before-transform order.
+    pub fn update_from_json<R, S>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        source: S,
+        input_name: impl Into<String>,
+    ) -> Result<()>
+    where
+        R: Read + Seek,
+        S: Read + Seek + 'static,
+    {
+        pdf.set_logger(self.logger.clone());
+        pdf.update_from_json(source, input_name)?;
+        self.record_document_warnings(pdf);
+        Ok(())
+    }
+
+    /// Serialize one already-created document and then complete the shared
+    /// warning/exit-status boundary.
+    ///
+    /// JSON construction and stream side-file handling remain owned by the
+    /// existing serializer; this method owns only the qpdf `writeQPDF`
+    /// lifecycle boundary (`QPDFJob.cc:484-563`).
+    pub fn write_json<R>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        options: JsonJobOptions<'_>,
+        output: JsonJobOutput<'_>,
+        creates_output: bool,
+    ) -> std::result::Result<JobExitCode, JsonJobError>
+    where
+        R: Read + Seek,
+    {
+        pdf.set_logger(self.logger.clone());
+        write_json(pdf, options, output)?;
+        self.record_document_warnings(pdf);
+        Ok(self.complete(creates_output)?)
     }
 
     /// Record that a stage observed one or more qpdf warnings.

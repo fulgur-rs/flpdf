@@ -1,10 +1,37 @@
-use flpdf::job::{JobExitCode, QPDFJob};
+use flpdf::job::{JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
+use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{Error, Pdf, PdfWriter, QPDFLogger};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+
+const COMPLETE_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {
+      "obj:1 0 R": {"value": {"/Pages": "2 0 R", "/Type": "/Catalog"}},
+      "obj:2 0 R": {"value": {"/Count": 0, "/Kids": [], "/Type": "/Pages"}},
+      "trailer": {"value": {"/Root": "1 0 R", "/Size": 3}}
+    }
+  ]
+}"#;
+
+const ROOTLESS_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2, "pdfversion": "1.3"},
+    {"trailer": {"value": {}}}
+  ]
+}"#;
+
+const UPDATE_JSON: &[u8] = br#"{
+  "qpdf": [
+    {"jsonversion": 2},
+    {"obj:1 0 R": {"value": {"/Marker": true, "/Pages": "2 0 R", "/Type": "/Catalog"}}}
+  ]
+}"#;
 
 #[derive(Default)]
 struct SinkState {
@@ -171,4 +198,134 @@ fn missing_progress_reporter_is_a_noop() {
     QPDFJob::new().configure_writer_progress(&mut writer);
     writer.write().unwrap();
     assert!(!writer.get_buffer().unwrap().is_empty());
+}
+
+#[test]
+fn json_create_update_and_write_share_one_job_lifecycle() {
+    let mut job = QPDFJob::new();
+    let mut pdf = job
+        .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+        .expect("complete JSON input");
+    assert_eq!(pdf.root_ref(), Some(flpdf::ObjectRef::new(1, 0)));
+
+    job.update_from_json(&mut pdf, Cursor::new(UPDATE_JSON), "update.json")
+        .expect("partial JSON update");
+    assert_eq!(
+        pdf.get_object_handle(flpdf::ObjectRef::new(1, 0))
+            .get_key(b"/Marker")
+            .as_boolean(),
+        Some(true)
+    );
+
+    let mut output = Vec::new();
+    let status = job
+        .write_json(
+            &mut pdf,
+            JsonJobOptions {
+                decode_level: DecodeLevel::None,
+                stream_data: JsonStreamData::None,
+                stream_prefix: None,
+                keys: &[],
+                objects: &[],
+            },
+            JsonJobOutput::Stdout(&mut output),
+            false,
+        )
+        .expect("JSON output");
+
+    assert_eq!(status, JobExitCode::Success);
+    assert!(String::from_utf8_lossy(&output).contains("\"jsonversion\": 2"));
+}
+
+#[test]
+fn json_create_installs_job_logger_before_import_warnings() {
+    let (logger, state) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+
+    let error = match job.create_from_json(Cursor::new(b"{}"), "input.json") {
+        Ok(_) => panic!("invalid JSON must fail"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("errors found in JSON"));
+    assert!(
+        !state.lock().unwrap().bytes.is_empty(),
+        "import-time diagnostic must use the job logger"
+    );
+}
+
+#[test]
+fn json_write_failure_does_not_emit_completion_summary() {
+    let (logger, state) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.record_warnings();
+    let mut pdf = Pdf::create_from_json(Cursor::new(ROOTLESS_JSON), "input.json")
+        .expect("rootless JSON input");
+    let mut output = Vec::new();
+
+    let error = job
+        .write_json(
+            &mut pdf,
+            JsonJobOptions {
+                decode_level: DecodeLevel::None,
+                stream_data: JsonStreamData::None,
+                stream_prefix: None,
+                keys: &[],
+                objects: &[],
+            },
+            JsonJobOutput::Stdout(&mut output),
+            false,
+        )
+        .expect_err("serializer failure must abort before completion");
+
+    assert!(matches!(error, flpdf::job::JsonJobError::Output(_)));
+    assert!(state.lock().unwrap().bytes.is_empty());
+}
+
+#[test]
+fn json_job_output_matches_qpdf_11_9_json_input_route() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/json-input/complete.json");
+    let expected = match Command::new("qpdf")
+        .args(["--json-input", "--json=2"])
+        .arg(&path)
+        .arg("-")
+        .output()
+    {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(output) => panic!(
+            "qpdf JSON route failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => {
+            eprintln!("skipping qpdf differential: {error}");
+            return;
+        }
+    };
+
+    let mut job = QPDFJob::new();
+    let mut pdf = job
+        .create_from_json(
+            File::open(&path).expect("complete JSON fixture"),
+            path.display().to_string(),
+        )
+        .expect("complete JSON input");
+    let mut actual = Vec::new();
+    job.write_json(
+        &mut pdf,
+        JsonJobOptions {
+            decode_level: DecodeLevel::Generalized,
+            stream_data: JsonStreamData::None,
+            stream_prefix: None,
+            keys: &[],
+            objects: &[],
+        },
+        JsonJobOutput::Stdout(&mut actual),
+        false,
+    )
+    .expect("JSON output");
+
+    assert_eq!(actual, expected);
 }

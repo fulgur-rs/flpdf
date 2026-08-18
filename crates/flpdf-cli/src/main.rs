@@ -4,8 +4,7 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
-    write_json, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob,
-    UsageError,
+    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -2142,6 +2141,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         None
     };
 
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+
     // 5. Open the input once and retain an identity handle for the output
     // check. JSON input uses the canonical complete-document importer; a
     // partial update is applied immediately after creation/opening.
@@ -2157,11 +2160,16 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         .map_err(|error| error_with_file(input, error.into()))?;
 
     if cli.json_input {
-        let mut pdf = open_json_pdf(input, cli.update_from_json.as_deref())?;
+        let mut pdf = job.create_from_json(input_file, input.display().to_string())?;
+        apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+        let mut runtime = JsonJobRuntime {
+            input_identity: &input_identity,
+            standard_output: &mut standard_output,
+            job: &mut job,
+        };
         run_json_document(
             cli,
-            &input_identity,
-            &mut standard_output,
+            &mut runtime,
             &mut pdf,
             stream_data,
             &json_keys,
@@ -2169,11 +2177,16 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         )
     } else {
         let mut pdf = open_pdf_from_file(input, input_file, cli.repair, &cli.password)?;
-        apply_json_update(&mut pdf, cli.update_from_json.as_deref())?;
+        job.record_document_warnings(&pdf);
+        apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+        let mut runtime = JsonJobRuntime {
+            input_identity: &input_identity,
+            standard_output: &mut standard_output,
+            job: &mut job,
+        };
         run_json_document(
             cli,
-            &input_identity,
-            &mut standard_output,
+            &mut runtime,
             &mut pdf,
             stream_data,
             &json_keys,
@@ -2227,8 +2240,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
 /// file-backed PDF inputs and JSON-created documents.
 fn run_json_document<R: Read + Seek>(
     cli: &Cli,
-    input_identity: &File,
-    standard_output: &mut Option<PipelineWriter>,
+    runtime: &mut JsonJobRuntime<'_>,
     pdf: &mut Pdf<R>,
     stream_data: JsonStreamData,
     json_keys: &[JsonKey],
@@ -2236,10 +2248,8 @@ fn run_json_document<R: Read + Seek>(
 ) -> CliResult<()> {
     // `decode_level` governs both inline `data` payloads and file-mode side
     // files emitted by the job-owned JSON output pipeline.
-    let diagnostics_start = pdf.repair_diagnostics().entries().len();
-    let had_open_warnings = diagnostics_start > 0;
     let json_result = if let Some(ref path) = cli.json_output {
-        let mut file = open_verified_json_output(input_identity, path)?;
+        let mut file = open_verified_json_output(runtime.input_identity, path)?;
         let options = JsonJobOptions {
             decode_level: DecodeLevel::Generalized,
             stream_data,
@@ -2247,13 +2257,14 @@ fn run_json_document<R: Read + Seek>(
             keys: json_keys,
             objects: json_objects,
         };
-        write_json(
+        runtime.job.write_json(
             pdf,
             options,
             JsonJobOutput::File {
                 filename: path,
                 writer: &mut file,
             },
+            true,
         )
     } else {
         let options = JsonJobOptions {
@@ -2263,29 +2274,31 @@ fn run_json_document<R: Read + Seek>(
             keys: json_keys,
             objects: json_objects,
         };
-        write_json(
+        runtime.job.write_json(
             pdf,
             options,
             JsonJobOutput::Stdout(
-                standard_output
+                runtime
+                    .standard_output
                     .as_mut()
                     .expect("stdout writer prepared for JSON stdout"),
             ),
+            false,
         )
     };
     match json_result {
-        Ok(()) => {}
+        Ok(JobExitCode::Success) => {}
+        Ok(JobExitCode::Warning) => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Warnings,
+                message: String::new(),
+            }))
+        }
         Err(JsonJobError::Output(error)) => return Err(Box::new(error)),
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
+        Err(JsonJobError::Completion(error)) => return Err(Box::new(error)),
     }
-
-    // qpdf exits 3 after successful JSON output when either opening or later
-    // processing warned. The document logger has already delivered every
-    // warning; the snapshots here control only exit status and the summary.
-    finish_warning_state(
-        had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start,
-        cli.json_output.is_some(),
-    )
+    Ok(())
 }
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
@@ -5507,6 +5520,12 @@ enum JobPdf {
     Json(Pdf<Cursor<Vec<u8>>>),
 }
 
+struct JsonJobRuntime<'a> {
+    input_identity: &'a File,
+    standard_output: &'a mut Option<PipelineWriter>,
+    job: &'a mut QPDFJob,
+}
+
 fn apply_json_update<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     update_from_json: Option<&Path>,
@@ -5515,6 +5534,18 @@ fn apply_json_update<R: Read + Seek + 'static>(
         let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
         pdf.update_from_json(source, path.display().to_string())
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    }
+    Ok(())
+}
+
+fn apply_json_update_with_job<R: Read + Seek + 'static>(
+    job: &mut QPDFJob,
+    pdf: &mut Pdf<R>,
+    update_from_json: Option<&Path>,
+) -> CliResult<()> {
+    if let Some(path) = update_from_json {
+        let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
+        job.update_from_json(pdf, source, path.display().to_string())?;
     }
     Ok(())
 }
