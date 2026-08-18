@@ -7344,12 +7344,12 @@ mod tests {
         assert!(
             encoded.windows(5).any(|w| w == b"\"/A\xe9\""),
             "expected raw byte 0xE9 preserved after the leading slash, got: {}",
-            String::from_utf8_lossy(&encoded)
+            String::from_utf8_lossy(&encoded) // cov:ignore: assert! failure-message arm, only evaluated when this passing test fails
         );
         assert!(
             !encoded.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
             "output must not contain a U+FFFD replacement character: {}",
-            String::from_utf8_lossy(&encoded)
+            String::from_utf8_lossy(&encoded) // cov:ignore: assert! failure-message arm, only evaluated when this passing test fails
         );
     }
 
