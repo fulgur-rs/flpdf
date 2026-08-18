@@ -574,3 +574,138 @@ fn plain_rewrite_same_input_and_output_is_rejected_without_modifying_the_file() 
 
     assert_eq!(fs::read(&path).unwrap(), original);
 }
+
+/// `run_page_extraction_from_repeated_pdf` (the path taken when
+/// `--json-input`/`--update-from-json` combines with `--pages`) applies
+/// every spec's range to the single already-opened job document; it has no
+/// way to honor a `--pages` source naming a genuinely different file, unlike
+/// the ordinary (non-JSON) branch, which opens that file directly. Before
+/// the fix, a lone explicit `--pages other.pdf N` (no `.` segment) never put
+/// the JSON primary into the single-document-scope `distinct` check, so it
+/// silently substituted the JSON primary's own page for the one requested
+/// from `other.pdf`, with exit 0 and no diagnostic. `.`-only usage (the
+/// documented, supported case) must keep working.
+#[test]
+fn json_input_pages_from_a_different_file_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json-input", COMPLETE_JSON, "--pages", ONE_PAGE_PDF, "1"])
+        .arg("--")
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cross-document page merge is not supported",
+        ));
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn update_from_json_pages_from_a_different_file_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(format!("--update-from-json={UPDATE_JSON}"))
+        .args([MINIMAL_PDF, "--pages", ONE_PAGE_PDF, "1"])
+        .arg("--")
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cross-document page merge is not supported",
+        ));
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn json_input_pages_using_dot_shorthand_still_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json-input", COMPLETE_JSON, "--pages", ".", "1"])
+        .arg("--")
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
+const RC4_ENCRYPTED_PDF: &str = "../../tests/fixtures/encrypted/v1-rc4-40-r2.pdf";
+const RC4_USER_PASSWORD: &str = "user-v1";
+const NOOP_UPDATE_JSON: &str = r#"{"qpdf":[{"jsonversion":2,"calledgetallpages":true,"pushedinheritedpageresources":false},{}]}"#;
+
+/// `run_check` forces `PdfOpenOptions::allow_weak_crypto = true` because
+/// qpdf treats `--check` as a read-only inspection (like `--show-encryption`):
+/// an RC4/R=5 file opened with the correct password checks cleanly without
+/// `--allow-weak-crypto` (verified qpdf 11.9.0). `--update-from-json --check`
+/// previously went through the generic (write-path) `open_job_pdf` branch,
+/// which used the normal, non-forced gate, so a file that passes plain
+/// `--check` failed once `--update-from-json` was added.
+#[test]
+fn update_from_json_check_inspects_rc4_encrypted_input_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let update = temp.path().join("noop-update.json");
+    fs::write(&update, NOOP_UPDATE_JSON).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(format!("--update-from-json={}", update.display()))
+        .args([
+            "--check",
+            &format!("--password={RC4_USER_PASSWORD}"),
+            RC4_ENCRYPTED_PDF,
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("File is encrypted\n"))
+        .stderr(predicate::str::contains("weak crypto").not());
+}
+
+/// `run_check` sets `suppress_warnings = true` so open-time repair
+/// diagnostics are collected rather than delivered live, since
+/// `finish_check_report` re-emits the same diagnostics from
+/// `pdf.repair_diagnostics()` afterward. The JSON-update inspection path
+/// previously used the default (non-suppressing) open, so each repair
+/// warning printed once live and once more from the report -- doubled.
+#[test]
+fn update_from_json_check_does_not_duplicate_repair_warnings() {
+    let temp = tempfile::tempdir().unwrap();
+    let update = temp.path().join("noop-update.json");
+    fs::write(&update, NOOP_UPDATE_JSON).unwrap();
+    let damaged = "../../tests/fixtures/test_driver/repairable_input.pdf";
+
+    let plain = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair", "--check", damaged])
+        .output()
+        .unwrap();
+    let via_update = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--repair")
+        .arg(format!("--update-from-json={}", update.display()))
+        .args(["--check", damaged])
+        .output()
+        .unwrap();
+
+    assert_eq!(plain.status.code(), Some(3));
+    assert_eq!(via_update.status.code(), Some(3));
+    assert_eq!(plain.stderr, via_update.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stderr)
+            .matches("file is damaged")
+            .count(),
+        1
+    );
+}

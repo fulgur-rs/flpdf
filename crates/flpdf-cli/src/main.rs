@@ -2215,6 +2215,7 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
         &cli.password,
         cli.json_input,
         cli.update_from_json.as_deref(),
+        cli.check,
     )?;
 
     match job_pdf {
@@ -3270,7 +3271,14 @@ fn run_rewrite(
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     reject_same_job_output(&input, &output)?;
-    let opened = open_job_pdf(&input, repair, password, json_input, update_from_json)?;
+    let opened = open_job_pdf(
+        &input,
+        repair,
+        password,
+        json_input,
+        update_from_json,
+        false,
+    )?;
     match opened {
         JobPdf::File(pdf) => run_rewrite_opened(
             pdf,
@@ -4310,12 +4318,38 @@ fn run_page_extraction(
     }
 
     if json_input || update_from_json.is_some() {
+        // `run_page_extraction_from_repeated_pdf` below applies every spec's
+        // range to the single already-opened job document; it has no way to
+        // honor a `spec.path` that names a genuinely different file (unlike
+        // the ordinary branch further down, which opens `inputs[0].path`
+        // directly). The `distinct.len() > 1` check above only catches this
+        // when two *explicit* paths disagree with each other -- a lone
+        // explicit source (e.g. `--pages other.pdf 1`, no `.` segment) never
+        // puts `primary_input` itself into `distinct`, so it silently
+        // resolves to a single-element `distinct` and slips past. Comparing
+        // every resolved spec path against `primary_input`'s own canonical
+        // path here closes that gap without touching the ordinary branch's
+        // (already correct) handling of a genuinely different single source.
+        let primary_canonical =
+            std::fs::canonicalize(primary_input).unwrap_or_else(|_| primary_input.to_path_buf());
+        if distinct.iter().any(|path| *path != primary_canonical) {
+            return Err(
+                "--pages: cross-document page merge is not supported at this layer \
+                 (an explicit --pages source differs from the --json-input/\
+                 --update-from-json primary input). Single-document extraction \
+                 ('.' or the primary input's own path) is supported; cross-doc \
+                 merge with a JSON-created/updated primary is tracked in a \
+                 separate issue."
+                    .into(),
+            );
+        }
         let opened = open_job_pdf(
             primary_input,
             repair,
             password,
             json_input,
             update_from_json,
+            false,
         )?;
         return match opened {
             JobPdf::File(pdf) => run_page_extraction_from_repeated_pdf(
@@ -4665,7 +4699,7 @@ fn run_rewrite_with_page_ops(
     options: WriterOptions,
     verbose: bool,
 ) -> CliResult<()> {
-    let opened = open_job_pdf(input, repair, password, json_input, update_from_json)?;
+    let opened = open_job_pdf(input, repair, password, json_input, update_from_json, false)?;
     match opened {
         JobPdf::File(pdf) => {
             run_rewrite_with_page_ops_opened(pdf, output, page_ops, options, verbose)
@@ -5624,17 +5658,29 @@ fn apply_json_update<R: Read + Seek + 'static>(
 /// Open the main qpdf job input and apply `--update-from-json` at the same
 /// point qpdf's `QPDFJob::createQPDF` does: immediately after input creation,
 /// before page specifications, rotations, overlays, or serialization.
+/// `check_inspection` applies `run_check`'s forced weak-crypto-open and
+/// warning-aggregation policy (see [`open_pdf_for_check_inspection`]) to the
+/// non-`--json-input` (`--update-from-json` only) branch. It has no effect
+/// on the `--json-input` branch: [`Pdf::create_from_json`] always seeds from
+/// the fixed, never-encrypted rootless bootstrap document, so this policy
+/// only matters for a real encrypted PDF opened through
+/// `--update-from-json`.
 fn open_job_pdf(
     input: &Path,
     repair: bool,
     password: &PasswordArgs,
     json_input: bool,
     update_from_json: Option<&Path>,
+    check_inspection: bool,
 ) -> CliResult<JobPdf> {
     if json_input {
         Ok(JobPdf::Json(open_json_pdf(input, update_from_json)?))
     } else {
-        let mut pdf = open_pdf(&input.to_path_buf(), repair, password)?;
+        let mut pdf = if check_inspection {
+            open_pdf_for_check_inspection(&input.to_path_buf(), repair, password)?
+        } else {
+            open_pdf(&input.to_path_buf(), repair, password)?
+        };
         apply_json_update(&mut pdf, update_from_json)?;
         Ok(JobPdf::File(pdf))
     }
@@ -5653,7 +5699,7 @@ fn open_pdf(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, false)
+    open_pdf_impl(input, repair, password, false, false)
 }
 
 fn open_pdf_from_file(
@@ -5662,7 +5708,7 @@ fn open_pdf_from_file(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_file_impl(input, file, repair, password, false)
+    open_pdf_file_impl(input, file, repair, password, false, false)
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,
@@ -5681,7 +5727,26 @@ fn open_pdf_for_inspection(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, true)
+    open_pdf_impl(input, repair, password, true, false)
+}
+
+/// Open for `--update-from-json --check`'s generic job-inspection route.
+///
+/// Mirrors `run_check`'s own two-part inspection policy exactly (forced
+/// weak-crypto gate, same reasoning as [`open_pdf_for_inspection`]; plus
+/// `suppress_warnings` so open/update-time repair diagnostics are collected
+/// rather than delivered live, since `finish_check_report` re-emits the
+/// same diagnostics from `pdf.repair_diagnostics()` afterward -- without
+/// this, a `--repair`-triggered warning prints twice). `--show-npages`/
+/// `--show-pages` do not need either policy: like their non-JSON siblings
+/// `run_show_npages`/`run_show_pages`, they use the plain [`open_pdf`]
+/// path via [`open_job_pdf`]'s `check_inspection` parameter.
+fn open_pdf_for_check_inspection(
+    input: &PathBuf,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<Pdf<BufReader<File>>> {
+    open_pdf_impl(input, repair, password, true, true)
 }
 
 fn open_pdf_impl(
@@ -5689,9 +5754,17 @@ fn open_pdf_impl(
     repair: bool,
     password: &PasswordArgs,
     force_allow_weak_crypto: bool,
+    suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
-    open_pdf_file_impl(input, file, repair, password, force_allow_weak_crypto)
+    open_pdf_file_impl(
+        input,
+        file,
+        repair,
+        password,
+        force_allow_weak_crypto,
+        suppress_warnings,
+    )
 }
 
 fn open_pdf_file_impl(
@@ -5700,10 +5773,14 @@ fn open_pdf_file_impl(
     repair: bool,
     password: &PasswordArgs,
     force_allow_weak_crypto: bool,
+    suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let mut options = pdf_open_options(repair, password)?;
     if force_allow_weak_crypto {
         options.allow_weak_crypto = true;
+    }
+    if suppress_warnings {
+        options.suppress_warnings = true;
     }
     configure_document_logger(&mut options, input);
     let pdf = Pdf::open_with_options(BufReader::new(file), options)
