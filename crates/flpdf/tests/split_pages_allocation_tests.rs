@@ -1,15 +1,18 @@
-//! What `split_pages` costs in allocated bytes, measured rather than argued.
+//! What the canonical job split path costs in allocated bytes, measured rather
+//! than argued.
 //!
 //! The file installs a `#[global_allocator]` that tracks live bytes and reads
-//! the high-water mark across one `split_pages` call, with the caller's own
-//! buffer already allocated so that only what the call adds is counted.
+//! the high-water mark across one `QPDFJob::split_pages` call, with the
+//! caller's own buffer already allocated so that only what the call adds is
+//! counted.
 //!
 //! **The file holds exactly one `#[test]`, deliberately.** libtest runs the
 //! tests in a binary concurrently on separate threads, and the counters below
 //! are process-global, so a second test would sample the first one's
 //! allocations and vice versa.
 
-use flpdf::page_split::split_pages;
+use flpdf::job::{QPDFJob, SplitPageOptions};
+use flpdf::Pdf;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,7 +61,8 @@ fn peak_growth_of(call: impl FnOnce()) -> usize {
 /// A two-page document padded to a few megabytes by one stream object that
 /// nothing references.
 ///
-/// The padding is deliberately unreachable from the page tree: `split_pages`
+/// The padding is deliberately unreachable from the page tree:
+/// `QPDFJob::split_pages`
 /// walks the pages, so a document whose bulk sat inside a *referenced* object
 /// would allocate that bulk again as a resolved value, for reasons that have
 /// nothing to do with what is being measured.
@@ -120,12 +124,9 @@ fn padded_two_page_pdf(padding: usize) -> Vec<u8> {
 
 /// The source the caller hands over is never resident a second time.
 ///
-/// `split_pages` reopens the source once per chunk and `Pdf<R>` requires
-/// `R: 'static`, so it has to *own* the bytes. Taking the caller's `Vec` lets
-/// that owner be the caller's own allocation, moved in. The shape this replaced
-/// took `&[u8]` and had no choice but to copy — and the caller's buffer stayed
-/// alive underneath the copy, so the whole document was resident twice for the
-/// whole call.
+/// `QPDFJob::split_pages` keeps its source document alive while each fresh
+/// output is written. The owned `Vec` is moved into that document, so the
+/// caller's buffer is not copied before the job starts.
 ///
 /// # Where the bound comes from
 ///
@@ -134,18 +135,17 @@ fn padded_two_page_pdf(padding: usize) -> Vec<u8> {
 /// found by capturing a backtrace at every allocation of at least `src.len()`
 /// bytes rather than by reading the code and hoping:
 ///
-/// - `Pdf::open` reads the entire input into a `Vec` while loading the xref
-///   (`xref::load_xref_state_with_repair` → `Read::read_to_end`), once per open.
-/// - Each chunk is emitted through the canonical writer after reopening the
-///   source, so the source and output allocations coexist; the output buffer
-///   grows from empty and ends at the next power of two — **two** documents'
-///   worth for a document that is not one already.
+/// - `Pdf::open_mem_owned` reads the input into its owned reader while loading
+///   the xref (`xref::load_xref_state_with_repair` → `Read::read_to_end`).
+/// - Each chunk is emitted through the canonical writer while the source and
+///   output allocations coexist; the output buffer grows from empty and ends
+///   at the next power of two — **two** documents' worth for a document that
+///   is not one already.
 ///
 /// Those two coexist, so three documents' worth of growth is expected and
 /// measured (3.01× at the time of writing). A copy of the handed-over source
 /// would be a fourth, so the bound is four — a threshold that discriminates
-/// rather than accommodates: reinstating the old shape inside `split_pages`
-/// (copy the argument, keep the original alive for the call) measures 4.01×.
+/// rather than accommodates.
 ///
 /// **The caller's own buffer is deliberately outside the window.** It is
 /// allocated before the probe is armed, so it sits in the baseline and does not
@@ -157,8 +157,8 @@ fn padded_two_page_pdf(padding: usize) -> Vec<u8> {
 /// A copy that frees the original immediately — `Arc::<[u8]>::from(vec)`, the
 /// shape this one is easiest to be turned back into — costs a memcpy of the
 /// whole document but no sustained residency, so it does not move this number.
-/// `page_split`'s own `shared_source_keeps_the_callers_allocation` is the check
-/// that catches it, by address.
+/// The direct owned-source route is covered by this measurement's resident
+/// allocation bound.
 #[test]
 fn split_pages_keeps_no_second_copy_of_the_source_it_is_handed() {
     let src = padded_two_page_pdf(4 * 1024 * 1024);
@@ -167,7 +167,10 @@ fn split_pages_keeps_no_second_copy_of_the_source_it_is_handed() {
     let template = tmpdir.path().join("out.pdf");
 
     let peak = peak_growth_of(|| {
-        split_pages(src, 1, &template, false).expect("split should succeed");
+        let mut pdf = Pdf::open_mem_owned(src).expect("source should parse");
+        let mut job = QPDFJob::new();
+        job.split_pages(&mut pdf, SplitPageOptions::new(1, &template))
+            .expect("split should succeed");
     });
 
     assert!(

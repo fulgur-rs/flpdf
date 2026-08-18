@@ -31,6 +31,7 @@
 | `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command and JSON section orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
+| `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/input.rs` | correspondence | \`QPDF_json.cc\` JSONReactor state machine, validators, deferred stream providers, and \`makeObject\` value construction |
@@ -87,7 +88,7 @@
 | `crates/flpdf/src/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/page_rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/page_splice.rs` | correspondence | QPDFPageDocumentHelper.cc page insertion and removal represented as an in-place splice |
-| `crates/flpdf/src/page_split.rs` | correspondence | QPDFJob.cc split-pages orchestration and output naming |
+| `crates/flpdf/src/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` output naming helpers |
 | `crates/flpdf/src/page_tree_rebuild.rs` | correspondence | QPDF_pages.cc page-tree repair plus QPDFJob.cc page-selection rebuilding |
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
 | `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |

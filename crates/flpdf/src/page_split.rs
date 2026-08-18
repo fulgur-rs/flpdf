@@ -1,9 +1,8 @@
-//! qpdf correspondence: QPDFJob.cc split-pages orchestration and output naming.
-//! Split a single PDF into multiple smaller PDFs by consecutive page chunks.
+//! qpdf correspondence: `QPDFJob::doSplitPages` output naming helpers.
 //!
-//! [`split_pages`] implements qpdf's `--split-pages=N` semantics: it divides
-//! the source document into consecutive N-page groups and writes each group as
-//! a separate file.
+//! The split lifecycle lives in [`crate::job::QPDFJob::split_pages`]. This
+//! module retains the pure qpdf 11.9.0 filename and page-count helpers plus a
+//! thin bytes-based compatibility facade for existing library callers.
 //!
 //! # Naming convention
 //!
@@ -32,81 +31,28 @@
 //! - The split is at the **last** `.` in the filename portion of the path
 //!   (confirmed with `two.dots.pdf` → `two.dots-1-2.pdf`).
 //!
-//! # Page labels
-//!
-//! When the source carries a `/PageLabels` number tree, each chunk gets its
-//! own reconstructed `/PageLabels` covering just that chunk's page span,
-//! renumbered to start at 0 — matching qpdf's `--split-pages`, which
-//! rebuilds the label array per chunk rather than copying the source tree
-//! verbatim. A source with no `/PageLabels` leaves every chunk without one.
-//!
-//! # Page extraction strategy
-//!
-//! Since a full page-tree rebuild pass is not yet available,
-//! this module uses a minimal approach: for each chunk it reopens the source
-//! bytes, mutates the `/Pages` root to contain only the chunk's page refs
-//! (updating `/Count` and `/Kids`), then writes the modified PDF through
-//! [`PdfWriter`]. The writer's qpdf reachability pass
-//! drops objects that are no longer reachable from the chunk's roots.
-//!
-//! ## Known limitation: inheritable attributes
-//!
-//! When reparenting page leaf nodes directly to the `/Pages` root, this
-//! module does **not** materialise inheritable attributes (`/Resources`,
-//! `/Rotate`, `/MediaBox`) that may have been stored on intermediate
-//! `/Pages` nodes in the original page tree.  Concretely:
-//!
-//! - If an intermediate `/Pages` node carried, say, a shared `/Resources`
-//!   dict, and a chunk's pages referenced that node but not the root, those
-//!   resources become inaccessible after the reparent.
-//! - In practice this is safe for **flat** page trees (where all pages are
-//!   direct children of the root `/Pages` node), which is the normal output
-//!   of qpdf-roundtripped PDFs.
-//! - Deep/branching page trees (e.g. large documents built by some InDesign
-//!   versions) may produce chunks with missing resources.
-//!
-//! Full resolution requires materialising inherited attributes before
-//! reparenting, which is not yet implemented.  For now, prefer running
-//! `qpdf --linearize` (or equivalent) on the source to flatten the page
-//! tree before splitting.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use std::path::Path;
-//! use flpdf::{page_split::split_pages, Pdf};
-//!
-//! let src = std::fs::read("input.pdf").unwrap();
-//! // `true` applies qpdf's deterministic-ID policy to every chunk.
-//! split_pages(src, 2, Path::new("output.pdf"), false).unwrap();
-//! // Produces: output-1-2.pdf, output-3-4.pdf, …
-//! ```
+//! The source page copy, inherited-attribute materialization, AcroForm fix,
+//! chunk-local labels, and writer lifecycle are deliberately owned by the job
+//! module so every caller reaches one canonical route.
 
-use crate::pages::page_refs;
-use crate::{Error, Object, ObjectRef, Pdf, PdfWriter, Result};
-use std::io::Cursor;
+use crate::{Pdf, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Split the PDF bytes in `src_bytes` into consecutive N-page chunks and write
-/// each chunk as a separate PDF file.
+/// Compatibility facade for qpdf's fresh-document split job.
+///
+/// The bytes are opened once and delegated to [`crate::job::QPDFJob::split_pages`]
+/// so the canonical foreign-page, AcroForm, PageLabels, and writer lifecycle
+/// is shared with the CLI. New callers that know the input path should use the
+/// job API directly to enable qpdf's same-file guard.
 ///
 /// # Arguments
 ///
-/// - `src_bytes`: Raw bytes of the source PDF, **taken by value**. Every chunk
-///   reopens the source, and `Pdf<R>` requires `R: 'static`, so the bytes have
-///   to be owned by something that outlives each chunk's document rather than
-///   borrowed from the caller. Taking the `Vec` means that owner can be the
-///   caller's own allocation, moved in — the whole document is never resident
-///   twice on this account. Callers that need to keep their copy can pass
-///   `bytes.clone()`, which makes the second copy visible at the call site
-///   instead of hiding it in here.
+/// - `src_bytes`: Raw bytes of the source PDF, taken by value and moved into
+///   the owned in-memory source document.
 /// - `chunk_size`: Number of pages per chunk (`N` in `--split-pages=N`). Must
 ///   be ≥ 1. Values ≥ total page count emit a single file containing all pages.
 /// - `output_template`: Output path template. The page suffix is inserted
@@ -126,83 +72,22 @@ use std::sync::Arc;
 ///
 /// # Errors
 ///
-/// - [`Error::Missing`] if the source PDF has no `/Root` or no pages.
-/// - [`Error::Io`] on any file-system error writing the output files.
-/// - Other [`Error`] variants on structural PDF problems.
+/// - [`crate::Error::Missing`] if the source PDF has no `/Root` or no pages.
+/// - [`crate::Error::Io`] on any file-system error writing the output files.
+/// - Other [`crate::Error`] variants on structural PDF problems.
 pub fn split_pages(
     src_bytes: Vec<u8>,
     chunk_size: usize,
     output_template: &Path,
     deterministic_id: bool,
 ) -> Result<Vec<PathBuf>> {
-    if chunk_size == 0 {
-        return Err(Error::Unsupported(
-            "split_pages: chunk_size must be >= 1".to_string(),
-        ));
-    }
-
-    // One allocation, shared by the initial open and every chunk's re-open:
-    // chunks are written sequentially and none of them mutates the source
-    // bytes. `Arc::new` moves the caller's `Vec` into the box rather than
-    // copying its contents — see [`SharedSource`] for why the `Vec` stays a
-    // `Vec` instead of becoming an `Arc<[u8]>`.
-    let shared_source = SharedSource::new(src_bytes);
-
-    // Open once to determine page count and collect page refs.
-    let mut pdf = Pdf::open(Cursor::new(shared_source.clone()))?;
-    let all_page_refs = page_refs(&mut pdf)?;
-    let total_pages = all_page_refs.len();
-    if total_pages == 0 {
-        return Err(Error::Missing("document has no pages"));
-    }
-
-    // Resolve the /Pages root ref from the catalog so we can mutate it per chunk.
-    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-    let Some(catalog_dict) = catalog_obj.as_dict() else {
-        return Err(Error::Unsupported(
-            "document catalog is not a dictionary".to_string(),
-        ));
-    };
-    let pages_root_ref = catalog_dict
-        .get_ref("Pages")
-        .ok_or(Error::Missing("/Pages"))?;
-
-    // Compute output path parameters.
-    let width = digit_width(total_pages as u32);
-
-    // Iterate over chunks (0-indexed chunk index).
-    let mut written = Vec::new();
-    let mut chunk_start = 0usize; // 0-based index into all_page_refs
-    while chunk_start < total_pages {
-        let chunk_end = (chunk_start + chunk_size).min(total_pages); // exclusive
-
-        // 1-based page numbers in source document.
-        let first_page = (chunk_start + 1) as u32;
-        let last_page = chunk_end as u32;
-
-        // Build the output path (single-number form for --split-pages=1).
-        let out_path = chunk_output_path(output_template, first_page, last_page, width, chunk_size);
-
-        // Extract page refs for this chunk.
-        let chunk_refs: Vec<ObjectRef> = all_page_refs[chunk_start..chunk_end].to_vec();
-
-        // Write the chunk to the output file.
-        write_chunk(
-            shared_source.clone(),
-            pages_root_ref,
-            &chunk_refs,
-            chunk_start,
-            chunk_end,
-            &out_path,
-            deterministic_id,
-        )?;
-
-        written.push(out_path);
-        chunk_start = chunk_end;
-    }
-
-    Ok(written)
+    let mut pdf = Pdf::open_mem_owned(src_bytes)?;
+    let mut job = crate::job::QPDFJob::new();
+    job.split_pages(
+        &mut pdf,
+        crate::job::SplitPageOptions::new(chunk_size, output_template)
+            .with_deterministic_id(deterministic_id),
+    )
 }
 
 /// Compute the **range-form** output path (`{stem}-{first}-{last}{ext}`) for a
@@ -263,14 +148,18 @@ pub fn split_output_path(
     last_page: u32,
     width: usize,
 ) -> PathBuf {
-    let (parent, stem, ext) = split_template(template);
-
-    let new_filename = format!(
-        "{stem}-{:0>width$}-{:0>width$}{ext}",
+    let range = format!(
+        "{:0>width$}-{:0>width$}",
         first_page,
         last_page,
         width = width
     );
+    if let Some(path) = replace_first_percent_d(template, &range) {
+        return path;
+    }
+    let (parent, stem, ext) = split_template(template);
+
+    let new_filename = format!("{stem}-{range}{ext}");
 
     join_parent(parent, new_filename)
 }
@@ -316,19 +205,43 @@ fn join_parent(parent: &Path, filename: String) -> PathBuf {
 ///
 /// Internal: keeps the public [`split_output_path`] signature stable while
 /// adding the single-number form needed by `--split-pages=1`.
-fn chunk_output_path(
+pub(crate) fn chunk_output_path(
     template: &Path,
     first_page: u32,
     last_page: u32,
     width: usize,
     chunk_size: usize,
 ) -> PathBuf {
+    let suffix = if chunk_size == 1 {
+        format!("{first_page:0>width$}", width = width)
+    } else {
+        format!("{first_page:0>width$}-{last_page:0>width$}", width = width)
+    };
+    if let Some(path) = replace_first_percent_d(template, &suffix) {
+        return path;
+    }
     if chunk_size != 1 {
         return split_output_path(template, first_page, last_page, width);
     }
     let (parent, stem, ext) = split_template(template);
     let new_filename = format!("{stem}-{first_page:0>width$}{ext}", width = width);
     join_parent(parent, new_filename)
+}
+
+/// Replace qpdf's first output-template `%d` with the page number or range.
+///
+/// qpdf searches the complete output path, not only the filename, and leaves
+/// later `%d` sequences literal. Returning `None` keeps the ordinary
+/// stem/extension naming path allocation-free for templates without a
+/// placeholder.
+fn replace_first_percent_d(template: &Path, replacement: &str) -> Option<PathBuf> {
+    let template = template.to_string_lossy();
+    let position = template.find("%d")?;
+    let mut output = String::with_capacity(template.len() + replacement.len());
+    output.push_str(&template[..position]);
+    output.push_str(replacement);
+    output.push_str(&template[position + 2..]);
+    Some(PathBuf::from(output))
 }
 
 /// Return the number of decimal digits needed to represent `n`.
@@ -360,144 +273,16 @@ pub fn digit_width(n: u32) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// The source bytes, shared by every chunk's document, in the one shape
-/// [`Cursor`] will read from without copying them.
-///
-/// Each chunk reopens the source, and `Pdf<R>` requires `R: 'static`, so the
-/// chunks cannot read through a borrowed `Cursor<&[u8]>` — they need an owning
-/// source that can be handed out once per chunk. `Arc<[u8]>` is the obvious
-/// shape and is what [`Pdf::open_mem`] takes, but building one from an owned
-/// `Vec` **copies the whole document**: `Arc`'s refcount header sits in front of
-/// the payload, and it cannot be retrofitted onto an allocation `Vec` already
-/// made, so `Arc::<[u8]>::from(vec)` allocates and memcpys. `Arc::new(vec)`
-/// moves the `Vec` — three words — into the box instead and copies nothing.
-///
-/// The newtype is what makes that usable: [`Cursor`]'s [`std::io::Read`] and
-/// [`std::io::Seek`] impls are bounded on `AsRef<[u8]>`, and `Arc<Vec<u8>>`
-/// implements only `AsRef<Vec<u8>>` (`impl<T: ?Sized> AsRef<T> for Arc<T>`),
-/// which is a different trait. This is `Clone` to be handed out per chunk;
-/// cloning bumps the refcount and copies nothing.
-#[derive(Clone)]
-struct SharedSource(Arc<Vec<u8>>);
-
-impl SharedSource {
-    /// Take ownership of `bytes` without copying them: the `Arc` box holds the
-    /// `Vec`'s three words, and the payload stays exactly where the caller
-    /// allocated it. `shared_source_keeps_the_callers_allocation` pins that by
-    /// address, which is the only way to tell this apart from the `Arc<[u8]>`
-    /// shapes that compile just as readily and memcpy the document.
-    fn new(bytes: Vec<u8>) -> Self {
-        Self(Arc::new(bytes))
-    }
-}
-
-impl AsRef<[u8]> for SharedSource {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-/// Write a single chunk PDF to `out_path`.
-///
-/// Re-opens `src_bytes` as a fresh `Pdf`, mutates the `/Pages` root so that
-/// only the `chunk_refs` pages remain, then emits a fresh PDF via
-/// [`PdfWriter`]. `chunk_start` (inclusive) and `chunk_end` (exclusive) are
-/// the chunk's 0-based half-open `[chunk_start, chunk_end)` span in the
-/// *source* document, used to reconstruct `/PageLabels` for the chunk
-/// (qpdf `--split-pages` parity).
-fn write_chunk(
-    src_bytes: SharedSource,
-    pages_root_ref: ObjectRef,
-    chunk_refs: &[ObjectRef],
-    chunk_start: usize,
-    chunk_end: usize,
-    out_path: &Path,
-    deterministic_id: bool,
-) -> Result<()> {
-    // Re-open the source bytes so each chunk starts from the pristine state.
-    // The buffer is shared with every other chunk, not copied per chunk.
-    let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
-
-    // /PageLabels (qpdf `QPDFJob::doSplitPages` parity): reconstruct the
-    // label range for this chunk's local page span, renumbered to start at
-    // 0, and install it as a direct `/Nums` dict. The write mutates the
-    // catalog's `/PageLabels` key only — it does not touch the `/Pages`
-    // subtree the mutation below rewrites. Both paths ultimately update
-    // the catalog dictionary via `set_object`, so running labels first
-    // avoids invalidating any borrow the /Pages rewrite acquires. A source
-    // with no `/PageLabels` at all is left untouched, matching qpdf's fresh
-    // `outpdf` (which never gains one either).
-    {
-        let mut labels = pdf.page_labels();
-        if labels.has_page_labels()? {
-            // `chunk_start`/`chunk_end` are half-open `[start, end)`; a
-            // valid chunk always has at least one page, so the caller-side
-            // invariant is `chunk_end > chunk_start`. debug_assert enforces
-            // it in dev/tests; the checked_sub fallback keeps release
-            // safety even if the invariant is ever violated (the empty
-            // labels vector below is a benign no-op).
-            debug_assert!(
-                chunk_end > chunk_start,
-                "write_chunk: empty chunk (start={chunk_start}, end={chunk_end})",
-            );
-            let start = chunk_start as i64;
-            let end_inclusive = chunk_end.checked_sub(1).unwrap_or(chunk_start) as i64;
-            let entries = labels.labels_for_page_range(start, end_inclusive, 0)?;
-            labels.write_reconstructed_labels(&entries)?;
-        }
-    }
-
-    // Read the current /Pages root dictionary.
-    let pages_obj = pdf.resolve_borrowed(pages_root_ref)?;
-    let Some(mut pages_dict) = pages_obj.as_dict().cloned() else {
-        return Err(Error::Unsupported(
-            "document /Pages root is not a dictionary".to_string(),
-        ));
-    };
-
-    // Build new /Kids array with only this chunk's pages.
-    // Re-parent each page to the root /Pages node.
-    let new_kids: Vec<Object> = chunk_refs.iter().map(|&r| Object::Reference(r)).collect();
-
-    // Update /Kids and /Count in the Pages root.
-    pages_dict.insert("Kids", Object::Array(new_kids));
-    pages_dict.insert("Count", Object::Integer(chunk_refs.len() as i64));
-    pdf.set_object(pages_root_ref, Object::Dictionary(pages_dict.clone()));
-
-    // Reparent each chunk page to the (sole) /Pages root.
-    for &page_ref in chunk_refs {
-        let page_obj = pdf.resolve_borrowed(page_ref)?;
-        if let Some(mut page_dict) = page_obj.as_dict().cloned() {
-            // Update /Parent to point to the /Pages root (may already be correct
-            // for flat page trees, but flatten inherited trees here).
-            page_dict.insert("Parent", Object::Reference(pages_root_ref));
-            pdf.set_object(page_ref, Object::Dictionary(page_dict));
-        }
-    }
-
-    // Every split output is a fresh qpdf writer output. deterministic_id is a
-    // writer setting, not a route selector.
-    let mut writer = PdfWriter::new(&mut pdf);
-    if deterministic_id {
-        writer.set_deterministic_id(true);
-    }
-    writer.set_output_file(out_path)?;
-    writer.write()?;
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pages::page_refs;
+    use crate::{Object, Pdf};
     use std::io::Cursor;
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // Pure-function unit tests: naming
@@ -514,6 +299,18 @@ mod tests {
         assert_eq!(
             chunk_output_path(Path::new("out.pdf"), 3, 3, 1, 1),
             PathBuf::from("out-3.pdf"),
+        );
+    }
+
+    #[test]
+    fn chunk_output_path_replaces_only_the_first_percent_d() {
+        assert_eq!(
+            chunk_output_path(Path::new("literal-%d-tail.pdf"), 1, 1, 1, 1),
+            PathBuf::from("literal-1-tail.pdf"),
+        );
+        assert_eq!(
+            chunk_output_path(Path::new("literal-%d-%d.pdf"), 1, 2, 1, 2),
+            PathBuf::from("literal-1-2-%d.pdf"),
         );
     }
 
@@ -554,6 +351,14 @@ mod tests {
         assert_eq!(
             split_output_path(Path::new("out.pdf"), 1, 2, 1),
             PathBuf::from("out-1-2.pdf"),
+        );
+    }
+
+    #[test]
+    fn split_output_path_replaces_only_the_first_percent_d() {
+        assert_eq!(
+            split_output_path(Path::new("literal-%d-tail-%d.pdf"), 1, 2, 1),
+            PathBuf::from("literal-1-2-tail-%d.pdf"),
         );
     }
 
@@ -799,44 +604,6 @@ mod tests {
     // Integration tests: split_pages
     // -----------------------------------------------------------------------
 
-    /// [`SharedSource::new`] copies nothing: the bytes stay exactly where the
-    /// caller allocated them, and every clone reaches that same allocation.
-    ///
-    /// Pinned by address rather than by size, because size cannot tell the
-    /// difference. The `Arc<[u8]>` shapes compile just as readily here —
-    /// `Arc::<[u8]>::from(bytes)` satisfies the same `AsRef<[u8]>` bound
-    /// `Cursor` needs — and allocate `bytes.len()` and memcpy into it, since an
-    /// `Arc`'s refcount header sits in front of the payload and cannot be
-    /// retrofitted onto an allocation `Vec` has already made. Swapping this
-    /// field to `Arc<[u8]>` still passes every other test in this file; it
-    /// fails here.
-    ///
-    /// This is the absolute companion to the relative measurement in
-    /// `tests/split_pages_allocation_tests.rs`, which compares handing the
-    /// source over against lending it and would stay green if both sides
-    /// gained a copy together.
-    #[test]
-    fn shared_source_keeps_the_callers_allocation() {
-        let bytes = vec![b'x'; 8 * 1024];
-        let address = bytes.as_ptr();
-        let length = bytes.len();
-
-        let shared = SharedSource::new(bytes);
-        assert_eq!(
-            shared.as_ref().as_ptr(),
-            address,
-            "the handover must move the Vec, not copy its contents"
-        );
-        assert_eq!(shared.as_ref().len(), length);
-
-        let per_chunk = shared.clone();
-        assert_eq!(
-            per_chunk.as_ref().as_ptr(),
-            address,
-            "each chunk's re-open must reach the same allocation, not its own copy"
-        );
-    }
-
     /// Open a PDF from bytes and return the page count.
     fn page_count_of(bytes: &[u8]) -> usize {
         let mut pdf = Pdf::open_mem(Arc::from(bytes)).expect("should parse");
@@ -956,8 +723,8 @@ mod tests {
 
     #[test]
     fn split_pages_propagates_chunk_write_error() {
-        // A chunk write into a non-existent directory fails at File::create
-        // inside write_chunk; that error must propagate out of split_pages.
+        // A chunk write into a non-existent directory fails at the canonical
+        // job writer and must propagate out of the compatibility facade.
         let src = build_n_page_pdf(2);
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let bad = tmpdir.path().join("no_such_subdir").join("out.pdf");
