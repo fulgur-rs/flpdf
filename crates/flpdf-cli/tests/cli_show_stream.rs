@@ -30,7 +30,7 @@ fn show_stream_raw_emits_stored_bytes() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "show-stream",
-        "--raw",
+        "--raw-stream-data",
         "7 0",
         "../../tests/fixtures/compat/one-page.pdf",
     ])
@@ -80,47 +80,6 @@ fn dump_object_unknown_object_reports_clear_error() {
     .stderr(predicate::str::contains("not found"));
 }
 
-#[test]
-fn show_stream_writes_to_out_file() {
-    let temp = tempfile::tempdir().unwrap();
-    let out_path = temp.path().join("stream.txt");
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "show-stream",
-        "7 0",
-        "../../tests/fixtures/compat/one-page.pdf",
-        "--out",
-    ])
-    .arg(&out_path)
-    .assert()
-    .success()
-    .stdout(predicate::function(|out: &[u8]| out.is_empty()));
-
-    let contents = std::fs::read_to_string(&out_path).unwrap();
-    assert!(
-        contents.contains("Fixture page 1"),
-        "expected 'Fixture page 1' in output file, got: {:?}",
-        &contents[..contents.len().min(200)]
-    );
-}
-
-#[test]
-fn show_stream_raw_writes_to_out_file() {
-    let temp = tempfile::tempdir().unwrap();
-    let out_path = temp.path().join("stream.raw");
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["show-stream", "--raw", "--out"])
-        .arg(&out_path)
-        .args(["7 0", "../../tests/fixtures/compat/one-page.pdf"])
-        .assert()
-        .success()
-        .stdout(predicate::function(|out: &[u8]| out.is_empty()));
-
-    assert!(std::fs::read(out_path).unwrap().starts_with(b"GapQh0E"));
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // flpdf-9hc.7.4: passthrough codec marker tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +125,7 @@ fn show_stream_dct_invalid_bytes_report_decode_error() {
         .stderr(predicate::str::contains("DCT decode:"));
 }
 
-/// For a JBIG2Decode stream, show-stream (without --raw) must print the marker.
+/// For a JBIG2Decode stream, show-stream (without --raw-stream-data) must print the marker.
 #[test]
 fn show_stream_passthrough_jbig2_prints_marker() {
     let fake_jbig2: &[u8] = &[0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -186,7 +145,7 @@ fn show_stream_passthrough_jbig2_prints_marker() {
         )));
 }
 
-/// For a JPXDecode stream, show-stream (without --raw) must print the marker.
+/// For a JPXDecode stream, show-stream (without --raw-stream-data) must print the marker.
 #[test]
 fn show_stream_passthrough_jpx_prints_marker() {
     let fake_jpx: &[u8] = &[0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A];
@@ -206,7 +165,7 @@ fn show_stream_passthrough_jpx_prints_marker() {
         )));
 }
 
-/// For a CCITTFaxDecode stream, show-stream (without --raw) must print the marker.
+/// For a CCITTFaxDecode stream, show-stream (without --raw-stream-data) must print the marker.
 #[test]
 fn show_stream_passthrough_ccitt_prints_marker() {
     let fake_ccitt: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE];
@@ -226,7 +185,7 @@ fn show_stream_passthrough_ccitt_prints_marker() {
         )));
 }
 
-/// With --raw, the passthrough codec stream must dump raw bytes to stdout.
+/// With --raw-stream-data, the passthrough codec stream must dump raw bytes to stdout.
 #[test]
 fn show_stream_passthrough_raw_dumps_bytes() {
     let fake_jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC];
@@ -236,7 +195,7 @@ fn show_stream_passthrough_raw_dumps_bytes() {
     std::fs::write(temp.path(), pdf_bytes).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["show-stream", "--raw", "3 0"])
+    cmd.args(["show-stream", "--raw-stream-data", "3 0"])
         .arg(temp.path())
         .assert()
         .success()
@@ -352,36 +311,4 @@ fn show_stream_passthrough_single_element_array_prints_marker() {
             "<binary, {} bytes, codec CCITTFaxDecode>",
             fake_ccitt.len()
         )));
-}
-
-/// With `--out`, a passthrough-codec stream must write the raw stored bytes to
-/// the file (the only available representation) and report the marker on
-/// stderr. JBIG2Decode (unlike DCTDecode) has no decode factory, so it still
-/// exercises the marker path.
-#[test]
-fn show_stream_passthrough_out_writes_raw_bytes() {
-    let fake_jbig2: &[u8] = &[0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A];
-    let pdf_bytes = build_pdf_with_stream("JBIG2Decode", fake_jbig2);
-
-    let temp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(temp.path(), pdf_bytes).unwrap();
-    let out = tempfile::NamedTempFile::new().unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["show-stream", "--out"])
-        .arg(out.path())
-        .args(["3 0"])
-        .arg(temp.path())
-        .assert()
-        .success()
-        .stderr(predicate::str::contains(format!(
-            "<binary, {} bytes, codec JBIG2Decode>",
-            fake_jbig2.len()
-        )));
-
-    let written = std::fs::read(out.path()).unwrap();
-    assert_eq!(
-        written, fake_jbig2,
-        "--out must receive the raw stored bytes"
-    );
 }

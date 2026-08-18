@@ -8,8 +8,8 @@
 //! 3. remove → list: key gone from both flpdf and qpdf listings; other keys survive
 //! 4. copy across files: payload + metadata (/Size, /CheckSum, dates, mimetype) preserved;
 //!    one --prefix case
-//! 5. metadata survives rewrite: dates / mimetype / description / afrelationship
-//!    survive a plain `flpdf in.pdf out.pdf` rewrite
+//! 5. metadata survives rewrite: dates / mimetype / description survive a
+//!    plain `flpdf in.pdf out.pdf` rewrite
 //! 6. reverse cross-check: qpdf-authored attachment is readable by flpdf list/show
 //!
 //! qpdf-dependent tests use an `is_qpdf_available()` guard and `eprintln!` + early
@@ -412,7 +412,6 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
             "--key=cpykey",
             "--mimetype=image/png",
             "--description=Copy test image",
-            "--afrelationship=Data",
             "--creationdate=D:20240315090000",
             "--moddate=D:20240316100000",
             "--",
@@ -499,8 +498,8 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         "copy: verbose listing must preserve /Desc 'Copy test image'; got: {verbose}"
     );
 
-    // /Size and /AFRelationship have no line in qpdf's doListAttachments
-    // output, so assert them where qpdf does report them: the JSON v2 dump.
+    // /Size has no line in qpdf's doListAttachments output, so assert it
+    // where qpdf does report it: the JSON v2 dump.
     let objects = String::from_utf8(
         CargoCommand::cargo_bin("flpdf")
             .unwrap()
@@ -514,10 +513,6 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         objects.contains(&format!("\"/Size\": {}", png.len())),
         "copy: /Size={} must be preserved; got: {objects}",
         png.len()
-    );
-    assert!(
-        objects.contains("\"/AFRelationship\": \"/Data\""),
-        "copy: /AFRelationship 'Data' must be preserved; got: {objects}"
     );
 }
 
@@ -601,7 +596,6 @@ fn lifecycle_5_metadata_survives_plain_rewrite() {
             "--key=metakey",
             "--mimetype=text/plain",
             "--description=Test description",
-            "--afrelationship=Unspecified",
             "--creationdate=D:20231201080000",
             "--moddate=D:20231215090000",
             "--",
@@ -644,22 +638,6 @@ fn lifecycle_5_metadata_survives_plain_rewrite() {
     assert!(
         verbose.contains("Test description"),
         "rewrite: description must be preserved; got: {verbose}"
-    );
-    // `--list-attachments` has no /AFRelationship line — qpdf's
-    // doListAttachments never emits one — so observe it where qpdf does, in
-    // the JSON v2 object dump.
-    let objects = String::from_utf8(
-        CargoCommand::cargo_bin("flpdf")
-            .unwrap()
-            .args(["--json=2", rewritten.to_str().unwrap()])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    assert!(
-        objects.contains("\"/AFRelationship\": \"/Unspecified\""),
-        "rewrite: afrelationship must be preserved; got: {objects}"
     );
     assert!(
         verbose.contains("D:20231201080000"),

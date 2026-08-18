@@ -1408,7 +1408,7 @@ fn rewrite_subcommand_static_aes_iv_produces_deterministic_output() {
     );
 }
 
-// ── --copy-encryption-from tests (flpdf-9hc.4.11) ───────────────────────────
+// ── --copy-encryption tests (flpdf-9hc.4.11) ───────────────────────────
 
 /// Build a donor PDF encrypted with V=4 AES-128 and return the path.
 /// Uses `--static-id --static-aes-iv` so the donor is deterministic, but the
@@ -1450,7 +1450,7 @@ fn qdf_copy_encryption_works_on_top_level_and_rewrite_surfaces() {
         }
         command
             .args(["--qdf", "--static-id", "--static-aes-iv"])
-            .arg("--copy-encryption-from")
+            .arg("--copy-encryption")
             .arg(&donor)
             .args(["--encryption-file-password", "donor-user"])
             .arg(fixture(QDF_ENCRYPTION_FIXTURE))
@@ -1462,11 +1462,11 @@ fn qdf_copy_encryption_works_on_top_level_and_rewrite_surfaces() {
     }
 }
 
-/// `--copy-encryption-from` produces an output that carries /Encrypt and that
+/// `--copy-encryption` produces an output that carries /Encrypt and that
 /// flpdf itself can round-trip through its own reader with both user and
 /// owner passwords.
 #[test]
-fn copy_encryption_from_output_has_encrypt_dict() {
+fn copy_encryption_output_has_encrypt_dict() {
     let tmp = tempfile::tempdir().unwrap();
     let donor = make_donor_pdf(&tmp, "secretuser", "secretowner");
     let out = tmp.path().join("copy_out.pdf");
@@ -1474,7 +1474,7 @@ fn copy_encryption_from_output_has_encrypt_dict() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "secretuser",
@@ -1487,15 +1487,15 @@ fn copy_encryption_from_output_has_encrypt_dict() {
     let bytes = std::fs::read(&out).unwrap();
     assert!(
         bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
-        "copy-encryption-from output must carry /Encrypt"
+        "copy-encryption output must carry /Encrypt"
     );
 }
 
-/// The output of `--copy-encryption-from` decrypts with the donor's user
+/// The output of `--copy-encryption` decrypts with the donor's user
 /// password through qpdf and reports V=4 / R=4 AESv2 — confirming the
 /// /Encrypt scheme was copied, not re-derived.
 #[test]
-fn copy_encryption_from_decrypts_with_donor_user_password_via_qpdf() {
+fn copy_encryption_decrypts_with_donor_user_password_via_qpdf() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -1506,7 +1506,7 @@ fn copy_encryption_from_decrypts_with_donor_user_password_via_qpdf() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "donoruser",
@@ -1531,7 +1531,7 @@ fn copy_encryption_from_decrypts_with_donor_user_password_via_qpdf() {
     let stdout = String::from_utf8_lossy(&check.stdout);
     assert!(
         stdout.contains("R = 4"),
-        "qpdf must report R=4 on copy-encryption-from output: {stdout}"
+        "qpdf must report R=4 on copy-encryption output: {stdout}"
     );
     assert!(
         stdout.contains("Supplied password is user password"),
@@ -1539,10 +1539,10 @@ fn copy_encryption_from_decrypts_with_donor_user_password_via_qpdf() {
     );
 }
 
-/// The output of `--copy-encryption-from` also decrypts with the donor's
+/// The output of `--copy-encryption` also decrypts with the donor's
 /// owner password.
 #[test]
-fn copy_encryption_from_decrypts_with_donor_owner_password_via_qpdf() {
+fn copy_encryption_decrypts_with_donor_owner_password_via_qpdf() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -1553,7 +1553,7 @@ fn copy_encryption_from_decrypts_with_donor_owner_password_via_qpdf() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "userpass",
@@ -1577,11 +1577,11 @@ fn copy_encryption_from_decrypts_with_donor_owner_password_via_qpdf() {
     );
 }
 
-/// `--copy-encryption-from` on a one-page fixture produces output that
+/// `--copy-encryption` on a one-page fixture produces output that
 /// qpdf can fully decrypt (not just inspect) — confirming stream encryption
 /// is consistent with the copied /Encrypt dict.
 #[test]
-fn copy_encryption_from_round_trip_decrypts_cleanly_via_qpdf() {
+fn copy_encryption_round_trip_decrypts_cleanly_via_qpdf() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -1593,7 +1593,7 @@ fn copy_encryption_from_round_trip_decrypts_cleanly_via_qpdf() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "pw",
@@ -1612,14 +1612,14 @@ fn copy_encryption_from_round_trip_decrypts_cleanly_via_qpdf() {
         .unwrap();
     assert!(
         decrypt.status.success(),
-        "qpdf --decrypt failed on copy-encryption-from output: {}",
+        "qpdf --decrypt failed on copy-encryption output: {}",
         String::from_utf8_lossy(&decrypt.stderr)
     );
 }
 
-/// `rewrite` subcommand also supports `--copy-encryption-from`.
+/// `rewrite` subcommand also supports `--copy-encryption`.
 #[test]
-fn rewrite_subcommand_copy_encryption_from_succeeds() {
+fn rewrite_subcommand_copy_encryption_succeeds() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -1631,7 +1631,7 @@ fn rewrite_subcommand_copy_encryption_from_succeeds() {
         .unwrap()
         .args([
             "rewrite",
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "donorpw",
@@ -1651,11 +1651,11 @@ fn rewrite_subcommand_copy_encryption_from_succeeds() {
     let stdout = String::from_utf8_lossy(&check.stdout);
     assert!(
         stdout.contains("R = 4") && stdout.contains("Supplied password is user password"),
-        "rewrite --copy-encryption-from: qpdf must report R=4 + user-password match: {stdout}"
+        "rewrite --copy-encryption: qpdf must report R=4 + user-password match: {stdout}"
     );
 }
 
-/// `--copy-encryption-from` (a V=4 AES-128 donor) applied to a low-version
+/// `--copy-encryption` (a V=4 AES-128 donor) applied to a low-version
 /// input must floor the output PDF header to 1.6 per qpdf QPDFWriter.cc L810:
 /// V=4 with AES needs at least 1.6 (AES-128 CBC arrived in PDF 1.6). Prior to
 /// the encryption-floor fix flpdf floored to 1.5, matching what RC4 needs but
@@ -1668,7 +1668,7 @@ fn copy_encryption_floors_pdf_header_to_1_6() {
     let out = tmp.path().join("copied.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
-        .arg("--copy-encryption-from")
+        .arg("--copy-encryption")
         .arg(&donor)
         .args(["--encryption-file-password", "user-pw", "--"])
         .arg(fixture(ONE_PAGE_FIXTURE))
@@ -1683,16 +1683,16 @@ fn copy_encryption_floors_pdf_header_to_1_6() {
     );
 }
 
-/// `--copy-encryption-from` applied to a plaintext donor is rejected with a
+/// `--copy-encryption` applied to a plaintext donor is rejected with a
 /// clear "not encrypted" diagnostic.
 #[test]
-fn copy_encryption_from_unencrypted_donor_is_rejected() {
+fn copy_encryption_unencrypted_donor_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             fixture(UNENCRYPTED_FIXTURE).to_str().unwrap(),
         ])
         .arg(fixture(UNENCRYPTED_FIXTURE))
@@ -1702,11 +1702,11 @@ fn copy_encryption_from_unencrypted_donor_is_rejected() {
         .stderr(predicates::str::contains("not encrypted"));
 }
 
-/// `--copy-encryption-from` accepts V=4 AES-128 donors only. An encrypted
+/// `--copy-encryption` accepts V=4 AES-128 donors only. An encrypted
 /// donor outside that shape (here V=5 AES-256) is rejected with a message
 /// naming the accepted shape rather than failing silently.
 #[test]
-fn copy_encryption_from_non_v4_aes128_donor_is_rejected() {
+fn copy_encryption_non_v4_aes128_donor_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let donor = tmp.path().join("donor256.pdf");
     Command::cargo_bin("flpdf")
@@ -1728,7 +1728,7 @@ fn copy_encryption_from_non_v4_aes128_donor_is_rejected() {
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "donoruser",
@@ -1742,17 +1742,17 @@ fn copy_encryption_from_non_v4_aes128_donor_is_rejected() {
         ));
 }
 
-/// `--copy-encryption-from` with a wrong password is rejected with an error
+/// `--copy-encryption` with a wrong password is rejected with an error
 /// (the donor cannot be opened with the supplied password).
 #[test]
-fn copy_encryption_from_wrong_password_is_rejected() {
+fn copy_encryption_wrong_password_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let donor = make_donor_pdf(&tmp, "correctpw", "ownerpw");
     let out = tmp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
-            "--copy-encryption-from",
+            "--copy-encryption",
             donor.to_str().unwrap(),
             "--encryption-file-password",
             "wrongpw",
@@ -1764,8 +1764,8 @@ fn copy_encryption_from_wrong_password_is_rejected() {
         // The error surfaces as either "failed to open" (wrong password
         // rejected by the reader at open time) or "failed to recover file
         // key" (auth passes but key recovery fails). Both include the
-        // --copy-encryption-from prefix, so we just pin that.
-        .stderr(predicates::str::contains("--copy-encryption-from"));
+        // --copy-encryption prefix, so we just pin that.
+        .stderr(predicates::str::contains("--copy-encryption"));
     assert!(!out.exists());
 }
 
@@ -2303,7 +2303,7 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
     );
 }
 
-// ── --linearize + --encrypt / --copy-encryption-from (flpdf-txag) ──────────
+// ── --linearize + --encrypt / --copy-encryption (flpdf-txag) ──────────
 //
 // qpdf itself supports `--linearize --encrypt ... --` and
 // `--linearize --copy-encryption=...` (verified empirically against qpdf
@@ -2422,12 +2422,12 @@ fn top_level_linearize_encrypt_produces_valid_linearized_encrypted_pdf() {
     );
 }
 
-/// `--linearize --copy-encryption-from` succeeds on both the `rewrite`
+/// `--linearize --copy-encryption` succeeds on both the `rewrite`
 /// subcommand and the top-level `--linearize` alias. The resulting bytes must
 /// be accepted by qpdf as both linearized and encrypted with the donor's
 /// password.
 #[test]
-fn linearize_copy_encryption_from_produces_valid_encrypted_output() {
+fn linearize_copy_encryption_produces_valid_encrypted_output() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -2440,7 +2440,7 @@ fn linearize_copy_encryption_from_produces_valid_encrypted_output() {
             vec![
                 "rewrite",
                 "--linearize",
-                "--copy-encryption-from",
+                "--copy-encryption",
                 donor.to_str().unwrap(),
                 "--encryption-file-password",
                 "donor-user",
@@ -2450,7 +2450,7 @@ fn linearize_copy_encryption_from_produces_valid_encrypted_output() {
             "top-level",
             vec![
                 "--linearize",
-                "--copy-encryption-from",
+                "--copy-encryption",
                 donor.to_str().unwrap(),
                 "--encryption-file-password",
                 "donor-user",
@@ -2561,7 +2561,7 @@ fn rewrite_linearize_encrypt_object_streams_generate_produces_valid_output() {
 /// Covers both flpdf write surfaces — the top-level `--linearize` alias and
 /// the `rewrite --linearize` subcommand — against the *same* qpdf oracle
 /// output per fixture. They build `WriterOptions` independently (see
-/// `fix(cli): allow --linearize with --encrypt / --copy-encryption-from`,
+/// `fix(cli): allow --linearize with --encrypt / --copy-encryption`,
 /// which fixed a real bug where the top-level alias silently dropped
 /// `--encrypt`), so comparing only one surface would leave the other
 /// unverified.

@@ -652,7 +652,7 @@ pub(crate) struct WriterOptions {
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
 
     /// Copy the authenticated encryption parameters from a donor PDF and
-    /// re-use its file encryption key (qpdf `--copy-encryption-from`
+    /// re-use its file encryption key (qpdf `--copy-encryption`
     /// equivalent).
     ///
     /// When set the writer bypasses the normal password-derivation path and
@@ -1664,7 +1664,7 @@ fn generate_v5r6_secrets(
 }
 
 /// Build an [`EncryptionContext`] from a donor [`crate::CopyEncryptionSource`]
-/// (the `--copy-encryption-from` path or PdfWriter's source-preservation
+/// (the `--copy-encryption` path or PdfWriter's source-preservation
 /// path).
 ///
 /// qpdf does not copy the donor dictionary byte-for-byte. It passes the
