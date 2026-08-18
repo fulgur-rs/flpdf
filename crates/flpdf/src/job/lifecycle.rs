@@ -2,9 +2,9 @@
 //!
 //! This module owns the state that qpdf keeps on `QPDFJob` itself rather than
 //! on an individual CLI route: the message prefix, logger, progress callback,
-//! warning aggregation, and the single warning-completion summary. Document
-//! creation and operation dispatch are layered on top of this state in later
-//! job slices.
+//! warning aggregation, and the single warning-completion summary. JSON and
+//! ordinary page-inspection dispatch are layered on top of this state; write,
+//! page-transform, and remaining inspection consumers are later job slices.
 
 use super::json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput};
 use crate::{Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, Result, Severity};
