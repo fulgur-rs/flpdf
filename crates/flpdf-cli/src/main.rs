@@ -5219,10 +5219,11 @@ where
     // logger, matching the previous `open_pdf` route without making it a
     // warning-exit condition.
     if pdf.uses_weak_crypto() {
-        job.logger().warn(format!(
+        let warning = format!(
             "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
             input.display()
-        ))?;
+        );
+        job.logger().warn(warning)?;
     }
 
     let logger = job.logger();
