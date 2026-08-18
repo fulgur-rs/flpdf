@@ -4845,10 +4845,16 @@ fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
 
 fn json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
     let rendered = error.to_string();
-    let message = error
-        .raw_os_error()
-        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-        .unwrap_or(&rendered);
+    let message = if error.kind() == std::io::ErrorKind::NotFound {
+        // qpdf uses its portable POSIX wording for a missing JSON input on
+        // every host; Rust exposes the native Windows wording instead.
+        "No such file or directory"
+    } else {
+        error
+            .raw_os_error()
+            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+            .unwrap_or(&rendered)
+    };
     format!("open {}: {message}", input.display()).into()
 }
 
@@ -6256,6 +6262,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "QPDFLogger: called setSave on standard output after standard output has already been used"
+        );
+    }
+
+    #[test]
+    fn json_input_open_error_uses_qpdf_not_found_wording() {
+        let error = json_input_open_error(
+            Path::new("missing.json"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "open missing.json: No such file or directory"
         );
     }
 
