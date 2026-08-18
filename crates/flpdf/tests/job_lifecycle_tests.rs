@@ -1,7 +1,7 @@
 use flpdf::job::{JobExitCode, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
 use flpdf::json_inspect::DecodeLevel;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, Pdf, PdfWriter, QPDFLogger};
+use flpdf::{Error, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
@@ -165,6 +165,60 @@ fn document_repair_warnings_feed_the_shared_completion_state() {
     job.record_document_warnings(&pdf);
 
     assert!(job.has_warnings());
+}
+
+#[test]
+fn job_open_installs_logger_before_open_warnings() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let (job_logger, job_state) = logger_with_warning_sink();
+    let (option_logger, option_state) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(job_logger);
+
+    let pdf = job
+        .open(
+            BufReader::new(File::open(path).unwrap()),
+            "repairable.pdf",
+            PdfOpenOptions {
+                repair: true,
+                logger: Some(option_logger),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("repairable input should open");
+
+    assert!(!pdf.repair_diagnostics().entries().is_empty());
+    assert!(job.has_warnings());
+    assert!(!job_state.lock().unwrap().bytes.is_empty());
+    assert!(
+        option_state.lock().unwrap().bytes.is_empty(),
+        "open diagnostics must use the job logger rather than caller options"
+    );
+}
+
+#[test]
+fn inspection_completes_through_the_shared_warning_boundary() {
+    let mut job = QPDFJob::new();
+    let (logger, state) = logger_with_warning_sink();
+    job.set_logger(logger);
+    let mut pdf = job
+        .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+        .expect("complete JSON input");
+    job.record_warnings();
+
+    let status = job
+        .inspect(&mut pdf, |document| -> flpdf::Result<()> {
+            assert_eq!(document.root_ref(), Some(flpdf::ObjectRef::new(1, 0)));
+            Ok(())
+        })
+        .expect("inspection completion");
+
+    assert_eq!(status, JobExitCode::Warning);
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: operation succeeded with warnings\n"
+    );
 }
 
 #[test]
