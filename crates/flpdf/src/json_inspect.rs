@@ -1,6 +1,5 @@
-//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object
-//! serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary
-//! normalization. The staged `QPDFJob::doJSON*` section builders are owned by
+//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary normalization.
+//! The staged `QPDFJob::doJSON*` section builders are owned by
 //! [`crate::job`], except for the deferred AcroForm builder below.
 //! qpdf JSON v2 value conversion and canonical object/stream serialization.
 //!

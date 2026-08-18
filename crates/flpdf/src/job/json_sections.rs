@@ -1,5 +1,4 @@
-//! qpdf correspondence: `QPDFJob::doJSONPages`, `doJSONPageLabels`,
-//! `doJSONOutlines`, `doJSONAttachments`, and `doJSONEncrypt` section builders.
+//! qpdf correspondence: `QPDFJob::doJSONPages`, `doJSONPageLabels`, `doJSONOutlines`, `doJSONAttachments`, and `doJSONEncrypt` section builders.
 //! qpdf 11.9.0 source responsibility: `QPDFJob.cc:1030-1158` and
 //! `QPDFJob.cc:1206-1325`.
 //!
