@@ -4411,7 +4411,8 @@ fn run_page_extraction(
         src_pw.password = Some(pw);
         src_pw.password_file = None;
     }
-    let pdf = open_pdf(&source_path.to_path_buf(), repair, &src_pw)?;
+    let mut pdf = open_pdf(&source_path.to_path_buf(), repair, &src_pw)?;
+    let primary_copy_encryption = pdf.writer_copy_encryption_source()?;
 
     run_page_extraction_after_plan(
         pdf,
@@ -4426,6 +4427,7 @@ fn run_page_extraction(
         standard_output,
         creates_output,
         primary_encrypted,
+        primary_copy_encryption,
         false,
         true,
         combined_pages,
@@ -4510,6 +4512,10 @@ fn run_page_extraction_from_multiple_sources(
         }
         sources.push(open_pdf(path, repair, &source_password)?);
     }
+    let primary_copy_encryption = sources
+        .first_mut()
+        .ok_or("--pages: primary input was not opened")?
+        .writer_copy_encryption_source()?;
 
     let collate = page_ops
         .collate
@@ -4557,6 +4563,7 @@ fn run_page_extraction_from_multiple_sources(
         standard_output,
         creates_output,
         primary_encrypted,
+        primary_copy_encryption,
         source_warnings,
         false,
         combined_pages,
@@ -4580,6 +4587,7 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
     distinct: &[PathBuf],
 ) -> CliResult<()> {
     let primary_encrypted = pdf.is_encrypted();
+    let primary_copy_encryption = pdf.writer_copy_encryption_source()?;
     if verbose {
         let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
         for path in distinct {
@@ -4626,6 +4634,7 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
         standard_output,
         creates_output,
         primary_encrypted,
+        primary_copy_encryption,
         false,
         true,
         combined_pages,
@@ -4646,6 +4655,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     mut standard_output: Option<PipelineWriter>,
     creates_output: bool,
     primary_encrypted: bool,
+    primary_copy_encryption: Option<CopyEncryptionSource>,
     prior_warnings: bool,
     reconstruct_labels: bool,
     combined_pages: Vec<CombinedPage>,
@@ -4680,6 +4690,15 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
 
     let mut options = options;
     options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
+    // qpdf keeps the authenticated primary input as the output/base document
+    // for `--pages` (libqpdf/QPDFJob.cc:2360-2633). The multi-source job has
+    // already copied selected pages into a fresh plaintext Pdf, so its writer
+    // cannot rediscover the primary's encryption from the merged document.
+    // Carry the authenticated donor explicitly to the final writer; split
+    // chunks remain cleartext, matching qpdf's fresh chunk writers.
+    if page_ops.split_pages.is_none() && options.copy_encryption.is_none() {
+        options.copy_encryption = primary_copy_encryption;
+    }
     // qpdf keeps a provider-backed source QPDF alive when
     // `copyForeignObject` copies a Form XObject whose data comes from a
     // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the opened

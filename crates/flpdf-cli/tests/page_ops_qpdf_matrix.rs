@@ -235,6 +235,45 @@ fn assert_qpdf_cleartext_chunk(path: &Path) {
     );
 }
 
+fn assert_qpdf_encrypted_output(path: &Path, password: &str) {
+    let inspection = Shell::new(QPDF)
+        .args([
+            &format!("--password={password}"),
+            "--show-encryption",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        inspection.status.success(),
+        "qpdf should open encrypted output {} with the primary password: {}",
+        path.display(),
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    assert_ne!(
+        String::from_utf8_lossy(&inspection.stdout).trim(),
+        "File is not encrypted",
+        "{} must remain encrypted",
+        path.display()
+    );
+}
+
+fn assert_qpdf_rejects_password(path: &Path, password: &str) {
+    let inspection = Shell::new(QPDF)
+        .args([
+            &format!("--password={password}"),
+            "--check",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !inspection.status.success(),
+        "qpdf must reject a wrong password for {}",
+        path.display()
+    );
+}
+
 // ===========================================================================
 // --pages : page-selection parity
 // ===========================================================================
@@ -1237,6 +1276,58 @@ fn pages_primary_encrypted_toplevel_password_matches_qpdf() {
         ])
         .assert()
         .success();
+    assert_eq!(
+        npages_of_with_password(&q, "secretpw"),
+        npages_of_with_password(&f, "secretpw")
+    );
+}
+
+#[test]
+fn pages_encrypted_primary_plaintext_secondary_preserves_primary_encryption() {
+    // qpdf 11.9.0 keeps the primary document as the output/base document for
+    // --pages (libqpdf/QPDFJob.cc:2360-2633). Therefore importing pages from a
+    // plaintext secondary does not turn an authenticated encrypted primary
+    // into a plaintext output.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let secondary = fixture_abs(THREE_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (ok, stderr) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--pages",
+        secondary.to_str().unwrap(),
+        "1-2",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        ok || q.exists(),
+        "qpdf primary/secondary merge failed: {stderr}"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            enc.to_str().unwrap(),
+            "--password=secretpw",
+            "--pages",
+            secondary.to_str().unwrap(),
+            "1-2",
+            "--",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_encrypted_output(&q, "secretpw");
+    assert_qpdf_encrypted_output(&f, "secretpw");
+    assert_qpdf_rejects_password(&q, "wrong");
+    assert_qpdf_rejects_password(&f, "wrong");
     assert_eq!(
         npages_of_with_password(&q, "secretpw"),
         npages_of_with_password(&f, "secretpw")
