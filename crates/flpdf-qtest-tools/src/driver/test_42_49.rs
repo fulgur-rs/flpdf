@@ -697,7 +697,7 @@ pub(crate) fn run_test_49<R: Read + Seek>(
     //
     // `OutlineTree::get_outlines_for_page` is qpdf's
     // `QPDFOutlineDocumentHelper::getOutlinesForPage`
-    // (`outline.rs:84-109`'s own doc cites the qpdf source), and
+    // (`outline_object_helper.rs:84-109`'s own doc cites the qpdf source), and
     // `OutlineItem::title`/`::dest` are the decoded `/Title` and resolved
     // destination `getTitle()`/`getDest()` produce.
     let tree = OutlineDocumentHelper::new(pdf).get_tree()?;

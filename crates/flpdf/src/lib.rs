@@ -6,7 +6,7 @@
 //! - [`Pdf`] is the parsed-but-lazy document handle. [`Pdf::open`] reads the trailer
 //!   and cross-reference table, then resolves objects on demand via [`Pdf::resolve`].
 //! - [`Object`], [`Dictionary`], [`Stream`], and [`ObjectRef`] are the data model.
-//! - [`pages`] and [`outline`] are traversal helpers built on top of `Pdf`. They
+//! - [`pages`] and [`outline_object_helper`] are traversal helpers built on top of `Pdf`. They
 //!   mirror the read-only inspection surface that `qpdf --show-pages` and
 //!   `--show-outline` provide.
 //! - [`PdfWriter`] configures the one fresh full-rewrite output with qpdf-shaped
@@ -117,9 +117,9 @@ pub mod object_copy;
 mod object_handle;
 pub mod objr_obj_annot_p;
 pub(crate) mod optimization;
-pub mod outline;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
+pub mod outline_object_helper;
 pub(crate) mod overlay;
 pub(crate) mod overlay_annotations;
 pub(crate) mod overlay_appearance_stream;
@@ -225,9 +225,9 @@ pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
 pub use object_handle::{ObjectHandle, StreamDataProvider};
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
-pub use outline::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::OutlineDocumentHelper;
+pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,

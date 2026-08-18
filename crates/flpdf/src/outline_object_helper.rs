@@ -3,7 +3,7 @@
 //! qpdf-compatible [`OutlineTree`] materialization.
 //!
 //! ```compile_fail
-//! use flpdf::outline::{outline_items, outline_items_with_max_depth};
+//! use flpdf::outline_object_helper::{outline_items, outline_items_with_max_depth};
 //! ```
 
 use crate::{ObjectHandle, ObjectRef};
