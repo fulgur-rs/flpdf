@@ -13,8 +13,8 @@ use crate::{Error, ObjectRef, Pdf, Result, XrefEntry};
 
 use super::settings::{DecodeLevel, WriterSettings};
 use super::{
-    effective_pdf_version, emit_canonical_pdf, report_progress_finished, ObjectStreamMode,
-    ProgressReporter, StreamDataMode, WriterOptions, WriterResult,
+    effective_pdf_version, emit_canonical_pdf, report_progress_finished, NewlineBeforeEndstream,
+    ObjectStreamMode, ProgressReporter, StreamDataMode, WriterOptions, WriterResult,
 };
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 
@@ -67,6 +67,186 @@ pub struct PdfWriter<'pdf, R: Read + Seek + 'static> {
     write_started: bool,
     write_succeeded: bool,
     result: Option<WriterResult>,
+}
+
+/// A reusable qpdf-shaped writer configuration.
+///
+/// qpdf's `QPDFJob::setWriterOptions` (`libqpdf/QPDFJob.cc:2847-2920`)
+/// applies the same writer settings to every output writer created by a job.
+/// Split-page jobs therefore need a configuration snapshot that can be
+/// replayed on each fresh chunk writer instead of retaining only one setting
+/// such as deterministic IDs. This type contains writer settings only; output
+/// sinks and progress reporters remain owned by each [`PdfWriter`] and its
+/// [`crate::job::QPDFJob`].
+#[derive(Debug, Clone, Default)]
+pub struct WriterConfiguration {
+    settings: WriterSettings,
+}
+
+impl WriterConfiguration {
+    /// Set qpdf's object-stream emission mode.
+    pub fn set_object_stream_mode(&mut self, mode: ObjectStreamMode) {
+        self.settings.object_stream_mode = mode;
+    }
+
+    /// Set qpdf's legacy stream-data policy.
+    pub fn set_stream_data_mode(&mut self, mode: StreamDataMode) {
+        self.settings.stream_data_mode = None;
+        match mode {
+            StreamDataMode::Preserve => {
+                self.settings.decode_level = DecodeLevel::None;
+                self.settings.compress_streams = false;
+            }
+            StreamDataMode::Uncompress => {
+                self.settings.decode_level =
+                    self.settings.decode_level.max(DecodeLevel::Generalized);
+                self.settings.compress_streams = false;
+            }
+            StreamDataMode::Compress => {
+                self.settings.decode_level =
+                    self.settings.decode_level.max(DecodeLevel::Generalized);
+                self.settings.compress_streams = true;
+            }
+        }
+        self.settings.decode_level_set = true;
+        self.settings.compress_streams_set = true;
+    }
+
+    /// Set qpdf's ordinary stream compression switch.
+    pub fn set_compress_streams(&mut self, value: bool) {
+        self.settings.compress_streams = value;
+        self.settings.compress_streams_set = true;
+    }
+
+    /// Set qpdf's stream decode level.
+    pub fn set_decode_level(&mut self, level: DecodeLevel) {
+        self.settings.decode_level = level;
+        self.settings.decode_level_set = true;
+    }
+
+    /// Set qpdf's `--recompress-flate` policy.
+    pub fn set_recompress_flate(&mut self, value: bool) {
+        self.settings.recompress_flate = value;
+    }
+
+    /// Set qpdf's content-normalization policy.
+    pub fn set_content_normalization(&mut self, value: bool) {
+        self.settings.content_normalization = value;
+        self.settings.content_normalization_set = true;
+    }
+
+    /// Set qpdf's QDF output mode.
+    pub fn set_qdf_mode(&mut self, value: bool) {
+        self.settings.qdf_mode = value;
+    }
+
+    /// Preserve otherwise unreferenced source objects.
+    pub fn set_preserve_unreferenced_objects(&mut self, value: bool) {
+        self.settings.preserve_unreferenced_objects = value;
+    }
+
+    /// Set qpdf's boolean `--newline-before-endstream` policy.
+    pub fn set_newline_before_endstream(&mut self, value: bool) {
+        self.settings.newline_before_endstream = if value {
+            NewlineBeforeEndstream::Yes
+        } else {
+            NewlineBeforeEndstream::Never
+        };
+    }
+
+    /// Set the full three-state endstream framing policy used by flpdf's CLI.
+    pub fn set_newline_before_endstream_mode(&mut self, value: NewlineBeforeEndstream) {
+        self.settings.newline_before_endstream = value;
+    }
+
+    /// Set qpdf's minimum output PDF version and extension level.
+    pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
+        update_minimum_pdf_version(
+            &mut self.settings.minimum_pdf_version,
+            version.into(),
+            extension_level,
+        );
+    }
+
+    /// Force qpdf's output PDF version and extension level.
+    pub fn force_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
+        self.settings.forced_pdf_version = Some((version.into(), extension_level));
+    }
+
+    /// Add qpdf's extra header text to each output writer.
+    pub fn set_extra_header_text(&mut self, text: impl Into<String>) {
+        let mut text = text.into();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        self.settings.extra_header_text = text;
+    }
+
+    /// Set qpdf's deterministic changing trailer ID policy.
+    pub fn set_deterministic_id(&mut self, value: bool) {
+        self.settings.deterministic_id = value;
+    }
+
+    /// Set qpdf's test-only static trailer ID policy.
+    pub fn set_static_id(&mut self, value: bool) {
+        self.settings.static_id = value;
+    }
+
+    /// Set qpdf's test-only static AES IV policy.
+    pub fn set_static_aes_iv(&mut self, value: bool) {
+        self.settings.static_aes_iv = value;
+    }
+
+    /// Set qpdf's QDF original-object-ID comment suppression policy.
+    pub fn set_suppress_original_object_ids(&mut self, value: bool) {
+        self.settings.suppress_original_object_ids = value;
+    }
+
+    /// Set whether source encryption may be preserved when compatible.
+    pub fn set_preserve_encryption(&mut self, value: bool) {
+        self.settings.preserve_encryption = value;
+    }
+
+    /// Configure explicit output encryption parameters.
+    pub fn set_encryption_parameters(&mut self, params: EncryptParams) {
+        self.settings.encryption_parameters = Some(params);
+        self.settings.copy_encryption = None;
+    }
+
+    /// Configure explicit encryption copied from an authenticated donor.
+    pub fn copy_encryption_parameters(&mut self, source: CopyEncryptionSource) {
+        self.settings.copy_encryption = Some(source);
+        self.settings.encryption_parameters = None;
+    }
+
+    /// Apply this configuration to one writer while preserving its output
+    /// sink lifecycle. Progress reporting is intentionally configured by the
+    /// owning job after this method returns.
+    pub fn apply_to<R: Read + Seek + 'static>(&self, writer: &mut PdfWriter<'_, R>) {
+        writer.settings = self.settings.clone();
+    }
+}
+
+fn update_minimum_pdf_version(
+    current: &mut Option<(String, i64)>,
+    version: String,
+    extension_level: i64,
+) {
+    match current {
+        None => *current = Some((version, extension_level)),
+        Some((current_version, current_extension_level)) => {
+            let current_parsed = crate::pdf_version::parse_pdf_version(current_version)
+                .expect("validated minimum PDF version remains parseable");
+            let candidate = crate::pdf_version::parse_pdf_version(&version)
+                .expect("validated minimum PDF version is parseable");
+            if candidate > current_parsed
+                || (candidate == current_parsed && extension_level > *current_extension_level)
+            {
+                *current_version = version;
+                *current_extension_level = extension_level;
+            }
+        }
+    }
 }
 
 impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
@@ -217,22 +397,11 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
     }
 
     pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
-        let version = version.into();
-        match self.settings.minimum_pdf_version.as_mut() {
-            None => self.settings.minimum_pdf_version = Some((version, extension_level)),
-            Some((current_version, current_extension_level)) => {
-                let current = crate::pdf_version::parse_pdf_version(current_version)
-                    .expect("validated minimum PDF version remains parseable");
-                let candidate = crate::pdf_version::parse_pdf_version(&version)
-                    .expect("validated minimum PDF version is parseable");
-                if candidate > current
-                    || (candidate == current && extension_level > *current_extension_level)
-                {
-                    *current_version = version;
-                    *current_extension_level = extension_level;
-                }
-            }
-        }
+        update_minimum_pdf_version(
+            &mut self.settings.minimum_pdf_version,
+            version.into(),
+            extension_level,
+        );
     }
 
     pub fn force_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
@@ -507,7 +676,8 @@ fn encryption_shape(options: &WriterOptions) -> Option<(i64, i64, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+    use crate::encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
+    use crate::security::standard::ObjectKeyAlg;
 
     fn options_for(method: EncryptMethod) -> WriterOptions {
         let params = match method {
@@ -579,5 +749,73 @@ mod tests {
         writer.set_minimum_pdf_version("1.5", 0);
 
         assert_eq!(writer.get_final_version().unwrap(), "1.5");
+    }
+
+    #[test]
+    fn writer_configuration_replays_qpdf_split_writer_settings() {
+        let mut configuration = WriterConfiguration::default();
+        configuration.set_object_stream_mode(ObjectStreamMode::Generate);
+        configuration.set_compress_streams(false);
+        configuration.set_stream_data_mode(StreamDataMode::Preserve);
+        configuration.set_stream_data_mode(StreamDataMode::Compress);
+        configuration.set_stream_data_mode(StreamDataMode::Uncompress);
+        configuration.set_decode_level(DecodeLevel::All);
+        configuration.set_recompress_flate(true);
+        configuration.set_content_normalization(true);
+        configuration.set_qdf_mode(true);
+        configuration.set_preserve_unreferenced_objects(true);
+        configuration.set_newline_before_endstream(false);
+        configuration.set_newline_before_endstream(true);
+        configuration.set_newline_before_endstream_mode(NewlineBeforeEndstream::No);
+        configuration.set_minimum_pdf_version("1.4", 2);
+        configuration.force_pdf_version("1.7", 3);
+        configuration.set_extra_header_text("% split configuration");
+        configuration.set_deterministic_id(true);
+        configuration.set_static_id(true);
+        configuration.set_static_aes_iv(true);
+        configuration.set_suppress_original_object_ids(true);
+        configuration.set_preserve_encryption(false);
+        configuration.set_encryption_parameters(EncryptParams::v4_aes128(b"u", b"o"));
+        configuration.copy_encryption_parameters(CopyEncryptionSource {
+            encrypt_dict: crate::Dictionary::new(),
+            file_key: vec![],
+            id0: vec![],
+            object_key_alg: ObjectKeyAlg::Rc4,
+        });
+
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let mut writer = PdfWriter::new(&mut pdf);
+        configuration.apply_to(&mut writer);
+
+        assert_eq!(
+            writer.settings.object_stream_mode,
+            ObjectStreamMode::Generate
+        );
+        assert!(!writer.settings.compress_streams);
+        assert_eq!(writer.settings.decode_level, DecodeLevel::All);
+        assert!(writer.settings.recompress_flate);
+        assert!(writer.settings.content_normalization);
+        assert!(writer.settings.qdf_mode);
+        assert!(writer.settings.preserve_unreferenced_objects);
+        assert_eq!(
+            writer.settings.newline_before_endstream,
+            NewlineBeforeEndstream::No
+        );
+        assert_eq!(
+            writer.settings.minimum_pdf_version,
+            Some(("1.4".to_owned(), 2))
+        );
+        assert_eq!(
+            writer.settings.forced_pdf_version,
+            Some(("1.7".to_owned(), 3))
+        );
+        assert_eq!(writer.settings.extra_header_text, "% split configuration\n");
+        assert!(writer.settings.deterministic_id);
+        assert!(writer.settings.static_id);
+        assert!(writer.settings.static_aes_iv);
+        assert!(writer.settings.suppress_original_object_ids);
+        assert!(!writer.settings.preserve_encryption);
+        assert!(writer.settings.encryption_parameters.is_none());
+        assert!(writer.settings.copy_encryption.is_some());
     }
 }

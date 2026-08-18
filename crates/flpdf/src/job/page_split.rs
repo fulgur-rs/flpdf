@@ -9,6 +9,7 @@ use super::QPDFJob;
 use crate::page_split::{chunk_output_path, digit_width};
 use crate::{
     Error, Matrix, PageDocumentHelper, PageInput, PageObjectHelper, Pdf, PdfWriter, Result,
+    WriterConfiguration,
 };
 use std::path::{Path, PathBuf};
 
@@ -23,8 +24,8 @@ pub struct SplitPageOptions {
     pub input_path: Option<PathBuf>,
     /// Apply qpdf's deterministic-ID policy to every chunk.
     pub deterministic_id: bool,
-    /// Apply qpdf's static-ID policy to every chunk.
-    pub static_id: bool,
+    /// Reapply the effective qpdf writer settings to every chunk.
+    pub writer_configuration: WriterConfiguration,
 }
 
 impl SplitPageOptions {
@@ -36,7 +37,7 @@ impl SplitPageOptions {
             output_template: output_template.into(),
             input_path: None,
             deterministic_id: false,
-            static_id: false,
+            writer_configuration: WriterConfiguration::default(),
         }
     }
 
@@ -54,10 +55,10 @@ impl SplitPageOptions {
         self
     }
 
-    /// Apply a static ID to all split outputs.
+    /// Reapply this writer configuration to every fresh output chunk.
     #[must_use]
-    pub fn with_static_id(mut self, static_id: bool) -> Self {
-        self.static_id = static_id;
+    pub fn with_writer_configuration(mut self, configuration: WriterConfiguration) -> Self {
+        self.writer_configuration = configuration;
         self
     }
 }
@@ -175,11 +176,9 @@ impl QPDFJob {
             }
 
             let mut writer = PdfWriter::new(&mut output);
+            options.writer_configuration.apply_to(&mut writer);
             if options.deterministic_id {
                 writer.set_deterministic_id(true);
-            }
-            if options.static_id {
-                writer.set_static_id(true);
             }
             self.configure_writer_progress(&mut writer);
             writer.set_output_file(&output_path)?;
@@ -254,13 +253,11 @@ mod tests {
     fn split_page_options_builder_keeps_qpdf_job_inputs() {
         let options = SplitPageOptions::new(2, "out-%d.pdf")
             .with_input_path("input.pdf")
-            .with_deterministic_id(true)
-            .with_static_id(true);
+            .with_deterministic_id(true);
         assert_eq!(options.chunk_size, 2);
         assert_eq!(options.output_template, PathBuf::from("out-%d.pdf"));
         assert_eq!(options.input_path, Some(PathBuf::from("input.pdf")));
         assert!(options.deterministic_id);
-        assert!(options.static_id);
     }
 
     #[test]
@@ -272,8 +269,10 @@ mod tests {
             let mut source = open_fixture("three-page.pdf");
             let temp = tempfile::tempdir().expect("tempdir");
             let mut job = QPDFJob::new();
-            let options =
-                SplitPageOptions::new(1, temp.path().join("chunk-%d.pdf")).with_static_id(true);
+            let mut configuration = WriterConfiguration::default();
+            configuration.set_static_id(true);
+            let options = SplitPageOptions::new(1, temp.path().join("chunk-%d.pdf"))
+                .with_writer_configuration(configuration);
             let written = job
                 .split_pages(&mut source, options)
                 .expect("split succeeds");

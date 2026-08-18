@@ -34,6 +34,7 @@ pub enum DecodeLevel {
 /// The current emitter consumes [`WriterOptions`]. `to_write_options` keeps
 /// the qpdf-shaped public setter state separate from the emitter's internal
 /// option representation.
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct WriterSettings {
     pub(crate) object_stream_mode: ObjectStreamMode,

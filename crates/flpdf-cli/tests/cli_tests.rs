@@ -893,25 +893,27 @@ fn top_level_qdf_explicit_normalize_content_n_overrides_default() {
 }
 
 #[test]
-fn top_level_normalize_content_y_rejects_unwired_page_operation_path() {
+fn top_level_normalize_content_y_applies_after_page_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("crlf-content.pdf");
+    let output = temp.path().join("normalized-pages.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"q\rQ")).unwrap();
+
     Command::cargo_bin("flpdf")
         .unwrap()
         .args([
             "--normalize-content=y",
-            "in.pdf",
+            input.to_str().unwrap(),
             "--pages",
             ".",
             "1",
             "--",
-            "out.pdf",
+            output.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains(
-            "--normalize-content is not applied in the \
-             --pages/--rotate/--split-pages/--collate pipeline",
-        ));
+        .success();
+
+    assert_eq!(first_page_content(&output), b"q\nQ");
 }
 
 #[test]

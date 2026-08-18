@@ -283,7 +283,7 @@ pub use tokenizer::{Token as ContentToken, TokenType as ContentTokenType};
 pub use writer::V5Randomness;
 pub use writer::{
     apply_stream_compress_policy, write_stream_to_buf, CompressStreams, DecodeLevel,
-    NewlineBeforeEndstream, ObjectStreamMode, PdfWriter, StreamDataMode,
+    NewlineBeforeEndstream, ObjectStreamMode, PdfWriter, StreamDataMode, WriterConfiguration,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,

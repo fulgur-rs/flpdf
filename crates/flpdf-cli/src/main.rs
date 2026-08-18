@@ -36,7 +36,7 @@ use flpdf::{
     EncryptMethod, EncryptParams, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg,
     ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf, PdfOpenOptions, PdfVersion,
     PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources,
-    Severity, StreamDataMode,
+    Severity, StreamDataMode, WriterConfiguration,
 };
 use flpdf::{
     copy_attachments_from, fix_qdf, insert_embedded_file, list_attachment_info, remove_attachment,
@@ -118,41 +118,49 @@ impl Default for WriterOptions {
     }
 }
 
+/// Translate the CLI's effective writer options into the reusable library
+/// configuration that qpdf reapplies to every split-page output writer.
+fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfiguration {
+    let mut configuration = WriterConfiguration::default();
+    configuration.set_object_stream_mode(options.object_streams);
+    configuration.set_compress_streams(matches!(options.compress_streams, CompressStreams::Yes));
+    if let Some(mode) = options.stream_data {
+        configuration.set_stream_data_mode(mode);
+    }
+    configuration.set_recompress_flate(options.recompress_flate);
+    configuration.set_qdf_mode(options.qdf && !linearize);
+    if options.content_normalization_set {
+        configuration.set_content_normalization(options.content_normalization);
+    }
+    configuration.set_preserve_unreferenced_objects(options.preserve_unreferenced_objects);
+    configuration.set_newline_before_endstream_mode(options.newline_before_endstream);
+    configuration.set_static_id(options.static_id);
+    configuration.set_deterministic_id(options.deterministic_id);
+    configuration.set_static_aes_iv(options.static_aes_iv);
+    configuration.set_suppress_original_object_ids(options.no_original_object_ids);
+    configuration.set_preserve_encryption(options.preserve_encryption);
+    if let Some(version) = options.min_version.as_deref() {
+        configuration.set_minimum_pdf_version(version, options.min_extension_level.unwrap_or(0));
+    }
+    if let Some(version) = options.force_version.as_deref() {
+        configuration.force_pdf_version(version, options.force_extension_level.unwrap_or(0));
+    }
+    if let Some(params) = options.encrypt.clone() {
+        configuration.set_encryption_parameters(params);
+    }
+    if let Some(source) = options.copy_encryption.clone() {
+        configuration.copy_encryption_parameters(source);
+    }
+    configuration
+}
+
 fn configure_pdf_writer<R: Read + Seek + 'static>(
     writer: &mut PdfWriter<'_, R>,
     options: &WriterOptions,
     linearize: bool,
     linearize_pass1: Option<&Path>,
 ) -> CliResult<()> {
-    writer.set_object_stream_mode(options.object_streams);
-    writer.set_compress_streams(matches!(options.compress_streams, CompressStreams::Yes));
-    if let Some(mode) = options.stream_data {
-        writer.set_stream_data_mode(mode);
-    }
-    writer.set_recompress_flate(options.recompress_flate);
-    writer.set_qdf_mode(options.qdf && !linearize);
-    if options.content_normalization_set {
-        writer.set_content_normalization(options.content_normalization);
-    }
-    writer.set_preserve_unreferenced_objects(options.preserve_unreferenced_objects);
-    writer.set_newline_before_endstream_mode(options.newline_before_endstream);
-    writer.set_static_id(options.static_id);
-    writer.set_deterministic_id(options.deterministic_id);
-    writer.set_static_aes_iv(options.static_aes_iv);
-    writer.set_suppress_original_object_ids(options.no_original_object_ids);
-    writer.set_preserve_encryption(options.preserve_encryption);
-    if let Some(version) = options.min_version.as_deref() {
-        writer.set_minimum_pdf_version(version, options.min_extension_level.unwrap_or(0));
-    }
-    if let Some(version) = options.force_version.as_deref() {
-        writer.force_pdf_version(version, options.force_extension_level.unwrap_or(0));
-    }
-    if let Some(params) = options.encrypt.clone() {
-        writer.set_encryption_parameters(params);
-    }
-    if let Some(source) = options.copy_encryption.clone() {
-        writer.copy_encryption_parameters(source);
-    }
+    writer_configuration(options, linearize).apply_to(writer);
     writer.set_linearization(linearize);
     if let Some(path) = linearize_pass1 {
         writer.set_linearization_pass1_filename(path.to_path_buf());
@@ -1632,34 +1640,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Top-level `--qdf` combined with a page operation is rejected here, before
-    // the dispatch chain, for the same reason: the `else if
-    // page_ops_active(...)` branch (below) wins over the default rewrite
-    // branch and does not thread `--qdf` into its `WriterOptions`, so the
-    // combination would silently emit a non-QDF document. The page-extraction
-    // pipeline produces a normalized (non-QDF) doc by design; reject the
-    // combination explicitly rather than ignoring the flag.
-    if args.qdf && page_ops_active(&args.page_ops) {
-        eprintln!("flpdf: --qdf cannot be combined with --pages/--rotate/--split-pages");
-        std::process::exit(1);
-    }
-
-    // qpdf applies content normalization in its writer after page selection.
-    // flpdf's page-operation pipelines currently own serialization directly
-    // and do not run the shared rewrite mutation pass, so accepting an
-    // effective `y` here would silently discard the requested transform.
-    // Mirror the native `rewrite` surface's explicit unsupported-combination
-    // diagnostic until that pipeline grows the same consumer. Explicit `n`
-    // remains accepted because it requests no transformation.
-    if normalize_content && page_ops_active(&args.page_ops) {
-        eprintln!(
-            "flpdf: --normalize-content is not applied in the \
-             --pages/--rotate/--split-pages/--collate pipeline; \
-             rerun with --normalize-content=n or without the page operation"
-        );
-        std::process::exit(1);
-    }
-
     // Attachment add/remove/copy operations rewrite through their own
     // serializers before the shared rewrite branch. qpdf applies writer
     // normalization to those outputs, but flpdf cannot yet do so without
@@ -1881,6 +1861,7 @@ fn main() {
             no_original_object_ids: args.no_original_object_ids,
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
+            qdf: args.qdf,
             ..WriterOptions::default()
         };
         if let Some(ref cs) = args.compress_streams {
@@ -2464,9 +2445,11 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     std::process::exit(1);
                 }
                 // The page-operation pipeline owns the write and does not run
-                // the rewrite-only passes. Silently dropping them would make
-                // `rewrite --rotate=90 --normalize-content=y ...` partially
-                // succeed; reject the unsupported combination loudly instead.
+                // the rewrite-only mutation passes. Silently dropping them
+                // would make the command partially succeed; reject the
+                // unsupported combinations loudly instead. Writer settings,
+                // including content normalization, are applied by the final
+                // PdfWriter and are therefore intentionally accepted here.
                 //
                 // --decrypt is rejected for the same reason: the page-ops
                 // pipeline already rejects encrypted inputs (so a useful
@@ -2475,8 +2458,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // rejecting upfront surfaces the unsupported combination
                 // instead of leaving the user wondering whether decryption
                 // happened.
-                if normalize_content
-                    || coalesce_contents
+                if coalesce_contents
                     || cmd.remove_restrictions
                     || cmd.decrypt
                     || !cmd.encrypt.is_empty()
@@ -2486,8 +2468,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     || cmd.flatten_rotation
                 {
                     eprintln!(
-                        "flpdf: --normalize-content / --coalesce-contents / \
-                         --remove-restrictions / --decrypt / --encrypt / \
+                        "flpdf: --coalesce-contents / --remove-restrictions / --decrypt / --encrypt / \
                          --copy-encryption / --flatten-annotations / \
                          --generate-appearances / --flatten-rotation are \
                          not applied in the --pages/--rotate/--split-pages/\
@@ -4764,7 +4745,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             output,
             input_path,
             options.deterministic_id,
-            options.static_id,
+            writer_configuration(&options, false),
         )?;
         if verbose {
             for path in &written {
@@ -4834,7 +4815,7 @@ fn split_rewritten_pdf(
     output: &Path,
     input_path: &Path,
     deterministic_id: bool,
-    static_id: bool,
+    writer_configuration: WriterConfiguration,
 ) -> CliResult<Vec<PathBuf>> {
     let mut pdf = Pdf::open_mem_owned(bytes)?;
     let mut job = QPDFJob::new();
@@ -4843,7 +4824,7 @@ fn split_rewritten_pdf(
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
-        .with_static_id(static_id);
+        .with_writer_configuration(writer_configuration);
     Ok(job.split_pages(&mut pdf, options)?)
 }
 
@@ -4916,7 +4897,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
             output,
             input,
             options.deterministic_id,
-            options.static_id,
+            writer_configuration(&options, false),
         )?;
         if verbose {
             for path in &written {

@@ -14,7 +14,7 @@ pub(crate) mod plain;
 pub(crate) mod serialize;
 mod settings;
 pub use object_streams::ObjectStreamMode;
-pub use pdf_writer::PdfWriter;
+pub use pdf_writer::{PdfWriter, WriterConfiguration};
 #[cfg(test)]
 use serialize::framing_adds_newline as stream_framing_adds_newline;
 use serialize::write_stream_payload;

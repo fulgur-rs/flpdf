@@ -429,11 +429,11 @@ fn qdf_linearize_is_rejected_top_level() {
         ));
 }
 
-/// Regression for roborev #194: top-level `--qdf` combined with a page
-/// operation must be rejected (exit 1) rather than silently emitting a
-/// non-QDF document.
+/// qpdf applies QDF at the final writer even when a page operation is present.
+/// The top-level alias must therefore preserve the QDF contract after page
+/// selection instead of rejecting or silently dropping it.
 #[test]
-fn qdf_page_ops_is_rejected_top_level() {
+fn qdf_page_ops_is_applied_top_level() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
@@ -447,9 +447,134 @@ fn qdf_page_ops_is_rejected_top_level() {
             output.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains(
-            "--qdf cannot be combined with --pages/--rotate/--split-pages",
-        ));
+        .success();
+
+    assert_canonical_qdf(&std::fs::read(output).unwrap());
+}
+
+/// qpdf's `setWriterOptions` is applied to every split chunk, not only to the
+/// intermediate document. This is the RED regression for flpdf-25kg.6.10:
+/// before the writer configuration bridge exists, the intermediate is QDF but
+/// the final chunk is emitted by a default non-QDF writer.
+#[test]
+fn qdf_split_pages_applies_qdf_to_every_chunk() {
+    let input = fixture_with_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--qdf",
+            "--split-pages=1",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let chunk = temp.path().join("out-1.pdf");
+    assert!(chunk.exists(), "split operation must write the first chunk");
+    let rendered = std::fs::read(&chunk).unwrap();
+    assert_canonical_qdf(&rendered);
+    if !skip_if_qpdf_missing() {
+        assert!(
+            qpdf_check(&chunk).success(),
+            "qpdf must accept every QDF split chunk"
+        );
+    }
+
+    let top_level_temp = tempfile::tempdir().unwrap();
+    let top_level_output = top_level_temp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--split-pages=1",
+            input.path().to_str().unwrap(),
+            top_level_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_canonical_qdf(&std::fs::read(top_level_temp.path().join("out-1.pdf")).unwrap());
+}
+
+#[test]
+fn split_pages_reapplies_stream_data_policy_to_every_chunk() {
+    let input = fixture_with_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--stream-data=uncompress",
+            "--split-pages=1",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let rendered = std::fs::read(temp.path().join("out-1.pdf")).unwrap();
+    assert!(
+        !rendered.windows(b"/Filter".len()).any(|w| w == b"/Filter"),
+        "--stream-data=uncompress must survive the final chunk writer"
+    );
+}
+
+#[test]
+fn split_pages_reapplies_object_stream_mode_to_every_chunk() {
+    let input = fixture_with_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--object-streams=generate",
+            "--split-pages=1",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let rendered = std::fs::read(temp.path().join("out-1.pdf")).unwrap();
+    assert!(
+        rendered
+            .windows(b"/Type /ObjStm".len())
+            .any(|w| w == b"/Type /ObjStm"),
+        "--object-streams=generate must survive the final chunk writer"
+    );
+}
+
+#[test]
+fn split_pages_reapplies_newline_before_endstream_to_every_chunk() {
+    let input = fixture_with_stream();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--newline-before-endstream=y",
+            "--split-pages=1",
+            input.path().to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let rendered = std::fs::read(temp.path().join("out-1.pdf")).unwrap();
+    assert!(
+        rendered
+            .windows(b"\nendstream".len())
+            .any(|w| w == b"\nendstream"),
+        "--newline-before-endstream=y must survive the final chunk writer"
+    );
 }

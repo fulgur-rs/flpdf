@@ -130,6 +130,34 @@ fn static_id_is_deterministic_across_runs() {
 }
 
 #[test]
+fn static_id_is_reapplied_to_every_split_chunk() {
+    let tmp = tempdir().expect("tempdir");
+    let input = fixture_path("three-page.pdf");
+    let output = tmp.path().join("chunks.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .expect("flpdf binary")
+        .args([
+            "rewrite",
+            "--static-id",
+            "--split-pages=1",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    for page in 1..=3 {
+        let chunk = tmp.path().join(format!("chunks-{page}.pdf"));
+        let (_id0, id1) = extract_id_array(&std::fs::read(chunk).expect("read split chunk"));
+        assert_eq!(
+            id1, b"31415926535897932384626433832795",
+            "static /ID[1] must be reapplied to chunk {page}"
+        );
+    }
+}
+
+#[test]
 fn static_id_trailer_id_matches_qpdf_oracle() {
     if skip_if_qpdf_missing() {
         return;
