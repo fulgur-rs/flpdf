@@ -2165,7 +2165,13 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // 5. Open the input once and retain an identity handle for the output
     // check. JSON input uses the canonical complete-document importer; a
     // partial update is applied immediately after creation/opening.
-    let input_file = File::open(input).map_err(|error| json_input_open_error(input, error))?;
+    let input_file = File::open(input).map_err(|error| {
+        if cli.json_input {
+            qpdf_json_input_open_error(input, error)
+        } else {
+            json_input_open_error(input, error)
+        }
+    })?;
     let input_identity = input_file
         .try_clone()
         .map_err(|error| error_with_file(input, error.into()))?;
@@ -4845,6 +4851,15 @@ fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
 
 fn json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
     let rendered = error.to_string();
+    let message = error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered);
+    format!("open {}: {message}", input.display()).into()
+}
+
+fn qpdf_json_input_open_error(input: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
+    let rendered = error.to_string();
     let message = if error.kind() == std::io::ErrorKind::NotFound {
         // qpdf uses its portable POSIX wording for a missing JSON input on
         // every host; Rust exposes the native Windows wording instead.
@@ -5492,7 +5507,7 @@ fn apply_json_update<R: Read + Seek + 'static>(
     update_from_json: Option<&Path>,
 ) -> CliResult<()> {
     if let Some(path) = update_from_json {
-        let source = File::open(path).map_err(|error| json_input_open_error(path, error))?;
+        let source = File::open(path).map_err(|error| qpdf_json_input_open_error(path, error))?;
         pdf.update_from_json(source, path.display().to_string())
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     }
@@ -5519,7 +5534,7 @@ fn open_job_pdf(
 }
 
 fn open_json_pdf(input: &Path, update_from_json: Option<&Path>) -> CliResult<Pdf<Cursor<Vec<u8>>>> {
-    let source = File::open(input).map_err(|error| json_input_open_error(input, error))?;
+    let source = File::open(input).map_err(|error| qpdf_json_input_open_error(input, error))?;
     let mut pdf = Pdf::create_from_json(source, input.display().to_string())
         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     apply_json_update(&mut pdf, update_from_json)?;
@@ -6267,7 +6282,7 @@ mod tests {
 
     #[test]
     fn json_input_open_error_uses_qpdf_not_found_wording() {
-        let error = json_input_open_error(
+        let error = qpdf_json_input_open_error(
             Path::new("missing.json"),
             std::io::Error::from(std::io::ErrorKind::NotFound),
         );
