@@ -27,22 +27,27 @@ static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
 impl<R: Read + Seek> Pdf<R> {
-    /// Open a document strictly: parse the cross-reference and trailer, but do not run
-    /// the recovery heuristics. Returns an [`Error`] if the document is malformed.
+    /// Open a document with qpdf's default recovery policy.
+    ///
+    /// qpdf enables recovery by default. Use [`Pdf::open_with_options`] with
+    /// `repair: false` for the explicit strict/suppressed-recovery route.
     ///
     /// # Errors
     ///
-    /// Propagates any error from [`Pdf::open_with_options`] (called with default
-    /// options): [`Error::Io`] / [`Error::Parse`] / [`Error::Missing`] from loading
-    /// the cross-reference and trailer, and [`Error::Encrypted`] when the document
-    /// is encrypted and cannot be authenticated.
+    /// Propagates any error from [`Pdf::open_with_options`] (called with qpdf's
+    /// default recovery options): [`Error::Io`] / [`Error::Parse`] /
+    /// [`Error::Missing`] from loading the cross-reference and trailer, and
+    /// [`Error::Encrypted`] when the document is encrypted and cannot be
+    /// authenticated.
     pub fn open(reader: R) -> Result<Self> {
         Self::open_with_options(reader, PdfOpenOptions::default())
     }
 
-    /// Open a document, falling back to qpdf-style xref/trailer recovery when the
-    /// strict parse fails. Diagnostics from the recovery pass are stored on the handle
-    /// and exposed via [`Pdf::repair_diagnostics`].
+    /// Open a document with qpdf-style xref/trailer recovery explicitly enabled.
+    ///
+    /// This is equivalent to [`Pdf::open`] because qpdf enables recovery by
+    /// default. Diagnostics from the recovery pass are stored on the handle and
+    /// exposed via [`Pdf::repair_diagnostics`].
     ///
     /// # Errors
     ///

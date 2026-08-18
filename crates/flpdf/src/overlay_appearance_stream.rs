@@ -411,6 +411,7 @@ fn allocate_next_ref<R: Read + Seek>(dest: &Pdf<R>) -> Result<ObjectRef> {
 mod tests {
     use super::*;
     use crate::ObjectRef;
+    use crate::PdfOpenOptions;
     use std::io::Cursor;
 
     /// Build a `DrMap` with a single category's rename table. `DrMap`'s
@@ -1333,7 +1334,14 @@ mod tests {
             format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
                 .as_bytes(),
         );
-        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("malformed object must stay lazy");
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: false,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("malformed object must stay lazy");
         let broken_resource_ref = set_dict(
             &mut pdf,
             5,

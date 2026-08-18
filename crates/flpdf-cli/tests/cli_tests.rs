@@ -1170,7 +1170,7 @@ fn rewrite_force_version_honored_without_mutation() {
 }
 
 #[test]
-fn check_without_repair_rejects_corrupt_xref() {
+fn check_repairs_corrupt_xref_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("corrupt.pdf");
     std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
@@ -1178,7 +1178,8 @@ fn check_without_repair_rejects_corrupt_xref() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--check", input.to_str().unwrap()])
         .assert()
-        .failure();
+        .code(3)
+        .stdout(predicate::str::contains("File is not encrypted\n"));
 }
 
 #[test]

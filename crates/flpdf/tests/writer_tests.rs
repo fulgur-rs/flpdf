@@ -2,7 +2,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     check_reader, filters, load_xref_and_trailer, parse_object, CompressStreams, Dictionary,
-    Object, ObjectRef, ObjectStreamMode, Pdf, XrefForm,
+    Object, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -1009,7 +1009,14 @@ fn rewrites_linearized_input_to_fresh_valid_pdf() {
 #[test]
 fn rewrites_repaired_pdf_in_best_effort_mode() {
     let input = corrupt_xref_pdf();
-    assert!(Pdf::open(Cursor::new(input.clone())).is_err());
+    assert!(Pdf::open_with_options(
+        Cursor::new(input.clone()),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .is_err());
 
     let mut pdf = Pdf::open_best_effort(Cursor::new(input)).unwrap();
     assert!(!pdf.repair_diagnostics().entries().is_empty());

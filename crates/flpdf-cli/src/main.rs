@@ -5686,7 +5686,10 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
     };
 
     Ok(PdfOpenOptions {
-        repair,
+        // qpdf's recovery permission is enabled on the document by default.
+        // Keep accepting `--repair` as an explicit compatibility spelling;
+        // the absence of that flag must not turn recovery off.
+        repair: repair || PdfOpenOptions::default().repair,
         password,
         password_mode,
         allow_weak_crypto,

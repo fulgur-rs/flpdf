@@ -13,7 +13,7 @@
 //!   (3) an ObjStm container with an indirect `/Length` + adjacent `endstream`
 //!       still has its compressed members read.
 
-use flpdf::{Object, ObjectRef, Pdf, Severity};
+use flpdf::{Object, ObjectRef, Pdf, PdfOpenOptions, Severity};
 use std::io::Cursor;
 
 /// Build a PDF-1.4 (xref table) with one content stream (obj 3) carrying
@@ -296,7 +296,14 @@ fn malformed_holder_resolution_recovers_target_stream() {
     // Sanity: the stream object/holder bodies are untouched.
     assert!(bytes.windows(needle.len()).any(|w| w == needle));
 
-    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut pdf = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
     assert_metadata_stream_and_warnings(
         &mut pdf,
         b"AAAABBBB",
