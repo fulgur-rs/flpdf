@@ -224,6 +224,69 @@ fn flatten_rotation_is_a_live_page_facade_route() {
 }
 
 #[test]
+fn flatten_rotation_handles_270_degrees_and_inherited_rotation_masking() {
+    let mut pdf = open(annotation_page("[30 50 70 100]", Some(270)));
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+    PageObjectHelper::new(page_ref, &mut pdf)
+        .flatten_rotation()
+        .expect("270-degree page should flatten");
+    let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+    assert!(page.get("Rotate").is_none());
+    let content = pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+    assert!(content.starts_with(b"q\n0 1 -1 0 340 0 cm\n"));
+
+    let mut inherited = open(build_pdf_with_extras(
+        "/Rotate 180",
+        "/MediaBox [0 0 200 300] /Contents 4 0 R /Rotate 90",
+        &[make_stream_object(4, b"BT (x) Tj ET")],
+    ));
+    let inherited_page = pages::page_refs(&mut inherited).unwrap()[0];
+    PageObjectHelper::new(inherited_page, &mut inherited)
+        .flatten_rotation()
+        .expect("direct rotation should mask inherited rotation");
+    let page = inherited
+        .resolve(inherited_page)
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    assert_eq!(page.get("Rotate"), Some(&Object::Integer(0)));
+}
+
+#[test]
+fn flatten_rotation_skips_invalid_media_box_and_non_array_annotations() {
+    let mut invalid_media = open(build_single_page_pdf(
+        "",
+        "/MediaBox [0 0 null 300] /Contents 4 0 R /Rotate 90",
+    ));
+    let invalid_page = pages::page_refs(&mut invalid_media).unwrap()[0];
+    PageObjectHelper::new(invalid_page, &mut invalid_media)
+        .flatten_rotation()
+        .expect("invalid media box should be a qpdf no-op");
+    let page = invalid_media
+        .resolve(invalid_page)
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+
+    let mut non_array_annots = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 200 300] /Contents 4 0 R /Rotate 90 /Annots /bad",
+        &[make_stream_object(4, b"BT (x) Tj ET")],
+    ));
+    let page_ref = pages::page_refs(&mut non_array_annots).unwrap()[0];
+    PageObjectHelper::new(page_ref, &mut non_array_annots)
+        .flatten_rotation()
+        .expect("non-array annotations should be ignored");
+    let page = non_array_annots
+        .resolve(page_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    assert!(page.get("Rotate").is_none());
+}
+
+#[test]
 fn copy_annotations_uses_same_document_live_handles() {
     let mut pdf = open(annotation_page("[30 50 70 100]", None));
     let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
@@ -319,6 +382,46 @@ fn copy_annotations_from_rejects_a_handle_owned_by_another_source() {
     assert!(
         matches!(result, Err(Error::Unsupported(message)) if message.contains("different Pdf"))
     );
+}
+
+#[test]
+fn copy_annotations_rejects_direct_and_foreign_same_document_handles() {
+    let mut destination = open(annotation_page("[0 0 10 10]", None));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let direct = ObjectHandle::dictionary(Vec::new());
+    let result = PageObjectHelper::new(destination_page, &mut destination)
+        .copy_annotations(direct, Matrix::default());
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message)) if message.contains("direct object")
+    ));
+
+    let mut other = open(annotation_page("[1 2 3 4]", None));
+    let other_page = pages::page_refs(&mut other).unwrap()[0];
+    let foreign = other.get_object_handle(other_page);
+    let result = PageObjectHelper::new(destination_page, &mut destination)
+        .copy_annotations(foreign, Matrix::default());
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message)) if message.contains("another Pdf")
+    ));
+}
+
+#[test]
+fn copy_annotations_from_rejects_a_direct_source_handle() {
+    let mut destination = open(annotation_page("[0 0 10 10]", None));
+    let mut source = open(annotation_page("[1 2 3 4]", None));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let direct = ObjectHandle::dictionary(Vec::new());
+    let result = PageObjectHelper::new(destination_page, &mut destination).copy_annotations_from(
+        direct,
+        Matrix::default(),
+        &mut source,
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message)) if message.contains("direct object")
+    ));
 }
 
 #[test]

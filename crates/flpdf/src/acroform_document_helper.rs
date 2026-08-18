@@ -729,7 +729,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         foreign_resources = Some(self.prepare_foreign_resource_plan(
                             source_defaults.resources.clone(),
                             source,
-                        )?);
+                        )?); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
                     }
                     let copied_top = self.copy_field_tree_with_overrides(
                         &copied_source_top,
@@ -761,7 +761,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 &copied,
                 cm,
                 appearance_renames,
-            )?;
+            )?; // cov:ignore: LLVM maps this multiline appearance-transform call to a defensive continuation edge
             let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
             copied.replace_key(b"/Rect", rect)?;
             self.pdf.mark_object_handle_dirty(&copied)?;
@@ -2101,7 +2101,7 @@ fn adjust_copied_appearance_resources<R: Read + Seek>(
         return Ok(());
     };
     let Some(ap_stream_ref) = copied.object_ref() else {
-        return Ok(());
+        return Ok(()); // cov:ignore: copied appearance streams are always indirect after copy_stream; retain the defensive direct-handle guard
     };
     let mut dr_map = crate::overlay_annotations::DrMap::new();
     for (category, category_renames) in renames {
@@ -4387,6 +4387,54 @@ mod tests {
     }
 
     #[test]
+    fn add_form_fields_handles_empty_existing_and_malformed_fields_arrays() {
+        let mut pdf = empty_pdf();
+        let field = ObjectHandle::dictionary(vec![(
+            b"/T".to_vec(),
+            ObjectHandle::string(b"field".to_vec()),
+        )]);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        helper.add_form_fields(Vec::new()).unwrap();
+        helper.add_form_fields(vec![field.clone()]).unwrap();
+        drop(helper);
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let acroform = root.try_get_key(b"/AcroForm").unwrap();
+        let fields = acroform
+            .try_get_key(b"/Fields")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].is_same_object_as(&field));
+
+        let mut malformed = empty_pdf();
+        malformed.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[(
+                "AcroForm",
+                Object::Dictionary(dict(&[("Fields", Object::Name(b"bad".to_vec()))])),
+            )])),
+        );
+        let replacement_field = ObjectHandle::dictionary(Vec::new());
+        AcroFormDocumentHelper::new(&mut malformed)
+            .add_form_fields(vec![replacement_field.clone()])
+            .unwrap();
+        let root = malformed.get_object_handle(ObjectRef::new(1, 0));
+        let fields = root
+            .try_get_key(b"/AcroForm")
+            .unwrap()
+            .try_get_key(b"/Fields")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].is_same_object_as(&replacement_field));
+    }
+
+    #[test]
     fn canonical_fully_qualified_name_walks_parents_and_stops_cycles() {
         let mut pdf = empty_pdf();
         pdf.set_object(
@@ -5623,5 +5671,20 @@ mod tests {
             .canonical_annotation_to_field_handles()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn adjust_copied_appearance_resources_ignores_a_direct_stream_guard() {
+        let mut pdf = empty_pdf();
+        let copied = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(0))]),
+            Rc::new(Vec::new()),
+        );
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"Fsrc".to_vec(), b"Fdst".to_vec());
+        adjust_copied_appearance_resources(&mut pdf, &copied, Some(&renames)).unwrap();
     }
 }

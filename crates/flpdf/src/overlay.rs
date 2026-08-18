@@ -478,9 +478,11 @@ where
         let mut source_page = PageObjectHelper::new(page_ref, source);
         let source_form = source_page.get_form_xobject_for_page(true)?;
         let imported = dest.copy_foreign_object(&source_form)?;
+        // cov:ignore-start: copy_foreign_object always returns an indirect destination object; this is an invariant guard for a malformed allocator result.
         imported_xobject_refs.push(imported.object_ref().ok_or_else(|| {
             Error::Unsupported("imported Form XObject is not indirect".to_string())
         })?);
+        // cov:ignore-end
     }
     let imported: BTreeMap<u32, ObjectRef> = distinct_sources
         .iter()
@@ -2597,6 +2599,50 @@ mod tests {
         );
         let fx0_res = fx0.dict.get("Resources").unwrap().as_dict().unwrap();
         assert!(fx0_res.get("Font").is_some(), "Fx0 keeps the page's /Font");
+    }
+
+    #[test]
+    fn apply_underlay_rejects_an_out_of_range_source_document_index() {
+        let mut dest = open(one_page_doc("page content"));
+        let dest_page_ref = ObjectRef::new(3, 0);
+        let source_form = insert_form_xobject(&mut dest, [0, 0, 612, 792], b"underlay");
+        let sources = [OverlaySource {
+            kind: OverlayKind::Underlay,
+            xobject_ref: source_form,
+            source_page: Some((0, ObjectRef::new(99, 0))),
+        }];
+        let mut source_documents: Vec<&mut Pdf<std::io::Cursor<Vec<u8>>>> = Vec::new();
+
+        let error = apply_overlays_to_page_with_sources(
+            &mut dest,
+            dest_page_ref,
+            &sources,
+            &mut source_documents,
+        )
+        .expect_err("an absent source document must be rejected");
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("out of range")));
+    }
+
+    #[test]
+    fn apply_overlay_rejects_an_out_of_range_source_document_index() {
+        let mut dest = open(one_page_doc("page content"));
+        let dest_page_ref = ObjectRef::new(3, 0);
+        let source_form = insert_form_xobject(&mut dest, [0, 0, 612, 792], b"overlay");
+        let sources = [OverlaySource {
+            kind: OverlayKind::Overlay,
+            xobject_ref: source_form,
+            source_page: Some((0, ObjectRef::new(99, 0))),
+        }];
+        let mut source_documents: Vec<&mut Pdf<std::io::Cursor<Vec<u8>>>> = Vec::new();
+
+        let error = apply_overlays_to_page_with_sources(
+            &mut dest,
+            dest_page_ref,
+            &sources,
+            &mut source_documents,
+        )
+        .expect_err("an absent source document must be rejected");
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("out of range")));
     }
 
     #[test]

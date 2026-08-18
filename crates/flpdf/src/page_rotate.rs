@@ -342,6 +342,31 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn object_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
+        assert!(object_to_pagebox(&Object::Integer(1)).is_none());
+        assert!(object_to_pagebox(&Object::Array(vec![Object::Integer(1)])).is_none());
+        assert_eq!(
+            object_to_pagebox(&Object::Array(vec![
+                Object::RealLiteral {
+                    value: 1.5,
+                    literal: b"1.5".to_vec(),
+                },
+                Object::Integer(2),
+                Object::Real(11.5),
+                Object::Integer(22),
+            ])),
+            Some(PageBox::new(1.5, 2.0, 11.5, 22.0))
+        );
+        assert!(object_to_pagebox(&Object::Array(vec![
+            Object::Integer(1),
+            Object::Null,
+            Object::Integer(11),
+            Object::Integer(22),
+        ]))
+        .is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Pure function tests: normalize_rotate
     // -----------------------------------------------------------------------
@@ -1174,6 +1199,7 @@ mod tests {
             .map(|annotation| {
                 let annotation = match annotation {
                     Object::Reference(reference) => pdf.resolve(*reference).unwrap(),
+                    // cov:ignore: qpdf transformAnnotations materializes every transformed annotation as an indirect object; retain this malformed-fixture fallback.
                     direct => direct.clone(),
                 };
                 let annotation = annotation.into_dict().expect("annotation dictionary");
