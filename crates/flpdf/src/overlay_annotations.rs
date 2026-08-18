@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::acroform_document_helper::{collect_reachable_refs, collect_refs_in_object};
-use crate::overlay_appearance_stream::adjust_appearance_stream;
+use crate::overlay_appearance_stream::adjust_appearance_stream_handle;
 use crate::resource_replacer::{replace_resource_names, ResourceRenames};
 use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 
@@ -889,7 +889,7 @@ fn adjust_default_appearance(da: &[u8], dr_map: &DrMap) -> Result<Vec<u8>> {
 /// dictionary level, matching qpdf's `apdict` traversal.
 ///
 /// When `dr_map` is non-empty, each dup'd stream is additionally passed to
-/// [`crate::overlay_appearance_stream::adjust_appearance_stream`] (qpdf
+/// [`crate::overlay_appearance_stream::adjust_appearance_stream_handle`] (qpdf
 /// `AcroForm::adjustAppearanceStream`, called from `transformAnnotations`
 /// line 1156-1161) so a `/Resources` name that collided during the `/DR`
 /// merge is privatized, renamed, and rewritten in the stream's own content —
@@ -922,7 +922,8 @@ fn transform_annot_ap_streams<R: Read + Seek>(
             Object::Reference(stream_ref) => {
                 if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
                     if !dr_map.is_empty() {
-                        adjust_appearance_stream(dest, new_ref, dr_map)?;
+                        let stream = dest.get_object_handle(new_ref);
+                        adjust_appearance_stream_handle(dest, &stream, dr_map)?;
                     }
                     apdict.insert(&key, Object::Reference(new_ref));
                 }
@@ -938,7 +939,8 @@ fn transform_annot_ap_streams<R: Read + Seek>(
                     if let Object::Reference(stream_ref) = sub_val {
                         if let Some(new_ref) = dup_and_transform_ap_stream(dest, stream_ref, cm)? {
                             if !dr_map.is_empty() {
-                                adjust_appearance_stream(dest, new_ref, dr_map)?;
+                                let stream = dest.get_object_handle(new_ref);
+                                adjust_appearance_stream_handle(dest, &stream, dr_map)?;
                             }
                             sub.insert(&sub_key, Object::Reference(new_ref));
                         }
@@ -2754,6 +2756,57 @@ mod tests {
             "no F1_1 entry should have been minted on the non-field annot's \
              AP stream — adjustAppearanceStream must not have run at all"
         );
+    }
+
+    #[test]
+    fn transform_annot_ap_streams_adjusts_top_level_and_nested_handles() {
+        let mut pdf = open_minimal();
+        let top_stream_ref = ObjectRef::new(20, 0);
+        let nested_stream_ref = ObjectRef::new(21, 0);
+        for stream_ref in [top_stream_ref, nested_stream_ref] {
+            let mut font = crate::Dictionary::new();
+            font.insert("F1", Object::Integer(1));
+            let mut resources = crate::Dictionary::new();
+            resources.insert("Font", Object::Dictionary(font));
+            let mut stream_dict = crate::Dictionary::new();
+            stream_dict.insert("Resources", Object::Dictionary(resources));
+            pdf.set_object(
+                stream_ref,
+                Object::Stream(crate::Stream::new(stream_dict, b"/F1 10 Tf".to_vec())),
+            );
+        }
+
+        let mut nested = crate::Dictionary::new();
+        nested.insert("On", Object::Reference(nested_stream_ref));
+        let mut ap = crate::Dictionary::new();
+        ap.insert("N", Object::Reference(top_stream_ref));
+        ap.insert("D", Object::Dictionary(nested));
+        let annot_ref = set_dict(&mut pdf, 22, &[("AP", Object::Dictionary(ap))]);
+        let dr_map = DrMap::for_test(b"Font", b"F1", b"F1_1");
+
+        transform_annot_ap_streams(&mut pdf, annot_ref, Matrix::default(), &dr_map).unwrap();
+
+        let annot = pdf.resolve(annot_ref).unwrap().into_dict().unwrap();
+        let ap = annot.get("AP").and_then(Object::as_dict).unwrap();
+        let top_ref = ap.get_ref("N").unwrap();
+        let nested_ref = ap
+            .get("D")
+            .and_then(Object::as_dict)
+            .and_then(|d| d.get_ref("On"))
+            .unwrap();
+        for stream_ref in [top_ref, nested_ref] {
+            let stream = pdf.resolve(stream_ref).unwrap().into_stream().unwrap();
+            assert_eq!(stream.data, b"/F1_1 10 Tf");
+            let font = stream
+                .dict
+                .get("Resources")
+                .and_then(Object::as_dict)
+                .and_then(|resources| resources.get("Font"))
+                .and_then(Object::as_dict)
+                .unwrap();
+            assert_eq!(font.get("F1_1"), Some(&Object::Integer(1)));
+            assert!(font.get("F1").is_none());
+        }
     }
 
     // ---- adjust_default_appearance ------------------------------------------
