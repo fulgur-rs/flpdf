@@ -6406,6 +6406,48 @@ fn corrupt_xref_with_info_pdf() -> Vec<u8> {
     corrupted
 }
 
+/// Regression: qpdf's cross-reference recovery permission is on by default
+/// (`include/qpdf/QPDF.hh:1458-1462`), so a corrupt-but-recoverable
+/// `--copy-attachments-from` donor must still recover and finish
+/// (qpdf 11.9.0 exits 3, "operation succeeded with warnings", for this
+/// exact scenario — verified empirically) even when the caller omits
+/// `--repair`. `run_copy_attachments_from` used to construct the donor's
+/// `PdfOpenOptions` from the raw `--repair` flag directly, bypassing the
+/// `pdf_open_options` helper's default-recovery treatment — the flag's
+/// absence turned recovery off for the donor specifically (the target
+/// document was unaffected), diverging from qpdf, which recovers and exits
+/// 3 rather than hard-failing.
+#[test]
+fn copy_attachments_from_corrupt_donor_recovers_without_explicit_repair_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let donor = temp.path().join("corrupt-donor.pdf");
+    std::fs::write(&donor, corrupt_xref_with_info_pdf()).unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--copy-attachments-from",
+            donor.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: file is damaged",
+            donor.display()
+        )))
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table",
+        ))
+        .stderr(predicate::str::contains(
+            "operation succeeded with warnings",
+        ));
+}
+
 // ── --no-original-object-ids (flpdf-9hc.13.5) ────────────────────────────────
 //
 // qpdf `--no-original-object-ids` omits the `%% Original object ID: N M`

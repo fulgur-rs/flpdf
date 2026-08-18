@@ -665,6 +665,40 @@ fn underlay_corrupt_source_emits_source_warnings_and_exits_zero() {
         )));
 }
 
+/// Regression: qpdf's cross-reference recovery permission is on by default
+/// (`include/qpdf/QPDF.hh:1458-1462`), so a corrupt-but-recoverable
+/// `--overlay` source must still recover and succeed even when the caller
+/// omits `--repair`. `build_overlay_specs` used to construct
+/// `PdfOpenOptions` from the raw `--repair` flag directly, bypassing the
+/// `pdf_open_options` helper's default-recovery treatment — the flag's
+/// absence turned recovery off for the overlay source specifically (the
+/// primary document was unaffected), diverging from qpdf.
+#[test]
+fn overlay_corrupt_source_recovers_without_explicit_repair_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corrupt = write_corrupt_fixture(tmp.path(), "corrupt-overlay-no-flag.pdf");
+    let out = tmp.path().join("out.pdf");
+    let dest = fixture("one-page.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg(&dest)
+        .arg("--overlay")
+        .arg(&corrupt)
+        .arg("--")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {}: file is damaged",
+            corrupt.display()
+        )))
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table",
+        ));
+}
+
 /// Regression guard: an overlay source with no `repair_diagnostics` must not
 /// add any `WARNING:` line — the emit helper must stay silent on a clean
 /// source. Also verifies that a re-parseable, warning-free source path does
