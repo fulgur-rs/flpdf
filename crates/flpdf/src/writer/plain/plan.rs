@@ -49,6 +49,21 @@ pub(crate) struct PlainWritePlan {
 }
 
 impl PlainWritePlan {
+    pub(crate) fn generated_object_stream_count(&self) -> usize {
+        self.objects
+            .iter()
+            .filter(|object| {
+                matches!(
+                    object,
+                    PlannedIndirectObject::ObjectStream {
+                        origin: PlannedObjectStreamOrigin::Synthetic,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         options: &WriterOptions,

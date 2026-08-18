@@ -78,19 +78,20 @@ fn qpdf_11_9_0() -> flpdf::Result<()> {
     Ok(())
 }
 
-fn qpdf_progress_for_minimal() -> flpdf::Result<Vec<u8>> {
+fn qpdf_progress_for_bytes(source: &[u8], options: &[&str]) -> flpdf::Result<Vec<u8>> {
     let dir = tempfile::tempdir()?;
+    let input_path = dir.path().join("qpdf-progress-input.pdf");
     let output_path = dir.path().join("qpdf-progress.pdf");
-    let output = Command::new("qpdf")
-        .arg("--progress")
-        .arg("../../tests/fixtures/minimal.pdf")
-        .arg(&output_path)
-        .output()?;
+    std::fs::write(&input_path, source)?;
+    let mut command = Command::new("qpdf");
+    command.arg("--progress");
+    command.args(options);
+    command.arg(&input_path).arg(&output_path);
+    let output = command.output()?;
     assert!(
         output.status.success(),
         "qpdf --progress failed: {output:?}"
     );
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut progress = Vec::new();
@@ -104,6 +105,10 @@ fn qpdf_progress_for_minimal() -> flpdf::Result<Vec<u8>> {
         }
     }
     Ok(progress)
+}
+
+fn qpdf_progress_for_minimal() -> flpdf::Result<Vec<u8>> {
+    qpdf_progress_for_bytes(include_bytes!("../../../tests/fixtures/minimal.pdf"), &[])
 }
 
 fn synthetic_unreferenced_object_pdf() -> Vec<u8> {
@@ -164,6 +169,64 @@ fn synthetic_many_object_pdf(count: u32) -> Vec<u8> {
         .as_bytes(),
     );
     bytes
+}
+
+fn synthetic_many_reachable_object_pdf(count: u32) -> Vec<u8> {
+    assert!(count >= 6);
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(count as usize);
+
+    for number in 1..=count {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        match number {
+            1 => bytes.extend_from_slice(
+                b"<< /Type /Catalog /Pages 2 0 R /Objects 5 0 R >>",
+            ),
+            2 => bytes.extend_from_slice(b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+            3 => bytes.extend_from_slice(
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << >> /Contents 4 0 R >>",
+            ),
+            4 => bytes.extend_from_slice(b"<< /Length 0 >>\nstream\n\nendstream"),
+            number if number < count => bytes.extend_from_slice(
+                format!("<< /Next {} 0 R /Marker {} >>", number + 1, number).as_bytes(),
+            ),
+            _ => bytes.extend_from_slice(b"<< /Marker 0 >>"),
+        }
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", count + 1).as_bytes());
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            count + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn flpdf_progress_for_bytes(source: &[u8], linearized: bool) -> flpdf::Result<(Vec<u8>, Vec<u8>)> {
+    let mut pdf = Pdf::open(Cursor::new(source.to_vec()))?;
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_static_id(true);
+    writer.set_linearization(linearized);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    let events = events.borrow().clone();
+    Ok((events, output))
 }
 
 struct FailingWriter;
@@ -2488,6 +2551,42 @@ fn pdf_writer_objstm_progress_counts_members_not_containers() -> flpdf::Result<(
     assert_eq!(events.first(), Some(&0));
     assert_eq!(events.iter().filter(|percent| **percent == 0).count(), 1);
     Ok(())
+}
+
+fn assert_large_generate_progress_matches_qpdf(linearized: bool) -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let source = synthetic_many_reachable_object_pdf(250);
+    let options = if linearized {
+        vec!["--object-streams=generate", "--linearize"]
+    } else {
+        vec!["--object-streams=generate"]
+    };
+    let expected = qpdf_progress_for_bytes(&source, &options)?;
+    let (actual, output) = flpdf_progress_for_bytes(&source, linearized)?;
+
+    assert!(
+        output
+            .windows(b"/Type /ObjStm".len())
+            .any(|window| window == b"/Type /ObjStm"),
+        "large generate fixture must emit an ObjStm"
+    );
+    assert_eq!(
+        actual,
+        expected,
+        "progress sequence must match qpdf for {} output",
+        if linearized { "linearized" } else { "standard" }
+    );
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_large_generate_progress_matches_qpdf_for_standard_output() -> flpdf::Result<()> {
+    assert_large_generate_progress_matches_qpdf(false)
+}
+
+#[test]
+fn pdf_writer_large_generate_progress_matches_qpdf_for_linearized_output() -> flpdf::Result<()> {
+    assert_large_generate_progress_matches_qpdf(true)
 }
 
 #[test]

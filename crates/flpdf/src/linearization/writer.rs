@@ -2344,6 +2344,14 @@ fn do_write_pass<R: Read + Seek>(
                 decrement_progress_event(options);
             }
             report_progress_event(options);
+            if pass1_digest {
+                // qpdf's writeObjectStream performs an offset-measuring pass
+                // followed by the payload pass inside each outer linearization
+                // pass. The first outer pass therefore reports each member
+                // twice after the decrement, while the final pass's net effect
+                // is one event (QPDFWriter.cc:1639-1707).
+                report_progress_event(options);
+            }
         }
     }
 
@@ -2484,6 +2492,9 @@ fn do_write_pass<R: Read + Seek>(
                 decrement_progress_event(options);
             }
             report_progress_event(options);
+            if pass1_digest {
+                report_progress_event(options);
+            }
         }
     }
 
@@ -2606,6 +2617,9 @@ fn do_write_pass<R: Read + Seek>(
                         decrement_progress_event(options);
                     }
                     report_progress_event(options);
+                    if pass1_digest {
+                        report_progress_event(options);
+                    }
                 }
             }
         }
@@ -3195,6 +3209,18 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     } else {
         options.object_streams
     };
+
+    // qpdf allocates generated ObjStm placeholders before it removes page and
+    // Catalog members from the mapping (QPDFWriter.cc:1970-2005, 2141-2161).
+    // Count those pre-filter containers for progress even when a later filter
+    // leaves one empty and therefore absent from the emitted layout.
+    let generated_object_stream_count = if mode == crate::writer::ObjectStreamMode::Generate {
+        let compressible = crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?;
+        crate::writer::object_streams::even_split_into_streams(&compressible.eligible).len()
+    } else {
+        0
+    };
+    crate::writer::configure_progress_for_pdf(pdf, options, generated_object_stream_count, true)?;
     let plan = LinearizationPlan::from_pdf_with_object_stream_mode(pdf, mode)?;
     let renumber = RenumberMap::from_plan(&plan);
     write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)

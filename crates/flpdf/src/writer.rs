@@ -676,6 +676,41 @@ pub(crate) struct WriterOptions {
     pub(crate) progress_reporter: Option<ProgressReporter>,
 }
 
+/// Configure qpdf-shaped progress after the writer has completed the setup
+/// that allocates any synthetic objects. qpdf snapshots
+/// `QPDF::getObjectCount()` only after `doWriteSetup` (QPDFWriter.cc:2189-2193),
+/// so callers pass the number of fresh ObjStm containers allocated during that
+/// setup without mutating the source document just for progress accounting.
+pub(crate) fn configure_progress_for_pdf<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    additional_objects: usize,
+    linearized: bool,
+) -> Result<()> {
+    if options.progress_reporter.is_none() {
+        return Ok(());
+    }
+
+    // cov:ignore-start: Pdf::get_object_count returns u32, and flpdf's
+    // supported targets have usize at least 32 bits wide.
+    let object_count = usize::try_from(pdf.get_object_count()?).map_err(|_| {
+        crate::Error::Unsupported("PdfWriter progress object count does not fit usize".into())
+    })?;
+    // cov:ignore-end
+    configure_progress(
+        options,
+        object_count.saturating_add(additional_objects),
+        linearized,
+    );
+    Ok(())
+}
+
+pub(crate) fn configure_progress(options: &WriterOptions, object_count: usize, linearized: bool) {
+    if let Some(reporter) = options.progress_reporter.as_ref() {
+        reporter.configure(object_count.saturating_mul(if linearized { 2 } else { 1 }));
+    } // cov:ignore: LLVM maps this closing brace as an executable branch line
+}
+
 pub(crate) fn report_progress_event(options: &WriterOptions) {
     if let Some(reporter) = options.progress_reporter.as_ref() {
         reporter.indicate(false, false);
@@ -8476,6 +8511,24 @@ mod tests {
         let reporter = ProgressReporter::new(Box::new(|_| {}));
 
         assert_eq!(format!("{reporter:?}"), "ProgressReporter(..)");
+    }
+
+    #[test]
+    fn configure_progress_reports_from_the_scaled_event_budget() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_for_reporter = Rc::clone(&events);
+        let options = WriterOptions {
+            progress_reporter: Some(ProgressReporter::new(Box::new(move |percent| {
+                events_for_reporter.borrow_mut().push(percent);
+            }))),
+            ..WriterOptions::default()
+        };
+
+        configure_progress(&options, 2, true);
+        report_progress_event(&options);
+        report_progress_finished(&options);
+
+        assert_eq!(&*events.borrow(), &[0, 100]);
     }
 
     #[test]
