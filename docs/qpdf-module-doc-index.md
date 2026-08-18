@@ -26,6 +26,7 @@
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/job/json.rs` | correspondence | QPDFJob.cc writeJSON output selection and stream-prefix resolution |
+| `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command orchestration with only JSON output selection currently exposed |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |

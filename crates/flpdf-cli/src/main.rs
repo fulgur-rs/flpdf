@@ -4,7 +4,8 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
-    write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
+    write_json, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob,
+    UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -2662,17 +2663,12 @@ fn finish_check_report(input: &Path, report: flpdf::CheckReport) -> CliResult<()
 
     if has_warnings {
         // Warnings without errors — exit 3. qpdf still prints the block above,
-        // but omits the trailing "No syntax ..." note. Pass an empty message so
-        // main() does not emit a redundant "flpdf: ..." line.
-        // qpdf 11.9.0 ends the warning-bearing run with this stderr summary.
-        logger_warn(format!(
-            "{}: operation succeeded with warnings\n",
-            progname()
-        ))?; // cov:ignore: exercised by check warning subprocess integration tests
-        return Err(Box::new(CliExitError {
-            code: ExitCode::Warnings,
-            message: String::new(),
-        }));
+        // but omits the trailing "No syntax ..." note. `--check` is inspection
+        // (`creates_output = false`), and qpdf's `writeQPDF` routes both the
+        // output and inspection arms through the same shared warning-summary
+        // block (`QPDFJob.cc:486-504`) rather than a `--check`-only path;
+        // `finish_warning_state` is that same shared boundary.
+        return finish_warning_state(true, false); // cov:ignore: exercised by check warning subprocess integration tests
     }
 
     // Clean — exit 0. qpdf closes a clean check with this two-line note; the
@@ -5807,22 +5803,20 @@ fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>, creates_output: bool)
 }
 
 fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<()> {
-    if !has_warnings {
-        return Ok(());
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    if has_warnings {
+        job.record_warnings();
     }
-    let suffix = if creates_output {
-        "; resulting file may have some problems"
-    } else {
-        ""
-    };
-    logger_warn(format!(
-        "{}: operation succeeded with warnings{suffix}\n",
-        progname()
-    ))?; // cov:ignore: exercised by warning-summary subprocess integration tests
-    Err(Box::new(CliExitError {
-        code: ExitCode::Warnings,
-        message: String::new(),
-    }))
+
+    match job.complete(creates_output)? {
+        JobExitCode::Success => Ok(()),
+        JobExitCode::Warning => Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        })),
+    }
 }
 
 fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) -> CliResult<()> {
@@ -5859,23 +5853,10 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     for &last_bad in normalization_last_bad {
         emit_content_normalization_warnings(input, last_bad)?;
     }
-    if !normalization_last_bad.is_empty() || has_repair_warnings {
-        let suffix = if creates_output {
-            "; resulting file may have some problems"
-        } else {
-            ""
-        };
-        logger_warn(format!(
-            "{}: operation succeeded with warnings{suffix}\n",
-            progname()
-        ))?; // cov:ignore: exercised by normalization-warning subprocess integration tests
-    } else {
+    if normalization_last_bad.is_empty() && !has_repair_warnings {
         return Ok(());
     }
-    Err(Box::new(CliExitError {
-        code: ExitCode::Warnings,
-        message: String::new(),
-    }))
+    finish_warning_state(true, creates_output)
 }
 
 /// Prefix a fatal error with the input path so main() renders the observed
