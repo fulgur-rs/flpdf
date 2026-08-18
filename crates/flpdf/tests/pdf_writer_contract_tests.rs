@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::process::Command;
 use std::rc::Rc;
 
@@ -78,6 +78,34 @@ fn qpdf_11_9_0() -> flpdf::Result<()> {
     Ok(())
 }
 
+fn qpdf_progress_for_minimal() -> flpdf::Result<Vec<u8>> {
+    let dir = tempfile::tempdir()?;
+    let output_path = dir.path().join("qpdf-progress.pdf");
+    let output = Command::new("qpdf")
+        .arg("--progress")
+        .arg("../../tests/fixtures/minimal.pdf")
+        .arg(&output_path)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "qpdf --progress failed: {output:?}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut progress = Vec::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        if let Some(value) = line.strip_prefix("qpdf: ") {
+            if let Some(value) = value.split("write progress: ").nth(1) {
+                progress.push(value.trim_end_matches('%').parse::<u8>().map_err(|error| {
+                    flpdf::Error::Unsupported(format!("invalid qpdf progress output: {error}"))
+                })?);
+            }
+        }
+    }
+    Ok(progress)
+}
+
 fn synthetic_unreferenced_object_pdf() -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
     let objects = [
@@ -103,6 +131,51 @@ fn synthetic_unreferenced_object_pdf() -> Vec<u8> {
         format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
     );
     bytes
+}
+
+fn synthetic_many_object_pdf(count: u32) -> Vec<u8> {
+    assert!(count >= 2);
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(count as usize);
+
+    for number in 1..=count {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        if number == 1 {
+            bytes.extend_from_slice(b"<< /Type /Catalog /Pages 2 0 R >>");
+        } else if number == 2 {
+            bytes.extend_from_slice(b"<< /Type /Pages /Count 0 /Kids [] >>");
+        } else {
+            bytes.extend_from_slice(b"<< /Marker 0 >>");
+        }
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", count + 1).as_bytes());
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            count + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("progress contract sink failure"))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn synthetic_pclm_image_pdf() -> Vec<u8> {
@@ -2325,6 +2398,7 @@ fn pdf_writer_pclm_uses_page_strip_fifo_and_synthetic_transforms() -> flpdf::Res
 
 #[test]
 fn pdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
     let events = Rc::new(RefCell::new(Vec::<u8>::new()));
     let mut pdf = open_minimal_pdf()?;
     let mut writer = PdfWriter::new(&mut pdf);
@@ -2338,9 +2412,141 @@ fn pdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
     let events = events.borrow();
     assert!(!events.is_empty());
     assert_eq!(events.first(), Some(&0));
+    assert_eq!(
+        events.iter().filter(|percent| **percent == 0).count(),
+        1,
+        "the first writeObject event is the only initial zero"
+    );
     assert_eq!(events.last(), Some(&100));
     assert!(events.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(events.iter().all(|percent| *percent <= 100));
+    assert_eq!(&*events, &qpdf_progress_for_minimal()?);
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_progress_throttles_large_documents() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_many_object_pdf(250)))?;
+    let source_object_count = pdf
+        .object_refs()
+        .into_iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .expect("synthetic PDF has objects") as usize;
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_preserve_unreferenced_objects(true);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let events = events.borrow();
+    assert_eq!(events.first(), Some(&0));
+    assert_eq!(events.iter().filter(|percent| **percent == 0).count(), 1);
+    assert_eq!(events.last(), Some(&100));
+    assert!(events[..events.len() - 1]
+        .iter()
+        .all(|percent| *percent <= 99));
+    assert!(
+        events.len() < source_object_count,
+        "qpdf's next_progress_report throttles callbacks: {}/{}",
+        events.len(),
+        source_object_count
+    );
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_objstm_progress_counts_members_not_containers() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let source_object_count = pdf
+        .object_refs()
+        .into_iter()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .expect("minimal PDF has objects") as usize;
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let events = events.borrow();
+    assert_eq!(events.last(), Some(&100));
+    assert_eq!(
+        events[..events.len() - 1].len(),
+        source_object_count,
+        "one progress event per source object, including ObjStm members"
+    );
+    assert_eq!(events.first(), Some(&0));
+    assert_eq!(events.iter().filter(|percent| **percent == 0).count(), 1);
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_failure_does_not_report_success() -> flpdf::Result<()> {
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_writer(FailingWriter)?;
+
+    assert!(writer.write().is_err());
+    assert!(!events.borrow().contains(&100));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_re_registration_uses_the_latest_reporter() -> flpdf::Result<()> {
+    let old_events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let new_events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    let old_events_for_reporter = Rc::clone(&old_events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        old_events_for_reporter.borrow_mut().push(percent);
+    }));
+    let new_events_for_reporter = Rc::clone(&new_events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        new_events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    assert!(old_events.borrow().is_empty());
+    assert_eq!(new_events.borrow().first(), Some(&0));
+    assert_eq!(new_events.borrow().last(), Some(&100));
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_progress_callback_panic_does_not_reach_success() -> flpdf::Result<()> {
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+        if percent == 0 {
+            panic!("progress callback failure");
+        }
+    }));
+    writer.set_output_memory()?;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.write()));
+    assert!(result.is_err());
+    assert_eq!(events.borrow().as_slice(), &[0]);
+    assert!(!events.borrow().contains(&100));
     Ok(())
 }
 
