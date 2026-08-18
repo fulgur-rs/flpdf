@@ -597,13 +597,16 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 
 ### B. `QPDFJob::handlePageSpecs` 相当の分解 — 4,158 行
 
-`job/page_specs.rs` / `page_merge.rs`(1117) / `page_rotate.rs`(632) / `page_split.rs`(454) / `page_extract.rs`(435) /
+`job/page_specs.rs` / `job/page_split.rs` / `page_merge.rs`(1117) / `page_rotate.rs`(632) / `page_split.rs`(naming helpers) / `page_extract.rs`(435) /
 `page_range.rs`(379) / `page_splice.rs`(304) / `page_combine.rs`(278) / `page_plan.rs`(210) /
 `rotate_spec.rs`(204) / `page_collate.rs`(145)
 
 `job/page_specs.rs` がqpdfのjob-level orchestration（`QPDFJob.cc:2360-2632`）を所有し、
 `page_merge.rs` と `PageDocumentHelper` がforeign page copy/page-tree primitiveを所有する。
-`doSplitPages`（`QPDFJob.cc:2940-3027`）とwriter/output命名のjob移設は次のstacked sliceとする。
+`doSplitPages`（`QPDFJob.cc:2940-3027`）とwriter/output命名は `job/page_split.rs` に移設済み。
+`PageDocumentHelper::add_page(PageInput::Foreign)`、`PageObjectHelper::copy_annotations_from`、
+`PageLabelDocumentHelper::write_reconstructed_labels_with_prefix_presence` を通る fresh chunk
+生成を実装し、CLI の単一入力・複数入力 split 出力を同じ job route に切り替えた。
 
 ### C. qpdf に機能そのものが無いもの
 
@@ -739,7 +742,7 @@ CI で走らない。ファイル全体が gated な 11 件は全て列挙済み
 | `Buffer` / `Pl_Buffer` / 汎用 `Pl_*` → `Vec<u8>` / `Write` | 856 | 無し |
 | `QPDFDocumentHelper` / `QPDFObjectHelper` 基底 → トレイト無し | 12 | 無し |
 | `std::shared_ptr<QPDFValue>` → `Rc<RefCell<..>>`（`object_handle.rs`） | 79 | 無し（`Rc` による共有 identity の内部所有権機構自体。live direct containment の weak reverse index は qpdf の現在の forward membership から派生する incremental dirty bookkeeping で、stale owner の誤った scheduling を現在の graph に一致させる。共有 identity と各 object の serialization rule は変えず、Pdf identity provenance は別フィールドで保持。byte-identical suite で確認済み） |
-| `std::shared_ptr<Buffer> QPDF_Stream::stream_data`（`libqpdf/qpdf/QPDF_Stream.hh:104`） → `Rc<Vec<u8>>`（`object_handle.rs` の `ObjectValue::Stream`） | 1 | 無し（共有の意味論は同一。`QPDFObjectHandle::newStream(QPDF*, shared_ptr<Buffer>)` / `replaceStreamData(shared_ptr<Buffer>, ..)` / `QPDF_Stream::getStreamDataBuffer` に対応する `ObjectHandle::stream` / `replace_stream_data` / `as_stream_data` が buffer を共有したまま受け渡す。`Rc<[u8]>` ではなく `Rc<Vec<u8>>` なのは、`Rc::<[u8]>::from(vec)` が refcount ヘッダを前置できず payload 全体を memcpy するため（`page_split.rs:376-386` に同じ罠を実測付きで記録）。二段の間接になるのは `shared_ptr<Buffer>` と偶然一致するだけで対応関係ではない — qpdf が `Buffer` 型を要するのは C++ が borrow/own を型で表せず実行時フラグに畳むからで（`include/qpdf/Buffer.hh:35-46` が所有・非所有の両コンストラクタを持つ）、その面は既存の `Buffer` → `Vec<u8>` 行が扱う。`Arc` ではなく `Rc` なのは `Repr` が `Rc<RefCell<..>>` ベースで `ObjectValue` がそもそも `!Send` のため。`replace_stream_data` は `QPDF_Stream::replaceFilterData`（`QPDF_Stream.cc:668-684`）に対応する共有 helper を通り、zero length では `/Length` を削除、nonzero では正確な integer を設定する（`flpdf-25kg.4.5`）。byte-identical suite（`qpdf-zlib-compat`）で確認済み） |
+| `std::shared_ptr<Buffer> QPDF_Stream::stream_data`（`libqpdf/qpdf/QPDF_Stream.hh:104`） → `Rc<Vec<u8>>`（`object_handle.rs` の `ObjectValue::Stream`） | 1 | 無し（共有の意味論は同一。`QPDFObjectHandle::newStream(QPDF*, shared_ptr<Buffer>)` / `replaceStreamData(shared_ptr<Buffer>, ..)` / `QPDF_Stream::getStreamDataBuffer` に対応する `ObjectHandle::stream` / `replace_stream_data` / `as_stream_data` が buffer を共有したまま受け渡す。`Rc<[u8]>` ではなく `Rc<Vec<u8>>` なのは、`Rc::<[u8]>::from(vec)` が refcount ヘッダを前置できず payload 全体を memcpy するため。二段の間接になるのは `shared_ptr<Buffer>` と偶然一致するだけで対応関係ではない — qpdf が `Buffer` 型を要するのは C++ が borrow/own を型で表せず実行時フラグに畳むからで（`include/qpdf/Buffer.hh:35-46` が所有・非所有の両コンストラクタを持つ）、その面は既存の `Buffer` → `Vec<u8>` 行が扱う。`Rc` なのは `Repr` が `Rc<RefCell<..>>` ベースで `ObjectValue` がそもそも `!Send` のため。`replace_stream_data` は `QPDF_Stream::replaceFilterData`（`QPDF_Stream.cc:668-684`）に対応する共有 helper を通り、zero length では `/Length` を削除、nonzero では正確な integer を設定する（`flpdf-25kg.4.5`）。byte-identical suite（`qpdf-zlib-compat`）で確認済み） |
 | `QPDF_Array` borrow / slash 付き canonical name string → `Vec<ObjectHandle>` の単一 child clone / slash 無し decoded `Vec<u8>`、および live array mutation（`object_handle.rs`） | 0 | 無し。`try_array_item` は `QPDF_Array::at` と同じ valid index の child identity を `Rc` clone で返し、name predicate は同じ decoded bytes を比較するだけで出力しない。`set_array_item` / `set_array_items` / `insert_array_item` / `append_array_item` / `erase_array_item` は `QPDFObjectHandle.cc:869-955` と `QPDF_Array.cc:10-26,220-313` の bounds→warning、ownership、live child containment、`setFromVector` の clear-before-check / partial-prefix 順序を保持する。`nntree.rs` の canonical NNTree engine はこの live mutation boundary を `set_array_items` から利用し、旧 `replace_array_item(s)` は qpdf の warning/ownership/insert/erase 契約を持たない compatibility bridge として残る。 |
 
 現時点の証拠ではいずれも出力バイトに影響しない。

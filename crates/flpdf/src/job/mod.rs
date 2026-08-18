@@ -10,6 +10,7 @@ mod json;
 mod json_sections;
 mod lifecycle;
 mod page_specs;
+mod page_split;
 
 pub use json::{
     write_json, write_qpdf_json_v2_selected_objects_to_output_with_options,
@@ -27,3 +28,4 @@ pub(crate) use json_sections::{
 };
 pub use lifecycle::{JobExitCode, QPDFJob};
 pub use page_specs::PageSpecInput;
+pub use page_split::SplitPageOptions;

@@ -5,7 +5,7 @@ use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
     JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
-    QPDFJob, UsageError,
+    QPDFJob, SplitPageOptions, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -16,7 +16,6 @@ use flpdf::{
     page_collate::collate,
     page_combine::{CombinedPage, CombinedPlan},
     page_rotate::apply_rotate_to_pages,
-    page_split::split_pages,
     page_tree_rebuild::rebuild_page_tree,
     struct_tree_pg::drop_struct_elem_dangling_pg,
     subset_prune::prune_after_subset,
@@ -4315,6 +4314,7 @@ fn run_page_extraction(
         return match opened {
             JobPdf::File(pdf) => run_page_extraction_from_repeated_pdf(
                 pdf,
+                primary_input,
                 output,
                 repair,
                 page_ops,
@@ -4329,6 +4329,7 @@ fn run_page_extraction(
             ),
             JobPdf::Json(pdf) => run_page_extraction_from_repeated_pdf(
                 pdf,
+                primary_input,
                 output,
                 repair,
                 page_ops,
@@ -4434,6 +4435,7 @@ fn run_page_extraction(
     run_page_extraction_after_plan(
         pdf,
         output,
+        source_path,
         repair,
         page_ops,
         overlay_specs,
@@ -4564,6 +4566,7 @@ fn run_page_extraction_from_multiple_sources(
     run_page_extraction_after_plan(
         merged,
         output,
+        primary_input,
         repair,
         page_ops,
         overlay_specs,
@@ -4582,6 +4585,7 @@ fn run_page_extraction_from_multiple_sources(
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
     mut pdf: Pdf<R>,
+    primary_input: &Path,
     output: &Path,
     repair: bool,
     page_ops: &PageOpArgs,
@@ -4631,6 +4635,7 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
     run_page_extraction_after_plan(
         pdf,
         output,
+        primary_input,
         repair,
         page_ops,
         overlay_specs,
@@ -4650,6 +4655,7 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
 fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     mut pdf: Pdf<R>,
     output: &Path,
+    input_path: &Path,
     repair: bool,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
@@ -4752,7 +4758,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_pages(bytes, n, output, options.deterministic_id)?;
+        let written = split_rewritten_pdf(bytes, n, output, input_path, options.deterministic_id)?;
         if verbose {
             for path in &written {
                 logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
@@ -4808,6 +4814,30 @@ fn parse_split_n(raw: &str) -> CliResult<usize> {
     Ok(n)
 }
 
+/// Run qpdf's fresh-document split job on a rewritten in-memory source.
+///
+/// The page-operation pipeline has already applied its transforms to `bytes`;
+/// the job-level split owns the subsequent per-chunk page copy, naming,
+/// annotation, label, and output-file lifecycle. `input_path` remains the
+/// original command input so the qpdf same-file guard can reject a generated
+/// chunk that would truncate it.
+fn split_rewritten_pdf(
+    bytes: Vec<u8>,
+    chunk_size: usize,
+    output: &Path,
+    input_path: &Path,
+    deterministic_id: bool,
+) -> CliResult<Vec<PathBuf>> {
+    let mut pdf = Pdf::open_mem_owned(bytes)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let options = SplitPageOptions::new(chunk_size, output)
+        .with_input_path(input_path)
+        .with_deterministic_id(deterministic_id);
+    Ok(job.split_pages(&mut pdf, options)?)
+}
+
 /// Apply `--rotate` / `--split-pages` to a plain (no `--pages`) rewrite.
 ///
 /// qpdf accepts these without `--pages` (exit 0). `--rotate` mutates the
@@ -4829,16 +4859,17 @@ fn run_rewrite_with_page_ops(
     let opened = open_job_pdf(input, repair, password, json_input, update_from_json, false)?;
     match opened {
         JobPdf::File(pdf) => {
-            run_rewrite_with_page_ops_opened(pdf, output, page_ops, options, verbose)
+            run_rewrite_with_page_ops_opened(pdf, input, output, page_ops, options, verbose)
         }
         JobPdf::Json(pdf) => {
-            run_rewrite_with_page_ops_opened(pdf, output, page_ops, options, verbose)
+            run_rewrite_with_page_ops_opened(pdf, input, output, page_ops, options, verbose)
         }
     }
 }
 
 fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
     mut pdf: Pdf<R>,
+    input: &Path,
     output: &std::path::Path,
     page_ops: &PageOpArgs,
     options: WriterOptions,
@@ -4870,11 +4901,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        // `bytes` is handed over rather than lent: the split branch is the last
-        // use of it (the `std::fs::write` below belongs to the other branch), so
-        // moving it in keeps the rewritten document resident once instead of
-        // twice for the whole of the split.
-        let written = split_pages(bytes, n, output, options.deterministic_id)?;
+        let written = split_rewritten_pdf(bytes, n, output, input, options.deterministic_id)?;
         if verbose {
             for path in &written {
                 // cov:ignore-start: exercised by verbose split-pages subprocess integration tests
