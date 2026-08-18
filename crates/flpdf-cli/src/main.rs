@@ -39,8 +39,8 @@ use flpdf::{
     Severity, StreamDataMode,
 };
 use flpdf::{
-    copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list_with_sink,
-    insert_embedded_file, list_attachment_info, remove_attachment, FileParamDates, FileSpecBuilder,
+    copy_attachments_from, fix_qdf, insert_embedded_file, list_attachment_info, remove_attachment,
+    FileParamDates, FileSpecBuilder,
 };
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -6224,14 +6224,12 @@ fn run_list_attachments(
 ) -> CliResult<()> {
     let input = input.ok_or("--list-attachments: missing input PDF")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    // qpdf reports the absence of an /EmbeddedFiles name tree with the input
-    // file name (QPDFJob::doListAttachments), so that branch stays with the
-    // caller that knows the name.
-    match format_attachment_list_with_sink(&mut pdf, verbose, |data| cli_logger().info(data))? {
-        Some(_) => {}
-        None => logger_info(format!("{} has no embedded files\n", input.display()))?,
-    }
-    finish_operation_warnings(&pdf, false)
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_input_name(input.display().to_string());
+    let status = job.list_attachments(&mut pdf, verbose)?;
+    finish_job_exit_status(status)
 }
 
 /// `--show-attachment KEY [-o PATH] input`
@@ -6242,16 +6240,20 @@ fn run_show_attachment(
     key: &str,
 ) -> CliResult<()> {
     let input = input.ok_or("--show-attachment: missing input PDF")?;
-    let mut standard_output = standard_save_writer()?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    let bytes = extract_attachment(&mut pdf, key.as_bytes()).map_err(|e| {
-        format!(
-            "--show-attachment: key {:?} not found or unreadable: {e}",
-            key
-        )
-    })?;
-    standard_output.write_all(&bytes)?;
-    finish_operation_warnings(&pdf, false)
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    job.set_input_name(input.display().to_string());
+    let status = job
+        .show_attachment(&mut pdf, key.as_bytes())
+        .map_err(|error| {
+            format!(
+                "--show-attachment: key {:?} not found or unreadable: {error}",
+                key
+            )
+        })?;
+    finish_job_exit_status(status)
 }
 
 /// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- input output`
