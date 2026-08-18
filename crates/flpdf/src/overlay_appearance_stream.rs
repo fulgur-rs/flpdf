@@ -136,13 +136,11 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
             continue;
         }
         let staged = merge_with.try_get_key(&category_key)?;
-        let mut has_staged_conflict = false;
         for (old_name, new_name) in renames {
             let old_key = canonical_resource_name(old_name);
             let new_key = canonical_resource_name(new_name);
             let existing_new = subdict.try_get_key(&new_key)?;
             if !existing_new.try_is_null()? {
-                has_staged_conflict = true;
                 staged.replace_key(&new_key, existing_new)?;
             }
             let existing_old = subdict.try_get_key(&old_key)?;
@@ -150,14 +148,6 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
                 subdict.replace_key(&new_key, existing_old)?;
                 subdict.remove_key(&old_key);
             }
-        }
-        if has_staged_conflict {
-            // qpdf lazily builds its object-identity/name maps when the
-            // first staged value meets an occupied destination slot. That
-            // scan resolves every resource value, so a malformed indirect
-            // resource must surface the same parse error here rather than
-            // being hidden by a handle-only identity comparison.
-            resolve_resource_values(pdf, &subdict)?;
         }
     }
 
@@ -226,23 +216,6 @@ fn extend_dr_map_from_conflicts(dr_map: &mut DrMap, conflicts: &ResourceConflict
             );
         }
     }
-}
-
-fn resolve_resource_values<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    category: &ObjectHandle,
-) -> Result<()> {
-    for key in category.try_get_keys()? {
-        let value = category.try_get_key(&key)?;
-        let value = pdf.resolve_object_handle_to_terminal(&value)?;
-        if value.as_dictionary().is_some() {
-            for nested_key in value.try_get_keys()? {
-                let nested_value = value.try_get_key(&nested_key)?;
-                pdf.resolve_object_handle_to_terminal(&nested_value)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1166,6 +1139,69 @@ mod tests {
     }
 
     #[test]
+    fn adjust_appearance_stream_leaves_lossy_filtered_content_byte_identical() {
+        // DCTDecode is both specialized AND lossy compression
+        // (StreamFilter::is_lossy_compression, stream_filter.rs's
+        // DctStreamFilter). qpdf's pipeStreamData gates a lossy filter on
+        // `decode_level >= qpdf_dl_all` (QPDF_Stream.cc); at the
+        // DecodeLevel::Generalized this module uses, the filter pipeline is
+        // never installed and raw bytes are piped through with
+        // `filtered = false`. Re-encoding those raw JPEG bytes as though
+        // they were decoded content would corrupt the image. This is
+        // distinct from the CCITTFaxDecode tests above, which exercise
+        // is_specialized_compression only; DCTDecode's is_lossy_compression
+        // flag is the specific signal filterable_stream_data must also
+        // honor (crate::object_handle's pipe_stream_data_inner gates lossy
+        // filters at `decode_level < DecodeLevel::All`, a stricter bound
+        // than specialized filters' `< DecodeLevel::Specialized`).
+        let mut pdf = open_minimal();
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", PdfObject::Integer(1));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
+        let jpeg_like_bytes: &[u8] = b"\xff\xd8\xff\xe0not-real-jpeg-but-lossy-passthrough-bytes";
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[
+                ("Resources", PdfObject::Dictionary(resources)),
+                ("Filter", PdfObject::Name(b"DCTDecode".to_vec())),
+            ],
+            jpeg_like_bytes,
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map)
+            .expect("a lossy-filtered AP stream must not fail the whole call");
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, jpeg_like_bytes,
+            "lossy/specialized-filtered content must stay byte-identical, \
+             not be treated as decoded and re-encoded"
+        );
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&PdfObject::Name(b"DCTDecode".to_vec())),
+            "the filter must stay untouched since qpdf never installs a \
+             decode pipeline for it at this decode level"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(PdfObject::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(
+            font.get("F1_1"),
+            Some(&PdfObject::Integer(1)),
+            "the /Resources dict rename still applies independently of the \
+             (never attempted) content rewrite"
+        );
+        assert!(font.get("F1").is_none());
+    }
+
+    #[test]
     fn adjust_appearance_stream_rename_chain_matches_qpdf_verified_result() {
         // dr_map records a CHAIN within one category: F1->F1_1 AND,
         // independently, F1_1->F1_1_1 (both entries genuinely present in
@@ -1456,11 +1492,16 @@ mod tests {
 
     #[test]
     fn adjust_appearance_stream_tolerates_malformed_nested_resource_like_qpdf() {
-        // Keep object 8 lazy and malformed. qpdf reports warnings while
-        // recovering this object as part of getResourceNames, but
-        // QPDFObjectHandle::mergeResources does not propagate that warning as
-        // an operation error; the canonical handle route must likewise keep
-        // adjusting the appearance stream.
+        // Keep object 8 lazy and malformed, reachable only two levels below
+        // the Font category (Font/F0 -> object 5 -> /Broken -> object 8).
+        // qpdf's actual conflict-resolution scan (getResourceNames,
+        // QPDFObjectHandle.cc:1156-1170) dereferences a category value only
+        // one level deep, to check `val.isDictionary()`, and then reads that
+        // value's own KEYS without dereferencing ITS values — so object 5 is
+        // touched (and is fine) but object 8 is never reached at all. The
+        // canonical handle route must match that resolution depth, not go
+        // deeper and surface a parse failure qpdf itself would never
+        // encounter here.
         let bodies: &[&[u8]] = &[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
             b"2 0 obj\nnull\nendobj\n",
@@ -1515,11 +1556,41 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        assert!(adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).is_ok());
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map)
+            .expect("a malformed object two levels below the touched category must not fail");
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"/F1_1 18 Tf",
+            "the rename must actually apply to the stream content"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(PdfObject::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(
+            font.get_ref("F1_1"),
+            Some(f1_ref),
+            "F1's value must move into the F1_1 slot"
+        );
+        assert!(font.get("F1").is_none(), "F1 must be removed after rename");
+        assert_eq!(
+            font.get_ref("F0"),
+            Some(broken_resource_ref),
+            "F0 is untouched by the rename and its malformed grandchild is never dereferenced"
+        );
     }
 
     #[test]
-    fn adjust_appearance_stream_resolves_nested_resource_values_on_conflict() {
+    fn adjust_appearance_stream_unrelated_nested_resource_does_not_interfere_with_rename() {
+        // An unrelated category entry (F0) that itself points at a
+        // dictionary with its own further reference (object 9 -> "Nested"
+        // -> object 8) is not part of the F1->F1_1 rename and is never
+        // dereferenced past its own immediate value — matching qpdf's
+        // getResourceNames, which reads only the immediate category value's
+        // own keys, not the values behind them (QPDFObjectHandle.cc:1156-1170).
         let mut pdf = open_minimal();
         let nested_value_ref = set_dict(&mut pdf, 8, &[]);
         let nested_resource_ref = set_dict(
@@ -1551,6 +1622,17 @@ mod tests {
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(PdfObject::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(
+            font.get_ref("F0"),
+            Some(nested_resource_ref),
+            "the unrelated F0 entry is untouched by the F1->F1_1 rename"
+        );
     }
 
     /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its
