@@ -532,7 +532,7 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 
 | doJSON* | 経由すべきヘルパー | §7 の状態 |
 |---|---|---|
-| `doJSONAcroform` | `QPDFAcroFormDocumentHelper` + `QPDFFormFieldObjectHelper` + `QPDFAnnotationObjectHelper` + `QPDFPageDocumentHelper` | ✅ / ✅ / ✅ / ✅ |
+| `doJSONAcroform` | `QPDFAcroFormDocumentHelper` + `QPDFFormFieldObjectHelper` + `QPDFAnnotationObjectHelper` + `QPDFPageDocumentHelper` | 🔀 / 🔀 / 🔀 / 🔀（このJSON経路自体のD2要件——単一実装で canonical helper を経由すること——はq2foで満たした。旧`json_inspect`の重複実装は削除済み。§7の🔀は各ヘルパー自体の他責務が未完了であることを指し、この行の完了とは独立） |
 | `doJSONAttachments` | `QPDFEmbeddedFileDocumentHelper` + `QPDFFileSpecObjectHelper` + `QPDFEFStreamObjectHelper` | ✅ / ✅（D1 は完成済み。`job/json_sections.rs` の再実装により D2 はなお未達 — `flpdf-q2fo` で解消予定） |
 | `doJSONPages` | `QPDFPageDocumentHelper` + `QPDFPageObjectHelper` | 🔀 / 🔀 |
 | `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |

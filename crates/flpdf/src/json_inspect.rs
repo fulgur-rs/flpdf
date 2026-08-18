@@ -1,4 +1,4 @@
-//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization, `QPDF_Stream::writeStreamJSON` payload/dictionary normalization, and `QPDFJob::doJSONAcroform`.
+//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary normalization.
 //! qpdf JSON v2 value conversion and canonical object/stream serialization.
 //!
 //! Provides the generic value-conversion frame for qpdf `--json` output.
@@ -7315,6 +7315,41 @@ mod tests {
         assert_eq!(
             value_for_key(&annotation, "appearancestate"),
             &serde_json::Value::String("/1".to_string())
+        );
+    }
+
+    #[test]
+    fn acroform_section_preserves_non_utf8_appearance_state_bytes() {
+        // qpdf's JSON::Writer::encode_string operates byte-wise and never
+        // validates UTF-8 (libqpdf/JSON.cc:216-271): a PDF Name's raw bytes
+        // pass through unescaped except for control chars and quote/backslash.
+        // `String::from_utf8_lossy` would replace an invalid sequence with
+        // U+FFFD before serialization, corrupting the output relative to
+        // qpdf. 0xE9 alone is not valid UTF-8 (it is a 3-byte sequence lead
+        // byte with no continuation bytes).
+        let mut pdf = load_fixture_pdf("form-fields-and-annotations.pdf");
+        let widget_ref = ObjectRef::new(13, 0);
+        let mut widget_dict = pdf
+            .resolve(widget_ref)
+            .expect("resolve widget 13 0")
+            .into_dict()
+            .expect("widget 13 0 is a dictionary");
+        widget_dict.insert("AS", Object::Name(vec![b'A', 0xE9]));
+        pdf.set_object(widget_ref, Object::Dictionary(widget_dict));
+
+        let result =
+            crate::job::build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let encoded = result.unparse().expect("unparse failed");
+
+        assert!(
+            encoded.windows(5).any(|w| w == b"\"/A\xe9\""),
+            "expected raw byte 0xE9 preserved after the leading slash, got: {}",
+            String::from_utf8_lossy(&encoded)
+        );
+        assert!(
+            !encoded.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]),
+            "output must not contain a U+FFFD replacement character: {}",
+            String::from_utf8_lossy(&encoded)
         );
     }
 

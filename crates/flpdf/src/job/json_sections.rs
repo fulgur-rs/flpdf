@@ -266,10 +266,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
         ) = {
             let mut field_helper =
                 crate::FormFieldObjectHelper::from_object_handle(field.clone(), pdf);
-            let fieldtype = field_helper
-                .field_type()?
-                .map(|name| String::from_utf8_lossy(&name).into_owned())
-                .unwrap_or_default();
+            let fieldtype = field_helper.field_type()?.unwrap_or_default();
             let fieldflags = field_helper.flags()?;
             let fullname = field_helper.fully_qualified_name()?;
             let partialname = field_helper.partial_name()?;
@@ -329,10 +326,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
         }
         let annotation = json_dictionary([
             ("object", pdf_object_to_json(&annotation)?),
-            (
-                "appearancestate",
-                Json::make_string(String::from_utf8_lossy(&appearancestate).into_owned()),
-            ),
+            ("appearancestate", Json::make_string(&appearancestate)),
             ("annotationflags", Json::make_int(annotationflags)),
         ])?; // cov:ignore: fixed annotation schema keys cannot trigger JsonError
 
