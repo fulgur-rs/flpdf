@@ -36,7 +36,6 @@ use std::process::Command as Shell;
 // `flpdf --check` is implicitly exercised by --show-pages succeeding).
 
 const THREE_PAGE: &str = "../../tests/fixtures/compat/three-page.pdf";
-const TWO_PAGE: &str = "../../tests/fixtures/compat/two-page.pdf";
 
 /// Absolute path to a fixture (so a per-cell `cwd` change is unnecessary).
 fn fixture_abs(rel: &str) -> PathBuf {
@@ -472,51 +471,82 @@ fn pages_multi_input_same_file_repeated_matches_qpdf() {
 }
 
 #[test]
-fn pages_cross_document_merge_is_expected_scope_error() {
-    // EXPECTED divergence (documented #4 / single-document scope): qpdf
-    // happily merges pages from two distinct files; flpdf intentionally
-    // refuses cross-document merges with an actionable error (cross-doc merge
-    // + AcroForm collision handling tracked separately). Assert flpdf's
-    // boundary behavior; qpdf-divergent by design.
+fn pages_cross_document_merge_matches_qpdf() {
+    // qpdf 11.9.0 keeps the primary document as the catalog base while
+    // copying selected pages from a distinct secondary document. The page
+    // widths below identify the source page and therefore check both the
+    // foreign-copy route and the global selection order.
     if !qpdf_available() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let three = fixture_abs(THREE_PAGE);
-    let two = fixture_abs(TWO_PAGE);
+    let primary_file = distinct_pages_pdf(3);
+    let secondary_file = distinct_pages_pdf(2);
+    let primary = primary_file.path();
+    let secondary = secondary_file.path();
     let q = tmp.path().join("q.pdf");
     let f = tmp.path().join("f.pdf");
 
-    // qpdf accepts the cross-document merge (3 pages: p1 of three + 2 of two).
     let (ok, _) = run_qpdf(&[
-        three.to_str().unwrap(),
+        primary.to_str().unwrap(),
         "--pages",
         ".",
         "1",
-        two.to_str().unwrap(),
+        secondary.to_str().unwrap(),
         "1-2",
         "--",
         q.to_str().unwrap(),
     ]);
     assert!(ok, "qpdf is expected to accept cross-document merge");
 
-    // flpdf refuses, actionably (exit != 0, message names the boundary).
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            three.to_str().unwrap(),
-            "--pages",
-            ".",
-            "1",
-            two.to_str().unwrap(),
-            "1-2",
-            "--",
-            f.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains("cross-document"))
-        .stderr(predicates::str::contains("not supported"));
+    // The qpdf-shaped job consumer handles this ordinary multi-source command.
+    flpdf_ok(&[
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1-2",
+        "--",
+        f.to_str().unwrap(),
+    ]);
+
+    assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+}
+
+#[test]
+fn pages_cross_document_collate_matches_qpdf() {
+    // qpdf collates specification occurrences, not source-document groups:
+    // A1,B1,A2,B2,B3 for A=2 pages and B=3 pages with --collate.
+    if !qpdf_available() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary_file = distinct_pages_pdf(2);
+    let secondary_file = distinct_pages_pdf(3);
+    let primary = primary_file.path();
+    let secondary = secondary_file.path();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let common = [
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1-2",
+        secondary.to_str().unwrap(),
+        "1-3",
+        "--",
+    ];
+    let mut q_args = common.to_vec();
+    q_args.extend(["--collate", q.to_str().unwrap()]);
+    let mut f_args = common.to_vec();
+    f_args.extend(["--collate", f.to_str().unwrap()]);
+
+    let (ok, _) = run_qpdf(&q_args);
+    assert!(ok, "qpdf is expected to accept cross-document collate");
+    flpdf_ok(&f_args);
+    assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
 }
 
 // ===========================================================================

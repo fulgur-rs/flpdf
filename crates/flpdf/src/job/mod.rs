@@ -9,6 +9,7 @@ mod attachments;
 mod json;
 mod json_sections;
 mod lifecycle;
+mod page_specs;
 
 pub use json::{
     write_json, write_qpdf_json_v2_selected_objects_to_output_with_options,
@@ -25,3 +26,4 @@ pub(crate) use json_sections::{
     cf_method_string, collect_content_refs, collect_image_refs, parse_pdf_date,
 };
 pub use lifecycle::{JobExitCode, QPDFJob};
+pub use page_specs::PageSpecInput;

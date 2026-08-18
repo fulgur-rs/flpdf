@@ -659,6 +659,22 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         Ok(out)
     }
 
+    /// Return whether the effective label dictionary for `page_idx` carries
+    /// an explicit `/P` key, including an explicitly empty string. qpdf keeps
+    /// that distinction when `getLabelsForPageRange` copies raw label
+    /// dictionaries; the JSON representation renders an empty Unicode prefix
+    /// as `u:` while an absent prefix is omitted.
+    pub(crate) fn label_prefix_is_present(&mut self, page_idx: i64) -> Result<bool> {
+        let Some(tree) = self.pagelabels_tree()? else {
+            return Ok(false);
+        };
+        let Some(label) = self.get_label_for_page_from_tree(&tree, page_idx)? else {
+            return Ok(false);
+        };
+        let label = self.pdf.resolve_object_handle_to_terminal(&label)?;
+        label.try_has_key(b"/P")
+    }
+
     /// Install `entries` as the catalog's `/PageLabels`: a direct
     /// (non-indirect) `<< /Nums [...] >>` dictionary — never a balanced
     /// number tree — with each entry's label dictionary built in the same
@@ -692,6 +708,37 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         for (idx, range) in entries {
             nums.push(Object::Integer(*idx));
             nums.push(Object::Dictionary(range.to_reconstructed_dict()));
+        }
+        let mut page_labels = Dictionary::new();
+        page_labels.insert("Nums", Object::Array(nums));
+        catalog.insert("PageLabels", Object::Dictionary(page_labels));
+        self.pdf
+            .set_object(catalog_ref, Object::Dictionary(catalog));
+        Ok(())
+    }
+
+    /// Install reconstructed labels while retaining whether the source had an
+    /// explicit empty `/P` prefix. This is the raw-handle distinction qpdf's
+    /// `getLabelsForPageRange` preserves and the compact [`LabelRange`] value
+    /// intentionally does not expose in its public three-field shape.
+    pub(crate) fn write_reconstructed_labels_with_prefix_presence(
+        &mut self,
+        entries: &[(i64, LabelRange, bool)],
+    ) -> Result<()> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(());
+        };
+        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+            return Ok(());
+        };
+        let mut nums = Vec::with_capacity(entries.len() * 2);
+        for (idx, range, prefix_present) in entries {
+            nums.push(Object::Integer(*idx));
+            let mut dict = range.to_reconstructed_dict();
+            if *prefix_present && range.prefix.is_empty() {
+                dict.insert("P", Object::String(Vec::new()));
+            }
+            nums.push(Object::Dictionary(dict));
         }
         let mut page_labels = Dictionary::new();
         page_labels.insert("Nums", Object::Array(nums));
@@ -2168,6 +2215,62 @@ mod tests {
     }
 
     #[test]
+    fn label_prefix_presence_distinguishes_empty_and_absent_prefixes() {
+        let mut explicit_empty =
+            pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), Some(""))]);
+        let mut helper = explicit_empty.page_labels();
+        assert!(helper.label_prefix_is_present(0).unwrap());
+
+        let mut empty_tree = pdf_with_pagelabels(vec![]);
+        assert!(!empty_tree.page_labels().label_prefix_is_present(0).unwrap());
+
+        let mut absent =
+            pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
+        assert!(!absent.page_labels().label_prefix_is_present(0).unwrap());
+
+        let mut no_tree = bare_one_page_pdf();
+        assert!(!no_tree.page_labels().label_prefix_is_present(0).unwrap());
+    }
+
+    #[test]
+    fn reconstructed_labels_can_retain_an_explicit_empty_prefix() {
+        let mut pdf = bare_one_page_pdf();
+        let range = LabelRange {
+            style: LabelStyle::Decimal,
+            prefix: String::new(),
+            start: 1,
+        };
+        pdf.page_labels()
+            .write_reconstructed_labels_with_prefix_presence(&[
+                (0, range.clone(), true),
+                (2, range, false),
+            ])
+            .unwrap();
+
+        let catalog_ref = pdf.root_ref().unwrap();
+        let catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
+        let Object::Dictionary(page_labels) = catalog.get("PageLabels").unwrap() else {
+            panic!("PageLabels must be a direct dictionary"); // cov:ignore: test-shape guard, the helper always installs a dictionary
+        };
+        let Object::Array(nums) = page_labels.get("Nums").unwrap() else {
+            panic!("PageLabels /Nums must be an array"); // cov:ignore: test-shape guard, the helper always installs an array
+        };
+        let Object::Dictionary(first) = &nums[1] else {
+            panic!("first label must be a dictionary"); // cov:ignore: test-shape guard, the helper yields dictionaries
+        };
+        let Object::Dictionary(second) = &nums[3] else {
+            panic!("second label must be a dictionary"); // cov:ignore: test-shape guard, the helper yields dictionaries
+        };
+        assert_eq!(first.get("P"), Some(&Object::String(Vec::new())));
+        assert_eq!(second.get("P"), None);
+    }
+
+    #[test]
     fn write_reconstructed_labels_replaces_existing_indirect_tree() {
         // A pre-existing indirect /PageLabels root is unconditionally replaced
         // by a fresh direct dict (qpdf never merges).
@@ -2207,6 +2310,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rootless trailer still opens");
         let mut h = pdf.page_labels();
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
+        h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
+            .unwrap();
     }
 
     #[test]
@@ -2216,6 +2321,8 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Integer(0)); // catalog no longer a dict
         let mut h = pdf.page_labels();
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
+        h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
+            .unwrap();
     }
 
     // ── insert_pages ──────────────────────────────────────────────────────

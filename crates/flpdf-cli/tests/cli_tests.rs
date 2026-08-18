@@ -5336,10 +5336,10 @@ fn pages_extraction_keeps_all_when_full_range_selected() {
     assert_eq!(titles, ["Item1", "Item2", "Item3"]);
 }
 
-// ── Scope-boundary errors (actionable, not swallowed) ─────────────────────
+// ── Page-spec source lifecycle ────────────────────────────────────────────
 
 #[test]
-fn pages_cross_document_merge_is_rejected_actionably() {
+fn pages_cross_document_merge_is_supported() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -5349,9 +5349,14 @@ fn pages_cross_document_merge_is_rejected_actionably() {
         .args(["--pages", ".", "1", TWO_PAGE, "2", "--"])
         .arg(&output)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cross-document"))
-        .stderr(predicate::str::contains("not supported"));
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("2"));
 }
 
 #[test]
