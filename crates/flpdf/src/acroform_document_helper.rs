@@ -707,35 +707,39 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             override_q: source_defaults.quadding != target_defaults.quadding,
             source_default_q: source_defaults.quadding,
         };
-        // qpdf's `init_dr_map` (`QPDFAcroFormDocumentHelper.cc:772-800`) is
-        // gated only on there being a field to copy (`foreign` plus at least
-        // one field object in the traversal queue), not on the source having
-        // a `/DR` at all: `from_dr` stays `QPDFObjectHandle::newNull()` when
-        // absent, and `makeResourcesIndirect`/`mergeResources` are safe
-        // no-ops on a null handle. The destination `/AcroForm/DR` still gets
-        // created/promoted to an indirect dictionary either way.
-        let foreign_resources = if source_annotations
-            .iter()
-            .any(|(_, top_field)| top_field.is_some())
-        {
-            let plan =
-                self.prepare_foreign_resource_plan(source_defaults.resources.clone(), source)?;
-            Some(plan)
-        } else {
-            None
-        };
+        // qpdf copies the source `/DR` unconditionally up front, before the
+        // annotation loop, whenever the source is foreign
+        // (`QPDFAcroFormDocumentHelper.cc:729-737`); only the *merge* into
+        // the destination `/AcroForm`/`/DR` (`init_dr_map`,
+        // `QPDFAcroFormDocumentHelper.cc:772-800`) is lazy, deferred until
+        // the first field is actually copied, so an annotation-only
+        // (no-field) transform never creates a destination `/AcroForm`.
+        // flpdf defers the whole resource plan -- including the `/DR` copy
+        // -- to that same first-field point instead of copying `/DR` eagerly
+        // like qpdf does; this is an object-allocation-order divergence
+        // (qpdf allocates the copied `/DR` before any field, flpdf after),
+        // not a byte-identical one: object numbers are reassigned by the
+        // writer's own BFS-from-root traversal (`QPDFWriter.cc:1097-1119`),
+        // not by allocation order, so this timing difference does not change
+        // written output.
+        let mut foreign_resources = None;
 
         let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();
         let mut copied_field_trees = HashSet::<ObjectHandleIdentity>::new();
         let mut added_new_fields = BTreeSet::new();
         for (source_annotation, source_top_field) in source_annotations {
             let source_annotation = ensure_foreign_indirect(source, source_annotation)?;
-            let copied_source_annotation = self.pdf.copy_foreign_object(&source_annotation)?;
 
             if let Some(source_top_field) = source_top_field {
                 let source_top_field = ensure_foreign_indirect(source, source_top_field)?;
                 let copied_source_top = self.pdf.copy_foreign_object(&source_top_field)?;
                 if copied_field_trees.insert(copied_source_top.identity_key()) {
+                    if foreign_resources.is_none() {
+                        foreign_resources = Some(self.prepare_foreign_resource_plan(
+                            source_defaults.resources.clone(),
+                            source,
+                        )?); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
+                    }
                     let copied_top = self.copy_field_tree_with_overrides(
                         &copied_source_top,
                         &mut orig_to_copy,
@@ -752,10 +756,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 // cov:ignore-end
             }
 
+            // qpdf copies the foreign annotation only after the field tree has
+            // been copied (`QPDFAcroFormDocumentHelper.cc:955-963`). Keeping
+            // this order is observable in QDF object numbering and also lets
+            // the field/annotation identity map reuse the copied widget.
+            let copied_source_annotation = self.pdf.copy_foreign_object(&source_annotation)?;
             let copied = self
                 .copy_transform_object(&copied_source_annotation, &mut orig_to_copy)?
                 .expect("stream annotations are filtered before copying");
-            copy_and_transform_appearance_streams(self.pdf, &copied, cm)?;
+            let appearance_renames = foreign_resources.as_ref().map(|plan| &plan.renames);
+            copy_and_transform_appearance_streams_with_renames(
+                self.pdf,
+                &copied,
+                cm,
+                appearance_renames,
+            )?; // cov:ignore: LLVM maps this multiline appearance-transform call to a defensive continuation edge
             let rect = transformed_annotation_rectangle(self.pdf, &copied, cm)?;
             copied.replace_key(b"/Rect", rect)?;
             self.pdf.mark_object_handle_dirty(&copied)?;
@@ -1114,6 +1129,40 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                 // cov:ignore-end
                 self.pdf.mark_object_handle_dirty(&field)?;
             }
+        }
+
+        let acroform = self.canonical_get_or_create_acroform()?;
+        let fields_array = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+        let fields_array = if fields_array.as_array().is_some() {
+            fields_array
+        } else {
+            let replacement = ObjectHandle::array(Vec::new());
+            acroform.replace_key(b"/Fields", replacement.clone())?;
+            self.pdf.mark_object_handle_dirty(&acroform)?;
+            replacement
+        };
+        for field in &fields {
+            fields_array.append_array_item(field.clone())?;
+        }
+        self.pdf.mark_object_handle_dirty(&fields_array)?;
+        self.pdf.mark_object_handle_dirty(&acroform)?;
+        for field in fields {
+            self.update_cached_field(field)?;
+        }
+        Ok(())
+    }
+
+    /// Append copied top-level fields without renaming them, mirroring qpdf's
+    /// `addFormField` (`QPDFAcroFormDocumentHelper.cc:49-59`). The
+    /// `flattenRotation` caller has already removed the original field tree,
+    /// so qpdf deliberately uses this no-rename route rather than
+    /// `addAndRenameFormFields`.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn add_form_fields(&mut self, fields: Vec<ObjectHandle>) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
         }
 
         let acroform = self.canonical_get_or_create_acroform()?;
@@ -1997,6 +2046,24 @@ fn copy_and_transform_appearance_streams<R: Read + Seek>(
     annotation: &ObjectHandle,
     cm: Matrix,
 ) -> Result<()> {
+    copy_and_transform_appearance_streams_with_renames(pdf, annotation, cm, None)
+}
+
+/// Copy and transform annotation appearance streams, then apply qpdf's
+/// appearance-resource privatization for a foreign AcroForm merge.
+///
+/// The resource-replacer implementation remains in the existing
+/// `overlay_appearance_stream` module until `flpdf-5v4a` completes its
+/// ObjectHandle cutover. The call is nevertheless made from the canonical
+/// AcroForm transform path, immediately after each copied appearance stream,
+/// which preserves qpdf's `transformAnnotations` ordering and keeps the
+/// legacy module out of page/overlay orchestration.
+fn copy_and_transform_appearance_streams_with_renames<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    annotation: &ObjectHandle,
+    cm: Matrix,
+    renames: Option<&ResourceRenames>,
+) -> Result<()> {
     let appearance = annotation.try_get_key(b"/AP")?;
     appearance.try_dereference()?;
     if appearance.as_dictionary().is_none() {
@@ -2010,6 +2077,7 @@ fn copy_and_transform_appearance_streams<R: Read + Seek>(
             let copied = entry.copy_stream()?;
             transform_appearance_stream_matrix(&copied, cm)?;
             pdf.mark_object_handle_dirty(&copied)?;
+            adjust_copied_appearance_resources(pdf, &copied, renames)?;
             appearance.replace_key(&key, copied)?;
             pdf.mark_object_handle_dirty(&appearance)?;
             continue;
@@ -2024,12 +2092,33 @@ fn copy_and_transform_appearance_streams<R: Read + Seek>(
                 let copied = stream.copy_stream()?;
                 transform_appearance_stream_matrix(&copied, cm)?;
                 pdf.mark_object_handle_dirty(&copied)?;
+                adjust_copied_appearance_resources(pdf, &copied, renames)?;
                 entry.replace_key(&state, copied)?;
                 pdf.mark_object_handle_dirty(&entry)?;
             }
         }
     }
     Ok(())
+}
+
+fn adjust_copied_appearance_resources<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    copied: &ObjectHandle,
+    renames: Option<&ResourceRenames>,
+) -> Result<()> {
+    let Some(renames) = renames.filter(|renames| !renames.is_empty()) else {
+        return Ok(());
+    };
+    let Some(ap_stream_ref) = copied.object_ref() else {
+        return Ok(()); // cov:ignore: copied appearance streams are always indirect after copy_stream; retain the defensive direct-handle guard
+    };
+    let mut dr_map = crate::overlay_annotations::DrMap::new();
+    for (category, category_renames) in renames {
+        for (old_name, new_name) in category_renames {
+            dr_map.insert_rename(category, old_name.clone(), new_name.clone());
+        }
+    }
+    crate::overlay_appearance_stream::adjust_appearance_stream(pdf, ap_stream_ref, &dr_map)
 }
 
 #[allow(dead_code)]
@@ -4307,6 +4396,54 @@ mod tests {
     }
 
     #[test]
+    fn add_form_fields_handles_empty_existing_and_malformed_fields_arrays() {
+        let mut pdf = empty_pdf();
+        let field = ObjectHandle::dictionary(vec![(
+            b"/T".to_vec(),
+            ObjectHandle::string(b"field".to_vec()),
+        )]);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        helper.add_form_fields(Vec::new()).unwrap();
+        helper.add_form_fields(vec![field.clone()]).unwrap();
+        drop(helper);
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let acroform = root.try_get_key(b"/AcroForm").unwrap();
+        let fields = acroform
+            .try_get_key(b"/Fields")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].is_same_object_as(&field));
+
+        let mut malformed = empty_pdf();
+        malformed.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[(
+                "AcroForm",
+                Object::Dictionary(dict(&[("Fields", Object::Name(b"bad".to_vec()))])),
+            )])),
+        );
+        let replacement_field = ObjectHandle::dictionary(Vec::new());
+        AcroFormDocumentHelper::new(&mut malformed)
+            .add_form_fields(vec![replacement_field.clone()])
+            .unwrap();
+        let root = malformed.get_object_handle(ObjectRef::new(1, 0));
+        let fields = root
+            .try_get_key(b"/AcroForm")
+            .unwrap()
+            .try_get_key(b"/Fields")
+            .unwrap()
+            .try_as_array()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].is_same_object_as(&replacement_field));
+    }
+
+    #[test]
     fn canonical_fully_qualified_name_walks_parents_and_stops_cycles() {
         let mut pdf = empty_pdf();
         pdf.set_object(
@@ -5543,5 +5680,20 @@ mod tests {
             .canonical_annotation_to_field_handles()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn adjust_copied_appearance_resources_ignores_a_direct_stream_guard() {
+        let mut pdf = empty_pdf();
+        let copied = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Length".to_vec(), ObjectHandle::integer(0))]),
+            Rc::new(Vec::new()),
+        );
+        let mut renames = ResourceRenames::new();
+        renames
+            .entry(b"Font".to_vec())
+            .or_default()
+            .insert(b"Fsrc".to_vec(), b"Fdst".to_vec());
+        adjust_copied_appearance_resources(&mut pdf, &copied, Some(&renames)).unwrap();
     }
 }

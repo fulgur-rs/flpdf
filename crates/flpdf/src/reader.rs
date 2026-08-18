@@ -1853,6 +1853,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// The destination retains the source-to-destination map, so copying the
     /// same source handle again returns the same destination identity. The
     /// source handle must be indirect and belong to a different live `Pdf`.
+    ///
+    /// A copied stream's data is not read until this document is written: a
+    /// stream backed by [`StreamDataProvider`](crate::StreamDataProvider)
+    /// is not materialized here, only referenced. Matching qpdf's own
+    /// documented contract (`include/qpdf/QPDF.hh:401-410`), **the source
+    /// `Pdf` must remain alive until every copied stream has been written**
+    /// (or otherwise read) from this document; dropping it first produces an
+    /// [`Error::Internal`] when the writer tries to read the now-gone
+    /// source. qpdf's escape hatch, `setImmediateCopyFrom` (materializing
+    /// provider-backed stream data into memory at copy time so the source
+    /// need not survive), has no flpdf counterpart yet.
     pub fn copy_foreign_object(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
         crate::object_copy::copy_foreign_object(self, foreign)
     }

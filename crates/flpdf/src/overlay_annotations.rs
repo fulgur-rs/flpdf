@@ -5,31 +5,19 @@
 //! (`libqpdf/QPDFPageObjectHelper.cc:991-1039`,
 //! `libqpdf/QPDFAcroFormDocumentHelper.cc:698-1014`).
 //!
-//! Split into two phases so the cross-document copy runs exactly once per
-//! source document (unioned with the Form XObject closure), matching qpdf's
-//! per-document `copyForeignObject` foreign→local map:
-//!
-//! 1. [`survey_source_annotations`] — walk the source page's `/Annots` in
-//!    source space and return the reachable-ref closure to add to the batch
-//!    [`copy_objects`](crate::object_copy::copy_objects) call, alongside a
-//!    survey describing the per-annot top-level field and (when present) the
-//!    source `/AcroForm/DR` ref.
-//! 2. [`template_from_survey`] — after the batch copy returns its map, remap
-//!    the survey's source-space refs into dest-space refs.
-//! 3. [`apply_placement`] — per placement, shallow-duplicate each annotation
-//!    (and its field-tree top) so that repeated placements of the same source
-//!    page do NOT share (transformation would otherwise cumulate), transform
-//!    `/Rect` and each `/AP` stream's `/Matrix` by `cm`, reset field `/DR`
-//!    references to the dest AcroForm `/DR`, and append the transformed annots
-//!    to the destination page `/Annots`. Returns the list of new top-level
-//!    field dest refs added by this placement.
-//! 4. The caller passes this placement's new top-level field handles to
-//!    [`crate::AcroFormDocumentHelper::add_and_rename_form_fields`]
-//!    immediately after this placement, not batched across every placement
-//!    on the destination page: qpdf's `copyAnnotations`
-//!    (`libqpdf/QPDFPageObjectHelper.cc:1030`) finalizes each placement's
-//!    fields before the next placement's frozen-cache rename pass runs, so a
-//!    later placement observes an earlier placement's renames.
+//! The live qpdf route now runs through
+//! [`crate::PageObjectHelper::copy_annotations`] and
+//! [`crate::PageObjectHelper::copy_annotations_from`], with
+//! [`crate::AcroFormDocumentHelper`] owning the transform/copy graph and field
+//! cache. The lower-level resource-replacer pieces in this module remain a
+//! narrow implementation dependency of the appearance-stream migration until
+//! `flpdf-5v4a` completes its ObjectHandle cutover. The older survey/template
+//! and placement helpers are retained only for their existing unit tests and
+//! are not used by page or overlay orchestration.
+
+// The retained test-only helpers are scheduled for removal with the
+// appearance-stream migration; do not reintroduce them as production callers.
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -39,9 +27,6 @@ use crate::overlay_appearance_stream::adjust_appearance_stream;
 use crate::resource_replacer::{replace_resource_names, ResourceRenames};
 use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 
-/// Bound field-tree /Parent walks (widget → top-level field). Mirrors the
-/// `DEFAULT_MAX_ACROFORM_DEPTH` cap used elsewhere in the crate (review rule 4:
-/// graph traversals must have a depth cap against hostile input).
 const MAX_PARENT_WALK_DEPTH: usize = 100;
 
 /// Per-placement inherited-field override plan derived from the source and
@@ -59,25 +44,18 @@ struct InheritedOverrides {
     from_default_q: i64,
 }
 
-/// Survey of a source page's annotation graph, in SOURCE object space,
-/// computed BEFORE the cross-document copy.
+/// Legacy source-space survey retained for the test-only compatibility helper.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct AnnotationSurvey {
-    /// One entry per source annotation in `/Annots` array order:
-    /// `(annot_ref, Option<top_level_field_ref>)`. `None` when the annot is
-    /// not a widget or is a widget without an associated form field.
     pub annots: Vec<(ObjectRef, Option<ObjectRef>)>,
-    /// Source `/AcroForm/DR` ref, if present.
     pub source_dr: Option<ObjectRef>,
-    /// Source `/AcroForm/DA` (raw string bytes) — feeds
-    /// `adjustInheritedFields` on the dest side.
     pub source_default_da: Option<Vec<u8>>,
-    /// Source `/AcroForm/Q` integer — same as above.
     pub source_default_q: Option<i64>,
 }
 
-/// Dest-space refs derived from an [`AnnotationSurvey`] after cross-doc copy;
-/// consumed by [`apply_placement`] once per placement.
+/// Dest-space refs for the legacy test-only placement helper; consumed by
+/// [`apply_placement`] once per placement.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct AnnotationCopyTemplate {
     /// Dest-space per-annot pairs, in the same order as the survey.
@@ -105,6 +83,7 @@ pub(crate) struct AnnotationCopyTemplate {
 ///
 /// Propagates any error from [`Pdf::resolve`] or from
 /// [`collect_reachable_refs`] (excessive graph depth on hostile input).
+#[allow(dead_code)]
 pub(crate) fn survey_source_annotations<R: Read + Seek>(
     source: &mut Pdf<R>,
     source_page_ref: ObjectRef,
@@ -226,6 +205,7 @@ pub(crate) fn survey_source_annotations<R: Read + Seek>(
 ///   `getFieldForAnnotation` + `getTopLevelField` composition.
 ///
 /// Cycle-guarded by `visited` and depth-capped by [`MAX_PARENT_WALK_DEPTH`].
+#[allow(dead_code)]
 fn top_level_field_for_annot<R: Read + Seek>(
     source: &mut Pdf<R>,
     annot_ref: ObjectRef,
@@ -296,7 +276,7 @@ fn top_level_field_for_annot<R: Read + Seek>(
 /// `transformAnnotations` line 914-917) so a copied field that inherits
 /// `/DA` or `/Q` from the source doc keeps rendering the same way when
 /// the destination doc's defaults differ.
-#[allow(clippy::type_complexity)]
+#[allow(dead_code, clippy::type_complexity)]
 fn read_source_acroform_defaults<R: Read + Seek>(
     source: &mut Pdf<R>,
 ) -> Result<(Option<ObjectRef>, Option<Vec<u8>>, Option<i64>)> {

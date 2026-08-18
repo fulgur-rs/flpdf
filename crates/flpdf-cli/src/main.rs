@@ -3462,7 +3462,13 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // so the output graph (and thus the bytes) matches qpdf. Each source is
         // opened (with its --password) and imported into the in-memory document
         // here; the new objects are part of the canonical writer graph.
-        if !overlay_specs.is_empty() {
+        // qpdf keeps a provider-backed source QPDF alive when
+        // `copyForeignObject` copies a Form XObject whose data comes from a
+        // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). The canonical
+        // overlay route has the same lifetime contract: retain the opened
+        // source documents until after the destination writer has consumed
+        // every copied Form stream, not just until page stacking returns.
+        let _built_overlay_specs = if !overlay_specs.is_empty() {
             let mut built = build_overlay_specs(overlay_specs, repair)?;
 
             // flpdf-9hc.16.8: propagate max input header version + Adobe
@@ -3527,7 +3533,10 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             }
 
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
-        }
+            Some(built)
+        } else {
+            None
+        };
 
         let announce_file = standard_output.is_none();
         write_with_pdf_writer(
@@ -4547,7 +4556,11 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
 
     let mut options = options;
     options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
-    if !overlay_specs.is_empty() {
+    // qpdf keeps a provider-backed source QPDF alive when
+    // `copyForeignObject` copies a Form XObject whose data comes from a
+    // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the opened
+    // source documents through the in-memory writer for the same reason.
+    let _built_overlay_specs = if !overlay_specs.is_empty() {
         let mut built = build_overlay_specs(overlay_specs, repair)?;
         let initial_version = parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
         let mut max_version = PdfVersion::new(
@@ -4594,7 +4607,10 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         }
 
         flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
-    }
+        Some(built)
+    } else {
+        None
+    };
 
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {

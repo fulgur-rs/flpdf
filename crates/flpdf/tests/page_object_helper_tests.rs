@@ -119,6 +119,22 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
 
+fn annotation_page(rect: &str, rotate: Option<i32>) -> Vec<u8> {
+    let rotate = rotate.map_or_else(String::new, |value| format!(" /Rotate {value}"));
+    build_pdf_with_extras(
+        "",
+        &format!("/MediaBox [10 20 210 320] /Contents 4 0 R{rotate} /Annots [5 0 R]"),
+        &[
+            make_stream_object(4, b"BT (x) Tj ET"),
+            (
+                5,
+                format!("5 0 obj\n<< /Type /Annot /Subtype /Text /Rect {rect} >>\nendobj\n")
+                    .into_bytes(),
+            ),
+        ],
+    )
+}
+
 struct PassthroughFilter;
 
 impl TokenFilter for PassthroughFilter {
@@ -165,6 +181,261 @@ fn content_stream_objects_empty_when_no_contents() {
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
     let objects = helper.content_stream_objects().unwrap();
     assert!(objects.is_empty(), "expected no objects on empty page");
+}
+
+#[test]
+fn flatten_rotation_is_a_live_page_facade_route() {
+    let mut pdf = open(annotation_page("[30 50 70 100]", Some(90)));
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+    let mut page = PageObjectHelper::new(page_ref, &mut pdf);
+
+    page.flatten_rotation()
+        .expect("direct /Rotate page should flatten");
+
+    let page_dict = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+    assert!(page_dict.get("Rotate").is_none());
+    assert_eq!(
+        page_dict.get("MediaBox"),
+        Some(&Object::Array(vec![
+            Object::Real(20.0),
+            Object::Real(10.0),
+            Object::Real(320.0),
+            Object::Real(210.0),
+        ]))
+    );
+    let annotation_ref = page_dict
+        .get("Annots")
+        .and_then(Object::as_array)
+        .and_then(|annots| annots.first())
+        .and_then(Object::as_ref_id)
+        .expect("flattened annotation must remain on the page");
+    let annotation = pdf.resolve(annotation_ref).unwrap().into_dict().unwrap();
+    assert_eq!(
+        annotation.get("Rect"),
+        Some(&Object::Array(vec![
+            Object::Real(50.0),
+            Object::Real(150.0),
+            Object::Real(100.0),
+            Object::Real(190.0),
+        ]))
+    );
+    let content = pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+    assert!(content.starts_with(b"q\n0 -1 1 0 0 220 cm\n"));
+}
+
+#[test]
+fn flatten_rotation_handles_270_degrees_and_inherited_rotation_masking() {
+    let mut pdf = open(annotation_page("[30 50 70 100]", Some(270)));
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+    PageObjectHelper::new(page_ref, &mut pdf)
+        .flatten_rotation()
+        .expect("270-degree page should flatten");
+    let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+    assert!(page.get("Rotate").is_none());
+    let content = pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+    assert!(content.starts_with(b"q\n0 1 -1 0 340 0 cm\n"));
+
+    let mut inherited = open(build_pdf_with_extras(
+        "/Rotate 180",
+        "/MediaBox [0 0 200 300] /Contents 4 0 R /Rotate 90",
+        &[make_stream_object(4, b"BT (x) Tj ET")],
+    ));
+    let inherited_page = pages::page_refs(&mut inherited).unwrap()[0];
+    PageObjectHelper::new(inherited_page, &mut inherited)
+        .flatten_rotation()
+        .expect("direct rotation should mask inherited rotation");
+    let page = inherited
+        .resolve(inherited_page)
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    assert_eq!(page.get("Rotate"), Some(&Object::Integer(0)));
+}
+
+#[test]
+fn flatten_rotation_skips_invalid_media_box_and_non_array_annotations() {
+    let mut invalid_media = open(build_single_page_pdf(
+        "",
+        "/MediaBox [0 0 null 300] /Contents 4 0 R /Rotate 90",
+    ));
+    let invalid_page = pages::page_refs(&mut invalid_media).unwrap()[0];
+    PageObjectHelper::new(invalid_page, &mut invalid_media)
+        .flatten_rotation()
+        .expect("invalid media box should be a qpdf no-op");
+    let page = invalid_media
+        .resolve(invalid_page)
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
+
+    let mut non_array_annots = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 200 300] /Contents 4 0 R /Rotate 90 /Annots /bad",
+        &[make_stream_object(4, b"BT (x) Tj ET")],
+    ));
+    let page_ref = pages::page_refs(&mut non_array_annots).unwrap()[0];
+    PageObjectHelper::new(page_ref, &mut non_array_annots)
+        .flatten_rotation()
+        .expect("non-array annotations should be ignored");
+    let page = non_array_annots
+        .resolve(page_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
+    assert!(page.get("Rotate").is_none());
+}
+
+#[test]
+fn copy_annotations_uses_same_document_live_handles() {
+    let mut pdf = open(annotation_page("[30 50 70 100]", None));
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+    let source_page = pdf.get_object_handle(page_ref);
+    let mut page = PageObjectHelper::new(page_ref, &mut pdf);
+
+    page.copy_annotations(source_page, Matrix::new(1.0, 0.0, 0.0, 1.0, 5.0, 7.0))
+        .expect("same-document annotation copy should succeed");
+
+    let annots = pdf
+        .resolve(page_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap()
+        .remove("Annots")
+        .unwrap()
+        .into_array()
+        .unwrap();
+    assert_eq!(annots.len(), 2);
+    let copied = annots[1]
+        .as_ref_id()
+        .expect("copied annotation is indirect");
+    let copied = pdf.resolve(copied).unwrap().into_dict().unwrap();
+    assert_eq!(
+        copied.get("Rect"),
+        Some(&Object::Array(vec![
+            Object::Real(35.0),
+            Object::Real(57.0),
+            Object::Real(75.0),
+            Object::Real(107.0),
+        ]))
+    );
+}
+
+#[test]
+fn copy_annotations_is_a_noop_for_a_non_array_source_annotations_value() {
+    let mut pdf = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 10 10] /Contents 4 0 R /Annots /bad",
+        &[make_stream_object(4, b"BT (x) Tj ET")],
+    ));
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+    let source_page = pdf.get_object_handle(page_ref);
+    PageObjectHelper::new(page_ref, &mut pdf)
+        .copy_annotations(source_page, Matrix::default())
+        .expect("a non-array source annotation value should be ignored");
+}
+
+#[test]
+fn copy_annotations_from_validates_the_foreign_source_owner() {
+    let mut destination = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 10 10] /Contents 4 0 R",
+        &[make_stream_object(4, b"BT (dest) Tj ET")],
+    ));
+    let mut source = open(annotation_page("[30 50 70 100]", None));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let source_page = pages::page_refs(&mut source).unwrap()[0];
+    let source_handle = source.get_object_handle(source_page);
+    let mut page = PageObjectHelper::new(destination_page, &mut destination);
+
+    page.copy_annotations_from(
+        source_handle,
+        Matrix::new(1.0, 0.0, 0.0, 1.0, 5.0, 7.0),
+        &mut source,
+    )
+    .expect("foreign annotation copy should succeed");
+
+    let annots = destination
+        .resolve(destination_page)
+        .unwrap()
+        .into_dict()
+        .unwrap()
+        .remove("Annots")
+        .unwrap()
+        .into_array()
+        .unwrap();
+    assert_eq!(annots.len(), 1);
+    let copied = annots[0].as_ref_id().expect("foreign copy is indirect");
+    let copied = destination.resolve(copied).unwrap().into_dict().unwrap();
+    assert_eq!(
+        copied.get("Rect"),
+        Some(&Object::Array(vec![
+            Object::Real(35.0),
+            Object::Real(57.0),
+            Object::Real(75.0),
+            Object::Real(107.0),
+        ]))
+    );
+}
+
+#[test]
+fn copy_annotations_from_rejects_a_handle_owned_by_another_source() {
+    let mut destination = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 10 10] /Contents 4 0 R",
+        &[make_stream_object(4, b"BT (dest) Tj ET")],
+    ));
+    let mut source = open(annotation_page("[30 50 70 100]", None));
+    let mut other_source = open(annotation_page("[1 2 3 4]", None));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let wrong_source_page = pages::page_refs(&mut other_source).unwrap()[0];
+    let wrong_source_handle = other_source.get_object_handle(wrong_source_page);
+    let mut page = PageObjectHelper::new(destination_page, &mut destination);
+
+    let result = page.copy_annotations_from(wrong_source_handle, Matrix::default(), &mut source);
+    assert!(
+        matches!(result, Err(Error::Unsupported(message)) if message.contains("different Pdf"))
+    );
+}
+
+#[test]
+fn copy_annotations_rejects_direct_and_foreign_same_document_handles() {
+    let mut destination = open(annotation_page("[0 0 10 10]", None));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let direct = ObjectHandle::dictionary(Vec::new());
+    let result = PageObjectHelper::new(destination_page, &mut destination)
+        .copy_annotations(direct, Matrix::default());
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message)) if message.contains("direct object")
+    ));
+
+    let mut other = open(annotation_page("[1 2 3 4]", None));
+    let other_page = pages::page_refs(&mut other).unwrap()[0];
+    let foreign = other.get_object_handle(other_page);
+    let result = PageObjectHelper::new(destination_page, &mut destination)
+        .copy_annotations(foreign, Matrix::default());
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message)) if message.contains("another Pdf")
+    ));
+}
+
+#[test]
+fn copy_annotations_from_rejects_a_direct_source_handle() {
+    let mut destination = open(annotation_page("[0 0 10 10]", None));
+    let mut source = open(annotation_page("[1 2 3 4]", None));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let direct = ObjectHandle::dictionary(Vec::new());
+    let result = PageObjectHelper::new(destination_page, &mut destination).copy_annotations_from(
+        direct,
+        Matrix::default(),
+        &mut source,
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Unsupported(message)) if message.contains("direct object")
+    ));
 }
 
 #[test]
