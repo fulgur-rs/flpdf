@@ -304,18 +304,27 @@ mod tests {
     #[test]
     fn same_file_guard_reports_metadata_errors_and_missing_input() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let file_parent = temp.path().join("file-parent");
-        std::fs::write(&file_parent, b"not a directory").expect("parent file should exist");
-
-        let output_error = same_file_if_existing(&file_parent, &file_parent.join("output.pdf"))
-            .expect_err("metadata below a file must fail");
-        assert!(output_error.to_string().contains("inspect split output"));
-
         let existing_output = temp.path().join("existing-output.pdf");
         std::fs::write(&existing_output, b"output").expect("output should exist");
-        let input_error = same_file_if_existing(&file_parent.join("input.pdf"), &existing_output)
-            .expect_err("input metadata below a file must fail");
-        assert!(input_error.to_string().contains("inspect split input"));
+
+        #[cfg(unix)]
+        {
+            let file_parent = temp.path().join("file-parent");
+            std::fs::write(&file_parent, b"not a directory").expect("parent file should exist");
+
+            let output_error = same_file_if_existing(&file_parent, &file_parent.join("output.pdf"))
+                .expect_err("metadata below a file must fail");
+            assert!(output_error.to_string().contains("inspect split output"));
+
+            let input_error =
+                same_file_if_existing(&file_parent.join("input.pdf"), &existing_output)
+                    .expect_err("input metadata below a file must fail");
+            assert!(input_error.to_string().contains("inspect split input"));
+        }
+
+        #[cfg(not(unix))]
+        assert!(same_file_if_existing(&existing_output, &existing_output)
+            .expect("canonicalize should inspect an existing Windows path"));
 
         let missing_input = temp.path().join("missing-input.pdf");
         assert!(!same_file_if_existing(&missing_input, &existing_output)
