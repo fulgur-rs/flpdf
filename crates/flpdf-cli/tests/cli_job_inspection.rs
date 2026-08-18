@@ -5,6 +5,7 @@ use std::process::Command as ShellCommand;
 
 const ONE_PAGE_PDF: &str = "../../tests/fixtures/compat/one-page.pdf";
 const REPAIRABLE_PDF: &str = "../../tests/fixtures/test_driver/repairable_input.pdf";
+const WEAK_RC4_PDF: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
 
 fn skip_if_qpdf_missing() -> bool {
     let version = ShellCommand::new("qpdf").arg("--version").output().ok();
@@ -121,5 +122,44 @@ fn ordinary_show_npages_completes_repair_warnings_with_status_three() {
     assert_eq!(
         normalize_newlines(&flpdf.stderr),
         normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn ordinary_show_npages_preserves_weak_crypto_advisory() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args([
+            "--show-npages",
+            "--allow-weak-crypto",
+            "--password=user-v2",
+            WEAK_RC4_PDF,
+        ])
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--show-npages",
+            "--allow-weak-crypto",
+            "--password=user-v2",
+            WEAK_RC4_PDF,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success());
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&flpdf.stderr).contains("encrypted PDF uses weak crypto"),
+        "ordinary inspection must retain the existing weak-crypto advisory"
     );
 }
