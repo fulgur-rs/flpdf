@@ -182,7 +182,7 @@ impl EncryptParams {
 }
 
 /// Donor `/Encrypt` dictionary and derived file key for the
-/// `--copy-encryption-from` write path.
+/// `--copy-encryption` write path.
 ///
 /// Built by the CLI layer from the donor PDF's on-disk state (opened with
 /// [`crate::Pdf::open_with_options`]) and stored in
