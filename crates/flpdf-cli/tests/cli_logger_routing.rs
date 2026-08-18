@@ -147,7 +147,7 @@ fn binary_json_uses_stdout_without_stderr() {
 #[test]
 fn binary_raw_stream_preserves_exact_bytes() {
     let output = flpdf()
-        .args(["show-stream", "4 0 R", MULTI_STREAM, "--raw"])
+        .args(["show-stream", "4 0 R", MULTI_STREAM, "--raw-stream-data"])
         .output()
         .unwrap();
 
@@ -432,7 +432,7 @@ fn qpdf_differential_matches_routed_output_matrix() {
         (
             "raw stream",
             &["--show-object=4", "--raw-stream-data", MULTI_STREAM],
-            &["show-stream", "4 0 R", MULTI_STREAM, "--raw"],
+            &["show-stream", "4 0 R", MULTI_STREAM, "--raw-stream-data"],
             false,
         ),
         (

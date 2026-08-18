@@ -115,11 +115,11 @@ are not treated as vulnerabilities on their own:
   An opt-in decode-output limit comparable to qpdf's
   `Pl_Flate::setMemoryLimit` is available via `filters::DecodeLimits` /
   `filters::decode_stream_data_with_limits` (default unbounded; embedders set
-  `max_output` to bound each `FlateDecode` / `LZWDecode` stage). The CLI exposes
-  this cap on the `--check` audit path via `--decode-memory-limit=BYTES` (default
-  unbounded, matching qpdf's default `flate_max_memory`); a content stream that
-  exceeds the cap is reported as a warning, not as corruption. The `--check` cap
-  bounds the generalized-filter decode the check pass performs; a content stream
+  `max_output` to bound each `FlateDecode` / `LZWDecode` stage). qpdf's CLI has
+  no corresponding flag, so `flpdf-cli` does not expose this cap either; a
+  content stream that exceeds a caller-supplied limit is reported as a
+  warning, not as corruption. The limit bounds the generalized-filter decode
+  the check pass performs; a content stream
   carrying an explicit `/Crypt` filter is decoded during object resolution
   (unbounded) before the check pass sees it, so it is not yet bounded. flpdf's
   other document paths still place no output cap by default.
@@ -216,4 +216,4 @@ Entry points through which untrusted bytes reach flpdf:
 | Writing (reads everything it writes) | `PdfWriter`, QDF repair, linearization |
 | Signature inspection | `signatures.rs` (`/ByteRange`, signature dictionaries, certificates) |
 | CLI (drives all of the above on argv-named files) | `flpdf-cli`: `check`, `rewrite`, `qdf`, `qdf-fix`, `linearize`, `dump-object`, `show-stream`, `pages`/`--pages`, `--split-pages`, attachment options, encryption options, JSON output |
-| Cross-document operations (two untrusted documents interacting) | `--pages` merging, `--copy-attachments-from`, `--copy-encryption-from` |
+| Cross-document operations (two untrusted documents interacting) | `--pages` merging, `--copy-attachments-from`, `--copy-encryption` |

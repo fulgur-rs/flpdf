@@ -194,9 +194,8 @@ fn recovered_content_stream_pdf_bytes() -> Vec<u8> {
 
 /// A structurally valid single-page PDF whose page `/Contents 4 0 R` is a
 /// *valid* FlateDecode stream that inflates to `decoded_len` bytes (small
-/// compressed, large inflated). Exercises the opt-in `--decode-memory-limit`
-/// guard: the stream is intact, so without a cap it is clean, and with a tight
-/// cap it trips the guard as a warning.
+/// compressed, large inflated). The stream is intact, so `--check` reports
+/// it clean regardless of size (default unlimited, matching qpdf).
 fn bomb_content_stream_pdf_bytes(decoded_len: usize) -> Vec<u8> {
     let mut flate_dict = flpdf::Dictionary::new();
     flate_dict.insert("Filter", flpdf::Object::Name(b"FlateDecode".to_vec()));
@@ -770,34 +769,11 @@ fn rewrite_repair_warnings_use_qpdf_stderr_format() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: opt-in `--decode-memory-limit` decompression-bomb guard
+// Tests: large-but-intact content streams are clean under `--check`
 // ---------------------------------------------------------------------------
 
-/// With `--decode-memory-limit` below the inflated size, the intact-but-large
-/// content stream trips the decompression-bomb guard: a WARNING (exit 3), the
-/// trailing "clean" note suppressed — NOT an error (exit 2).
-#[test]
-fn check_decode_memory_limit_bomb_warns_exit_3() {
-    let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(&bomb_content_stream_pdf_bytes(64 * 1024))
-        .unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.env_remove("FLPDF_PROGNAME")
-        .args([
-            "--check",
-            "--decode-memory-limit",
-            "1024",
-            f.path().to_str().unwrap(),
-        ])
-        .assert()
-        .code(3)
-        .stdout(predicate::str::contains("No syntax or stream encoding errors found").not())
-        .stderr(predicate::str::contains("decode-bomb guard"));
-}
-
-/// Without the flag, the same large stream decodes fine: clean exit 0 (default
-/// unlimited, matching qpdf).
+/// A large-but-intact content stream decodes fine: clean exit 0 (default
+/// unlimited, matching qpdf; qpdf has no CLI decompression-bomb guard).
 #[test]
 fn check_no_limit_large_stream_exits_0() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -808,62 +784,6 @@ fn check_no_limit_large_stream_exits_0() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(0);
-}
-
-/// The `check` subcommand carries the same flag.
-#[test]
-fn check_subcommand_decode_memory_limit_bomb_warns_exit_3() {
-    let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(&bomb_content_stream_pdf_bytes(64 * 1024))
-        .unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "check",
-        "--decode-memory-limit",
-        "1024",
-        f.path().to_str().unwrap(),
-    ])
-    .assert()
-    .code(3)
-    .stderr(predicate::str::contains("decode-bomb guard"));
-}
-
-/// A genuinely corrupt content stream is still an error (exit 2) even with the
-/// cap set — the limit path must not mask real decode failures.
-#[test]
-fn check_decode_memory_limit_does_not_mask_corruption() {
-    let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(&corrupt_content_stream_pdf_bytes()).unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "--check",
-        "--decode-memory-limit",
-        "1024",
-        f.path().to_str().unwrap(),
-    ])
-    .assert()
-    .code(2)
-    .stderr(predicate::str::contains(
-        "errors while decoding content stream",
-    ));
-}
-
-/// `--decode-memory-limit` only affects the `--check` audit path, so passing it
-/// without `--check` is a clap usage error (`requires = "check"`) rather than a
-/// silently-ignored flag. clap reports a missing-required-argument error
-/// (exit 2) naming `--check`.
-#[test]
-fn decode_memory_limit_requires_check() {
-    let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(&clean_pdf_bytes()).unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--decode-memory-limit", "1024", f.path().to_str().unwrap()])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--check"));
 }
 
 // ---------------------------------------------------------------------------

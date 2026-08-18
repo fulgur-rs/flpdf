@@ -267,9 +267,9 @@ impl std::error::Error for CliExitError {}
 // chain in `main`, so supplying two at once would silently run only the
 // first. Make them mutually exclusive at the parser level: clap rejects
 // e.g. `--add-attachment … -- --copy-attachments-from …` with a usage
-// error instead of discarding the second operation. (`--verbose` and
-// `-o/--show-attachment-to` are sub-modifiers, not operations, so they are
-// intentionally NOT members of this group.)
+// error instead of discarding the second operation. (`--verbose` is a
+// sub-modifier, not an operation, so it is intentionally NOT a member of
+// this group.)
 #[command(group(
     ArgGroup::new("attachment_op")
         .multiple(false)
@@ -292,15 +292,8 @@ struct Cli {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
-    /// Bound each page content stream's decoded output to BYTES during `--check`
-    /// (opt-in decompression-bomb guard). Absent = unlimited (qpdf's default).
-    /// A stream exceeding the cap is a warning (exit 3), not an error. Only
-    /// meaningful with `--check`, so it `requires` that flag rather than being
-    /// silently ignored alongside other modes.
-    #[arg(long = "decode-memory-limit", value_name = "BYTES", requires = "check")]
-    decode_memory_limit: Option<usize>,
     #[arg(long)]
-    dump_object: Option<String>,
+    show_object: Option<String>,
     #[arg(long)]
     show_npages: bool,
     #[arg(long)]
@@ -326,10 +319,10 @@ struct Cli {
           value_name = "VERSION", value_parser = ["2"],
           conflicts_with_all = [
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
-              "dump_object",
+              "show_object",
               "show_npages", "show_pages", "show_linearization", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
-              "decrypt", "encrypt", "copy_encryption_from",
+              "decrypt", "encrypt", "copy_encryption",
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf", "coalesce_contents",
@@ -343,7 +336,7 @@ struct Cli {
     #[arg(
         long = "json-input",
         conflicts_with_all = [
-            "dump_object",
+            "show_object",
             "show_linearization", "list_attachments", "show_attachment",
             "remove_attachment", "add_attachment", "copy_attachments_from",
         ],
@@ -359,7 +352,7 @@ struct Cli {
         value_name = "QPDF-JSON",
         require_equals = true,
         conflicts_with_all = [
-            "dump_object",
+            "show_object",
             "show_linearization", "list_attachments", "show_attachment",
             "remove_attachment", "add_attachment", "copy_attachments_from",
         ],
@@ -466,7 +459,7 @@ struct Cli {
     /// (top-level alias of `flpdf rewrite --remove-restrictions`; qpdf
     /// `--remove-restrictions` equivalent). Does NOT bypass authentication.
     // This is a rewrite-path modifier. main()'s dispatch chain runs the
-    // inspection modes (--check / --dump-object / --show-*) before the
+    // inspection modes (--check / --show-object / --show-*) before the
     // rewrite branch, so without these conflicts `flpdf --check
     // --remove-restrictions in out` would silently ignore the flag (and the
     // OUTPUT positional). Listing the inspection modes as clap conflicts
@@ -476,7 +469,7 @@ struct Cli {
     // excluded here.)
     #[arg(long = "remove-restrictions",
           conflicts_with_all = [
-              "check", "dump_object",
+              "check", "show_object",
               "show_npages", "show_pages", "show_linearization",
           ])]
     remove_restrictions: bool,
@@ -496,7 +489,7 @@ struct Cli {
     // rather than silently ignoring the flag (and OUTPUT).
     #[arg(long = "decrypt",
           conflicts_with_all = [
-              "check", "dump_object",
+              "check", "show_object",
               "show_npages", "show_pages", "show_linearization",
           ])]
     decrypt: bool,
@@ -547,7 +540,7 @@ struct Cli {
     /// user's requested coalescing would not appear in the output.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
-              "check", "dump_object",
+              "check", "show_object",
               "show_npages", "show_pages", "show_linearization",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
@@ -608,7 +601,7 @@ struct Cli {
     ///
     /// Syntax: `--add-attachment FILE [--key=K] [--filename=F] [--mimetype=M]
     ///           [--description=D] [--creationdate=D] [--moddate=D]
-    ///           [--afrelationship=R] [--replace] --`
+    ///           [--replace] --`
     ///
     /// The `--` terminator ends the sub-flag segment. The token after `--` is
     /// the OUTPUT positional.
@@ -650,25 +643,15 @@ struct Cli {
 
     /// Extract an attachment by key (qpdf --show-attachment compatible).
     ///
-    /// KEY is the name-tree key used when the attachment was added.  Without
-    /// `-o` the raw bytes are written to stdout.
+    /// KEY is the name-tree key used when the attachment was added. The raw
+    /// bytes are written to stdout.
     #[arg(
         long = "show-attachment",
         value_name = "KEY",
-        help = "Extract the embedded file with the given key to stdout or -o PATH \
+        help = "Extract the embedded file with the given key to stdout \
                 (qpdf --show-attachment)"
     )]
     show_attachment: Option<String>,
-
-    /// Write --show-attachment output to this file instead of stdout.
-    #[arg(
-        short = 'o',
-        long = "show-attachment-to",
-        value_name = "PATH",
-        requires = "show_attachment",
-        help = "Write --show-attachment output to PATH instead of stdout"
-    )]
-    show_attachment_to: Option<PathBuf>,
 
     /// Copy attachments from another PDF (qpdf --copy-attachments-from compatible).
     ///
@@ -706,17 +689,17 @@ struct Cli {
         // Reject combinations that don't make sense on the rewrite path.
         // --remove-restrictions / --decrypt overlap with --encrypt and are
         // rejected because they imply contradictory output forms; --check /
-        // --dump-object / --show-* are inspection paths that don't produce an
+        // --show-object / --show-* are inspection paths that don't produce an
         // output file at all. --linearize is NOT rejected: qpdf itself
         // supports `--linearize --encrypt ...` (verified: `qpdf --linearize
         // --encrypt "" "" 128 --use-aes=y --` produces a valid,
         // `qpdf --check`-clean linearized+encrypted file), and
         // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
-            "check", "dump_object",
+            "check", "show_object",
             "show_npages", "show_pages", "show_linearization",
             "remove_restrictions", "decrypt",
-            "copy_encryption_from",
+            "copy_encryption",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
                 USER-PW OWNER-PW KEY-LEN [sub-flags] --"
@@ -724,7 +707,7 @@ struct Cli {
     encrypt: Vec<String>,
 
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
-    /// output encryption (qpdf --copy-encryption-from equivalent).
+    /// output encryption (qpdf --copy-encryption equivalent).
     ///
     /// Supply the donor's password via `--encryption-file-password` (empty
     /// string if the donor has no user password).  Only V=4 AES-128 donors are
@@ -734,20 +717,20 @@ struct Cli {
     /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
     /// this option; qpdf supports copying encryption into a linearized output.
     #[arg(
-        long = "copy-encryption-from",
+        long = "copy-encryption",
         value_name = "FILE",
         conflicts_with_all = [
             "encrypt",
-            "check", "dump_object",
+            "check", "show_object",
             "show_npages", "show_pages", "show_linearization",
             "remove_restrictions", "decrypt",
         ],
-        help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
+        help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption); \
                 pair with --encryption-file-password"
     )]
-    copy_encryption_from: Option<PathBuf>,
+    copy_encryption: Option<PathBuf>,
 
-    /// Password to open the donor PDF specified by `--copy-encryption-from`.
+    /// Password to open the donor PDF specified by `--copy-encryption`.
     ///
     /// Omit (or pass an empty string) if the donor has no user password.
     /// This is the *donor's* password, not the output file's password
@@ -755,8 +738,8 @@ struct Cli {
     #[arg(
         long = "encryption-file-password",
         value_name = "PW",
-        requires = "copy_encryption_from",
-        help = "User password to open the donor PDF for --copy-encryption-from"
+        requires = "copy_encryption",
+        help = "User password to open the donor PDF for --copy-encryption"
     )]
     encryption_file_password: Option<String>,
 
@@ -968,11 +951,6 @@ struct CheckCommand {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
-    /// Bound each page content stream's decoded output to BYTES (opt-in
-    /// decompression-bomb guard). Absent = unlimited. Exceeding the cap is a
-    /// warning (exit 3), not an error.
-    #[arg(long = "decode-memory-limit", value_name = "BYTES")]
-    decode_memory_limit: Option<usize>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -996,12 +974,9 @@ struct ShowStreamCommand {
     /// Object reference, e.g. "7 0" or "7 0 R".
     object_ref: String,
     input: PathBuf,
-    /// Emit unfiltered stored bytes instead of decoding.
-    #[arg(long)]
-    raw: bool,
-    /// Write output to this file instead of stdout.
-    #[arg(long, value_name = "PATH")]
-    out: Option<PathBuf>,
+    /// Emit unfiltered stored bytes instead of decoding (qpdf --raw-stream-data).
+    #[arg(long = "raw-stream-data")]
+    raw_stream_data: bool,
     #[arg(long)]
     repair: bool,
     #[command(flatten)]
@@ -1011,8 +986,9 @@ struct ShowStreamCommand {
 #[derive(Debug, ClapArgs)]
 struct PagesCommand {
     input: PathBuf,
-    #[arg(long)]
-    count: bool,
+    /// Print only the page count (qpdf --show-npages).
+    #[arg(long = "show-npages")]
+    show_npages: bool,
     #[arg(long)]
     repair: bool,
     #[command(flatten)]
@@ -1107,12 +1083,12 @@ struct RewriteCommand {
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
         conflicts_with_all = [
             "remove_restrictions", "decrypt",
-            "copy_encryption_from",
+            "copy_encryption",
         ]
     )]
     encrypt: Vec<String>,
     /// Copy the /Encrypt dictionary from a donor PDF and use its passwords for
-    /// output encryption (qpdf --copy-encryption-from equivalent).
+    /// output encryption (qpdf --copy-encryption equivalent).
     ///
     /// Supply the donor's password via `--encryption-file-password` (empty
     /// string if the donor has no user password).  Only V=4 AES-128 donors are
@@ -1122,24 +1098,24 @@ struct RewriteCommand {
     /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
     /// this option; qpdf supports copying encryption into a linearized output.
     #[arg(
-        long = "copy-encryption-from",
+        long = "copy-encryption",
         value_name = "FILE",
         conflicts_with_all = [
             "encrypt",
             "remove_restrictions", "decrypt",
         ],
-        help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
+        help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption); \
                 pair with --encryption-file-password"
     )]
-    copy_encryption_from: Option<PathBuf>,
-    /// Password to open the donor PDF specified by `--copy-encryption-from`.
+    copy_encryption: Option<PathBuf>,
+    /// Password to open the donor PDF specified by `--copy-encryption`.
     ///
     /// Omit (or pass an empty string) if the donor has no user password.
     #[arg(
         long = "encryption-file-password",
         value_name = "PW",
-        requires = "copy_encryption_from",
-        help = "User password to open the donor PDF for --copy-encryption-from"
+        requires = "copy_encryption",
+        help = "User password to open the donor PDF for --copy-encryption"
     )]
     encryption_file_password: Option<String>,
     /// Set a minimum PDF version for the output header.
@@ -1718,7 +1694,7 @@ fn main() {
             Some(_) => false,
             None => {
                 args.json.is_none()
-                    && args.dump_object.is_none()
+                    && args.show_object.is_none()
                     && !args.show_npages
                     && !args.show_pages
                     && !args.show_linearization
@@ -1754,7 +1730,7 @@ fn main() {
         run_json(&args)
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
-    } else if let Some(object_ref) = args.dump_object.as_deref() {
+    } else if let Some(object_ref) = args.show_object.as_deref() {
         run_dump_object(args.input, args.repair, &args.password, object_ref)
     } else if args.show_npages {
         run_show_npages(args.input, args.repair, &args.password)
@@ -1767,21 +1743,12 @@ fn main() {
             args.input,
             args.repair,
             &args.password,
-            filters::DecodeLimits {
-                max_output: args.decode_memory_limit,
-                ..filters::DecodeLimits::default()
-            },
+            filters::DecodeLimits::default(),
         )
     } else if args.list_attachments {
         run_list_attachments(args.input, args.repair, &args.password, args.verbose)
     } else if let Some(key) = args.show_attachment {
-        run_show_attachment(
-            args.input,
-            args.repair,
-            &args.password,
-            &key,
-            args.show_attachment_to,
-        )
+        run_show_attachment(args.input, args.repair, &args.password, &key)
     } else if let Some(key) = args.remove_attachment {
         run_remove_attachment(
             args.input,
@@ -1841,17 +1808,17 @@ fn main() {
                 }
             }
         }
-        // Top-level --encrypt / --copy-encryption-from on the --linearize
+        // Top-level --encrypt / --copy-encryption on the --linearize
         // alias: wire encryption onto WriterOptions (shared with the
         // non-linearize branch below and the `rewrite` subcommand via
         // apply_encryption_options). Without this call the linearize branch
-        // would silently drop --encrypt/--copy-encryption-from (WriterOptions
+        // would silently drop --encrypt/--copy-encryption (WriterOptions
         // built here is separate from the non-linearize branch's), emitting
         // plaintext output even though the user asked for encryption.
         apply_encryption_options(
             &mut options,
             &args.encrypt,
-            args.copy_encryption_from.as_deref(),
+            args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             args.password.allow_weak_crypto,
         );
@@ -1898,11 +1865,11 @@ fn main() {
             );
             std::process::exit(1);
         }
-        if args.copy_encryption_from.is_some() {
+        if args.copy_encryption.is_some() {
             eprintln!(
-                "flpdf: --copy-encryption-from is not applied in the \
+                "flpdf: --copy-encryption is not applied in the \
                  --pages/--rotate/--split-pages/--collate pipeline; \
-                 rerun without --copy-encryption-from or without the page operation"
+                 rerun without --copy-encryption or without the page operation"
             );
             std::process::exit(1);
         }
@@ -1991,7 +1958,7 @@ fn main() {
                 }
             }
         }
-        // Top-level --encrypt / --copy-encryption-from: wire encryption onto
+        // Top-level --encrypt / --copy-encryption: wire encryption onto
         // WriterOptions (shared with the `rewrite` surface via
         // apply_encryption_options). Parse / donor-open errors exit 2. The
         // page-op pipeline does not thread either option, so
@@ -2000,7 +1967,7 @@ fn main() {
         apply_encryption_options(
             &mut options,
             &args.encrypt,
-            args.copy_encryption_from.as_deref(),
+            args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
             args.password.allow_weak_crypto,
         );
@@ -2242,10 +2209,7 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
-    let decode_limits = filters::DecodeLimits {
-        max_output: cli.decode_memory_limit,
-        ..filters::DecodeLimits::default()
-    };
+    let decode_limits = filters::DecodeLimits::default();
     if cli.check {
         return run_check_pdf(input, pdf, decode_limits);
     }
@@ -2332,10 +2296,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             Some(cmd.input),
             cmd.repair,
             &cmd.password,
-            filters::DecodeLimits {
-                max_output: cmd.decode_memory_limit,
-                ..filters::DecodeLimits::default()
-            },
+            filters::DecodeLimits::default(),
         ),
         Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
             Ok(()) => logger_info("linearization OK\n"),
@@ -2355,7 +2316,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
         }
         Commands::Pages(cmd) => {
-            if cmd.count {
+            if cmd.show_npages {
                 run_show_npages(Some(cmd.input), cmd.repair, &cmd.password)
             } else {
                 run_show_pages(Some(cmd.input), cmd.repair, &cmd.password)
@@ -2445,13 +2406,13 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 recompress_flate: cmd.recompress_flate,
                 ..WriterOptions::default()
             };
-            // `rewrite --encrypt` / `--copy-encryption-from`: wire encryption
+            // `rewrite --encrypt` / `--copy-encryption`: wire encryption
             // onto WriterOptions (shared with the top-level surface via
             // apply_encryption_options).
             apply_encryption_options(
                 &mut options,
                 &cmd.encrypt,
-                cmd.copy_encryption_from.as_deref(),
+                cmd.copy_encryption.as_deref(),
                 cmd.encryption_file_password.as_deref(),
                 cmd.password.allow_weak_crypto,
             );
@@ -2518,7 +2479,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     || cmd.remove_restrictions
                     || cmd.decrypt
                     || !cmd.encrypt.is_empty()
-                    || cmd.copy_encryption_from.is_some()
+                    || cmd.copy_encryption.is_some()
                     || cmd.generate_appearances
                     || cmd.flatten_annotations.is_some()
                     || cmd.flatten_rotation
@@ -2526,7 +2487,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     eprintln!(
                         "flpdf: --normalize-content / --coalesce-contents / \
                          --remove-restrictions / --decrypt / --encrypt / \
-                         --copy-encryption-from / --flatten-annotations / \
+                         --copy-encryption / --flatten-annotations / \
                          --generate-appearances / --flatten-rotation are \
                          not applied in the --pages/--rotate/--split-pages/\
                          --collate pipeline; rerun without them or without \
@@ -2753,9 +2714,9 @@ fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) -> CliResult<(
     logger_info(output)
 }
 
-/// Wire `--encrypt` / `--copy-encryption-from` onto `options`, shared by the
+/// Wire `--encrypt` / `--copy-encryption` onto `options`, shared by the
 /// top-level and `rewrite` surfaces so the two stay in lock-step. A `--encrypt`
-/// parse error or a `--copy-encryption-from`
+/// parse error or a `--copy-encryption`
 /// donor-open/validation error prints a `flpdf:`-prefixed diagnostic and exits
 /// 2, matching the surrounding option parsers. The two options are mutually
 /// exclusive at the CLI layer (clap `conflicts_with`), so at most one branch
@@ -2763,7 +2724,7 @@ fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) -> CliResult<(
 fn apply_encryption_options(
     options: &mut WriterOptions,
     encrypt: &[String],
-    copy_encryption_from: Option<&std::path::Path>,
+    copy_encryption: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
     allow_weak_crypto: bool,
 ) {
@@ -2778,7 +2739,7 @@ fn apply_encryption_options(
             }
         }
     }
-    if let Some(donor_path) = copy_encryption_from {
+    if let Some(donor_path) = copy_encryption {
         match build_copy_encryption_source(donor_path, encryption_file_password) {
             Ok(src) => {
                 options.copy_encryption = Some(src);
@@ -2793,7 +2754,7 @@ fn apply_encryption_options(
 
 /// Open a donor PDF at `path` (with optional `password`) and extract the
 /// information needed to copy its encryption to a new output file
-/// (`--copy-encryption-from`).
+/// (`--copy-encryption`).
 ///
 /// Returns a [`CopyEncryptionSource`] ready to be stored in
 /// [`WriterOptions::copy_encryption`] or an error string suitable for printing
@@ -2805,8 +2766,8 @@ fn build_copy_encryption_source(
     path: &std::path::Path,
     password: Option<&str>,
 ) -> CliResult<CopyEncryptionSource> {
-    let file = File::open(path)
-        .map_err(|e| format!("--copy-encryption-from: cannot open {:?}: {e}", path))?;
+    let file =
+        File::open(path).map_err(|e| format!("--copy-encryption: cannot open {:?}: {e}", path))?;
     let reader = BufReader::new(file);
 
     let pw_bytes: Vec<u8> = password.unwrap_or("").as_bytes().to_vec();
@@ -2818,13 +2779,13 @@ fn build_copy_encryption_source(
     let mut opts = opts;
     configure_document_logger(&mut opts, path);
     let mut donor = Pdf::open_with_options(reader, opts)
-        .map_err(|e| format!("--copy-encryption-from: failed to open {:?}: {e}", path))?;
+        .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
 
     // Validate the donor is encrypted.
     let info = donor
         .encryption_info()
-        .map_err(|e| format!("--copy-encryption-from: failed to read encryption info: {e}"))?
-        .ok_or_else(|| format!("--copy-encryption-from: donor {:?} is not encrypted", path))?;
+        .map_err(|e| format!("--copy-encryption: failed to read encryption info: {e}"))?
+        .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
 
     // Walking-skeleton scope: only V=4 AES-128 (StmF=AESV2 / StrF=AESV2).
     // Note: encryption_info uses qpdf_name() which returns "AESv2" (lowercase v).
@@ -2834,7 +2795,7 @@ fn build_copy_encryption_source(
         && info.string_method == "AESv2";
     if !is_v4_aes128 {
         return Err(format!(
-            "--copy-encryption-from: donor {:?} uses V={} length={} \
+            "--copy-encryption: donor {:?} uses V={} length={} \
              stream={} string={} — only V=4 AES-128 donors are accepted",
             path, info.v, info.length_bits, info.stream_method, info.string_method,
         )
@@ -2845,7 +2806,7 @@ fn build_copy_encryption_source(
     // supply the correct password via --encryption-file-password.
     let file_key: Vec<u8> = donor.encryption_file_key().ok_or_else(|| {
         format!(
-            "--copy-encryption-from: failed to recover donor file key for {:?} \
+            "--copy-encryption: failed to recover donor file key for {:?} \
              (wrong --encryption-file-password?)",
             path
         )
@@ -2856,14 +2817,14 @@ fn build_copy_encryption_source(
     // before calling resolve() which needs &mut self.
     let encrypt_ref = donor.trailer().get_ref("Encrypt").ok_or_else(|| {
         format!(
-            "--copy-encryption-from: donor {:?} has no /Encrypt in trailer",
+            "--copy-encryption: donor {:?} has no /Encrypt in trailer",
             path
         )
     })?;
 
     let encrypt_obj = donor.resolve_borrowed(encrypt_ref).map_err(|e| {
         format!(
-            "--copy-encryption-from: failed to resolve /Encrypt in {:?}: {e}",
+            "--copy-encryption: failed to resolve /Encrypt in {:?}: {e}",
             path
         )
     })?;
@@ -2872,7 +2833,7 @@ fn build_copy_encryption_source(
         Object::Dictionary(d) => d.clone(),
         other => {
             return Err(format!(
-                "--copy-encryption-from: /Encrypt in {:?} is not a dictionary (got {:?})",
+                "--copy-encryption: /Encrypt in {:?} is not a dictionary (got {:?})",
                 path, other
             )
             .into())
@@ -2884,16 +2845,14 @@ fn build_copy_encryption_source(
         Some(Object::Array(arr)) => match arr.first() {
             Some(Object::String(bytes)) => bytes.clone(),
             _ => {
-                return Err(format!(
-                    "--copy-encryption-from: donor {:?} /ID[0] is not a string",
-                    path
+                return Err(
+                    format!("--copy-encryption: donor {:?} /ID[0] is not a string", path).into(),
                 )
-                .into())
             }
         },
         _ => {
             return Err(format!(
-                "--copy-encryption-from: donor {:?} has no /ID array in trailer",
+                "--copy-encryption: donor {:?} has no /ID array in trailer",
                 path
             )
             .into())
@@ -3913,7 +3872,6 @@ impl QpdfArgSegment {
                     | "description"
                     | "creationdate"
                     | "moddate"
-                    | "afrelationship"
                     | "replace"
             ),
             Self::CopyAttachments => matches!(name, "password" | "prefix"),
@@ -5127,12 +5085,8 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
             .into());
         };
 
-        if cmd.raw {
-            if let Some(path) = cmd.out.as_ref() {
-                std::fs::write(path, &stream.data)?;
-            } else {
-                standard_save_writer()?.write_all(&stream.data)?;
-            }
+        if cmd.raw_stream_data {
+            standard_save_writer()?.write_all(&stream.data)?;
             return Ok(());
         }
 
@@ -5158,26 +5112,14 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
             }
         });
         if let Some(label) = passthrough_label {
-            // These codecs are not decodable. With `--out`, write the raw stored
-            // bytes (the only available representation — e.g. the embedded JBIG2
-            // data for JBIG2Decode) and report the marker on stderr. Without
-            // `--out`, print the marker to stdout instead of dumping binary to
-            // the terminal.
-            if let Some(path) = cmd.out.as_ref() {
-                std::fs::write(path, &stream.data)?;
-                eprintln!("<binary, {} bytes, codec {}>", stream.data.len(), label);
-            } else {
-                println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
-            }
+            // This codec is not decodable, so print a marker instead of
+            // dumping binary data to the terminal.
+            println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
             return Ok(());
         }
 
         let bytes = filters::decode_stream_data(&stream.dict, &stream.data)?;
-        if let Some(path) = cmd.out.as_ref() {
-            std::fs::write(path, bytes)?;
-        } else {
-            standard_save_writer()?.write_all(&bytes)?;
-        }
+        standard_save_writer()?.write_all(&bytes)?;
         Ok(())
     })();
     operation?;
@@ -6050,8 +5992,6 @@ struct AddAttachmentArgs {
     mimetype: Option<Vec<u8>>,
     /// Human-readable description for `/Filespec /Desc`.
     description: Option<Vec<u8>>,
-    /// `/AFRelationship` name.
-    af_relationship: Option<Vec<u8>>,
     /// `/Params /CreationDate` as `(year, month, day, hour, minute, second)`.
     creation_date: Option<(u16, u8, u8, u8, u8, u8)>,
     /// `/Params /ModDate` as `(year, month, day, hour, minute, second)`.
@@ -6064,8 +6004,7 @@ struct AddAttachmentArgs {
 /// [`AddAttachmentArgs`].
 ///
 /// Expected token order: FILE [--key=K] [--filename=F] [--mimetype=M]
-/// [--description=D] [--creationdate=D] [--moddate=D] [--afrelationship=R]
-/// [--replace]
+/// [--description=D] [--creationdate=D] [--moddate=D] [--replace]
 fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentArgs> {
     let mut iter = tokens.into_iter();
     let file: PathBuf = iter
@@ -6077,7 +6016,6 @@ fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentA
     let mut filename: Option<Vec<u8>> = None;
     let mut mimetype: Option<Vec<u8>> = None;
     let mut description: Option<Vec<u8>> = None;
-    let mut af_relationship: Option<Vec<u8>> = None;
     let mut creation_date: Option<(u16, u8, u8, u8, u8, u8)> = None;
     let mut mod_date: Option<(u16, u8, u8, u8, u8, u8)> = None;
     let mut replace = false;
@@ -6091,8 +6029,6 @@ fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentA
             mimetype = Some(v.as_bytes().to_vec());
         } else if let Some(v) = token.strip_prefix("--description=") {
             description = Some(v.as_bytes().to_vec());
-        } else if let Some(v) = token.strip_prefix("--afrelationship=") {
-            af_relationship = Some(v.as_bytes().to_vec());
         } else if let Some(v) = token.strip_prefix("--creationdate=") {
             creation_date = Some(parse_pdf_date_arg(v)?);
         } else if let Some(v) = token.strip_prefix("--moddate=") {
@@ -6113,7 +6049,6 @@ fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentA
         filename,
         mimetype,
         description,
-        af_relationship,
         creation_date,
         mod_date,
         replace,
@@ -6226,9 +6161,6 @@ fn run_add_attachment(
     if let Some(desc) = args.description {
         builder = builder.description(desc);
     }
-    if let Some(rel) = args.af_relationship {
-        builder = builder.af_relationship(rel);
-    }
     let filespec_ref = builder.build(&mut pdf)?;
     insert_embedded_file(&mut pdf, &key, filespec_ref)?;
 
@@ -6308,14 +6240,9 @@ fn run_show_attachment(
     repair: bool,
     password: &PasswordArgs,
     key: &str,
-    out_path: Option<PathBuf>,
 ) -> CliResult<()> {
     let input = input.ok_or("--show-attachment: missing input PDF")?;
-    let mut standard_output = if out_path.is_none() {
-        Some(standard_save_writer()?)
-    } else {
-        None
-    };
+    let mut standard_output = standard_save_writer()?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let bytes = extract_attachment(&mut pdf, key.as_bytes()).map_err(|e| {
         format!(
@@ -6323,15 +6250,7 @@ fn run_show_attachment(
             key
         )
     })?;
-    if let Some(path) = out_path {
-        std::fs::write(&path, &bytes)
-            .map_err(|e| format!("--show-attachment: cannot write to {:?}: {e}", path))?;
-    } else {
-        standard_output
-            .as_mut()
-            .expect("stdout writer prepared for attachment output")
-            .write_all(&bytes)?;
-    }
+    standard_output.write_all(&bytes)?;
     finish_operation_warnings(&pdf, false)
 }
 

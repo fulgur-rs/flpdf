@@ -538,7 +538,7 @@ fn pages_subcommand_prints_count() {
     let fixture = fixture_with_nested_pages();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["pages", "--count", fixture.path().to_str().unwrap()])
+    cmd.args(["pages", "--show-npages", fixture.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("2"));
@@ -1200,7 +1200,7 @@ fn check_with_repair_accepts_corrupt_xref() {
 #[test]
 fn dump_object_accepts_ref_without_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--dump-object", "1 0", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["--show-object", "1 0", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
@@ -1209,7 +1209,7 @@ fn dump_object_accepts_ref_without_suffix() {
 #[test]
 fn dump_object_accepts_ref_with_r_suffix() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--dump-object", "1 0 R", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["--show-object", "1 0 R", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/Type /Catalog"));
@@ -1218,7 +1218,7 @@ fn dump_object_accepts_ref_with_r_suffix() {
 #[test]
 fn dump_object_rejects_invalid_ref() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--dump-object", "bad", "../../tests/fixtures/minimal.pdf"])
+    cmd.args(["--show-object", "bad", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .failure();
 }
@@ -5593,7 +5593,7 @@ fn add_attachment_non_ascii_basename_uses_ascii_fallback_and_unicode_uf() {
 }
 
 #[test]
-fn add_attachment_subflag_mimetype_description_afrelationship() {
+fn add_attachment_subflag_mimetype_description() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
     let attachment = temp.path().join("report.pdf");
@@ -5609,7 +5609,6 @@ fn add_attachment_subflag_mimetype_description_afrelationship() {
             "--key=report",
             "--mimetype=application/pdf",
             "--description=Annual Report",
-            "--afrelationship=Data",
             "--",
             output.to_str().unwrap(),
         ])
@@ -6048,44 +6047,6 @@ fn show_attachment_writes_to_stdout() {
         .stdout;
 
     assert_eq!(stdout_bytes, payload);
-}
-
-#[test]
-fn show_attachment_writes_to_file_with_o_flag() {
-    let temp = tempfile::tempdir().unwrap();
-    let input = minimal_pdf_temp();
-    let payload = b"payload bytes for file test";
-    let attachment = temp.path().join("tofile.txt");
-    std::fs::write(&attachment, payload).unwrap();
-    let out_pdf = temp.path().join("out.pdf");
-
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            input.path().to_str().unwrap(),
-            "--add-attachment",
-            attachment.to_str().unwrap(),
-            "--key=tofile",
-            "--",
-            out_pdf.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
-    let extracted = temp.path().join("extracted.txt");
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--show-attachment=tofile",
-            "--show-attachment-to",
-            extracted.to_str().unwrap(),
-            out_pdf.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
-    let read_back = std::fs::read(&extracted).unwrap();
-    assert_eq!(read_back, payload);
 }
 
 #[test]
