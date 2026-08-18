@@ -287,23 +287,93 @@ impl V5Randomness {
 /// report to the one registered qpdf progress reporter.
 type ProgressCallback = Box<dyn FnMut(u8) + 'static>;
 type SharedProgressCallback = Rc<RefCell<ProgressCallback>>;
+type SharedProgressState = Rc<RefCell<ProgressStateInner>>;
 
 #[derive(Clone)]
-pub(crate) struct ProgressReporter(SharedProgressCallback);
+pub(crate) struct ProgressReporter {
+    callback: SharedProgressCallback,
+    state: SharedProgressState,
+}
 
 impl ProgressReporter {
     pub(crate) fn new(reporter: Box<dyn FnMut(u8) + 'static>) -> Self {
-        Self(Rc::new(RefCell::new(reporter)))
+        Self {
+            callback: Rc::new(RefCell::new(reporter)),
+            state: Rc::new(RefCell::new(ProgressStateInner::default())),
+        }
     }
 
     pub(crate) fn report(&self, percent: u8) {
-        (self.0.borrow_mut())(percent);
+        (self.callback.borrow_mut())(percent);
+    }
+
+    pub(crate) fn configure(&self, events_expected: usize) {
+        *self.state.borrow_mut() = ProgressStateInner {
+            events_expected: events_expected.max(1),
+            ..ProgressStateInner::default()
+        };
+    }
+
+    /// Translate QPDFWriter::indicateProgress (`QPDFWriter.cc:2957-2982`).
+    ///
+    /// The counter is shared because the canonical writer clones its option
+    /// snapshot while a linearized file performs both passes. The callback is
+    /// invoked after the state borrow is released so a reporter can safely
+    /// observe external state without extending the writer's interior borrow.
+    pub(crate) fn indicate(&self, decrement: bool, finished: bool) {
+        let progress = {
+            let mut state = self.state.borrow_mut();
+            if decrement {
+                state.events_seen = state.events_seen.saturating_sub(1);
+                return;
+            }
+
+            state.events_seen = state.events_seen.saturating_add(1);
+            let progress = if finished {
+                Some(100)
+            } else if state.events_seen >= state.next_progress_report {
+                Some(if state.next_progress_report == 0 {
+                    0
+                } else {
+                    let scaled = state.events_seen.saturating_mul(100) / state.events_expected;
+                    1_u8.saturating_add(u8::try_from(scaled.min(98)).unwrap_or(98))
+                })
+            } else {
+                None
+            };
+
+            let increment = (state.events_expected / 100).max(1);
+            while state.events_seen >= state.next_progress_report {
+                state.next_progress_report = state.next_progress_report.saturating_add(increment);
+            }
+            progress
+        };
+
+        if let Some(progress) = progress {
+            self.report(progress);
+        }
     }
 }
 
 impl fmt::Debug for ProgressReporter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ProgressReporter(..)")
+    }
+}
+
+#[derive(Debug)]
+struct ProgressStateInner {
+    events_expected: usize,
+    events_seen: usize,
+    next_progress_report: usize,
+}
+impl Default for ProgressStateInner {
+    fn default() -> Self {
+        Self {
+            events_expected: 1,
+            events_seen: 0,
+            next_progress_report: 0,
+        }
     }
 }
 
@@ -606,22 +676,57 @@ pub(crate) struct WriterOptions {
     pub(crate) progress_reporter: Option<ProgressReporter>,
 }
 
-pub(crate) fn report_progress(options: &WriterOptions, percent: u8) {
+/// Configure qpdf-shaped progress after the writer has completed the setup
+/// that allocates any synthetic objects. qpdf snapshots
+/// `QPDF::getObjectCount()` only after `doWriteSetup` (QPDFWriter.cc:2189-2193),
+/// so callers pass the number of fresh ObjStm containers allocated during that
+/// setup without mutating the source document just for progress accounting.
+pub(crate) fn configure_progress_for_pdf<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    additional_objects: usize,
+    linearized: bool,
+) -> Result<()> {
+    if options.progress_reporter.is_none() {
+        return Ok(());
+    }
+
+    // cov:ignore-start: Pdf::get_object_count returns u32, and flpdf's
+    // supported targets have usize at least 32 bits wide.
+    let object_count = usize::try_from(pdf.get_object_count()?).map_err(|_| {
+        crate::Error::Unsupported("PdfWriter progress object count does not fit usize".into())
+    })?;
+    // cov:ignore-end
+    configure_progress(
+        options,
+        object_count.saturating_add(additional_objects),
+        linearized,
+    );
+    Ok(())
+}
+
+pub(crate) fn configure_progress(options: &WriterOptions, object_count: usize, linearized: bool) {
     if let Some(reporter) = options.progress_reporter.as_ref() {
-        reporter.report(percent);
+        reporter.configure(object_count.saturating_mul(if linearized { 2 } else { 1 }));
+    } // cov:ignore: LLVM maps this closing brace as an executable branch line
+}
+
+pub(crate) fn report_progress_event(options: &WriterOptions) {
+    if let Some(reporter) = options.progress_reporter.as_ref() {
+        reporter.indicate(false, false);
     }
 }
 
-pub(crate) fn report_progress_event(
-    options: &WriterOptions,
-    events_seen: &mut usize,
-    events_expected: usize,
-) {
-    *events_seen = events_seen.saturating_add(1);
-    let expected = events_expected.max(1);
-    let scaled = events_seen.saturating_mul(100) / expected;
-    let percent = 1_u8.saturating_add(u8::try_from(scaled.min(98)).unwrap_or(98));
-    report_progress(options, percent);
+pub(crate) fn decrement_progress_event(options: &WriterOptions) {
+    if let Some(reporter) = options.progress_reporter.as_ref() {
+        reporter.indicate(true, false);
+    }
+}
+
+pub(crate) fn report_progress_finished(options: &WriterOptions) {
+    if let Some(reporter) = options.progress_reporter.as_ref() {
+        reporter.indicate(false, true);
+    }
 }
 
 /// True when `--force-version` pins the output header below PDF 1.5.
@@ -2599,8 +2704,6 @@ fn write_pclm<R: Read + Seek, W: Write>(
     }
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
-    let expected = plan.items.len().max(1);
-    let mut events = 0_usize;
     let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
 
     for item in &plan.items {
@@ -2663,7 +2766,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 offsets.insert(output.number, (0, offset));
             }
         }
-        report_progress_event(options, &mut events, expected);
+        report_progress_event(options);
     }
 
     let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
@@ -2747,8 +2850,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             "deterministic_id and static_id are mutually exclusive".to_string(),
         ));
     }
-
-    report_progress(options, 0);
 
     // A forced sub-1.5 header suppresses object-stream generation: object
     // streams are a PDF 1.5 feature and qpdf will not emit them under a forced
@@ -3306,13 +3407,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         new_root
     };
 
-    let progress_expected = renumbered
-        .len()
-        .saturating_add(plan.batches.len())
-        .saturating_add(usize::from(encrypt_ctx.is_some()))
-        .max(1);
-    let mut progress_events = 0_usize;
-
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
     if options.pclm {
@@ -3615,7 +3709,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
         emitted_old_to_new.insert(*old_ref, ObjectRef::new(emit_ref.number, 0));
-        report_progress_event(options, &mut progress_events, progress_expected);
+        report_progress_event(options);
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -3663,7 +3757,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let body = object_streams::emit_objstm_body_from_handles_with_writer(
             &handles,
             &mut |out, _member_index, _member_ref, handle| {
-                handle.unparse_object_with_ref_map_and_removed(out, &map, &removed_refs)
+                let result =
+                    handle.unparse_object_with_ref_map_and_removed(out, &map, &removed_refs);
+                if result.is_ok() {
+                    report_progress_event(options);
+                }
+                result
             },
         )?; // cov:ignore: handle-native ObjStm member emission; LLVM maps the call continuation here
         let (stream_handle, stream_data) =
@@ -3746,7 +3845,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(container_ref.number, (0, emit_offset));
-        report_progress_event(options, &mut progress_events, progress_expected);
     }
 
     // ── flpdf-9hc.4.9: emit the /Encrypt dictionary as a plaintext indirect
@@ -3763,7 +3861,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(ctx.encrypt_ref.number, (0, emit_offset));
-        report_progress_event(options, &mut progress_events, progress_expected);
     }
 
     // Build xref / trailer matching the input's xref form.
@@ -8414,6 +8511,24 @@ mod tests {
         let reporter = ProgressReporter::new(Box::new(|_| {}));
 
         assert_eq!(format!("{reporter:?}"), "ProgressReporter(..)");
+    }
+
+    #[test]
+    fn configure_progress_reports_from_the_scaled_event_budget() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let events_for_reporter = Rc::clone(&events);
+        let options = WriterOptions {
+            progress_reporter: Some(ProgressReporter::new(Box::new(move |percent| {
+                events_for_reporter.borrow_mut().push(percent);
+            }))),
+            ..WriterOptions::default()
+        };
+
+        configure_progress(&options, 2, true);
+        report_progress_event(&options);
+        report_progress_finished(&options);
+
+        assert_eq!(&*events.borrow(), &[0, 100]);
     }
 
     #[test]

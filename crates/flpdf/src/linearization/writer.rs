@@ -75,9 +75,9 @@ use crate::writer::object_streams::{
     wrap_objstm_body_as_handle,
 };
 use crate::writer::{
-    effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension,
-    report_progress_event, serialize::xref_stream, strip_adbe_extension, CompressStreams,
-    NewlineBeforeEndstream, WriterOptions, WriterResult,
+    decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
+    inject_adbe_extension, report_progress_event, serialize::xref_stream, strip_adbe_extension,
+    CompressStreams, NewlineBeforeEndstream, WriterOptions, WriterResult,
 };
 use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result};
 
@@ -2100,8 +2100,6 @@ fn do_write_pass<R: Read + Seek>(
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
-    progress_events: &mut usize,
-    progress_expected: usize,
 ) -> Result<LinearizedPassOutput> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
@@ -2285,7 +2283,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.removed_refs,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
-        report_progress_event(options, progress_events, progress_expected);
+        report_progress_event(options);
         catalog_emitted_early = true;
     }
 
@@ -2320,7 +2318,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.removed_refs,
         )?; // cov:ignore: planner-produced open-document references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options, progress_events, progress_expected);
+        report_progress_event(options);
     }
 
     // Open-document ObjStm containers (qpdf part4).  qpdf places the
@@ -2341,9 +2339,18 @@ fn do_write_pass<R: Read + Seek>(
             encrypt_ctx,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
-        if !pass1_digest {
-            for _ in &container.members {
-                report_progress_event(options, progress_events, progress_expected);
+        for _ in &container.members {
+            if pass1_digest {
+                decrement_progress_event(options);
+            }
+            report_progress_event(options);
+            if pass1_digest {
+                // qpdf's writeObjectStream performs an offset-measuring pass
+                // followed by the payload pass inside each outer linearization
+                // pass. The first outer pass therefore reports each member
+                // twice after the decrement, while the final pass's net effect
+                // is one event (QPDFWriter.cc:1639-1707).
+                report_progress_event(options);
             }
         }
     }
@@ -2424,7 +2431,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.removed_refs,
         )?; // cov:ignore: planner-produced Part-2 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options, progress_events, progress_expected);
+        report_progress_event(options);
     }
 
     // Part 3 (Annex F) continued: shared objects sit INSIDE the first-page
@@ -2462,7 +2469,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.removed_refs,
         )?; // cov:ignore: planner-produced Part-3 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options, progress_events, progress_expected);
+        report_progress_event(options);
     }
 
     // Part-3 ObjStm containers.  These hold shared/catalog members and MUST
@@ -2480,9 +2487,13 @@ fn do_write_pass<R: Read + Seek>(
             encrypt_ctx,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
-        if !pass1_digest {
-            for _ in &container.members {
-                report_progress_event(options, progress_events, progress_expected);
+        for _ in &container.members {
+            if pass1_digest {
+                decrement_progress_event(options);
+            }
+            report_progress_event(options);
+            if pass1_digest {
+                report_progress_event(options);
             }
         }
     }
@@ -2588,7 +2599,7 @@ fn do_write_pass<R: Read + Seek>(
                     &plan.removed_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options, progress_events, progress_expected);
+                report_progress_event(options);
             }
             Part4Emit::Container(container) => {
                 let offset = append_objstm_container_object(
@@ -2601,9 +2612,13 @@ fn do_write_pass<R: Read + Seek>(
                     encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
-                if !pass1_digest {
-                    for _ in &container.members {
-                        report_progress_event(options, progress_events, progress_expected);
+                for _ in &container.members {
+                    if pass1_digest {
+                        decrement_progress_event(options);
+                    }
+                    report_progress_event(options);
+                    if pass1_digest {
+                        report_progress_event(options);
                     }
                 }
             }
@@ -3194,7 +3209,21 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     } else {
         options.object_streams
     };
+
     let plan = LinearizationPlan::from_pdf_with_object_stream_mode(pdf, mode)?;
+    // qpdf allocates generated ObjStm placeholders before it removes page and
+    // Catalog members from the mapping (QPDFWriter.cc:1970-2005, 2141-2161).
+    // Count those pre-filter containers for progress even when a later filter
+    // leaves one empty and therefore absent from the emitted layout. Keep this
+    // traversal after plan construction: the plan's first qpdf-shaped graph
+    // walk establishes stream-recovery state for malformed encrypted sources.
+    let generated_object_stream_count = if mode == crate::writer::ObjectStreamMode::Generate {
+        let compressible = crate::writer::object_streams::compressible_objgens_qpdf_plan(pdf)?;
+        crate::writer::object_streams::even_split_into_streams(&compressible.eligible).len()
+    } else {
+        0
+    };
+    crate::writer::configure_progress_for_pdf(pdf, options, generated_object_stream_count, true)?;
     let renumber = RenumberMap::from_plan(&plan);
     write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
 }
@@ -3933,13 +3962,6 @@ fn write_linearized_impl<R: Read + Seek>(
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
     let pass1_part1 = build_pass1_part1(&part1);
-    // qpdf's progress denominator is an approximation of source object count
-    // times the two linearization passes (`QPDFWriter::write`, around
-    // QPDFWriter.cc:2191). Keep one counter across both passes so progress
-    // reaches the same pre-sink 99% ceiling before `QPDFWriter::write` emits
-    // the terminal 100% event after the sink finishes.
-    let progress_expected = pdf.object_refs().len().saturating_mul(2).max(1);
-    let mut progress_events = 0_usize;
     let pass1_output = do_write_pass(
         plan,
         renumber,
@@ -3960,8 +3982,6 @@ fn write_linearized_impl<R: Read + Seek>(
         None,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
-        &mut progress_events,
-        progress_expected,
     )?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
 
     let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if options.deterministic_id {
@@ -4362,8 +4382,6 @@ fn write_linearized_impl<R: Read + Seek>(
         id_writer,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
-        &mut progress_events,
-        progress_expected,
     )?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     let LinearizedPassOutput {
         bytes: mut final_bytes,
