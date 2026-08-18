@@ -112,11 +112,14 @@ fn page_index_of(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, target: Objec
 /// test-harness bug, not something the assertions below should tolerate
 /// silently.
 fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> usize {
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     let target = tree[tree.roots()[0]]
-        .dest_page()
+        .dest_page(&mut helper)
+        .unwrap()
         .object_ref()
         .expect("dest must resolve to a page ref");
+    drop(helper);
     page_index_of(pdf, target)
 }
 

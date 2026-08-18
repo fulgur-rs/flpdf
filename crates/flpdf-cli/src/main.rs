@@ -5256,7 +5256,8 @@ fn run_show_outline(
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
 
-    let tree = match pdf.outline().get_tree() {
+    let mut helper = pdf.outline();
+    let tree = match helper.get_tree() {
         Ok(tree) => tree,
         Err(error) => {
             eprintln!("Warning: {error}");
@@ -5273,7 +5274,22 @@ fn run_show_outline(
     }
 
     for (index, (depth, _id, item)) in tree.preorder().enumerate() {
-        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, item.title);
+        let title = match item.title(&mut helper) {
+            Ok(title) => title,
+            Err(error) => {
+                // Title resolution now happens live per item (matching qpdf's
+                // own accessors, which never cache), so a title lookup can
+                // fail after earlier items have already printed -- unlike
+                // the `get_tree` failure above, there is no pre-output point
+                // left to fall back to. Preserve the same non-fatal recovery
+                // contract this command already established for `get_tree`:
+                // warn and stop enumerating rather than aborting the whole
+                // command on one item's error.
+                eprintln!("Warning: {error}");
+                break;
+            }
+        };
+        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, title);
     }
     finish_operation_warnings(&pdf, false)
 }

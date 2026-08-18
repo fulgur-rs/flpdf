@@ -146,7 +146,8 @@ fn deep_outline_round_trip_through_write_pdf() {
     let mapped_page = mapping[&ObjectRef::new(3, 0)];
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let tree = reopened.outline().get_tree().unwrap();
+    let mut helper = reopened.outline();
+    let tree = helper.get_tree().unwrap();
     assert_eq!(
         tree.roots().len(),
         1,
@@ -159,8 +160,8 @@ fn deep_outline_round_trip_through_write_pdf() {
     let mut id = tree.roots()[0];
     loop {
         let item = &tree[id];
-        assert_eq!(item.title, format!("L{depth}"));
-        let dest_page = item.dest_page();
+        assert_eq!(item.title(&mut helper).unwrap(), format!("L{depth}"));
+        let dest_page = item.dest_page(&mut helper).unwrap();
         assert_eq!(
             dest_page
                 .object_ref()
@@ -509,14 +510,15 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
 
     // -- Deep chain (20 levels) preserved --
-    let tree = reopened.outline().get_tree().unwrap();
-    let roots = tree.roots();
+    let mut helper = reopened.outline();
+    let tree = helper.get_tree().unwrap();
+    let roots = tree.roots().to_vec();
     assert_eq!(roots.len(), 7);
     let mut depth = 0usize;
     let mut id = roots[0];
     loop {
         let item = &tree[id];
-        assert_eq!(item.title, format!("Deep{depth}"));
+        assert_eq!(item.title(&mut helper).unwrap(), format!("Deep{depth}"));
         match item.kids.first() {
             Some(&child) => {
                 id = child;
@@ -526,6 +528,12 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         }
     }
     assert_eq!(depth, 19, "20-level deep chain must survive intact");
+
+    // Fetch the `/SE` item's title live while `helper` still borrows
+    // `reopened`, then drop `helper` so the raw-dictionary checks below can
+    // borrow `reopened` mutably again.
+    let se_title = tree[roots[6]].title(&mut helper).unwrap();
+    drop(helper);
 
     // -- All five raw action dictionaries preserved, in sibling order --
     let actions: Vec<Object> = roots[1..=5]
@@ -573,7 +581,7 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
 
     // -- Raw /SE link preserved and still resolves to a live /StructElem --
     let se_item = &tree[roots[6]];
-    assert_eq!(se_item.title, "WithSE");
+    assert_eq!(se_title, "WithSE");
     let se_ref = match dict_value(
         &mut reopened,
         se_item.source_ref.expect("fixture item is indirect"),

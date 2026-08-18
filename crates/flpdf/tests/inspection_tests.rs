@@ -26,11 +26,12 @@ fn page_refs_with_max_depth_rejects_too_deep_trees() {
 fn outline_tree_returns_titles_in_pre_order() {
     let pdf = pdf_with_metadata_outline_and_fonts();
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     let (depth, id, item) = tree.preorder().next().unwrap();
     assert_eq!(tree.roots().len(), 1);
     assert_eq!(depth, 1);
-    assert_eq!(item.title, "Chapter One");
+    assert_eq!(item.title(&mut helper).unwrap(), "Chapter One");
     assert_eq!(item.source_ref, Some(ObjectRef::new(10, 0)));
     assert!(tree
         .get(id)
@@ -53,10 +54,11 @@ fn outline_tree_resolves_indirect_title() {
     let object5 = b"5 0 obj\n(Chapter One)\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4, object5]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     let item = &tree[tree.roots()[0]];
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(item.title, "Chapter One");
+    assert_eq!(item.title(&mut helper).unwrap(), "Chapter One");
     assert_eq!(item.source_ref, Some(ObjectRef::new(4, 0)));
 }
 
@@ -65,9 +67,10 @@ fn outline_tree_decodes_utf16be_title_like_qpdf() {
     let object4 = b"4 0 obj\n<< /Title <FEFF65E5> /Parent 3 0 R >>\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title, "日");
+    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "日");
 }
 
 #[test]
@@ -75,9 +78,10 @@ fn outline_tree_uses_empty_title_when_title_absent() {
     let object4 = b"4 0 obj\n<< /Parent 3 0 R >>\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title, "");
+    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
 }
 
 #[test]
@@ -85,9 +89,10 @@ fn outline_tree_uses_empty_title_for_non_string_value() {
     let object4 = b"4 0 obj\n<< /Title 42 /Parent 3 0 R >>\nendobj\n".to_vec();
     let pdf = single_outline_pdf(&[object4]);
     let mut pdf = Pdf::open(Cursor::new(pdf)).unwrap();
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title, "");
+    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
 }
 
 /// Build a minimal PDF whose catalog points at an `/Outlines` tree with a single

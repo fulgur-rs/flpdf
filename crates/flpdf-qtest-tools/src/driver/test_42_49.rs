@@ -697,16 +697,35 @@ pub(crate) fn run_test_49<R: Read + Seek>(
     //
     // `OutlineTree::get_outlines_for_page` is qpdf's
     // `QPDFOutlineDocumentHelper::getOutlinesForPage`
-    // (`outline_object_helper.rs:84-109`'s own doc cites the qpdf source), and
+    // (`outline_object_helper.rs:159-178`'s own doc cites the qpdf source), and
     // `OutlineItem::title`/`::dest` are the decoded `/Title` and resolved
-    // destination `getTitle()`/`getDest()` produce.
-    let tree = OutlineDocumentHelper::new(pdf).get_tree()?;
+    // destination `getTitle()`/`getDest()` produce, recomputed live on every
+    // call like qpdf's own accessors.
+    //
+    // qpdf constructs `QPDFOutlineDocumentHelper odh(pdf)` -- which walks the
+    // top-level `/Outlines` `/First`/`/Next` chain in its constructor
+    // (`libqpdf/QPDFOutlineDocumentHelper.cc:5-21`) -- before it lists pages
+    // via `QPDFPageDocumentHelper(pdf).getAllPages()`. `OutlineDocumentHelper`
+    // has no constructor-time side effect of its own; `get_tree` is where the
+    // equivalent top-level walk happens, so it must run before page listing
+    // to preserve that order. The tree-building helper is dropped immediately
+    // after so the page list can borrow `pdf` again; a fresh helper serves
+    // the per-page loop below (each item's `title`/`dest` calls already
+    // resolve live off the item's own handle, so a different helper instance
+    // observes the same catalog and produces identical results).
+    let tree = {
+        let mut tree_helper = OutlineDocumentHelper::new(pdf);
+        tree_helper.get_tree()?
+    };
     let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let mut helper = OutlineDocumentHelper::new(pdf);
     for (pageno, page_ref) in pages.into_iter().enumerate() {
-        let lines: Vec<(String, Vec<u8>)> = tree
-            .get_outlines_for_page(Some(page_ref))
-            .map(|(_, item)| (item.title.clone(), item.dest.unparse_resolved()))
-            .collect();
+        let mut lines: Vec<(String, Vec<u8>)> = Vec::new();
+        for (_, item) in tree.get_outlines_for_page(&mut helper, Some(page_ref))? {
+            let title = item.title(&mut helper)?;
+            let dest = item.dest(&mut helper)?.unparse_resolved();
+            lines.push((title, dest));
+        }
         for (title, dest) in lines {
             write!(stdout, "page {pageno}: {title} -> ")?;
             write_bytes(stdout, &dest)?;

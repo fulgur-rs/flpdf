@@ -1082,22 +1082,25 @@ pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json
 // ── build_outlines_section ────────────────────────────────────────────────────
 
 /// Project one live outline item into qpdf's JSON v2 shape.
-fn outline_item_to_json(
+fn outline_item_to_json<R: Read + Seek>(
     tree: &crate::OutlineTree,
     id: crate::OutlineId,
     page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
+    helper: &mut crate::OutlineDocumentHelper<'_, R>,
 ) -> Result<Json, ConvertError> {
     let item = &tree[id];
-    let dest = pdf_dest_to_json(&item.dest)?;
+    let dest = pdf_dest_to_json(&item.dest(helper)?)?;
     let destpageposfrom1 = item
-        .dest_page()
+        .dest_page(helper)?
         .object_ref()
         .and_then(|reference| page_numbers.get(&reference).copied())
         .map(Json::make_int)
         .unwrap_or_else(Json::make_null);
+    let count = item.count(helper)?;
+    let title = item.title(helper)?;
     let mut kids = Vec::with_capacity(item.kids.len());
     for kid in item.kids.iter().copied() {
-        kids.push(outline_item_to_json(tree, kid, page_numbers)?);
+        kids.push(outline_item_to_json(tree, kid, page_numbers, helper)?);
     }
     let object = match item.source_ref {
         Some(reference) => Json::make_string(reference.to_string()),
@@ -1109,8 +1112,8 @@ fn outline_item_to_json(
         ("destpageposfrom1".to_string(), destpageposfrom1),
         ("kids".to_string(), json_array(kids)?),
         ("object".to_string(), object),
-        ("open".to_string(), Json::make_bool(item.count >= 0)),
-        ("title".to_string(), Json::make_string(item.title.clone())),
+        ("open".to_string(), Json::make_bool(count >= 0)),
+        ("title".to_string(), Json::make_string(title)),
     ])
 }
 
@@ -1133,10 +1136,11 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
         .enumerate()
         .map(|(index, reference)| (reference, index as i64 + 1))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let tree = pdf.outline().get_tree()?;
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree()?;
     let mut entries = Vec::with_capacity(tree.roots().len());
     for id in tree.roots().to_vec() {
-        entries.push(outline_item_to_json(&tree, id, &page_numbers)?);
+        entries.push(outline_item_to_json(&tree, id, &page_numbers, &mut helper)?);
     }
     json_array(entries)
 }

@@ -13,10 +13,12 @@
 //!
 //! # fn f(bytes: Vec<u8>) -> flpdf::Result<()> {
 //! let mut pdf = Pdf::open(Cursor::new(bytes))?;
-//! if pdf.outline().has_outlines()? {
-//!     let tree = pdf.outline().get_tree()?;
+//! let mut helper = pdf.outline();
+//! if helper.has_outlines()? {
+//!     let tree = helper.get_tree()?;
 //!     for (depth, _id, item) in tree.preorder() {
-//!         println!("{:indent$}{}", "", item.title, indent = (depth - 1) * 2);
+//!         let title = item.title(&mut helper)?;
+//!         println!("{:indent$}{}", "", title, indent = (depth - 1) * 2);
 //!     }
 //! }
 //! # Ok(())
@@ -105,14 +107,43 @@ struct SiblingSeen {
 }
 
 /// High-level outline helper for a document. See module docs.
+///
+/// Named-destination lookups cache the catalog's `/Dests` dictionary and
+/// `/Names/Dests` name tree for the lifetime of *this instance*, matching
+/// qpdf's `QPDFOutlineDocumentHelper` (whose equivalent cache lives as long
+/// as the caller holds that C++ object). [`Pdf::outline`] mints a new
+/// instance on every call, so that cache only spans calls made through the
+/// same `&mut OutlineDocumentHelper` — callers that want the caching
+/// benefit across many [`crate::OutlineItem::dest`] calls (as
+/// [`crate::json_inspect::build_outlines_section`] does for a whole
+/// outline-tree walk) must hold one instance and reuse it, the same way a
+/// qpdf caller reuses one `QPDFOutlineDocumentHelper`.
 pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
+    /// Cached resolved `/Dests` catalog entry, mirroring
+    /// `QPDFOutlineDocumentHelper::Members::dest_dict`
+    /// (`libqpdf/QPDFOutlineDocumentHelper.cc:60-63`): fetched once on first
+    /// use (whatever it resolves to, including null) and reused for every
+    /// later named-destination lookup in this session.
+    dest_dict: Option<ObjectHandle>,
+    /// Cached `/Names/Dests` name tree, mirroring
+    /// `QPDFOutlineDocumentHelper::Members::names_dest`
+    /// (`libqpdf/QPDFOutlineDocumentHelper.cc:70-77`): built once a valid
+    /// name tree is found and reused thereafter. Unlike `dest_dict`, an
+    /// absent or malformed `/Names`/`/Names/Dests` leaves this `None`, so
+    /// (matching qpdf's `nullptr ==` guard) every call keeps retrying the
+    /// catalog lookup until a valid tree is found.
+    names_dest: Option<HandleNameTree>,
 }
 
 impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Wrap a document for outline access. Prefer [`Pdf::outline`].
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
-        Self { pdf }
+        Self {
+            pdf,
+            dest_dict: None,
+            names_dest: None,
+        }
     }
 
     /// Return `true` if the resolved catalog `/Outlines` dictionary has a
@@ -388,45 +419,69 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if cursor.try_is_null()? {
             return Ok(None);
         }
-        let (title_src, count_src, dest_src, action_src) = if cursor.try_as_dictionary()?.is_some()
-        {
-            (
-                cursor
-                    .try_has_key(b"/Title")?
-                    .then(|| cursor.try_get_key(b"/Title")),
-                cursor
-                    .try_has_key(b"/Count")?
-                    .then(|| cursor.try_get_key(b"/Count")),
-                cursor
-                    .try_has_key(b"/Dest")?
-                    .then(|| cursor.try_get_key(b"/Dest")),
-                cursor
-                    .try_has_key(b"/A")?
-                    .then(|| cursor.try_get_key(b"/A")),
-            )
-        } else {
-            (None, None, None, None)
-        };
-        let title_src = title_src.transpose()?;
-        let count_src = count_src.transpose()?;
-        let dest_src = dest_src.transpose()?;
-        let action_src = action_src.transpose()?;
-        let title = resolve_title(self.pdf, title_src)?;
-        let count = resolve_count(self.pdf, count_src)?;
-        let dest = self.resolve_node_dest(dest_src, action_src)?;
-        self.resolve_handle(&dest)?;
         let id = OutlineId(tree.items.len());
         tree.items.push(OutlineItem {
             source_ref,
             parent,
             kids: Vec::new(),
             object: cursor,
-            title,
-            count,
-            dest,
         });
 
         Ok(Some(id))
+    }
+
+    /// Extract an outline dictionary's `/key` entry, or `None` when the
+    /// object is not a dictionary or lacks that key. Shared by
+    /// [`Self::resolve_item_title`], [`Self::resolve_item_count`], and
+    /// [`Self::resolve_item_dest`].
+    fn outline_dict_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
+        if object.try_as_dictionary()?.is_none() || !object.try_has_key(key)? {
+            return Ok(None);
+        }
+        Ok(Some(object.try_get_key(key)?))
+    }
+
+    /// Decode `/Title` from a live outline object, mirroring qpdf's
+    /// `getTitle()` (`libqpdf/QPDFOutlineObjectHelper.cc:91-98`), which
+    /// re-reads `/Title` on every call rather than caching it. Backs
+    /// [`crate::OutlineItem::title`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors resolving `/Title` or emitting a type-mismatch warning.
+    pub(crate) fn resolve_item_title(&mut self, object: &ObjectHandle) -> Result<String> {
+        let title_src = Self::outline_dict_key(object, b"/Title")?;
+        resolve_title(self.pdf, title_src)
+    }
+
+    /// Read `/Count` from a live outline object, mirroring qpdf's
+    /// `getCount()` (`libqpdf/QPDFOutlineObjectHelper.cc:81-88`), which
+    /// re-reads `/Count` on every call rather than caching it. Backs
+    /// [`crate::OutlineItem::count`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors resolving `/Count` or emitting a type-mismatch warning.
+    pub(crate) fn resolve_item_count(&mut self, object: &ObjectHandle) -> Result<i32> {
+        let count_src = Self::outline_dict_key(object, b"/Count")?;
+        resolve_count(self.pdf, count_src)
+    }
+
+    /// Resolve a live outline object's destination, mirroring qpdf's
+    /// `getDest()` (`libqpdf/QPDFOutlineObjectHelper.cc:47-69`), which
+    /// re-reads `/Dest`/`/A` on every call rather than caching the result.
+    /// Backs [`crate::OutlineItem::dest`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors resolving the destination or the catalog's
+    /// named-destination tables.
+    pub(crate) fn resolve_item_dest(&mut self, object: &ObjectHandle) -> Result<ObjectHandle> {
+        let dest_src = Self::outline_dict_key(object, b"/Dest")?;
+        let action_src = Self::outline_dict_key(object, b"/A")?;
+        let dest = self.resolve_node_dest(dest_src, action_src)?;
+        self.resolve_handle(&dest)?;
+        Ok(dest)
     }
 
     /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
@@ -477,11 +532,23 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(Some(action.try_get_key(b"/D")?))
     }
 
-    fn resolve_legacy_node_dest(&mut self, name: &[u8]) -> Result<ObjectHandle> {
-        let Some(dests) = self.catalog_value_handle(b"/Dests")? else {
-            return Ok(ObjectHandle::null());
+    /// Return the cached `/Dests` catalog entry, fetching and caching it on
+    /// first use (matching qpdf's `dest_dict.isInitialized()` guard, which
+    /// caches the fetch outcome unconditionally, including a missing entry).
+    fn cached_dest_dict(&mut self) -> Result<ObjectHandle> {
+        if let Some(dests) = &self.dest_dict {
+            return Ok(dests.clone());
+        }
+        let dests = match self.catalog_value_handle(b"/Dests")? {
+            Some(dests) => self.resolve_value_handle(dests)?,
+            None => ObjectHandle::null(),
         };
-        let dests = self.resolve_value_handle(dests)?;
+        self.dest_dict = Some(dests.clone());
+        Ok(dests)
+    }
+
+    fn resolve_legacy_node_dest(&mut self, name: &[u8]) -> Result<ObjectHandle> {
+        let dests = self.cached_dest_dict()?;
         if dests.try_as_dictionary()?.is_none() {
             return Ok(ObjectHandle::null());
         }
@@ -503,21 +570,26 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<ObjectHandle> {
         let lookup =
             crate::pdf_string::normalized_utf8_value(&crate::pdf_string::utf8_value(bytes));
-        let Some(names) = self.catalog_value_handle(b"/Names")? else {
-            return Ok(ObjectHandle::null());
-        };
-        let names = self.resolve_value_handle(names)?;
-        if names.try_as_dictionary()?.is_none() || !names.try_has_key(b"/Dests")? {
-            return Ok(ObjectHandle::null());
+        if self.names_dest.is_none() {
+            let Some(names) = self.catalog_value_handle(b"/Names")? else {
+                return Ok(ObjectHandle::null());
+            };
+            let names = self.resolve_value_handle(names)?;
+            if names.try_as_dictionary()?.is_none() || !names.try_has_key(b"/Dests")? {
+                return Ok(ObjectHandle::null());
+            }
+            let root = names.try_get_key(b"/Dests")?;
+            let root = self.resolve_value_handle(root)?;
+            if root.try_as_dictionary()?.is_none() {
+                return Ok(ObjectHandle::null());
+            }
+            self.names_dest = Some(HandleNameTree::new(root, self.pdf.unique_id(), true));
         }
-
-        let root = names.try_get_key(b"/Dests")?;
-        let root = self.resolve_value_handle(root)?;
-        if root.try_as_dictionary()?.is_none() {
-            return Ok(ObjectHandle::null());
-        }
-        let mut tree = HandleNameTree::new(root, self.pdf.unique_id(), true);
-        let found = tree.find(self.pdf, lookup.as_slice())?;
+        let tree = self
+            .names_dest
+            .as_mut()
+            .expect("populated by the check above");
+        let found = tree.find(&mut *self.pdf, lookup.as_slice())?;
         found
             .map(|value| self.resolve_value_handle(value))
             .transpose()

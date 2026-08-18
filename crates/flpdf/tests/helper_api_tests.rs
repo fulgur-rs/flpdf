@@ -378,10 +378,11 @@ fn outline_helper_walk_yields_preorder_titles_with_depth() {
 
     assert!(pdf.outline().has_outlines().unwrap());
 
-    let tree = pdf.outline().get_tree().unwrap();
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().unwrap();
     let seen: Vec<(String, usize)> = tree
         .preorder()
-        .map(|(depth, _id, item)| (item.title.clone(), depth))
+        .map(|(depth, _id, item)| (item.title(&mut helper).unwrap(), depth))
         .collect();
 
     assert_eq!(

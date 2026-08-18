@@ -37,13 +37,15 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let page_refs = pages::page_refs(&mut pdf)?;
     println!("pages: {}", page_refs.len());
 
-    let outline = pdf.outline().get_tree()?;
+    let mut outline_helper = pdf.outline();
+    let outline = outline_helper.get_tree()?;
     if outline.roots().is_empty() {
         println!("outline: <empty>");
     } else {
         println!("outline:");
         for (depth, _id, item) in outline.preorder() {
-            println!("{}- {}", "  ".repeat(depth), item.title);
+            let title = item.title(&mut outline_helper)?;
+            println!("{}- {}", "  ".repeat(depth), title);
         }
     }
     Ok(())

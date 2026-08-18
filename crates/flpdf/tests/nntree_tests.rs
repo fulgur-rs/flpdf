@@ -184,9 +184,17 @@ fn canonical_name_tree_probe_matches_qpdf_warning_context() {
     }
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open malformed probe PDF");
-    let error = pdf
-        .outline()
-        .get_tree()
+    // qpdf's `--json=2 --json-key=outlines` above exits 2 while building the
+    // JSON `dest` field, not while constructing the outline document helper
+    // (`QPDFOutlineDocumentHelper`'s constructor never touches `/Dest`).
+    // `get_tree()` mirrors that constructor and so must succeed here too;
+    // the malformed named-tree lookup only runs, and only then can fail,
+    // when `dest()` is actually called on the item.
+    let mut helper = pdf.outline();
+    let tree = helper.get_tree().expect("get_tree never touches /Dest");
+    let item = tree[tree.roots()[0]].clone();
+    let error = item
+        .dest(&mut helper)
         .expect_err("malformed name tree must fail through the same consumer as qpdf");
     assert!(
         error
