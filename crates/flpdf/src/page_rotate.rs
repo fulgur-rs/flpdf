@@ -1199,8 +1199,7 @@ mod tests {
             .map(|annotation| {
                 let annotation = match annotation {
                     Object::Reference(reference) => pdf.resolve(*reference).unwrap(),
-                    // cov:ignore: qpdf transformAnnotations materializes every transformed annotation as an indirect object; retain this malformed-fixture fallback.
-                    direct => direct.clone(),
+                    direct => direct.clone(), // cov:ignore: qpdf transformAnnotations materializes every transformed annotation as an indirect object; retain this malformed-fixture fallback.
                 };
                 let annotation = annotation.into_dict().expect("annotation dictionary");
                 let rectangle = object_to_pagebox(annotation.get("Rect").unwrap()).unwrap();

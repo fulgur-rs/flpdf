@@ -322,6 +322,20 @@ fn copy_annotations_uses_same_document_live_handles() {
 }
 
 #[test]
+fn copy_annotations_is_a_noop_for_a_non_array_source_annotations_value() {
+    let mut pdf = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 10 10] /Contents 4 0 R /Annots /bad",
+        &[make_stream_object(4, b"BT (x) Tj ET")],
+    ));
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+    let source_page = pdf.get_object_handle(page_ref);
+    PageObjectHelper::new(page_ref, &mut pdf)
+        .copy_annotations(source_page, Matrix::default())
+        .expect("a non-array source annotation value should be ignored");
+}
+
+#[test]
 fn copy_annotations_from_validates_the_foreign_source_owner() {
     let mut destination = open(build_pdf_with_extras(
         "",
