@@ -10,9 +10,11 @@
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
 use flpdf::linearization::{LinearizationPlan, RenumberMap};
-use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf};
+use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf, PdfWriter};
+use std::cell::RefCell;
 use std::io::Cursor;
 use std::path::Path;
+use std::rc::Rc;
 
 /// Linearize `fixture` with `--object-streams=generate` via the public API and
 /// return the complete back-patched bytes.
@@ -1358,4 +1360,69 @@ fn linearize_generate_recovers_malformed_length_content_stream() {
         "the page's recovered content stream text must survive \
          --object-streams=generate linearization, not be silently dropped"
     );
+}
+
+/// Exercise qpdf's progress-setup ordering across every writer route that can
+/// resolve source objects before emission: ordinary/linearized output,
+/// preserved/generated object streams, and reporter registration on/off.
+///
+/// qpdf's `attempt_recovery` is document-wide (`QPDF.hh:1461`), so resolving
+/// the object count for progress must see the same recovery permission as the
+/// later writer walk. Before `flpdf-xm72`, registering a reporter exposed the
+/// pre-route `get_object_count()` resolution and silently dropped this
+/// recoverable content in all four reporter-enabled cases. The eight cases
+/// must all retain the payload and all three qpdf recovery diagnostics.
+#[test]
+fn writer_progress_preserves_recoverable_stream_content_in_all_routes() {
+    for linearized in [false, true] {
+        for object_streams in [ObjectStreamMode::Preserve, ObjectStreamMode::Generate] {
+            for reporter_registered in [false, true] {
+                let mut pdf = Pdf::open(Cursor::new(build_recoverable_length_pdf()))
+                    .expect("open recoverable stream fixture");
+                let events = Rc::new(RefCell::new(Vec::new()));
+                let events_for_reporter = Rc::clone(&events);
+
+                let mut writer = PdfWriter::new(&mut pdf);
+                writer.set_object_stream_mode(object_streams);
+                writer.set_deterministic_id(true);
+                writer.set_compress_streams(false);
+                writer.set_linearization(linearized);
+                if reporter_registered {
+                    writer.register_progress_reporter(Box::new(move |percent| {
+                        events_for_reporter.borrow_mut().push(percent);
+                    }));
+                }
+                writer.set_output_memory().expect("configure memory output");
+                writer.write().expect("write recoverable stream fixture");
+                let output = writer.get_buffer().expect("take writer output");
+                drop(writer);
+
+                let diagnostics = pdf.repair_diagnostics();
+                assert_eq!(
+                    diagnostics.entries().len(),
+                    3,
+                    "linearized={linearized} object_streams={object_streams:?} \
+                     reporter={reporter_registered}: qpdf emits three recovery diagnostics"
+                );
+                assert!(
+                    diagnostics.entries()[2]
+                        .message
+                        .contains("recovered stream length: 37"),
+                    "linearized={linearized} object_streams={object_streams:?} \
+                     reporter={reporter_registered}: qpdf recovers the full payload"
+                );
+                assert_eq!(
+                    !events.borrow().is_empty(),
+                    reporter_registered,
+                    "linearized={linearized} object_streams={object_streams:?} \
+                     reporter={reporter_registered}: progress callback registration"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output).contains("Hello"),
+                    "linearized={linearized} object_streams={object_streams:?} \
+                     reporter={reporter_registered}: recovered content must survive"
+                );
+            }
+        }
+    }
 }
