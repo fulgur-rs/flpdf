@@ -43,6 +43,7 @@ impl JobExitCode {
 /// and progress callbacks cannot diverge between CLI and library consumers.
 pub struct QPDFJob {
     logger: QPDFLogger,
+    input_name: String,
     message_prefix: String,
     warnings: bool,
     suppress_warnings: bool,
@@ -68,6 +69,7 @@ impl QPDFJob {
     pub fn new() -> Self {
         Self {
             logger: QPDFLogger::default_logger(),
+            input_name: String::new(),
             message_prefix: "qpdf".to_owned(),
             warnings: false,
             suppress_warnings: false,
@@ -92,6 +94,24 @@ impl QPDFJob {
     /// Mirrors `QPDFJob::setMessagePrefix` (`QPDFJob.cc:303-307`).
     pub fn set_message_prefix(&mut self, message_prefix: impl Into<String>) {
         self.message_prefix = message_prefix.into();
+    }
+
+    /// Set the qpdf input name used by inspection diagnostics.
+    ///
+    /// This corresponds to the `QPDFJob` input filename retained by
+    /// `QPDFJob::doListAttachments` for its no-embedded-files branch
+    /// (`libqpdf/QPDFJob.cc:909`). `open` and `create_from_json` set it
+    /// automatically; `update_from_json` keeps the primary input name while
+    /// using its own source name only for the update source. Callers that open
+    /// a document outside this job may set it explicitly before an inspection.
+    pub fn set_input_name(&mut self, input_name: impl Into<String>) {
+        self.input_name = input_name.into();
+    }
+
+    /// Return the input name retained by this job.
+    #[must_use]
+    pub fn input_name(&self) -> &str {
+        &self.input_name
     }
 
     /// Return the current diagnostic prefix.
@@ -142,6 +162,8 @@ impl QPDFJob {
     where
         S: Read + Seek + 'static,
     {
+        let input_name = input_name.into();
+        self.input_name = input_name.clone();
         let pdf = Pdf::create_from_json_with_options(
             source,
             input_name,
@@ -171,8 +193,10 @@ impl QPDFJob {
     where
         R: Read + Seek,
     {
+        let input_name = input_name.into();
+        self.input_name = input_name.clone();
         options.logger = Some(self.logger.clone());
-        options.description = input_name.into();
+        options.description = input_name;
         let pdf = Pdf::open_with_options(source, options)?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
@@ -190,6 +214,7 @@ impl QPDFJob {
         R: Read + Seek,
         S: Read + Seek + 'static,
     {
+        let input_name = input_name.into();
         pdf.set_logger(self.logger.clone());
         pdf.update_from_json(source, input_name)?;
         self.record_document_warnings(pdf);

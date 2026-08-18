@@ -2,9 +2,10 @@
 //! Command-level operations corresponding to qpdf's `QPDFJob` layer.
 //!
 //! The module contains the shared qpdf 11.9.0 job lifecycle state and the JSON
-//! output-selection responsibility from `QPDFJob::writeJSON`, together with
-//! the staged `doJSON*` section builders.
+//! output-selection responsibility from `QPDFJob::writeJSON`, the staged
+//! `doJSON*` section builders, and the attachment inspection consumers.
 
+mod attachments;
 mod json;
 mod json_sections;
 mod lifecycle;
