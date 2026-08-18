@@ -207,6 +207,19 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
         Pdf::open_with_options(reader, options)?
     };
 
+    Ok(check_pdf_with_limits(&mut pdf, limits))
+}
+
+/// Validate an already-opened document using the same checks as [`check_reader`].
+///
+/// This is the document-consumer half of qpdf's `--check` path. It is used by
+/// job inputs that do not originate from a PDF byte stream, such as
+/// `--json-input` and `--update-from-json`, after their canonical document
+/// boundary has been created and updated.
+pub fn check_pdf_with_limits<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    limits: DecodeLimits,
+) -> CheckReport {
     // `repair_diagnostics` already hands back an owned snapshot, so this is
     // the copy — no second `.clone()` needed.
     let mut diagnostics = pdf.repair_diagnostics();
@@ -217,7 +230,7 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
             None,
         ));
     }
-    if pdf.trailer().get_ref("Root").is_none() {
+    if pdf.root_ref().is_none() {
         diagnostics.push(Diagnostic::error("trailer is missing /Root", None));
     }
     // The document already opened, so a failed linearization probe must not
@@ -245,7 +258,7 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     // content stream. The whole-document page walk here is deliberate: --check is
     // a full-document audit, the one place flpdf's lazy-load discipline is
     // intentionally relaxed.
-    check_content_streams(&mut pdf, &mut diagnostics, limits);
+    check_content_streams(pdf, &mut diagnostics, limits);
     for diagnostic in pdf
         .repair_diagnostics()
         .entries()
@@ -263,11 +276,11 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
         extension_level: pdf.adobe_extension_level(),
     };
 
-    Ok(CheckReport {
+    CheckReport {
         valid: !diagnostics.has_errors(),
         diagnostics,
         summary: Some(summary),
-    })
+    }
 }
 
 fn open_failure_source(error: &Error) -> &Error {

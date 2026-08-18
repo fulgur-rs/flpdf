@@ -104,6 +104,62 @@ fn json_input_can_feed_json_output_without_reopening_as_pdf() {
 }
 
 #[test]
+fn json_input_inspection_modes_match_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    for option in ["--check", "--show-npages", "--show-pages"] {
+        let qpdf = ShellCommand::new("qpdf")
+            .args(["--json-input", option, COMPLETE_JSON])
+            .output()
+            .unwrap();
+        let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+            .env("FLPDF_PROGNAME", "qpdf")
+            .args(["--json-input", option, COMPLETE_JSON])
+            .output()
+            .unwrap();
+
+        assert!(qpdf.status.success(), "qpdf {option} failed: {qpdf:?}");
+        assert_eq!(flpdf.status.code(), qpdf.status.code(), "{option}");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{option} stderr");
+        match option {
+            "--check" | "--show-npages" => assert_eq!(flpdf.stdout, qpdf.stdout, "{option}"),
+            "--show-pages" => assert!(
+                String::from_utf8_lossy(&flpdf.stdout).starts_with("page 1: 3 0 R\n"),
+                "show-pages must inspect the JSON-created page tree: {:?}",
+                flpdf.stdout
+            ),
+            _ => unreachable!("test option is fixed above"),
+        }
+    }
+}
+
+#[test]
+fn update_from_json_check_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg(format!("--update-from-json={UPDATE_JSON}"))
+        .args(["--check", MINIMAL_PDF])
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(format!("--update-from-json={UPDATE_JSON}"))
+        .args(["--check", MINIMAL_PDF])
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
 fn json_input_json_output_matches_qpdf_11_9() {
     if skip_if_qpdf_missing() {
         return;

@@ -23,7 +23,8 @@ use flpdf::{
     InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    check_reader_with_options_and_limits, filters, flatten_rotation_on_pages,
+    check_pdf_with_limits, check_reader_with_options_and_limits, filters,
+    flatten_rotation_on_pages,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path, LinearizationCheckError,
@@ -351,8 +352,7 @@ struct Cli {
     #[arg(
         long = "json-input",
         conflicts_with_all = [
-            "check", "dump_object", "show_info", "show_catalog",
-            "show_metadata", "show_outline", "show_npages", "show_pages",
+            "dump_object", "show_info", "show_catalog", "show_metadata", "show_outline",
             "show_linearization", "list_attachments", "show_attachment",
             "remove_attachment", "add_attachment", "copy_attachments_from",
         ],
@@ -368,8 +368,7 @@ struct Cli {
         value_name = "QPDF-JSON",
         require_equals = true,
         conflicts_with_all = [
-            "check", "dump_object", "show_info", "show_catalog",
-            "show_metadata", "show_outline", "show_npages", "show_pages",
+            "dump_object", "show_info", "show_catalog", "show_metadata", "show_outline",
             "show_linearization", "list_attachments", "show_attachment",
             "remove_attachment", "add_attachment", "copy_attachments_from",
         ],
@@ -1758,12 +1757,18 @@ fn main() {
         }
     }
 
-    // JSON mode takes the first branch, but this is unambiguous: clap's
-    // conflicts_with_all on --json (plus args_conflicts_with_subcommands on
-    // Cli) guarantees no other top-level mode or subcommand can be set at
-    // the same time, so the ordering here is a formality, not a precedence
-    // rule that could silently shadow another requested mode.
-    let result = if args.json.is_some() {
+    let json_input_inspection = (args.json_input || args.update_from_json.is_some())
+        && (args.check || args.show_npages || args.show_pages);
+
+    // JSON-input/update inspection is routed through the already-created job
+    // document before the ordinary file-backed inspection branches. qpdf
+    // creates or updates the QPDF object first, then runs read-only consumers
+    // such as --check and --show-pages on that same object.
+    // For ordinary JSON output, the separate --json branch remains first among
+    // the non-inspection modes and retains its existing validation boundary.
+    let result = if json_input_inspection {
+        run_json_input_inspection(&args)
+    } else if args.json.is_some() {
         run_json(&args)
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
@@ -2202,6 +2207,45 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     }
 }
 
+fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
+    let input = cli.input.as_ref().ok_or("missing input file")?;
+    let job_pdf = open_job_pdf(
+        input,
+        cli.repair,
+        &cli.password,
+        cli.json_input,
+        cli.update_from_json.as_deref(),
+    )?;
+
+    match job_pdf {
+        JobPdf::File(mut pdf) => run_job_inspection_on_pdf(cli, input, &mut pdf),
+        JobPdf::Json(mut pdf) => run_job_inspection_on_pdf(cli, input, &mut pdf),
+    }
+}
+
+fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
+    cli: &Cli,
+    input: &Path,
+    pdf: &mut Pdf<R>,
+) -> CliResult<()> {
+    let decode_limits = filters::DecodeLimits {
+        max_output: cli.decode_memory_limit,
+        ..filters::DecodeLimits::default()
+    };
+    if cli.check {
+        return run_check_pdf(input, pdf, decode_limits);
+    }
+    if cli.show_npages {
+        show_npages_from_pdf(pdf)?;
+        return finish_operation_warnings(pdf, false);
+    }
+    if cli.show_pages {
+        show_pages_from_pdf(pdf)?;
+        return finish_operation_warnings(pdf, false);
+    }
+    Err("JSON input/update inspection mode is missing a consumer".into())
+}
+
 /// Serialize an already-opened job document through the existing qpdf JSON
 /// output consumer. Keeping this generic preserves the same output path for
 /// file-backed PDF inputs and JSON-created documents.
@@ -2567,6 +2611,18 @@ fn run_check(
     options.suppress_warnings = true;
     let report = check_reader_with_options_and_limits(BufReader::new(file), options, decode_limits)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    finish_check_report(&input, report)
+}
+
+fn run_check_pdf<R: Read + Seek + 'static>(
+    input: &Path,
+    pdf: &mut Pdf<R>,
+    decode_limits: filters::DecodeLimits,
+) -> CliResult<()> {
+    finish_check_report(input, check_pdf_with_limits(pdf, decode_limits))
+}
+
+fn finish_check_report(input: &Path, report: flpdf::CheckReport) -> CliResult<()> {
     // The library always emits a weak-crypto advisory when a weak file opens
     // (flpdf check.rs: "encrypted PDF uses weak crypto; processing continued").
     // Because `--check` forces the gate open as an inspection rather than the
@@ -5149,16 +5205,25 @@ fn run_show_outline(
 fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    let pages = pages::page_refs(&mut pdf)?;
-    logger_info(format!("{}\n", pages.len()))?;
+    show_npages_from_pdf(&mut pdf)?;
     finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    write_page_descriptions(&mut pdf, &cli_logger())?;
+    show_pages_from_pdf(&mut pdf)?;
     finish_operation_warnings(&pdf, false)
+}
+
+fn show_npages_from_pdf<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> CliResult<()> {
+    let pages = pages::page_refs(pdf)?;
+    logger_info(format!("{}\n", pages.len()))?;
+    Ok(())
+}
+
+fn show_pages_from_pdf<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> CliResult<()> {
+    write_page_descriptions(pdf, &cli_logger())
 }
 
 fn write_page_descriptions<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &QPDFLogger) -> CliResult<()> {

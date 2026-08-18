@@ -188,7 +188,7 @@ pub use attachment_list::{
 };
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{
-    check_reader, check_reader_strict, check_reader_with_options,
+    check_pdf_with_limits, check_reader, check_reader_strict, check_reader_with_options,
     check_reader_with_options_and_limits, CheckReport, CheckSummary,
 };
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
