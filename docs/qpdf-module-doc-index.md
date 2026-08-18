@@ -16,7 +16,7 @@
 | `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
-| `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
+| `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads. The input-side \`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` boundary lives in the private JSON document module (the output and input paths remain separate qpdf responsibilities) |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | \`EmbeddedFileDocumentHelper\` implements QPDFEmbeddedFileDocumentHelper.hh's public API (hasEmbeddedFiles, getEmbeddedFiles, getEmbeddedFile, replaceEmbeddedFile, removeEmbeddedFile) |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\`, \`processFile()\`, and \`processMemoryFile()\`) and their shared construction orchestration |
@@ -27,6 +27,7 @@
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/job/json.rs` | correspondence | QPDFJob.cc writeJSON output selection and stream-prefix resolution |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command orchestration with only JSON output selection currently exposed |
+| `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/input.rs` | correspondence | \`QPDF_json.cc\` JSONReactor state machine, validators, deferred stream providers, and \`makeObject\` value construction |
 | `crates/flpdf/src/json/input_tests.rs` | correspondence | tests for the JSON input value and deferred stream provider boundaries |

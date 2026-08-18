@@ -7,7 +7,12 @@
 //! Serialization APIs, including blob callbacks, write only to caller-supplied
 //! pipelines without finishing the outer pipeline; callers retain ownership of
 //! that finish boundary.
+//!
+//! The qpdf JSON input document boundary is implemented by a private document
+//! module and exposed through `Pdf::create_from_json` and
+//! `Pdf::update_from_json`.
 
+mod document;
 mod handler;
 #[allow(dead_code)] // consumed by the JSONReactor slice in flpdf-3yn9.15.3
 pub(crate) mod input;

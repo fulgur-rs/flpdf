@@ -1,0 +1,18 @@
+{
+  "comment": ["flpdf-authored partial JSON update fixture"],
+  "qpdf": [
+    {
+      "jsonversion": 2,
+      "calledgetallpages": true,
+      "pushedinheritedpageresources": false
+    },
+    {
+      "obj:4 0 R": {
+        "stream": {
+          "dict": {"/Custom": "/UPDATED"},
+          "data": "VXBkYXRlZCBKU09OCg=="
+        }
+      }
+    }
+  ]
+}
