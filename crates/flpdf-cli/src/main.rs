@@ -4758,7 +4758,14 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_rewritten_pdf(bytes, n, output, input_path, options.deterministic_id)?;
+        let written = split_rewritten_pdf(
+            bytes,
+            n,
+            output,
+            input_path,
+            options.deterministic_id,
+            options.static_id,
+        )?;
         if verbose {
             for path in &written {
                 logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
@@ -4827,6 +4834,7 @@ fn split_rewritten_pdf(
     output: &Path,
     input_path: &Path,
     deterministic_id: bool,
+    static_id: bool,
 ) -> CliResult<Vec<PathBuf>> {
     let mut pdf = Pdf::open_mem_owned(bytes)?;
     let mut job = QPDFJob::new();
@@ -4834,7 +4842,8 @@ fn split_rewritten_pdf(
     job.set_message_prefix(progname());
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
-        .with_deterministic_id(deterministic_id);
+        .with_deterministic_id(deterministic_id)
+        .with_static_id(static_id);
     Ok(job.split_pages(&mut pdf, options)?)
 }
 
@@ -4901,7 +4910,14 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_rewritten_pdf(bytes, n, output, input, options.deterministic_id)?;
+        let written = split_rewritten_pdf(
+            bytes,
+            n,
+            output,
+            input,
+            options.deterministic_id,
+            options.static_id,
+        )?;
         if verbose {
             for path in &written {
                 // cov:ignore-start: exercised by verbose split-pages subprocess integration tests

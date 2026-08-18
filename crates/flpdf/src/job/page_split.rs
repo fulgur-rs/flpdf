@@ -23,6 +23,8 @@ pub struct SplitPageOptions {
     pub input_path: Option<PathBuf>,
     /// Apply qpdf's deterministic-ID policy to every chunk.
     pub deterministic_id: bool,
+    /// Apply qpdf's static-ID policy to every chunk.
+    pub static_id: bool,
 }
 
 impl SplitPageOptions {
@@ -34,6 +36,7 @@ impl SplitPageOptions {
             output_template: output_template.into(),
             input_path: None,
             deterministic_id: false,
+            static_id: false,
         }
     }
 
@@ -48,6 +51,13 @@ impl SplitPageOptions {
     #[must_use]
     pub fn with_deterministic_id(mut self, deterministic_id: bool) -> Self {
         self.deterministic_id = deterministic_id;
+        self
+    }
+
+    /// Apply a static ID to all split outputs.
+    #[must_use]
+    pub fn with_static_id(mut self, static_id: bool) -> Self {
+        self.static_id = static_id;
         self
     }
 }
@@ -168,6 +178,9 @@ impl QPDFJob {
             if options.deterministic_id {
                 writer.set_deterministic_id(true);
             }
+            if options.static_id {
+                writer.set_static_id(true);
+            }
             self.configure_writer_progress(&mut writer);
             writer.set_output_file(&output_path)?;
             writer.write()?;
@@ -241,11 +254,35 @@ mod tests {
     fn split_page_options_builder_keeps_qpdf_job_inputs() {
         let options = SplitPageOptions::new(2, "out-%d.pdf")
             .with_input_path("input.pdf")
-            .with_deterministic_id(true);
+            .with_deterministic_id(true)
+            .with_static_id(true);
         assert_eq!(options.chunk_size, 2);
         assert_eq!(options.output_template, PathBuf::from("out-%d.pdf"));
         assert_eq!(options.input_path, Some(PathBuf::from("input.pdf")));
         assert!(options.deterministic_id);
+        assert!(options.static_id);
+    }
+
+    #[test]
+    fn split_pages_with_static_id_produces_identical_chunk_ids_across_runs() {
+        // QPDFJob::setWriterOptions applies static_id to every chunk writer
+        // the same way it applies deterministic_id (QPDFJob.cc:2879-2883),
+        // called once per chunk from doSplitPages (QPDFJob.cc:3021-3022).
+        let run = || {
+            let mut source = open_fixture("three-page.pdf");
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut job = QPDFJob::new();
+            let options =
+                SplitPageOptions::new(1, temp.path().join("chunk-%d.pdf")).with_static_id(true);
+            let written = job
+                .split_pages(&mut source, options)
+                .expect("split succeeds");
+            written
+                .iter()
+                .map(|path| std::fs::read(path).expect("chunk readable"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run());
     }
 
     #[test]
