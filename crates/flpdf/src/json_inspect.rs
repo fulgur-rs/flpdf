@@ -1,7 +1,4 @@
-//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object
-//! serialization and `QPDF_Stream::writeStreamJSON` payload/dictionary
-//! normalization. `QPDFJob::doJSONAcroform` is implemented by the dedicated
-//! page-Widget builder in [`crate::job`].
+//! qpdf correspondence: `QPDFObjectHandle::getJSON` / `writeJSON` object serialization, `QPDF_Stream::writeStreamJSON` payload/dictionary normalization, and `QPDFJob::doJSONAcroform`.
 //! qpdf JSON v2 value conversion and canonical object/stream serialization.
 //!
 //! Provides the generic value-conversion frame for qpdf `--json` output.
