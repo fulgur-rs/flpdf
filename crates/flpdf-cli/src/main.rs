@@ -3269,6 +3269,7 @@ fn run_rewrite(
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
+    reject_same_job_output(&input, &output)?;
     let opened = open_job_pdf(&input, repair, password, json_input, update_from_json)?;
     match opened {
         JobPdf::File(pdf) => run_rewrite_opened(
@@ -4239,6 +4240,14 @@ fn run_page_extraction(
     options: WriterOptions,
     verbose: bool,
 ) -> CliResult<()> {
+    // `--split-pages` writes one numbered file per output page rather than a
+    // single `output` path, so `output` is a naming template here, not a
+    // literal file to compare against `primary_input` — matching qpdf's own
+    // `(!m->split_pages) && QUtil::same_file(...)` exclusion in
+    // `checkConfiguration()` (`QPDFJob.cc:627`).
+    if page_ops.split_pages.is_none() {
+        reject_same_job_output(primary_input, output)?;
+    }
     let standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     let creates_output = standard_output.is_none();
     if page_ops.empty {
@@ -4881,22 +4890,55 @@ fn run_qdf_fix(input: &std::path::Path, output: &std::path::Path) -> CliResult<(
 }
 
 fn reject_same_json_output(input: &Path, output: &Path) -> CliResult<()> {
+    reject_same_file(
+        input,
+        output,
+        "input file and output file are the same; choose a different --json-output path",
+        "--json-output",
+    )
+}
+
+/// Reject a job whose main input and output resolve to the same file
+/// (qpdf's `QUtil::same_file` guard in `checkConfiguration()`,
+/// `QPDFJob.cc:627-630`). qpdf's own message references `--replace-input`,
+/// a dedicated escape hatch flpdf does not implement; this instead follows
+/// the existing `--json-output` guard's wording (a different output path is
+/// the only way out today), the same way that guard already departs from
+/// qpdf's exact text for the same reason.
+///
+/// This is a job-wide guard, not one scoped to `--json-input`/
+/// `--update-from-json`: qpdf's check is unconditional, and an ordinary
+/// `flpdf in.pdf in.pdf` rewrite is just as destructive (the canonical
+/// writer reads from `input` while truncating `output`) as the JSON case
+/// that surfaced the gap.
+fn reject_same_job_output(input: &Path, output: &Path) -> CliResult<()> {
+    reject_same_file(
+        input,
+        output,
+        "input file and output file are the same; use a different output path",
+        "output",
+    )
+}
+
+fn reject_same_file(
+    input: &Path,
+    output: &Path,
+    same_file_message: &str,
+    inspect_label: &str,
+) -> CliResult<()> {
     match std::fs::metadata(output) {
         Ok(output_metadata) => {
             // This is only a non-destructive hint: if inspecting the input
             // fails, the real input open below owns its path-specific error.
             // Output metadata failures remain fail-closed in the next arm.
             if let Ok(true) = paths_identify_same_file(input, output, &output_metadata) {
-                return Err(
-                    "input file and output file are the same; choose a different --json-output path"
-                        .into(),
-                );
+                return Err(same_file_message.into());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "unable to inspect --json-output file {}: {error}",
+                "unable to inspect {inspect_label} file {}: {error}",
                 output.display()
             )
             .into())

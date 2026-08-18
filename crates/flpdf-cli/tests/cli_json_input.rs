@@ -492,3 +492,85 @@ fn update_from_json_missing_file_fails_without_creating_output() {
 
     assert!(!output.exists());
 }
+
+/// qpdf's `checkConfiguration()` rejects an input/output pair that resolve
+/// to the same file (`QUtil::same_file`, `QPDFJob.cc:627-630`) with exit 2,
+/// *before* opening or writing anything — verified against live qpdf 11.9.0
+/// (`qpdf --json-input samefile.json samefile.json` exits 2 and leaves the
+/// file untouched). Without this guard, `--json-input` previously exited 0
+/// and silently replaced the JSON source with PDF bytes.
+#[test]
+fn json_input_same_input_and_output_is_rejected_without_modifying_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("samefile.json");
+    fs::copy(COMPLETE_JSON, &path).unwrap();
+    let original = fs::read(&path).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json-input"])
+        .arg(&path)
+        .arg(&path)
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "input file and output file are the same",
+        ));
+
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+/// Same guard, `--update-from-json` mode: the job document is created by
+/// opening `input` as an ordinary PDF, so this exercises `open_job_pdf`'s
+/// non-`--json-input` branch rather than `create_from_json`.
+#[test]
+fn update_from_json_same_input_and_output_is_rejected_without_modifying_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("samefile.pdf");
+    fs::copy(MINIMAL_PDF, &path).unwrap();
+    let original = fs::read(&path).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(format!("--update-from-json={UPDATE_JSON}"))
+        .arg(&path)
+        .arg(&path)
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "input file and output file are the same",
+        ));
+
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
+
+/// The same guard also covers an ordinary (non-JSON) rewrite: qpdf's check
+/// is unconditional on `--json-input`/`--update-from-json`, and flpdf's
+/// canonical writer is just as destructive reading `input` while truncating
+/// `output` when they are the same file. Verified against live qpdf 11.9.0
+/// (`qpdf plain.pdf plain.pdf` exits 2 and leaves the file untouched).
+#[test]
+fn plain_rewrite_same_input_and_output_is_rejected_without_modifying_the_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("samefile.pdf");
+    fs::copy(MINIMAL_PDF, &path).unwrap();
+    let original = fs::read(&path).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&path)
+        .arg(&path)
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "input file and output file are the same",
+        ));
+
+    assert_eq!(fs::read(&path).unwrap(), original);
+}
