@@ -362,8 +362,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(693) + `outline_object_helper.rs`(237) | ✅ live `ObjectHandle` route: `OutlineItem.object` retains canonical identity; `OutlineItem::title`/`count`/`dest`/`dest_page` recompute fresh from the live object on every call (no caching), matching qpdf's `getTitle`/`getCount`/`getDest`/`getDestPage` (`QPDFOutlineObjectHelper.cc:47-98`), while `parent`/`kids` are captured once at construction, matching qpdf's cached `getParent`/`getKids`. `/Dest` and `/A /GoTo /D` use qpdf-shaped handle accessors; named destinations use `HandleNameTree`, cached per session in `OutlineDocumentHelper::dest_dict`/`names_dest` (`QPDFOutlineDocumentHelper.cc:60-90`); JSON consumes the handles directly. The narrow terminal-handle chase only covers flpdf's temporary `Pdf::set_object` bare-reference bridge; parsed qpdf objects stay one-hop/live. |
 | `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(1037) + `nntree.rs` (`HandleNumberTree`) | ✅ canonical ObjectHandle route for `hasPageLabels`, `getLabelForPage`, `getLabelsForPageRange`, and `pageLabelDict`; typed page-operation adapters and JSON migration remain downstream |
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 (`34-75,106-168,216-390,391-520,560-700`) | `nntree.rs`（shared canonical `ObjectHandle` engine + `NameTree`/`NumberTree` wrappers）+ consumer adapters。qpdf の live `QPDFObjectHandle`/`QPDF_Array` mutation（`NNTree.cc:34-75` の iterator value 更新、`:106-168` の limits、`:216-390` の split/insert、`:391-520` の remove/deepen、`:560-700` の find）に対応し、`ResolvedArray` は `ObjectHandle::set_array_items` で alias を保持したまま更新、direct kid の indirect 化は `Pdf::make_indirect_from_object_handle`、root split は既存 root slot を維持する。dirty propagation で raw compatibility read/writer も canonical mutation を観測する。`Object` は root の compatibility projection と test-only raw fixture boundary に限定し、production tree mutation は `Pdf::set_object` を経由しない | ✅ |
-| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ D1 完成（`flpdf-jzy7`）: `has_embedded_files`/`get_embedded_files`/`get_embedded_file`/`replace_embedded_file`/`remove_embedded_file` が `QPDFEmbeddedFileDocumentHelper.hh` の公開 API と 1:1 対応。モジュール doc の自己申告も更新済み。D2 は未達のまま — `json_inspect.rs` の `build_attachments_section` はこのヘルパーを経由せず `NameTree` を直接歩く（`flpdf-q2fo` で解消予定） |
-| `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ D1 完成（`flpdf-d9sq`）。D2 は未達のまま — `json_inspect.rs::filespec_dict_to_json` が `FileSpec`/`EmbeddedFileStream` を経由せず同じ Mac/DOS 優先順位ロジックを再実装している（`flpdf-q2fo` で解消予定） |
+| `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | ✅ D1 完成（`flpdf-jzy7`）: `has_embedded_files`/`get_embedded_files`/`get_embedded_file`/`replace_embedded_file`/`remove_embedded_file` が `QPDFEmbeddedFileDocumentHelper.hh` の公開 API と 1:1 対応。モジュール doc の自己申告も更新済み。D2 は未達のまま — `job/json_sections.rs` の `build_attachments_section` はこのヘルパーを経由せず `NameTree` を直接歩く（`flpdf-q2fo` で解消予定） |
+| `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | ✅ D1 完成（`flpdf-d9sq`）。D2 は未達のまま — `job/json_sections.rs::filespec_dict_to_json` が `FileSpec`/`EmbeddedFileStream` を経由せず同じ Mac/DOS 優先順位ロジックを再実装している（`flpdf-q2fo` で解消予定） |
 | `ResourceFinder.cc` | 56 | `resource_finder.rs`（operator/name tracking、qpdf `getNames()` 相当のカテゴリ横断 flat set、resource type/offset 集約）。production consumer は `resource_replacer.rs` と `resources.rs` の resource pruning | ✅ |
 | `QPDFAcroFormDocumentHelper.cc` anonymous `ResourceReplacer` | — | `resource_replacer.rs`（`ResourceFinder` の name offsets を exact-byte 置換）。production consumer は `overlay_annotations.rs` の `/DA` と `overlay_appearance_stream.rs` の AP streams | ✅ |
 | `QPDFDocumentHelper.cc` / `QPDFObjectHelper.cc` | 12 | 基底トレイトが無い | ⚪ |
@@ -447,7 +447,7 @@ cargo test -p flpdf-cli --test cli_json --quiet
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6796) + `job/lifecycle.rs`（JSON create/update/write、ordinary open、ordinary page inspection、JSON inspection と共有 completion、`QPDFJob.cc:429-516,843-875,1646-1714`）+ `job/json.rs`（`QPDFJob::writeJSON` の出力選択部分、`QPDFJob.cc:3094-3115`）+ **`json_inspect.rs` の `doJSON*`**（下記。`QPDF::writeJSON` 相当は `document_json.rs` に分離済み — §8）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(1074: `QPDFJob.cc:876-911` の `doListAttachments` 移植。`<file> has no embedded files` は infilename を要するため CLI 側に残す) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `job/lifecycle.rs` はJSON create/update/write、JSON read-only inspection、ordinary page-count/page-list inspectionのcanonical boundaryを移植済み。argv/config、通常rewrite、page/attachment/linearizationの残りconsumerは後続sliceで集約する。ordinary page-list formatterの出力形状は既存flpdf contractを保持し、qpdf `doShowPages` との完全な出力整合は別consumer scopeとする。 |
+| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6796) + `job/lifecycle.rs`（JSON create/update/write、ordinary open、ordinary page inspection、JSON inspection と共有 completion、`QPDFJob.cc:429-516,843-875,1646-1714`）+ `job/json.rs`（`QPDFJob::writeJSON` の出力選択と `doJSON` 固定順、`QPDFJob.cc:1545-1640,3094-3115`）+ `job/json_sections.rs`（非AcroFormの `doJSONPages` / `doJSONPageLabels` / `doJSONOutlines` / `doJSONAttachments` / `doJSONEncrypt`、`QPDFJob.cc:1030-1158,1206-1325`）+ **`json_inspect.rs` の `build_acroform_section`（専用移行待ち）** + `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(1074: `QPDFJob.cc:876-911` の `doListAttachments` 移植。`<file> has no embedded files` は infilename を要するため CLI 側に残す) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `job/lifecycle.rs` はJSON create/update/write、JSON read-only inspection、ordinary page-count/page-list inspectionのcanonical boundaryを移植済み。argv/config、通常rewrite、page/attachment/linearizationの残りconsumerは後続sliceで集約する。ordinary page-list formatterの出力形状は既存flpdf contractを保持し、qpdf `doShowPages` との完全な出力整合は別consumer scopeとする。 |
 | `QPDFJob.cc` `createQPDF` / `doInspection` + `QPDFJob_config.cc` `jsonInput` / `updateFromJson` | `459-516,1646-1714; 305-309,328-332` | `job/lifecycle.rs` のJSON create/update/open/inspect（`flpdf-25kg.5.2.1/.2`）+ `flpdf-cli/src/main.rs` の `run_json_input_inspection`、`check.rs::check_pdf_with_limits` + `page_combine.rs::CombinedPlan::build_repeated` + retained `open_job_pdf` for other routes | 🔀 `--json-input` / `--update-from-json` のJSON outputとread-only `--show-npages`/`--show-pages`はQPDFJobの一つのdocument/logger lifecycleへ移行済み。`--check`は専用のqpdf-shaped report rendererを保ち、generic summaryの二重出力を避ける。通常rewrite・rotate・page-tree選択・その他inspectionは後続Job sliceで同じ状態へ接続する。JSON主入力の `--pages` は一時PDFを経由せず、同じ文書のObjectHandle/xrefを `build_repeated` で計画化する。qpdf 11.9.0のupdate-before-inspection順序を `cli_json_input.rs` で固定する。 |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
@@ -489,47 +489,51 @@ logger consumer に移行済みである。
   (`flpdf-25kg.5.2`) より前の CLI shell responsibility。最終 dispatch error と usage result
   は logger 済みだが、この validation 群は同 downstream cutover まで direct stderr を維持する
 
-### `QPDFJob.cc` の `doJSON*` 族 — `json_inspect.rs` に埋没
+### `QPDFJob.cc` の `doJSON*` 族 — job 層への段階移設
 
-`QPDFJob.cc:958-1620` の JSON セクション生成が `json_inspect.rs` にある。
-同ファイルは `QPDF::writeJSON` 相当の serialization も担う。一方、
-`QPDFJob::writeJSON` の `QPDFJob.cc:3094-3115` にある top-level 出力先・
-stream side-file prefix の選択だけは `job/json.rs` が担い、その後の JSON
-構築と出力 lifecycle は `json_inspect.rs` へ委譲する。
+`QPDFJob.cc:958-1620` の JSON セクション生成のうち、非AcroFormの5 section builderと
+`doJSON` の固定順序は `job/json_sections.rs` / `job/json.rs` へ移設した。
+`QPDF::writeJSON` 相当の serialization は §8 の `document_json.rs` と
+`json_inspect.rs` の canonical ObjectHandle writerが担い、AcroFormだけは専用 helper
+移行まで `json_inspect.rs` に単一実装を残す。一方、`QPDFJob::writeJSON` の
+`QPDFJob.cc:3094-3115` にある top-level 出力先・stream side-file prefix の選択も
+`job/json.rs` が所有する。
 **§8 の `QPDF_json.cc` 行と混同しないこと**（`QPDF_json.cc` は JSON 入力と
 `writeJSON` であって、セクション生成ではない）。
 
-| qpdf `QPDFJob.cc` | flpdf `json_inspect.rs` |
+| qpdf `QPDFJob.cc` | flpdf owner |
 |---|---|
 | `doJSONObjects`(958) の **v1 分岐**(960-981) / `doJSONObjectinfo`(1002) | **対応物なし**。どちらも JSON v1 専用（`doJSONObjectinfo` は `QPDFJob.cc:1620` の version guard 内、`objects` の schema も `json_schema:1357` で v1 限定）。flpdf CLI は `--json=2` のみを受け付け、`main.rs:1914` が `objects` / `objectinfo` を「v1 でのみ有効」と明示的に拒否する |
 | `doJSONObjects`(958) の **v2 分岐**(981-997) | 自前では何も組み立てず `QPDF::writeJSON` に委譲するだけ。実体は §8 の `QPDF_json.cc` 出力側の行を参照（ここに再掲すると二重帰属になる） |
-| `doJSONPages`(1030) | `build_pages_section` |
-| `doJSONPageLabels`(1095) | `build_pagelabels_section` |
-| `doJSONOutlines`(1143) | `build_outlines_section` |
-| `doJSONAcroform`(1159) | `build_acroform_section` |
-| `doJSONEncrypt`(1206) | `build_encrypt_section` |
-| `doJSONAttachments`(1281) | `build_attachments_section` |
+| `doJSONPages`(1030) | `job/json_sections.rs::build_pages_section` |
+| `doJSONPageLabels`(1095) | `job/json_sections.rs::build_pagelabels_section` |
+| `doJSONOutlines`(1143) | `job/json_sections.rs::build_outlines_section` |
+| `doJSONAcroform`(1159) | `json_inspect.rs::build_acroform_section`（専用sliceへ延期） |
+| `doJSONEncrypt`(1206) | `job/json_sections.rs::build_encrypt_section` |
+| `doJSONAttachments`(1281) | `job/json_sections.rs::build_attachments_section` |
 | `json_schema`(1332) / `json_out_schema`(1533) | `JsonKey` ほか |
-| `doJSON`(1545) | `write_qpdf_json_v2_selected_objects*` |
+| `doJSON`(1545) | `job/json.rs::write_qpdf_json_v2_selected_objects*` |
 
 **qpdf 側の `doJSON*` は辞書を直接歩かず、ヘルパーの薄い JSON 化層でしかない。**
-flpdf の現行実装はヘルパーを経由せず辞書を直接歩いており、PR #613/#614 で
+flpdf の非AcroForm section実装は現在 `job/json_sections.rs` にまとまり、既存の
+canonical helperを呼ぶ境界と、次のhelper cutoverまで残る辞書アクセスが明示されている。
+PR #613/#614 では
 以下が同時に露出した: `preferredname` の Mac/DOS 優先順位バグが
-`json_inspect.rs` と `filespec_helper.rs` の**両方で独立に発生**、
+`job/json_sections.rs` と `filespec_helper.rs` の**両方で独立に発生**、
 `modificationdate` が `QPDFEFStreamObjectHelper::getCreationDate()` を経由せず
 qpdf 側のコピペバグ（`QPDFJob.cc:1319-1322`）を再現できていなかった、
 `fieldtype` の先頭 `/` 欠落（`getFieldType()` 未経由）、
-`build_acroform_section` の走査モデルが qpdf と構造的に別物（`flpdf-d949`）。
+`build_acroform_section` の走査モデルが qpdf と構造的に別物（`flpdf-d949`）である。
 
 **同じ責務が 2 箇所に実装されている状態そのものが D2 違反**であり、
-ヘルパー側が D1 未達であることとは独立した問題である。Tier D1（`flpdf-q2fo`）は
+これは配置移設だけで完了するものではない。ヘルパー側が D1 未達であることとは独立した問題である。Tier D1（`flpdf-q2fo`）は
 「ヘルパーへ載せ替える」だけでなく、載せ替え先のヘルパーが D1 を満たすことを
 前提とするため、下表の 🔀 を先に解消する必要がある。
 
 | doJSON* | 経由すべきヘルパー | §7 の状態 |
 |---|---|---|
 | `doJSONAcroform` | `QPDFAcroFormDocumentHelper` + `QPDFFormFieldObjectHelper` + `QPDFAnnotationObjectHelper` + `QPDFPageDocumentHelper` | 🔀 / 🔀 / 🔀 / 🔀 |
-| `doJSONAttachments` | `QPDFEmbeddedFileDocumentHelper` + `QPDFFileSpecObjectHelper` + `QPDFEFStreamObjectHelper` | ✅ / ✅（D1 は完成済み。`json_inspect.rs` の再実装により D2 はなお未達 — `flpdf-q2fo` で解消予定） |
+| `doJSONAttachments` | `QPDFEmbeddedFileDocumentHelper` + `QPDFFileSpecObjectHelper` + `QPDFEFStreamObjectHelper` | ✅ / ✅（D1 は完成済み。`job/json_sections.rs` の再実装により D2 はなお未達 — `flpdf-q2fo` で解消予定） |
 | `doJSONPages` | `QPDFPageDocumentHelper` + `QPDFPageObjectHelper` | 🔀 / 🔀 |
 | `doJSONOutlines` | `QPDFOutlineDocumentHelper` | ✅ |
 | `doJSONPageLabels` | `QPDFPageLabelDocumentHelper` | ✅ |
