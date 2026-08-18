@@ -331,9 +331,12 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         self.validate_supported_settings()?;
         let mut options = self.prepared_write_options()?;
         if let Some(reporter) = options.progress_reporter.as_ref() {
+            // cov:ignore-start: Pdf::get_object_count returns u32, and flpdf's
+            // supported targets have usize at least 32 bits wide.
             let object_count = usize::try_from(self.pdf.get_object_count()?).map_err(|_| {
                 Error::Unsupported("PdfWriter progress object count does not fit usize".into())
             })?;
+            // cov:ignore-end
             reporter.configure(object_count.saturating_mul(if self.settings.linearization {
                 2
             } else {

@@ -2491,6 +2491,32 @@ fn pdf_writer_objstm_progress_counts_members_not_containers() -> flpdf::Result<(
 }
 
 #[test]
+fn pdf_writer_linearized_objstm_progress_accounts_for_pass_one() -> flpdf::Result<()> {
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    assert!(output
+        .windows(b"/Type /ObjStm".len())
+        .any(|window| window == b"/Type /ObjStm"));
+    let events = events.borrow();
+    assert_eq!(events.first(), Some(&0));
+    assert_eq!(events.last(), Some(&100));
+    assert!(events.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(events.iter().any(|percent| (1..=99).contains(percent)));
+    Ok(())
+}
+
+#[test]
 fn pdf_writer_failure_does_not_report_success() -> flpdf::Result<()> {
     let events = Rc::new(RefCell::new(Vec::<u8>::new()));
     let mut pdf = open_minimal_pdf()?;
