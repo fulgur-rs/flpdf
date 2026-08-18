@@ -1518,6 +1518,41 @@ mod tests {
         assert!(adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).is_ok());
     }
 
+    #[test]
+    fn adjust_appearance_stream_resolves_nested_resource_values_on_conflict() {
+        let mut pdf = open_minimal();
+        let nested_value_ref = set_dict(&mut pdf, 8, &[]);
+        let nested_resource_ref = set_dict(
+            &mut pdf,
+            9,
+            &[("Nested", PdfObject::Reference(nested_value_ref))],
+        );
+        let f1_ref = set_dict(&mut pdf, 6, &[]);
+        let f1_1_ref = set_dict(&mut pdf, 7, &[]);
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F0", PdfObject::Reference(nested_resource_ref));
+        font_dict.insert("F1", PdfObject::Reference(f1_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(f1_1_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", PdfObject::Dictionary(resources))],
+            b"/F1 18 Tf",
+        );
+
+        adjust_appearance_stream_via_handle(
+            &mut pdf,
+            ap_ref,
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+        )
+        .unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"/F1_1 18 Tf");
+    }
+
     /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its
     /// own literal code (codes 0-255 are always literal single-byte table
     /// entries per PDF §7.4.4), followed by EOD (257). Every code stays 9
