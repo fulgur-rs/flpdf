@@ -480,8 +480,6 @@ logger consumer に移行済みである。
 
 以下の direct output は意図的に retained とする。
 
-- `run_show_info` / `run_show_catalog` / `run_show_metadata` / `run_show_outline`:
-  flpdf-only inspection で、qpdf 11.9.0 `QPDFJob` に同じ command consumer がない
 - `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
   unfilterable stream を同じ marker へ変換しない
 - native `rewrite --static-id` warning、`--remove-restrictions` intent diagnostic、
