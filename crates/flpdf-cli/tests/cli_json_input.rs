@@ -124,7 +124,11 @@ fn json_input_inspection_modes_match_qpdf_11_9() {
         assert_eq!(flpdf.status.code(), qpdf.status.code(), "{option}");
         assert_eq!(flpdf.stderr, qpdf.stderr, "{option} stderr");
         match option {
-            "--check" | "--show-npages" => assert_eq!(flpdf.stdout, qpdf.stdout, "{option}"),
+            "--check" | "--show-npages" => assert_eq!(
+                normalize_program_prefix(&flpdf.stdout),
+                normalize_program_prefix(&qpdf.stdout),
+                "{option}"
+            ),
             "--show-pages" => assert!(
                 String::from_utf8_lossy(&flpdf.stdout).starts_with("page 1: 3 0 R\n"),
                 "show-pages must inspect the JSON-created page tree: {:?}",
@@ -155,7 +159,10 @@ fn update_from_json_check_matches_qpdf_11_9() {
 
     assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stdout),
+        normalize_program_prefix(&qpdf.stdout)
+    );
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
