@@ -30,6 +30,7 @@
 | `crates/flpdf/src/job/json_sections.rs` | correspondence | \`QPDFJob::doJSONPages\`, \`doJSONPageLabels\`, \`doJSONOutlines\`, \`doJSONAcroform\`, \`doJSONAttachments\`, and \`doJSONEncrypt\` section builders |
 | `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command and JSON section orchestration |
+| `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/input.rs` | correspondence | \`QPDF_json.cc\` JSONReactor state machine, validators, deferred stream providers, and \`makeObject\` value construction |

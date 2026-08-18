@@ -4,7 +4,8 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
-    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob, UsageError,
+    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
+    QPDFJob, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -767,9 +768,10 @@ struct PageOpArgs {
     /// selects all pages of that file. The `--` terminator ends the segment;
     /// the token after it is the OUTPUT positional.
     ///
-    /// Cross-document merge (pages from more than one distinct source file) is
-    /// out of scope for this layer — see the SCOPE comment in
-    /// `run_page_extraction`.
+    /// Distinct source files are opened and copied through the qpdf-shaped
+    /// `QPDFJob::handle_page_specs` boundary; JSON-created primaries retain
+    /// their separate single-document restriction until their source heap is
+    /// implemented.
     #[arg(
         long = "pages",
         num_args = 1..,
@@ -3663,8 +3665,8 @@ fn parse_pages_segment(tokens: &[String]) -> CliResult<Vec<PageSegmentSpec>> {
 }
 
 /// Resolve `--pages` specs into [`InputSpec`]s, mapping the `.` shorthand to
-/// the primary input path. Also returns the set of distinct resolved paths so
-/// the caller can enforce the single-document scope boundary.
+/// the primary input path while preserving the literal filename identity used
+/// by qpdf's page-spec source heap.
 fn resolve_page_specs(
     specs: &[PageSegmentSpec],
     primary_input: &std::path::Path,
@@ -4205,14 +4207,12 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 ///   8. acroform_field_prune::prune_acroform_after_subset
 ///   9. write (or split_pages when --split-pages is set)
 ///
-/// SCOPE BOUNDARY (single document only):
-/// `rebuild_page_tree` and the post-rebuild passes operate on ONE [`Pdf`].
-/// Cross-document page merge (selecting pages from more than one distinct
-/// source file) — and the cross-doc AcroForm field-collision renaming it
-/// would require — is explicitly out of scope here. When the resolved
-/// `--pages` specs reference more than one distinct file we surface an
-/// actionable [`Error::Unsupported`] instead of silently producing wrong
-/// output or swallowing the limitation.
+/// Multi-source page specifications are handled by the job-level
+/// `QPDFJob::handle_page_specs` route, which returns a fresh primary-based
+/// document after foreign-page copy, field collision handling, PageLabels
+/// reconstruction, and spec-order restoration. The in-place route below is
+/// retained for a single source so the existing post-rebuild consumers can
+/// continue to operate on the original object graph.
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction(
     primary_input: &std::path::Path,
@@ -4250,14 +4250,13 @@ fn run_page_extraction(
     let specs = parse_pages_segment(&page_ops.pages)?;
     let mut inputs = resolve_page_specs(&specs, primary_input)?;
 
-    // CombinedPlan::from_specs (below) opens each input using only the
-    // segment-local InputSpec password. For `--pages . ...` on an encrypted
-    // primary input where the user supplied the top-level `--password`, the
-    // spec carries no password and the planning open would fail before the
-    // later open_pdf(..., &src_pw) path applies it. Backfill the top-level
-    // password into specs that lack their own so planning and the rebuild
-    // open use the same credential. (Single-document scope is enforced just
-    // below, so every spec resolves to the primary input.)
+    // CombinedPlan and the job-level page-spec route both open each input
+    // using the segment-local InputSpec password. For `--pages . ...` on an
+    // encrypted primary input where the user supplied the top-level
+    // `--password`, the spec carries no password and planning would fail
+    // before the later open_pdf(..., &src_pw) path applies it. Backfill the
+    // top-level password into specs that lack their own so every route uses
+    // the same credential.
     if let Some(top_pw) = &password.password {
         for spec in &mut inputs {
             if spec.password.is_none() {
@@ -4266,11 +4265,10 @@ fn run_page_extraction(
         }
     }
 
-    // ── Single-document scope enforcement ────────────────────────────────
-    // Compare *canonicalized* source paths so the same file spelled
-    // differently (`tests/x.pdf` vs `./tests/x.pdf`, the `.` shorthand,
-    // relative/symlinked equivalents) is correctly treated as one document.
-    // The original path is preserved for opening/reporting.
+    // Keep the canonicalized path set for the JSON-input guard and the
+    // single-source verbose route. Ordinary page operations below use the
+    // literal qpdf filename identity: two spellings of the same file may be
+    // distinct QPDF sources, as documented by qpdf's page-spec API.
     let mut distinct: Vec<std::path::PathBuf> = Vec::new();
     for spec in &inputs {
         // Source inputs must exist to be opened; if canonicalization fails
@@ -4280,22 +4278,6 @@ fn run_page_extraction(
             distinct.push(key);
         }
     }
-    if distinct.len() > 1 {
-        return Err(format!(
-            "--pages: cross-document page merge is not supported at this layer \
-             (got {} distinct source files: {}). Single-document extraction \
-             (repeats of the same file or '.') is supported; cross-doc merge \
-             and AcroForm field-collision handling are tracked in a separate issue.",
-            distinct.len(),
-            distinct
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .into());
-    }
-
     if json_input || update_from_json.is_some() {
         // `run_page_extraction_from_repeated_pdf` below applies every spec's
         // range to the single already-opened job document; it has no way to
@@ -4360,6 +4342,29 @@ fn run_page_extraction(
                 &distinct,
             ),
         };
+    }
+
+    // qpdf's ordinary page-spec job owns distinct input documents and copies
+    // foreign pages into the primary output. Route that case through the
+    // library QPDFJob facade; retain the existing in-place route for the
+    // single-document path, where its outline/structure post-passes operate
+    // on the original object graph.
+    let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
+    if has_external_source {
+        return run_page_extraction_from_multiple_sources(
+            primary_input,
+            output,
+            repair,
+            password,
+            page_ops,
+            overlay_specs,
+            remove_unref,
+            options,
+            verbose,
+            standard_output,
+            creates_output,
+            inputs,
+        );
     }
 
     // qpdf's page-operation output inherits encryption from the command's
@@ -4438,6 +4443,138 @@ fn run_page_extraction(
         standard_output,
         creates_output,
         primary_encrypted,
+        false,
+        true,
+        combined_pages,
+    )
+}
+
+/// Run qpdf's ordinary multi-source page-spec path.
+///
+/// The primary document is retained at source index zero even when no page
+/// spec selects it. Every other literal filename is opened once and reused by
+/// the job-level page-spec planner, matching qpdf's page heap keyed by the
+/// filename token. The resulting fresh merged document is then passed through
+/// the same rotate/structure/overlay/write completion boundary as a
+/// single-document extraction.
+#[allow(clippy::too_many_arguments)]
+fn run_page_extraction_from_multiple_sources(
+    primary_input: &Path,
+    output: &Path,
+    repair: bool,
+    password: &PasswordArgs,
+    page_ops: &PageOpArgs,
+    overlay_specs: &[OverlaySpec],
+    remove_unref: CliRemoveUnreferencedResources,
+    options: WriterOptions,
+    verbose: bool,
+    standard_output: Option<PipelineWriter>,
+    creates_output: bool,
+    inputs: Vec<InputSpec>,
+) -> CliResult<()> {
+    // qpdf inherits output encryption from the primary input for page
+    // operations. Keep this probe separate from the mutable source vector so
+    // source opening below can use the same top-level password policy.
+    let primary_encrypted =
+        open_pdf(&primary_input.to_path_buf(), repair, password)?.is_encrypted();
+
+    // Build literal-path source identity and one qpdf page specification per
+    // occurrence. `.` was already normalized to primary_input by
+    // resolve_page_specs; path equality therefore preserves qpdf's documented
+    // distinction between two different spellings of the same file.
+    let mut source_paths = vec![primary_input.to_path_buf()];
+    let mut source_passwords: Vec<Option<String>> = vec![None];
+    let mut specs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let source_index = if input.path == primary_input {
+            0
+        } else if let Some(index) = source_paths.iter().position(|path| path == &input.path) {
+            index
+        } else {
+            let index = source_paths.len();
+            source_paths.push(input.path.clone());
+            source_passwords.push(input.password.clone());
+            index
+        };
+        specs.push(PageSpecInput::new(source_index, input.range));
+    }
+
+    if verbose {
+        let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
+        for path in &source_paths {
+            let fname = pages_progress_filename(path);
+            message.push_str(&format!(
+                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+            ));
+        }
+        message.push_str("flpdf: removing unreferenced pages from primary input\n");
+        for path in &source_paths {
+            message.push_str(&format!(
+                "flpdf: adding pages from {}\n",
+                pages_progress_filename(path)
+            ));
+        }
+        logger_info(message)?;
+    }
+
+    let mut sources = Vec::with_capacity(source_paths.len());
+    sources.push(open_pdf(&primary_input.to_path_buf(), repair, password)?);
+    for (source_index, path) in source_paths.iter().enumerate().skip(1) {
+        let mut source_password = password.clone();
+        if let Some(segment_password) = &source_passwords[source_index] {
+            source_password.password = Some(segment_password.clone());
+            source_password.password_file = None;
+        }
+        sources.push(open_pdf(path, repair, &source_password)?);
+    }
+
+    let collate = page_ops
+        .collate
+        .as_deref()
+        .map(parse_collate_n)
+        .transpose()?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let source_warnings = job.has_warnings();
+    let mut merged = job.handle_page_specs(&mut sources, &specs, collate)?;
+    let source_warnings = source_warnings || job.has_warnings();
+
+    // The merge job has already rebuilt the target page tree and copied the
+    // primary document-level structures. Represent its current output pages
+    // as a local selection so the shared post-selection consumer can apply
+    // rotate, cleanup, overlays, split naming, and writer options without
+    // reintroducing source-document ObjectRefs.
+    let selected = pages::page_refs(&mut merged)?;
+    let combined_pages: Vec<CombinedPage> = selected
+        .iter()
+        .enumerate()
+        .map(|(index, &page_ref)| {
+            Ok(CombinedPage {
+                source_index: 0,
+                page: flpdf::page_plan::SelectedPage {
+                    index_1based: u32::try_from(index + 1)
+                        .map_err(|_| "--pages: too many output pages")?,
+                    page_ref,
+                },
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
+
+    run_page_extraction_after_plan(
+        merged,
+        output,
+        repair,
+        page_ops,
+        overlay_specs,
+        remove_unref,
+        options,
+        verbose,
+        standard_output,
+        creates_output,
+        primary_encrypted,
+        source_warnings,
+        false,
         combined_pages,
     )
 }
@@ -4503,6 +4640,8 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
         standard_output,
         creates_output,
         primary_encrypted,
+        false,
+        true,
         combined_pages,
     )
 }
@@ -4520,6 +4659,8 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     mut standard_output: Option<PipelineWriter>,
     creates_output: bool,
     primary_encrypted: bool,
+    prior_warnings: bool,
+    reconstruct_labels: bool,
     combined_pages: Vec<CombinedPage>,
 ) -> CliResult<()> {
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
@@ -4530,7 +4671,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let result = rebuild_page_tree(&mut pdf, &selected)?;
     apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
 
-    {
+    if reconstruct_labels {
         let mut labels = pdf.page_labels();
         if labels.has_page_labels()? {
             let src_indices: Vec<i64> = combined_pages
@@ -4625,7 +4766,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
-    finish_operation_warnings(&pdf, creates_output)
+    finish_operation_warnings_with_prior(&pdf, creates_output, prior_warnings)
 }
 
 /// Apply each `--rotate` spec (in order) to `target_pages`, resolving each
@@ -5844,8 +5985,18 @@ fn check_diagnostic_location(input: &Path, diagnostic: &flpdf::Diagnostic) -> St
 /// qpdf aggregates warnings from both open-time and lazy object resolution;
 /// the summary shape depends on whether this route created a PDF output.
 fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>, creates_output: bool) -> CliResult<()> {
+    finish_operation_warnings_with_prior(pdf, creates_output, false)
+}
+
+/// Complete the warning boundary while retaining warnings observed in source
+/// documents that were merged into a fresh output PDF.
+fn finish_operation_warnings_with_prior<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    creates_output: bool,
+    prior_warnings: bool,
+) -> CliResult<()> {
     finish_warning_state(
-        !pdf.repair_diagnostics().entries().is_empty(),
+        prior_warnings || !pdf.repair_diagnostics().entries().is_empty(),
         creates_output,
     )
 }
