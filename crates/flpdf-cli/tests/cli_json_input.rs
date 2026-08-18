@@ -186,7 +186,10 @@ fn update_from_json_show_npages_matches_qpdf_11_9() {
 
     assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
     assert_eq!(flpdf.status.code(), qpdf.status.code());
-    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stdout),
+        normalize_program_prefix(&qpdf.stdout)
+    );
     assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
