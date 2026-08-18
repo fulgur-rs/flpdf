@@ -4886,7 +4886,21 @@ fn run_show_outline(
     }
 
     for (index, (depth, _id, item)) in tree.preorder().enumerate() {
-        let title = item.title(&mut helper)?;
+        let title = match item.title(&mut helper) {
+            Ok(title) => title,
+            Err(error) => {
+                // Title resolution now happens live per item (matching qpdf's
+                // own accessors, which never cache), so a title lookup can
+                // fail after earlier items have already printed -- unlike
+                // the `get_tree` failure above, there is no pre-output point
+                // left to fall back to. Preserve the same non-fatal recovery
+                // contract this command already established for `get_tree`:
+                // warn and stop enumerating rather than aborting the whole
+                // command on one item's error.
+                eprintln!("Warning: {error}");
+                break;
+            }
+        };
         println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, title);
     }
     finish_operation_warnings(&pdf, false)
