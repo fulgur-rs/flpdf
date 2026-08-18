@@ -58,8 +58,11 @@ impl Default for QPDFJob {
 impl QPDFJob {
     /// Construct a job with qpdf's default message prefix and logger.
     ///
-    /// Corresponds to `QPDFJob::QPDFJob` and the default `Members` state in
-    /// qpdf 11.9.0 (`libqpdf/QPDFJob.cc:290-296`).
+    /// Corresponds to `QPDFJob::QPDFJob` (`libqpdf/QPDFJob.cc:290-293`), whose
+    /// `Members` default-constructs the shared logger
+    /// (`libqpdf/QPDFJob.cc:286-289`); the remaining field defaults are the
+    /// `Members` in-class initializers in qpdf 11.9.0
+    /// (`include/qpdf/QPDFJob.hh:588-601`).
     #[must_use]
     pub fn new() -> Self {
         Self {
