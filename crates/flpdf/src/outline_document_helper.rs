@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline.rs.
+//! qpdf correspondence: QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline_object_helper.rs.
 //! High-level outline (`/Outlines`) document helper.
 //!
 //! [`OutlineDocumentHelper`] wraps a `&mut Pdf<R>` and materializes the document
@@ -45,7 +45,7 @@
 //! ```
 
 use crate::nntree::HandleNameTree;
-use crate::outline::{OutlineId, OutlineItem, OutlineTree};
+use crate::outline_object_helper::{OutlineId, OutlineItem, OutlineTree};
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
