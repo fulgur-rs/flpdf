@@ -130,7 +130,7 @@ The crate is organized as a few small layers:
   cross-reference table, then resolves objects on demand via `Pdf::resolve`).
 - `Object`, `Dictionary`, `Stream`, `ObjectRef` — the data model.
 - `pages`, `outline_object_helper` — read-only traversal helpers that mirror
-  `qpdf --show-pages` and `--show-outline`.
+  `qpdf --show-pages` and `--json-key=outlines`.
 - `write_pdf` / `write_qdf` — incremental rewrite and qdf-style flat dump.
 - `check_reader` — diagnostics gathered during parsing/repair, returning a
   `CheckReport` of `Diagnostic`s.

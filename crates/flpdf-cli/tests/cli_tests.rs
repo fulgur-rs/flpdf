@@ -1170,53 +1170,6 @@ fn rewrite_force_version_honored_without_mutation() {
 }
 
 #[test]
-fn show_info_with_repair_flag_handles_corrupt_xref() {
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("corrupt.pdf");
-    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--repair", "--show-info", input.to_str().unwrap()])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains(
-            "flpdf: operation succeeded with warnings\n",
-        ))
-        .stderr(predicate::str::contains("resulting file may have some problems").not())
-        .stdout(predicate::str::contains("Title = (Corrupt fixture)"));
-}
-
-#[test]
-fn show_catalog_repaired_input_exits_three_with_inspection_summary() {
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            "--repair",
-            "--show-catalog",
-            "../../tests/fixtures/test_driver/repairable_input.pdf",
-        ])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains(
-            "flpdf: operation succeeded with warnings\n",
-        ))
-        .stderr(predicate::str::contains("resulting file may have some problems").not())
-        .stdout(predicate::str::contains("Catalog:"));
-}
-
-#[test]
-fn show_info_without_repair_rejects_corrupt_xref() {
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("corrupt.pdf");
-    std::fs::write(&input, corrupt_xref_with_info_pdf()).unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-info", input.to_str().unwrap()])
-        .assert()
-        .failure();
-}
-
-#[test]
 fn check_without_repair_rejects_corrupt_xref() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("corrupt.pdf");
@@ -1267,68 +1220,6 @@ fn dump_object_rejects_invalid_ref() {
     cmd.args(["--dump-object", "bad", "../../tests/fixtures/minimal.pdf"])
         .assert()
         .failure();
-}
-
-#[test]
-fn show_info_prints_document_info() {
-    let fixture = fixture_with_metadata_outline_and_fonts();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-info", fixture.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Title = (Fixture PDF)"))
-        .stdout(predicate::str::contains("Creator = (flpdf)"));
-}
-
-#[test]
-fn show_catalog_prints_root_dictionary() {
-    let fixture = fixture_with_metadata_outline_and_fonts();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-catalog", fixture.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Catalog: <<"))
-        .stdout(predicate::str::contains("/Type /Catalog"));
-}
-
-#[test]
-fn show_metadata_prints_stream_summary() {
-    let fixture = fixture_with_metadata_outline_and_fonts();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-metadata", fixture.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Metadata: stream"))
-        .stdout(predicate::str::contains("/XML"));
-}
-
-#[test]
-fn show_outline_prints_titles() {
-    let fixture = fixture_with_metadata_outline_and_fonts();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-outline", fixture.path().to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("1: Chapter One"));
-}
-
-#[test]
-fn show_outline_warns_and_prints_empty_when_outline_resolution_fails() {
-    let fixture = fixture_with_unresolvable_outline();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--show-outline", fixture.path().to_str().unwrap()])
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("WARNING:"))
-        .stderr(predicate::str::contains(
-            "flpdf: operation succeeded with warnings\n",
-        ))
-        .stdout(predicate::str::contains("Outline:\n  <empty>"));
 }
 
 #[test]
@@ -3013,74 +2904,6 @@ fn show_pages_lists_each_page() {
         .stdout(predicate::str::contains("media-box: [ 0 0 200 100 ]"));
 }
 
-fn fixture_with_metadata_outline_and_fonts() -> tempfile::NamedTempFile {
-    let mut fixture = tempfile::NamedTempFile::new().unwrap();
-
-    let object1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R /Metadata 4 0 R /Info 5 0 R >>\nendobj\n";
-    let object2 = b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [6 0 R] >>\nendobj\n";
-    let object3 = b"3 0 obj\n<< /Type /Outlines /First 10 0 R /Last 10 0 R /Count 1 >>\nendobj\n";
-    let metadata_data = b"<xmpmeta>Fixture metadata</xmpmeta>";
-    let object4 = format!(
-        "4 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{}\nendstream\nendobj\n",
-        metadata_data.len(),
-        String::from_utf8_lossy(metadata_data)
-    )
-    .into_bytes();
-    let object5 = b"5 0 obj\n<< /Title (Fixture PDF) /Creator (flpdf) >>\nendobj\n";
-    let object6 = b"6 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R >> >> /MediaBox [0 0 612 792] /Contents 9 0 R >>\nendobj\n";
-    let object7 = b"7 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n";
-    let object8 = b"8 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /Courier >>\nendobj\n";
-    let content_data = b"BT /F1 12 Tf (Hello) Tj ET";
-    let object9 = format!(
-        "9 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
-        content_data.len(),
-        String::from_utf8_lossy(content_data)
-    )
-    .into_bytes();
-    let object10 =
-        b"10 0 obj\n<< /Title (Chapter One) /Parent 3 0 R /Dest [6 0 R /Fit] >>\nendobj\n";
-
-    let objects = vec![
-        object1.to_vec(),
-        object2.to_vec(),
-        object3.to_vec(),
-        object4,
-        object5.to_vec(),
-        object6.to_vec(),
-        object7.to_vec(),
-        object8.to_vec(),
-        object9,
-        object10.to_vec(),
-    ];
-
-    let mut bytes = b"%PDF-1.7\n".to_vec();
-    let mut offsets = Vec::with_capacity(objects.len() + 1);
-    for object in &objects {
-        offsets.push(bytes.len() as u32);
-        bytes.extend_from_slice(object);
-    }
-
-    let start_xref = bytes.len();
-    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
-    bytes.extend_from_slice(format!("{:010} 65535 f\n", 0).as_bytes());
-    for &offset in &offsets {
-        bytes.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
-    }
-    bytes.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{}\n%%EOF\n",
-            objects.len() + 1,
-            start_xref
-        )
-        .as_bytes(),
-    );
-
-    let file = fixture.as_file_mut();
-    file.write_all(&bytes).unwrap();
-
-    fixture
-}
-
 fn fixture_with_short_first_name_tree_pair() -> tempfile::NamedTempFile {
     let mut fixture = tempfile::NamedTempFile::new().unwrap();
     let objects = [
@@ -3194,19 +3017,6 @@ fn corrupt_xref_repaired_name_tree_fixture() -> tempfile::NamedTempFile {
         .position(|window| window == b"xref")
         .expect("fixture must contain xref");
     bytes[xref + 2] = b'z';
-    std::fs::write(fixture.path(), bytes).unwrap();
-    fixture
-}
-
-fn fixture_with_unresolvable_outline() -> tempfile::NamedTempFile {
-    let fixture = fixture_with_metadata_outline_and_fonts();
-    let mut bytes = std::fs::read(fixture.path()).unwrap();
-    let marker = b"3 0 obj\n<< /Type /Outlines";
-    let start = bytes
-        .windows(marker.len())
-        .position(|window| window == marker)
-        .unwrap();
-    bytes[start + b"3 0 obj\n".len()] = b'@';
     std::fs::write(fixture.path(), bytes).unwrap();
     fixture
 }
@@ -5444,7 +5254,7 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
     // Item1/Item3 now point at removed, nulled pages).
     let outline = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--show-outline", output.to_str().unwrap()])
+        .args(["--json=2", "--json-key=outlines", output.to_str().unwrap()])
         .assert()
         .success();
     let outline_txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();
@@ -5505,7 +5315,7 @@ fn pages_extraction_keeps_all_when_full_range_selected() {
 
     let outline = Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["--show-outline", output.to_str().unwrap()])
+        .args(["--json=2", "--json-key=outlines", output.to_str().unwrap()])
         .assert()
         .success();
     let txt = String::from_utf8_lossy(&outline.get_output().stdout).into_owned();

@@ -8,7 +8,7 @@
 //! - [`Object`], [`Dictionary`], [`Stream`], and [`ObjectRef`] are the data model.
 //! - [`pages`] and [`outline_object_helper`] are traversal helpers built on top of `Pdf`. They
 //!   mirror the read-only inspection surface that `qpdf --show-pages` and
-//!   `--show-outline` provide.
+//!   `--json-key=outlines` provide.
 //! - [`PdfWriter`] configures the one fresh full-rewrite output with qpdf-shaped
 //!   settings.
 //! - [`check_reader`] reports diagnostics gathered during parsing/repair, returning a

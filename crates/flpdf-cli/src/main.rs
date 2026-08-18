@@ -302,14 +302,6 @@ struct Cli {
     #[arg(long)]
     dump_object: Option<String>,
     #[arg(long)]
-    show_info: bool,
-    #[arg(long)]
-    show_catalog: bool,
-    #[arg(long)]
-    show_metadata: bool,
-    #[arg(long)]
-    show_outline: bool,
-    #[arg(long)]
     show_npages: bool,
     #[arg(long)]
     show_pages: bool,
@@ -335,7 +327,6 @@ struct Cli {
           conflicts_with_all = [
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
               "dump_object",
-              "show_info", "show_catalog", "show_metadata", "show_outline",
               "show_npages", "show_pages", "show_linearization", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption_from",
@@ -352,7 +343,7 @@ struct Cli {
     #[arg(
         long = "json-input",
         conflicts_with_all = [
-            "dump_object", "show_info", "show_catalog", "show_metadata", "show_outline",
+            "dump_object",
             "show_linearization", "list_attachments", "show_attachment",
             "remove_attachment", "add_attachment", "copy_attachments_from",
         ],
@@ -368,7 +359,7 @@ struct Cli {
         value_name = "QPDF-JSON",
         require_equals = true,
         conflicts_with_all = [
-            "dump_object", "show_info", "show_catalog", "show_metadata", "show_outline",
+            "dump_object",
             "show_linearization", "list_attachments", "show_attachment",
             "remove_attachment", "add_attachment", "copy_attachments_from",
         ],
@@ -485,8 +476,7 @@ struct Cli {
     // excluded here.)
     #[arg(long = "remove-restrictions",
           conflicts_with_all = [
-              "check", "dump_object", "show_info", "show_catalog",
-              "show_metadata", "show_outline",
+              "check", "dump_object",
               "show_npages", "show_pages", "show_linearization",
           ])]
     remove_restrictions: bool,
@@ -506,8 +496,7 @@ struct Cli {
     // rather than silently ignoring the flag (and OUTPUT).
     #[arg(long = "decrypt",
           conflicts_with_all = [
-              "check", "dump_object", "show_info", "show_catalog",
-              "show_metadata", "show_outline",
+              "check", "dump_object",
               "show_npages", "show_pages", "show_linearization",
           ])]
     decrypt: bool,
@@ -558,8 +547,7 @@ struct Cli {
     /// user's requested coalescing would not appear in the output.
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
-              "check", "dump_object", "show_info", "show_catalog",
-              "show_metadata", "show_outline",
+              "check", "dump_object",
               "show_npages", "show_pages", "show_linearization",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
@@ -725,8 +713,7 @@ struct Cli {
         // `qpdf --check`-clean linearized+encrypted file), and
         // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
-            "check", "dump_object", "show_info", "show_catalog",
-            "show_metadata", "show_outline",
+            "check", "dump_object",
             "show_npages", "show_pages", "show_linearization",
             "remove_restrictions", "decrypt",
             "copy_encryption_from",
@@ -751,8 +738,7 @@ struct Cli {
         value_name = "FILE",
         conflicts_with_all = [
             "encrypt",
-            "check", "dump_object", "show_info", "show_catalog",
-            "show_metadata", "show_outline",
+            "check", "dump_object",
             "show_npages", "show_pages", "show_linearization",
             "remove_restrictions", "decrypt",
         ],
@@ -1733,10 +1719,6 @@ fn main() {
             None => {
                 args.json.is_none()
                     && args.dump_object.is_none()
-                    && !args.show_info
-                    && !args.show_catalog
-                    && !args.show_metadata
-                    && !args.show_outline
                     && !args.show_npages
                     && !args.show_pages
                     && !args.show_linearization
@@ -1774,14 +1756,6 @@ fn main() {
         run_command(command, &overlay_specs)
     } else if let Some(object_ref) = args.dump_object.as_deref() {
         run_dump_object(args.input, args.repair, &args.password, object_ref)
-    } else if args.show_info {
-        run_show_info(args.input, args.repair, &args.password)
-    } else if args.show_catalog {
-        run_show_catalog(args.input, args.repair, &args.password)
-    } else if args.show_metadata {
-        run_show_metadata(args.input, args.repair, &args.password)
-    } else if args.show_outline {
-        run_show_outline(args.input, args.repair, &args.password)
     } else if args.show_npages {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
@@ -5153,144 +5127,6 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
         Ok(())
     })();
     operation?;
-    finish_operation_warnings(&pdf, false)
-}
-
-fn run_show_info(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-    let info_ref = pdf
-        .trailer()
-        .get_ref("Info")
-        .ok_or("document info dictionary not found")?;
-    let info = pdf.resolve_borrowed(info_ref)?;
-
-    let Object::Dictionary(dict) = info else {
-        return Err(format!("info object {} is not a dictionary", info_ref).into());
-    };
-
-    println!("Info:");
-    for (key, value) in dict.iter() {
-        let key = String::from_utf8_lossy(key);
-        println!("  {} = {}", key, object_to_pdf(value));
-    }
-    finish_operation_warnings(&pdf, false)
-}
-
-fn run_show_catalog(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-    let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve_borrowed(catalog_ref)?;
-    println!("Catalog: {}", object_to_pdf(catalog));
-    finish_operation_warnings(&pdf, false)
-}
-
-fn run_show_metadata(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-    let catalog_ref = pdf.root_ref().ok_or("document catalog missing")?;
-    let catalog = pdf.resolve_borrowed(catalog_ref)?;
-
-    let Object::Dictionary(catalog) = catalog else {
-        return Err(format!("document catalog {} is not a dictionary", catalog_ref).into());
-    };
-
-    match catalog.get_ref("Metadata") {
-        Some(metadata_ref) => {
-            let metadata = pdf.resolve_borrowed(metadata_ref)?;
-            match metadata {
-                Object::Stream(stream) => {
-                    let kind = stream
-                        .dict
-                        .get("Subtype")
-                        .map(object_to_pdf)
-                        .unwrap_or_else(|| String::from("Unknown"));
-                    println!("Metadata: stream ({}) {}", metadata_ref, kind);
-                    println!("  length: {}", stream.data.len());
-                    const MAX_METADATA_PREVIEW_BYTES: usize = 1000;
-                    let preview_len = stream.data.len().min(MAX_METADATA_PREVIEW_BYTES);
-                    let preview = String::from_utf8_lossy(&stream.data[..preview_len]);
-                    if stream.data.len() > MAX_METADATA_PREVIEW_BYTES {
-                        println!(
-                            "  preview: {} (truncated, total {} bytes)",
-                            preview,
-                            stream.data.len()
-                        );
-                    } else {
-                        println!("  preview: {}", preview);
-                    }
-                }
-                Object::Dictionary(dict) => {
-                    println!("Metadata: dictionary {}", metadata_ref);
-                    for (key, value) in dict.iter() {
-                        let key = String::from_utf8_lossy(key);
-                        println!("  {}: {}", key, object_to_pdf(value));
-                    }
-                }
-                other => {
-                    println!("Metadata: non-stream {}", metadata_ref);
-                    println!("  type: {}", object_to_pdf(other));
-                }
-            }
-        }
-        None => println!("Metadata: <missing>"),
-    }
-
-    finish_operation_warnings(&pdf, false)
-}
-
-fn run_show_outline(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
-    let mut pdf = open_pdf(&input, repair, password)?;
-
-    let mut helper = pdf.outline();
-    let tree = match helper.get_tree() {
-        Ok(tree) => tree,
-        Err(error) => {
-            eprintln!("Warning: {error}");
-            println!("Outline:");
-            println!("  <empty>");
-            return finish_operation_warnings(&pdf, false);
-        }
-    };
-
-    println!("Outline:");
-    if tree.roots().is_empty() {
-        println!("  <empty>");
-        return finish_operation_warnings(&pdf, false);
-    }
-
-    for (index, (depth, _id, item)) in tree.preorder().enumerate() {
-        let title = match item.title(&mut helper) {
-            Ok(title) => title,
-            Err(error) => {
-                // Title resolution now happens live per item (matching qpdf's
-                // own accessors, which never cache), so a title lookup can
-                // fail after earlier items have already printed -- unlike
-                // the `get_tree` failure above, there is no pre-output point
-                // left to fall back to. Preserve the same non-fatal recovery
-                // contract this command already established for `get_tree`:
-                // warn and stop enumerating rather than aborting the whole
-                // command on one item's error.
-                eprintln!("Warning: {error}");
-                break;
-            }
-        };
-        println!("{}{}: {}", "  ".repeat(depth - 1), index + 1, title);
-    }
     finish_operation_warnings(&pdf, false)
 }
 

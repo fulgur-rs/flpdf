@@ -1312,10 +1312,10 @@ fn json_flag_conflicts_with_output_positional() {
 }
 
 #[test]
-fn json_flag_conflicts_with_show_info() {
+fn json_flag_conflicts_with_show_npages() {
     let input = write_temp_pdf(&one_page_pdf_with_stream());
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args(["--json", "--show-info", input.path().to_str().unwrap()])
+    cmd.args(["--json", "--show-npages", input.path().to_str().unwrap()])
         .assert()
         .code(2);
 }
