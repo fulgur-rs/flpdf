@@ -154,6 +154,30 @@ impl QPDFJob {
         Ok(pdf)
     }
 
+    /// Open a file-backed document with this job's logger installed before
+    /// parsing begins.
+    ///
+    /// This is the ordinary-input half of qpdf's `createQPDF` boundary:
+    /// `QPDFJob` applies its document options before `processFile` can emit
+    /// repair diagnostics (`QPDFJob.cc:429-462`). The caller supplies policy
+    /// options such as repair, weak-crypto allowance, and warning suppression;
+    /// the job owns the logger and qpdf-shaped input description.
+    pub fn open<R>(
+        &mut self,
+        source: R,
+        input_name: impl Into<String>,
+        mut options: PdfOpenOptions,
+    ) -> Result<Pdf<R>>
+    where
+        R: Read + Seek,
+    {
+        options.logger = Some(self.logger.clone());
+        options.description = input_name.into();
+        let pdf = Pdf::open_with_options(source, options)?;
+        self.record_document_warnings(&pdf);
+        Ok(pdf)
+    }
+
     /// Apply a partial JSON update before the job's output or inspection
     /// stage, matching qpdf's update-before-transform order.
     pub fn update_from_json<R, S>(
@@ -170,6 +194,29 @@ impl QPDFJob {
         pdf.update_from_json(source, input_name)?;
         self.record_document_warnings(pdf);
         Ok(())
+    }
+
+    /// Run one read-only consumer and complete the shared warning/status
+    /// boundary after it has finished.
+    ///
+    /// This mirrors `QPDFJob::writeQPDF` selecting `doInspection` when no
+    /// output is created (`QPDFJob.cc:484-516,1646-1693`). The callback owns
+    /// the inspection-specific output; the job owns logger identity, lazy
+    /// warning collection, and the final status.
+    pub fn inspect<R, F, E>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        inspection: F,
+    ) -> std::result::Result<JobExitCode, E>
+    where
+        R: Read + Seek,
+        F: FnOnce(&mut Pdf<R>) -> std::result::Result<(), E>,
+        E: From<crate::Error>,
+    {
+        pdf.set_logger(self.logger.clone());
+        inspection(pdf)?;
+        self.record_document_warnings(pdf);
+        Ok(self.complete(false)?)
     }
 
     /// Serialize one already-created document and then complete the shared

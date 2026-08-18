@@ -2197,24 +2197,49 @@ fn run_json(cli: &Cli) -> CliResult<()> {
 
 fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
     let input = cli.input.as_ref().ok_or("missing input file")?;
-    let job_pdf = open_job_pdf(
-        input,
-        cli.repair,
-        &cli.password,
-        cli.json_input,
-        cli.update_from_json.as_deref(),
-        cli.check,
-    )?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
 
-    match job_pdf {
-        JobPdf::File(mut pdf) => run_job_inspection_on_pdf(cli, input, &mut pdf),
-        JobPdf::Json(mut pdf) => run_job_inspection_on_pdf(cli, input, &mut pdf),
+    let file = File::open(input).map_err(|error| {
+        if cli.json_input {
+            qpdf_json_input_open_error(input, error)
+        } else {
+            error_with_file(input, error.into())
+        }
+    })?;
+
+    if cli.json_input {
+        let mut pdf = job.create_from_json(file, input.display().to_string())?;
+        apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+        return run_job_inspection_on_pdf(cli, input, &mut job, &mut pdf);
     }
+
+    let mut options = pdf_open_options(cli.repair, &cli.password)?;
+    if cli.check {
+        // `--check` is a read-only inspection: qpdf forces weak-crypto
+        // authentication open and re-emits collected diagnostics once in its
+        // check report rather than delivering them during input creation.
+        options.allow_weak_crypto = true;
+        options.suppress_warnings = true;
+    }
+    let mut pdf = job
+        .open(BufReader::new(file), input.display().to_string(), options)
+        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    if pdf.uses_weak_crypto() && !cli.check {
+        logger_warn(format!(
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
+            input.display()
+        ))?;
+    }
+    apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
+    run_job_inspection_on_pdf(cli, input, &mut job, &mut pdf)
 }
 
 fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     cli: &Cli,
     input: &Path,
+    job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
     let decode_limits = filters::DecodeLimits {
@@ -2225,12 +2250,12 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
         return run_check_pdf(input, pdf, decode_limits);
     }
     if cli.show_npages {
-        show_npages_from_pdf(pdf)?;
-        return finish_operation_warnings(pdf, false);
+        let logger = job.logger();
+        return finish_job_exit_status(job.inspect(pdf, |pdf| show_npages_from_pdf(pdf, &logger))?);
     }
     if cli.show_pages {
-        show_pages_from_pdf(pdf)?;
-        return finish_operation_warnings(pdf, false);
+        let logger = job.logger();
+        return finish_job_exit_status(job.inspect(pdf, |pdf| show_pages_from_pdf(pdf, &logger))?);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
 }
@@ -5158,25 +5183,33 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
 fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    show_npages_from_pdf(&mut pdf)?;
+    let logger = cli_logger();
+    show_npages_from_pdf(&mut pdf, &logger)?;
     finish_operation_warnings(&pdf, false)
 }
 
 fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    show_pages_from_pdf(&mut pdf)?;
+    let logger = cli_logger();
+    show_pages_from_pdf(&mut pdf, &logger)?;
     finish_operation_warnings(&pdf, false)
 }
 
-fn show_npages_from_pdf<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> CliResult<()> {
+fn show_npages_from_pdf<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    logger: &QPDFLogger,
+) -> CliResult<()> {
     let pages = pages::page_refs(pdf)?;
-    logger_info(format!("{}\n", pages.len()))?;
+    logger.info(format!("{}\n", pages.len()))?;
     Ok(())
 }
 
-fn show_pages_from_pdf<R: Read + Seek + 'static>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    write_page_descriptions(pdf, &cli_logger())
+fn show_pages_from_pdf<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    logger: &QPDFLogger,
+) -> CliResult<()> {
+    write_page_descriptions(pdf, logger)
 }
 
 fn write_page_descriptions<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &QPDFLogger) -> CliResult<()> {
@@ -5831,6 +5864,16 @@ fn finish_operation_warnings<R: Read + Seek>(pdf: &Pdf<R>, creates_output: bool)
         !pdf.repair_diagnostics().entries().is_empty(),
         creates_output,
     )
+}
+
+fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
+    match status {
+        JobExitCode::Success => Ok(()),
+        JobExitCode::Warning => Err(Box::new(CliExitError {
+            code: ExitCode::Warnings,
+            message: String::new(),
+        })),
+    }
 }
 
 fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<()> {

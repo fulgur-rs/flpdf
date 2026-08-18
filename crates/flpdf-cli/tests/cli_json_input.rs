@@ -167,6 +167,33 @@ fn update_from_json_check_matches_qpdf_11_9() {
 }
 
 #[test]
+fn update_from_json_show_npages_matches_qpdf_11_9() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg(format!("--update-from-json={UPDATE_JSON}"))
+        .args(["--show-npages", MINIMAL_PDF])
+        .output()
+        .unwrap();
+    let flpdf = ShellCommand::new(assert_cmd::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .arg(format!("--update-from-json={UPDATE_JSON}"))
+        .args(["--show-npages", MINIMAL_PDF])
+        .output()
+        .unwrap();
+
+    assert!(qpdf.status.success(), "qpdf failed: {qpdf:?}");
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(
+        normalize_program_prefix(&flpdf.stdout),
+        normalize_program_prefix(&qpdf.stdout)
+    );
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
 fn json_input_json_output_matches_qpdf_11_9() {
     if skip_if_qpdf_missing() {
         return;
