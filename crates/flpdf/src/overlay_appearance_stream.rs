@@ -41,7 +41,7 @@ fn rewrite_appearance_content(decoded: &[u8], dr_map: &DrMap) -> Vec<u8> {
 /// `ObjectHandle` graph.
 ///
 /// This is qpdf's `QPDFAcroFormDocumentHelper::adjustAppearanceStream`
-/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:752-849`) over the live handle
+/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:615-696`) over the live handle
 /// route. The resource dictionary is copied before it is changed, the
 /// qpdf-shaped `mergeResources` conflict map is fed back into the local
 /// content rename map, and content decoding failures leave the already
@@ -63,6 +63,13 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
         return Ok(()); // cov:ignore: caller gates on an existing /Resources entry
     }
     let resources_terminal = pdf.resolve_object_handle_to_terminal(&resources_value)?;
+    if resources_terminal.as_dictionary().is_none() {
+        // qpdf's caller only invokes adjustAppearanceStream when
+        // `resources.isDictionary()` (QPDFAcroFormDocumentHelper.cc:1006-1008).
+        // A non-dictionary `/Resources` (e.g. an Integer in a malformed or
+        // foreign appearance stream) is left untouched, matching qpdf.
+        return Ok(());
+    }
     let was_indirect = resources_value.is_indirect()
         || resources_value.as_reference().is_some()
         || resources_terminal.object_ref().is_some();
@@ -298,6 +305,9 @@ fn extend_dr_map_from_conflicts(dr_map: &mut DrMap, conflicts: &ResourceConflict
 /// re-encode failure is swallowed and instead re-encodes the rewritten
 /// content as `FlateDecode` so it stays consistent with the `/Resources`
 /// rename.
+// Both call sites now route through `adjust_appearance_stream_handle`;
+// removal of this raw-`Object` implementation is a separate dependent slice.
+#[allow(dead_code)]
 pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
     dest: &mut Pdf<R>,
     ap_stream_ref: ObjectRef,
@@ -892,6 +902,34 @@ mod tests {
             resources.try_get_key(b"/Font").unwrap().as_integer(),
             Some(7)
         );
+    }
+
+    #[test]
+    fn canonical_adjust_appearance_stream_keeps_non_dictionary_resources_untouched() {
+        // qpdf only calls adjustAppearanceStream when `resources.isDictionary()`
+        // (QPDFAcroFormDocumentHelper.cc:1006-1008). A non-dictionary
+        // `/Resources` (e.g. from a malformed or foreign appearance stream)
+        // must leave both content and `/Resources` byte-for-byte untouched.
+        let mut pdf = open_minimal();
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Integer(7))],
+            b"/F1 18 Tf",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        let ap = pdf.get_object_handle(ap_ref);
+        pdf.resolve_object_handle(&ap).unwrap();
+
+        super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
+
+        assert_eq!(ap.as_stream_data().unwrap().as_slice(), b"/F1 18 Tf");
+        let resources = ap
+            .as_stream_dict()
+            .unwrap()
+            .try_get_key(b"/Resources")
+            .unwrap();
+        assert_eq!(resources.as_integer(), Some(7));
     }
 
     #[test]
