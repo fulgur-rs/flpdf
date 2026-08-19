@@ -4514,6 +4514,37 @@ fn run_page_extraction_from_multiple_sources(
         source_password.password_file = None;
         sources.push(open_pdf(path, repair, &source_password)?);
     }
+
+    // qpdf raises the writer floor from every input processed by the job
+    // (`QPDFJob.cc:1714-1715`) and applies that floor before explicit
+    // --min-version/--force-version settings
+    // (`QPDFJob.cc:2847-2918`). The merged fresh document starts at its
+    // baseline version, so carry the source floor explicitly through the
+    // multi-source consumer boundary. Keep the existing pairwise version /
+    // extension ordering used by the overlay route.
+    let mut options = options;
+    let mut max_version = PdfVersion::new(1, 0, 0);
+    for source in &mut sources {
+        let source_version =
+            parse_pdf_version(source.version()).unwrap_or(PdfVersion::new(1, 0, 0));
+        max_version.update_if_greater(PdfVersion::new(
+            source_version.major(),
+            source_version.minor(),
+            source.adobe_extension_level().unwrap_or(0),
+        ));
+    }
+    if let Some(ref current) = options.min_version {
+        let current_version = parse_pdf_version(current).unwrap_or(PdfVersion::new(1, 0, 0));
+        max_version.update_if_greater(PdfVersion::new(
+            current_version.major(),
+            current_version.minor(),
+            options.min_extension_level.unwrap_or(0),
+        ));
+    }
+    let (version, max_ext) = max_version.get_version();
+    options.min_version = Some(version);
+    options.min_extension_level = (max_ext > 0).then_some(max_ext);
+
     let primary_copy_encryption = sources
         .first_mut()
         .ok_or("--pages: primary input was not opened")?
