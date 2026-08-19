@@ -295,8 +295,8 @@ pub fn extract_page<R: Read + Seek>(
 /// `attrs` were resolved from the source page tree before the copy severed the
 /// `/Parent` chain; each is inserted only when the leaf does not already carry
 /// it directly, with any indirect references inside the attribute value
-/// remapped through `map` into the target's numbering. Shared by
-/// [`extract_pages`] and [`crate::page_merge::merge_documents`].
+/// remapped through `map` into the target's numbering. Used by
+/// [`crate::page_merge::merge_documents`].
 pub(crate) fn materialize_leaf(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     copied_page_ref: ObjectRef,
@@ -342,7 +342,7 @@ pub(crate) fn materialize_leaf(
 /// the first copy, matching qpdf's observed duplicate-page output. `used`
 /// tracks which copied page objects already appear in `kids`, so this may be
 /// called once per input (with `used`/`kids` accumulating across calls) by
-/// [`crate::page_merge::merge_documents`], or once by [`extract_pages`].
+/// [`crate::page_merge::merge_documents`], its sole caller.
 ///
 /// New object numbers for clones are allocated above the current maximum in
 /// `target`, recomputed on entry so repeated calls into a growing target do
