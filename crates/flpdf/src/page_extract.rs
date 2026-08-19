@@ -51,42 +51,12 @@
 //! placeholder, matching qpdf's page-selection behavior without interpreting
 //! the carrier's semantics.
 
-use crate::object_copy::rewrite_refs;
 use crate::page_label_document_helper::merge_adjacent_ranges;
-use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
-use crate::pages::tree_rebuild::resolve_inherited_raw;
-use crate::pages::{page_refs, resolve_inherited_resources_with_max_depth};
+use crate::pages::page_refs;
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
-
-/// Inherited page attributes resolved from the source page tree before the
-/// copy severs the `/Parent` chain.
-pub(crate) struct InheritedAttrs {
-    pub(crate) resources: Option<Dictionary>,
-    pub(crate) rotate: i32,
-    pub(crate) mediabox: Option<Object>,
-    pub(crate) cropbox: Option<Object>,
-}
-
-impl InheritedAttrs {
-    /// Resolve the four inheritable page attributes (`/Resources`, `/Rotate`,
-    /// `/MediaBox`, `/CropBox`) for `page_ref` from `source`'s page tree, before
-    /// any copy severs the `/Parent` chain.
-    pub(crate) fn resolve<R: Read + Seek>(
-        source: &mut Pdf<R>,
-        page_ref: ObjectRef,
-        depth: usize,
-    ) -> Result<Self> {
-        Ok(InheritedAttrs {
-            resources: resolve_inherited_resources_with_max_depth(source, page_ref, depth)?,
-            rotate: resolve_inherited_rotate_with_max_depth(source, page_ref, depth)?,
-            mediabox: resolve_inherited_raw(source, page_ref, "MediaBox", depth)?,
-            cropbox: resolve_inherited_raw(source, page_ref, "CropBox", depth)?,
-        })
-    }
-}
 
 /// Extract the pages at `page_indices` (0-based) from `source` into a
 /// brand-new minimal document.
@@ -289,50 +259,6 @@ pub fn extract_page<R: Read + Seek>(
     extract_pages(source, &[page_index])
 }
 
-/// Materialize the four inheritable attributes onto a copied leaf page and
-/// repoint its `/Parent` at `pages_root_ref`.
-///
-/// `attrs` were resolved from the source page tree before the copy severed the
-/// `/Parent` chain; each is inserted only when the leaf does not already carry
-/// it directly, with any indirect references inside the attribute value
-/// remapped through `map` into the target's numbering. Used by
-/// [`crate::page_merge::merge_documents`].
-pub(crate) fn materialize_leaf(
-    target: &mut Pdf<Cursor<Vec<u8>>>,
-    copied_page_ref: ObjectRef,
-    attrs: InheritedAttrs,
-    map: &std::collections::BTreeMap<ObjectRef, ObjectRef>,
-    pages_root_ref: ObjectRef,
-) -> Result<()> {
-    let mut leaf = resolve_dict(target, copied_page_ref, "copied page is not a dictionary")?; // cov:ignore: Err arm unreachable — page_refs yields only /Type /Page dicts and copy_objects preserves the source page dict
-
-    if !has_own(&leaf, "Resources") {
-        if let Some(res) = attrs.resources {
-            let mut value = Object::Dictionary(res);
-            rewrite_refs(&mut value, 0, map)?;
-            leaf.insert("Resources", value);
-        }
-    }
-    if !has_own(&leaf, "MediaBox") {
-        if let Some(mut mb) = attrs.mediabox {
-            rewrite_refs(&mut mb, 0, map)?;
-            leaf.insert("MediaBox", mb);
-        } // cov:ignore: rewrite_refs ? Err arm (MAX_INLINE_DEPTH) unreachable for shallow inherited /MediaBox
-    }
-    if !has_own(&leaf, "CropBox") {
-        if let Some(mut cb) = attrs.cropbox {
-            rewrite_refs(&mut cb, 0, map)?;
-            leaf.insert("CropBox", cb);
-        }
-    }
-    if !has_own(&leaf, "Rotate") {
-        leaf.insert("Rotate", Object::Integer(attrs.rotate as i64));
-    }
-    leaf.insert("Parent", Object::Reference(pages_root_ref));
-    target.set_object(copied_page_ref, Object::Dictionary(leaf));
-    Ok(())
-}
-
 /// Append `/Kids` entries to `kids` for `selected` (in selection order),
 /// shallow-cloning any source page selected more than once.
 ///
@@ -380,7 +306,7 @@ pub(crate) fn append_selection_kids(
             // cov:ignore-end
             let clone_ref = ObjectRef::new(next_num, 0);
             // The one intentional copy: the duplicate kid's own dictionary.
-            let dict = resolve_dict(target, copied_page_ref, "copied page is not a dictionary")?; // cov:ignore: Err arm unreachable — the first copy of this page resolved to a dictionary in the materialize loop above
+            let dict = resolve_dict(target, copied_page_ref, "copied page is not a dictionary")?; // cov:ignore: Err arm unreachable — the first copy of this page resolved to a dictionary before it was reparented above
             target.set_object(clone_ref, Object::Dictionary(dict));
             clone_ref
         };
@@ -404,9 +330,9 @@ pub(crate) fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<Obj
 
 /// Resolve `r` in `target` and move out its [`Dictionary`], or fail with `ctx`.
 ///
-/// Shared by [`extract_pages`]'s leaf/root materialization and
-/// [`target_pages_root`]; the error arm guards against a ref resolving to a
-/// non-dictionary (or a missing object, which resolves to [`Object::Null`]).
+/// Shared by [`target_pages_root`] and the merge route's page/root bookkeeping;
+/// the error arm guards against a ref resolving to a non-dictionary (or a
+/// missing object, which resolves to [`Object::Null`]).
 pub(crate) fn resolve_dict(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     r: ObjectRef,
@@ -416,13 +342,6 @@ pub(crate) fn resolve_dict(
         Object::Dictionary(d) => Ok(d),
         _ => Err(Error::Missing(ctx)),
     }
-}
-
-/// `true` when `dict` carries `key` as something other than `null`
-/// (ISO 32000-1 §7.3.9: explicit `null` == absent). Mirrors
-/// `pages::tree_rebuild::leaf_has_own`.
-fn has_own(dict: &Dictionary, key: &str) -> bool {
-    !matches!(dict.get(key), None | Some(Object::Null))
 }
 
 #[cfg(test)]

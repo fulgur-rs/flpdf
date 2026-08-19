@@ -21,27 +21,30 @@
 //! here (there is nothing from a secondary input to collide with).
 //!
 //! The target document is built via [`Pdf::empty`] (qpdf's
-//! `QPDF::emptyPDF()`) plus the same page-copy primitives
-//! [`crate::page_extract`] uses for `QPDFPageDocumentHelper::addPage()`.
-//! Neither of those calls touches PDF version, so the returned document
-//! keeps `emptyPDF()`'s own header version (`"1.3"`) rather than any input's
-//! version. Propagating an input's version, as the `qpdf` CLI's `--pages`
-//! does, is `QPDFJob` orchestration layered on top of these library
-//! primitives — a distinct responsibility this function does not implement.
+//! `QPDF::emptyPDF()`). Its merge-specific union copy retains the
+//! document-level and AcroForm handling needed by `QPDFJob::handlePageSpecs`;
+//! each source is nevertheless prepared through
+//! [`PageDocumentHelper::push_inherited_attributes_to_pages`] and each copied
+//! leaf is reparented through a live destination handle, matching qpdf's
+//! `insertPage` boundary. Neither the empty-document construction nor this
+//! page preparation touches PDF version, so the returned document keeps
+//! `emptyPDF()`'s own header version (`"1.3"`) rather than any input's version.
+//! Propagating an input's version, as the qpdf CLI's `--pages` does, is
+//! `QPDFJob` orchestration layered on top of these library primitives — a
+//! distinct responsibility this function does not implement.
 
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::object_copy::copy_objects;
 use crate::page_closure::{extend_object_closure, extend_page_object_closure};
 use crate::page_extract::{
-    append_selection_kids, materialize_leaf, null_copied_removed_pages, resolve_dict,
-    target_pages_root, InheritedAttrs,
+    append_selection_kids, null_copied_removed_pages, resolve_dict, target_pages_root,
 };
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
-use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
+use crate::pages::page_refs;
 use crate::ref_chain::resolve_ref_chain;
 use crate::subset_prune::sweep_unreachable_objects;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
@@ -864,7 +867,6 @@ pub fn merge_documents<R: Read + Seek>(
     let mut any_page_labels = false;
     let mut out_pageno: i64 = 0;
 
-    let depth = DEFAULT_MAX_PAGE_TREE_DEPTH;
     for (input_index, input) in inputs.iter_mut().enumerate() {
         // Document-level structures (outlines, named dests, /OpenAction) are
         // inherited from the PRIMARY input only (qpdf `--pages` parity).
@@ -879,6 +881,14 @@ pub fn merge_documents<R: Read + Seek>(
         if !is_primary && input.pages.is_empty() {
             continue;
         }
+
+        // qpdf's `QPDF::insertPage` prepares every foreign source through
+        // `pushInheritedAttributesToPage` before `copyForeignObject`. This
+        // source-side mutation promotes shared non-scalar inherited values
+        // (such as a direct `/MediaBox` on `/Pages`) once, and only writes a
+        // leaf key when an ancestor actually supplies it. In particular, an
+        // absent `/Rotate` must stay absent rather than becoming `/Rotate 0`.
+        PageDocumentHelper::new(input.source).push_inherited_attributes_to_pages()?;
 
         // Reconstruct this input's page-label contribution, one entry per
         // selected page (in selection order, duplicates included), before any
@@ -939,13 +949,6 @@ pub fn merge_documents<R: Read + Seek>(
             }
         }
 
-        // Resolve inherited attributes from the SOURCE before copying severs
-        // the /Parent chain.
-        let mut inherited: Vec<InheritedAttrs> = Vec::with_capacity(unique.len());
-        for &page_ref in &unique {
-            inherited.push(InheritedAttrs::resolve(input.source, page_ref, depth)?);
-        }
-
         // UNION of the per-page transitive closures, then ONE deep-copy pass
         // into the growing target: a single renumbering map means an object
         // shared by several selected pages of this input is copied once. The
@@ -995,6 +998,20 @@ pub fn merge_documents<R: Read + Seek>(
         );
 
         null_copied_removed_pages(&mut target, &all, &seen, &map);
+
+        // qpdf replaces each copied page's `/Parent` with the destination
+        // `/Pages` handle during insertion. Keep the same live-handle boundary
+        // after the source-side inherited-attribute push and foreign copy.
+        let pages_handle = target.get_object_handle(pages_root_ref);
+        for &src_ref in &unique {
+            let copied_page_ref = *map
+                .get(&src_ref)
+                .ok_or(Error::Missing("merged page missing from copy map"))?;
+            let page = target.get_object_handle(copied_page_ref);
+            target.resolve_object_handle(&page)?;
+            page.replace_key(b"/Parent", pages_handle.clone())?;
+            target.mark_object_handle_dirty(&page)?;
+        }
 
         // Wire the primary's inherited document-level structures onto the output
         // catalog (obj 1, distinct from the /Pages root obj 2 rebuilt below).
@@ -1074,15 +1091,6 @@ pub fn merge_documents<R: Read + Seek>(
             primary_map = map.clone();
         }
 
-        // Materialize inherited attrs onto each copied leaf and reparent it to
-        // the fresh /Pages root.
-        for (&src_ref, attrs) in unique.iter().zip(inherited) {
-            let copied_page_ref = *map
-                .get(&src_ref)
-                .ok_or(Error::Missing("merged page missing from copy map"))?;
-            materialize_leaf(&mut target, copied_page_ref, attrs, &map, pages_root_ref)?;
-        }
-
         // Append this input's pages to /Kids in selection order, with each
         // input resolved through its own copy map.
         append_selection_kids(&mut target, &selected, &map, &mut used, &mut kids)?;
@@ -1093,7 +1101,7 @@ pub fn merge_documents<R: Read + Seek>(
         &mut target,
         pages_root_ref,
         "target /Pages is not a dictionary",
-    )?; // cov:ignore: Err arm unreachable — minimal_target_bytes creates /Pages as a dict, and nothing since overwrites it (copy_objects renumbers into fresh numbers; materialize_leaf/append_selection_kids touch only copied leaves)
+    )?; // cov:ignore: Err arm unreachable — minimal_target_bytes creates /Pages as a dict, and nothing since overwrites it (copy_objects renumbers into fresh numbers; page reparenting/append_selection_kids touch only copied leaves)
     root.insert(
         "Kids",
         Object::Array(kids.iter().map(|&r| Object::Reference(r)).collect()),

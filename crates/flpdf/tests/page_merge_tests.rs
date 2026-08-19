@@ -159,6 +159,52 @@ fn merge_single_input_copies_selected_pages_with_shared_dedup() {
     assert_eq!(count_font_objects(&mut doc, b"Courier"), 0); // unselected page's font absent
 }
 
+/// qpdf's `--pages` path pushes inherited page attributes before copying a
+/// foreign page. A shared direct `/MediaBox` on `/Pages` is therefore promoted
+/// once and both leaves point at that indirect object; an absent inherited
+/// `/Rotate` remains absent instead of becoming `/Rotate 0`.
+#[test]
+fn merge_preserves_qpdf_inherited_box_identity_without_default_rotate() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 300] >>",
+            ),
+            (3, "<< /Type /Page /Parent 2 0 R >>"),
+            (4, "<< /Type /Page /Parent 2 0 R >>"),
+        ],
+        1,
+    );
+    let mut source = Pdf::open_mem_owned(bytes).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut source,
+        pages: vec![0, 1],
+    }];
+
+    let mut merged = merge_documents(&mut inputs).unwrap();
+    let page_refs = pages::page_refs(&mut merged).unwrap();
+    assert_eq!(page_refs.len(), 2);
+    let leaves: Vec<_> = page_refs
+        .iter()
+        .map(|page_ref| merged.resolve(*page_ref).unwrap().into_dict().unwrap())
+        .collect();
+
+    assert!(
+        leaves.iter().all(|page| page.get("Rotate").is_none()),
+        "qpdf does not synthesize /Rotate 0 when no page-tree node carries /Rotate"
+    );
+    let media_boxes: Vec<_> = leaves
+        .iter()
+        .map(|page| match page.get("MediaBox") {
+            Some(Object::Reference(reference)) => *reference,
+            other => panic!("inherited /MediaBox should be one shared indirect object: {other:?}"),
+        })
+        .collect();
+    assert_eq!(media_boxes[0], media_boxes[1]);
+}
+
 /// The merged document is built the same way qpdf's library-level
 /// `QPDF::emptyPDF()` + `QPDFPageDocumentHelper::addPage()` pattern would:
 /// neither call touches the document's PDF version, so the result carries
