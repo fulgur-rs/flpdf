@@ -4524,7 +4524,12 @@ fn run_page_extraction_from_multiple_sources(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     let source_warnings = job.has_warnings();
-    let mut merged = job.handle_page_specs(&mut sources, &specs, collate)?;
+    let mut merged = job.handle_page_specs_with_resource_mode(
+        &mut sources,
+        &specs,
+        collate,
+        remove_unref.into(),
+    )?;
     let source_warnings = source_warnings || job.has_warnings();
 
     // The merge job has already rebuilt the target page tree and copied the
@@ -4555,7 +4560,12 @@ fn run_page_extraction_from_multiple_sources(
         repair,
         page_ops,
         overlay_specs,
-        remove_unref,
+        // QPDFJob has already applied the page-copy resource policy to each
+        // source page. The post-copy completion boundary must not run the
+        // document-wide resource pass a second time; qpdf's --pages job does
+        // this pruning before its first page copy and relies on the writer for
+        // final reachability cleanup.
+        CliRemoveUnreferencedResources::No,
         options,
         verbose,
         standard_output,

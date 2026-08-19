@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use flpdf::{
-    acroform_sig_flags, filespec_helper::encode_utf16be, AnnotationObjectHelper, Object, Pdf,
+    acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper, Object, Pdf,
 };
 use predicates::prelude::*;
 use std::fs::File;
@@ -1408,6 +1408,43 @@ fn json_metadata_tracks_page_enumeration_without_pushing_inherited_resources() {
                 .get("/Resources")
                 .is_none(),
             "{label}: page dictionary must remain unmodified"
+        );
+    }
+}
+
+#[test]
+fn pages_external_source_matches_qpdf_resource_copy_modes() {
+    // qpdf 11.9.0's --pages path uses a page-local copy for inherited or
+    // shared /Resources when auto fires or yes is explicit. `no` leaves the
+    // source reference intact. This fixture is the smallest inherited-
+    // /Resources case that distinguishes those three modes.
+    let primary =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/inherited-resources-one-page.pdf");
+    let temp = tempfile::tempdir().unwrap();
+
+    for (mode, expected_direct) in [("auto", true), ("yes", true), ("no", false)] {
+        let output = temp.path().join(format!("pages-{mode}.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(["rewrite"])
+            .arg(&primary)
+            .arg(&output)
+            .arg(format!("--remove-unreferenced-resources={mode}"))
+            .args(["--pages"])
+            .arg(&source)
+            .args(["1", "--"])
+            .assert()
+            .success();
+
+        let mut pdf = Pdf::open(std::io::BufReader::new(File::open(&output).unwrap())).unwrap();
+        let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
+        let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        assert_eq!(
+            matches!(page.get("Resources"), Some(Object::Dictionary(_))),
+            expected_direct,
+            "--remove-unreferenced-resources={mode}: {page:?}"
         );
     }
 }

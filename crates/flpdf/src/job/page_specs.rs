@@ -7,8 +7,9 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use crate::page_label_document_helper::LabelRange;
-use crate::page_merge::{merge_documents, MergeInput};
+use crate::page_merge::{merge_documents_with_resource_mode, MergeInput};
 use crate::page_plan::PagePlan;
+use crate::resources::RemoveUnreferencedResources;
 use crate::{Error, PageRange, Pdf, Result};
 use std::io::{Cursor, Read, Seek};
 
@@ -92,6 +93,28 @@ pub fn handle_page_specs<R: Read + Seek + 'static>(
     sources: &mut [Pdf<R>],
     specs: &[PageSpecInput],
     collate: Option<usize>,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    handle_page_specs_with_resource_mode(
+        job,
+        sources,
+        specs,
+        collate,
+        RemoveUnreferencedResources::Auto,
+    )
+}
+
+/// Resolve and execute qpdf's page-specification operation with an explicit
+/// page-resource mode.
+///
+/// qpdf's default is `auto`; the mode is a job-level policy and is therefore
+/// threaded into the bounded merge consumer rather than changing the generic
+/// [`crate::merge_documents`] library primitive.
+pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
+    job: &mut super::QPDFJob,
+    sources: &mut [Pdf<R>],
+    specs: &[PageSpecInput],
+    collate: Option<usize>,
+    resource_mode: RemoveUnreferencedResources,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if sources.is_empty() {
         return Err(Error::Unsupported(
@@ -219,7 +242,7 @@ pub fn handle_page_specs<R: Read + Seek + 'static>(
             pages: pages.clone(),
         })
         .collect();
-    let mut merged = merge_documents(&mut merge_inputs)?;
+    let mut merged = merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?;
     drop(merge_inputs);
 
     // merge_documents emits source-group order. Rebuild the target tree with
@@ -275,6 +298,18 @@ impl super::QPDFJob {
     ) -> Result<Pdf<Cursor<Vec<u8>>>> {
         handle_page_specs(self, sources, specs, collate)
     }
+
+    /// Execute qpdf's page-specification operation with an explicit resource
+    /// pruning mode.
+    pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
+        &mut self,
+        sources: &mut [Pdf<R>],
+        specs: &[PageSpecInput],
+        collate: Option<usize>,
+        resource_mode: RemoveUnreferencedResources,
+    ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+        handle_page_specs_with_resource_mode(self, sources, specs, collate, resource_mode)
+    }
 }
 
 #[cfg(test)]
@@ -292,6 +327,14 @@ mod tests {
         .expect("open three-page fixture")
     }
 
+    fn inherited_resources_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/inherited-resources-one-page.pdf")
+                .to_vec(),
+        )
+        .expect("open inherited-resources fixture")
+    }
+
     fn labelled_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open_mem_owned(
             include_bytes!("../../../../tests/fixtures/json-diff/direct-outlines.pdf").to_vec(),
@@ -303,6 +346,28 @@ mod tests {
         crate::pages::page_refs(pdf)
             .expect("read merged page tree")
             .len()
+    }
+
+    #[test]
+    fn handle_page_specs_default_materializes_inherited_resources_like_qpdf() {
+        let mut sources = vec![inherited_resources_pdf()];
+        let specs = [PageSpecInput::new(0, PageRange::parse("1,1").unwrap())];
+
+        let mut merged = handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None)
+            .expect("merge inherited-resources page");
+        let page_refs = crate::pages::page_refs(&mut merged).expect("read merged page tree");
+        assert_eq!(page_refs.len(), 2);
+        for page_ref in page_refs {
+            let page = merged
+                .resolve(page_ref)
+                .expect("resolve merged page")
+                .into_dict()
+                .expect("merged page dictionary");
+            assert!(
+                matches!(page.get("Resources"), Some(Object::Dictionary(_))),
+                "qpdf --pages default copies inherited /Resources directly onto the page: {page:?}"
+            );
+        }
     }
 
     #[test]

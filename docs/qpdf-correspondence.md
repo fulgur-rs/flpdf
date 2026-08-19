@@ -603,6 +603,14 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 
 `job/page_specs.rs` がqpdfのjob-level orchestration（`QPDFJob.cc:2360-2632`）を所有し、
 `page_merge.rs` と `PageDocumentHelper` がforeign page copy/page-tree primitiveを所有する。
+`.18` では `QPDFJob.cc:2251-2337,2442-2455,2520-2555` の
+`--remove-unreferenced-resources={auto,yes,no}` を `job/page_specs.rs` から
+`page_merge.rs` の初回 foreign-page copy 境界へ渡す。Auto は source ごとに
+`shouldRemoveUnreferencedResources` を一度だけ判定し、初回の unique page にだけ
+`QPDFPageObjectHelper::removeUnreferencedResources` 相当を適用する。重複選択は
+qpdf と同じ shallow page copy とし、汎用 `merge_documents` の library-level route
+には job-level resource policy を混ぜない。CLI の複数source経路ではこの pre-copy
+処理を正本とし、completion後の document-wide resource passを二重適用しない。
 `doSplitPages`（`QPDFJob.cc:2940-3027`）とwriter/output命名は `job/page_split.rs` に移設済み。
 `PageDocumentHelper::add_page(PageInput::Foreign)`、`PageObjectHelper::copy_annotations_from`、
 `PageLabelDocumentHelper::write_reconstructed_labels_with_prefix_presence` を通る fresh chunk

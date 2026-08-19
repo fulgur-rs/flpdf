@@ -43,8 +43,11 @@ use crate::page_extract::{
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
 use crate::ref_chain::resolve_ref_chain;
+use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::subset_prune::sweep_unreachable_objects;
-use crate::{Dictionary, Error, Object, ObjectRef, PageDocumentHelper, Pdf, Result};
+use crate::{
+    Dictionary, Error, Object, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, Result,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
@@ -829,11 +832,39 @@ fn rewrite_field_kids<R: Read + Seek>(
 pub fn merge_documents<R: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    merge_documents_with_resource_mode(inputs, RemoveUnreferencedResources::No)
+}
+
+/// Merge selected pages while applying qpdf's page-job resource mode to the
+/// first copy of each selected source page.
+///
+/// The public [`merge_documents`] library primitive intentionally retains its
+/// historical library-level behaviour: resource pruning belongs to
+/// `QPDFJob::handlePageSpecs`, not to the generic page insertion primitive.
+/// The job route calls this bounded variant so that qpdf's
+/// `--remove-unreferenced-resources={auto,yes,no}` decision is made per source
+/// before a page enters the foreign-object copy closure.
+pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    resource_mode: RemoveUnreferencedResources,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
             "merge requires at least one input".to_string(),
         ));
     }
+
+    // qpdf computes the Auto decision once per source QPDF, before any page
+    // is copied or the source page tree is flattened. Keep the result by input
+    // index so duplicate page specifications share the same source decision.
+    let remove_resources: Vec<bool> = inputs
+        .iter_mut()
+        .map(|input| match resource_mode {
+            RemoveUnreferencedResources::No => Ok(false),
+            RemoveUnreferencedResources::Yes => Ok(true),
+            RemoveUnreferencedResources::Auto => should_remove_unreferenced_resources(input.source),
+        })
+        .collect::<Result<_>>()?;
 
     let mut target = Pdf::empty()?;
     let pages_root_ref = target_pages_root(&mut target)?;
@@ -946,6 +977,19 @@ pub fn merge_documents<R: Read + Seek>(
         for &page_ref in &selected {
             if seen.insert(page_ref) {
                 unique.push(page_ref);
+            }
+        }
+
+        // qpdf removes resources from each unique source page immediately
+        // before its first foreign copy. A later duplicate is a shallow page
+        // copy and must not run the resource pass a second time. The source
+        // inherited-attribute push above is intentionally before this call:
+        // qpdf's page helper sees the effective page attributes at the copy
+        // boundary, while the Auto decision above was made against the
+        // original page tree.
+        if remove_resources[input_index] {
+            for &page_ref in &unique {
+                PageObjectHelper::new(page_ref, input.source).remove_unreferenced_resources()?;
             }
         }
 
