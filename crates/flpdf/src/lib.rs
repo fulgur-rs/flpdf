@@ -231,9 +231,7 @@ pub use overlay::{
     apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource,
 };
-pub use page_annotation_enum::{
-    enumerate_document_annotations, enumerate_page_annotations, EnumeratedAnnotation,
-};
+pub use page_annotation_enum::{enumerate_page_annotations, EnumeratedAnnotation};
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::{PageDocumentHelper, PageInput};
@@ -246,8 +244,8 @@ pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_rotate::{
-    apply_rotate_to_pages, compose_rotate, flatten_rotation_on_pages, normalize_rotate,
-    resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
+    apply_rotate_to_pages, compose_rotate, flatten_rotation_on_pages, resolve_inherited_rotate,
+    resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
