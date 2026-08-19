@@ -6,6 +6,11 @@ use std::collections::BTreeMap;
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
 /// `body` is the literal text between `N 0 obj` and `endobj`.
 fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+    build_pdf_with_trailer(objects, root, "")
+}
+
+/// Build a PDF whose trailer carries caller-supplied entries after `/Root`.
+fn build_pdf_with_trailer(objects: &[(u32, &str)], root: u32, trailer_extra: &str) -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
     let max = objects.iter().map(|(n, _)| *n).max().unwrap_or(0);
@@ -24,8 +29,10 @@ fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
         }
     }
     out.extend_from_slice(
-        format!("trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-            .as_bytes(),
+        format!(
+            "trailer\n<< /Size {size} /Root {root} 0 R {trailer_extra}>>\nstartxref\n{xref_start}\n%%EOF\n"
+        )
+        .as_bytes(),
     );
     out
 }
@@ -288,6 +295,102 @@ fn merge_two_inputs_concatenates_in_order() {
     let mut out = Vec::new();
     write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// qpdf's multi-source page job keeps the authenticated primary Catalog and
+/// trailer as the document base. The fresh-target merge must carry their
+/// non-page metadata and remap its indirect references instead of retaining
+/// only the old document-level allowlist.
+#[test]
+fn merge_preserves_primary_catalog_and_trailer_metadata() {
+    let primary = build_pdf_with_trailer(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Ref2 7 0 R /ViewerPreferences 8 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>",
+            ),
+            (5, "<< /Producer (primary-info) >>"),
+            (
+                7,
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>",
+            ),
+            (8, "<< /DisplayDocTitle true >>"),
+            (9, "<< /Marker (primary-trailer) >>"),
+        ],
+        1,
+        "/Info 5 0 R /ID [<00112233445566778899aabbccddeeff> <00112233445566778899aabbccddeeff>] /Custom 9 0 R ",
+    );
+    let secondary = single_font_pdf(b"Courier");
+    let mut primary = Pdf::open_mem_owned(primary).unwrap();
+    let mut secondary = Pdf::open_mem_owned(secondary).unwrap();
+    let mut inputs = [
+        MergeInput {
+            source: &mut primary,
+            pages: vec![0],
+        },
+        MergeInput {
+            source: &mut secondary,
+            pages: vec![0],
+        },
+    ];
+
+    let mut merged = merge_documents(&mut inputs).unwrap();
+    let catalog = catalog_dict(&mut merged);
+    let ref2 = catalog
+        .get_ref("Ref2")
+        .expect("primary unrelated Catalog reference must survive");
+    let ref2_object = merged.resolve(ref2).unwrap();
+    assert_eq!(
+        ref2_object
+            .as_dict()
+            .and_then(|dict| dict.get("BaseFont"))
+            .and_then(Object::as_name),
+        Some(&b"Times-Roman"[..])
+    );
+    assert_eq!(
+        catalog
+            .get_ref("ViewerPreferences")
+            .and_then(|reference| merged.resolve(reference).ok())
+            .and_then(|object| object.as_dict().cloned())
+            .and_then(|dict| dict.get("DisplayDocTitle").cloned()),
+        Some(Object::Boolean(true))
+    );
+    assert_eq!(
+        merged
+            .trailer()
+            .get_ref("Info")
+            .and_then(|reference| merged.resolve(reference).ok())
+            .and_then(|object| object.as_dict().cloned())
+            .and_then(|dict| dict.get("Producer").cloned()),
+        Some(Object::String(b"primary-info".to_vec()))
+    );
+    assert_eq!(
+        merged
+            .trailer()
+            .get_ref("Custom")
+            .and_then(|reference| merged.resolve(reference).ok())
+            .and_then(|object| object.as_dict().cloned())
+            .and_then(|dict| dict.get("Marker").cloned()),
+        Some(Object::String(b"primary-trailer".to_vec()))
+    );
+    assert_eq!(
+        merged.trailer().get("ID"),
+        Some(&Object::Array(vec![
+            Object::String(vec![
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]),
+            Object::String(vec![
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]),
+        ]))
+    );
 }
 
 // An out-of-range page index is rejected.
@@ -2872,6 +2975,62 @@ fn merge_drops_orphan_field_of_unselected_page() {
     }];
     let mut doc = merge_documents(&mut inputs).unwrap();
     assert_eq!(acroform_field_names(&mut doc), vec![b"f1".to_vec()]);
+
+    let mut out = Vec::new();
+    write_default(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
+/// Three-page form, no `/DR` / `/DA`: page 0 carries field `f1` (obj 4), page 1
+/// carries field `f2` (obj 7), page 2 (obj 9) carries no field. Selecting only
+/// page 2 drops every field.
+fn three_page_form_no_dr_da_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R] /Count 3 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>",
+            ),
+            (
+                7,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f2) /Rect [0 0 100 20] /P 6 0 R >>",
+            ),
+            (8, "<< /Fields [4 0 R 7 0 R] >>"),
+            (9, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+// qpdf removes `/AcroForm` entirely once page selection prunes every field to
+// zero (`QPDFJob.cc:2609-2629`, `pdf.getRoot().removeKey("/AcroForm")`) — it
+// does not leave an empty-`/Fields` stub. Selecting only the field-free third
+// page of a DR/DA-less form must drop `/AcroForm` from the merged catalog.
+#[test]
+fn merge_removes_acroform_when_no_fields_survive() {
+    let mut a = Pdf::open_mem_owned(three_page_form_no_dr_da_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![2],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    assert!(
+        cat.get("AcroForm").is_none(),
+        "expected /AcroForm to be removed once every field is pruned, got {:?}",
+        cat.get("AcroForm")
+    );
 
     let mut out = Vec::new();
     write_default(&mut doc, &mut out).unwrap();

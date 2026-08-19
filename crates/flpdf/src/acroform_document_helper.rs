@@ -2387,6 +2387,21 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .collect())
     }
 
+    /// Whether the document has an `/AcroForm` dictionary whose `/Fields`
+    /// resolves to an array, of any length including empty. This is qpdf's
+    /// exact gate for rebuilding `/Fields` after page selection
+    /// (`QPDFJob.cc:2609-2610`, `this_afdh->hasAcroForm() &&
+    /// fields.isArray()`) — distinct from [`Self::top_level_fields`], which
+    /// collapses "no `/AcroForm`", "`/Fields` absent", and "`/Fields` is a
+    /// non-empty array" into the same empty `Vec` and cannot signal whether
+    /// the rebuild gate should fire at all.
+    pub(crate) fn has_fields_array(&mut self) -> Result<bool> {
+        let Some(acroform) = self.acroform_dict()? else {
+            return Ok(false);
+        };
+        Ok(resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.is_some())
+    }
+
     pub(crate) fn acroform_inherited_entries(&mut self) -> Result<Vec<(Vec<u8>, Object)>> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());

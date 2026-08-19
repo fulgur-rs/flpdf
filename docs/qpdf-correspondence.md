@@ -632,6 +632,16 @@ fallback にしない。global な password mode/weak-crypto policy は共有す
 fresh merged document に明示的に伝播する。primary と全 secondary の
 `M.m`/`/Extensions /ADBE /ExtensionLevel` の pairwise max を既存の
 `--min-version` と合成し、`--force-version` は従来どおり最終的に優先させる。
+`.50qd.3` では `QPDFJob.cc:2462-2472` の「primary QPDF をページ操作の
+base として in-place 更新する」責務と、`QPDFJob.cc:2590-2632` の
+`/Pages`・`/PageLabels`・AcroForm の選択ページ側更新を分離した。`page_merge.rs`
+は primary Catalog/trailer の全 graph を foreign-copy closure に含め、
+`/Pages` と writer/xref-owned trailer keys だけを target 側で再構築する。
+その結果 `/Info`、`/ID[0]`、未知の trailer entries、`/ViewerPreferences` や
+その他の Catalog siblings は primary の値と indirect-reference identity を
+保ったまま remap され、secondary の Catalog/trailer metadata は継承されない。
+`page_merge_tests.rs::merge_preserves_primary_catalog_and_trailer_metadata` と
+CLI の qpdf 11.9.0 differential test、および fixture の live probe で確認する。
 
 ### C. qpdf に機能そのものが無いもの
 
