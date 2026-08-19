@@ -213,9 +213,10 @@ impl QPDFJob {
     }
 
     fn set_attachment_page_mode<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
-        let Some(root_ref) = pdf.root_ref() else {
-            return Ok(());
-        };
+        // qpdf's `maybe_set_pagemode` (`QPDFJob.cc:2036-2042`) calls
+        // `QPDF::getRoot`, which throws when the trailer has no valid
+        // `/Root` dictionary (`QPDF.cc:2355-2359`).
+        let root_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let root = pdf.get_object_handle(root_ref);
         pdf.resolve_object_handle(&root)?;
         if root.try_get_key(b"/PageMode")?.try_is_null()? {
@@ -682,8 +683,7 @@ mod tests {
         assert_eq!(error.to_string(), "sink write failure 1");
     }
 
-    #[test]
-    fn set_attachment_page_mode_tolerates_a_pdf_without_catalog_root() {
+    fn rootless_fixture_bytes() -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
@@ -694,15 +694,41 @@ mod tests {
             )
             .as_bytes(),
         );
+        bytes
+    }
 
-        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open rootless fixture");
+    #[test]
+    fn set_attachment_page_mode_rejects_a_pdf_without_catalog_root() {
+        let mut pdf = Pdf::open(Cursor::new(rootless_fixture_bytes())).expect("open fixture");
         assert!(
             pdf.root_ref().is_none(),
             "fixture must have no catalog root"
         );
         let job = QPDFJob::new();
-        job.set_attachment_page_mode(&mut pdf)
-            .expect("missing root must be tolerated");
+        let error = job
+            .set_attachment_page_mode(&mut pdf)
+            .expect_err("missing root must be rejected, matching qpdf's getRoot() throw");
+        assert_eq!(error.to_string(), "missing required PDF entry: /Root");
+    }
+
+    #[test]
+    fn add_attachment_rejects_a_pdf_without_catalog_root() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let attachment = dir.path().join("payload.txt");
+        std::fs::write(&attachment, b"payload").expect("write payload");
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(rootless_fixture_bytes()),
+                "rootless.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let error = job
+            .add_attachment(&mut pdf, add_options(attachment, b"payload-key"))
+            .expect_err("missing root must be rejected before creating any objects");
+        assert_eq!(error.to_string(), "missing required PDF entry: /Root");
     }
 
     #[test]
