@@ -16,6 +16,7 @@ use flpdf::{
     page_combine::{CombinedPage, CombinedPlan},
     page_rotate::apply_rotate_to_pages,
     pages::tree_rebuild::rebuild_page_tree,
+    should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
     subset_prune::prune_after_subset,
     thread_bead_p::drop_thread_bead_dangling_p,
@@ -4360,11 +4361,11 @@ fn run_page_extraction(
     // "removing unreferenced pages from primary input" (L2539) once, then
     // "adding pages from <file>" per Selection (L2594) inside the copy loop.
     //
-    // flpdf does not implement qpdf's shared-resource scan (heuristic for
-    // whether resource pruning is worth it); we always emit the negative
-    // branch. Similarly, flpdf has no auto keep-open-files subsystem; we
-    // emit "y" unconditionally when the block fires. Both are documented
-    // parity divergences.
+    // The qpdf shared-resource heuristic is evaluated again at the consumer
+    // boundary immediately before rebuild_page_tree, when the source page
+    // tree is still intact. This progress block retains the established
+    // ordering; the keep-open-files subsystem remains an unconditional "y"
+    // because flpdf has no equivalent file-handle policy.
     if verbose {
         let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
         for path in &distinct {
@@ -4662,6 +4663,19 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         return Err("--pages: page selection is empty".into());
     }
 
+    // qpdf's --pages Auto mode scans the source page tree before it removes
+    // the old pages. A page-local indirect /Resources that appears only once
+    // does not trigger the expensive page-helper pruning route; inherited or
+    // shared resources do (QPDFJob.cc:2251-2337). Preserve that decision
+    // before rebuild_page_tree flattens the original inheritance structure.
+    let prune_mode = if remove_unref == CliRemoveUnreferencedResources::Auto
+        && !should_remove_unreferenced_resources(&mut pdf)?
+    {
+        CliRemoveUnreferencedResources::No
+    } else {
+        remove_unref
+    };
+
     let result = rebuild_page_tree(&mut pdf, &selected)?;
     apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
 
@@ -4682,7 +4696,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let objr_obj_targets = drop_struct_elem_dangling_pg(&mut pdf, &result)?;
     drop_thread_bead_dangling_p(&mut pdf, &result)?;
     drop_objr_obj_annot_dangling_p(&mut pdf, &result, &objr_obj_targets)?;
-    prune_after_subset(&mut pdf, remove_unref.into())?;
+    prune_after_subset(&mut pdf, prune_mode.into())?;
     prune_acroform_after_subset(&mut pdf, &result)?;
 
     let mut options = options;

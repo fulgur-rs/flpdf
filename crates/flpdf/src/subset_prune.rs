@@ -46,6 +46,7 @@
 //! pruning **and** xref-level GC of unreachable objects.  `No` preserves both.
 
 use crate::object::MAX_INLINE_DEPTH;
+use crate::page_object_helper::PageObjectHelper;
 use crate::resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
@@ -90,6 +91,19 @@ pub fn prune_after_subset<R: Read + Seek>(
 ) -> Result<()> {
     if mode == RemoveUnreferencedResources::No {
         return Ok(());
+    }
+
+    // qpdf's --pages path calls QPDFPageObjectHelper::removeUnreferencedResources
+    // on each copied page before it adds that page to the output
+    // (QPDFJob.cc:2520-2555). That helper obtains `/Resources` through
+    // getAttribute("/Resources", true), so an inherited or indirect resource
+    // dictionary is shallow-copied directly onto the page before any resource
+    // entries are removed (QPDFPageObjectHelper.cc:539-649). The aggregate
+    // resource pass below owns cross-group category protection, but it must see
+    // the same page-local resource boundary as qpdf's page-copy operation.
+    for page_ref in crate::pages::page_refs(pdf)? {
+        let mut helper = PageObjectHelper::new(page_ref, pdf);
+        let _ = helper.get_resources(true)?;
     }
 
     // ── Pass 1: name-level prune ──────────────────────────────────────────────
@@ -616,9 +630,10 @@ mod tests {
     }
 
     /// Extract page 1 from shared-resources PDF.
-    /// After rebuild, page1 leaf retains the inherited indirect /Resources handle
-    /// with F1+F2. After prune (Auto), F2 entry must be removed from that shared
-    /// resource dictionary, and page2 objects must be GC'd.
+    /// After rebuild, qpdf's page-copy resource-prune boundary materializes the
+    /// inherited indirect /Resources dictionary directly on page1. After prune
+    /// (Auto), F2 must be removed from that private copy, and page2 objects must
+    /// be GC'd.
     #[test]
     fn auto_extracts_page1_from_shared_resources_prunes_f2() {
         let bytes = build_shared_resources_pdf();
@@ -653,18 +668,14 @@ mod tests {
             "page1 content must survive"
         );
 
-        // Name-level: page1's inherited indirect /Resources should have F1 but not F2.
+        // Name-level: page1's direct /Resources copy should have F1 but not F2.
         let page1 = match pdf.resolve_borrowed(ObjectRef::new(4, 0)).unwrap() {
             Object::Dictionary(d) => d,
             other => panic!("page1 not a dict: {other:?}"),
         };
-        let res_ref = match page1.get("Resources") {
-            Some(Object::Reference(r)) => *r,
-            other => panic!("page1 /Resources not the inherited indirect handle: {other:?}"), // cov:ignore: fixture-shape guard
-        };
-        let res_dict = match pdf.resolve_borrowed(res_ref).unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            other => panic!("inherited /Resources is not a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
+        let res_dict = match page1.get("Resources") {
+            Some(Object::Dictionary(d)) => d.clone(),
+            other => panic!("page1 /Resources was not materialized directly: {other:?}"), // cov:ignore: fixture-shape guard
         };
         let font_dict = match res_dict.get("Font") {
             Some(Object::Dictionary(d)) => d.clone(),
