@@ -3116,13 +3116,28 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
         let Object::Dictionary(page) = pdf.resolve(page_ref).unwrap() else {
             panic!("page must be a dictionary");
         };
+        let Some(Object::Reference(resources_ref)) = page.get("Resources") else {
+            panic!("qpdf promotes direct inherited /Resources to an indirect handle");
+        };
         assert_eq!(
-            page.get("Resources"),
-            Some(&Object::Dictionary(resources.clone()))
+            pdf.resolve(*resources_ref).unwrap(),
+            Object::Dictionary(resources.clone())
         );
         assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
-        assert_eq!(page.get("MediaBox"), Some(&expected_media_box));
-        assert_eq!(page.get("CropBox"), Some(&expected_crop_box));
+        let Some(Object::Reference(media_box_ref)) = page.get("MediaBox") else {
+            panic!("qpdf promotes direct inherited /MediaBox to an indirect handle");
+        };
+        assert_eq!(
+            pdf.resolve(*media_box_ref).unwrap(),
+            expected_media_box.clone()
+        );
+        let Some(Object::Reference(crop_box_ref)) = page.get("CropBox") else {
+            panic!("qpdf promotes direct inherited /CropBox to an indirect handle");
+        };
+        assert_eq!(
+            pdf.resolve(*crop_box_ref).unwrap(),
+            expected_crop_box.clone()
+        );
     }
 }
 

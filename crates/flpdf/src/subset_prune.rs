@@ -61,10 +61,11 @@ use std::io::{Read, Seek};
 /// 1. **Name-level prune** (`remove_unreferenced_resources`): removes entries
 ///    from each page's `/Resources` sub-dictionaries (`/Font`, `/XObject`, …)
 ///    that are not referenced by any content stream of the retained pages.
-///    After `rebuild_page_tree` materialises inherited attributes onto each
-///    leaf, every leaf's `/Resources` is an inline dict (unshared), so
-///    [`RemoveUnreferencedResources::Auto`] prunes just as aggressively as
-///    `Yes` for those leaves.
+///    After `rebuild_page_tree` pushes inherited attributes onto each leaf,
+///    qpdf-promoted non-scalar `/Resources` values may remain shared indirect
+///    handles. The resource pass follows those handles before pruning, so
+///    [`RemoveUnreferencedResources::Auto`] preserves qpdf's shared-identity
+///    boundary while removing names unused by retained pages.
 ///
 /// 2. **xref-level GC** (`collect_reachable` + `delete_object`): walks every
 ///    `Object::Reference` reachable from `/Root` (transitively), then calls
@@ -93,9 +94,9 @@ pub fn prune_after_subset<R: Read + Seek>(
 
     // ── Pass 1: name-level prune ──────────────────────────────────────────────
     // Delegate entirely to the existing per-page name pruning logic.
-    // After rebuild_page_tree, each leaf carries its /Resources as a
-    // PageInline dict (never inherited or shared at the indirect level),
-    // so Auto behaves identically to Yes for those leaves.
+    // After rebuild_page_tree, each leaf carries an explicit /Resources key.
+    // qpdf-promoted non-scalar values may still be shared indirect handles;
+    // the resource walker follows those handles before applying the mode.
     remove_unreferenced_resources(pdf, mode)?;
 
     // ── Pass 2: xref-level GC ─────────────────────────────────────────────────
@@ -615,9 +616,9 @@ mod tests {
     }
 
     /// Extract page 1 from shared-resources PDF.
-    /// After rebuild, page1 leaf has materialized /Resources (inline) with F1+F2.
-    /// After prune (Auto), F2 entry must be removed from the inline /Resources,
-    /// and page2 objects must be GC'd.
+    /// After rebuild, page1 leaf retains the inherited indirect /Resources handle
+    /// with F1+F2. After prune (Auto), F2 entry must be removed from that shared
+    /// resource dictionary, and page2 objects must be GC'd.
     #[test]
     fn auto_extracts_page1_from_shared_resources_prunes_f2() {
         let bytes = build_shared_resources_pdf();
@@ -652,14 +653,18 @@ mod tests {
             "page1 content must survive"
         );
 
-        // Name-level: page1's materialized inline /Resources should have F1 but not F2.
+        // Name-level: page1's inherited indirect /Resources should have F1 but not F2.
         let page1 = match pdf.resolve_borrowed(ObjectRef::new(4, 0)).unwrap() {
             Object::Dictionary(d) => d,
             other => panic!("page1 not a dict: {other:?}"),
         };
-        let res_dict = match page1.get("Resources") {
-            Some(Object::Dictionary(d)) => d.clone(),
-            other => panic!("page1 /Resources not an inline dict: {other:?}"),
+        let res_ref = match page1.get("Resources") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("page1 /Resources not the inherited indirect handle: {other:?}"),
+        };
+        let res_dict = match pdf.resolve_borrowed(res_ref).unwrap() {
+            Object::Dictionary(d) => d.clone(),
+            other => panic!("inherited /Resources is not a dictionary: {other:?}"),
         };
         let font_dict = match res_dict.get("Font") {
             Some(Object::Dictionary(d)) => d.clone(),
