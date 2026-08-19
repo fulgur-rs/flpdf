@@ -2654,17 +2654,46 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     let result =
         pdf.with_plain_writer_stream_recovery(|pdf| emit_canonical_pdf_inner(pdf, out, options));
 
-    // Restore the original Catalog and its pre-write dirty state. Runs on
-    // success and on error alike so partial injection state cannot leak
-    // either. `set_object` marks the ref dirty; if the ref was clean before
-    // this call, clear the dirty flag to leave the caller's Pdf byte-for-byte
-    // equivalent to its pre-call state.
+    // Restore only the pre-write `/Extensions` value on top of whatever the
+    // write left behind, rather than the whole pre-call Catalog. A full-dict
+    // revert here would also undo the QDF/content-normalization page-tree
+    // repair above (`PageDocumentHelper::get_all_pages`) whenever the source
+    // Catalog holds a direct `/Pages` dictionary -- that repair writes its
+    // promoted/deduplicated `/Kids` back into the *same* Catalog object the
+    // ADBE injection/strip guard below reverts, so a blind whole-dict restore
+    // would silently discard the repair and re-mint a fresh promoted object
+    // on every subsequent write of the same `Pdf` (observed: object count
+    // climbing 1 -> 2 -> 3 across two writes, with the second write's output
+    // no longer byte-identical to the first). The repair is a genuine,
+    // permanent mutation -- matching qpdf's own `QPDF::getAllPages()`, which
+    // is not scoped to one write -- so it must survive this restore; only the
+    // output-only `/Extensions` injection/strip must not leak into the
+    // caller's Pdf handle. Runs on success and on error alike so partial
+    // injection state cannot leak either. `set_object` marks the ref dirty;
+    // if the ref was clean before this call, clear the dirty flag to leave
+    // the caller's Pdf byte-for-byte equivalent to its pre-call state absent
+    // any repair.
     // cov:ignore-start: outer if-let and inner-if closing braces are
     // llvm-cov region artifacts; the interior is exercised by
     // emit_canonical_pdf_does_not_leave_root_dirty_flag_set and
     // emit_canonical_pdf_preserves_pre_existing_root_dirty_flag.
     if let Some((root_ref, original, was_dirty)) = catalog_snapshot {
-        pdf.set_object(root_ref, original);
+        let original_extensions = match &original {
+            Object::Dictionary(dict) => dict.get("Extensions").cloned(),
+            _ => None,
+        };
+        match pdf.resolve(root_ref) {
+            Ok(Object::Dictionary(mut current)) => {
+                match original_extensions {
+                    Some(extensions) => current.insert("Extensions", extensions),
+                    None => {
+                        current.remove("Extensions");
+                    }
+                }
+                pdf.set_object(root_ref, Object::Dictionary(current));
+            }
+            _ => pdf.set_object(root_ref, original),
+        }
         if !was_dirty {
             pdf.clear_dirty(root_ref);
         }
@@ -2976,6 +3005,21 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         && pdf.encryption_ref().is_none()
         && pdf.deleted_object_refs().is_empty();
     let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    // QPDFWriter::write calls initializeSpecialStreams() -- which repairs the
+    // page tree via QPDF::getAllPages() (promoting a direct /Kids leaf to a
+    // fresh indirect object, cloning a duplicate leaf) -- before any object
+    // numbering (QPDFWriter.cc:2113-2115, ahead of preserveObjectStreams/
+    // generateObjectStreams). Run the same repair here, before the
+    // Catalog-first walk below, so any object it mints is already part of
+    // the graph the walk numbers. Running this after the walk (as an earlier
+    // version of this function did) left freshly-minted refs outside every
+    // numbering map, causing a hard failure for a page tree that needed
+    // repair in QDF/content-normalization mode.
+    let qdf_page_refs = if options.qdf || options.content_normalization {
+        Some(crate::PageDocumentHelper::new(pdf).get_all_pages()?)
+    } else {
+        None
+    };
     // The specialized writer is a live ObjectHandle consumer. Its
     // Catalog-first walk must therefore use the same canonical graph as the
     // emission loop; the legacy raw-Object walk would parse a content holder
@@ -3368,7 +3412,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
         let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
         let mut content_container_refs = BTreeSet::new();
-        let page_refs = crate::pages::page_refs(pdf)?;
+        // QPDFWriter::initializeSpecialStreams delegates page enumeration to
+        // QPDF::getAllPages(), whose live ObjectHandle lookup accepts a direct
+        // Catalog /Pages dictionary (QPDFWriter.cc:1916; QPDF_pages.cc:47-71).
+        // The repair-and-enumerate pass already ran once, before the
+        // Catalog-first numbering walk above, so any object it mints is
+        // numbered; reuse that snapshot instead of repairing (a no-op the
+        // second time) and enumerating again.
+        let page_refs = qdf_page_refs
+            .as_ref()
+            .expect("qdf_page_refs is Some whenever options.qdf || options.content_normalization");
         for (idx, page_ref) in page_refs.iter().enumerate() {
             let seq = (idx as u32).saturating_add(1);
             if options.qdf {
@@ -8199,6 +8252,62 @@ mod tests {
         assert!(
             !pdf.is_dirty(root_ref),
             "Root dirty flag must be cleared after the full-rewrite restore"
+        );
+    }
+
+    #[test]
+    fn emit_canonical_pdf_direct_catalog_pages_repair_survives_catalog_restore() {
+        // A direct Catalog /Pages dict (not `N 0 R`) whose own /Kids needs
+        // promotion: PageDocumentHelper::get_all_pages's repair mints a fresh
+        // indirect page and rewrites /Kids on the same Catalog object that
+        // the /Extensions restore below reverts. A whole-dict restore would
+        // discard that repair, so a second write on the same Pdf would repeat
+        // it from scratch -- minting *another* fresh object (count climbing
+        // 1 -> 2 -> 3) and producing non-byte-identical output, since the
+        // promoted page would land on a different object number each time.
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Count 1 /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] >> >>\nendobj\n",
+        );
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open");
+        let options = WriterOptions {
+            qdf: true,
+            object_streams: ObjectStreamMode::Disable,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let count_before = pdf.get_object_count().unwrap();
+
+        let mut out1 = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut out1, &options).expect("first write");
+        let count_after_1 = pdf.get_object_count().unwrap();
+        assert_eq!(
+            count_after_1,
+            count_before + 1,
+            "repair must mint exactly one promoted page object"
+        );
+
+        let mut out2 = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut out2, &options).expect("second write");
+        let count_after_2 = pdf.get_object_count().unwrap();
+        assert_eq!(
+            count_after_2, count_after_1,
+            "the repair must not re-run (and re-mint an object) on a second write \
+             of the same Pdf -- its Catalog mutation must survive the ADBE restore"
+        );
+        assert_eq!(
+            out1, out2,
+            "back-to-back writes on the same Pdf must be byte-identical even when \
+             the source Catalog needed page-tree repair"
         );
     }
 
