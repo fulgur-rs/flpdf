@@ -3284,6 +3284,28 @@ fn one_page_pdf_with_inherited_indirect_resources() -> Vec<u8> {
     ])
 }
 
+/// One page with a page-local indirect `/Resources` dictionary. qpdf's
+/// `--pages` Auto heuristic leaves this reference alone when the source has
+/// no shared resource dictionary, shared XObject dictionary, or inherited
+/// resources to trigger pruning.
+fn one_page_pdf_with_page_local_indirect_resources() -> Vec<u8> {
+    let content = b"q Q";
+    let stream = [
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Resources 4 0 R /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Font << /F1 6 0 R >> >>\nendobj\n",
+        stream.as_slice(),
+        b"6 0 obj\n<< /BaseFont /Helvetica /Subtype /Type1 /Type /Font >>\nendobj\n",
+    ])
+}
+
 fn one_page_pdf_with_indirect_contents_array(content: &[u8]) -> Vec<u8> {
     let stream = [
         format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
@@ -5363,6 +5385,58 @@ fn pages_extraction_materializes_inherited_indirect_resources_before_prune() {
             matches!(resources, Some(Object::Dictionary(_))),
             "{label}: qpdf's copy_if_shared route must materialize /Resources directly on the page; got {resources:?}"
         );
+    }
+}
+
+#[test]
+fn pages_extraction_resource_modes_match_qpdf_copy_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("page-local-resources.pdf");
+    std::fs::write(&input, one_page_pdf_with_page_local_indirect_resources()).unwrap();
+
+    let cases: [(&str, &[&str], bool); 3] = [
+        ("auto", &[], false),
+        ("no", &["--remove-unreferenced-resources=no"], false),
+        ("yes", &["--remove-unreferenced-resources=yes"], true),
+    ];
+    for (label, flags, should_materialize) in cases {
+        let output = temp.path().join(format!("out-{label}.pdf"));
+        let mut command = Command::cargo_bin("flpdf").unwrap();
+        if flags.is_empty() {
+            command
+                .arg(&input)
+                .args(["--pages", ".", "1", "--"])
+                .arg(&output);
+        } else {
+            command
+                .arg("rewrite")
+                .args(flags)
+                .arg(&input)
+                .arg(&output)
+                .args(["--pages", ".", "1", "--"]);
+        }
+        command.assert().success();
+
+        let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+        let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+        let page = pdf.resolve(page_ref).unwrap();
+        let resources = page.as_dict().and_then(|dict| dict.get("Resources"));
+        if should_materialize {
+            let Some(Object::Dictionary(resources)) = resources else {
+                panic!("{label}: qpdf Yes must materialize /Resources; got {resources:?}");
+            };
+            let font = resources.get("Font");
+            assert!(
+                font.is_none()
+                    || matches!(font, Some(Object::Dictionary(font)) if font.iter().next().is_none()),
+                "{label}: qpdf Yes must prune unused /F1 after materializing /Resources; got {font:?}"
+            );
+        } else {
+            assert!(
+                matches!(resources, Some(Object::Reference(_))),
+                "{label}: qpdf must leave an unshared page-local indirect /Resources reference intact; got {resources:?}"
+            );
+        }
     }
 }
 

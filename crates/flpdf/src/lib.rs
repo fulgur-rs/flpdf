@@ -255,7 +255,10 @@ pub use permissions::{PermissionsConfig, PrintPermission};
 pub use pipeline::{Pipeline, PipelineError, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::{EncryptionInfo, PdfOpenOptions, Permissions};
-pub use resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
+pub use resources::{
+    remove_unreferenced_resources, should_remove_unreferenced_resources,
+    RemoveUnreferencedResources,
+};
 pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
 pub use security::standard::ObjectKeyAlg;
