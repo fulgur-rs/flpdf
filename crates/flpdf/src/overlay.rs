@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use crate::page_form_xobject::get_form_xobject_for_page;
-use crate::page_object_helper::{PageBox, PageObjectHelper};
+use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
 use crate::pages::page_refs;
 use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
@@ -851,22 +851,34 @@ enum BoxKind {
 }
 
 /// Read the destination page's effective `/MediaBox` or `/TrimBox` (inheritance
-/// and fallback resolved by [`PageObjectHelper`]), erroring when absent.
+/// and fallback resolved by [`PageObjectHelper`]). A present but malformed box
+/// maps to qpdf's zero rectangle from `getArrayAsRectangle`; only an absent
+/// effective box is an error.
 fn page_box_or_err<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     kind: BoxKind,
 ) -> Result<PageBox> {
     let mut helper = PageObjectHelper::new(page_ref, pdf);
-    let opt = match kind {
-        BoxKind::Media => helper.media_box()?,
-        BoxKind::Trim => helper.trim_box()?,
+    let value = match kind {
+        BoxKind::Media => helper.get_media_box(false)?,
+        BoxKind::Trim => helper.get_trim_box(false, false)?,
     };
-    opt.ok_or_else(|| {
-        Error::Unsupported(format!(
+    if value.is_null() {
+        return Err(Error::Unsupported(format!(
             "destination page {page_ref} has no usable placement box"
-        ))
-    })
+        )));
+    }
+    // qpdf's getArrayAsRectangle returns the zero rectangle for a present but
+    // malformed value; the destination Form-XObject conversion owns the
+    // warning that makes the overlay operation observable as repaired.
+    let rectangle = rectangle_from_handle(pdf, &value)?.unwrap_or_default();
+    Ok(PageBox::new(
+        rectangle.llx,
+        rectangle.lly,
+        rectangle.urx,
+        rectangle.ury,
+    ))
 }
 
 /// Build a placement fragment through the canonical page/Form handle route.
@@ -2875,6 +2887,52 @@ mod tests {
         ));
         let err = page_box_or_err(&mut pdf, ObjectRef::new(3, 0), BoxKind::Media);
         assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn overlay_accepts_malformed_destination_trim_box_like_qpdf() {
+        // qpdf's getArrayAsRectangle returns the zero rectangle for a malformed
+        // destination box, so doUnderOverlayForPage reaches the destination
+        // Form-XObject warning and still completes the operation. The previous
+        // page_box_or_err path converted the same malformed /TrimBox into a
+        // hard Error::Unsupported before that warning could be emitted.
+        let content_body = "<< /Length 1 >>\nstream\nx\nendstream";
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /TrimBox [0 0 5] /Resources << >> /Contents 4 0 R >>",
+                ),
+                (4, content_body),
+            ],
+            1,
+        ));
+        let page_ref = ObjectRef::new(3, 0);
+        let source = insert_form_xobject(&mut pdf, [0, 0, 100, 100], b"source");
+        let mut dr_map = crate::overlay_annotations::DrMap::new();
+
+        apply_overlays_to_page(
+            &mut pdf,
+            page_ref,
+            &[OverlaySource {
+                kind: OverlayKind::Overlay,
+                xobject_ref: source,
+                source_page: None,
+            }],
+            &mut dr_map,
+        )
+        .expect("malformed destination TrimBox must warn and continue like qpdf");
+
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("bounding box is invalid")),
+            "destination Form-XObject conversion must retain qpdf's warning"
+        );
     }
 
     #[test]
