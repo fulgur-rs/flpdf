@@ -1,4 +1,5 @@
-//! qpdf correspondence: QPDFPageDocumentHelper.cc page insertion and removal represented as an in-place splice.
+//! qpdf correspondence: `QPDFPageDocumentHelper.cc:37-52` delegates page insertion/removal to the page-tree owner.
+//! `QPDF_pages.cc:203-304` maintains `/Kids`, `/Count`, and `/Parent` during those mutations.
 //! Surgical in-place splice of the `/Pages` tree.
 //!
 //! Unlike [`crate::page_tree_rebuild`], which always produces a flat single-level
@@ -7,8 +8,11 @@
 //! position, updating `/Count` at every ancestor node and repointing `/Parent`
 //! on inserted pages.
 
-use crate::pages::{page_refs_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH};
-use crate::{Error, Object, ObjectRef, Pdf, Result};
+use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+#[cfg(test)]
+use crate::Object;
+use crate::ObjectHandle;
+use crate::{Error, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
 /// Remove `remove.len()` pages starting at 0-based document-order position
@@ -53,8 +57,8 @@ pub fn splice_pages<R: Read + Seek>(
 /// - [`Error::Missing`] if the result would be an empty document, or if a
 ///   required structural entry is absent (`/Root`, the `/Catalog` dictionary,
 ///   or `/Pages`).
-/// - Propagates any error from resolving objects and from collecting the page
-///   refs (for example a malformed cross-reference table).
+/// - Propagates any error from resolving objects (for example a malformed
+///   cross-reference table).
 pub fn splice_pages_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     remove: std::ops::Range<usize>,
@@ -73,7 +77,8 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
         return Ok(());
     }
 
-    let page_count = page_refs_with_max_depth(pdf, max_depth)?.len();
+    let pages_ref = pages_ref(pdf)?;
+    let page_count = leaf_count_of(pdf, pages_ref)?;
 
     if remove.end > page_count {
         return Err(Error::Unsupported(format!(
@@ -86,16 +91,6 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
     if remaining == 0 {
         return Err(Error::Missing("splice would result in an empty document"));
     }
-
-    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let pages_ref = {
-        let catalog = pdf.resolve(catalog_ref)?;
-        catalog
-            .as_dict()
-            .ok_or(Error::Missing("/Catalog dict"))?
-            .get_ref("Pages")
-            .ok_or(Error::Missing("/Pages"))?
-    };
 
     let mut insert_done = false;
     splice_subtree(
@@ -119,25 +114,52 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
     Ok(())
 }
 
+/// Resolve the catalog's `/Pages` entry to its canonical indirect identity.
+///
+/// qpdf's page-document helper hands mutation to the page-tree owner; keeping
+/// this lookup on handles means an indirect `/Pages` entry is not flattened
+/// into a legacy `Object` before the owner starts its walk.
+fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
+    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+    let catalog = pdf.get_object_handle(catalog_ref);
+    pdf.resolve_object_handle(&catalog)?;
+    if catalog.as_dictionary().is_none() {
+        return Err(Error::Missing("/Catalog dict"));
+    }
+    catalog
+        .try_get_key(b"/Pages")?
+        .object_ref()
+        .ok_or(Error::Missing("/Pages"))
+}
+
 /// Returns the leaf-page count contributed by `node_ref`.
 /// - `/Pages` → its `/Count` value
-/// - `/Page` (or anything else) → 1
+/// - another dictionary type → 1
 fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node_ref: ObjectRef) -> Result<usize> {
-    let obj = pdf.resolve_borrowed(node_ref)?;
-    let dict = obj
-        .as_dict()
-        .ok_or_else(|| Error::Unsupported(format!("node {node_ref} is not a dictionary")))?;
-    match dict.get("Type").and_then(Object::as_name) {
-        Some(b"Pages") => match dict.get("Count").and_then(Object::as_integer) {
-            Some(n) if n >= 0 => Ok(n as usize),
-            Some(n) => Err(Error::Unsupported(format!(
-                "/Pages node {node_ref} has negative /Count {n}"
-            ))),
-            None => Err(Error::Unsupported(format!(
-                "/Pages node {node_ref} has no /Count"
-            ))),
-        },
-        _ => Ok(1),
+    let node = pdf.get_object_handle(node_ref);
+    pdf.resolve_object_handle(&node)?;
+    if node.as_dictionary().is_none() {
+        return Err(Error::Unsupported(format!(
+            "node {node_ref} is not a dictionary"
+        )));
+    }
+
+    let node_type = node.try_get_key(b"/Type")?;
+    pdf.resolve_object_handle(&node_type)?;
+    if node_type.as_name().as_deref() != Some(b"Pages") {
+        return Ok(1);
+    }
+
+    let count = node.try_get_key(b"/Count")?;
+    pdf.resolve_object_handle(&count)?;
+    match count.as_integer() {
+        Some(n) if n >= 0 => Ok(n as usize),
+        Some(n) => Err(Error::Unsupported(format!(
+            "/Pages node {node_ref} has negative /Count {n}"
+        ))),
+        None => Err(Error::Unsupported(format!(
+            "/Pages node {node_ref} has no /Count"
+        ))),
     }
 }
 
@@ -147,12 +169,15 @@ fn set_page_parent<R: Read + Seek>(
     page_ref: ObjectRef,
     parent_ref: ObjectRef,
 ) -> Result<()> {
-    let mut dict = pdf
-        .resolve(page_ref)?
-        .into_dict()
-        .ok_or_else(|| Error::Unsupported(format!("page {page_ref} is not a dictionary")))?;
-    dict.insert("Parent", Object::Reference(parent_ref));
-    pdf.set_object(page_ref, Object::Dictionary(dict));
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    if page.as_dictionary().is_none() {
+        return Err(Error::Unsupported(format!(
+            "page {page_ref} is not a dictionary"
+        )));
+    }
+    page.replace_key(b"/Parent", pdf.get_object_handle(parent_ref))?;
+    pdf.mark_object_dirty(page_ref);
     Ok(())
 }
 
@@ -181,23 +206,30 @@ fn splice_subtree<R: Read + Seek>(
         )));
     }
 
-    // Snapshot the node's kids and count *before* any mutation so that
-    // the borrow on `pdf` is released before we recurse.
+    // Snapshot the node's kids and count *before* any mutation so that the
+    // canonical node handle remains stable while we recurse.
     let (kids, old_count) = {
-        let obj = pdf.resolve_borrowed(node_ref)?;
-        let dict = obj
-            .as_dict()
-            .ok_or_else(|| Error::Unsupported(format!("{node_ref} is not a /Pages dictionary")))?;
+        let node = pdf.get_object_handle(node_ref);
+        pdf.resolve_object_handle(&node)?;
+        if node.as_dictionary().is_none() {
+            return Err(Error::Unsupported(format!(
+                "{node_ref} is not a /Pages dictionary"
+            )));
+        }
 
-        let kids: Vec<ObjectRef> = dict
-            .get("Kids")
-            .and_then(Object::as_array)
-            .map(|arr| arr.iter().filter_map(Object::as_ref_id).collect())
-            .unwrap_or_default();
+        let kids_value = node.try_get_key(b"/Kids")?;
+        pdf.resolve_object_handle(&kids_value)?;
+        let kids: Vec<ObjectRef> = kids_value
+            .as_array()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|child| child.object_ref())
+            .collect();
 
-        let old_count_raw = dict
-            .get("Count")
-            .and_then(Object::as_integer)
+        let count_value = node.try_get_key(b"/Count")?;
+        pdf.resolve_object_handle(&count_value)?;
+        let old_count_raw = count_value
+            .as_integer()
             .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_ref} has no /Count")))?;
         if old_count_raw < 0 {
             return Err(Error::Unsupported(format!(
@@ -230,14 +262,13 @@ fn splice_subtree<R: Read + Seek>(
 
         let overlaps_remove = kid_end > remove.start && kid_start < remove.end;
         if overlaps_remove {
-            // Determine kid type (Page vs Pages) without holding a borrow.
+            // Determine kid type (Page vs Pages) through the live child handle.
             let kid_is_pages = {
-                let kid_obj = pdf.resolve_borrowed(kid_ref)?;
-                kid_obj
-                    .as_dict()
-                    .and_then(|d| d.get("Type"))
-                    .and_then(Object::as_name)
-                    == Some(b"Pages")
+                let kid = pdf.get_object_handle(kid_ref);
+                pdf.resolve_object_handle(&kid)?;
+                let kid_type = kid.try_get_key(b"/Type")?;
+                pdf.resolve_object_handle(&kid_type)?;
+                kid_type.as_name().as_deref() == Some(b"Pages")
             };
 
             if kid_is_pages {
@@ -286,15 +317,19 @@ fn splice_subtree<R: Read + Seek>(
             "splice: negative page count {new_count} for node {node_ref}"
         )));
     }
-    let mut dict = pdf.resolve(node_ref)?.into_dict().ok_or_else(|| {
-        Error::Unsupported(format!("{node_ref} is not a dictionary (re-resolve)"))
-    })?;
-    dict.insert("Count", Object::Integer(new_count));
-    dict.insert(
-        "Kids",
-        Object::Array(new_kids.iter().map(|&r| Object::Reference(r)).collect()),
-    );
-    pdf.set_object(node_ref, Object::Dictionary(dict));
+    let node = pdf.get_object_handle(node_ref);
+    pdf.resolve_object_handle(&node)?;
+    node.replace_key(b"/Count", ObjectHandle::integer(new_count))?;
+    node.replace_key(
+        b"/Kids",
+        ObjectHandle::array(
+            new_kids
+                .iter()
+                .map(|&child_ref| pdf.get_object_handle(child_ref))
+                .collect(),
+        ),
+    )?; // cov:ignore: all array children come from this Pdf, so ownership failure is invariant-impossible
+    pdf.mark_object_dirty(node_ref);
 
     Ok(net_delta)
 }
@@ -355,6 +390,35 @@ mod tests {
             (8, "<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] >>"),
         ];
         build_pdf(parts)
+    }
+
+    /// Build the same flat tree as [`build_flat_pdf`] with the root's `/Kids`
+    /// array and `/Count` stored in indirect objects. qpdf page-tree mutation
+    /// resolves these values through the live page-node handle rather than
+    /// assuming that either entry is an inline value.
+    fn build_indirect_flat_pdf() -> Vec<u8> {
+        let parts: &[(u32, &str)] = &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids 9 0 R /Count 10 0 R >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (9, "[3 0 R 4 0 R 5 0 R]"),
+            (10, "3"),
+        ];
+        build_pdf(parts)
+    }
+
+    fn build_catalog_not_dictionary_pdf() -> Vec<u8> {
+        build_pdf(&[(1, "[]")])
+    }
+
+    fn build_pages_not_dictionary_pdf() -> Vec<u8> {
+        build_pdf(&[(1, "<< /Type /Catalog /Pages 2 0 R >>"), (2, "[]")])
+    }
+
+    fn build_pages_with_count_pdf(count: &str) -> Vec<u8> {
+        build_pdf(&[(1, "<< /Type /Catalog /Pages 2 0 R >>"), (2, count)])
     }
 
     fn build_pdf(parts: &[(u32, &str)]) -> Vec<u8> {
@@ -535,6 +599,90 @@ mod tests {
     }
 
     #[test]
+    fn indirect_kids_and_count_are_mutated_canonically() {
+        let mut pdf = open(build_indirect_flat_pdf());
+        splice_pages(&mut pdf, 1..2, &[]).unwrap();
+
+        assert_eq!(
+            page_list(&mut pdf),
+            vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)]
+        );
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let kids = root
+            .get("Kids")
+            .and_then(Object::as_array)
+            .expect("written /Kids array");
+        assert_eq!(
+            kids,
+            vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Reference(ObjectRef::new(5, 0)),
+            ]
+        );
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+    }
+
+    #[test]
+    fn malformed_catalog_is_rejected_before_page_count() {
+        let mut pdf = open(build_catalog_not_dictionary_pdf());
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(
+            matches!(err, Error::Missing("/Catalog dict")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn non_dictionary_pages_root_is_rejected() {
+        let mut pdf = open(build_pages_not_dictionary_pdf());
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn negative_pages_count_is_rejected() {
+        let mut pdf = open(build_pages_with_count_pdf(
+            "<< /Type /Pages /Kids [] /Count -1 >>",
+        ));
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn missing_pages_count_is_rejected() {
+        let mut pdf = open(build_pages_with_count_pdf("<< /Type /Pages /Kids [] >>"));
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn splice_subtree_rejects_a_non_dictionary_node() {
+        let mut pdf = open(build_pages_not_dictionary_pdf());
+        let mut insert_done = false;
+        let err = splice_subtree(
+            &mut pdf,
+            ObjectRef::new(2, 0),
+            0,
+            &(0..0),
+            &[],
+            &mut insert_done,
+            0,
+            DEFAULT_MAX_PAGE_TREE_DEPTH,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn non_dictionary_insert_page_is_rejected() {
+        let mut pdf = open(build_flat_pdf());
+        let bad_page = ObjectRef::new(6, 0);
+        pdf.set_object(bad_page, Object::Array(Vec::new()));
+        let err = splice_pages(&mut pdf, 0..0, &[bad_page]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
     fn replace_middle_page_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
@@ -608,6 +756,13 @@ mod tests {
         // Right subtree: only D remains → /Count = 1
         let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
         assert_eq!(right.get("Count"), Some(&Object::Integer(1)));
+    }
+
+    #[test]
+    fn depth_limit_is_preserved_for_nested_page_trees() {
+        let mut pdf = open(build_nested_pdf());
+        let err = splice_pages_with_max_depth(&mut pdf, 0..1, &[], 1).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
     #[test]
