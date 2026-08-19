@@ -178,9 +178,13 @@ fn node_label(node: &ObjectHandle) -> String {
 /// `QPDF::getAllPagesInternal` (`QPDF_pages.cc:99-114`): only a kid lacking
 /// `/Kids` is promoted. The live `ObjectHandle` returned by `as_array` keeps
 /// the direct node attached to its containing `/Kids` array while its direct
-/// leaves are promoted in place. The visited set uses handle identity rather
-/// than an `(0, 0)` object-reference sentinel; qpdf's `QPDFObjGen::set` also
-/// ignores direct objects (`QPDFObjGen.hh:105-121`).
+/// leaves are promoted in place. The visited set is keyed on handle identity
+/// rather than an indirect object reference, so distinct direct `/Pages`
+/// siblings never collide: qpdf's own `QPDFObjGen::set::add` silently skips
+/// every direct object without recording it at all
+/// (`QPDFObjGen.hh:105-121`, "Attempts to insert QPDFObjGen(0, 0) are
+/// ignored"), so it can never detect a cycle confined entirely to direct
+/// objects either — a genuinely stricter, not merely equivalent, guard here.
 #[allow(
     clippy::mutable_key_type,
     reason = "qpdf page-tree cycle detection intentionally keys on canonical ObjectHandle identity"
@@ -423,11 +427,17 @@ fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node: &ObjectHandle) -> Resul
     }
 }
 
-/// Sets `/Parent` on `page_ref` to point at `parent_ref`.
-fn set_page_parent<R: Read + Seek>(
+/// Validates `page_ref` resolves to a dictionary, then sets `/Parent` on it
+/// to point at `parent`'s indirect identity.
+///
+/// An inline `/Pages` node has no legal indirect reference for `/Parent`;
+/// the write is skipped in that case, but `page_ref` is still validated
+/// unconditionally — this is a splice-order-position check on the inserted
+/// page itself, not something that depends on where in the tree it lands.
+fn set_page_parent_for_node<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-    parent_ref: ObjectRef,
+    parent: &ObjectHandle,
 ) -> Result<()> {
     let page = pdf.get_object_handle(page_ref);
     pdf.resolve_object_handle(&page)?;
@@ -436,21 +446,9 @@ fn set_page_parent<R: Read + Seek>(
             "page {page_ref} is not a dictionary"
         )));
     }
-    page.replace_key(b"/Parent", pdf.get_object_handle(parent_ref))?;
-    pdf.mark_object_dirty(page_ref);
-    Ok(())
-}
-
-fn set_page_parent_for_node<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    parent: &ObjectHandle,
-) -> Result<()> {
-    // An inline /Pages node has no legal indirect reference for `/Parent`.
-    // Keep it inline rather than allocating an object number solely to make
-    // this topology-preserving helper synthesize a back-reference.
     if let Some(parent_ref) = parent.object_ref() {
-        set_page_parent(pdf, page_ref, parent_ref)?;
+        page.replace_key(b"/Parent", pdf.get_object_handle(parent_ref))?;
+        pdf.mark_object_dirty(page_ref);
     }
     Ok(())
 }
@@ -1464,6 +1462,19 @@ mod tests {
         let bad_page = ObjectRef::new(6, 0);
         pdf.set_object(bad_page, Object::Array(Vec::new()));
         let err = splice_pages(&mut pdf, 0..0, &[bad_page]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn non_dictionary_insert_page_into_direct_intermediate_is_rejected() {
+        // set_page_parent_for_node skips writing /Parent when the enclosing
+        // node has no indirect identity (an inline /Pages node), but it must
+        // still validate the inserted page itself rather than let a
+        // non-dictionary object into /Kids uncaught.
+        let mut pdf = open(build_pages_with_direct_intermediate_two_pages_pdf());
+        let bad_page = ObjectRef::new(5, 0);
+        pdf.set_object(bad_page, Object::Array(Vec::new()));
+        let err = splice_pages(&mut pdf, 1..1, &[bad_page]).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
