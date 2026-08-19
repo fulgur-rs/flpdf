@@ -11,7 +11,7 @@
 //! later helper-vs-raw byte comparisons meaningful.
 //!
 //! The Layer-2 manual paths intentionally reproduce helper-internal structural
-//! details (e.g. `/Rotate 0` materialisation by `rebuild_page_tree`, the
+//! details (e.g. qpdf's absent `/Rotate` behavior in `rebuild_page_tree`, the
 //! inline-to-indirect `/AcroForm` promotion by `ensure_acroform_ref`). If a
 //! helper's resulting structure changes, these byte-identity tests are
 //! *expected* to fail: update the corresponding manual path to mirror the new
@@ -566,20 +566,6 @@ fn roundtrip_eq(
     );
 }
 
-/// Materialize `/Rotate value` (Integer) explicitly on the leaf page `page_ref`,
-/// mirroring what `rebuild_page_tree` / `apply_rotate_to_pages` write on a leaf.
-/// All other keys are left untouched.
-fn manual_set_leaf_rotate(
-    pdf: &mut flpdf::Pdf<std::io::Cursor<Vec<u8>>>,
-    page_ref: flpdf::ObjectRef,
-    value: i64,
-) {
-    use flpdf::Object;
-    let mut leaf = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
-    leaf.insert("Rotate", Object::Integer(value));
-    pdf.set_object(page_ref, Object::Dictionary(leaf));
-}
-
 /// Rewrite the root `/Pages` node's `/Kids` and `/Count` to exactly `kids`,
 /// matching the flat single-level tree `rebuild_page_tree` produces. The root
 /// `ObjectRef` is preserved (the helper keeps it stable too).
@@ -608,13 +594,11 @@ fn manual_set_pages_kids(
 /// Page `remove` parity.
 ///
 /// `PageDocumentHelper::remove_page(4 0 R)` routes through `rebuild_page_tree`, which (a)
-/// drops the removed leaf from a flat `/Kids` and sets `/Count`, and (b)
-/// materializes `/Rotate 0` explicitly on every *surviving* leaf (there is no
-/// inheritable `/Resources` / `/MediaBox` / `/CropBox` source in this fixture, so
-/// only `/Rotate` is added; each leaf already carries its own `/MediaBox` and
-/// `/Parent`). The removed leaf (4 0 R) is left as an untouched orphan on both
-/// sides, so `full_rewrite` treats it symmetrically. The manual path reproduces
-/// exactly that resulting structure ⇒ byte-identity.
+/// drops the removed leaf from a flat `/Kids` and sets `/Count`. Since this
+/// fixture has no inherited `/Rotate`, qpdf leaves that key absent on the
+/// surviving pages. The removed leaf (4 0 R) is left as an untouched orphan
+/// on both sides, so `full_rewrite` treats it symmetrically. The manual path
+/// reproduces exactly that resulting structure ⇒ byte-identity.
 #[test]
 fn page_remove_matches_manual_kids_rewrite() {
     use flpdf::ObjectRef;
@@ -627,8 +611,6 @@ fn page_remove_matches_manual_kids_rewrite() {
         },
         |pdf| {
             // Survivors are 3 0 R and 5 0 R (page index 1 == 4 0 R removed).
-            manual_set_leaf_rotate(pdf, ObjectRef::new(3, 0), 0);
-            manual_set_leaf_rotate(pdf, ObjectRef::new(5, 0), 0);
             manual_set_pages_kids(pdf, &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
         },
     );
