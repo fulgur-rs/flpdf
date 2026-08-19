@@ -159,7 +159,16 @@ fn page_refs_for_splice<R: Read + Seek>(
 ) -> Result<Vec<ObjectRef>> {
     let mut pages = Vec::new();
     let mut seen = HashSet::new();
-    collect_page_refs(pdf, pages_ref, 0, max_depth, &mut pages, &mut seen)?;
+    let mut visited = HashSet::new();
+    collect_page_refs(
+        pdf,
+        pages_ref,
+        0,
+        max_depth,
+        &mut pages,
+        &mut seen,
+        &mut visited,
+    )?;
     Ok(pages)
 }
 
@@ -170,6 +179,7 @@ fn collect_page_refs<R: Read + Seek>(
     max_depth: usize,
     pages: &mut Vec<ObjectRef>,
     seen: &mut HashSet<ObjectRef>,
+    visited: &mut HashSet<ObjectRef>,
 ) -> Result<usize> {
     if depth >= max_depth {
         return Err(Error::Unsupported(format!(
@@ -190,6 +200,11 @@ fn collect_page_refs<R: Read + Seek>(
     if node_type.as_name().as_deref() != Some(b"Pages") {
         pages.push(node_ref);
         return Ok(1);
+    }
+    if !visited.insert(node_ref) {
+        return Err(Error::Unsupported(format!(
+            "Loop detected in /Pages structure at {node_ref}"
+        )));
     }
 
     let kids_value = node.try_get_key(b"/Kids")?;
@@ -215,10 +230,11 @@ fn collect_page_refs<R: Read + Seek>(
                 Error::Internal("direct page-tree child promotion lost its identity".to_owned())
             })?;
             // cov:ignore-end
-            kids_handle
+            let kids_handle = kids_handle
                 .as_ref()
-                .expect("array handle exists when promoting a direct child")
-                .set_array_item(index, indirect)?;
+                .expect("array handle exists when promoting a direct child");
+            kids_handle.set_array_item(index, indirect)?;
+            pdf.mark_object_handle_dirty(kids_handle)?;
             child_ref
         };
 
@@ -235,14 +251,18 @@ fn collect_page_refs<R: Read + Seek>(
                 Error::Internal("duplicated page copy lost its identity".to_owned())
             })?;
             // cov:ignore-end
-            kids_handle
+            let kids_handle = kids_handle
                 .as_ref()
-                .expect("array handle exists when copying a duplicate page")
-                .set_array_item(index, indirect)?;
+                .expect("array handle exists when copying a duplicate page");
+            kids_handle.set_array_item(index, indirect)?;
+            pdf.mark_object_handle_dirty(kids_handle)?;
             copy_ref
         } else {
             child_ref
         };
+        if !child_is_pages {
+            set_page_parent(pdf, child_ref, node_ref)?;
+        }
         kids.push(child_ref);
     }
     if let Some(kids_handle) = kids_handle {
@@ -267,7 +287,8 @@ fn collect_page_refs<R: Read + Seek>(
 
     let mut actual_count = 0usize;
     for child_ref in kids {
-        let child_count = collect_page_refs(pdf, child_ref, depth + 1, max_depth, pages, seen)?;
+        let child_count =
+            collect_page_refs(pdf, child_ref, depth + 1, max_depth, pages, seen, visited)?;
         // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
         actual_count = actual_count.checked_add(child_count).ok_or_else(|| {
             Error::Unsupported(format!("page count overflow at /Pages node {node_ref}"))
@@ -672,6 +693,38 @@ mod tests {
         ])
     }
 
+    fn build_pages_with_cross_parent_duplicate_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>"),
+            (3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 >>"),
+            (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+            (6, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 >>"),
+            (8, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
+    fn build_pages_with_shared_intermediate_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 3 0 R] /Count 2 >>"),
+            (3, "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 >>"),
+            (4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
+    fn build_pages_with_direct_kid_before_invalid_kid_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [<< /Type /Page /MediaBox [0 0 612 792] >> 3 0 R] /Count 2 >>",
+            ),
+            (3, "[]"),
+        ])
+    }
+
     fn build_direct_pages_root_pdf() -> Vec<u8> {
         build_pdf(&[
             (
@@ -925,6 +978,51 @@ mod tests {
         assert_eq!(pages[1], ObjectRef::new(3, 0));
         assert_ne!(pages[2], ObjectRef::new(3, 0));
         assert_eq!(pages[3], ObjectRef::new(4, 0));
+    }
+
+    #[test]
+    fn duplicate_page_kid_is_reparented_to_its_new_subtree() {
+        let mut pdf = open(build_pages_with_cross_parent_duplicate_pdf());
+        splice_pages(&mut pdf, 0..0, &[ObjectRef::new(8, 0)]).unwrap();
+
+        let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
+        let duplicate = match right.get("Kids").and_then(Object::as_array) {
+            Some([Object::Reference(page_ref)]) => *page_ref,
+            other => panic!("right /Kids should contain one indirect page, got {other:?}"),
+        };
+        assert_ne!(duplicate, ObjectRef::new(4, 0));
+        assert_eq!(
+            dict_of(&mut pdf, duplicate).get_ref("Parent"),
+            Some(ObjectRef::new(6, 0))
+        );
+    }
+
+    #[test]
+    fn shared_intermediate_page_tree_is_rejected_as_a_loop() {
+        let mut pdf = open(build_pages_with_shared_intermediate_pdf());
+        let err = splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(ref message) if message.contains("Loop detected")
+                && message.contains("3 0 R")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn direct_kid_promotion_is_dirty_before_later_preflight_error() {
+        let mut pdf = open(build_pages_with_direct_kid_before_invalid_kid_pdf());
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert!(
+            pdf.is_dirty(ObjectRef::new(2, 0)),
+            "the live /Kids owner must stay dirty after partial preflight mutation"
+        );
+
+        let output = crate::writer::write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
+        let mut round_trip = open(output);
+        let root = dict_of(&mut round_trip, ObjectRef::new(2, 0));
+        let kids = root.get("Kids").and_then(Object::as_array).unwrap();
+        assert!(matches!(kids.first(), Some(Object::Reference(_))));
     }
 
     #[test]
