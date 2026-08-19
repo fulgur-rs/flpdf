@@ -1473,6 +1473,53 @@ fn pages_secondary_version_floor_matches_qpdf() {
     assert!(std::fs::read(&q_min).unwrap().starts_with(expected_header));
     assert!(std::fs::read(&f_min).unwrap().starts_with(expected_header));
 
+    let q_min_above = tmp.path().join("q-min-above.pdf");
+    let f_min_above = tmp.path().join("f-min-above.pdf");
+    let (q_min_above_ok, stderr) = run_qpdf(&[
+        "--min-version=2.0",
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q_min_above.to_str().unwrap(),
+    ]);
+    assert!(
+        q_min_above_ok || q_min_above.exists(),
+        "qpdf min-version-above-floor merge failed: {stderr}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f_min_above.to_str().unwrap(),
+            "--min-version=2.0",
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+    let min_above_header = b"%PDF-2.0\n";
+    assert!(
+        std::fs::read(&q_min_above)
+            .unwrap()
+            .starts_with(min_above_header),
+        "qpdf --min-version above the source floor must win"
+    );
+    assert!(
+        std::fs::read(&f_min_above)
+            .unwrap()
+            .starts_with(min_above_header),
+        "--min-version above the source floor must override the floor, matching qpdf"
+    );
+
     let q_force = tmp.path().join("q-force.pdf");
     let f_force = tmp.path().join("f-force.pdf");
     let (q_force_ok, stderr) = run_qpdf(&[
