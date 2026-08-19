@@ -3263,6 +3263,27 @@ fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
     ])
 }
 
+/// One page whose effective `/Resources` is an indirect dictionary inherited
+/// from the `/Pages` node. The `--pages` resource-prune route must shallow-copy
+/// that dictionary onto the selected leaf before pruning, matching qpdf's
+/// `QPDFPageObjectHelper::getAttribute("/Resources", true)` boundary.
+fn one_page_pdf_with_inherited_indirect_resources() -> Vec<u8> {
+    let content = b"q Q";
+    let stream = [
+        format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< >>\nendobj\n",
+        stream.as_slice(),
+    ])
+}
+
 fn one_page_pdf_with_indirect_contents_array(content: &[u8]) -> Vec<u8> {
     let stream = [
         format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
@@ -5304,6 +5325,45 @@ fn pages_extraction_remaps_outline_and_prunes_resources_via_cli() {
         .args(["--check", output.to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn pages_extraction_materializes_inherited_indirect_resources_before_prune() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("inherited-resources.pdf");
+    std::fs::write(&input, one_page_pdf_with_inherited_indirect_resources()).unwrap();
+
+    let cases: [(&str, &[&str]); 2] = [
+        ("auto", &[]),
+        ("yes", &["--remove-unreferenced-resources=yes"]),
+    ];
+    for (label, flags) in cases {
+        let output = temp.path().join(format!("out-{label}.pdf"));
+        let mut command = Command::cargo_bin("flpdf").unwrap();
+        if flags.is_empty() {
+            command
+                .arg(&input)
+                .args(["--pages", ".", "1", "--"])
+                .arg(&output);
+        } else {
+            command
+                .arg("rewrite")
+                .args(flags)
+                .arg(&input)
+                .arg(&output)
+                .args(["--pages", ".", "1", "--"]);
+        }
+        command.assert().success();
+
+        let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+        let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+        let page = pdf.resolve(page_ref).unwrap();
+        let resources = page.as_dict().and_then(|dict| dict.get("Resources"));
+        assert!(
+            matches!(resources, Some(Object::Dictionary(_))),
+            "{label}: qpdf's copy_if_shared route must materialize /Resources directly on the page; got {resources:?}"
+        );
+    }
 }
 
 #[test]
