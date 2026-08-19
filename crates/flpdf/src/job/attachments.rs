@@ -78,13 +78,22 @@ fn civil_from_days(days_since_epoch: i64) -> (u16, u8, u8) {
 // strerror(errno)` (`libqpdf/QUtil.cc:512-515`, `QPDFSystemError.cc:12-27`),
 // with no numeric error code. `std::io::Error`'s `Display` appends a
 // `" (os error N)"` suffix that qpdf's message lacks; strip it so the two
-// diagnostics match byte-for-byte on POSIX hosts.
+// diagnostics match byte-for-byte. A missing file is special-cased to
+// qpdf's portable C-runtime wording ("No such file or directory") on every
+// host, since Rust's `std::io::Error` on Windows instead surfaces the
+// native Win32 FormatMessage text ("The system cannot find the file
+// specified."), matching the same divergence already handled by
+// `qpdf_json_input_open_error` in flpdf-cli.
 fn qpdf_style_open_error(path: &std::path::Path, error: std::io::Error) -> Error {
     let rendered = error.to_string();
-    let message = error
-        .raw_os_error()
-        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
-        .unwrap_or(&rendered);
+    let message = if error.kind() == std::io::ErrorKind::NotFound {
+        "No such file or directory"
+    } else {
+        error
+            .raw_os_error()
+            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+            .unwrap_or(&rendered)
+    };
     Error::System(format!("open {}: {message}", path.display()))
 }
 
