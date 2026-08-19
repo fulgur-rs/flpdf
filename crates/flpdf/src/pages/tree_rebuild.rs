@@ -140,7 +140,14 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     else {
         return Ok(None);
     };
-    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    // An indirect value is kept as a reference, not dereferenced: the leaf
+    // can legitimately share the same indirect object (qpdf does this for
+    // /MediaBox in the observed 1,3 case; QPDF_pages.cc's inherited-attribute
+    // push writes the ancestor's handle -- reference or direct -- onto the
+    // leaf as-is, matching `getKey`'s non-transparent reference semantics).
+    if let Some(reference) = value.object_ref() {
+        return Ok(Some(Object::Reference(reference)));
+    }
     let value = value.materialize()?;
     Ok(Some(value))
 }
@@ -839,6 +846,38 @@ mod tests {
         assert_eq!(
             resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "/BleedBox", 10).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn raw_inherited_lookup_preserves_an_indirect_ancestor_value() {
+        // qpdf 11.9.0 (`qpdf --pages`, live-probed): when an ancestor `/Pages`
+        // node's inheritable attribute is itself an indirect reference, the
+        // pushed leaf value stays that same reference -- it is never
+        // dereferenced and inlined. Set object 3's /MediaBox (direct in
+        // build_nested_pdf's fixture) to a fresh indirect object 10 and
+        // confirm leaf 6 (no own MediaBox) inherits the reference itself.
+        let mut pdf = open(build_nested_pdf());
+        pdf.set_object(
+            ObjectRef::new(10, 0),
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(200),
+                Object::Integer(300),
+            ]),
+        );
+        let mut parent3 = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("intermediate node must be a dictionary");
+        parent3.insert("MediaBox", Object::Reference(ObjectRef::new(10, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent3));
+
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(6, 0), "MediaBox", 10).unwrap(),
+            Some(Object::Reference(ObjectRef::new(10, 0)))
         );
     }
 

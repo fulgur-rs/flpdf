@@ -87,9 +87,14 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
 
 /// Resolve the first non-null inherited value as its live qpdf-shaped handle.
 ///
-/// This is the canonical shared parent walk. The legacy public resource helper
-/// below still materializes its return type for existing callers; new page
-/// consumers must use this handle-native boundary instead.
+/// Ports the bottom-up `/Parent`-climbing half of
+/// `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:217-263`):
+/// climb ancestors looking for `key`, treating an explicit `null` as absent
+/// (ISO 32000-1 §7.3.9) and stopping at the first node that carries a
+/// non-null value. This is the canonical shared parent walk. The legacy
+/// public resource helper below still materializes its return type for
+/// existing callers; new page consumers must use this handle-native
+/// boundary instead.
 pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
