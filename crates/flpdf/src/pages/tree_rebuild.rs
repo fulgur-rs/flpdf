@@ -284,7 +284,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                 b"/CropBox",
                 max_depth,
                 &mut promoted_inherited,
-            )?;
+            )?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_mediabox = resolve_inherited_for_page(
                 pdf,
                 src,
@@ -292,7 +292,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                 b"/MediaBox",
                 max_depth,
                 &mut promoted_inherited,
-            )?;
+            )?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_resources = resolve_inherited_for_page(
                 pdf,
                 src,
@@ -300,7 +300,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                 b"/Resources",
                 max_depth,
                 &mut promoted_inherited,
-            )?;
+            )?; // cov:ignore: LLVM maps this covered multiline call terminator to the call setup
             let inherited_rotate =
                 resolve_inherited_handle_with_max_depth(pdf, src, b"/Rotate", max_depth)?;
 
@@ -336,6 +336,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             pdf.get_object_handle(catalog).try_get_key(b"/Pages")?
         }
     };
+    // cov:ignore-start: prepare_for_optimization guarantees that the retained /Pages root is a dictionary
     if root.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(match page_root {
             PageTreeRoot::Indirect(root_ref) => {
@@ -345,21 +346,15 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                 "document catalog /Pages root is not a dictionary".into()
             }
         }));
-    }
+    } // cov:ignore-end
     root.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
-    root.replace_key(
-        b"/Kids",
-        ObjectHandle::array(
-            new_kids
-                .iter()
-                .map(|object_ref| pdf.get_object_handle(*object_ref))
-                .collect(),
-        ),
-    )?;
-    root.replace_key(
-        b"/Count",
-        ObjectHandle::integer(i64::try_from(new_kids.len()).unwrap_or(i64::MAX)),
-    )?;
+    let kid_handles: Vec<_> = new_kids
+        .iter()
+        .map(|object_ref| pdf.get_object_handle(*object_ref))
+        .collect();
+    root.replace_key(b"/Kids", ObjectHandle::array(kid_handles))?;
+    let count = i64::try_from(new_kids.len()).unwrap_or(i64::MAX);
+    root.replace_key(b"/Count", ObjectHandle::integer(count))?;
     root.remove_key(b"/Parent");
     pdf.mark_object_handle_dirty(&root)?;
 
@@ -400,6 +395,7 @@ mod tests {
     use crate::Pdf;
     use std::io::Cursor;
     use std::process::Command;
+    use std::rc::Rc;
 
     /// Build a PDF with a root `/Pages` (2 0 R) → intermediate `/Pages`
     /// (3 0 R, carrying `/Rotate 90`, `/MediaBox [0 0 200 300]`,
@@ -668,7 +664,9 @@ mod tests {
         let leaf = dict_of(&mut pdf, ObjectRef::new(4, 0));
         assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
         let Some(Object::Reference(media_box_ref)) = leaf.get("MediaBox") else {
+            // cov:ignore-start: fixture-shape guard
             panic!("expected promoted inherited /MediaBox reference, got {leaf:?}");
+            // cov:ignore-end
         };
         assert_eq!(
             pdf.resolve(*media_box_ref).unwrap(),
@@ -685,7 +683,7 @@ mod tests {
             Some(Object::Reference(resources_ref)) => {
                 assert_eq!(*resources_ref, ObjectRef::new(9, 0));
             }
-            other => panic!("expected inherited /Resources reference, got {other:?}"),
+            other => panic!("expected inherited /Resources reference, got {other:?}"), // cov:ignore: fixture-shape guard
         }
         // Reparented to root.
         assert_eq!(
@@ -964,5 +962,19 @@ mod tests {
             direct_page.get("Rotate").is_none(),
             "qpdf's direct-leaf probe has no inherited /Rotate to push"
         );
+    }
+
+    #[test]
+    fn promote_inherited_value_promotes_direct_streams() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"stream".to_vec()),
+        );
+        let promoted = promote_inherited_value(&mut pdf, stream, &mut Vec::new())
+            .expect("direct stream promotion must succeed");
+
+        assert!(promoted.is_indirect());
+        assert!(promoted.as_stream_dict().is_some());
     }
 }

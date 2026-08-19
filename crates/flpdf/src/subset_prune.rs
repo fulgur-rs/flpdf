@@ -660,11 +660,11 @@ mod tests {
         };
         let res_ref = match page1.get("Resources") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("page1 /Resources not the inherited indirect handle: {other:?}"),
+            other => panic!("page1 /Resources not the inherited indirect handle: {other:?}"), // cov:ignore: fixture-shape guard
         };
         let res_dict = match pdf.resolve_borrowed(res_ref).unwrap() {
             Object::Dictionary(d) => d.clone(),
-            other => panic!("inherited /Resources is not a dictionary: {other:?}"),
+            other => panic!("inherited /Resources is not a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
         };
         let font_dict = match res_dict.get("Font") {
             Some(Object::Dictionary(d)) => d.clone(),
