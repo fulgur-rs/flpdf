@@ -1241,6 +1241,56 @@ fn pages_secondary_encrypted_input_matches_qpdf() {
 }
 
 #[test]
+fn pages_primary_password_does_not_fall_back_to_secondary() {
+    // qpdf keeps the top-level password on the primary input. A secondary
+    // source without a page-spec password is opened with its own empty/default
+    // password attempt, not with the primary password.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let primary = fixture_abs(THREE_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (q_ok, _) = run_qpdf(&[
+        "--password=secretpw",
+        primary.to_str().unwrap(),
+        "--pages",
+        enc.to_str().unwrap(),
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        !q_ok,
+        "qpdf must not reuse the primary password for the secondary"
+    );
+    assert!(
+        !q.exists(),
+        "qpdf must not leave an output after authentication failure"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--password=secretpw",
+            primary.to_str().unwrap(),
+            "--pages",
+            enc.to_str().unwrap(),
+            "1",
+            "--",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert!(
+        !f.exists(),
+        "flpdf must not leave an output after secondary authentication failure"
+    );
+}
+
+#[test]
 fn pages_primary_encrypted_toplevel_password_matches_qpdf() {
     // qpdf authenticates the primary with the top-level password before
     // planning the selected pages. The same password must reach both the
