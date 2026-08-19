@@ -177,6 +177,10 @@ fn coalesce_discards_first_stream_non_filter_dict_entries() {
     };
 
     assert!(
+        s.dict.iter().next().is_none(),
+        "qpdf creates a fresh empty dictionary for the coalesced stream"
+    );
+    assert!(
         s.dict.get("MyMeta").is_none(),
         "unrelated first-stream dict entry must be discarded"
     );
