@@ -630,6 +630,11 @@ qpdf 11.9.0 の `QPDF::copyForeignObject`（`QPDF.cc:2019-2272`）に対応す�
 `ot_reserved` は外部に露出しない内部 reservation sentinel として
 destination-owned indirect null slot で表現する。
 
+`page_extract.rs::extract_pages` はこの canonical foreign-copy route へ切り替え済みで、
+qpdf の source-side inherited-attribute preparation と destination-side page-tree
+mutation を組み合わせる。`page_merge.rs` と共有 raw helpers は別の consumer cutover
+として残っている。
+
 ⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
 相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を
 `direct_visiting`（`ForeignObjectCopier` フィールド）で bound する。qpdf の該当

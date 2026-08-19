@@ -2,8 +2,8 @@
 //! Page extraction into a fresh minimal document.
 //!
 //! [`extract_pages`] builds a brand-new minimal [`Pdf`] (via [`Pdf::empty`])
-//! containing the selected pages from `source` plus their transitive object
-//! closure, copied across documents; [`extract_page`] is the single-page
+//! containing the selected pages from `source` plus their reachable object
+//! graph, copied across documents; [`extract_page`] is the single-page
 //! convenience form. This mirrors the qpdf *library* pattern of
 //! `QPDF::emptyPDF()` followed by `QPDFPageDocumentHelper::addPage()`: a
 //! **new** document object is constructed and populated here, then written
@@ -19,15 +19,16 @@
 //! CLI's `--pages` does, is `QPDFJob` orchestration — a distinct
 //! responsibility this module does not implement.
 //!
-//! `source` is left unmodified. Inherited page attributes (`/Resources`,
-//! `/MediaBox`, `/CropBox`, `/Rotate`) are materialized onto each extracted
-//! page exactly as [`crate::pages::tree_rebuild`] does, so the pages render
-//! identically in isolation.
+//! qpdf's foreign-page insertion first materializes inherited page attributes
+//! on the source document. Extraction follows that responsibility boundary;
+//! the source page membership and ordering remain unchanged, while its page
+//! dictionaries may gain explicit `/Resources`, `/MediaBox`, `/CropBox`, and
+//! `/Rotate` entries before the copy.
 //!
-//! Composes [`page_object_closure`](crate::page_closure::page_object_closure)
-//! and [`copy_objects`]. All selected pages
-//! are copied in a single pass, so objects shared between them (fonts, images,
-//! content streams) are copied exactly once.
+//! Composes [`PageDocumentHelper::push_inherited_attributes_to_pages`] with the
+//! canonical [`Pdf::copy_foreign_object`] route. The destination keeps qpdf's
+//! per-source identity map alive across all selected pages, so objects shared
+//! between them (fonts, images, content streams) are copied exactly once.
 //!
 //! # Page labels
 //!
@@ -45,20 +46,18 @@
 //!
 //! Carriers such as annotation destinations, action dictionaries, structure
 //! destinations, and article-thread beads keep their copied page references.
-//! If such a reference caused an unselected source page to enter the copied
-//! closure, that copied page object is replaced with `null`, matching qpdf's
-//! page-selection behavior without interpreting the carrier's semantics.
+//! A reference to an unselected source page reaches qpdf's `/Pages` boundary
+//! during `copyForeignObject` and becomes a destination-owned `null`
+//! placeholder, matching qpdf's page-selection behavior without interpreting
+//! the carrier's semantics.
 
-use crate::object_copy::{copy_objects, rewrite_refs};
-use crate::page_closure::extend_page_object_closure;
+use crate::object_copy::rewrite_refs;
 use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::tree_rebuild::resolve_inherited_raw;
-use crate::pages::{
-    page_refs, resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
-};
+use crate::pages::{page_refs, resolve_inherited_resources_with_max_depth};
 use crate::subset_prune::sweep_unreachable_objects;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
@@ -95,9 +94,9 @@ impl InheritedAttrs {
 /// Returns an owned in-memory [`Pdf`] whose catalog has a single-level
 /// `/Pages` tree with one `/Kids` entry per selected index, in **selection
 /// order** (any order is accepted, matching qpdf's `--pages` selection
-/// semantics). Selected pages are copied in a single pass with one shared
-/// renumbering map, so objects referenced by several selected pages (fonts,
-/// images, content streams) appear exactly once in the output.
+/// semantics). Selected pages are copied through one destination-side
+/// per-source identity map, so objects referenced by several selected pages
+/// (fonts, images, content streams) appear exactly once in the output.
 ///
 /// An index may appear more than once. The second and later occurrences of a
 /// page become shallow clones of its first copy: each duplicate gets its own
@@ -105,14 +104,16 @@ impl InheritedAttrs {
 /// `/Resources`, `/Annots`, `/B`) stay shared between the duplicates,
 /// matching qpdf 11.9.0's observed duplicate-page output.
 ///
-/// The returned document is already minimal: copied ancestor `/Pages` nodes
-/// left over from the closure are pruned (mark-and-sweep from the new
-/// catalog) before returning. Write it with [`crate::PdfWriter`], which always
-/// emits a fresh qpdf-style document rewrite.
+/// The returned document is already minimal: the canonical foreign copier's
+/// `/Pages` boundary is attached to the fresh single-level root, and a
+/// mark-and-sweep from the new catalog removes any other unreachable
+/// construction objects before returning. Write it with [`crate::PdfWriter`],
+/// which always emits a fresh qpdf-style document rewrite.
 ///
-/// `source` is not modified. See also [`extract_page`] for the single-page
-/// form, and the [module documentation](self) for how references to removed
-/// pages are handled and how `/PageLabels` is reconstructed for the selection.
+/// See also [`extract_page`] for the single-page form, and the [module
+/// documentation](self) for qpdf's source-side inherited-attribute
+/// materialization, how references to removed pages are handled, and how
+/// `/PageLabels` is reconstructed for the selection.
 ///
 /// # Examples
 ///
@@ -157,48 +158,74 @@ pub fn extract_pages<R: Read + Seek>(
         selected.push(page_ref);
     }
 
-    // Unique source pages in first-occurrence order. Duplicates re-use the
-    // same copied object and are shallow-cloned when building /Kids below.
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut unique: Vec<ObjectRef> = Vec::with_capacity(selected.len());
-    for &page_ref in &selected {
-        if seen.insert(page_ref) {
-            unique.push(page_ref);
-        }
-    }
-
-    // Resolve inherited attributes from the SOURCE before copying severs the
-    // /Parent chain. Same four attributes / helpers as pages::tree_rebuild.
-    let depth = DEFAULT_MAX_PAGE_TREE_DEPTH;
-    let mut inherited: Vec<InheritedAttrs> = Vec::with_capacity(unique.len());
-    for &page_ref in &unique {
-        inherited.push(InheritedAttrs::resolve(source, page_ref, depth)?);
-    }
-
-    // UNION of the per-page transitive closures, then ONE deep-copy pass into
-    // a fresh minimal doc: a single renumbering map means an object shared by
-    // several selected pages is copied exactly once. The closures share one
-    // `visited` set so a subtree reachable from several selected pages is
-    // walked once for the whole union, not once per referencing page.
-    let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
-    for &page_ref in &unique {
-        extend_page_object_closure(source, page_ref, &mut closure)?;
-    }
+    // qpdf first flattens the destination page tree, then prepares inherited
+    // attributes on the foreign source before calling copyForeignObject. Keep
+    // those two responsibility boundaries separate: the source helper performs
+    // only the qpdf-compatible inherited-attribute push, while the extraction
+    // route below performs the canonical foreign copy and page-tree mutations.
     let mut target = Pdf::empty()?;
-    let map = copy_objects(source, &mut target, &closure)?;
-    null_copied_removed_pages(&mut target, &all_pages, &seen, &map);
     let pages_root_ref = target_pages_root(&mut target)?;
+    PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
 
-    // Materialize inherited attrs onto each copied leaf (remapping refs), then
-    // repoint /Parent at the fresh root.
-    let mut copied_unique: Vec<ObjectRef> = Vec::with_capacity(unique.len());
-    for (&src_ref, attrs) in unique.iter().zip(inherited) {
-        let copied_page_ref = *map
-            .get(&src_ref)
+    // Copy each unique selected page through the destination's persistent
+    // qpdf ObjCopier map. If a page was encountered earlier as a nested
+    // `/Page` boundary, a later top-level copy fills that same reservation.
+    let mut page_map = BTreeMap::new();
+    for &source_page_ref in &selected {
+        if page_map.contains_key(&source_page_ref) {
+            continue;
+        }
+        let source_page = source.get_object_handle(source_page_ref);
+        let copied_page = target.copy_foreign_object(&source_page)?;
+        let copied_page_ref = copied_page
+            .object_ref()
             .ok_or(Error::Missing("extracted page missing from copy map"))?;
-        materialize_leaf(&mut target, copied_page_ref, attrs, &map, pages_root_ref)?;
-        copied_unique.push(copied_page_ref);
+        page_map.insert(source_page_ref, copied_page_ref);
     }
+
+    // qpdf::insertPage replaces the copied page's `/Parent` through the live
+    // destination handle, before it inserts that page into `/Kids`.
+    let pages_handle = target.get_object_handle(pages_root_ref);
+    for &copied_page_ref in page_map.values() {
+        let page = target.get_object_handle(copied_page_ref);
+        target.resolve_object_handle(&page)?;
+        page.replace_key(b"/Parent", pages_handle.clone())?;
+        target.mark_object_handle_dirty(&page)?;
+    }
+
+    // Build `/Kids` in selection order. Repeated selections reuse the copied
+    // page identity as the first occurrence and then shallow-copy its page
+    // dictionary into a fresh indirect object, preserving shared child
+    // identities exactly as QPDF_pages.cc:233-237 does.
+    let mut kids = Vec::with_capacity(selected.len());
+    let mut used = BTreeSet::new();
+    for &source_page_ref in &selected {
+        let copied_page_ref = *page_map
+            .get(&source_page_ref)
+            .ok_or(Error::Missing("extracted page missing from copy map"))?;
+        let kid = if used.insert(copied_page_ref) {
+            copied_page_ref
+        } else {
+            let page = target.get_object_handle(copied_page_ref);
+            let clone = target.make_indirect_object_handle(page.shallow_copy()?)?;
+            clone.object_ref().ok_or(Error::Missing(
+                "duplicate extracted page missing from target",
+            ))?
+        };
+        kids.push(kid);
+    }
+
+    let root = target.get_object_handle(pages_root_ref);
+    root.replace_key(
+        b"/Kids",
+        ObjectHandle::array(
+            kids.iter()
+                .map(|&kid| target.get_object_handle(kid))
+                .collect(),
+        ),
+    )?; // cov:ignore: Pdf::empty creates a dictionary /Pages root, so this defensive replace_key error is unreachable
+    root.replace_key(b"/Count", ObjectHandle::integer(kids.len() as i64))?;
+    target.mark_object_handle_dirty(&root)?;
 
     // /PageLabels (qpdf `addPage`-based reconstruction parity — the same
     // per-page accumulation `QPDFJob::handlePageSpecs` performs while adding
@@ -215,32 +242,9 @@ pub fn extract_pages<R: Read + Seek>(
         }
     }
 
-    // Build /Kids in SELECTION order. The first occurrence of a source page
-    // uses its mapped copy; later occurrences get a shallow clone of the
-    // materialized first copy: a fresh page object whose
-    // indirectly referenced sub-objects (/Contents, /Resources, /Annots, /B)
-    // stay shared, matching qpdf's observed duplicate-page output and
-    // pages::tree_rebuild's duplicate-selection scheme.
-    let mut kids: Vec<ObjectRef> = Vec::with_capacity(selected.len());
-    let mut used: BTreeSet<ObjectRef> = BTreeSet::new();
-    append_selection_kids(&mut target, &selected, &map, &mut used, &mut kids)?;
-
-    // Build the fresh single-level /Pages root.
-    let mut root = resolve_dict(
-        &mut target,
-        pages_root_ref,
-        "target /Pages is not a dictionary",
-    )?;
-    root.insert(
-        "Kids",
-        Object::Array(kids.iter().map(|&r| Object::Reference(r)).collect()),
-    );
-    root.insert("Count", Object::Integer(kids.len() as i64));
-    target.set_object(pages_root_ref, Object::Dictionary(root));
-
-    // Drop the copied ancestor /Pages node(s) and any objects only they
-    // referenced before handing the graph to the canonical writer. This keeps
-    // the page-operation graph explicitly free of unrelated objects.
+    // The canonical handle mutations above built the fresh single-level
+    // /Pages root. Drop any objects that were made unreachable by that rebuild
+    // before handing the graph to the canonical writer.
     sweep_unreachable_objects(&mut target)?;
 
     Ok(target)
@@ -271,7 +275,8 @@ pub(crate) fn null_copied_removed_pages<R: Read + Seek>(
 ///
 /// Single-page convenience form of [`extract_pages`]: the returned document's
 /// catalog has a single-level `/Pages` tree with a single entry in `/Kids`.
-/// `source` is not modified.
+/// qpdf may materialize inherited page attributes on `source` while preparing
+/// the foreign copy; page membership and ordering remain unchanged.
 ///
 /// # Errors
 ///

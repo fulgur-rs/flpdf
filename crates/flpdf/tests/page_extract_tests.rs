@@ -45,6 +45,21 @@ fn two_page_pdf() -> Vec<u8> {
     )
 }
 
+/// An indirect null resource entry is visible to the legacy pre-closed copier
+/// but qpdf's `copyForeignObject` omits it through `getKeys()` null filtering.
+fn page_with_indirect_null_resource_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /Null 4 0 R >> >> >>"),
+            (4, "null"),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ],
+        1,
+    )
+}
+
 /// Resolve the catalog's /Pages dict from a freshly-extracted document.
 fn pages_dict(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
     let catalog_ref = doc.root_ref().unwrap();
@@ -147,6 +162,30 @@ fn extracts_single_page_with_count_one() {
     }
 }
 
+#[test]
+fn extract_omits_indirect_null_dictionary_entries_like_qpdf_copy_foreign_object() {
+    let src = page_with_indirect_null_resource_pdf();
+    let mut source = Pdf::open_mem_owned(src).unwrap();
+
+    let mut out = extract_page(&mut source, 0).unwrap();
+    let leaf = only_leaf(&mut out);
+    let fonts = leaf
+        .get("Resources")
+        .and_then(|resources| resources.as_dict())
+        .and_then(|resources| resources.get("Font"))
+        .and_then(Object::as_dict)
+        .expect("/Resources /Font dictionary");
+
+    assert!(
+        fonts.get("F1").is_some(),
+        "live font entry must be retained"
+    );
+    assert!(
+        fonts.get("Null").is_none(),
+        "qpdf copyForeignObject drops an indirect-null dictionary entry"
+    );
+}
+
 /// The extracted document is built the same way qpdf's library-level
 /// `QPDF::emptyPDF()` + `QPDFPageDocumentHelper::addPage()` pattern would:
 /// neither call touches the document's PDF version, so the result carries
@@ -187,19 +226,18 @@ fn materializes_inherited_attributes() {
     let leaf = only_leaf(&mut out);
 
     assert_eq!(
-        leaf.get("MediaBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf.get("MediaBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
             Object::Integer(400),
             Object::Integer(500),
-        ]))
+        ])
     );
     assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
 
-    let res = leaf
-        .get("Resources")
-        .and_then(|o| o.as_dict())
+    let res = resolve_indirect_value(&mut out, leaf.get("Resources").unwrap().clone())
+        .into_dict()
         .expect("/Resources");
     let font_ref = res
         .get("Font")
@@ -246,23 +284,23 @@ fn materializes_inherited_cropbox() {
 
     // Own /MediaBox preserved.
     assert_eq!(
-        leaf.get("MediaBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf.get("MediaBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
             Object::Integer(612),
             Object::Integer(792),
-        ]))
+        ])
     );
     // Inherited /CropBox materialized onto the leaf.
     assert_eq!(
-        leaf.get("CropBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf.get("CropBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(5),
             Object::Integer(5),
             Object::Integer(590),
             Object::Integer(770),
-        ]))
+        ])
     );
 }
 
@@ -335,23 +373,23 @@ fn materializes_intermediate_mediabox_and_cropbox() {
 
     // Inherited /MediaBox materialized onto the leaf.
     assert_eq!(
-        leaf.get("MediaBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf.get("MediaBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
             Object::Integer(612),
             Object::Integer(792),
-        ]))
+        ])
     );
     // Inherited /CropBox materialized onto the leaf.
     assert_eq!(
-        leaf.get("CropBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf.get("CropBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(10),
             Object::Integer(10),
             Object::Integer(600),
             Object::Integer(780),
-        ]))
+        ])
     );
 }
 
@@ -506,17 +544,18 @@ fn extracted_doc_has_no_unrelated_objects() {
         "page 2's image must not leak in"
     );
 
-    // Exactly one /Pages node — the fresh root. The copied ancestor /Pages node
-    // must have been pruned by the sweep (no orphan left in the object table).
+    // Exactly one /Pages node — the fresh destination root. The canonical
+    // foreign copier stops at the source /Pages boundary, so no source
+    // ancestor remains in the object table.
     assert_eq!(
         count_type(&mut out, b"Pages"),
         1,
-        "no orphan ancestor /Pages node"
+        "only the fresh destination /Pages root must remain"
     );
     assert_eq!(pages::page_refs(&mut out).unwrap().len(), 1);
 
-    // Sanity: the pruned document still writes and reopens to a single page,
-    // with no orphan /Pages reappearing.
+    // Sanity: the minimal document still writes and reopens to a single page,
+    // with no source /Pages node reappearing.
     let mut bytes = Vec::new();
     write_default(&mut out, &mut bytes).unwrap();
     let mut rt = Pdf::open_mem_owned(bytes).unwrap();
@@ -524,7 +563,7 @@ fn extracted_doc_has_no_unrelated_objects() {
     assert_eq!(
         count_type(&mut rt, b"Pages"),
         1,
-        "no orphan /Pages after round-trip"
+        "no source /Pages node after round-trip"
     );
 }
 
@@ -585,7 +624,7 @@ fn out_of_range_index_errors() {
 }
 
 #[test]
-fn source_is_not_modified_by_extract() {
+fn source_page_membership_and_order_remain_stable_after_extract() {
     let src = two_page_pdf();
     let mut source = Pdf::open_mem_owned(src).unwrap();
     let before = pages::page_refs(&mut source).unwrap();
@@ -593,17 +632,18 @@ fn source_is_not_modified_by_extract() {
 
     let _ = extract_page(&mut source, 0).unwrap();
 
-    // Source still has both pages, unchanged refs/order.
+    // qpdf may materialize inherited attributes, but source page membership
+    // and ordering remain unchanged.
     let after = pages::page_refs(&mut source).unwrap();
     assert_eq!(
         after, before,
-        "extract_page must not mutate the source page tree"
+        "extract_page must preserve the source page tree"
     );
 }
 
 /// Page 0 (obj 3) has a Link annotation (obj 5) whose explicit /Dest targets the
-/// SIBLING page (obj 4). The sibling and its ancestor /Pages currently leak into
-/// the extracted doc.
+/// SIBLING page (obj 4). The canonical foreign copier must retain the carrier
+/// while replacing the unselected page at the `/Pages` boundary.
 fn cross_page_link_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -636,7 +676,7 @@ fn cross_page_link_keeps_dest_and_nulls_removed_page() {
     assert_eq!(
         count_type(&mut out, b"Pages"),
         1,
-        "ancestor /Pages must be pruned once the copied sibling becomes null"
+        "only the fresh destination /Pages root must remain"
     );
 
     // Annotation and /Dest are retained; the referenced page resolves to null.
@@ -1585,8 +1625,8 @@ fn aa_with_only_local_subaction_is_unchanged() {
 #[test]
 fn indirect_next_cycle_is_preserved_and_removed_page_is_null() {
     // /A -> action 8 whose /Next is 9, and 9's /Next is 8 (an A<->B indirect
-    // cycle). Both are cross-page GoTos. Generic closure traversal terminates
-    // via its visited set, and both /D carriers target the same nulled page.
+    // cycle). Both are cross-page GoTos. The canonical copier preserves the
+    // action cycle and both /D carriers target the same null boundary.
     let src = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -1829,8 +1869,8 @@ fn action_goto_sd_named_dest_is_preserved() {
 
 #[test]
 fn annot_p_is_preserved_and_removed_page_is_null() {
-    // A malformed annotation /P points at the SIBLING page (obj 4); the closure
-    // copies the sibling, whose copied object is then replaced with null.
+    // A malformed annotation /P points at the SIBLING page (obj 4); the
+    // canonical copier reaches the `/Pages` boundary and leaves a null target.
     let pdf = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -2260,13 +2300,13 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
 
     let leaf0 = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
     assert_eq!(
-        leaf0.get("MediaBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf0.get("MediaBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
             Object::Integer(100),
             Object::Integer(200),
-        ])),
+        ]),
         "leaf 0 inherits /MediaBox from its own parent (obj 3)"
     );
     assert_eq!(
@@ -2277,30 +2317,30 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
 
     let leaf1 = out.resolve(page_refs[1]).unwrap().into_dict().unwrap();
     assert_eq!(
-        leaf1.get("MediaBox"),
-        Some(&Object::Array(vec![
+        resolve_indirect_value(&mut out, leaf1.get("MediaBox").unwrap().clone()),
+        Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
             Object::Integer(300),
             Object::Integer(400),
-        ])),
+        ]),
         "leaf 1 inherits /MediaBox from its own parent (obj 4), not leaf 0's"
     );
-    // flpdf materializes /Rotate explicitly on every extracted leaf; with no
-    // /Rotate anywhere in leaf 1's parent chain, the default 0 is written out.
-    assert_eq!(
-        leaf1.get("Rotate"),
-        Some(&Object::Integer(0)),
-        "leaf 1 must NOT inherit leaf 0's /Rotate 90; the default 0 is materialized"
+    // qpdf's foreign-page insertion does not synthesize a /Rotate key when
+    // the source page tree has no inherited rotation for that leaf.
+    assert!(
+        leaf1.get("Rotate").is_none(),
+        "leaf 1 must not inherit leaf 0's /Rotate 90 or synthesize a default"
     );
 }
 
 #[test]
-fn bead_p_via_indirect_chain_is_preserved_and_removed_page_is_null() {
-    // The sibling bead (obj 11) is reached from the on-page bead's /N through an
-    // indirect-reference chain (obj 13 is itself `11 0 R`). Generic closure
-    // traversal follows the chain; bead 11's /P 4 0 R remains and resolves to
-    // the nulled copied page.
+fn legacy_reference_value_is_rejected_by_canonical_foreign_copy() {
+    // Object 13 is created below through Pdf::set_object as an indirect object
+    // whose value is itself a reference. qpdf's ObjectHandle graph cannot
+    // represent that raw-cache shape: a parsed indirect reference is already
+    // the target handle. The canonical foreign copier must reject it rather
+    // than preserve a source-number reference into the destination.
     let pdf = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R >>"),
@@ -2333,32 +2373,15 @@ fn bead_p_via_indirect_chain_is_preserved_and_removed_page_is_null() {
         ObjectRef::new(13, 0),
         Object::Reference(ObjectRef::new(11, 0)),
     );
-    let mut out = extract_page(&mut src, 0).unwrap();
-    assert_eq!(
-        count_type(&mut out, b"Page"),
-        1,
-        "copied unselected page must be nulled"
-    );
-    let leaf = only_leaf(&mut out);
-    assert!(leaf.get("B").is_some(), "page /B must be retained");
-    let bead_ref = leaf
-        .get("B")
-        .and_then(Object::as_array)
-        .and_then(|beads| beads.first())
-        .and_then(Object::as_ref_id)
-        .unwrap();
-    let bead = out.resolve(bead_ref).unwrap().into_dict().unwrap();
-    let sibling_bead = resolve_indirect_value(
-        &mut out,
-        bead.get("N").cloned().expect("indirect bead /N retained"),
-    )
-    .into_dict()
-    .unwrap();
-    assert_reference_target_is_null(
-        &mut out,
-        sibling_bead.get("P").expect("sibling bead /P retained"),
-        "indirect sibling bead /P target must resolve to null",
-    );
+    let err = match extract_page(&mut src, 0) {
+        Ok(_) => panic!("canonical foreign copy must reject a raw reference-value holder"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        flpdf::Error::System(message)
+            if message == "QPDF::copyForeign encountered an object whose value is itself a reference"
+    ));
 }
 
 // ---------------------------------------------------------------------------
