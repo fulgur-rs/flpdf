@@ -4695,8 +4695,16 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // already copied selected pages into a fresh plaintext Pdf, so its writer
     // cannot rediscover the primary's encryption from the merged document.
     // Carry the authenticated donor explicitly to the final writer; split
-    // chunks remain cleartext, matching qpdf's fresh chunk writers.
-    if page_ops.split_pages.is_none() && options.copy_encryption.is_none() {
+    // chunks remain cleartext, matching qpdf's fresh chunk writers. Gate on
+    // the same conditions as `PdfWriter::prepared_write_options`'s implicit
+    // `can_preserve` (`writer/pdf_writer.rs:589-596`) so an explicit source
+    // doesn't bypass qpdf's QDF-is-always-cleartext contract
+    // (`cell_a_encrypted_input_is_transparently_decrypted_by_qdf`).
+    if page_ops.split_pages.is_none()
+        && options.copy_encryption.is_none()
+        && !options.qdf
+        && !options.content_normalization
+    {
         options.copy_encryption = primary_copy_encryption;
     }
     // qpdf keeps a provider-backed source QPDF alive when

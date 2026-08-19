@@ -1333,3 +1333,51 @@ fn pages_encrypted_primary_plaintext_secondary_preserves_primary_encryption() {
         npages_of_with_password(&f, "secretpw")
     );
 }
+
+#[test]
+fn pages_qdf_with_encrypted_primary_produces_cleartext_output() {
+    // qpdf's QDF output is always cleartext regardless of source encryption
+    // (single-document contract exercised by
+    // cell_a_encrypted_input_is_transparently_decrypted_by_qdf). --qdf must
+    // keep that contract for the multi-source --pages merge path too, even
+    // though the primary's authenticated CopyEncryptionSource is carried
+    // forward for the non-QDF case.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let secondary = fixture_abs(THREE_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (ok, stderr) = run_qpdf(&[
+        "--qdf",
+        "--password=secretpw",
+        enc.to_str().unwrap(),
+        "--pages",
+        secondary.to_str().unwrap(),
+        "1-2",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(ok || q.exists(), "qpdf --qdf merge failed: {stderr}");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--qdf",
+            "--password=secretpw",
+            enc.to_str().unwrap(),
+            "--pages",
+            secondary.to_str().unwrap(),
+            "1-2",
+            "--",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_cleartext_chunk(&q);
+    assert_qpdf_cleartext_chunk(&f);
+    assert_eq!(npages_of(&q), npages_of(&f));
+}
