@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn add_attachments_tolerates_a_pdf_without_catalog_root() {
+    fn set_attachment_page_mode_tolerates_a_pdf_without_catalog_root() {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let object_offset = bytes.len();
         bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
@@ -691,9 +691,9 @@ mod tests {
             pdf.root_ref().is_none(),
             "fixture must have no catalog root"
         );
-        let mut job = QPDFJob::new();
-        job.add_attachments(&mut pdf, &[])
-            .expect("empty add operation must tolerate missing root");
+        let job = QPDFJob::new();
+        job.set_attachment_page_mode(&mut pdf)
+            .expect("missing root must be tolerated");
     }
 
     #[test]
