@@ -4699,11 +4699,19 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // the same conditions as `PdfWriter::prepared_write_options`'s implicit
     // `can_preserve` (`writer/pdf_writer.rs:589-596`) so an explicit source
     // doesn't bypass qpdf's QDF-is-always-cleartext contract
-    // (`cell_a_encrypted_input_is_transparently_decrypted_by_qdf`).
+    // (`cell_a_encrypted_input_is_transparently_decrypted_by_qdf`) or its
+    // `decode_level == DecodeLevel::None` requirement: `--stream-data`
+    // `Uncompress`/`Compress` raise the writer's decode level above `None`
+    // (`WriterConfiguration::set_stream_data_mode`, `writer/pdf_writer.rs:100-108`),
+    // which `can_preserve` would likewise refuse to auto-preserve through.
     if page_ops.split_pages.is_none()
         && options.copy_encryption.is_none()
         && !options.qdf
         && !options.content_normalization
+        && !matches!(
+            options.stream_data,
+            Some(StreamDataMode::Uncompress) | Some(StreamDataMode::Compress)
+        )
     {
         options.copy_encryption = primary_copy_encryption;
     }
