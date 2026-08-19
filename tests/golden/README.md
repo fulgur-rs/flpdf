@@ -110,3 +110,13 @@ holder, and stores the raw payload length `1` in that holder.
 
 qpdf command:
 `qpdf --static-id --qdf --warning-exit-0 tests/fixtures/compat/qdf-ignore-newline.pdf tests/golden/references/qdf-ignore-newline/qdf-static-id.pdf`.
+
+## Coalesced page contents QDF byte gate (flpdf-egzr.3.2.6.4)
+
+`multi-contents-one-page/coalesce-qdf.pdf` pins the CLI
+`--qdf --coalesce-contents --static-id` path. The fixture's first decoded
+content stream already ends in LF, so qpdf must not insert a second separator
+before the following stream.
+
+qpdf command:
+`qpdf --qdf --coalesce-contents --static-id --warning-exit-0 tests/fixtures/compat/multi-contents-one-page.pdf tests/golden/references/multi-contents-one-page/coalesce-qdf.pdf`.

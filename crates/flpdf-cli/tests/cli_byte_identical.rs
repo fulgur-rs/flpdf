@@ -77,6 +77,29 @@ fn run_cli_full_rewrite_static_id(stem: &str) -> Vec<u8> {
     std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
 }
 
+/// Run `flpdf rewrite --qdf --coalesce-contents --static-id <fixture> <out>`
+/// through the actual binary and return the written bytes. The QDF framing
+/// makes this a byte-stable end-to-end gate for the page-content coalescer,
+/// including the conditional separator between adjacent decoded streams.
+fn run_cli_coalesce_qdf_static_id(stem: &str) -> Vec<u8> {
+    let outdir = tempfile::tempdir().unwrap();
+    let out = outdir.path().join("out.pdf");
+    let input = fixture(stem);
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("rewrite")
+        .arg("--qdf")
+        .arg("--coalesce-contents")
+        .arg("--static-id")
+        .arg(&input)
+        .arg(&out)
+        .assert()
+        .success();
+
+    std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
+}
+
 fn assert_byte_identical(stem: &str, kind: &str, extra: &[&str]) {
     let actual = run_cli(stem, extra);
     let expected = golden(stem, kind);
@@ -187,4 +210,37 @@ fn cli_two_page_full_rewrite_static_id_byte_identical() {
 #[test]
 fn cli_three_page_full_rewrite_static_id_byte_identical() {
     assert_full_rewrite_static_id_byte_identical("three-page");
+}
+
+// ── QDF coalesce-contents: conditional separator between stream segments ────
+//
+// multi-contents-one-page.pdf has a non-final content stream whose decoded
+// bytes already end in LF. qpdf's pipeContentStreams leaves that LF in place
+// and does not add a second one before the next stream.
+
+fn assert_coalesce_qdf_byte_identical(stem: &str) {
+    let actual = run_cli_coalesce_qdf_static_id(stem);
+    let expected = golden(stem, "coalesce-qdf");
+    if actual == expected {
+        return;
+    }
+    let common = actual.len().min(expected.len());
+    let off = (0..common)
+        .find(|&i| actual[i] != expected[i])
+        .unwrap_or(common);
+    let lo = off.saturating_sub(24);
+    panic!(
+        "{stem} (coalesce-qdf): CLI output diverged from qpdf golden \
+         (flpdf={} bytes, golden={} bytes, first diff at byte {off})\n\
+         flpdf : {:?}\ngolden: {:?}",
+        actual.len(),
+        expected.len(),
+        String::from_utf8_lossy(&actual[lo..(off + 24).min(actual.len())]),
+        String::from_utf8_lossy(&expected[lo..(off + 24).min(expected.len())]),
+    );
+}
+
+#[test]
+fn cli_multi_contents_coalesce_qdf_byte_identical() {
+    assert_coalesce_qdf_byte_identical("multi-contents-one-page");
 }
