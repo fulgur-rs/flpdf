@@ -624,7 +624,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// helper snapshots the authenticated file key, the source `/Encrypt`
     /// dictionary, and the permanent `/ID[0]`; the writer then applies qpdf's
     /// canonical copy rules (including forcing AES for V>=4).
-    pub(crate) fn writer_copy_encryption_source(&mut self) -> Result<Option<CopyEncryptionSource>> {
+    pub fn writer_copy_encryption_source(&mut self) -> Result<Option<CopyEncryptionSource>> {
         let (file_key, encryption_v) = {
             let guard = self.encryption.borrow();
             let Some(encryption) = guard.as_ref() else {
