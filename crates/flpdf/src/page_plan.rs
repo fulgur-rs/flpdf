@@ -59,7 +59,7 @@ pub struct SelectedPage {
 /// expression order, with deduplication already handled by [`PageRange::resolve`].
 ///
 /// The selected page refs it produces feed directly into
-/// [`rebuild_page_tree`](crate::page_tree_rebuild::rebuild_page_tree), which
+/// [`rebuild_page_tree`](crate::pages::tree_rebuild::rebuild_page_tree), which
 /// rewrites the document's `/Pages` tree to contain exactly those pages. For an
 /// end-to-end extraction walkthrough see the runnable `examples/extract_pages.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]

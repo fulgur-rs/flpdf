@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements.
 //! Structure-tree `/Pg` reference drop after page extraction.
 //!
-//! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page
+//! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree for a subset extraction, this module updates the structure tree
 //! (catalog `/StructTreeRoot`, ISO 32000-2 §14.7) to match qpdf's `--pages`
 //! behaviour for structure elements:
@@ -38,7 +38,7 @@
 //! which survive via `/K` and are remapped by the writer — so it needs no
 //! handling here.
 
-use crate::page_tree_rebuild::RebuildResult;
+use crate::pages::tree_rebuild::RebuildResult;
 use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,7 +66,7 @@ struct WalkState {
 /// (qpdf `--pages` parity).
 ///
 /// `result` is the [`RebuildResult`] returned by
-/// [`crate::page_tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
 /// old → new page reference mapping: a page absent from the map was removed; a
 /// page present maps to `ref_map[old][0]` (first new occurrence).
 ///

@@ -4026,7 +4026,7 @@ fn action_goto_two_page_pdf() -> Vec<u8> {
 /// Selecting a page more than once (e.g. `qpdf --pages . 1,1`) clones the
 /// second-and-later occurrences to fresh object numbers, while the first
 /// occurrence keeps the source page's original ref (see
-/// `page_tree_rebuild.rs`'s "First occurrence: mutate the existing object in
+/// `pages/tree_rebuild.rs`'s "First occurrence: mutate the existing object in
 /// place" branch — [`crate`]-level `rebuild_page_tree` never renumbers a
 /// singly-selected page). Selecting page 30 twice below is what makes this
 /// test meaningful: it proves a GoTo action's `/D` is remapped to the FIRST

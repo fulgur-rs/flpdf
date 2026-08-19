@@ -138,7 +138,6 @@ pub mod page_plan;
 pub mod page_range;
 pub mod page_rotate;
 pub mod page_splice;
-pub mod page_tree_rebuild;
 pub mod pages;
 pub mod parser;
 pub mod pdf;
@@ -248,7 +247,7 @@ pub use page_rotate::{
     resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
 };
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
-pub use page_tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
+pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;
 pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, PdfVersion};

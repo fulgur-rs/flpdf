@@ -11,6 +11,7 @@ pub(crate) mod repair;
 #[cfg(feature = "qtest-driver")]
 #[doc(hidden)]
 pub mod repair;
+pub mod tree_rebuild;
 
 use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::pipeline::buffer::Buffer;

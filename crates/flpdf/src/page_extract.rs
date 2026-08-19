@@ -21,7 +21,7 @@
 //!
 //! `source` is left unmodified. Inherited page attributes (`/Resources`,
 //! `/MediaBox`, `/CropBox`, `/Rotate`) are materialized onto each extracted
-//! page exactly as [`crate::page_tree_rebuild`] does, so the pages render
+//! page exactly as [`crate::pages::tree_rebuild`] does, so the pages render
 //! identically in isolation.
 //!
 //! Composes [`page_object_closure`](crate::page_closure::page_object_closure)
@@ -53,7 +53,7 @@ use crate::object_copy::{copy_objects, rewrite_refs};
 use crate::page_closure::extend_page_object_closure;
 use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
-use crate::page_tree_rebuild::resolve_inherited_raw;
+use crate::pages::tree_rebuild::resolve_inherited_raw;
 use crate::pages::{
     page_refs, resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
@@ -168,7 +168,7 @@ pub fn extract_pages<R: Read + Seek>(
     }
 
     // Resolve inherited attributes from the SOURCE before copying severs the
-    // /Parent chain. Same four attributes / helpers as page_tree_rebuild.
+    // /Parent chain. Same four attributes / helpers as pages::tree_rebuild.
     let depth = DEFAULT_MAX_PAGE_TREE_DEPTH;
     let mut inherited: Vec<InheritedAttrs> = Vec::with_capacity(unique.len());
     for &page_ref in &unique {
@@ -220,7 +220,7 @@ pub fn extract_pages<R: Read + Seek>(
     // materialized first copy: a fresh page object whose
     // indirectly referenced sub-objects (/Contents, /Resources, /Annots, /B)
     // stay shared, matching qpdf's observed duplicate-page output and
-    // page_tree_rebuild's duplicate-selection scheme.
+    // pages::tree_rebuild's duplicate-selection scheme.
     let mut kids: Vec<ObjectRef> = Vec::with_capacity(selected.len());
     let mut used: BTreeSet<ObjectRef> = BTreeSet::new();
     append_selection_kids(&mut target, &selected, &map, &mut used, &mut kids)?;
@@ -415,7 +415,7 @@ pub(crate) fn resolve_dict(
 
 /// `true` when `dict` carries `key` as something other than `null`
 /// (ISO 32000-1 §7.3.9: explicit `null` == absent). Mirrors
-/// `page_tree_rebuild::leaf_has_own`.
+/// `pages::tree_rebuild::leaf_has_own`.
 fn has_own(dict: &Dictionary, key: &str) -> bool {
     !matches!(dict.get(key), None | Some(Object::Null))
 }
