@@ -1,4 +1,4 @@
-//! qpdf correspondence: `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:876-927,2046-2090`).
+//! qpdf correspondence: `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:876-927,2046-2087`).
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::attachment_list::format_attachment_list_with_sink;
@@ -12,8 +12,11 @@ use std::path::PathBuf;
 /// The path is retained by the provider-backed embedded-file stream; the
 /// payload is not materialized by the job. `creation_date` and
 /// `modification_date` carry raw PDF date strings so an explicit qpdf date is
-/// preserved byte-for-byte. When omitted, the job supplies qpdf's current UTC
-/// PDF date at the start of the operation.
+/// preserved byte-for-byte. When omitted, the job supplies the current date
+/// in UTC (`D:YYYYMMDDHHMMSSZ`). qpdf instead derives its default date from
+/// local wall-clock time plus the system's UTC offset, emitting `Z` only
+/// when that offset is zero and `+HH'MM'`/`-HH'MM'` otherwise
+/// (`QUtil::get_current_qpdf_time`, `libqpdf/QUtil.cc:867-934`).
 #[derive(Debug, Clone)]
 pub struct AttachmentAddOptions {
     /// Path whose bytes are embedded.
@@ -71,6 +74,20 @@ fn civil_from_days(days_since_epoch: i64) -> (u16, u8, u8) {
     (year as u16, month as u8, day as u8)
 }
 
+// qpdf's `QUtil::safe_fopen` reports `"open " + filename + ": " +
+// strerror(errno)` (`libqpdf/QUtil.cc:512-515`, `QPDFSystemError.cc:12-27`),
+// with no numeric error code. `std::io::Error`'s `Display` appends a
+// `" (os error N)"` suffix that qpdf's message lacks; strip it so the two
+// diagnostics match byte-for-byte on POSIX hosts.
+fn qpdf_style_open_error(path: &std::path::Path, error: std::io::Error) -> Error {
+    let rendered = error.to_string();
+    let message = error
+        .raw_os_error()
+        .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+        .unwrap_or(&rendered);
+    Error::System(format!("open {}: {message}", path.display()))
+}
+
 impl QPDFJob {
     /// Add one or more provider-backed attachments through the shared qpdf
     /// job lifecycle.
@@ -87,6 +104,12 @@ impl QPDFJob {
         pdf: &mut Pdf<R>,
         options: &[AttachmentAddOptions],
     ) -> Result<()> {
+        // qpdf's sole caller only invokes `addAttachments` when
+        // `attachments_to_add` is non-empty (`QPDFJob.cc:2241-2243`); an
+        // empty batch is a no-op there, so no page-mode change happens.
+        if options.is_empty() {
+            return Ok(());
+        }
         pdf.set_logger(self.logger());
         self.set_attachment_page_mode(pdf)?;
 
@@ -114,9 +137,8 @@ impl QPDFJob {
             // EmbeddedFile so that it can compute /Params /Size and /CheckSum.
             // Keep that failure at the job boundary to retain qpdf's `open
             // <path>: <error>` diagnostic before the provider is installed.
-            std::fs::File::open(&option.path).map_err(|error| {
-                Error::System(format!("open {}: {error}", option.path.display()))
-            })?;
+            std::fs::File::open(&option.path)
+                .map_err(|error| qpdf_style_open_error(&option.path, error))?;
 
             let filespec =
                 FileSpec::create_file_spec_from_path(pdf, &option.filename, &option.path)?;
@@ -672,5 +694,68 @@ mod tests {
         let mut job = QPDFJob::new();
         job.add_attachments(&mut pdf, &[])
             .expect("empty add operation must tolerate missing root");
+    }
+
+    #[test]
+    fn add_attachments_with_empty_batch_leaves_page_mode_untouched() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+        let root_ref = pdf.root_ref().expect("catalog root");
+        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        assert_eq!(
+            root.get("PageMode"),
+            None,
+            "fixture must start without /PageMode"
+        );
+
+        job.add_attachments(&mut pdf, &[])
+            .expect("empty batch must be a no-op");
+
+        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        assert_eq!(
+            root.get("PageMode"),
+            None,
+            "empty batch must not introduce /PageMode /UseAttachments"
+        );
+    }
+
+    #[test]
+    fn add_attachment_reports_missing_file_without_os_error_suffix() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let missing = dir.path().join("does-not-exist.bin");
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let error = job
+            .add_attachment(&mut pdf, add_options(missing.clone(), b"payload-key"))
+            .expect_err("missing source file must fail");
+        assert_eq!(
+            error.to_string(),
+            format!("open {}: No such file or directory", missing.display())
+        );
     }
 }
