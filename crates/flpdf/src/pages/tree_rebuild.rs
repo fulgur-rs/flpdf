@@ -15,6 +15,9 @@
 //!   leaf no longer depends on the old ancestor chain. Direct non-scalar values
 //!   are promoted once through the canonical object registry; scalar values and
 //!   existing indirect values retain qpdf's copy/identity behavior.
+//! - After that push, the retained root no longer carries those four inheritable
+//!   keys, matching `QPDF_optimization.cc:159-228`; its page-tree mutation keeps
+//!   `/Type`, `/Kids`, and `/Count` as the structural keys.
 //! - Every leaf's `/Parent` is repointed at the stable root `/Pages` value.
 //!
 //! The result is a **flat** qpdf-style page tree: no intermediate `/Pages`
@@ -355,6 +358,18 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     root.replace_key(b"/Kids", ObjectHandle::array(kid_handles))?;
     let count = i64::try_from(new_kids.len()).unwrap_or(i64::MAX);
     root.replace_key(b"/Count", ObjectHandle::integer(count))?;
+    // qpdf's QPDF_optimization.cc:159-228 removes each inheritable key from
+    // every /Pages node after pushing its effective value to the leaves. The
+    // retained rebuilt root is subject to that same cleanup; only the
+    // non-inheritable page-tree keys remain here.
+    for key in [
+        b"/CropBox".as_slice(),
+        b"/MediaBox".as_slice(),
+        b"/Resources".as_slice(),
+        b"/Rotate".as_slice(),
+    ] {
+        root.remove_key(key);
+    }
     root.remove_key(b"/Parent");
     pdf.mark_object_handle_dirty(&root)?;
 
@@ -652,6 +667,51 @@ mod tests {
                 .expect("live page /Parent lookup must succeed")
                 .is_same_object_as(&root),
             "reparenting must be visible through the retained page handle"
+        );
+    }
+
+    #[test]
+    fn rebuilt_root_drops_qpdf_inheritable_attributes_after_materializing_pages() {
+        let mut pdf = open(build_nested_pdf());
+        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        root.insert(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        root.insert(
+            "CropBox",
+            Object::Array(vec![
+                Object::Integer(10),
+                Object::Integer(20),
+                Object::Integer(500),
+                Object::Integer(700),
+            ]),
+        );
+        root.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
+        root.insert("Rotate", Object::Integer(180));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(6, 0)])
+            .expect("flat page rebuild must succeed");
+
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        for key in ["MediaBox", "CropBox", "Resources", "Rotate"] {
+            assert!(
+                root.get(key).is_none(),
+                "rebuilt /Pages root must not retain inheritable /{key}: {root:?}"
+            );
+        }
+
+        let page = dict_of(&mut pdf, ObjectRef::new(6, 0));
+        assert_eq!(
+            page.get("CropBox"),
+            Some(&Object::Reference(ObjectRef::new(10, 0))),
+            "the selected page must retain the root-inherited /CropBox handle"
         );
     }
 
