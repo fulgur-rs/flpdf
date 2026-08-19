@@ -619,6 +619,11 @@ qpdf と同じ shallow page copy とし、汎用 `merge_documents` の library-l
 `page_spec.password` 境界に合わせ、top-level primary password を distinct secondary の
 fallback にしない。global な password mode/weak-crypto policy は共有するが、credential
 本体は spec-local に限定する。
+`.50qd.2` では `QPDFJob.cc:1714-1715` の全 input version floor と
+`QPDFJob.cc:2847-2918` の writer 設定境界を、multi-source `--pages` の
+fresh merged document に明示的に伝播する。primary と全 secondary の
+`M.m`/`/Extensions /ADBE /ExtensionLevel` の pairwise max を既存の
+`--min-version` と合成し、`--force-version` は従来どおり最終的に優先させる。
 
 ### C. qpdf に機能そのものが無いもの
 

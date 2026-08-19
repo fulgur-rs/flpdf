@@ -36,6 +36,7 @@ use std::process::Command as Shell;
 // `flpdf --check` is implicitly exercised by --show-pages succeeding).
 
 const THREE_PAGE: &str = "../../tests/fixtures/compat/three-page.pdf";
+const ONE_PAGE_V17: &str = "../../tests/fixtures/compat/one-page-v17.pdf";
 
 /// Absolute path to a fixture (so a per-cell `cwd` change is unnecessary).
 fn fixture_abs(rel: &str) -> PathBuf {
@@ -1382,6 +1383,178 @@ fn pages_encrypted_primary_plaintext_secondary_preserves_primary_encryption() {
         npages_of_with_password(&q, "secretpw"),
         npages_of_with_password(&f, "secretpw")
     );
+}
+
+#[test]
+fn pages_secondary_version_floor_matches_qpdf() {
+    // QPDFJob accumulates the source version from every input before it
+    // configures the writer (QPDFJob.cc:1714-1715, 2847-2918). A PDF 1.7
+    // secondary must therefore raise the fresh multi-source output above the
+    // merged document's PDF 1.3 baseline.
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let secondary = fixture_abs(ONE_PAGE_V17);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (q_ok, stderr) = run_qpdf(&[
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(q_ok || q.exists(), "qpdf page merge failed: {stderr}");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            primary.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    let q_bytes = std::fs::read(&q).unwrap();
+    let f_bytes = std::fs::read(&f).unwrap();
+    let expected_header = b"%PDF-1.7\n";
+    assert!(q_bytes.starts_with(expected_header));
+    assert!(
+        f_bytes.starts_with(expected_header),
+        "multi-source page output must propagate the highest source version"
+    );
+
+    let q_min = tmp.path().join("q-min.pdf");
+    let f_min = tmp.path().join("f-min.pdf");
+    let (q_min_ok, stderr) = run_qpdf(&[
+        "--min-version=1.6",
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q_min.to_str().unwrap(),
+    ]);
+    assert!(
+        q_min_ok || q_min.exists(),
+        "qpdf min-version merge failed: {stderr}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f_min.to_str().unwrap(),
+            "--min-version=1.6",
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+    assert!(std::fs::read(&q_min).unwrap().starts_with(expected_header));
+    assert!(std::fs::read(&f_min).unwrap().starts_with(expected_header));
+
+    let q_force = tmp.path().join("q-force.pdf");
+    let f_force = tmp.path().join("f-force.pdf");
+    let (q_force_ok, stderr) = run_qpdf(&[
+        "--force-version=1.4",
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q_force.to_str().unwrap(),
+    ]);
+    assert!(
+        q_force_ok || q_force.exists(),
+        "qpdf force-version merge failed: {stderr}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            primary.to_str().unwrap(),
+            f_force.to_str().unwrap(),
+            "--force-version=1.4",
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+    let forced_header = b"%PDF-1.4\n";
+    assert!(std::fs::read(&q_force).unwrap().starts_with(forced_header));
+    assert!(std::fs::read(&f_force).unwrap().starts_with(forced_header));
+}
+
+#[test]
+fn pages_secondary_extension_level_matches_qpdf() {
+    // The source extension level is part of qpdf's accumulated input version
+    // and must reach the fresh output Catalog as well as the header.
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(THREE_PAGE);
+    let secondary = fixture_abs("../../tests/fixtures/compat/one-page-enc-u.pdf");
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (q_ok, stderr) = run_qpdf(&[
+        primary.to_str().unwrap(),
+        "--pages",
+        secondary.to_str().unwrap(),
+        "--password=u",
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q.exists(),
+        "qpdf extension-level merge failed: {stderr}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            primary.to_str().unwrap(),
+            f.to_str().unwrap(),
+            "--pages",
+            secondary.to_str().unwrap(),
+            "--password=u",
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    for path in [&q, &f] {
+        let check = Shell::new(QPDF)
+            .args(["--check", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&check.stdout);
+        assert!(
+            stdout.contains("PDF Version: 1.7 extension level 8"),
+            "expected qpdf check to report the propagated extension level: {stdout}"
+        );
+    }
 }
 
 #[test]
