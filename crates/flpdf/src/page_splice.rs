@@ -11,6 +11,14 @@
 //! `QPDF::insertPage`/`removePage` callers flatten first
 //! (`QPDF_pages.cc:209,256`), while this bounded page-extraction/merge route
 //! preserves the caller's subtree and applies the same page-owner invariants.
+//!
+//! Because every mutation is `/Kids`-array-keyed by indirect object
+//! reference, a direct intermediate `/Pages` node is promoted to an indirect
+//! object during the preflight walk even though qpdf's own
+//! `QPDF::getAllPagesInternal` only promotes a kid lacking `/Kids`
+//! (`QPDF_pages.cc:99-114`). `/Parent` itself is left untouched by the
+//! preflight walk, matching qpdf: neither `getAllPagesInternal` nor a
+//! duplicate page's `shallowCopy` (`QPDFObjectHandle.cc:2073-2077`) write it.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 #[cfg(test)]
@@ -156,11 +164,24 @@ fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
 /// (`QPDF_pages.cc:154-188`). The index is also the duplicate-page boundary
 /// used by `QPDF::insertPage` (`QPDF_pages.cc:233-237`), while the recursive
 /// count check below mirrors the same flattening pass's `/Count` validation.
+/// `mark_get_all_pages_called` mirrors `QPDF::getAllPages` setting
+/// `m->ever_called_get_all_pages` (`QPDF_pages.cc:41`), which this walk
+/// completes just as fully as the flattening traversal it replaces.
+///
+/// A direct intermediate `/Pages` node is promoted to indirect here just like
+/// a direct leaf, which diverges from `QPDF::getAllPagesInternal`'s own kid
+/// (`QPDF_pages.cc:99-114`, only a kid lacking `/Kids` is promoted). This is a
+/// known, tracked deviation: [`splice_subtree`] and `leaf_count_of` are also
+/// `ObjectRef`-keyed and require every kid — leaf or intermediate — to
+/// already be indirect, so leaving an intermediate kid direct here would only
+/// move the promotion (or a hard failure) into the mutation pass that always
+/// follows this walk.
 fn page_refs_for_splice<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pages_ref: ObjectRef,
     max_depth: usize,
 ) -> Result<Vec<ObjectRef>> {
+    pdf.mark_get_all_pages_called();
     let mut pages = Vec::new();
     let mut seen = HashSet::new();
     let mut visited = HashSet::new();
@@ -274,9 +295,6 @@ fn collect_page_refs<R: Read + Seek>(
         } else {
             child_ref
         };
-        if !child_is_pages {
-            set_page_parent(pdf, child_ref, node_ref)?;
-        }
         kids.push(child_ref);
     }
     if let Some(kids_handle) = kids_handle {
@@ -830,6 +848,18 @@ mod tests {
     }
 
     #[test]
+    fn splice_marks_get_all_pages_called_like_qpdfs_getallpages() {
+        // qpdf's `QPDF::getAllPages` sets `m->ever_called_get_all_pages = true`
+        // (`QPDF_pages.cc:41`) every time it actually walks the tree; this
+        // preflight walk is that same complete enumeration, so it must set
+        // the flag too (surfaced in `--json` output as `calledgetallpages`).
+        let mut pdf = open(build_flat_pdf());
+        assert!(!pdf.ever_called_get_all_pages());
+        splice_pages(&mut pdf, 0..1, &[]).unwrap();
+        assert!(pdf.ever_called_get_all_pages());
+    }
+
+    #[test]
     fn remove_first_page_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         splice_pages(&mut pdf, 0..1, &[]).unwrap();
@@ -1019,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_page_kid_is_reparented_to_its_new_subtree() {
+    fn duplicate_page_kid_copy_keeps_the_stale_parent_of_its_original() {
         let mut pdf = open(build_pages_with_cross_parent_duplicate_pdf());
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(8, 0)]).unwrap();
 
@@ -1029,9 +1059,16 @@ mod tests {
             other => panic!("right /Kids should contain one indirect page, got {other:?}"), // cov:ignore: the fixture always has one indirect page in this /Kids array
         };
         assert_ne!(duplicate, ObjectRef::new(4, 0));
+        // qpdf's duplicate-page copy is a plain `QPDFObjectHandle::shallowCopy`
+        // (`QPDFObjectHandle.cc:2073-2077`, `obj->copy()`) with no `/Parent`
+        // adjustment; `getAllPagesInternal` never writes `/Parent` either
+        // (`QPDF_pages.cc:81-136`). Live-probed with qpdf 11.9.0 against this
+        // exact fixture (`qpdf --pages . -- in.pdf --qdf --static-id out.pdf`):
+        // the duplicate's copy keeps `/Parent 3 0 R`, the original kid's
+        // parent, not the subtree it was copied into.
         assert_eq!(
             dict_of(&mut pdf, duplicate).get_ref("Parent"),
-            Some(ObjectRef::new(6, 0))
+            Some(ObjectRef::new(3, 0))
         );
     }
 
