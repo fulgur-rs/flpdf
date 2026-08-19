@@ -150,10 +150,16 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
         let page = self.materialize_page_input(page)?;
         if refs.contains(&page) {
-            let copy = self.pdf.resolve(page)?;
-            let duplicate = self.pdf.next_available_object_ref()?;
-            self.pdf.set_object(duplicate, copy);
-            refs.insert(idx, duplicate);
+            // qpdf's QPDF::insertPage uses shallowCopy followed by
+            // makeIndirectObject for a page that is already in the tree
+            // (QPDF_pages.cc:233-237). Keep the duplicate on the canonical
+            // handle graph so its shared indirect children retain identity.
+            let copy = self.pdf.get_object_handle(page).shallow_copy()?;
+            let duplicate = self.pdf.make_indirect_object_handle(copy)?;
+            let duplicate_ref = duplicate
+                .object_ref()
+                .expect("make_indirect_object_handle returns an indirect handle");
+            refs.insert(idx, duplicate_ref);
         } else {
             refs.insert(idx, page);
         }
@@ -263,48 +269,39 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     fn clear_page_tree(&mut self) -> Result<RebuildResult> {
         let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
         let catalog_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let crate::Object::Dictionary(mut catalog) = self.pdf.resolve(catalog_ref)? else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        self.pdf.resolve_object_handle(&catalog)?;
+        let Some(catalog_dict) = catalog.as_dictionary() else {
             // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
             return Err(Error::Unsupported(format!(
                 "document catalog {catalog_ref} is not a dictionary"
             )));
             // cov:ignore-end
         };
-        let pages = catalog
-            .get("Pages")
-            .cloned()
-            .ok_or(Error::Missing("/Pages"))?;
-        let (mut root, indirect_root) = match pages {
-            crate::Object::Reference(pages_root_ref) => {
-                let crate::Object::Dictionary(root) = self.pdf.resolve(pages_root_ref)? else {
-                    // cov:ignore-start: remove obtains pages through get_all_pages, which proves the selected /Pages root is a dictionary before clear_page_tree runs
-                    return Err(Error::Unsupported(format!(
-                        "document /Pages root {pages_root_ref} is not a dictionary"
-                    )));
-                    // cov:ignore-end
-                };
-                (root, Some(pages_root_ref))
-            }
-            crate::Object::Dictionary(root) => (root, None),
-            // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
-            _ => {
-                return Err(Error::Unsupported(
-                    "document /Pages root is not a dictionary".into(),
-                ))
-            } // cov:ignore-end
-        };
-        root.insert("Type", crate::Object::Name(b"Pages".to_vec()));
-        root.insert("Kids", crate::Object::Array(Vec::new()));
-        root.insert("Count", crate::Object::Integer(0));
-        root.remove("Parent");
-        if let Some(pages_root_ref) = indirect_root {
-            self.pdf
-                .set_object(pages_root_ref, crate::Object::Dictionary(root));
-        } else {
-            catalog.insert("Pages", crate::Object::Dictionary(root));
-            self.pdf
-                .set_object(catalog_ref, crate::Object::Dictionary(catalog));
+        // cov:ignore-start: get_all_pages must have found the removed page through catalog /Pages before this final-page path can run
+        if !catalog_dict.contains_key(b"/Pages".as_slice()) {
+            return Err(Error::Missing("/Pages"));
         }
+        // cov:ignore-end
+        let pages = catalog.try_get_key(b"/Pages")?;
+        let root = self.pdf.resolve_object_handle_to_terminal(&pages)?;
+        if root.as_dictionary().is_none() {
+            // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
+            return Err(Error::Unsupported(
+                "document /Pages root is not a dictionary".into(),
+            ));
+            // cov:ignore-end
+        }
+
+        // QPDF::removePage keeps the existing /Pages handle, erases its
+        // children, updates /Count, and leaves the root without /Parent
+        // (QPDF_pages.cc:264-275). These live mutations also preserve a
+        // direct catalog /Pages root without re-materializing the catalog.
+        root.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
+        root.replace_key(b"/Kids", ObjectHandle::array(Vec::new()))?;
+        root.replace_key(b"/Count", ObjectHandle::integer(0))?;
+        root.remove_key(b"/Parent");
+        self.pdf.mark_object_handle_dirty(&root)?;
         Ok(RebuildResult {
             new_kids: Vec::new(),
             ref_map: BTreeMap::new(),
