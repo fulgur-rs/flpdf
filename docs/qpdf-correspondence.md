@@ -230,10 +230,12 @@ paths and Windows directory-open failures for both metadata helpers.
 | `QPDFExc.cc` / `QPDFSystemError.cc` | 123 | `error.rs`(125) | ✅ |
 
 `flpdf-egzr.3.2.6.19` の `pages/tree_rebuild.rs` は、`QPDF_optimization.cc:159-228`
-に合わせて選択ページへ inheritable attributes を materialize した後、保持する
-`/Pages` root から `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を remove する。
-`--pages` の CLI consumer で qpdf 11.9.0 と同じ root shape（`/Type`・`/Kids`・`/Count`）を
-確認する回帰テストは `cli_pages_root_inheritable_qpdf.rs` が所有する。
+に合わせて選択ページへ inheritable attributes を materialize した後、元の page-tree
+に残る `/Pages` node から `/MediaBox`・`/CropBox`・`/Resources`・`/Rotate` を remove する。
+保持する root 以外の中間 node は引き続き orphan として `subset_prune` の xref-level GC に
+委ねるが、writer が orphan を保存する場合にも qpdf の flattening-side cleanup を保つ。
+`--pages` の CLI consumer で qpdf 11.9.0 と同じ root/kids/leaf の正規化 shape を
+比較する回帰テストは `cli_pages_root_inheritable_qpdf.rs` が所有する。
 
 ## 3. 書き込み — 最大の smear
 

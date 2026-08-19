@@ -2,7 +2,7 @@
 //!
 //! `QPDF_optimization::pushInheritedAttributesToPage` pushes the effective
 //! `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate` values to selected
-//! leaves and removes those keys from the retained root. The `--pages` CLI
+//! leaves and removes those keys from the page-tree nodes. The `--pages` CLI
 //! consumer must preserve that shape after rebuilding its page tree.
 
 use assert_cmd::Command;
@@ -38,7 +38,7 @@ fn root_inheritable_fixture() -> Vec<u8> {
         (1, "<< /Type /Catalog /Pages 2 0 R >>"),
         (
             2,
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /CropBox [10 20 500 700] /Resources << >> /Rotate 180 >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /CustomRoot /retained /MediaBox [0 0 612 792] /CropBox [10 20 500 700] /Resources << >> /Rotate 180 >>",
         ),
         (3, "<< /Type /Page /Parent 2 0 R >>"),
     ];
@@ -63,45 +63,165 @@ fn root_inheritable_fixture() -> Vec<u8> {
     bytes
 }
 
-fn pages_root(path: &Path) -> flpdf::Dictionary {
+fn resolve_to_terminal(pdf: &mut Pdf<BufReader<File>>, mut value: Object) -> Object {
+    for _ in 0..64 {
+        match value {
+            Object::Reference(reference) => {
+                value = pdf
+                    .resolve(reference)
+                    .expect("referenced value must resolve");
+            }
+            other => return other,
+        }
+    }
+    panic!("object reference chain exceeded test depth bound");
+}
+
+#[derive(Debug, PartialEq)]
+struct PageSnapshot {
+    type_name: Option<Object>,
+    media_box: Option<Object>,
+    crop_box: Option<Object>,
+    resources: Option<Object>,
+    rotate: Option<Object>,
+    parent_is_reference: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct PageTreeSnapshot {
+    root_type: Option<Object>,
+    root_count: Option<Object>,
+    root_custom: Option<Object>,
+    root_inheritable_keys: [bool; 4],
+    kids: Vec<PageSnapshot>,
+}
+
+fn page_snapshot(pdf: &mut Pdf<BufReader<File>>, value: Object) -> PageSnapshot {
+    let page = resolve_to_terminal(pdf, value);
+    let Object::Dictionary(page) = page else {
+        panic!("page kid must resolve to a dictionary: {page:?}");
+    };
+    let mut resolved = |key: &str| {
+        page.get(key)
+            .cloned()
+            .map(|value| resolve_to_terminal(pdf, value))
+    };
+    PageSnapshot {
+        type_name: resolved("Type"),
+        media_box: resolved("MediaBox"),
+        crop_box: resolved("CropBox"),
+        resources: resolved("Resources"),
+        rotate: resolved("Rotate"),
+        parent_is_reference: matches!(page.get("Parent"), Some(Object::Reference(_))),
+    }
+}
+
+fn page_tree_snapshot(path: &Path) -> PageTreeSnapshot {
     let file = File::open(path).expect("output PDF must be readable");
     let mut pdf = Pdf::open(BufReader::new(file)).expect("output PDF must parse");
     let catalog_ref = pdf.root_ref().expect("output PDF must have a catalog");
     let catalog = pdf.resolve(catalog_ref).expect("catalog must resolve");
-    let pages_ref = match catalog {
-        Object::Dictionary(dictionary) => match dictionary.get("Pages") {
-            Some(Object::Reference(reference)) => *reference,
-            other => panic!("catalog /Pages must be an indirect reference: {other:?}"),
-        },
-        other => panic!("catalog must be a dictionary: {other:?}"),
+    let Object::Dictionary(catalog) = catalog else {
+        panic!("catalog must be a dictionary: {catalog:?}");
     };
-    match pdf.resolve(pages_ref).expect("/Pages root must resolve") {
-        Object::Dictionary(dictionary) => dictionary,
-        other => panic!("/Pages root must be a dictionary: {other:?}"),
+    let pages = catalog
+        .get("Pages")
+        .cloned()
+        .expect("catalog must contain /Pages");
+    let pages = resolve_to_terminal(&mut pdf, pages);
+    let Object::Dictionary(root) = pages else {
+        panic!("/Pages root must be a dictionary: {pages:?}");
+    };
+    let kids = root
+        .get("Kids")
+        .cloned()
+        .map(|value| resolve_to_terminal(&mut pdf, value))
+        .expect("rebuilt root must contain /Kids");
+    let Object::Array(kids) = kids else {
+        panic!("rebuilt root /Kids must be an array: {kids:?}");
+    };
+    PageTreeSnapshot {
+        root_type: root.get("Type").cloned(),
+        root_count: root.get("Count").cloned(),
+        root_custom: root.get("CustomRoot").cloned(),
+        root_inheritable_keys: ["MediaBox", "CropBox", "Resources", "Rotate"]
+            .map(|key| root.get(key).is_some()),
+        kids: kids
+            .into_iter()
+            .map(|kid| page_snapshot(&mut pdf, kid))
+            .collect(),
     }
 }
 
-fn assert_rebuilt_root_shape(root: &flpdf::Dictionary, tool: &str) {
+fn assert_rebuilt_root_shape(tree: &PageTreeSnapshot, tool: &str) {
     assert_eq!(
-        root.get("Type"),
-        Some(&Object::Name(b"Pages".to_vec())),
+        tree.root_type,
+        Some(Object::Name(b"Pages".to_vec())),
         "{tool}: rebuilt root must retain /Type /Pages"
     );
-    assert!(
-        root.get("Kids").is_some(),
-        "{tool}: rebuilt root needs /Kids"
-    );
     assert_eq!(
-        root.get("Count"),
-        Some(&Object::Integer(1)),
+        tree.root_count,
+        Some(Object::Integer(1)),
         "{tool}: rebuilt root must retain /Count 1"
     );
-    for key in ["MediaBox", "CropBox", "Resources", "Rotate"] {
-        assert!(
-            root.get(key).is_none(),
-            "{tool}: rebuilt root must not retain inheritable /{key}: {root:?}"
-        );
-    }
+    assert_eq!(
+        tree.root_custom,
+        Some(Object::Name(b"retained".to_vec())),
+        "{tool}: rebuilt root must retain non-inheritable /CustomRoot"
+    );
+    assert_eq!(
+        tree.root_inheritable_keys,
+        [false, false, false, false],
+        "{tool}: rebuilt root must not retain qpdf inheritable keys"
+    );
+    assert_eq!(
+        tree.kids.len(),
+        1,
+        "{tool}: rebuilt root must retain one selected page"
+    );
+}
+
+fn assert_materialized_page(tree: &PageTreeSnapshot, tool: &str) {
+    let page = tree.kids.first().expect("root must have one page kid");
+    assert_eq!(
+        page.type_name,
+        Some(Object::Name(b"Page".to_vec())),
+        "{tool}: selected kid must remain /Type /Page"
+    );
+    assert_eq!(
+        page.media_box,
+        Some(Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(612),
+            Object::Integer(792),
+        ])),
+        "{tool}: selected page must materialize /MediaBox"
+    );
+    assert_eq!(
+        page.crop_box,
+        Some(Object::Array(vec![
+            Object::Integer(10),
+            Object::Integer(20),
+            Object::Integer(500),
+            Object::Integer(700),
+        ])),
+        "{tool}: selected page must materialize /CropBox"
+    );
+    assert_eq!(
+        page.resources,
+        Some(Object::Dictionary(flpdf::Dictionary::new())),
+        "{tool}: selected page must materialize /Resources"
+    );
+    assert_eq!(
+        page.rotate,
+        Some(Object::Integer(180)),
+        "{tool}: selected page must materialize /Rotate"
+    );
+    assert!(
+        page.parent_is_reference,
+        "{tool}: selected page must be reparented to the rebuilt root"
+    );
 }
 
 #[test]
@@ -147,8 +267,14 @@ fn cli_pages_removes_root_inheritable_attributes_like_qpdf() {
         .assert()
         .success();
 
-    let qpdf_root = pages_root(&qpdf_output);
-    let flpdf_root = pages_root(&flpdf_output);
-    assert_rebuilt_root_shape(&qpdf_root, "qpdf");
-    assert_rebuilt_root_shape(&flpdf_root, "flpdf");
+    let qpdf_tree = page_tree_snapshot(&qpdf_output);
+    let flpdf_tree = page_tree_snapshot(&flpdf_output);
+    assert_rebuilt_root_shape(&qpdf_tree, "qpdf");
+    assert_rebuilt_root_shape(&flpdf_tree, "flpdf");
+    assert_materialized_page(&qpdf_tree, "qpdf");
+    assert_materialized_page(&flpdf_tree, "flpdf");
+    assert_eq!(
+        flpdf_tree, qpdf_tree,
+        "flpdf --pages must match qpdf's normalized root/kids/page shape"
+    );
 }
