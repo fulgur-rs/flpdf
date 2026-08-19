@@ -3933,6 +3933,29 @@ impl ObjectHandle {
         self.replace_key(b"/Contents", ObjectHandle::array(content_streams))
     }
 
+    /// Saturate `value` to the `i32` range, warning on `self` (the source of
+    /// the value) at each clamp.
+    ///
+    /// Ports the saturating half of `QPDFObjectHandle::getIntValueAsInt`
+    /// (`libqpdf/QPDFObjectHandle.cc:525-543`) for a caller that has already
+    /// obtained an `i64` some other way than [`Self::try_get_int_value`] --
+    /// [`rotate_page`](Self::rotate_page)'s relative-rotation walk needs the
+    /// same saturate-and-warn behavior qpdf's `getValueAsInt(int&)` applies
+    /// to a *found* integer, without that function's unconditional warn-and-
+    /// default-to-0 for a non-integer receiver, which would misfire on the
+    /// common case of an ancestor with no `/Rotate` at all.
+    fn saturate_i64_to_i32_range_with_warning(&self, value: i64) -> Result<i64> {
+        if value < i64::from(i32::MIN) {
+            self.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
+            Ok(i64::from(i32::MIN))
+        } else if value > i64::from(i32::MAX) {
+            self.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
+            Ok(i64::from(i32::MAX))
+        } else {
+            Ok(value)
+        }
+    }
+
     /// Set this page's rotation, optionally adding the nearest inherited
     /// `/Rotate` value.
     ///
@@ -3976,19 +3999,7 @@ impl ObjectHandle {
                     // still falls through to the /Parent walk below, exactly
                     // as qpdf's isInteger() guard does, so this only clamps
                     // once an integer is actually found.
-                    old_angle = if value < i64::from(i32::MIN) {
-                        rotate.warn_if_possible(
-                            "requested value of integer is too small; returning INT_MIN",
-                        )?;
-                        i64::from(i32::MIN)
-                    } else if value > i64::from(i32::MAX) {
-                        rotate.warn_if_possible(
-                            "requested value of integer is too big; returning INT_MAX",
-                        )?;
-                        i64::from(i32::MAX)
-                    } else {
-                        value
-                    };
+                    old_angle = rotate.saturate_i64_to_i32_range_with_warning(value)?;
                     break;
                 }
 
