@@ -34,7 +34,7 @@ jobs:
         run: bash scripts/tests/patch-coverage-contract.sh
 
       - name: Install libjpeg development headers (Linux)
-        run: sudo apt-get update && sudo apt-get install -y libjpeg-dev
+        run: bash scripts/ci-apt-install.sh libjpeg-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
@@ -103,7 +103,7 @@ jobs:
       # version happens to be current in Homebrew or Chocolatey.
       - name: Install qpdf 11.9.0 (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y qpdf
+        run: bash scripts/ci-apt-install.sh qpdf
 
       # The qpdf executable is statically linked to libqpdf but still needs
       # these Homebrew-provided runtime libraries. Keep them outside the cache
@@ -332,7 +332,7 @@ jobs:
       # qpdf oracle hard-fails on Linux CI when missing (skip_if_qpdf_missing),
       # and cargo llvm-cov --workspace exercises those suites — install it.
       - name: Install qpdf
-        run: sudo apt-get update && sudo apt-get install -y qpdf
+        run: bash scripts/ci-apt-install.sh qpdf
 
       # Output to target/ (gitignored) so the working tree stays clean for the
       # patch-coverage gate's dirty-tree check.
