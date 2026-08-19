@@ -760,6 +760,36 @@ mod tests {
     }
 
     #[test]
+    fn add_clamps_a_below_i32_range_existing_rotate_like_qpdf() {
+        // Mirrors add_clamps_an_out_of_i32_range_existing_rotate_like_qpdf
+        // for the "too small" clamp branch. Live-probed against qpdf 11.9.0:
+        // `/Rotate -2147483700` (< i32::MIN, itself a multiple of 90)
+        // rotated by `--rotate=+90` produces `/Rotate 90` — INT_MIN
+        // (-2147483648) is not a multiple of 90 either, so the
+        // existing-value guard resets it to 0 before adding.
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut page = pdf
+            .resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Rotate", Object::Integer(-2_147_483_700));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: 90,
+        };
+        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
+        let dict = obj.as_dict().expect("not a dict");
+        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+    }
+
+    #[test]
     fn add_clamps_a_near_i64_max_existing_rotate_without_overflow() {
         // A value near i64::MAX that IS a multiple of 90 (so it survives the
         // existing-value guard below and actually reaches the `+=`) must not
