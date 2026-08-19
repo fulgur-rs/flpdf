@@ -3368,7 +3368,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
         let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
         let mut content_container_refs = BTreeSet::new();
-        let page_refs = crate::pages::page_refs(pdf)?;
+        // QPDFWriter::initializeSpecialStreams delegates page enumeration to
+        // QPDF::getAllPages(), whose live ObjectHandle lookup accepts a direct
+        // Catalog /Pages dictionary (QPDFWriter.cc:1916; QPDF_pages.cc:47-71).
+        // Keep this consumer on the canonical page-document helper so the
+        // direct-root and page-tree repair boundary is shared with qpdf.
+        let page_refs = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
         for (idx, page_ref) in page_refs.iter().enumerate() {
             let seq = (idx as u32).saturating_add(1);
             if options.qdf {

@@ -1299,6 +1299,57 @@ fn write_qdf_emits_page_and_contents_markers_per_page() {
     }
 }
 
+/// qpdf's QPDFWriter calls QPDF::getAllPages(), whose ObjectHandle lookup
+/// accepts a direct dictionary stored under the Catalog's `/Pages` key.
+/// The QDF pre-scan must keep that same direct-root boundary instead of
+/// requiring the legacy PageWalk to find an indirect reference.
+#[test]
+fn write_qdf_traverses_direct_catalog_pages_root() {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    let off3 = bytes.len();
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    );
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off3:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let Object::Dictionary(pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("Pages", Object::Dictionary(pages));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    let mut output = Vec::new();
+    write_qdf_output(&mut pdf, &mut output)
+        .expect("QDF writer must traverse a direct Catalog /Pages root");
+    assert!(
+        output
+            .windows(b"%% Page 1\n".len())
+            .any(|w| w == b"%% Page 1\n"),
+        "direct-root page must still receive its QDF page marker"
+    );
+    let report = check_reader(Cursor::new(output)).expect("QDF output must be readable");
+    assert!(
+        report.valid,
+        "direct-root QDF output must pass flpdf check: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
 /// Even under `no_original_object_ids = true` (qpdf's `--no-original-object-ids`),
 /// the QDF page/contents markers must still be emitted — qpdf keeps them
 /// regardless of that flag; only `%% Original object ID:` is suppressed.
