@@ -12,7 +12,7 @@
 //! merge and were renamed there (`DrMap`, populated by
 //! `merge_resources_shallow`). Left alone, the stream's content would still
 //! say e.g. `/F1 18 Tf` while the destination's merged `/DR/Font` no longer
-//! has an `F1` entry — only `F1_1`. [`adjust_appearance_stream`] privatizes
+//! has an `F1` entry — only `F1_1`. [`adjust_appearance_stream_handle`] privatizes
 //! the stream's `/Resources`, renames the colliding keys there, and rewrites
 //! the matching name tokens in the stream's own content so both stay
 //! internally consistent.
@@ -28,13 +28,39 @@ use crate::object_handle::{ObjectHandle, ResourceConflicts};
 use crate::overlay_annotations::DrMap;
 use crate::resource_replacer::replace_resource_names;
 use crate::writer::DecodeLevel;
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::{Pdf, Result};
 
 fn rewrite_appearance_content(decoded: &[u8], dr_map: &DrMap) -> Vec<u8> {
     match replace_resource_names(decoded, dr_map.renames()) {
         Ok(Some(bytes)) => bytes,
         Ok(None) | Err(_) => decoded.to_vec(),
     }
+}
+
+/// Return decoded appearance bytes only when qpdf's filter pipeline was
+/// actually installed. `pipeStreamData` writes raw bytes and reports
+/// `filtering_attempted = false` for unsupported or decode-level-gated
+/// filters; treating those bytes as decoded would make a later re-encode
+/// corrupt an image/binary appearance stream.
+fn filterable_stream_data(
+    stream: &ObjectHandle,
+    decode_level: DecodeLevel,
+) -> Result<Option<Rc<Vec<u8>>>> {
+    let mut bytes = Vec::new();
+    let mut pipeline = crate::pipeline::PlString::new("appearance stream data", None, &mut bytes);
+    let mut filtering_attempted = false;
+    let succeeded = stream.pipe_stream_data(
+        &mut pipeline,
+        &mut filtering_attempted,
+        0,
+        decode_level,
+        false,
+        false,
+    )?;
+    if !succeeded || !filtering_attempted {
+        return Ok(None);
+    }
+    Ok(Some(Rc::new(bytes)))
 }
 
 /// Privatize and rewrite an appearance stream through the canonical
@@ -140,7 +166,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
 
     // qpdf's token-filter installation is best effort. Resource mutations are
     // intentionally not rolled back when the stream cannot be decoded.
-    if let Ok(decoded) = stream.get_stream_data(DecodeLevel::Generalized) {
+    if let Ok(Some(decoded)) = filterable_stream_data(stream, DecodeLevel::Generalized) {
         let rewritten = rewrite_appearance_content(&decoded, &local_dr_map);
         if let Ok(encoded) =
             crate::filters::encode_stream_data_from_handle(&stream_dict, &rewritten)
@@ -192,386 +218,11 @@ fn extend_dr_map_from_conflicts(dr_map: &mut DrMap, conflicts: &ResourceConflict
     }
 }
 
-/// Privatize and rewrite an appearance stream's `/Resources` dictionary and
-/// content so a resource name that collided during the destination
-/// `/AcroForm/DR` merge ([`DrMap`], populated by
-/// `crate::overlay_annotations::merge_resources_shallow`) resolves to the
-/// renamed destination name, matching qpdf's `AcroForm::adjustAppearanceStream`
-/// (`libqpdf/QPDFAcroFormDocumentHelper.cc:752-849`). Called once per
-/// (already per-placement-dup'd) `/AP` stream from
-/// `crate::overlay_annotations::transform_annot_ap_streams`, after the
-/// stream's `/Matrix` has already been concatenated with the placement's
-/// `cm`.
-///
-/// Does nothing when `dr_map` is empty, or when the stream at
-/// `ap_stream_ref` has no `/Resources` entry — together with the caller's
-/// own `!dr_map.is_empty()` check, this reproduces the two-part gate qpdf
-/// applies at the `transformAnnotations` call site (`libqpdf/QPDFAcroFormDocumentHelper.cc:1160-1161`:
-/// `if (!dr_map.empty() && resources)`) before invoking this function at
-/// all.
-///
-/// # Algorithm
-///
-/// 1. Resolve `/Resources` to an owned [`Dictionary`], noting whether it was
-///    reached through an indirect reference. Every stream that reaches this
-///    point gets its OWN private copy — never shared with another
-///    placement's dup of the same stream, or with the source
-///    `/AcroForm/DR` object the copy started out pointing at — matching
-///    qpdf's unconditional `resources.shallowCopy()`.
-/// 2. For every resource-type category [`DrMap::categories`] recorded a
-///    rename for: resolve that category's sub-dictionary (an indirect
-///    `/Font <ref>`-style sub-dictionary is resolved the same as a direct
-///    one — an appearance stream's own `/Resources` can name either shape),
-///    inserting an empty one if absent — mirrors merging in qpdf's
-///    per-category empty `merge_with` dict, whose only effect at this stage
-///    is to force the sub-dictionary to exist and be unshared.
-/// 3. Rename every `old_key` present in that sub-dictionary to `dr_map`'s
-///    `new_key`, keeping the same value, matching qpdf's rename loop
-///    verbatim (`libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`, fetched and
-///    read line-by-line for this port — roborev PR #490 iter-3 finding 1).
-///    This is a TWO-PHASE algorithm, not a single pass:
-///    - **Phase 1** mutates the sub-dictionary key-by-key, IN PLACE, reading
-///      `existing_new`/`old_val` from the LIVE, currently-mutating
-///      sub-dictionary — exactly like qpdf. A `new_key` that already names a
-///      value gets that value staged into a local `merge_with` dict (NOT
-///      immediately renamed) before `old_key`'s value moves into `new_key`.
-///      Because phase 1 reads live state, a LATER rename entry in the same
-///      category CAN observe an EARLIER entry's freshly-written key — e.g.
-///      `dr_map` recording both `F1->F1_1` and `F1_1->F1_1_1` for the same
-///      category means the second entry's `old_key` lookup (`F1_1`) finds
-///      the value phase 1 JUST moved there from `F1`, not the sub-dict's
-///      true original `F1_1` occupant. This matches qpdf bug-for-bug: a
-///      snapshot-based rewrite that avoided this "reprocessing" would
-///      itself be the byte-identical divergence (see the
-///      `adjust_appearance_stream_rename_chain_*` tests below, which encode
-///      the resulting cross-wired names as the correct, qpdf-verified
-///      output).
-///    - **Phase 2** re-merges the staged `merge_with` dict back into the
-///      (now phase-1-mutated) sub-dictionary, matching qpdf's
-///      `resources.mergeResources(merge_with, &dr_map)` (`:807`, itself
-///      `QPDFObjectHandle::mergeResources`'s generic dict-merge-with-
-///      conflicts algorithm). A staged value whose slot phase 1 already
-///      vacated re-lands under its own original name, no conflict. A
-///      GENUINE new conflict (the slot is occupied by something else) is
-///      resolved the same way `crate::overlay_annotations::merge_resources_shallow`
-///      resolves the top-level `/DR` merge conflict: reuse a key that
-///      already names the SAME object elsewhere in the sub-dictionary (by
-///      [`ObjectRef`] identity — qpdf's `QPDFObjGen`-keyed `og_to_name`), or
-///      else mint a fresh name via
-///      [`crate::overlay_annotations::unique_dr_name`] and extend a
-///      **per-call, cloned** copy of `dr_map` ([`DrMap::insert_rename`]) so
-///      step 5's content rewrite also redirects any token that already said
-///      the staged key. qpdf's `dr_map` parameter to this function is
-///      itself passed **by value** (`:752`), which is exactly why growing a
-///      local copy here cannot leak into another placement's shared
-///      [`DrMap`].
-/// 4. Drop any sub-dictionary left empty by step 3 (qpdf: "remove empty
-///    subdictionaries").
-/// 5. Rewrite the stream's decoded content via [`rewrite_appearance_content`], using
-///    the per-call rename map extended by step 3. Steps 1–4 (the
-///    `/Resources` dictionary rewrite) always run; step 5 is best-effort in
-///    one direction only: if the content **cannot be decoded** at all (most
-///    commonly an unsupported `/Filter`), the content bytes are left
-///    exactly as read and only the dictionary-level rename from steps 1–4
-///    applies. This was verified directly against qpdf's source
-///    (`libqpdf/QPDFAcroFormDocumentHelper.cc`, fetched and read for
-///    roborev PR #490 iter-3 finding 3): the `/Resources` rename (steps 1–4
-///    of this function) runs unconditionally BEFORE qpdf's equivalent
-///    tokenize step, which is wrapped in its OWN `try`/`catch`
-///    (`:824-849`) that turns a content-parse failure into a warning
-///    without rolling back the rename already made to `/Resources` — qpdf
-///    genuinely leaves the stream in this state (renamed dict, stale
-///    content) rather than reverting it, so flpdf matches rather than
-///    "fixing" it. If the content **decodes** but the rewritten bytes
-///    cannot be **re-encoded under the original `/Filter`** (e.g.
-///    `/LZWDecode`, which flpdf can decode but not re-encode — see
-///    `crate::filters::apply_single_filter_encode`, decision
-///    flpdf-9hc.7.2), the rewritten content is instead re-encoded as
-///    `FlateDecode` and `/Filter`/`/DecodeParms` are replaced accordingly, so
-///    the dictionary rename and the content tokens never disagree about a
-///    resource's name. qpdf never needs this fallback: it installs
-///    `ResourceReplacer` as a token filter once the content tokenizes, and
-///    its writer re-serializes under its own default output filter
-///    (`FlateDecode`, since qpdf has no LZW encoder either) rather than
-///    reproducing the original filter's bytes — the Flate fallback here
-///    mirrors that write-time re-serialization.
-///
-/// # Errors
-///
-/// Propagates any error from [`Pdf::resolve`]. A content decode or
-/// re-encode failure is not one of them (see step 5 above) — a decode
-/// failure is swallowed and leaves the content unchanged, matching qpdf
-/// (verified against source, not just observed behavior — see step 5); a
-/// re-encode failure is swallowed and instead re-encodes the rewritten
-/// content as `FlateDecode` so it stays consistent with the `/Resources`
-/// rename.
-// Both call sites now route through `adjust_appearance_stream_handle`;
-// removal of this raw-`Object` implementation is a separate dependent slice.
-#[allow(dead_code)]
-pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
-    dest: &mut Pdf<R>,
-    ap_stream_ref: ObjectRef,
-    dr_map: &DrMap,
-) -> Result<()> {
-    if dr_map.is_empty() {
-        return Ok(());
-    }
-    let Object::Stream(mut stream) = dest.resolve(ap_stream_ref)? else {
-        return Ok(()); // cov:ignore: defensive early return — caller only ever passes a stream ref
-    };
-    let Some(resources_val) = stream.dict.get("Resources").cloned() else {
-        return Ok(());
-    };
-    let (mut resources, was_indirect) = match resources_val {
-        Object::Dictionary(d) => (d, false),
-        Object::Reference(r) => match dest.resolve(r)?.into_dict() {
-            Some(d) => (d, true),
-            None => return Ok(()), // cov:ignore: /Resources ref does not resolve to a dict — malformed input
-        },
-        _ => return Ok(()), // cov:ignore: /Resources neither dict nor reference — malformed input
-    };
-
-    // Per-call, owned copy of `dr_map` — mirrors qpdf's `dr_map` parameter
-    // to `AcroForm::adjustAppearanceStream` being passed BY VALUE
-    // (`libqpdf/QPDFAcroFormDocumentHelper.cc:752`). Phase 2 below extends
-    // this LOCAL copy only, via [`DrMap::insert_rename`], so an extra
-    // rename discovered while privatizing one stream's `/Resources` never
-    // leaks into another placement's shared `DrMap`.
-    let mut local_dr_map = dr_map.clone();
-
-    for category in dr_map.categories() {
-        let Some(renames) = dr_map.category(category) else {
-            continue; // cov:ignore: category() looked up from categories()'s own keys — never None
-        };
-        let existing = resources.get(category).cloned();
-        let mut subdict = match existing {
-            Some(Object::Dictionary(d)) => d,
-            Some(Object::Reference(r)) => dest.resolve(r)?.into_dict().unwrap_or_default(),
-            _ => Dictionary::new(),
-        };
-
-        // PHASE 1 (qpdf `libqpdf/QPDFAcroFormDocumentHelper.cc:781-803`):
-        // mutate `subdict` key-by-key, IN PLACE — `existing_new`/`old_val`
-        // are read from the LIVE, currently-mutating `subdict`, matching
-        // qpdf's `subdict.getKey(new_key)` / `subdict.getKey(old_key)`
-        // exactly (both consult `subdict` at the moment of THIS iteration,
-        // not a pre-loop snapshot). Any value a rename would otherwise
-        // silently clobber is staged into `merge_with` (qpdf's own local of
-        // that name) rather than lost outright.
-        let mut merge_with = Dictionary::new();
-        for (old_key, new_key) in renames {
-            if let Some(existing_new) = subdict.get(new_key.as_slice()).cloned() {
-                merge_with.insert(new_key.clone(), existing_new);
-            }
-            if let Some(existing_old) = subdict.remove(old_key) {
-                subdict.insert(new_key.clone(), existing_old);
-            }
-        }
-
-        // PHASE 2 (qpdf `:805-807`'s `resources.mergeResources(merge_with,
-        // &dr_map)`): re-merge every staged, displaced value back in. Not a
-        // simple re-insert — `QPDFObjectHandle::mergeResources`'s
-        // conflicts-map algorithm applies again here, so a slot phase 1
-        // left vacant re-lands its staged value verbatim, while a slot
-        // phase 1 left OCCUPIED by something else is a genuine new
-        // conflict, resolved exactly like the top-level `/DR` merge
-        // conflict in `merge_resources_shallow`: reuse a key that already
-        // names the SAME object elsewhere in `subdict` (an `ObjectRef`
-        // identity scan, qpdf's `og_to_name`), else mint a fresh name.
-        //
-        // `og_to_name` and `rnames`' lazy-init-then-FROZEN lifecycle (qpdf
-        // `libqpdf/QPDFObjectHandle.cc`, `mergeResources`, the
-        // `initialized_maps` guard around `make_og_to_name`, verified
-        // against the live source — line numbers below are from qpdf
-        // `main` as fetched, not the finding's cited
-        // `QPDFAcroFormDocumentHelper.cc:791-816`, which was for a
-        // different, older qpdf revision):
-        //   - Both maps are built EXACTLY ONCE, lazily, the first time a
-        //     staged key collides with an occupied `subdict` slot (a
-        //     genuine conflict, not a phase-1-vacated slot) — so they DO
-        //     see any vacated-slot reinstates that happened EARLIER in
-        //     THIS SAME staged loop (they already mutated `subdict`/
-        //     `this_val` by then).
-        //   - Once built, neither map is EVER updated again for the rest of
-        //     resource-type's staged loop — neither by a LATER vacated-slot
-        //     reinstate, nor by a freshly-minted alias from a LATER genuine
-        //     conflict (`this_val.replaceKey(new_key, rval)` in qpdf's
-        //     `else` branch does not touch either map).
-        // Concretely: two genuine conflicts on the SAME object each mint
-        // their OWN fresh alias (no reuse between them) — reuse only
-        // happens when one of the two colliding values was already visible
-        // to `subdict` (either pre-existing, or reinstated verbatim earlier
-        // in this loop) at the moment `og_to_name` was snapshotted.
-        if merge_with.iter().next().is_some() {
-            let staged: Vec<(Vec<u8>, Object)> = merge_with
-                .iter()
-                .map(|(k, v)| (k.to_vec(), v.clone()))
-                .collect();
-            let mut ref_to_key: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
-            let mut resource_names: Option<std::collections::BTreeSet<Vec<u8>>> = None;
-            let mut min_suffix: u32 = 1;
-            for (key, rval) in staged {
-                if subdict.get(key.as_slice()).is_none() {
-                    // The slot this value was staged under is free again
-                    // (phase 1 vacated it) — no conflict, reinstate verbatim.
-                    // Deliberately does NOT touch `ref_to_key`: once it has
-                    // been snapshotted below, qpdf's `og_to_name` stays
-                    // frozen even across later vacated-slot reinstates.
-                    subdict.insert(key, rval);
-                    continue;
-                }
-                // Genuine conflict — snapshot both qpdf maps lazily, on the
-                // FIRST such conflict only (`og_to_name`'s
-                // `initialized_maps` guard). These snapshots legitimately
-                // include any vacated-slot reinstates already applied above
-                // in this same loop, and neither map changes afterward.
-                if ref_to_key.is_none() {
-                    let mut m = std::collections::HashMap::new();
-                    for (k, v) in subdict.iter() {
-                        if let Some(r) = v.as_ref_id() {
-                            m.insert(r, k.to_vec());
-                        }
-                    }
-                    ref_to_key = Some(m);
-                    resource_names = Some(crate::overlay_annotations::get_resource_names(
-                        dest, &subdict,
-                    )?);
-                }
-                let snapshot = ref_to_key
-                    .as_ref()
-                    .expect("identity map initialized on first AP conflict");
-                let reused = rval.as_ref_id().and_then(|r| snapshot.get(&r).cloned());
-                if let Some(existing_key) = reused {
-                    // `existing_key == key` (no rename needed — the
-                    // displaced value already sits under its own staged
-                    // name) matches qpdf's `if (new_key != key)` guard
-                    // around its `conflicts[rtype][key] = new_key` write.
-                    if existing_key != key {
-                        local_dr_map.insert_rename(category, key, existing_key);
-                    }
-                } else {
-                    let names = resource_names
-                        .as_ref()
-                        .expect("resource-name pool initialized on first AP conflict");
-                    let fresh_name =
-                        crate::overlay_annotations::unique_dr_name(&key, names, &mut min_suffix)?;
-                    subdict.insert(fresh_name.clone(), rval);
-                    local_dr_map.insert_rename(category, key, fresh_name);
-                }
-            }
-        }
-
-        resources.insert(category, Object::Dictionary(subdict));
-    }
-
-    // Remove empty sub-dictionaries (qpdf: "Remove empty subdictionaries").
-    let empty_categories: Vec<Vec<u8>> = resources
-        .iter()
-        .filter_map(|(key, value)| match value {
-            Object::Dictionary(d) if d.iter().next().is_none() => Some(key.to_vec()),
-            _ => None,
-        })
-        .collect();
-    for key in empty_categories {
-        resources.remove(&key);
-    }
-
-    // Best-effort content rewrite (step 5, see doc comment above): a decode
-    // failure here — most commonly an unsupported `/Filter` chain (e.g. an
-    // image codec on an AP stream that also has a `/Resources` collision) —
-    // must NOT propagate. qpdf wraps its equivalent tokenize step in a
-    // `try`/`catch` that turns exactly this failure into a warning rather
-    // than aborting; propagating an `Err` here would fail the WHOLE overlay
-    // call chain over one unrelated AP stream, which real qpdf does not do.
-    // On decode failure, `stream.data` is simply left as read — only the
-    // `/Resources` dictionary rename above still applies (matching qpdf,
-    // which does not roll back the rename either).
-    if let Ok(decoded) = crate::filters::decode_stream_data(&stream.dict, &stream.data) {
-        let new_decoded = rewrite_appearance_content(&decoded, &local_dr_map);
-        match crate::filters::encode_stream_data(&stream.dict, &new_decoded) {
-            Ok(encoded) => {
-                // Keep `/Length` consistent with the rewritten body — the
-                // rename may shrink or grow the compressed payload, and a
-                // stale dict `/Length` here would leave the stream
-                // structurally inconsistent (symmetric with the FlateDecode
-                // fallback below, which already updates it).
-                stream.dict.insert(
-                    "Length",
-                    Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
-                );
-                stream.data = encoded;
-            }
-            Err(_) => {
-                // Re-encoding under the ORIGINAL `/Filter` failed — decodable
-                // but not re-encodable filters are exactly `/LZWDecode`
-                // (`crate::filters::apply_single_filter_encode`, decision
-                // flpdf-9hc.7.2: "flpdf writes stream compression as
-                // FlateDecode only ... qpdf has no LZW encoder either").
-                // Leaving `stream.data` untouched here (the pre-fix
-                // behavior) would strand the content on the OLD resource
-                // names while `/Resources` above already has the NEW ones —
-                // an inconsistent stream. Re-encode the rewritten content as
-                // `FlateDecode` instead, mirroring how qpdf's writer would
-                // re-serialize this same token-filtered content under its
-                // own default output filter rather than reproducing LZW.
-                // In-memory FlateDecode of already-decoded bytes does not
-                // fail in practice, so no further fallback is attempted.
-                let mut flate_dict = Dictionary::new();
-                flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-                if let Ok(encoded) = crate::filters::encode_stream_data(&flate_dict, &new_decoded) {
-                    stream.dict.remove("DecodeParms");
-                    stream
-                        .dict
-                        .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-                    stream.dict.insert(
-                        "Length",
-                        Object::Integer(i64::try_from(encoded.len()).unwrap_or(i64::MAX)),
-                    );
-                    stream.data = encoded;
-                }
-            }
-        }
-    }
-
-    if was_indirect {
-        // A fresh indirect object, never the original ref: the original
-        // still identifies the (possibly shared-across-placements) source
-        // `/DR` copy this stream's `/Resources` started out pointing at.
-        // Overwriting it in place would corrupt every other consumer of
-        // that ref; the writer's existing reachability pass drops the now-
-        // unreferenced original once nothing points at it any more.
-        let new_ref = allocate_next_ref(dest)?;
-        dest.set_object(new_ref, Object::Dictionary(resources));
-        stream.dict.insert("Resources", Object::Reference(new_ref));
-    } else {
-        stream
-            .dict
-            .insert("Resources", Object::Dictionary(resources));
-    }
-    dest.set_object(ap_stream_ref, Object::Stream(stream));
-    Ok(())
-}
-
-/// Allocate a fresh indirect object ref (`max(numbers) + 1`, gen 0).
-/// Duplicate of the crate-local helper in `overlay_annotations.rs` /
-/// `overlay.rs` / `page_form_xobject.rs` — kept module-local so this file
-/// has no dependency on `overlay_annotations.rs`'s private surface.
-fn allocate_next_ref<R: Read + Seek>(dest: &Pdf<R>) -> Result<ObjectRef> {
-    let n = dest
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| crate::Error::Unsupported("object-number space exhausted".to_string()))?;
-    Ok(ObjectRef::new(n, 0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ObjectRef;
+    use crate::{Dictionary, Object as PdfObject, ObjectRef};
+    type Object = PdfObject;
     use crate::PdfOpenOptions;
     use std::io::Cursor;
 
@@ -611,7 +262,7 @@ mod tests {
         assert_eq!(rewrite_appearance_content(content, &dr_map), content);
     }
 
-    // ---- adjust_appearance_stream -------------------------------------------
+    // ---- adjust_appearance_stream_via_handle --------------------------------
 
     fn minimal_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
@@ -639,7 +290,7 @@ mod tests {
             d.insert(*k, v.clone());
         }
         let r = ObjectRef::new(n, 0);
-        pdf.set_object(r, Object::Dictionary(d));
+        pdf.set_object(r, PdfObject::Dictionary(d));
         r
     }
 
@@ -654,23 +305,35 @@ mod tests {
             d.insert(*k, v.clone());
         }
         let r = ObjectRef::new(n, 0);
-        pdf.set_object(r, Object::Stream(crate::Stream::new(d, data.to_vec())));
+        pdf.set_object(r, PdfObject::Stream(crate::Stream::new(d, data.to_vec())));
         r
+    }
+
+    /// Keep the existing raw-shaped test fixtures while exercising only the
+    /// canonical live-handle implementation. This helper is test-local; the
+    /// production raw route is removed below.
+    fn adjust_appearance_stream_via_handle<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        ap_stream_ref: ObjectRef,
+        dr_map: &DrMap,
+    ) -> Result<()> {
+        let stream = pdf.get_object_handle(ap_stream_ref);
+        super::adjust_appearance_stream_handle(pdf, &stream, dr_map)
     }
 
     #[test]
     fn adjust_appearance_stream_empty_dr_map_is_noop() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let resources_ref = set_dict(
             &mut pdf,
             3,
             &[(
                 "Font",
-                Object::Dictionary({
+                PdfObject::Dictionary({
                     let mut d = Dictionary::new();
-                    d.insert("F1", Object::Reference(font_ref));
+                    d.insert("F1", PdfObject::Reference(font_ref));
                     d
                 }),
             )],
@@ -678,17 +341,17 @@ mod tests {
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Reference(resources_ref))],
+            &[("Resources", PdfObject::Reference(resources_ref))],
             b"/F1 18 Tf",
         );
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &DrMap::new()).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &DrMap::new()).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1 18 Tf");
         assert_eq!(
             stream.dict.get("Resources"),
-            Some(&Object::Reference(resources_ref))
+            Some(&PdfObject::Reference(resources_ref))
         );
     }
 
@@ -698,7 +361,7 @@ mod tests {
         let ap_ref = set_stream(&mut pdf, 4, &[], b"/F1 18 Tf");
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1 18 Tf");
@@ -709,15 +372,15 @@ mod tests {
     fn adjust_appearance_stream_rewrites_content_and_privatizes_indirect_resources() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let resources_ref = set_dict(
             &mut pdf,
             3,
             &[(
                 "Font",
-                Object::Dictionary({
+                PdfObject::Dictionary({
                     let mut d = Dictionary::new();
-                    d.insert("F1", Object::Reference(font_ref));
+                    d.insert("F1", PdfObject::Reference(font_ref));
                     d
                 }),
             )],
@@ -725,12 +388,12 @@ mod tests {
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Reference(resources_ref))],
+            &[("Resources", PdfObject::Reference(resources_ref))],
             b"/F1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
@@ -751,10 +414,10 @@ mod tests {
             .into_dict()
             .unwrap()
             .get("Font")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .unwrap()
             .clone();
-        assert_eq!(new_font.get("F1_1"), Some(&Object::Reference(font_ref)));
+        assert_eq!(new_font.get("F1_1"), Some(&PdfObject::Reference(font_ref)));
         assert!(new_font.get("F1").is_none());
 
         // The ORIGINAL shared /DR-copy object is untouched.
@@ -764,25 +427,25 @@ mod tests {
             .into_dict()
             .unwrap()
             .get("Font")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .unwrap()
             .clone();
-        assert_eq!(orig_font.get("F1"), Some(&Object::Reference(font_ref)));
+        assert_eq!(orig_font.get("F1"), Some(&PdfObject::Reference(font_ref)));
     }
 
     #[test]
     fn canonical_adjust_appearance_stream_rewrites_a_live_handle_without_materializing_it() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let resources_ref = set_dict(
             &mut pdf,
             3,
             &[(
                 "Font",
-                Object::Dictionary({
+                PdfObject::Dictionary({
                     let mut d = Dictionary::new();
-                    d.insert("F1", Object::Reference(font_ref));
+                    d.insert("F1", PdfObject::Reference(font_ref));
                     d
                 }),
             )],
@@ -790,7 +453,7 @@ mod tests {
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Reference(resources_ref))],
+            &[("Resources", PdfObject::Reference(resources_ref))],
             b"/F1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
@@ -852,12 +515,12 @@ mod tests {
     fn canonical_adjust_appearance_stream_keeps_direct_resources_direct() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
-        let resources = Object::Dictionary({
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
+        let resources = PdfObject::Dictionary({
             let mut d = Dictionary::new();
             let mut fonts = Dictionary::new();
-            fonts.insert("F1", Object::Reference(font_ref));
-            d.insert("Font", Object::Dictionary(fonts));
+            fonts.insert("F1", PdfObject::Reference(font_ref));
+            d.insert("Font", PdfObject::Dictionary(fonts));
             d
         });
         let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf");
@@ -881,9 +544,9 @@ mod tests {
     #[test]
     fn canonical_adjust_appearance_stream_keeps_non_dictionary_resource_category() {
         let mut pdf = open_minimal();
-        let resources = Object::Dictionary({
+        let resources = PdfObject::Dictionary({
             let mut d = Dictionary::new();
-            d.insert("Font", Object::Integer(7));
+            d.insert("Font", PdfObject::Integer(7));
             d
         });
         let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf");
@@ -914,7 +577,7 @@ mod tests {
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Integer(7))],
+            &[("Resources", PdfObject::Integer(7))],
             b"/F1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
@@ -936,15 +599,15 @@ mod tests {
     fn canonical_adjust_appearance_stream_keeps_resources_when_content_cannot_decode() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let resources_ref = set_dict(
             &mut pdf,
             3,
             &[(
                 "Font",
-                Object::Dictionary({
+                PdfObject::Dictionary({
                     let mut d = Dictionary::new();
-                    d.insert("F1", Object::Reference(font_ref));
+                    d.insert("F1", PdfObject::Reference(font_ref));
                     d
                 }),
             )],
@@ -954,8 +617,8 @@ mod tests {
             &mut pdf,
             4,
             &[
-                ("Resources", Object::Reference(resources_ref)),
-                ("Filter", Object::Name(b"FlateDecode".to_vec())),
+                ("Resources", PdfObject::Reference(resources_ref)),
+                ("Filter", PdfObject::Name(b"FlateDecode".to_vec())),
             ],
             raw,
         );
@@ -989,17 +652,17 @@ mod tests {
         let mut pdf = open_minimal();
         let first_font_ref = ObjectRef::new(5, 0);
         let second_font_ref = ObjectRef::new(6, 0);
-        pdf.set_object(first_font_ref, Object::Dictionary(Dictionary::new()));
-        pdf.set_object(second_font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(first_font_ref, PdfObject::Dictionary(Dictionary::new()));
+        pdf.set_object(second_font_ref, PdfObject::Dictionary(Dictionary::new()));
         let resources_ref = set_dict(
             &mut pdf,
             3,
             &[(
                 "Font",
-                Object::Dictionary({
+                PdfObject::Dictionary({
                     let mut d = Dictionary::new();
-                    d.insert("F1", Object::Reference(first_font_ref));
-                    d.insert("F1_1", Object::Reference(second_font_ref));
+                    d.insert("F1", PdfObject::Reference(first_font_ref));
+                    d.insert("F1_1", PdfObject::Reference(second_font_ref));
                     d
                 }),
             )],
@@ -1007,7 +670,7 @@ mod tests {
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Reference(resources_ref))],
+            &[("Resources", PdfObject::Reference(resources_ref))],
             b"/F1 18 Tf /F1_1 12 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
@@ -1039,15 +702,15 @@ mod tests {
     fn canonical_adjust_appearance_stream_falls_back_from_lzw_to_flate() {
         let mut pdf = open_minimal();
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Integer(1));
+        font_dict.insert("F1", PdfObject::Integer(1));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
             &[
-                ("Resources", Object::Dictionary(resources)),
-                ("Filter", Object::Name(b"LZWDecode".to_vec())),
+                ("Resources", PdfObject::Dictionary(resources)),
+                ("Filter", PdfObject::Name(b"LZWDecode".to_vec())),
             ],
             &pack_lzw_9bit_literal(b"/F1 18 Tf"),
         );
@@ -1073,31 +736,31 @@ mod tests {
     fn adjust_appearance_stream_incomplete_inline_image_keeps_resources_and_prefix_consistent() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(font_ref));
+        font_dict.insert("F1", PdfObject::Reference(font_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 12 Tf BI ID",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 12 Tf BI ID ");
         let font = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .and_then(|resources| resources.get("Font"))
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("appearance stream should retain a Font resource dictionary");
-        assert_eq!(font.get("F1_1"), Some(&Object::Reference(font_ref)));
+        assert_eq!(font.get("F1_1"), Some(&PdfObject::Reference(font_ref)));
         assert!(font.get("F1").is_none());
     }
 
@@ -1105,30 +768,30 @@ mod tests {
     fn adjust_appearance_stream_direct_resources_stays_direct() {
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(font_ref));
+        font_dict.insert("F1", PdfObject::Reference(font_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
-        assert_eq!(font.get("F1_1"), Some(&Object::Reference(font_ref)));
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(font.get("F1_1"), Some(&PdfObject::Reference(font_ref)));
     }
 
     #[test]
@@ -1140,22 +803,22 @@ mod tests {
         // stray empty sub-dictionary in the output.
         let mut pdf = open_minimal();
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(Dictionary::new()));
+        resources.insert("Font", PdfObject::Dictionary(Dictionary::new()));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"q Q",
         );
         let dr_map = dr_map_with(b"ExtGState", b"GS1", b"GS1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("expected direct Resources dict");
         assert!(
             resources.get("ExtGState").is_none(),
@@ -1178,36 +841,36 @@ mod tests {
         // permits and `merge_resources_shallow` already resolves on the
         // /DR-merge side. Before the fix, the pre-rename snapshot the
         // membership guard consults still held the un-resolved
-        // `Object::Reference`, `Object::as_dict` cannot see through it, and
+        // `PdfObject::Reference`, `PdfObject::as_dict` cannot see through it, and
         // the guard silently blocked the rewrite even though `/F1` really
         // was present under that indirect sub-dict.
         let mut pdf = open_minimal();
         let font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(font_ref, PdfObject::Dictionary(Dictionary::new()));
         let font_dict_ref = ObjectRef::new(6, 0);
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(font_ref));
-        pdf.set_object(font_dict_ref, Object::Dictionary(font_dict));
+        font_dict.insert("F1", PdfObject::Reference(font_ref));
+        pdf.set_object(font_dict_ref, PdfObject::Dictionary(font_dict));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Reference(font_dict_ref));
+        resources.insert("Font", PdfObject::Reference(font_dict_ref));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(font.get_ref("F1_1"), Some(font_ref));
         assert!(font.get("F1").is_none());
     }
@@ -1227,32 +890,32 @@ mod tests {
         // source name (`F1`).
         let mut pdf = open_minimal();
         let f1_font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(f1_font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(f1_font_ref, PdfObject::Dictionary(Dictionary::new()));
         let f1_1_font_ref = ObjectRef::new(6, 0);
-        pdf.set_object(f1_1_font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(f1_1_font_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(f1_font_ref));
-        font_dict.insert("F1_1", Object::Reference(f1_1_font_ref));
+        font_dict.insert("F1", PdfObject::Reference(f1_font_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(f1_1_font_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf /F1_1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1_1 18 Tf");
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert!(font.get("F1").is_none());
         assert_eq!(
             font.get_ref("F1_1"),
@@ -1274,25 +937,25 @@ mod tests {
         let f2_ref = ObjectRef::new(7, 0);
         let f2_1_ref = ObjectRef::new(8, 0);
         for object_ref in [f1_ref, f1_1_ref, f2_ref, f2_1_ref] {
-            pdf.set_object(object_ref, Object::Dictionary(Dictionary::new()));
+            pdf.set_object(object_ref, PdfObject::Dictionary(Dictionary::new()));
         }
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(f1_ref));
-        font_dict.insert("F1_1", Object::Reference(f1_1_ref));
-        font_dict.insert("F2", Object::Reference(f2_ref));
-        font_dict.insert("F2_1", Object::Reference(f2_1_ref));
+        font_dict.insert("F1", PdfObject::Reference(f1_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(f1_1_ref));
+        font_dict.insert("F2", PdfObject::Reference(f2_ref));
+        font_dict.insert("F2_1", PdfObject::Reference(f2_1_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf /F1_1 18 Tf /F2 18 Tf /F2_1 18 Tf",
         );
         let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         dr_map.insert_rename(b"Font", b"F2".to_vec(), b"F2_1".to_vec());
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
@@ -1302,9 +965,9 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .unwrap();
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(font.get_ref("F1_1"), Some(f1_ref));
         assert_eq!(font.get_ref("F1_1_1"), Some(f1_1_ref));
         assert_eq!(font.get_ref("F2_1"), Some(f2_ref));
@@ -1319,21 +982,21 @@ mod tests {
         // exact same object either way) and mints no fresh name at all.
         let mut pdf = open_minimal();
         let shared_font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(shared_font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(shared_font_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(shared_font_ref));
-        font_dict.insert("F1_1", Object::Reference(shared_font_ref));
+        font_dict.insert("F1", PdfObject::Reference(shared_font_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(shared_font_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf /F1_1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         // `/F1` is renamed to `/F1_1`; the second `/F1_1` token is untouched
@@ -1343,9 +1006,9 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert!(font.get("F1").is_none());
         assert!(
             font.get("F1_1_1").is_none(),
@@ -1373,21 +1036,21 @@ mod tests {
         // them at all.
         let mut pdf = open_minimal();
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F2", Object::Integer(1));
+        font_dict.insert("F2", PdfObject::Integer(1));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
             &[
-                ("Resources", Object::Dictionary(resources)),
-                ("Filter", Object::Name(b"CCITTFaxDecode".to_vec())),
+                ("Resources", PdfObject::Dictionary(resources)),
+                ("Filter", PdfObject::Name(b"CCITTFaxDecode".to_vec())),
             ],
             b"\x00\x01opaque-ccitt-bytes",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        let result = adjust_appearance_stream(&mut pdf, ap_ref, &dr_map);
+        let result = adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map);
         assert!(
             result.is_ok(),
             "an undecodable AP stream content must not fail the whole call"
@@ -1401,12 +1064,12 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(
             font.get("F2"),
-            Some(&Object::Integer(1)),
+            Some(&PdfObject::Integer(1)),
             "unrelated existing key is untouched"
         );
         assert!(font.get("F1").is_none());
@@ -1433,21 +1096,21 @@ mod tests {
         // says "F1_1", the content still says "F1" — exactly like qpdf.
         let mut pdf = open_minimal();
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Integer(1));
+        font_dict.insert("F1", PdfObject::Integer(1));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
             &[
-                ("Resources", Object::Dictionary(resources)),
-                ("Filter", Object::Name(b"CCITTFaxDecode".to_vec())),
+                ("Resources", PdfObject::Dictionary(resources)),
+                ("Filter", PdfObject::Name(b"CCITTFaxDecode".to_vec())),
             ],
             b"\x00\x01/F1 opaque-ccitt-bytes",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        let result = adjust_appearance_stream(&mut pdf, ap_ref, &dr_map);
+        let result = adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map);
         assert!(
             result.is_ok(),
             "an undecodable AP stream content must not fail the whole call"
@@ -1463,14 +1126,77 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(
             font.get("F1_1"),
-            Some(&Object::Integer(1)),
+            Some(&PdfObject::Integer(1)),
             "the /Resources dict rename (steps 1-4) still applies even though \
              the content (step 5) could not be rewritten"
+        );
+        assert!(font.get("F1").is_none());
+    }
+
+    #[test]
+    fn adjust_appearance_stream_leaves_lossy_filtered_content_byte_identical() {
+        // DCTDecode is both specialized AND lossy compression
+        // (StreamFilter::is_lossy_compression, stream_filter.rs's
+        // DctStreamFilter). qpdf's pipeStreamData gates a lossy filter on
+        // `decode_level >= qpdf_dl_all` (QPDF_Stream.cc); at the
+        // DecodeLevel::Generalized this module uses, the filter pipeline is
+        // never installed and raw bytes are piped through with
+        // `filtered = false`. Re-encoding those raw JPEG bytes as though
+        // they were decoded content would corrupt the image. This is
+        // distinct from the CCITTFaxDecode tests above, which exercise
+        // is_specialized_compression only; DCTDecode's is_lossy_compression
+        // flag is the specific signal filterable_stream_data must also
+        // honor (crate::object_handle's pipe_stream_data_inner gates lossy
+        // filters at `decode_level < DecodeLevel::All`, a stricter bound
+        // than specialized filters' `< DecodeLevel::Specialized`).
+        let mut pdf = open_minimal();
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", PdfObject::Integer(1));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
+        let jpeg_like_bytes: &[u8] = b"\xff\xd8\xff\xe0not-real-jpeg-but-lossy-passthrough-bytes";
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[
+                ("Resources", PdfObject::Dictionary(resources)),
+                ("Filter", PdfObject::Name(b"DCTDecode".to_vec())),
+            ],
+            jpeg_like_bytes,
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map)
+            .expect("a lossy-filtered AP stream must not fail the whole call");
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, jpeg_like_bytes,
+            "lossy/specialized-filtered content must stay byte-identical, \
+             not be treated as decoded and re-encoded"
+        );
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&PdfObject::Name(b"DCTDecode".to_vec())),
+            "the filter must stay untouched since qpdf never installs a \
+             decode pipeline for it at this decode level"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(PdfObject::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(
+            font.get("F1_1"),
+            Some(&PdfObject::Integer(1)),
+            "the /Resources dict rename still applies independently of the \
+             (never attempted) content rewrite"
         );
         assert!(font.get("F1").is_none());
     }
@@ -1500,33 +1226,33 @@ mod tests {
         // rewrite would be the byte-identical divergence here.
         let mut pdf = open_minimal();
         let f1_font_ref = ObjectRef::new(5, 0);
-        pdf.set_object(f1_font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(f1_font_ref, PdfObject::Dictionary(Dictionary::new()));
         let f1_1_font_ref = ObjectRef::new(6, 0);
-        pdf.set_object(f1_1_font_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(f1_1_font_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(f1_font_ref));
-        font_dict.insert("F1_1", Object::Reference(f1_1_font_ref));
+        font_dict.insert("F1", PdfObject::Reference(f1_font_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(f1_1_font_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf /F1_1 18 Tf",
         );
         let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         dr_map.insert_rename(b"Font", b"F1_1".to_vec(), b"F1_1_1".to_vec());
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1_1 18 Tf");
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert!(font.get("F1").is_none());
         assert_eq!(
             font.get_ref("F1_1"),
@@ -1555,24 +1281,24 @@ mod tests {
         // (F2->F1) instead — no fresh name minted at all.
         let mut pdf = open_minimal();
         let shared_ref = ObjectRef::new(5, 0);
-        pdf.set_object(shared_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(shared_ref, PdfObject::Dictionary(Dictionary::new()));
         let other_ref = ObjectRef::new(6, 0);
-        pdf.set_object(other_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(other_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(shared_ref));
-        font_dict.insert("F2", Object::Reference(shared_ref));
-        font_dict.insert("F3", Object::Reference(other_ref));
+        font_dict.insert("F1", PdfObject::Reference(shared_ref));
+        font_dict.insert("F2", PdfObject::Reference(shared_ref));
+        font_dict.insert("F3", PdfObject::Reference(other_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F3 18 Tf /F2 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F3", b"F2");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
@@ -1584,9 +1310,9 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(font.get_ref("F1"), Some(shared_ref));
         assert_eq!(font.get_ref("F2"), Some(other_ref));
         assert!(font.get("F3").is_none());
@@ -1649,29 +1375,29 @@ mod tests {
         //         minting a fresh alias (e.g. the wrong "F4_1").
         let mut pdf = open_minimal();
         let shared_ref = ObjectRef::new(5, 0);
-        pdf.set_object(shared_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(shared_ref, PdfObject::Dictionary(Dictionary::new()));
         let temp_ref = ObjectRef::new(6, 0);
-        pdf.set_object(temp_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(temp_ref, PdfObject::Dictionary(Dictionary::new()));
         let other_ref = ObjectRef::new(7, 0);
-        pdf.set_object(other_ref, Object::Dictionary(Dictionary::new()));
+        pdf.set_object(other_ref, PdfObject::Dictionary(Dictionary::new()));
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Reference(temp_ref));
-        font_dict.insert("F1_1", Object::Reference(shared_ref));
-        font_dict.insert("F2", Object::Reference(other_ref));
-        font_dict.insert("F4", Object::Reference(shared_ref));
+        font_dict.insert("F1", PdfObject::Reference(temp_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(shared_ref));
+        font_dict.insert("F2", PdfObject::Reference(other_ref));
+        font_dict.insert("F4", PdfObject::Reference(shared_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F4 12 Tf",
         );
         let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         dr_map.insert_rename(b"Font", b"F1_1".to_vec(), b"F3".to_vec());
         dr_map.insert_rename(b"Font", b"F2".to_vec(), b"F4".to_vec());
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
@@ -1683,9 +1409,9 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(
             font.get_ref("F1_1"),
             Some(shared_ref),
@@ -1720,26 +1446,26 @@ mod tests {
             temp_c_ref,
             c_original_ref,
         ] {
-            pdf.set_object(object_ref, Object::Dictionary(Dictionary::new()));
+            pdf.set_object(object_ref, PdfObject::Dictionary(Dictionary::new()));
         }
         let mut b_original = Dictionary::new();
-        b_original.insert("C_1", Object::Name(b"Inserted".to_vec()));
-        pdf.set_object(b_original_ref, Object::Dictionary(b_original));
+        b_original.insert("C_1", PdfObject::Name(b"Inserted".to_vec()));
+        pdf.set_object(b_original_ref, PdfObject::Dictionary(b_original));
 
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F0", Object::Reference(shared_ref));
-        font_dict.insert("A", Object::Reference(shared_ref));
-        font_dict.insert("A0", Object::Reference(temp_a_ref));
-        font_dict.insert("A1", Object::Reference(temp_b_ref));
-        font_dict.insert("A2", Object::Reference(temp_c_ref));
-        font_dict.insert("B", Object::Reference(b_original_ref));
-        font_dict.insert("C", Object::Reference(c_original_ref));
+        font_dict.insert("F0", PdfObject::Reference(shared_ref));
+        font_dict.insert("A", PdfObject::Reference(shared_ref));
+        font_dict.insert("A0", PdfObject::Reference(temp_a_ref));
+        font_dict.insert("A1", PdfObject::Reference(temp_b_ref));
+        font_dict.insert("A2", PdfObject::Reference(temp_c_ref));
+        font_dict.insert("B", PdfObject::Reference(b_original_ref));
+        font_dict.insert("C", PdfObject::Reference(c_original_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/C 12 Tf",
         );
         let mut dr_map = dr_map_with(b"Font", b"A0", b"A");
@@ -1747,7 +1473,7 @@ mod tests {
         dr_map.insert_rename(b"Font", b"A2".to_vec(), b"C".to_vec());
         dr_map.insert_rename(b"Font", b"B".to_vec(), b"D".to_vec());
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
@@ -1757,18 +1483,25 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
         assert_eq!(font.get_ref("C_1"), Some(c_original_ref));
         assert!(font.get("C_2").is_none());
     }
 
     #[test]
-    fn adjust_appearance_stream_propagates_resource_name_resolution_error() {
-        // Keep object 8 lazy and malformed: unknown references resolve to
-        // qpdf-shaped null, so the error path needs a real parser error from
-        // an indexed object rather than a dangling object number.
+    fn adjust_appearance_stream_tolerates_malformed_nested_resource_like_qpdf() {
+        // Keep object 8 lazy and malformed, reachable only two levels below
+        // the Font category (Font/F0 -> object 5 -> /Broken -> object 8).
+        // qpdf's actual conflict-resolution scan (getResourceNames,
+        // QPDFObjectHandle.cc:1156-1170) dereferences a category value only
+        // one level deep, to check `val.isDictionary()`, and then reads that
+        // value's own KEYS without dereferencing ITS values — so object 5 is
+        // touched (and is fine) but object 8 is never reached at all. The
+        // canonical handle route must match that resolution depth, not go
+        // deeper and surface a parse failure qpdf itself would never
+        // encounter here.
         let bodies: &[&[u8]] = &[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
             b"2 0 obj\nnull\nendobj\n",
@@ -1805,25 +1538,101 @@ mod tests {
         let broken_resource_ref = set_dict(
             &mut pdf,
             5,
-            &[("Broken", Object::Reference(ObjectRef::new(8, 0)))],
+            &[("Broken", PdfObject::Reference(ObjectRef::new(8, 0)))],
         );
         let f1_ref = set_dict(&mut pdf, 6, &[]);
         let f1_1_ref = set_dict(&mut pdf, 7, &[]);
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F0", Object::Reference(broken_resource_ref));
-        font_dict.insert("F1", Object::Reference(f1_ref));
-        font_dict.insert("F1_1", Object::Reference(f1_1_ref));
+        font_dict.insert("F0", PdfObject::Reference(broken_resource_ref));
+        font_dict.insert("F1", PdfObject::Reference(f1_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(f1_1_ref));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
         let ap_ref = set_stream(
             &mut pdf,
             4,
-            &[("Resources", Object::Dictionary(resources))],
+            &[("Resources", PdfObject::Dictionary(resources))],
             b"/F1 18 Tf",
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        assert!(adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).is_err());
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map)
+            .expect("a malformed object two levels below the touched category must not fail");
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"/F1_1 18 Tf",
+            "the rename must actually apply to the stream content"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(PdfObject::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(
+            font.get_ref("F1_1"),
+            Some(f1_ref),
+            "F1's value must move into the F1_1 slot"
+        );
+        assert!(font.get("F1").is_none(), "F1 must be removed after rename");
+        assert_eq!(
+            font.get_ref("F0"),
+            Some(broken_resource_ref),
+            "F0 is untouched by the rename and its malformed grandchild is never dereferenced"
+        );
+    }
+
+    #[test]
+    fn adjust_appearance_stream_unrelated_nested_resource_does_not_interfere_with_rename() {
+        // An unrelated category entry (F0) that itself points at a
+        // dictionary with its own further reference (object 9 -> "Nested"
+        // -> object 8) is not part of the F1->F1_1 rename and is never
+        // dereferenced past its own immediate value — matching qpdf's
+        // getResourceNames, which reads only the immediate category value's
+        // own keys, not the values behind them (QPDFObjectHandle.cc:1156-1170).
+        let mut pdf = open_minimal();
+        let nested_value_ref = set_dict(&mut pdf, 8, &[]);
+        let nested_resource_ref = set_dict(
+            &mut pdf,
+            9,
+            &[("Nested", PdfObject::Reference(nested_value_ref))],
+        );
+        let f1_ref = set_dict(&mut pdf, 6, &[]);
+        let f1_1_ref = set_dict(&mut pdf, 7, &[]);
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F0", PdfObject::Reference(nested_resource_ref));
+        font_dict.insert("F1", PdfObject::Reference(f1_ref));
+        font_dict.insert("F1_1", PdfObject::Reference(f1_1_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", PdfObject::Dictionary(resources))],
+            b"/F1 18 Tf",
+        );
+
+        adjust_appearance_stream_via_handle(
+            &mut pdf,
+            ap_ref,
+            &dr_map_with(b"Font", b"F1", b"F1_1"),
+        )
+        .unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(stream.data, b"/F1_1 18 Tf");
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(PdfObject::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(
+            font.get_ref("F0"),
+            Some(nested_resource_ref),
+            "the unrelated F0 entry is untouched by the F1->F1_1 rename"
+        );
     }
 
     /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its
@@ -1868,23 +1677,23 @@ mod tests {
         // inconsistent stream. This asserts the two stay consistent.
         let mut pdf = open_minimal();
         let mut font_dict = Dictionary::new();
-        font_dict.insert("F1", Object::Integer(1));
+        font_dict.insert("F1", PdfObject::Integer(1));
         let mut resources = Dictionary::new();
-        resources.insert("Font", Object::Dictionary(font_dict));
+        resources.insert("Font", PdfObject::Dictionary(font_dict));
 
         let lzw_bytes = pack_lzw_9bit_literal(b"/F1 18 Tf");
         let ap_ref = set_stream(
             &mut pdf,
             4,
             &[
-                ("Resources", Object::Dictionary(resources)),
-                ("Filter", Object::Name(b"LZWDecode".to_vec())),
+                ("Resources", PdfObject::Dictionary(resources)),
+                ("Filter", PdfObject::Name(b"LZWDecode".to_vec())),
             ],
             &lzw_bytes,
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
 
-        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+        adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
         let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
 
@@ -1892,17 +1701,17 @@ mod tests {
         let resources = stream
             .dict
             .get("Resources")
-            .and_then(Object::as_dict)
+            .and_then(PdfObject::as_dict)
             .expect("Resources should stay a direct (embedded) dictionary");
-        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
-        assert_eq!(font.get("F1_1"), Some(&Object::Integer(1)));
+        let font = resources.get("Font").and_then(PdfObject::as_dict).unwrap();
+        assert_eq!(font.get("F1_1"), Some(&PdfObject::Integer(1)));
         assert!(font.get("F1").is_none());
 
         // The content must agree: re-encoded as FlateDecode (flpdf cannot
         // re-encode LZW), with the resource token renamed to match.
         assert_eq!(
             stream.dict.get("Filter"),
-            Some(&Object::Name(b"FlateDecode".to_vec())),
+            Some(&PdfObject::Name(b"FlateDecode".to_vec())),
             "un-re-encodable /LZWDecode must fall back to /FlateDecode"
         );
         assert!(
@@ -1918,7 +1727,7 @@ mod tests {
         let expected_length = i64::try_from(stream.data.len()).unwrap();
         assert_eq!(
             stream.dict.get("Length"),
-            Some(&Object::Integer(expected_length)),
+            Some(&PdfObject::Integer(expected_length)),
             "/Length must match the newly re-encoded bytes"
         );
     }
