@@ -27,7 +27,7 @@
 //! changed by this extraction-only responsibility.
 
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
-use crate::filters::decode_stream_data;
+use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::page_object_helper::PageObjectHelper;
 use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
@@ -265,7 +265,18 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             }
             _ => None,
         };
-        let Ok(bytes) = decode_stream_data(&form.dict, &form.data) else {
+        let form_handle = pdf.get_object_handle(form_ref);
+        let decoded = (|| -> Result<Vec<u8>> {
+            pdf.resolve_object_handle(&form_handle)?;
+            let stream_dict = form_stream_dict(&form_handle)?;
+            let stream_data = form_handle.get_raw_stream_data()?;
+            decode_stream_data_from_handle(
+                &stream_dict,
+                stream_data.as_ref(),
+                DecodeLimits::default(),
+            )
+        })();
+        let Ok(bytes) = decoded else {
             any_failures = true;
             if let Some(resources) = resources.as_ref() {
                 pending.extend(form_xobjects_in_resources(pdf, resources)?);
@@ -1620,7 +1631,14 @@ fn recurse_form_xobject<R: Read + Seek>(
     // children below.
     let mut complete;
     let mut pruning_ran = false;
-    match decode_stream_data(&stream.dict, &stream.data) {
+    let form_handle = ctx.pdf.get_object_handle(xobj_ref);
+    let decoded = (|| -> Result<Vec<u8>> {
+        ctx.pdf.resolve_object_handle(&form_handle)?;
+        let stream_dict = form_stream_dict(&form_handle)?;
+        let stream_data = form_handle.get_raw_stream_data()?;
+        decode_stream_data_from_handle(&stream_dict, stream_data.as_ref(), DecodeLimits::default())
+    })();
+    match decoded {
         Ok(form_bytes) => {
             // Parse the current Form before visiting children. qpdf's
             // `forEachFormXObject(true, ...)` invokes the parent Form action
@@ -1705,6 +1723,12 @@ fn recurse_form_xobject<R: Read + Seek>(
     }
 
     Ok(complete)
+}
+
+fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
+    handle.as_stream_dict().ok_or_else(|| {
+        Error::Internal("Form XObject handle did not resolve to a stream".to_owned())
+    })
 }
 
 /// Prune `res_ref` (an indirect /Resources object) in-place: remove every
@@ -1937,6 +1961,7 @@ fn apply_pruning<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::PdfOpenOptions;
+    use crate::Stream;
     use std::io::Cursor;
 
     /// Build a 1-page PDF whose inherited `/Resources` is an indirect reference.
@@ -2120,6 +2145,110 @@ mod tests {
             pdf.is_dirty(form_ref),
             "privatizing an indirect category before the veto must dirty its Form owner"
         );
+    }
+
+    fn build_page_with_indirect_form_filter_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R /Resources 6 0 R >>",
+            "null",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let mut page_content = Dictionary::new();
+        page_content.insert("Length", Object::Integer(7));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(page_content, b"/Fm Do".to_vec())),
+        );
+
+        let mut page_xobjects = Dictionary::new();
+        page_xobjects.insert("Fm", Object::Reference(ObjectRef::new(4, 0)));
+        let mut page_resources = Dictionary::new();
+        page_resources.insert("XObject", Object::Dictionary(page_xobjects));
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(page_resources));
+
+        let form_body = b"BT /F1 12 Tf ET";
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = crate::filters::encode_stream_data(&filter_dict, form_body).unwrap();
+        let mut form_dict = Dictionary::new();
+        form_dict.insert("Type", Object::Name(b"XObject".to_vec()));
+        form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+        form_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(100),
+            ]),
+        );
+        form_dict.insert("Resources", Object::Reference(ObjectRef::new(9, 0)));
+        form_dict.insert("Filter", Object::Reference(ObjectRef::new(7, 0)));
+        form_dict.insert("DecodeParms", Object::Reference(ObjectRef::new(8, 0)));
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Stream(Stream::new(form_dict, encoded)),
+        );
+        pdf.set_object(ObjectRef::new(7, 0), Object::Name(b"FlateDecode".to_vec()));
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(decode_params));
+
+        let mut fonts = Dictionary::new();
+        fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+        fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+        let mut form_resources = Dictionary::new();
+        form_resources.insert("Font", Object::Dictionary(fonts));
+        pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(form_resources));
+
+        pdf
+    }
+
+    fn assert_form_fonts_pruned(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+        let form = pdf
+            .resolve(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should remain a stream");
+        let resources = form
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("pruned Form resources should be inline");
+        let fonts = resources
+            .get("Font")
+            .and_then(Object::as_dict)
+            .expect("Form resources should retain /Font");
+        assert!(fonts.get("F1").is_some(), "used /F1 must remain");
+        assert!(fonts.get("F2").is_none(), "unused /F2 must be pruned");
+    }
+
+    #[test]
+    fn remove_unreferenced_resources_resolves_indirect_form_filter() {
+        let mut pdf = build_page_with_indirect_form_filter_pdf();
+
+        remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
+            .expect("resource pruning should succeed");
+
+        assert_form_fonts_pruned(&mut pdf);
+    }
+
+    #[test]
+    fn collect_used_names_for_page_resolves_indirect_form_filter() {
+        let mut pdf = build_page_with_indirect_form_filter_pdf();
+        assert!(
+            collect_used_names_for_page(&mut pdf, ObjectRef::new(3, 0))
+                .expect("Form traversal should succeed")
+                .is_some(),
+            "complete page traversal should return used names"
+        );
+        assert_form_fonts_pruned(&mut pdf);
+    }
+
+    #[test]
+    fn form_stream_dict_rejects_non_stream_handle() {
+        assert!(form_stream_dict(&ObjectHandle::integer(1)).is_err());
     }
 
     // No-regression guard: a single-hop indirect /Resources (5 0 R -> <<dict>>)

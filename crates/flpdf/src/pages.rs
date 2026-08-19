@@ -12,7 +12,7 @@ pub(crate) mod repair;
 #[doc(hidden)]
 pub mod repair;
 
-use crate::filters::decode_stream_data;
+use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::pipeline::buffer::Buffer;
 #[cfg(test)]
 use crate::pipeline::test_support::ascii85_fixture_bytes;
@@ -477,14 +477,25 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
         _ => return Ok(()),
     };
 
+    // qpdf's page helper delegates coalescing to the ObjectHandle route
+    // (`QPDFPageObjectHelper.cc:474-476`, `QPDFObjectHandle.cc:1550-1572`).
+    // Keep the legacy `Object` values above only for the existing
+    // dictionary/write-back contract; filter metadata and raw bytes must come
+    // from the resolver-backed handles.
+    let page_handle = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page_handle)?;
+    let contents_handle = page_handle.try_get_key(b"/Contents")?;
+    let content_handles = canonical_content_handles(contents_handle, refs.len(), page_ref)?;
+
     // ── 3. Decode each stream and concatenate with '\n' separators ─────────────
     let mut coalesced: Vec<u8> = Vec::new();
+    let mut need_newline = false;
     // Preserve the first content stream's non-filter dictionary entries so
     // stream-level metadata in the input is not silently dropped. Keys that
     // describe the encoded form are stripped because the coalesced data is
     // raw decoded bytes (the writer re-derives Length / re-applies a filter).
     let mut new_dict: Option<Dictionary> = None;
-    for (i, elem) in refs.iter().enumerate() {
+    for (i, (elem, content_handle)) in refs.iter().zip(content_handles.iter()).enumerate() {
         let stream: Stream = match elem {
             // Follow the full holder chain per element so a doubly-indirect
             // array entry (`ref → ref → stream`) is coalesced rather than dropped.
@@ -528,11 +539,22 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
             new_dict = Some(d);
         }
 
-        let decoded = decode_stream_data(&stream.dict, &stream.data)?;
-        if i > 0 {
+        let stream_handle = pdf.resolve_object_handle_to_terminal(content_handle)?;
+        let stream_dict_handle = content_stream_dict(&stream_handle, page_ref)?;
+        let stream_data = stream_handle.get_raw_stream_data()?;
+        let decoded = decode_stream_data_from_handle(
+            &stream_dict_handle,
+            stream_data.as_ref(),
+            DecodeLimits::default(),
+        )?;
+        if need_newline {
             coalesced.push(b'\n');
         }
         coalesced.extend_from_slice(&decoded);
+        // qpdf's LastChar pipeline only inserts a separator before the next
+        // stream when this decoded stream did not end in LF
+        // (`QPDFObjectHandle.cc:1710-1737`).
+        need_newline = decoded.last().copied() != Some(b'\n');
     }
 
     // ── 4. Allocate a fresh object number for the coalesced stream ─────────────
@@ -565,6 +587,32 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     pdf.set_object(page_ref, Object::Dictionary(new_page_dict));
 
     Ok(())
+}
+
+fn canonical_content_handles(
+    contents: ObjectHandle,
+    expected_len: usize,
+    page_ref: ObjectRef,
+) -> Result<Vec<ObjectHandle>> {
+    let Some(content_handles) = contents.as_array() else {
+        return Err(Error::Unsupported(format!(
+            "/Contents on page {page_ref} changed from an array during coalesce"
+        )));
+    };
+    if content_handles.len() != expected_len {
+        return Err(Error::Unsupported(format!(
+            "/Contents array on page {page_ref} changed during coalesce"
+        )));
+    }
+    Ok(content_handles)
+}
+
+fn content_stream_dict(stream: &ObjectHandle, page_ref: ObjectRef) -> Result<ObjectHandle> {
+    stream.as_stream_dict().ok_or_else(|| {
+        Error::Unsupported(format!(
+            "/Contents array element on page {page_ref} does not resolve to a stream"
+        ))
+    })
 }
 
 fn object_type_name(obj: &Object) -> &'static str {
@@ -1200,6 +1248,129 @@ mod tests {
 
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert_eq!(content, body);
+    }
+
+    #[test]
+    fn coalesce_page_contents_resolves_indirect_filter_and_decode_params() {
+        let body1 = b"q 1 0 0 1 0 0 cm";
+        let body2 = b"Q";
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = encode_stream_data(&filter_dict, body1).unwrap();
+
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[
+                (4, stream_object_bytes(4, &encoded)),
+                (5, stream_object_bytes(5, body2)),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Filter", Object::Reference(ObjectRef::new(6, 0)));
+        stream_dict.insert("DecodeParms", Object::Reference(ObjectRef::new(7, 0)));
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Stream(Stream::new(stream_dict, encoded)),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Name(b"FlateDecode".to_vec()));
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(decode_params));
+
+        coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+
+        let page = pdf.resolve_borrowed(ObjectRef::new(3, 0)).unwrap();
+        let new_stream_ref = page
+            .as_dict()
+            .and_then(|dict| dict.get("Contents"))
+            .and_then(Object::as_ref_id)
+            .expect("coalesce should replace /Contents with a stream reference");
+        let stream = pdf
+            .resolve(new_stream_ref)
+            .unwrap()
+            .into_stream()
+            .expect("coalesce target should be a stream");
+        let mut expected = body1.to_vec();
+        expected.push(b'\n');
+        expected.extend_from_slice(body2);
+        assert_eq!(stream.data, expected);
+    }
+
+    #[test]
+    fn coalesce_page_contents_avoids_separator_after_trailing_newline() {
+        let body1 = b"q 1 0 0 1 0 0 cm\n";
+        let body2 = b"Q";
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[
+                (4, stream_object_bytes(4, body1)),
+                (5, stream_object_bytes(5, body2)),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+
+        let page = pdf.resolve_borrowed(ObjectRef::new(3, 0)).unwrap();
+        let new_stream_ref = page
+            .as_dict()
+            .and_then(|dict| dict.get("Contents"))
+            .and_then(Object::as_ref_id)
+            .expect("coalesce should replace /Contents with a stream reference");
+        let stream = pdf
+            .resolve(new_stream_ref)
+            .unwrap()
+            .into_stream()
+            .expect("coalesce target should be a stream");
+        let mut expected = body1.to_vec();
+        expected.extend_from_slice(body2);
+        assert_eq!(stream.data, expected);
+    }
+
+    #[test]
+    fn coalesce_page_contents_propagates_canonical_filter_error() {
+        let body1 = b"q 1 0 0 1 0 0 cm";
+        let body2 = b"Q";
+        let bytes = build_pdf_with_binary_extras(
+            "[4 0 R 5 0 R]",
+            &[
+                (4, stream_object_bytes(4, body1)),
+                (5, stream_object_bytes(5, body2)),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Filter", Object::Reference(ObjectRef::new(6, 0)));
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Stream(Stream::new(stream_dict, body1.to_vec())),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(1));
+
+        let result = coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0));
+        assert!(
+            matches!(result, Err(Error::Unsupported(message)) if message.contains("stream filter type is not name or array"))
+        );
+    }
+
+    #[test]
+    fn canonical_content_handles_rejects_non_array_and_wrong_length() {
+        let page_ref = ObjectRef::new(3, 0);
+        assert!(canonical_content_handles(ObjectHandle::integer(1), 0, page_ref).is_err());
+        assert!(canonical_content_handles(
+            ObjectHandle::array(vec![ObjectHandle::null()]),
+            0,
+            page_ref
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn content_stream_dict_rejects_non_stream() {
+        assert!(content_stream_dict(&ObjectHandle::integer(1), ObjectRef::new(3, 0)).is_err());
     }
 
     // -----------------------------------------------------------------------
