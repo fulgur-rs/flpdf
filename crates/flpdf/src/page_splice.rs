@@ -988,8 +988,7 @@ mod tests {
         let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
         let duplicate = match right.get("Kids").and_then(Object::as_array) {
             Some([Object::Reference(page_ref)]) => *page_ref,
-            // cov:ignore: the fixture always has one indirect page in this /Kids array
-            other => panic!("right /Kids should contain one indirect page, got {other:?}"),
+            other => panic!("right /Kids should contain one indirect page, got {other:?}"), // cov:ignore: the fixture always has one indirect page in this /Kids array
         };
         assert_ne!(duplicate, ObjectRef::new(4, 0));
         assert_eq!(
