@@ -779,6 +779,16 @@ encoded-stream passthrough remains a separate responsibility. The qpdf
 `/ColorTransform` `DecodeParms`, malformed JPEG input, 57 fixtures, and 11
 CLI probes.
 
+### coalesceContentStreams correspondence
+
+qpdf の `QPDFPageObjectHelper::coalesceContentStreams`（`QPDFPageObjectHelper.cc:474-476`）から
+`QPDFObjectHandle::coalesceContentStreams`（`QPDFObjectHandle.cc:1550-1572`）へ委譲される
+coalesce は、`QPDF.cc:1912-1917` の `newStream()` で空の stream dictionary を新規作成する。
+したがって入力の先頭 stream にだけある非 filter metadata もコピーしない。flpdf の
+`pages.rs::coalesce_page_contents` も `Dictionary::new()` で結果 stream を生成する。
+canonical provider-backed pipeline と content-tree の全面 cutover は
+`flpdf-qynx.7` の責務であり、この対応は dictionary shape の差だけを固定する。
+
 ## 集計
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
