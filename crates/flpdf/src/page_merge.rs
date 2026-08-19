@@ -467,6 +467,11 @@ struct PrimaryAcroForm {
     /// Indirect refs reachable from `/DR` / `/DA`, folded into the primary copy
     /// closure so the referenced fonts are copied into the output.
     closure_seed: BTreeSet<ObjectRef>,
+    /// Whether the primary has an `/AcroForm` dictionary whose `/Fields`
+    /// resolves to an array (qpdf's `hasAcroForm() && fields.isArray()`
+    /// gate, `QPDFJob.cc:2609-2610`). Drives [`build_merged_acroform`]'s
+    /// decision to rebuild or remove `/AcroForm`, independent of `/DR`/`/DA`.
+    had_fields_array: bool,
 }
 
 /// Read the primary input's `/AcroForm /DR` and `/DA`, returning them with the
@@ -475,7 +480,10 @@ struct PrimaryAcroForm {
 /// numbering); [`build_merged_acroform`] remaps them after the copy.
 fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryAcroForm> {
     let entries = source.acroform().acroform_inherited_entries()?;
-    let mut out = PrimaryAcroForm::default();
+    let mut out = PrimaryAcroForm {
+        had_fields_array: source.acroform().has_fields_array()?,
+        ..Default::default()
+    };
     // One shared `seen` across /DR and /DA so a font referenced by both is
     // resolved once. `collect_refs_in_object` bounds the reference chain by
     // `DEFAULT_MAX_ACROFORM_DEPTH` (review rule 4) and follows arrays, dicts, and
@@ -550,6 +558,25 @@ fn resolve_field_partial_name<R: Read + Seek>(
     Ok(resolved.as_string().map(<[u8]>::to_vec))
 }
 
+/// Remove `/AcroForm` from the target's catalog, if present.
+///
+/// [`wire_doc_level`]'s generic catalog copy places the primary's `/AcroForm`
+/// on the target verbatim (unpruned) before [`build_merged_acroform`] runs.
+/// qpdf removes `/AcroForm` entirely once the filtered field count reaches 0
+/// (`QPDFJob.cc:2626-2629`, `pdf.getRoot().removeKey("/AcroForm")`); this
+/// mirrors that removal for the case where nothing else rebuilds the key.
+fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
+    let Some(catalog_ref) = target.root_ref() else {
+        return Ok(()); // cov:ignore: the seed target always has a /Root catalog
+    };
+    let Some(mut catalog) = target.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        return Ok(()); // cov:ignore: the seed catalog is always a dict
+    };
+    catalog.remove("AcroForm");
+    target.set_object(catalog_ref, Object::Dictionary(catalog));
+    Ok(())
+}
+
 /// Build the merged output's `/AcroForm` from the primary's inherited `/DR` /
 /// `/DA` base plus every kept top-level field, applying qpdf's `+N` name
 /// collision renaming to fields from later inputs.
@@ -566,6 +593,13 @@ fn build_merged_acroform<R: Read + Seek>(
     map: &BTreeMap<ObjectRef, ObjectRef>,
 ) -> Result<()> {
     if kept.is_empty() && primary.dr.is_none() && primary.da.is_none() {
+        if primary.had_fields_array {
+            // The primary had a /Fields array (so the generic catalog copy
+            // placed a real, now-stale /AcroForm on the target) but every
+            // field's page was dropped from the selection. Remove it to
+            // match qpdf instead of leaving the unpruned copy in place.
+            remove_target_acroform(target)?;
+        }
         return Ok(());
     }
 

@@ -2981,6 +2981,62 @@ fn merge_drops_orphan_field_of_unselected_page() {
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
+/// Three-page form, no `/DR` / `/DA`: page 0 carries field `f1` (obj 4), page 1
+/// carries field `f2` (obj 7), page 2 (obj 9) carries no field. Selecting only
+/// page 2 drops every field.
+fn three_page_form_no_dr_da_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 8 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R] /Count 3 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+            ),
+            (
+                4,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f1) /Rect [0 0 100 20] /P 3 0 R >>",
+            ),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (
+                6,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>",
+            ),
+            (
+                7,
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T (f2) /Rect [0 0 100 20] /P 6 0 R >>",
+            ),
+            (8, "<< /Fields [4 0 R 7 0 R] >>"),
+            (9, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    )
+}
+
+// qpdf removes `/AcroForm` entirely once page selection prunes every field to
+// zero (`QPDFJob.cc:2609-2629`, `pdf.getRoot().removeKey("/AcroForm")`) — it
+// does not leave an empty-`/Fields` stub. Selecting only the field-free third
+// page of a DR/DA-less form must drop `/AcroForm` from the merged catalog.
+#[test]
+fn merge_removes_acroform_when_no_fields_survive() {
+    let mut a = Pdf::open_mem_owned(three_page_form_no_dr_da_pdf()).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut a,
+        pages: vec![2],
+    }];
+    let mut doc = merge_documents(&mut inputs).unwrap();
+    let cat = catalog_dict(&mut doc);
+    assert!(
+        cat.get("AcroForm").is_none(),
+        "expected /AcroForm to be removed once every field is pruned, got {:?}",
+        cat.get("AcroForm")
+    );
+
+    let mut out = Vec::new();
+    write_default(&mut doc, &mut out).unwrap();
+    assert!(Pdf::open_mem_owned(out).is_ok());
+}
+
 // The primary's `/AcroForm /DR` / `/DA` are the merged form's base: the output
 // `/AcroForm` carries `/DA` and a `/DR /Font /Helv` pointing at the copied
 // (remapped) Helvetica font object.
