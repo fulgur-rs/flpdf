@@ -37,6 +37,22 @@ fn minimal_pdf_temp() -> tempfile::NamedTempFile {
     f
 }
 
+/// Normalize text-mode CRLF output from qpdf on Windows to LF.
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
+}
+
 /// A minimal PNG-like binary payload (valid PNG header + 1×1 RGBA).
 fn png_like_payload() -> Vec<u8> {
     vec![
@@ -773,7 +789,10 @@ fn lifecycle_7_add_success_and_duplicate_diagnostics_match_qpdf() {
 
     assert_eq!(qpdf_add.status.code(), Some(0));
     assert_eq!(flpdf_add.status.code(), Some(0));
-    assert_eq!(qpdf_add.stderr, flpdf_add.stderr);
+    assert_eq!(
+        normalize_text_newlines(&qpdf_add.stderr),
+        normalize_text_newlines(&flpdf_add.stderr)
+    );
     // qpdf's Windows text stdout is CRLF while flpdf writes LF; compare the
     // diagnostic content independently of the platform line ending.
     let qpdf_verbose = qpdf_add
@@ -822,8 +841,14 @@ fn lifecycle_7_add_success_and_duplicate_diagnostics_match_qpdf() {
 
     assert_eq!(qpdf_duplicate.status.code(), Some(2));
     assert_eq!(flpdf_duplicate.status.code(), Some(2));
-    assert_eq!(qpdf_duplicate.stdout, flpdf_duplicate.stdout);
-    assert_eq!(qpdf_duplicate.stderr, flpdf_duplicate.stderr);
+    assert_eq!(
+        normalize_text_newlines(&qpdf_duplicate.stdout),
+        normalize_text_newlines(&flpdf_duplicate.stdout)
+    );
+    assert_eq!(
+        normalize_text_newlines(&qpdf_duplicate.stderr),
+        normalize_text_newlines(&flpdf_duplicate.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------
