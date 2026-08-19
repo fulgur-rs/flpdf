@@ -11,6 +11,7 @@
 //! 5. metadata survives rewrite: dates / mimetype / description survive a
 //!    plain `flpdf in.pdf out.pdf` rewrite
 //! 6. reverse cross-check: qpdf-authored attachment is readable by flpdf list/show
+//! 7. add success and duplicate diagnostics have the same qpdf exit/status shape
 //!
 //! qpdf-dependent tests use an `is_qpdf_available()` guard and `eprintln!` + early
 //! return when qpdf is absent — they never hard-fail in qpdf-less environments.
@@ -34,6 +35,22 @@ fn minimal_pdf_temp() -> tempfile::NamedTempFile {
     f.write_all(include_bytes!("../../../tests/fixtures/minimal.pdf"))
         .unwrap();
     f
+}
+
+/// Normalize text-mode CRLF output from qpdf on Windows to LF.
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+    normalized
 }
 
 /// A minimal PNG-like binary payload (valid PNG header + 1×1 RGBA).
@@ -725,6 +742,112 @@ fn lifecycle_6_qpdf_authored_readable_by_flpdf() {
     assert!(
         qpdf_listing.contains("qpdfkey"),
         "qpdf sanity: 'qpdfkey' must appear in qpdf's own listing; got: {qpdf_listing}"
+    );
+}
+
+#[test]
+fn lifecycle_7_add_success_and_duplicate_diagnostics_match_qpdf() {
+    if !support::is_qpdf_available() {
+        eprintln!(
+            "lifecycle_7_add_success_and_duplicate_diagnostics_match_qpdf: qpdf not available, skipping"
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("probe.txt");
+    std::fs::write(&attachment, b"diagnostic payload").unwrap();
+    let qpdf_output = temp.path().join("qpdf-output.pdf");
+    let flpdf_output = temp.path().join("flpdf-output.pdf");
+
+    let add_args = [
+        "--verbose",
+        "--add-attachment",
+        attachment.to_str().unwrap(),
+        "--key=probe-key",
+        "--filename=renamed.txt",
+        "--mimetype=text/plain",
+        "--description=probe description",
+        "--creationdate=D:20240101120000Z",
+        "--moddate=D:20240102130000Z",
+        "--",
+        input.path().to_str().unwrap(),
+    ];
+    let qpdf_add = ShellCommand::new("qpdf")
+        .args(add_args)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf add must spawn");
+    let flpdf_add = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(add_args)
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf_add.status.code(), Some(0));
+    assert_eq!(flpdf_add.status.code(), Some(0));
+    assert_eq!(
+        normalize_text_newlines(&qpdf_add.stderr),
+        normalize_text_newlines(&flpdf_add.stderr)
+    );
+    // qpdf's Windows text stdout is CRLF while flpdf writes LF; compare the
+    // diagnostic content independently of the platform line ending.
+    let qpdf_verbose = qpdf_add
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let qpdf_verbose = qpdf_verbose.strip_suffix(b"\r").unwrap_or(qpdf_verbose);
+    let flpdf_verbose = flpdf_add
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let flpdf_verbose = flpdf_verbose.strip_suffix(b"\r").unwrap_or(flpdf_verbose);
+    assert_eq!(
+        qpdf_verbose, flpdf_verbose,
+        "the verbose attached diagnostic must match qpdf"
+    );
+    assert!(qpdf_output.exists());
+    assert!(flpdf_output.exists());
+
+    let qpdf_duplicate = ShellCommand::new("qpdf")
+        .args([
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=probe-key",
+            "--",
+            qpdf_output.to_str().unwrap(),
+        ])
+        .arg(temp.path().join("qpdf-duplicate.pdf"))
+        .output()
+        .expect("qpdf duplicate add must spawn");
+    let flpdf_duplicate = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+            "--key=probe-key",
+            "--",
+            qpdf_output.to_str().unwrap(),
+        ])
+        .arg(temp.path().join("flpdf-duplicate.pdf"))
+        .output()
+        .unwrap();
+
+    assert_eq!(qpdf_duplicate.status.code(), Some(2));
+    assert_eq!(flpdf_duplicate.status.code(), Some(2));
+    assert_eq!(
+        normalize_text_newlines(&qpdf_duplicate.stdout),
+        normalize_text_newlines(&flpdf_duplicate.stdout)
+    );
+    assert_eq!(
+        normalize_text_newlines(&qpdf_duplicate.stderr),
+        normalize_text_newlines(&flpdf_duplicate.stderr)
     );
 }
 

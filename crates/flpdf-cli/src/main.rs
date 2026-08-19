@@ -2,10 +2,9 @@
 
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
-use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
-    JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput,
-    QPDFJob, SplitPageOptions, UsageError,
+    AttachmentAddOptions, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData,
+    PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -38,10 +37,7 @@ use flpdf::{
     PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources,
     Severity, StreamDataMode, WriterConfiguration,
 };
-use flpdf::{
-    copy_attachments_from, fix_qdf, insert_embedded_file, list_attachment_info, remove_attachment,
-    FileParamDates, FileSpecBuilder,
-};
+use flpdf::{copy_attachments_from, fix_qdf, remove_attachment};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -1747,6 +1743,7 @@ fn main() {
             &args.password,
             args.add_attachment,
             args.deterministic_id,
+            args.verbose,
         )
     } else if !args.copy_attachments_from.is_empty() {
         run_copy_attachments_from(
@@ -6116,12 +6113,11 @@ fn object_to_pdf(object: &Object) -> String {
 
 // ── Attachment helpers (flpdf-9hc.10.9) ──────────────────────────────────────
 
-/// Parse a PDF date string of the form `D:YYYYMMDDHHmmSS` (with optional
-/// trailing timezone) into `(year, month, day, hour, minute, second)`.
-///
-/// Only the local-time components are extracted; timezone info is ignored.
-/// The `D:` prefix is required.
-fn parse_pdf_date_arg(s: &str) -> CliResult<(u16, u8, u8, u8, u8, u8)> {
+/// Parse and retain the PDF timestamp syntax accepted by qpdf's
+/// `QUtil::pdf_time_to_qpdf_time`: `D:YYYYMMDDHHmmSS`, optionally followed by
+/// `Z` or a signed `HH'MM'` offset. The raw value is retained so qpdf's exact
+/// timezone spelling is written to `/Params`.
+fn parse_pdf_date_arg(s: &str) -> CliResult<Vec<u8>> {
     let s = s
         .strip_prefix("D:")
         .ok_or_else(|| format!("invalid PDF date {s:?}: must start with D:"))?;
@@ -6134,25 +6130,22 @@ fn parse_pdf_date_arg(s: &str) -> CliResult<(u16, u8, u8, u8, u8, u8)> {
         )
         .into());
     }
-    let year: u16 = s[0..4]
-        .parse()
-        .map_err(|_| format!("invalid year in PDF date D:{s}"))?;
-    let month: u8 = s[4..6]
-        .parse()
-        .map_err(|_| format!("invalid month in PDF date D:{s}"))?;
-    let day: u8 = s[6..8]
-        .parse()
-        .map_err(|_| format!("invalid day in PDF date D:{s}"))?;
-    let hour: u8 = s[8..10]
-        .parse()
-        .map_err(|_| format!("invalid hour in PDF date D:{s}"))?;
-    let minute: u8 = s[10..12]
-        .parse()
-        .map_err(|_| format!("invalid minute in PDF date D:{s}"))?;
-    let second: u8 = s[12..14]
-        .parse()
-        .map_err(|_| format!("invalid second in PDF date D:{s}"))?;
-    Ok((year, month, day, hour, minute, second))
+    let suffix = &s[14..];
+    let valid_suffix = match suffix.as_bytes() {
+        b"" | b"Z" => true,
+        [sign, hour_tens, hour_ones, b'\'', minute_tens, minute_ones, b'\''] => {
+            matches!(sign, b'+' | b'-')
+                && hour_tens.is_ascii_digit()
+                && hour_ones.is_ascii_digit()
+                && minute_tens.is_ascii_digit()
+                && minute_ones.is_ascii_digit()
+        }
+        _ => false,
+    };
+    if !valid_suffix {
+        return Err(format!("invalid PDF date D:{s:?}: timezone must be Z or [+|-]HH'MM'").into());
+    }
+    Ok(format!("D:{s}").into_bytes())
 }
 
 /// Parsed sub-flags for the `--add-attachment FILE [sub-flags] --` segment.
@@ -6161,16 +6154,16 @@ struct AddAttachmentArgs {
     file: PathBuf,
     /// Name-tree key (default: basename of `file`).
     key: Option<Vec<u8>>,
-    /// Filename stored in `/UF`; `/F` uses an ASCII-safe fallback.
+    /// Filename stored in both `/F` and `/UF` by qpdf's `createFileSpec` path.
     filename: Option<Vec<u8>>,
     /// MIME type for `/EmbeddedFile /Subtype`.
     mimetype: Option<Vec<u8>>,
     /// Human-readable description for `/Filespec /Desc`.
     description: Option<Vec<u8>>,
-    /// `/Params /CreationDate` as `(year, month, day, hour, minute, second)`.
-    creation_date: Option<(u16, u8, u8, u8, u8, u8)>,
-    /// `/Params /ModDate` as `(year, month, day, hour, minute, second)`.
-    mod_date: Option<(u16, u8, u8, u8, u8, u8)>,
+    /// `/Params /CreationDate` as the raw PDF date string.
+    creation_date: Option<Vec<u8>>,
+    /// `/Params /ModDate` as the raw PDF date string.
+    mod_date: Option<Vec<u8>>,
     /// When true, replace an existing attachment with the same key.
     replace: bool,
 }
@@ -6191,8 +6184,8 @@ fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentA
     let mut filename: Option<Vec<u8>> = None;
     let mut mimetype: Option<Vec<u8>> = None;
     let mut description: Option<Vec<u8>> = None;
-    let mut creation_date: Option<(u16, u8, u8, u8, u8, u8)> = None;
-    let mut mod_date: Option<(u16, u8, u8, u8, u8, u8)> = None;
+    let mut creation_date: Option<Vec<u8>> = None;
+    let mut mod_date: Option<Vec<u8>> = None;
     let mut replace = false;
 
     for token in iter {
@@ -6290,60 +6283,53 @@ fn run_add_attachment(
     password: &PasswordArgs,
     tokens: Vec<String>,
     deterministic_id: bool,
+    verbose: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
     let args = parse_add_attachment_segment(tokens)?;
 
-    let payload = std::fs::read(&args.file)
-        .map_err(|e| format!("--add-attachment: cannot read {:?}: {e}", args.file))?;
-
     let basename = path_basename(&args.file)?;
     let key = args.key.unwrap_or_else(|| basename.clone());
     let filename = args.filename.unwrap_or_else(|| basename.clone());
-    let filename = String::from_utf8(filename).map_err(|_| {
-        "--add-attachment: filename must be valid UTF-8 so it can be encoded as /UF"
-    })?;
 
-    let mut pdf = open_pdf(&input, repair, password)?;
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let options = pdf_open_options(repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let mut pdf = job
+        .open(BufReader::new(file), input.display().to_string(), options)
+        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
 
-    // Duplicate-key handling.
-    if !args.replace {
-        let existing = list_attachment_info(&mut pdf)?;
-        if existing.iter().any(|a| a.key == key) {
-            return Err(format!(
-                "--add-attachment: key {:?} already exists; use --replace to overwrite",
-                String::from_utf8_lossy(&key)
-            )
-            .into());
-        }
-    } else {
-        // Remove the existing entry so insert_embedded_file can start clean.
-        remove_attachment(&mut pdf, &key)?;
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+
+    if pdf.uses_weak_crypto() {
+        job.logger().warn(format!(
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
+            input.display()
+        ))?;
     }
 
-    let dates = FileParamDates {
-        creation: args.creation_date,
-        modification: args.mod_date,
-    };
-
-    let mut builder = FileSpecBuilder::new(ascii_filename_fallback(&filename), payload)
-        .uf_filename(&filename)
-        .dates(dates);
-    if let Some(mime) = args.mimetype {
-        builder = builder.mimetype(mime);
-    }
-    if let Some(desc) = args.description {
-        builder = builder.description(desc);
-    }
-    let filespec_ref = builder.build(&mut pdf)?;
-    insert_embedded_file(&mut pdf, &key, filespec_ref)?;
+    job.add_attachment(
+        &mut pdf,
+        AttachmentAddOptions {
+            path: args.file,
+            key,
+            filename,
+            mimetype: args.mimetype,
+            description: args.description,
+            creation_date: args.creation_date,
+            modification_date: args.mod_date,
+            replace: args.replace,
+            verbose,
+        },
+    )?;
 
     let options = WriterOptions {
         deterministic_id,
         ..WriterOptions::default()
     };
-    let mut standard_output = None;
     write_with_pdf_writer(
         &mut pdf,
         &output,
@@ -6352,7 +6338,12 @@ fn run_add_attachment(
         false,
         None,
     )?;
-    finish_operation_warnings(&pdf, true)
+    if verbose && output.as_os_str() != "-" {
+        job.logger()
+            .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+    }
+    job.record_document_warnings(&pdf);
+    finish_job_exit_status(job.complete(true)?)
 }
 
 /// `--remove-attachment KEY [input] [output]`

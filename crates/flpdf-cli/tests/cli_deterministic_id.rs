@@ -313,7 +313,10 @@ fn deterministic_id_honored_in_split_pages() {
 #[test]
 fn deterministic_id_honored_in_add_attachment() {
     // qpdf applies --deterministic-id to attachment writes too; flpdf threads it
-    // into run_add_attachment, so the output is byte-stable across runs.
+    // into run_add_attachment, so the output is byte-stable across runs when the
+    // attachment metadata is stable. qpdf generates a fresh current date when
+    // these options are omitted, so explicit dates keep this test focused on
+    // the deterministic-ID policy rather than the wall clock.
     let tmp = tempdir().expect("tempdir");
     let att = tmp.path().join("payload.txt");
     std::fs::write(&att, b"attachment payload").expect("write attachment");
@@ -327,6 +330,10 @@ fn deterministic_id_honored_in_add_attachment() {
             .arg("--deterministic-id")
             .arg("--add-attachment")
             .arg(&att)
+            .args([
+                "--creationdate=D:20240101120000Z",
+                "--moddate=D:20240102130000Z",
+            ])
             .arg("--")
             .arg(&input)
             .arg(out)

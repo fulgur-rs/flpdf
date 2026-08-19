@@ -25,7 +25,7 @@
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
-| `crates/flpdf/src/job/attachments.rs` | correspondence | \`QPDFJob::doListAttachments\` and \`QPDFJob::doShowAttachment\` (\`libqpdf/QPDFJob.cc:876-927\`) |
+| `crates/flpdf/src/job/attachments.rs` | correspondence | \`QPDFJob::addAttachments\`, \`QPDFJob::doListAttachments\`, and \`QPDFJob::doShowAttachment\` (\`libqpdf/QPDFJob.cc:876-927,2046-2087\`) |
 | `crates/flpdf/src/job/json.rs` | correspondence | \`QPDFJob.cc:1545-1640\` (\`doJSON\` fixed section order) and \`QPDFJob.cc:3094-3115\` (\`writeJSON\` output/stream-prefix selection) |
 | `crates/flpdf/src/job/json_sections.rs` | correspondence | \`QPDFJob::doJSONPages\`, \`doJSONPageLabels\`, \`doJSONOutlines\`, \`doJSONAcroform\`, \`doJSONAttachments\`, and \`doJSONEncrypt\` section builders |
 | `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
