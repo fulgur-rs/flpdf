@@ -66,9 +66,9 @@
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::{
-    next_page_parent, page_parent_entries,
     repair::{prepare_for_optimization_with_max_depth, PageTreeRoot},
-    resolve_inherited_resources_with_max_depth, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
+    resolve_inherited_handle_with_max_depth, resolve_inherited_resources_with_max_depth,
+    DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -131,49 +131,21 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     key: &str,
     max_depth: usize,
 ) -> Result<Option<Object>> {
-    use std::collections::BTreeSet;
-
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = PageParentCursor::Reference(page_ref);
-    let mut depth: usize = 0;
-
-    loop {
-        if depth >= max_depth {
-            return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {current}"
-            )));
-        }
-        if let PageParentCursor::Reference(reference) = &current {
-            if !seen.insert(*reference) {
-                // Cycle — treat the attribute as absent.
-                return Ok(None);
-            }
-        }
-
-        let Some((value, parent)) = page_parent_entries(pdf, &current, key)? else {
-            return Ok(None);
-        };
-
-        if let Some(val) = value {
-            match val {
-                // null == absent (§7.3.9): keep walking.
-                Object::Null => {}
-                // An indirect reference to the value is kept as-is: the leaf
-                // can legitimately share the same indirect object (qpdf does
-                // this for /MediaBox in the observed 1,3 case).
-                other => return Ok(Some(other)),
-            }
-        }
-
-        let parent_val = match parent {
-            Some(Object::Null) | None => return Ok(None),
-            Some(v) => v,
-        };
-        let Some(parent) = next_page_parent(parent_val) else {
-            return Ok(None);
-        };
-        current = parent;
-        depth += 1;
+    let key = if key.starts_with('/') {
+        key.as_bytes().to_vec()
+    } else {
+        format!("/{key}").into_bytes()
+    };
+    let Some(value) = resolve_inherited_handle_with_max_depth(pdf, page_ref, &key, max_depth)?
+    else {
+        return Ok(None);
+    };
+    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    let value = value.materialize()?;
+    if matches!(value, Object::Null) {
+        Ok(None)
+    } else {
+        Ok(Some(value))
     }
 }
 
