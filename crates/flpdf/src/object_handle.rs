@@ -3968,7 +3968,27 @@ impl ObjectHandle {
             while visited.insert(current.identity_key()) {
                 let rotate = current.try_get_key(b"/Rotate")?;
                 if let Some(value) = rotate.try_as_integer()? {
-                    old_angle = value;
+                    // qpdf's rotatePage reads the found value through
+                    // getValueAsInt(int&), which saturates out-of-i32-range
+                    // integers to INT_MIN/INT_MAX with a warning
+                    // (getIntValueAsInt, QPDFObjectHandle.cc:525-543) rather
+                    // than using the raw value. Absent/non-integer /Rotate
+                    // still falls through to the /Parent walk below, exactly
+                    // as qpdf's isInteger() guard does, so this only clamps
+                    // once an integer is actually found.
+                    old_angle = if value < i64::from(i32::MIN) {
+                        rotate.warn_if_possible(
+                            "requested value of integer is too small; returning INT_MIN",
+                        )?;
+                        i64::from(i32::MIN)
+                    } else if value > i64::from(i32::MAX) {
+                        rotate.warn_if_possible(
+                            "requested value of integer is too big; returning INT_MAX",
+                        )?;
+                        i64::from(i32::MAX)
+                    } else {
+                        value
+                    };
                     break;
                 }
 
