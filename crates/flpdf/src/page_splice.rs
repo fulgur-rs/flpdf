@@ -210,9 +210,11 @@ fn collect_page_refs<R: Read + Seek>(
             child_ref
         } else {
             let indirect = pdf.make_indirect_object_handle(child)?;
+            // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
             let child_ref = indirect.object_ref().ok_or_else(|| {
                 Error::Internal("direct page-tree child promotion lost its identity".to_owned())
             })?;
+            // cov:ignore-end
             kids_handle
                 .as_ref()
                 .expect("array handle exists when promoting a direct child")
@@ -228,9 +230,11 @@ fn collect_page_refs<R: Read + Seek>(
         let child_ref = if !child_is_pages && !seen.insert(child_ref) {
             let copy = child.shallow_copy()?;
             let indirect = pdf.make_indirect_object_handle(copy)?;
+            // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
             let copy_ref = indirect.object_ref().ok_or_else(|| {
                 Error::Internal("duplicated page copy lost its identity".to_owned())
             })?;
+            // cov:ignore-end
             kids_handle
                 .as_ref()
                 .expect("array handle exists when copying a duplicate page")
@@ -627,6 +631,10 @@ mod tests {
         build_pdf(&[(1, "[]")])
     }
 
+    fn build_catalog_with_direct_pages_not_dictionary_pdf() -> Vec<u8> {
+        build_pdf(&[(1, "<< /Type /Catalog /Pages [] >>")])
+    }
+
     fn build_pages_not_dictionary_pdf() -> Vec<u8> {
         build_pdf(&[(1, "<< /Type /Catalog /Pages 2 0 R >>"), (2, "[]")])
     }
@@ -967,6 +975,13 @@ mod tests {
             matches!(err, Error::Missing("/Catalog dict")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn direct_pages_entry_that_is_not_a_dictionary_is_rejected() {
+        let mut pdf = open(build_catalog_with_direct_pages_not_dictionary_pdf());
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(matches!(err, Error::Missing("/Pages")), "got {err:?}");
     }
 
     #[test]
