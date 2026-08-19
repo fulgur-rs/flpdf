@@ -139,10 +139,10 @@ fn coalesce_joins_two_streams_with_newline() {
 }
 
 #[test]
-fn coalesce_preserves_first_stream_non_filter_dict_entries() {
-    // First stream carries an extra non-filter dict entry. It must survive
-    // coalesce; encode-form keys (Filter/Length) must be stripped since the
-    // coalesced data is raw decoded bytes.
+fn coalesce_discards_first_stream_non_filter_dict_entries() {
+    // qpdf creates a fresh empty stream dictionary for the coalesced stream.
+    // Encode-form keys (Filter/Length) and unrelated first-stream entries must
+    // therefore all be absent from the raw decoded result.
     let seg1 = b"q Q";
     let seg2 = b"BT ET";
     let s1 = format!(
@@ -176,10 +176,9 @@ fn coalesce_preserves_first_stream_non_filter_dict_entries() {
         panic!("not a stream");
     };
 
-    assert_eq!(
-        s.dict.get("MyMeta"),
-        Some(&Object::String(b"keepme".to_vec())),
-        "non-filter dict entry from first stream must be preserved"
+    assert!(
+        s.dict.get("MyMeta").is_none(),
+        "unrelated first-stream dict entry must be discarded"
     );
     assert!(
         s.dict.get("Filter").is_none(),

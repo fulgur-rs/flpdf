@@ -490,50 +490,9 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     // ── 3. Decode each stream and concatenate with '\n' separators ─────────────
     let mut coalesced: Vec<u8> = Vec::new();
     let mut need_newline = false;
-    // Preserve the first content stream's non-filter dictionary entries so
-    // stream-level metadata in the input is not silently dropped. Keys that
-    // describe the encoded form are stripped because the coalesced data is
-    // raw decoded bytes (the writer re-derives Length / re-applies a filter).
-    let mut new_dict: Option<Dictionary> = None;
-    for (i, content_handle) in content_handles.iter().enumerate() {
+    for content_handle in &content_handles {
         let stream_handle = pdf.resolve_object_handle_to_terminal(content_handle)?;
         let stream_dict_handle = content_stream_dict(&stream_handle, page_ref)?;
-        if i == 0 {
-            // `content_stream_dict` returns the live stream dictionary. Its
-            // materialization copies only dictionary entries and does not read
-            // the stream payload, so the canonical raw-data read below remains
-            // the sole provider invocation for this stream.
-            let mut d = match stream_dict_handle.materialize()? {
-                Object::Dictionary(dict) => dict,
-                // cov:ignore-start: every ObjectHandle stream owns a dictionary;
-                // this guards a broken internal stream invariant without panicking.
-                _ => {
-                    return Err(Error::Internal(
-                        "content stream handle did not contain a dictionary".to_owned(),
-                    ));
-                } // cov:ignore-end
-            };
-            // Stripped: encode-form keys (Filter/DecodeParms/DP/Length/DL)
-            // and external-data keys (F/FFilter/FDecodeParms) — see the
-            // stream-dictionary entries in ISO 32000-1 Table 5. The
-            // coalesced payload is embedded raw decoded bytes, so an
-            // external file specification or external-filter chain would
-            // be inconsistent with it.
-            for key in [
-                "Filter",
-                "DecodeParms",
-                "DP",
-                "Length",
-                "DL",
-                "F",
-                "FFilter",
-                "FDecodeParms",
-            ] {
-                d.remove(key);
-            }
-            new_dict = Some(d);
-        }
-
         let stream_data = stream_handle.get_raw_stream_data()?;
         let decoded = decode_stream_data_from_handle(
             &stream_dict_handle,
@@ -566,7 +525,9 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     let new_stream_ref = ObjectRef::new(new_num, 0);
 
     // ── 5. Build the new Stream (no filter: raw decoded bytes; writer handles re-encode) ─
-    let new_stream = Stream::new(new_dict.unwrap_or_default(), coalesced);
+    // qpdf newStream() creates a fresh stream with an empty dictionary
+    // (QPDF.cc:1912-1917); metadata from the input streams is not copied.
+    let new_stream = Stream::new(Dictionary::new(), coalesced);
     pdf.set_object(new_stream_ref, Object::Stream(new_stream));
 
     // ── 6. Re-resolve the page dictionary (it may have been evicted) and patch /Contents ─
