@@ -623,6 +623,10 @@ qpdf と同じ shallow page copy とし、汎用 `merge_documents` の library-l
 `PageDocumentHelper::add_page(PageInput::Foreign)`、`PageObjectHelper::copy_annotations_from`、
 `PageLabelDocumentHelper::write_reconstructed_labels_with_prefix_presence` を通る fresh chunk
 生成を実装し、CLI の単一入力・複数入力 split 出力を同じ job route に切り替えた。
+`.50qd.1` では secondary source の認証を `QPDFJob.cc:2400-2412` の
+`page_spec.password` 境界に合わせ、top-level primary password を distinct secondary の
+fallback にしない。global な password mode/weak-crypto policy は共有するが、credential
+本体は spec-local に限定する。
 
 ### C. qpdf に機能そのものが無いもの
 

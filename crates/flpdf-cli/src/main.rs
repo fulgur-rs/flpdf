@@ -4227,18 +4227,20 @@ fn run_page_extraction(
 
     let specs = parse_pages_segment(&page_ops.pages)?;
     let mut inputs = resolve_page_specs(&specs, primary_input)?;
+    let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
 
-    // CombinedPlan and the job-level page-spec route both open each input
-    // using the segment-local InputSpec password. For `--pages . ...` on an
-    // encrypted primary input where the user supplied the top-level
-    // `--password`, the spec carries no password and planning would fail
-    // before the later open_pdf(..., &src_pw) path applies it. Backfill the
-    // top-level password into specs that lack their own so every route uses
-    // the same credential.
-    if let Some(top_pw) = &password.password {
-        for spec in &mut inputs {
-            if spec.password.is_none() {
-                spec.password = Some(top_pw.clone());
+    // The in-place single-document planner must use the top-level password
+    // for the already-authenticated primary when `--pages . ...` carries no
+    // segment password. The multi-source QPDFJob route opens the primary
+    // separately and must leave secondary credentials segment-local: qpdf does
+    // not fall back to the primary password for a distinct source
+    // (QPDFJob.cc:2400-2412).
+    if !has_external_source {
+        if let Some(top_pw) = &password.password {
+            for spec in &mut inputs {
+                if spec.password.is_none() {
+                    spec.password = Some(top_pw.clone());
+                }
             }
         }
     }
@@ -4329,7 +4331,6 @@ fn run_page_extraction(
     // library QPDFJob facade; retain the existing in-place route for the
     // single-document path, where its outline/structure post-passes operate
     // on the original object graph.
-    let has_external_source = inputs.iter().any(|spec| spec.path != primary_input);
     if has_external_source {
         return run_page_extraction_from_multiple_sources(
             primary_input,
@@ -4504,10 +4505,13 @@ fn run_page_extraction_from_multiple_sources(
     sources.push(open_pdf(&primary_input.to_path_buf(), repair, password)?);
     for (source_index, path) in source_paths.iter().enumerate().skip(1) {
         let mut source_password = password.clone();
-        if let Some(segment_password) = &source_passwords[source_index] {
-            source_password.password = Some(segment_password.clone());
-            source_password.password_file = None;
-        }
+        // qpdf opens each secondary with only the password attached to its
+        // page specification (QPDFJob.cc:2400-2412). The primary password is
+        // not a fallback for a secondary with no segment password; retain the
+        // global interpretation/policy flags, but replace both credential
+        // fields with the per-source value, including an explicit empty value.
+        source_password.password = source_passwords[source_index].clone();
+        source_password.password_file = None;
         sources.push(open_pdf(path, repair, &source_password)?);
     }
     let primary_copy_encryption = sources
