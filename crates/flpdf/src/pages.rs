@@ -33,20 +33,28 @@ pub const DEFAULT_MAX_PAGE_TREE_DEPTH: usize = 100;
 /// A qpdf-style page-tree dictionary handle while following `/Parent`.
 ///
 /// `QPDFObjectHandle` keeps direct dictionaries addressable just like indirect
-/// objects. Rust has no shared direct-object identity, so a direct parent is
-/// carried by value while reference parents retain their object identity for
-/// cycle detection.
+/// objects. Keep the handle itself so direct parents retain their live identity
+/// and indirect parents retain their canonical object reference while walking.
 #[derive(Debug, Clone)]
-pub(crate) enum PageParentCursor {
-    Reference(ObjectRef),
-    Direct(Dictionary),
+pub(crate) struct PageParentCursor {
+    handle: ObjectHandle,
+}
+
+impl PageParentCursor {
+    pub(crate) fn from_handle(handle: ObjectHandle) -> Self {
+        Self { handle }
+    }
+
+    fn handle(&self) -> ObjectHandle {
+        self.handle.clone()
+    }
 }
 
 impl fmt::Display for PageParentCursor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Reference(reference) => write!(f, "{reference}"),
-            Self::Direct(_) => f.write_str("direct page-tree dictionary"),
+        match self.handle.object_ref() {
+            Some(reference) => write!(f, "{reference}"),
+            None => f.write_str("direct page-tree dictionary"),
         }
     }
 }
@@ -55,21 +63,80 @@ impl fmt::Display for PageParentCursor {
 pub(crate) fn page_parent_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     cursor: &PageParentCursor,
-    key: &str,
-) -> Result<Option<(Option<Object>, Option<Object>)>> {
-    let dict = match cursor {
-        PageParentCursor::Reference(reference) => pdf.resolve_borrowed(*reference)?.as_dict(),
-        PageParentCursor::Direct(dict) => Some(dict),
-    };
-    Ok(dict.map(|dict| (dict.get(key).cloned(), dict.get("Parent").cloned())))
+    key: &[u8],
+) -> Result<Option<(ObjectHandle, ObjectHandle)>> {
+    let dict = cursor.handle();
+    pdf.resolve_object_handle(&dict)?;
+    if dict.as_dictionary().is_none() {
+        return Ok(None);
+    }
+    Ok(Some((
+        dict.try_get_key(key)?,
+        dict.try_get_key(b"/Parent")?,
+    )))
 }
 
 /// Advance a page-tree parent cursor when `/Parent` is a dictionary handle.
-pub(crate) fn next_page_parent(parent: Object) -> Option<PageParentCursor> {
-    match parent {
-        Object::Reference(reference) => Some(PageParentCursor::Reference(reference)),
-        Object::Dictionary(dict) => Some(PageParentCursor::Direct(dict)),
-        _ => None,
+pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParentCursor>> {
+    parent.try_dereference()?;
+    if parent.is_null() || parent.as_dictionary().is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PageParentCursor::from_handle(parent)))
+}
+
+/// Resolve the first non-null inherited value as its live qpdf-shaped handle.
+///
+/// Ports the bottom-up `/Parent`-climbing half of
+/// `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:217-263`):
+/// climb ancestors looking for `key`, treating an explicit `null` as absent
+/// (ISO 32000-1 §7.3.9) and stopping at the first node that carries a
+/// non-null value. This is the canonical shared parent walk. The legacy
+/// public resource helper below still materializes its return type for
+/// existing callers; new page consumers must use this handle-native
+/// boundary instead.
+pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    key: &[u8],
+    max_depth: usize,
+) -> Result<Option<ObjectHandle>> {
+    let mut seen: Vec<ObjectHandle> = Vec::new();
+    let mut current = PageParentCursor::from_handle(pdf.get_object_handle(page_ref));
+    let mut depth = 0usize;
+
+    loop {
+        if depth >= max_depth {
+            return Err(Error::Unsupported(format!(
+                "page tree depth exceeds maximum of {max_depth} at {current}"
+            )));
+        }
+        let current_handle = current.handle();
+        if seen
+            .iter()
+            .any(|seen_handle| seen_handle.is_same_object_as(&current_handle))
+        {
+            return Ok(None);
+        }
+        seen.push(current_handle);
+
+        let Some((value, parent)) = page_parent_entries(pdf, &current, key)? else {
+            return Ok(None);
+        };
+        // Parsed PDF references already have canonical indirect identity. The
+        // terminal chase below only preserves the existing Pdf::set_object
+        // redirect compatibility for callers that have not migrated yet; the
+        // returned handle remains the original live child handle.
+        let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
+        if !terminal.try_is_null()? {
+            return Ok(Some(value));
+        }
+
+        let Some(parent) = next_page_parent(parent)? else {
+            return Ok(None);
+        };
+        current = parent;
+        depth += 1;
     }
 }
 
@@ -622,68 +689,24 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
     page_ref: ObjectRef,
     max_depth: usize,
 ) -> Result<Option<Dictionary>> {
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = PageParentCursor::Reference(page_ref);
-    let mut depth: usize = 0;
+    let Some(resources) =
+        resolve_inherited_handle_with_max_depth(pdf, page_ref, b"/Resources", max_depth)?
+    else {
+        return Ok(None);
+    };
 
-    loop {
-        if depth >= max_depth {
-            return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {current}"
-            )));
-        }
-
-        // Cycle guard: if we have already visited this node, stop.
-        if let PageParentCursor::Reference(reference) = &current {
-            if !seen.insert(*reference) {
-                return Ok(None);
-            }
-        }
-
-        let Some((resources_val, parent_val)) = page_parent_entries(pdf, &current, "Resources")?
-        else {
-            // Not a dictionary — cannot walk further.
-            return Ok(None);
-        };
-
-        // Check for /Resources on this node. Per PDF §7.3.9, a null value is
-        // equivalent to the key being absent — so Object::Null (and references
-        // that resolve to null) fall through to the /Parent chain.
-        if let Some(resources_val) = resources_val {
-            match resources_val {
-                Object::Null => {}
-                Object::Dictionary(d) => return Ok(Some(d)),
-                // Follow the full holder chain (`ref → ref → dict`) so an
-                // indirectly-held inherited /Resources is resolved, not dropped.
-                Object::Reference(r) => match resolve_ref_chain(pdf, &Object::Reference(r))?.0 {
-                    Object::Null => {}
-                    Object::Dictionary(d) => return Ok(Some(d)),
-                    _ => {
-                        return Err(Error::Unsupported(format!(
-                            "/Resources reference {r} on node {current} does not resolve to a dictionary"
-                        )));
-                    }
-                },
-                _ => {
-                    return Err(Error::Unsupported(format!(
-                        "/Resources entry on node {current} has unexpected type"
-                    )));
-                }
-            }
-        }
-
-        // No /Resources here — try the /Parent. A null /Parent is equivalent
-        // to no /Parent at all (PDF §7.3.9), so stop walking in either case.
-        let parent_val = match parent_val {
-            Some(Object::Null) | None => return Ok(None),
-            Some(v) => v,
-        };
-
-        let Some(parent) = next_page_parent(parent_val) else {
-            return Ok(None);
-        };
-        current = parent;
-        depth += 1;
+    let resources_ref = resources.object_ref();
+    let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
+    match resources.materialize()? {
+        Object::Dictionary(dictionary) => Ok(Some(dictionary)),
+        _ => match resources_ref {
+            Some(resources_ref) => Err(Error::Unsupported(format!(
+                "/Resources reference {resources_ref} on page {page_ref} does not resolve to a dictionary"
+            ))),
+            None => Err(Error::Unsupported(format!(
+                "/Resources entry on page {page_ref} has unexpected type"
+            ))),
+        },
     }
 }
 
@@ -831,6 +854,7 @@ mod tests {
     use crate::filters::encode_stream_data;
     use crate::Dictionary;
     use std::io::Cursor;
+    use std::process::Command;
 
     /// `object_type_name` collapses both real variants to `"real"` so that
     /// diagnostics do not leak the implementation detail that one form
@@ -862,10 +886,175 @@ mod tests {
     #[test]
     fn page_parent_cursor_handles_direct_and_non_dictionary_parents() {
         assert_eq!(
-            PageParentCursor::Direct(Dictionary::new()).to_string(),
+            PageParentCursor::from_handle(ObjectHandle::dictionary(Vec::new())).to_string(),
             "direct page-tree dictionary"
         );
-        assert!(next_page_parent(Object::Integer(42)).is_none());
+        assert!(next_page_parent(ObjectHandle::integer(42))
+            .expect("non-dictionary parent lookup should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn page_parent_handles_preserve_identity_and_absent_inheritance() {
+        let direct_resources = ObjectHandle::dictionary(Vec::new());
+        let direct_parent = ObjectHandle::dictionary(vec![
+            (b"/Resources".to_vec(), direct_resources.clone()),
+            (b"/Parent".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut empty = Pdf::empty().expect("empty PDF should be constructible");
+        let non_dictionary = PageParentCursor::from_handle(ObjectHandle::integer(42));
+        assert!(
+            page_parent_entries(&mut empty, &non_dictionary, b"/Resources")
+                .expect("non-dictionary parent lookup should succeed")
+                .is_none()
+        );
+
+        let cursor = PageParentCursor::from_handle(direct_parent.clone());
+        let (resources, parent) = page_parent_entries(&mut empty, &cursor, b"/Resources")
+            .expect("direct parent lookup should succeed")
+            .expect("direct parent should be a dictionary");
+
+        assert!(cursor.handle().is_same_object_as(&direct_parent));
+        assert!(resources.is_same_object_as(&direct_resources));
+        assert!(parent.is_null());
+        assert!(next_page_parent(parent)
+            .expect("null parent lookup should succeed")
+            .is_none());
+
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 7 0 R >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (7, "<< /Font << >> >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let depth_error =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 0)
+                .expect_err("a zero page-tree depth limit should fail before walking");
+        assert!(depth_error
+            .to_string()
+            .contains("page tree depth exceeds maximum of 0 at 3 0 R"));
+
+        let inherited = resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/Resources",
+            10,
+        )
+        .expect("inherited resource lookup should succeed")
+        .expect("the page should inherit /Resources");
+        assert_eq!(inherited.object_ref(), Some(ObjectRef::new(7, 0)));
+        assert!(inherited.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(7, 0))));
+        assert!(resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/Rotate",
+            10,
+        )
+        .expect("absent /Rotate lookup should succeed")
+        .is_none());
+
+        let mut non_dictionary_pdf = Pdf::empty().expect("empty PDF should be constructible");
+        non_dictionary_pdf.set_object(ObjectRef::new(3, 0), Object::Integer(42));
+        assert!(resolve_inherited_handle_with_max_depth(
+            &mut non_dictionary_pdf,
+            ObjectRef::new(3, 0),
+            b"/Resources",
+            10,
+        )
+        .expect("non-dictionary page lookup should succeed")
+        .is_none());
+    }
+
+    #[test]
+    fn page_parent_handle_walk_matches_qpdf_11_9_flatten_probe() {
+        let version = match Command::new("qpdf").arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            // cov:ignore-start: the optional qpdf oracle probe skips when qpdf is absent or exits unsuccessfully in a CI environment.
+            Ok(_) | Err(_) => {
+                eprintln!("qpdf 11.9.0 is unavailable; skipping page-tree oracle probe");
+                return;
+            } // cov:ignore-end
+        };
+        // cov:ignore-start: the optional qpdf oracle probe skips when a different qpdf version is installed.
+        if !version.starts_with("qpdf version 11.9.") {
+            eprintln!("qpdf 11.9.0 is unavailable; skipping page-tree oracle probe");
+            return;
+        }
+        // cov:ignore-end
+
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 7 0 R >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+                (7, "<< /Font << >> >>"),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("temporary qpdf probe directory");
+        let input = dir.path().join("input.pdf");
+        let flattened = dir.path().join("flattened.pdf");
+        std::fs::write(&input, &bytes).expect("write qpdf probe input");
+
+        let flatten = Command::new("qpdf")
+            .arg(&input)
+            .arg("--pages")
+            .arg(&input)
+            .arg("1")
+            .arg("--")
+            .arg(&flattened)
+            .output()
+            .expect("run qpdf page flatten probe");
+        assert!(
+            flatten.status.success(),
+            "qpdf --pages probe failed: {}",
+            String::from_utf8_lossy(&flatten.stderr) // cov:ignore: assertion failure arm, only evaluated when the qpdf probe fails
+        );
+
+        let shown = Command::new("qpdf")
+            .arg("--show-object=3")
+            .arg(&flattened)
+            .output()
+            .expect("show qpdf flattened page");
+        assert!(
+            shown.status.success(),
+            "qpdf --show-object probe failed: {}",
+            String::from_utf8_lossy(&shown.stderr) // cov:ignore: assertion failure arm, only evaluated when the qpdf probe fails
+        );
+        let shown = String::from_utf8_lossy(&shown.stdout);
+        assert!(shown.contains("/Resources"), "qpdf output: {shown}");
+        assert!(!shown.contains("/Rotate"), "qpdf output: {shown}");
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let inherited = resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/Resources",
+            10,
+        )
+        .expect("inherited resource lookup should succeed")
+        .expect("the page should inherit /Resources");
+        assert_eq!(inherited.object_ref(), Some(ObjectRef::new(7, 0)));
+        assert!(resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/Rotate",
+            10,
+        )
+        .expect("absent /Rotate lookup should succeed")
+        .is_none());
     }
 
     // -----------------------------------------------------------------------

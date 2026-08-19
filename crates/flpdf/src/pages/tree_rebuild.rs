@@ -66,9 +66,9 @@
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::{
-    next_page_parent, page_parent_entries,
     repair::{prepare_for_optimization_with_max_depth, PageTreeRoot},
-    resolve_inherited_resources_with_max_depth, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
+    resolve_inherited_handle_with_max_depth, resolve_inherited_resources_with_max_depth,
+    DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -131,50 +131,25 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     key: &str,
     max_depth: usize,
 ) -> Result<Option<Object>> {
-    use std::collections::BTreeSet;
-
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = PageParentCursor::Reference(page_ref);
-    let mut depth: usize = 0;
-
-    loop {
-        if depth >= max_depth {
-            return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {current}"
-            )));
-        }
-        if let PageParentCursor::Reference(reference) = &current {
-            if !seen.insert(*reference) {
-                // Cycle — treat the attribute as absent.
-                return Ok(None);
-            }
-        }
-
-        let Some((value, parent)) = page_parent_entries(pdf, &current, key)? else {
-            return Ok(None);
-        };
-
-        if let Some(val) = value {
-            match val {
-                // null == absent (§7.3.9): keep walking.
-                Object::Null => {}
-                // An indirect reference to the value is kept as-is: the leaf
-                // can legitimately share the same indirect object (qpdf does
-                // this for /MediaBox in the observed 1,3 case).
-                other => return Ok(Some(other)),
-            }
-        }
-
-        let parent_val = match parent {
-            Some(Object::Null) | None => return Ok(None),
-            Some(v) => v,
-        };
-        let Some(parent) = next_page_parent(parent_val) else {
-            return Ok(None);
-        };
-        current = parent;
-        depth += 1;
+    let key = if key.starts_with('/') {
+        key.as_bytes().to_vec()
+    } else {
+        format!("/{key}").into_bytes()
+    };
+    let Some(value) = resolve_inherited_handle_with_max_depth(pdf, page_ref, &key, max_depth)?
+    else {
+        return Ok(None);
+    };
+    // An indirect value is kept as a reference, not dereferenced: the leaf
+    // can legitimately share the same indirect object (qpdf does this for
+    // /MediaBox in the observed 1,3 case; QPDF_pages.cc's inherited-attribute
+    // push writes the ancestor's handle -- reference or direct -- onto the
+    // leaf as-is, matching `getKey`'s non-transparent reference semantics).
+    if let Some(reference) = value.object_ref() {
+        return Ok(Some(Object::Reference(reference)));
     }
+    let value = value.materialize()?;
+    Ok(Some(value))
 }
 
 /// `true` when `dict` carries `key` as something other than `null`
@@ -867,6 +842,42 @@ mod tests {
         assert_eq!(
             resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "BleedBox", 10).unwrap(),
             None
+        );
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "/BleedBox", 10).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_inherited_lookup_preserves_an_indirect_ancestor_value() {
+        // qpdf 11.9.0 (`qpdf --pages`, live-probed): when an ancestor `/Pages`
+        // node's inheritable attribute is itself an indirect reference, the
+        // pushed leaf value stays that same reference -- it is never
+        // dereferenced and inlined. Set object 3's /MediaBox (direct in
+        // build_nested_pdf's fixture) to a fresh indirect object 10 and
+        // confirm leaf 6 (no own MediaBox) inherits the reference itself.
+        let mut pdf = open(build_nested_pdf());
+        pdf.set_object(
+            ObjectRef::new(10, 0),
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(200),
+                Object::Integer(300),
+            ]),
+        );
+        let mut parent3 = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("intermediate node must be a dictionary");
+        parent3.insert("MediaBox", Object::Reference(ObjectRef::new(10, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent3));
+
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(6, 0), "MediaBox", 10).unwrap(),
+            Some(Object::Reference(ObjectRef::new(10, 0)))
         );
     }
 
