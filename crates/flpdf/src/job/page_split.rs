@@ -565,6 +565,11 @@ mod tests {
 
     #[test]
     fn digit_width_small_values() {
+        assert_eq!(
+            digit_width(0),
+            1,
+            "edge case: won't occur for real page counts"
+        );
         assert_eq!(digit_width(1), 1);
         assert_eq!(digit_width(9), 1);
         assert_eq!(digit_width(10), 2);
