@@ -18,18 +18,20 @@ delegates to that owner in `QPDFPageDocumentHelper.cc:37-52`.
   `ObjectHandle` resolution/accessors and canonical mutation/write-back.
 - [x] Existing flat, nested, boundary, invalid-range, empty-result, and
   depth-limit behavior remains unchanged.
-- [x] Indirect `/Kids` and `/Count` are covered by a regression test, and
-  mutations are marked dirty through the canonical document route.
+- [x] Indirect `/Kids` identity is retained while its live array is mutated,
+  `/Count` is updated canonically, and both count mismatches and duplicate
+  insertions have regression coverage.
 - [x] Focused tests, formatting, rustdoc, strict clippy, relevant qpdf
   differential tests, workspace tests, and fresh patch coverage pass.
 - [x] A source-first qpdf review finds no remaining scoped legacy bridge.
 - [ ] The PR is rebased onto current `main`, all CI checks pass, and it is
-  changed from Draft to Ready. Merge is handled by the integration session.
+  changed from Draft to Ready.
 
-The one `cov:ignore` marker is on the `ObjectHandle::replace_key` error edge
-for `/Kids`: every child handle is minted by the same owning `Pdf`, so qpdf's
-ownership check cannot fail on this route; the normal success path is covered
-by every splice mutation test.
+The `cov:ignore` markers cover only invariant-impossible branches: the
+`ObjectHandle` ownership edge for `/Kids` has only same-`Pdf` children, and
+`usize` page-count overflow cannot be constructed by a finite PDF object tree.
+The private count-mismatch error edge is directly exercised because the public
+entry point rejects the same malformed tree during its full preflight walk.
 
 ## Implementation sequence
 
@@ -44,8 +46,9 @@ by every splice mutation test.
 **[provisional — settled by TDD, not by this document]**
 
 The implementation may snapshot child handles from a resolved `/Kids` array
-before recursing, then replace `/Kids` and `/Count` on the live `/Pages`
-handle. The oracle and tests determine the exact resolution order and error
-boundary.
+before recursing, then mutate an existing live array in place (preserving its
+indirect identity) and update `/Count` on the live `/Pages` handle. A missing
+or non-array `/Kids` value may be replaced with a new array. The oracle and
+tests determine the exact resolution order and error boundary.
 
 **[/provisional]**
