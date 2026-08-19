@@ -1916,7 +1916,7 @@ fn object_handle_description(object: &ObjectHandle) -> String {
         .unwrap_or_else(|| "direct object".to_owned())
 }
 
-fn rectangle_from_handle<R: Read + Seek>(
+pub(crate) fn rectangle_from_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
 ) -> Result<Option<Rectangle>> {
