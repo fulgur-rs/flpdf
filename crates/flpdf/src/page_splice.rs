@@ -12,13 +12,12 @@
 //! (`QPDF_pages.cc:209,256`), while this bounded page-extraction/merge route
 //! preserves the caller's subtree and applies the same page-owner invariants.
 //!
-//! Because every mutation is `/Kids`-array-keyed by indirect object
-//! reference, a direct intermediate `/Pages` node is promoted to an indirect
-//! object during the preflight walk even though qpdf's own
-//! `QPDF::getAllPagesInternal` only promotes a kid lacking `/Kids`
-//! (`QPDF_pages.cc:99-114`). `/Parent` itself is left untouched by the
-//! preflight walk, matching qpdf: neither `getAllPagesInternal` nor a
-//! duplicate page's `shallowCopy` (`QPDFObjectHandle.cc:2073-2077`) write it.
+//! The preflight walk promotes only direct leaf kids, while a direct
+//! intermediate `/Pages` node stays live and is mutated in place. This matches
+//! qpdf's `QPDF::getAllPagesInternal` (`QPDF_pages.cc:99-114`). `/Parent`
+//! itself is left untouched by the preflight walk, matching qpdf: neither
+//! `getAllPagesInternal` nor a duplicate page's `shallowCopy`
+//! (`QPDFObjectHandle.cc:2073-2077`) write it.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 #[cfg(test)]
@@ -108,9 +107,10 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
     }
 
     let mut insert_done = false;
+    let pages_node = pdf.get_object_handle(pages_ref);
     splice_subtree(
         pdf,
-        pages_ref,
+        pages_node,
         0,
         &remove,
         &normalized_insert,
@@ -158,6 +158,12 @@ fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     Ok(pages_ref)
 }
 
+fn node_label(node: &ObjectHandle) -> String {
+    node.object_ref()
+        .map(|object_ref| object_ref.to_string())
+        .unwrap_or_else(|| "direct object".to_owned())
+}
+
 /// Snapshot the complete page order through canonical handles.
 ///
 /// qpdf's page owner maintains a page-object index while flattening the tree
@@ -168,14 +174,17 @@ fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
 /// `m->ever_called_get_all_pages` (`QPDF_pages.cc:41`), which this walk
 /// completes just as fully as the flattening traversal it replaces.
 ///
-/// A direct intermediate `/Pages` node is promoted to indirect here just like
-/// a direct leaf, which diverges from `QPDF::getAllPagesInternal`'s own kid
-/// (`QPDF_pages.cc:99-114`, only a kid lacking `/Kids` is promoted). This is a
-/// known, tracked deviation: [`splice_subtree`] and `leaf_count_of` are also
-/// `ObjectRef`-keyed and require every kid — leaf or intermediate — to
-/// already be indirect, so leaving an intermediate kid direct here would only
-/// move the promotion (or a hard failure) into the mutation pass that always
-/// follows this walk.
+/// A direct intermediate `/Pages` node stays direct here, matching
+/// `QPDF::getAllPagesInternal` (`QPDF_pages.cc:99-114`): only a kid lacking
+/// `/Kids` is promoted. The live `ObjectHandle` returned by `as_array` keeps
+/// the direct node attached to its containing `/Kids` array while its direct
+/// leaves are promoted in place. The visited set uses handle identity rather
+/// than an `(0, 0)` object-reference sentinel; qpdf's `QPDFObjGen::set` also
+/// ignores direct objects (`QPDFObjGen.hh:105-121`).
+#[allow(
+    clippy::mutable_key_type,
+    reason = "qpdf page-tree cycle detection intentionally keys on canonical ObjectHandle identity"
+)]
 fn page_refs_for_splice<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pages_ref: ObjectRef,
@@ -185,9 +194,10 @@ fn page_refs_for_splice<R: Read + Seek>(
     let mut pages = Vec::new();
     let mut seen = HashSet::new();
     let mut visited = HashSet::new();
+    let root = pdf.get_object_handle(pages_ref);
     collect_page_refs(
         pdf,
-        pages_ref,
+        root,
         0,
         max_depth,
         true,
@@ -198,28 +208,32 @@ fn page_refs_for_splice<R: Read + Seek>(
     Ok(pages)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::mutable_key_type,
+    clippy::too_many_arguments,
+    reason = "qpdf page-tree cycle detection intentionally keys on canonical ObjectHandle identity"
+)]
 fn collect_page_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
+    node: ObjectHandle,
     depth: usize,
     max_depth: usize,
     is_root: bool,
     pages: &mut Vec<ObjectRef>,
     seen: &mut HashSet<ObjectRef>,
-    visited: &mut HashSet<ObjectRef>,
+    visited: &mut HashSet<crate::object_handle::ObjectHandleIdentity>,
 ) -> Result<usize> {
+    let node_label = node_label(&node);
     if depth >= max_depth {
         return Err(Error::Unsupported(format!(
-            "page-tree depth exceeds {max_depth} at {node_ref}"
+            "page-tree depth exceeds {max_depth} at {node_label}"
         )));
     }
 
-    let node = pdf.get_object_handle(node_ref);
     pdf.resolve_object_handle(&node)?;
     if node.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
-            "node {node_ref} is not a dictionary"
+            "node {node_label} is not a dictionary"
         )));
     }
 
@@ -231,16 +245,19 @@ fn collect_page_refs<R: Read + Seek>(
             node.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
             pdf.mark_object_handle_dirty(&node)?;
         }
-        pages.push(node_ref);
+        let page_ref = node
+            .object_ref()
+            .ok_or_else(|| Error::Internal("page-tree leaf has no indirect identity".to_owned()))?;
+        pages.push(page_ref);
         return Ok(1);
     }
     if node_type.as_name().as_deref() != Some(b"Pages") {
         node.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
         pdf.mark_object_handle_dirty(&node)?;
     }
-    if !visited.insert(node_ref) {
+    if !visited.insert(node.identity_key()) {
         return Err(Error::Unsupported(format!(
-            "Loop detected in /Pages structure at {node_ref}"
+            "Loop detected in /Pages structure at {node_label}"
         )));
     }
 
@@ -251,51 +268,41 @@ fn collect_page_refs<R: Read + Seek>(
     } else {
         None
     };
-    let mut kids = Vec::new();
-    for (index, child) in kids_value
+    let mut children = Vec::new();
+    for (index, mut child) in kids_value
         .as_array()
         .unwrap_or_default()
         .into_iter()
         .enumerate()
     {
-        let child_ref = if let Some(child_ref) = child.object_ref() {
-            child_ref
-        } else {
+        pdf.resolve_object_handle(&child)?;
+        let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
+        if !child_is_pages && child.is_direct() {
             let indirect = pdf.make_indirect_object_handle(child)?;
-            // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
-            let child_ref = indirect.object_ref().ok_or_else(|| {
-                Error::Internal("direct page-tree child promotion lost its identity".to_owned())
-            })?;
-            // cov:ignore-end
             let kids_handle = kids_handle
                 .as_ref()
                 .expect("array handle exists when promoting a direct child");
-            kids_handle.set_array_item(index, indirect)?;
+            kids_handle.set_array_item(index, indirect.clone())?;
             pdf.mark_object_handle_dirty(kids_handle)?;
-            child_ref
-        };
+            child = indirect;
+        }
 
-        let child = pdf.get_object_handle(child_ref);
-        pdf.resolve_object_handle(&child)?;
-        let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
-        let child_ref = if !child_is_pages && !seen.insert(child_ref) {
-            let copy = child.shallow_copy()?;
-            let indirect = pdf.make_indirect_object_handle(copy)?;
-            // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
-            let copy_ref = indirect.object_ref().ok_or_else(|| {
-                Error::Internal("duplicated page copy lost its identity".to_owned())
+        if !child_is_pages {
+            let child_ref = child.object_ref().ok_or_else(|| {
+                Error::Internal("page-tree leaf has no indirect identity".to_owned())
             })?;
-            // cov:ignore-end
-            let kids_handle = kids_handle
-                .as_ref()
-                .expect("array handle exists when copying a duplicate page");
-            kids_handle.set_array_item(index, indirect)?;
-            pdf.mark_object_handle_dirty(kids_handle)?;
-            copy_ref
-        } else {
-            child_ref
-        };
-        kids.push(child_ref);
+            if !seen.insert(child_ref) {
+                let copy = child.shallow_copy()?;
+                let indirect = pdf.make_indirect_object_handle(copy)?;
+                let kids_handle = kids_handle
+                    .as_ref()
+                    .expect("array handle exists when copying a duplicate page");
+                kids_handle.set_array_item(index, indirect.clone())?;
+                pdf.mark_object_handle_dirty(kids_handle)?;
+                child = indirect;
+            }
+        }
+        children.push(child);
     }
     if let Some(kids_handle) = kids_handle {
         pdf.mark_object_handle_dirty(&kids_handle)?;
@@ -307,21 +314,21 @@ fn collect_page_refs<R: Read + Seek>(
         Some(n) if n >= 0 => n as usize,
         Some(n) => {
             return Err(Error::Unsupported(format!(
-                "/Pages node {node_ref} has negative /Count {n}"
+                "/Pages node {node_label} has negative /Count {n}"
             )))
         }
         None => {
             return Err(Error::Unsupported(format!(
-                "/Pages node {node_ref} has no /Count"
+                "/Pages node {node_label} has no /Count"
             )))
         }
     };
 
     let mut actual_count = 0usize;
-    for child_ref in kids {
+    for child in children {
         let child_count = collect_page_refs(
             pdf,
-            child_ref,
+            child,
             depth + 1,
             max_depth,
             false,
@@ -331,13 +338,13 @@ fn collect_page_refs<R: Read + Seek>(
         )?;
         // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
         actual_count = actual_count.checked_add(child_count).ok_or_else(|| {
-            Error::Unsupported(format!("page count overflow at /Pages node {node_ref}"))
+            Error::Unsupported(format!("page count overflow at /Pages node {node_label}"))
         })?;
         // cov:ignore-end
     }
     if declared_count != actual_count {
         return Err(Error::Unsupported(format!(
-            "/Pages node {node_ref} has /Count {declared_count}, but /Kids contain {actual_count} pages"
+            "/Pages node {node_label} has /Count {declared_count}, but /Kids contain {actual_count} pages"
         )));
     }
 
@@ -385,21 +392,19 @@ fn normalize_insert_pages<R: Read + Seek>(
     Ok(normalized)
 }
 
-/// Returns the leaf-page count contributed by `node_ref`.
-/// - `/Pages` → its `/Count` value
+/// Returns the leaf-page count contributed by `node`.
+/// - a dictionary with `/Kids` → its `/Count` value
 /// - another dictionary type → 1
-fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node_ref: ObjectRef) -> Result<usize> {
-    let node = pdf.get_object_handle(node_ref);
-    pdf.resolve_object_handle(&node)?;
+fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node: &ObjectHandle) -> Result<usize> {
+    let node_label = node_label(node);
+    pdf.resolve_object_handle(node)?;
     if node.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
-            "node {node_ref} is not a dictionary"
+            "node {node_label} is not a dictionary"
         )));
     }
 
-    let node_type = node.try_get_key(b"/Type")?;
-    pdf.resolve_object_handle(&node_type)?;
-    if node_type.as_name().as_deref() != Some(b"Pages") {
+    if !node.try_has_key(b"/Kids")? {
         return Ok(1);
     }
 
@@ -408,10 +413,10 @@ fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node_ref: ObjectRef) -> Resul
     match count.as_integer() {
         Some(n) if n >= 0 => Ok(n as usize),
         Some(n) => Err(Error::Unsupported(format!(
-            "/Pages node {node_ref} has negative /Count {n}"
+            "/Pages node {node_label} has negative /Count {n}"
         ))),
         None => Err(Error::Unsupported(format!(
-            "/Pages node {node_ref} has no /Count"
+            "/Pages node {node_label} has no /Count"
         ))),
     }
 }
@@ -434,6 +439,20 @@ fn set_page_parent<R: Read + Seek>(
     Ok(())
 }
 
+fn set_page_parent_for_node<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    parent: &ObjectHandle,
+) -> Result<()> {
+    // An inline /Pages node has no legal indirect reference for `/Parent`.
+    // Keep it inline rather than allocating an object number solely to make
+    // this topology-preserving helper synthesize a back-reference.
+    if let Some(parent_ref) = parent.object_ref() {
+        set_page_parent(pdf, page_ref, parent_ref)?;
+    }
+    Ok(())
+}
+
 /// DFS splice for a single `/Pages` node.
 ///
 /// Returns the **net change** in leaf count within this subtree
@@ -445,7 +464,7 @@ fn set_page_parent<R: Read + Seek>(
 #[allow(clippy::too_many_arguments)]
 fn splice_subtree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
+    node: ObjectHandle,
     base: usize,
     remove: &std::ops::Range<usize>,
     insert: &[ObjectRef],
@@ -453,37 +472,35 @@ fn splice_subtree<R: Read + Seek>(
     depth: usize,
     max_depth: usize,
 ) -> Result<i64> {
+    let node_label = node_label(&node);
     if depth >= max_depth {
         return Err(Error::Unsupported(format!(
-            "page-tree depth exceeds {max_depth} at {node_ref}"
+            "page-tree depth exceeds {max_depth} at {node_label}"
         )));
     }
 
     // Snapshot the node's kids and count *before* any mutation so that the
     // canonical node handle remains stable while we recurse.
     let (kids, old_count, kids_handle) = {
-        let node = pdf.get_object_handle(node_ref);
         pdf.resolve_object_handle(&node)?;
         if node.as_dictionary().is_none() {
             return Err(Error::Unsupported(format!(
-                "{node_ref} is not a /Pages dictionary"
+                "{node_label} is not a /Pages dictionary"
             )));
         }
 
         let kids_value = node.try_get_key(b"/Kids")?;
         pdf.resolve_object_handle(&kids_value)?;
-        let kids: Vec<ObjectRef> = kids_value
-            .as_array()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|child| {
-                child.object_ref().ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "child of /Pages node {node_ref} is not an indirect object"
-                    ))
-                })
-            })
-            .collect::<Result<_>>()?;
+        let kids = kids_value.as_array().unwrap_or_default();
+        for child in &kids {
+            pdf.resolve_object_handle(child)?;
+            let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
+            if child.is_direct() && !child_is_pages {
+                return Err(Error::Unsupported(format!(
+                    "child of /Pages node {node_label} is not an indirect object"
+                )));
+            }
+        }
         let kids_handle = if kids_value.as_array().is_some() {
             Some(kids_value.clone())
         } else {
@@ -494,10 +511,10 @@ fn splice_subtree<R: Read + Seek>(
         pdf.resolve_object_handle(&count_value)?;
         let old_count_raw = count_value
             .as_integer()
-            .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_ref} has no /Count")))?;
+            .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_label} has no /Count")))?;
         if old_count_raw < 0 {
             return Err(Error::Unsupported(format!(
-                "/Pages node {node_ref} has negative /Count {old_count_raw}"
+                "/Pages node {node_label} has negative /Count {old_count_raw}"
             )));
         }
         let old_count = old_count_raw as usize;
@@ -505,34 +522,34 @@ fn splice_subtree<R: Read + Seek>(
         (kids, old_count, kids_handle)
     };
 
-    let actual_count = kids.iter().try_fold(0usize, |total, &child_ref| {
-        let child_count = leaf_count_of(pdf, child_ref)?;
+    let actual_count = kids.iter().try_fold(0usize, |total, child| {
+        let child_count = leaf_count_of(pdf, child)?;
         // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
         total.checked_add(child_count).ok_or_else(|| {
-            Error::Unsupported(format!("page count overflow at /Pages node {node_ref}"))
+            Error::Unsupported(format!("page count overflow at /Pages node {node_label}"))
         })
         // cov:ignore-end
     })?;
     if old_count != actual_count {
         return Err(Error::Unsupported(format!(
-            "/Pages node {node_ref} has /Count {old_count}, but /Kids contain {actual_count} pages"
+            "/Pages node {node_label} has /Count {old_count}, but /Kids contain {actual_count} pages"
         )));
     }
 
-    let mut new_kids: Vec<ObjectRef> = Vec::with_capacity(kids.len() + insert.len());
+    let mut new_kids: Vec<ObjectHandle> = Vec::with_capacity(kids.len() + insert.len());
     let mut net_delta: i64 = 0;
     let mut offset = base;
 
-    for kid_ref in kids {
-        let kid_leaf_count = leaf_count_of(pdf, kid_ref)?;
+    for kid in kids {
+        let kid_leaf_count = leaf_count_of(pdf, &kid)?;
         let kid_start = offset;
         let kid_end = offset + kid_leaf_count;
 
         // Insertion point: insert BEFORE this kid.
         if !*insert_done && remove.start == kid_start {
             for &page_ref in insert {
-                new_kids.push(page_ref);
-                set_page_parent(pdf, page_ref, node_ref)?;
+                new_kids.push(pdf.get_object_handle(page_ref));
+                set_page_parent_for_node(pdf, page_ref, &node)?;
             }
             net_delta += insert.len() as i64;
             *insert_done = true;
@@ -541,18 +558,13 @@ fn splice_subtree<R: Read + Seek>(
         let overlaps_remove = kid_end > remove.start && kid_start < remove.end;
         if overlaps_remove {
             // Determine kid type (Page vs Pages) through the live child handle.
-            let kid_is_pages = {
-                let kid = pdf.get_object_handle(kid_ref);
-                pdf.resolve_object_handle(&kid)?;
-                let kid_type = kid.try_get_key(b"/Type")?;
-                pdf.resolve_object_handle(&kid_type)?;
-                kid_type.as_name().as_deref() == Some(b"Pages")
-            };
+            pdf.resolve_object_handle(&kid)?;
+            let kid_is_pages = kid.as_dictionary().is_some() && kid.try_has_key(b"/Kids")?;
 
             if kid_is_pages {
                 let sub_delta = splice_subtree(
                     pdf,
-                    kid_ref,
+                    kid.clone(),
                     kid_start,
                     remove,
                     insert,
@@ -565,14 +577,14 @@ fn splice_subtree<R: Read + Seek>(
                 // Drop now-empty intermediate nodes.
                 let new_sub_count = kid_leaf_count as i64 + sub_delta;
                 if new_sub_count > 0 {
-                    new_kids.push(kid_ref);
+                    new_kids.push(kid);
                 }
             } else {
                 // /Page leaf inside remove range: drop it.
                 net_delta -= 1;
             }
         } else {
-            new_kids.push(kid_ref);
+            new_kids.push(kid);
         }
 
         offset = kid_end;
@@ -581,8 +593,8 @@ fn splice_subtree<R: Read + Seek>(
     // Append case: insertion point is at the end of this node's kids.
     if !*insert_done && remove.start == offset {
         for &page_ref in insert {
-            new_kids.push(page_ref);
-            set_page_parent(pdf, page_ref, node_ref)?;
+            new_kids.push(pdf.get_object_handle(page_ref));
+            set_page_parent_for_node(pdf, page_ref, &node)?;
         }
         net_delta += insert.len() as i64;
         *insert_done = true;
@@ -592,23 +604,17 @@ fn splice_subtree<R: Read + Seek>(
     let new_count = old_count as i64 + net_delta;
     if new_count < 0 {
         return Err(Error::Unsupported(format!(
-            "splice: negative page count {new_count} for node {node_ref}"
+            "splice: negative page count {new_count} for node {node_label}"
         )));
     }
-    let node = pdf.get_object_handle(node_ref);
-    pdf.resolve_object_handle(&node)?;
     node.replace_key(b"/Count", ObjectHandle::integer(new_count))?;
-    let new_kid_handles = new_kids
-        .iter()
-        .map(|&child_ref| pdf.get_object_handle(child_ref))
-        .collect();
     if let Some(kids_handle) = kids_handle {
-        kids_handle.set_array_items(new_kid_handles)?;
+        kids_handle.set_array_items(new_kids)?;
         pdf.mark_object_handle_dirty(&kids_handle)?;
     } else {
-        node.replace_key(b"/Kids", ObjectHandle::array(new_kid_handles))?;
+        node.replace_key(b"/Kids", ObjectHandle::array(new_kids))?;
     } // cov:ignore: all array children come from this Pdf, so ownership failure is invariant-impossible
-    pdf.mark_object_dirty(node_ref);
+    pdf.mark_object_handle_dirty(&node)?;
 
     Ok(net_delta)
 }
@@ -720,6 +726,43 @@ mod tests {
                 "<< /Type /Pages /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] /Count 1 >>",
             ),
             (3, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
+    fn build_pages_with_direct_intermediate_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [<< /Type /Pages /Kids [3 0 R] /Count 1 >>] /Count 1 >>",
+            ),
+            (3, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
+    fn build_pages_with_two_direct_intermediates_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [<< /Type /Pages /Kids [3 0 R] /Count 1 >> << /Type /Pages /Kids [4 0 R] /Count 1 >>] /Count 2 >>",
+            ),
+            (3, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
+    fn build_pages_with_direct_intermediate_two_pages_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>] /Count 2 >>",
+            ),
+            (3, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
         ])
     }
 
@@ -1037,6 +1080,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_intermediate_page_kid_stays_inline_during_splice() {
+        let mut pdf = open(build_pages_with_direct_intermediate_pdf());
+        splice_pages(&mut pdf, 0..0, &[ObjectRef::new(4, 0)]).unwrap();
+
+        let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&root).unwrap();
+        let kids = root.try_get_key(b"/Kids").unwrap();
+        pdf.resolve_object_handle(&kids).unwrap();
+        let kids = kids.as_array().expect("root /Kids array");
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
+        assert!(kids[1].is_direct(), "intermediate /Pages must stay inline");
+        assert!(kids[1].try_has_key(b"/Kids").unwrap());
+    }
+
+    #[test]
+    fn distinct_direct_intermediate_siblings_do_not_collide_in_cycle_guard() {
+        let mut pdf = open(build_pages_with_two_direct_intermediates_pdf());
+        splice_pages(&mut pdf, 1..1, &[ObjectRef::new(5, 0)]).unwrap();
+
+        let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&root).unwrap();
+        let kids = root.try_get_key(b"/Kids").unwrap();
+        pdf.resolve_object_handle(&kids).unwrap();
+        let kids = kids.as_array().expect("root /Kids array");
+        assert_eq!(kids.len(), 3);
+        assert!(kids[0].is_direct());
+        assert_eq!(kids[1].object_ref(), Some(ObjectRef::new(5, 0)));
+        assert!(kids[2].is_direct());
+    }
+
+    #[test]
+    fn direct_intermediate_page_kid_is_mutated_in_place() {
+        let mut pdf = open(build_pages_with_direct_intermediate_two_pages_pdf());
+        splice_pages(&mut pdf, 0..1, &[]).unwrap();
+
+        let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&root).unwrap();
+        let kids = root.try_get_key(b"/Kids").unwrap();
+        pdf.resolve_object_handle(&kids).unwrap();
+        let root_kids = kids.as_array().expect("root /Kids array");
+        let [intermediate] = root_kids.as_slice() else {
+            panic!("root should retain one direct intermediate /Pages node");
+        };
+        assert!(intermediate.is_direct());
+        let count = intermediate.try_get_key(b"/Count").unwrap();
+        pdf.resolve_object_handle(&count).unwrap();
+        assert_eq!(count.as_integer(), Some(1));
+        let child_kids = intermediate.try_get_key(b"/Kids").unwrap();
+        pdf.resolve_object_handle(&child_kids).unwrap();
+        let child_kids = child_kids.as_array().expect("intermediate /Kids array");
+        assert_eq!(child_kids.len(), 1);
+        assert_eq!(child_kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
+    }
+
+    #[test]
     fn duplicate_page_kid_is_shallow_copied_during_preflight() {
         let mut pdf = open(build_pages_with_duplicate_kid_pdf());
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap();
@@ -1202,10 +1301,11 @@ mod tests {
     #[test]
     fn splice_subtree_rejects_a_non_dictionary_node() {
         let mut pdf = open(build_pages_not_dictionary_pdf());
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
         let mut insert_done = false;
         let err = splice_subtree(
             &mut pdf,
-            ObjectRef::new(2, 0),
+            pages,
             0,
             &(0..0),
             &[],
@@ -1220,10 +1320,11 @@ mod tests {
     #[test]
     fn splice_subtree_rejects_a_count_mismatch() {
         let mut pdf = open(build_pages_with_mismatched_count_pdf());
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
         let mut insert_done = false;
         let err = splice_subtree(
             &mut pdf,
-            ObjectRef::new(2, 0),
+            pages,
             0,
             &(0..1),
             &[],
@@ -1241,10 +1342,11 @@ mod tests {
     #[test]
     fn splice_subtree_rejects_a_direct_page_kid() {
         let mut pdf = open(build_pages_with_direct_kid_pdf());
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
         let mut insert_done = false;
         let err = splice_subtree(
             &mut pdf,
-            ObjectRef::new(2, 0),
+            pages,
             0,
             &(0..1),
             &[],
@@ -1259,7 +1361,8 @@ mod tests {
     #[test]
     fn leaf_count_of_rejects_a_non_dictionary_node() {
         let mut pdf = open(build_pages_not_dictionary_pdf());
-        let err = leaf_count_of(&mut pdf, ObjectRef::new(2, 0)).unwrap_err();
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let err = leaf_count_of(&mut pdf, &pages).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
@@ -1268,11 +1371,13 @@ mod tests {
         let mut negative = open(build_pages_with_count_pdf(
             "<< /Type /Pages /Kids [] /Count -1 >>",
         ));
-        let negative_err = leaf_count_of(&mut negative, ObjectRef::new(2, 0)).unwrap_err();
+        let negative_pages = negative.get_object_handle(ObjectRef::new(2, 0));
+        let negative_err = leaf_count_of(&mut negative, &negative_pages).unwrap_err();
         assert!(matches!(negative_err, Error::Unsupported(_)));
 
         let mut missing = open(build_pages_with_count_pdf("<< /Type /Pages /Kids [] >>"));
-        let missing_err = leaf_count_of(&mut missing, ObjectRef::new(2, 0)).unwrap_err();
+        let missing_pages = missing.get_object_handle(ObjectRef::new(2, 0));
+        let missing_err = leaf_count_of(&mut missing, &missing_pages).unwrap_err();
         assert!(matches!(missing_err, Error::Unsupported(_)));
     }
 
