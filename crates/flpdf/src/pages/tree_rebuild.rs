@@ -15,6 +15,9 @@
 //!   leaf no longer depends on the old ancestor chain. Direct non-scalar values
 //!   are promoted once through the canonical object registry; scalar values and
 //!   existing indirect values retain qpdf's copy/identity behavior.
+//! - After that push, the retained root no longer carries those four inheritable
+//!   keys, matching `QPDF_optimization.cc:159-228`; its page-tree mutation keeps
+//!   `/Type`, `/Kids`, and `/Count` as the structural keys.
 //! - Every leaf's `/Parent` is repointed at the stable root `/Pages` value.
 //!
 //! The result is a **flat** qpdf-style page tree: no intermediate `/Pages`
@@ -65,14 +68,17 @@
 //! Obsolete intermediate `/Pages` nodes are intentionally left as orphan
 //! objects (unreachable from the page tree) for the unreferenced-resource
 //! pruning layer to remove, mirroring the precedent set by
-//! [`crate::job::QPDFJob::split_pages`]. They do not affect output validity.
+//! [`crate::job::QPDFJob::split_pages`]. Their qpdf-inheritable keys are
+//! removed before they become orphaned, so preserved orphan objects still
+//! match qpdf's flattening-side cleanup.
 
+use crate::object_handle::ObjectHandleIdentity;
 use crate::pages::{
     repair::{prepare_for_optimization_with_max_depth, PageTreeRoot},
     resolve_inherited_handle_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -182,6 +188,88 @@ fn resolve_inherited_for_page<R: Read + Seek>(
         .transpose()
 }
 
+/// Collect the canonical `/Pages` handles that qpdf's inherited-attribute
+/// push visits before flattening the tree. The handles are captured before
+/// leaf reparenting so the now-orphaned intermediate nodes can receive the
+/// same inheritable-key cleanup as the retained root.
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+)]
+fn collect_page_tree_nodes(
+    node: ObjectHandle,
+    nodes: &mut Vec<ObjectHandle>,
+    seen: &mut HashSet<ObjectHandleIdentity>,
+    depth: usize,
+    max_depth: usize,
+) -> Result<()> {
+    if depth >= max_depth {
+        let location = node
+            .object_ref()
+            .map_or_else(|| "direct /Pages node".to_owned(), |r| r.to_string());
+        return Err(Error::Unsupported(format!(
+            "page tree depth exceeds maximum of {max_depth} at {location}"
+        )));
+    }
+    if !seen.insert(node.identity_key()) {
+        return Ok(());
+    }
+
+    node.try_dereference()?;
+    if !node.try_is_dictionary_of_type(b"Pages", b"")? {
+        return Ok(());
+    }
+    nodes.push(node.clone());
+
+    let kids = node.try_get_key(b"/Kids")?;
+    let Some(kid_count) = kids.try_array_len()? else {
+        return Ok(());
+    };
+    for index in 0..kid_count {
+        let Some(kid) = kids.try_array_item(index)? else {
+            continue; // cov:ignore: canonical array handles return Some for every in-range item
+        };
+        if kid.try_has_key(b"/Kids")? {
+            collect_page_tree_nodes(kid, nodes, seen, depth + 1, max_depth)?;
+        }
+    }
+    Ok(())
+}
+
+fn page_tree_root_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_root: PageTreeRoot,
+) -> Result<ObjectHandle> {
+    match page_root {
+        PageTreeRoot::Indirect(root_ref) => Ok(pdf.get_object_handle(root_ref)),
+        PageTreeRoot::Direct { catalog } => pdf.get_object_handle(catalog).try_get_key(b"/Pages"),
+    }
+}
+
+/// Remove qpdf's four inheritable keys from every original `/Pages` node.
+///
+/// The selected leaves have already received their effective values when this
+/// runs. Keeping this cleanup on live handles matters when the writer is asked
+/// to preserve otherwise-unreferenced objects: the old intermediate nodes are
+/// then still serialized, but no longer retain stale inherited attributes.
+fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    nodes: &[ObjectHandle],
+) -> Result<()> {
+    for node in nodes {
+        for key in [
+            b"/CropBox".as_slice(),
+            b"/MediaBox".as_slice(),
+            b"/Resources".as_slice(),
+            b"/Rotate".as_slice(),
+        ] {
+            node.remove_key(key);
+        }
+        pdf.mark_object_handle_dirty(node)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -251,6 +339,15 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     let prepared =
         prepare_for_optimization_with_max_depth(pdf, max_depth)?.ok_or(Error::Missing("/Pages"))?;
     let page_root = prepared.root;
+    let root = page_tree_root_handle(pdf, page_root)?;
+    let mut page_tree_nodes = Vec::new();
+    collect_page_tree_nodes(
+        root.clone(),
+        &mut page_tree_nodes,
+        &mut HashSet::new(),
+        0,
+        max_depth,
+    )?; // cov:ignore: LLVM attributes this multiline canonical traversal terminator separately
 
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
     // Any original leaf absent from ref_map is a removed page.
@@ -330,12 +427,6 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // Rewrite the root /Pages handle in place: flat /Kids in selection order,
     // /Count equal to the selection length, and no stale /Parent. A direct
     // root remains the live dictionary embedded in the catalog.
-    let root = match page_root {
-        PageTreeRoot::Indirect(root_ref) => pdf.get_object_handle(root_ref),
-        PageTreeRoot::Direct { catalog } => {
-            pdf.get_object_handle(catalog).try_get_key(b"/Pages")?
-        }
-    };
     // cov:ignore-start: prepare_for_optimization guarantees that the retained /Pages root is a dictionary
     if root.try_as_dictionary()?.is_none() {
         return Err(Error::Unsupported(match page_root {
@@ -355,6 +446,11 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     root.replace_key(b"/Kids", ObjectHandle::array(kid_handles))?;
     let count = i64::try_from(new_kids.len()).unwrap_or(i64::MAX);
     root.replace_key(b"/Count", ObjectHandle::integer(count))?;
+    // qpdf's QPDF_optimization.cc:159-228 removes each inheritable key from
+    // every /Pages node after pushing its effective value to the leaves. The
+    // retained rebuilt root and the now-orphaned intermediate nodes are all
+    // subject to that same cleanup.
+    remove_inheritable_keys_from_page_tree(pdf, &page_tree_nodes)?;
     root.remove_key(b"/Parent");
     pdf.mark_object_handle_dirty(&root)?;
 
@@ -494,6 +590,45 @@ mod tests {
         assert!(
             pdf.ever_called_get_all_pages(),
             "qpdf rebuild preparation enumerates pages through getAllPages"
+        );
+    }
+
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "the test exercises the canonical live-allocation identity set"
+    )]
+    #[test]
+    fn collect_page_tree_nodes_handles_duplicate_and_malformed_handles() {
+        let pages = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::integer(7)),
+        ]);
+        let mut nodes = Vec::new();
+        let mut seen = HashSet::new();
+
+        collect_page_tree_nodes(pages.clone(), &mut nodes, &mut seen, 0, 8)
+            .expect("a malformed /Kids value is treated as an empty array");
+        assert_eq!(nodes.len(), 1);
+        collect_page_tree_nodes(pages, &mut nodes, &mut seen, 0, 8)
+            .expect("a repeated canonical handle is skipped");
+        assert_eq!(nodes.len(), 1);
+
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Page".to_vec()),
+        )]);
+        collect_page_tree_nodes(leaf, &mut nodes, &mut seen, 0, 8)
+            .expect("a non-/Pages dictionary is ignored");
+        assert_eq!(nodes.len(), 1);
+
+        let direct_pages = ObjectHandle::dictionary(vec![(
+            b"/Type".to_vec(),
+            ObjectHandle::name(b"Pages".to_vec()),
+        )]);
+        let error = collect_page_tree_nodes(direct_pages, &mut nodes, &mut seen, 0, 0)
+            .expect_err("the depth bound must apply before dereferencing the node");
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("direct /Pages node"))
         );
     }
 
@@ -652,6 +787,59 @@ mod tests {
                 .expect("live page /Parent lookup must succeed")
                 .is_same_object_as(&root),
             "reparenting must be visible through the retained page handle"
+        );
+    }
+
+    #[test]
+    fn rebuilt_root_drops_qpdf_inheritable_attributes_after_materializing_pages() {
+        let mut pdf = open(build_nested_pdf());
+        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        root.insert(
+            "MediaBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(612),
+                Object::Integer(792),
+            ]),
+        );
+        root.insert(
+            "CropBox",
+            Object::Array(vec![
+                Object::Integer(10),
+                Object::Integer(20),
+                Object::Integer(500),
+                Object::Integer(700),
+            ]),
+        );
+        root.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
+        root.insert("Rotate", Object::Integer(180));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(6, 0)])
+            .expect("flat page rebuild must succeed");
+
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        for key in ["MediaBox", "CropBox", "Resources", "Rotate"] {
+            assert!(
+                root.get(key).is_none(),
+                "rebuilt /Pages root must not retain inheritable /{key}: {root:?}"
+            );
+        }
+
+        let intermediate = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        for key in ["MediaBox", "CropBox", "Resources", "Rotate"] {
+            assert!(
+                intermediate.get(key).is_none(),
+                "orphaned intermediate /Pages must not retain inheritable /{key}: {intermediate:?}"
+            );
+        }
+
+        let page = dict_of(&mut pdf, ObjectRef::new(6, 0));
+        assert_eq!(
+            page.get("CropBox"),
+            Some(&Object::Reference(ObjectRef::new(10, 0))),
+            "the selected page must retain the root-inherited /CropBox handle"
         );
     }
 
