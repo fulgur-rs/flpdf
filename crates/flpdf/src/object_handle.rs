@@ -3933,6 +3933,29 @@ impl ObjectHandle {
         self.replace_key(b"/Contents", ObjectHandle::array(content_streams))
     }
 
+    /// Saturate `value` to the `i32` range, warning on `self` (the source of
+    /// the value) at each clamp.
+    ///
+    /// Ports the saturating half of `QPDFObjectHandle::getIntValueAsInt`
+    /// (`libqpdf/QPDFObjectHandle.cc:525-543`) for a caller that has already
+    /// obtained an `i64` some other way than [`Self::try_get_int_value`] --
+    /// [`rotate_page`](Self::rotate_page)'s relative-rotation walk needs the
+    /// same saturate-and-warn behavior qpdf's `getValueAsInt(int&)` applies
+    /// to a *found* integer, without that function's unconditional warn-and-
+    /// default-to-0 for a non-integer receiver, which would misfire on the
+    /// common case of an ancestor with no `/Rotate` at all.
+    fn saturate_i64_to_i32_range_with_warning(&self, value: i64) -> Result<i64> {
+        if value < i64::from(i32::MIN) {
+            self.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
+            Ok(i64::from(i32::MIN))
+        } else if value > i64::from(i32::MAX) {
+            self.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
+            Ok(i64::from(i32::MAX))
+        } else {
+            Ok(value)
+        }
+    }
+
     /// Set this page's rotation, optionally adding the nearest inherited
     /// `/Rotate` value.
     ///
@@ -3968,7 +3991,15 @@ impl ObjectHandle {
             while visited.insert(current.identity_key()) {
                 let rotate = current.try_get_key(b"/Rotate")?;
                 if let Some(value) = rotate.try_as_integer()? {
-                    old_angle = value;
+                    // qpdf's rotatePage reads the found value through
+                    // getValueAsInt(int&), which saturates out-of-i32-range
+                    // integers to INT_MIN/INT_MAX with a warning
+                    // (getIntValueAsInt, QPDFObjectHandle.cc:525-543) rather
+                    // than using the raw value. Absent/non-integer /Rotate
+                    // still falls through to the /Parent walk below, exactly
+                    // as qpdf's isInteger() guard does, so this only clamps
+                    // once an integer is actually found.
+                    old_angle = rotate.saturate_i64_to_i32_range_with_warning(value)?;
                     break;
                 }
 

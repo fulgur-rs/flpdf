@@ -24,12 +24,13 @@
 //! every direct page box, and delegates annotation/field/AP transformation to
 //! [`crate::AcroFormDocumentHelper`].
 
+use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageObjectHelper;
-use crate::pages::{
-    next_page_parent, page_parent_entries, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
-};
-use crate::{Error, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
+use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+#[cfg(test)]
+use crate::Object;
+use crate::{Error, ObjectRef, Pdf, Result};
+use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -47,14 +48,15 @@ pub enum RotateMode {
 
 /// A rotation operation: mode plus angle in degrees.
 ///
-/// Angles need not be multiples of 90; they will be composed via
-/// [`compose_rotate`] and normalized to one of `{0, 90, 180, 270}`.
+/// `degrees` must be a multiple of 90, matching qpdf's own `--rotate`
+/// parsing; [`apply_rotate_to_pages`] rejects any other value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RotateOp {
     /// Whether this is an assignment or an additive rotation.
     pub mode: RotateMode,
-    /// Angle in degrees (positive = clockwise per PDF convention). May be
-    /// negative or exceed 360.
+    /// Angle in degrees, a multiple of 90 (positive = clockwise per PDF
+    /// convention). May be negative or exceed 360; the final `/Rotate` is
+    /// normalized to one of `{0, 90, 180, 270}`.
     pub degrees: i32,
 }
 
@@ -154,69 +156,57 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
     page_ref: ObjectRef,
     max_depth: usize,
 ) -> Result<i32> {
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = PageParentCursor::Reference(page_ref);
+    // qpdf's page helpers walk live QPDFObjectHandle values. Keep the same
+    // canonical identity while following /Parent so cycles are detected by
+    // object identity rather than by materialized ObjectRef snapshots.
+    let mut current = pdf.get_object_handle(page_ref);
     let mut depth: usize = 0;
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "qpdf identity keys intentionally retain the live handle allocation"
+    )]
+    let mut seen = HashSet::new();
 
     loop {
         if depth >= max_depth {
             return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {current}"
+                "page tree depth exceeds maximum of {max_depth} at {}",
+                current_description(&current)
             )));
         }
 
-        // Cycle guard.
-        if let PageParentCursor::Reference(reference) = &current {
-            if !seen.insert(*reference) {
-                // We hit a cycle before finding /Rotate — default to 0.
-                return Ok(0);
-            }
+        if !seen.insert(current.identity_key()) {
+            // We hit a cycle before finding /Rotate — default to 0.
+            return Ok(0);
         }
 
-        let Some((rotate_val, parent_val)) = page_parent_entries(pdf, &current, "Rotate")? else {
-            // Not a dictionary — cannot walk further; use default.
-            return Ok(0);
-        };
-
-        // Check for /Rotate on this node.
+        let rotate = current.try_get_key(b"/Rotate")?;
         // Per ISO 32000-1 §7.3.9, a null value is equivalent to absent.
-        if let Some(rotate_val) = rotate_val {
-            match rotate_val {
-                // null → treat as absent; continue walking.
-                Object::Null => {}
-                Object::Integer(n) => return Ok(normalize_rotate_i64(n)),
-                Object::Reference(r) => {
-                    let resolved = pdf.resolve_borrowed(r)?;
-                    match resolved {
-                        Object::Null => {}
-                        Object::Integer(n) => return Ok(normalize_rotate_i64(*n)),
-                        _ => {
-                            return Err(Error::Unsupported(format!(
-                                "/Rotate reference {r} on node {current} does not resolve to an integer"
-                            )));
-                        }
-                    }
-                }
-                _ => {
-                    return Err(Error::Unsupported(format!(
-                        "/Rotate entry on node {current} has unexpected type"
-                    )));
-                }
-            }
+        if let Some(value) = rotate.try_as_integer()? {
+            return Ok(normalize_rotate_i64(value));
+        }
+        if !rotate.is_null() {
+            return Err(Error::Unsupported(format!(
+                "/Rotate entry on node {} has unexpected type",
+                current_description(&current)
+            )));
         }
 
-        // No /Rotate here — try the /Parent.
-        let parent_val = match parent_val {
-            Some(Object::Null) | None => return Ok(0), // no parent, use default
-            Some(v) => v,
-        };
-
-        let Some(parent) = next_page_parent(parent_val) else {
+        let parent = current.try_get_key(b"/Parent")?;
+        parent.try_dereference()?;
+        if parent.as_dictionary().is_none() {
             return Ok(0);
-        };
+        }
         current = parent;
         depth += 1;
     }
+}
+
+fn current_description(current: &ObjectHandle) -> String {
+    current
+        .object_ref()
+        .map(|reference| reference.to_string())
+        .unwrap_or_else(|| "direct page-tree dictionary".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -226,58 +216,57 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
 /// Apply `op` to each `ObjectRef` in `pages`, materializing the resulting
 /// `/Rotate` explicitly on every leaf page dictionary.
 ///
-/// Inheritance is resolved *before* any write: if a leaf has no `/Rotate` of its
-/// own, the inherited value is read from the ancestor chain.  The computed angle
-/// (via [`compose_rotate`]) is then written directly on the leaf, so the leaf no
-/// longer depends on the parent's value.
+/// Ports `QPDFPageObjectHelper::rotatePage`/`QPDFObjectHandle::rotatePage`
+/// (`libqpdf/QPDFPageObjectHelper.cc:468-470`,
+/// `libqpdf/QPDFObjectHandle.cc:1517-1546`): for an additive rotation, the
+/// existing `/Rotate` is read by walking `/Parent` on the live handle (an
+/// existing value that is not itself a multiple of 90 is treated as `0`,
+/// matching qpdf), and the combined angle is written directly on the leaf,
+/// so the leaf no longer depends on the parent's value. This walk has no
+/// depth bound — only cycle detection — matching qpdf's own unbounded
+/// `/Parent` walk in `rotatePage`.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] if any of the supplied `ObjectRef`s does not
-/// resolve to a dictionary, does not resolve to a leaf `/Page` object (e.g. it
-/// points at a `/Pages` tree node), or if the page-tree depth limit is
-/// exceeded.
+/// resolve to a dictionary, or does not resolve to a leaf `/Page` object (e.g.
+/// it points at a `/Pages` tree node). Returns [`Error::System`] if
+/// `op.degrees` is not a multiple of 90.
 pub fn apply_rotate_to_pages<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     pages: &[ObjectRef],
     op: &RotateOp,
 ) -> Result<()> {
     for &page_ref in pages {
-        // 1. Resolve the current (inherited) /Rotate before modification.
-        let existing = resolve_inherited_rotate(pdf, page_ref)?;
-
-        // 2. Compute the new value.
-        let new_rotate = compose_rotate(existing, op);
-
-        // 3. Re-resolve the page dictionary (it may have changed if there are
-        //    multiple pages sharing a parent — re-resolution is safe because
-        //    Pdf::resolve goes through the cache).
-        let page_obj = pdf.resolve(page_ref)?;
-        let Object::Dictionary(mut page_dict) = page_obj else {
+        // qpdf's QPDFPageObjectHelper::rotatePage operates on the live handle,
+        // not a materialized Object snapshot. Resolve and validate the page
+        // through the same canonical handle before mutating it.
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve_object_handle(&page)?;
+        if page.as_dictionary().is_none() {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"
             )));
-        };
+        }
 
         // Guard: only leaf `/Page` objects are valid targets. Writing /Rotate
         // onto a `/Pages` tree node (or any non-Page dict) would change the
         // inherited rotation of every descendant page, violating the
         // per-leaf-page contract.
-        let is_leaf_page = matches!(
-            page_dict.get("Type"),
-            Some(Object::Name(t)) if t.as_slice() == b"Page"
-        );
-        if !is_leaf_page {
-            return Err(Error::Unsupported(format!(
-                "object {page_ref} is not a leaf /Page (missing or non-/Page /Type), cannot set /Rotate"
-            )));
+        let page_type = page.try_get_key(b"/Type")?;
+        match page_type.try_as_name()? {
+            Some(name) if name.as_slice() == b"Page" => {}
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "object {page_ref} is not a leaf /Page (missing or non-/Page /Type), cannot set /Rotate"
+                )));
+            }
         }
 
-        // 4. Materialize the new /Rotate on the leaf.
-        //    We always write it explicitly (even for 0) so the leaf is no longer
-        //    dependent on any ancestor's /Rotate.
-        page_dict.insert("Rotate", Object::Integer(new_rotate as i64));
-        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+        // `relative` selects qpdf's inherited-parent walk; both modes make
+        // the result explicit even when it is zero.
+        page.rotate_page(op.degrees, matches!(op.mode, RotateMode::Add))?;
+        pdf.mark_object_handle_dirty(&page)?;
     }
     Ok(())
 }
@@ -612,6 +601,51 @@ mod tests {
         assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 90);
     }
 
+    #[test]
+    fn resolve_reports_depth_limit_at_a_direct_page_tree_node() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut page = pdf
+            .resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        let mut parent = crate::Dictionary::new();
+        parent.insert("Rotate", Object::Integer(90));
+        page.insert("Parent", Object::Dictionary(parent));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let error = resolve_inherited_rotate_with_max_depth(&mut pdf, page_ref, 1).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Unsupported(message)
+                if message.contains("page tree depth exceeds maximum of 1")
+                    && message.contains("direct page-tree dictionary")
+        ));
+    }
+
+    #[test]
+    fn resolve_rejects_a_non_integer_rotate_entry() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut page = pdf
+            .resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Rotate", Object::Name(b"Bad".to_vec()));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let error = resolve_inherited_rotate(&mut pdf, page_ref).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Unsupported(message) if message.contains("/Rotate entry")
+                && message.contains("has unexpected type")
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // apply_rotate_to_pages tests
     // -----------------------------------------------------------------------
@@ -672,6 +706,117 @@ mod tests {
             panic!("not a dict")
         };
         assert_eq!(dict.get("Rotate"), Some(&Object::Integer(0)));
+    }
+
+    #[test]
+    fn add_ignores_non_quarter_turn_existing_rotate_like_qpdf() {
+        // QPDFObjectHandle::rotatePage treats an existing /Rotate value that
+        // is not a multiple of 90 as zero before applying a relative angle.
+        let bytes = build_single_page_pdf(Some(45), None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: 90,
+        };
+        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
+        let dict = obj.as_dict().expect("not a dict");
+        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+    }
+
+    #[test]
+    fn add_clamps_an_out_of_i32_range_existing_rotate_like_qpdf() {
+        // QPDFObjectHandle::rotatePage reads the existing /Rotate through
+        // getValueAsInt(int&), which saturates an out-of-range integer to
+        // INT_MIN/INT_MAX (QPDFObjectHandle.cc:525-543) rather than using the
+        // raw value. Live-probed against qpdf 11.9.0: a page with
+        // `/Rotate 2147483700` (> i32::MAX, itself a multiple of 90) rotated
+        // by `--rotate=+90` produces `/Rotate 90` — INT_MAX (2147483647) is
+        // not a multiple of 90, so the existing-value guard resets it to 0
+        // before adding.
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut page = pdf
+            .resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Rotate", Object::Integer(2_147_483_700));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: 90,
+        };
+        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
+        let dict = obj.as_dict().expect("not a dict");
+        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+    }
+
+    #[test]
+    fn add_clamps_a_below_i32_range_existing_rotate_like_qpdf() {
+        // Mirrors add_clamps_an_out_of_i32_range_existing_rotate_like_qpdf
+        // for the "too small" clamp branch. Live-probed against qpdf 11.9.0:
+        // `/Rotate -2147483700` (< i32::MIN, itself a multiple of 90)
+        // rotated by `--rotate=+90` produces `/Rotate 90` — INT_MIN
+        // (-2147483648) is not a multiple of 90 either, so the
+        // existing-value guard resets it to 0 before adding.
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut page = pdf
+            .resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Rotate", Object::Integer(-2_147_483_700));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: 90,
+        };
+        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
+        let dict = obj.as_dict().expect("not a dict");
+        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+    }
+
+    #[test]
+    fn add_clamps_a_near_i64_max_existing_rotate_without_overflow() {
+        // A value near i64::MAX that IS a multiple of 90 (so it survives the
+        // existing-value guard below and actually reaches the `+=`) must not
+        // panic (integer overflow) or wrap when combined with the relative
+        // angle; it must saturate to i32::MAX first, exactly as an
+        // out-of-i32-range value does. 9_223_372_036_854_775_800 is the
+        // largest multiple of 90 not exceeding i64::MAX.
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+        let mut page = pdf
+            .resolve(page_ref)
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Rotate", Object::Integer(9_223_372_036_854_775_800));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let op = RotateOp {
+            mode: RotateMode::Add,
+            degrees: 90,
+        };
+        apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
+
+        let obj = pdf.resolve_borrowed(page_ref).unwrap();
+        let dict = obj.as_dict().expect("not a dict");
+        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
     }
 
     #[test]
