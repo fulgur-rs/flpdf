@@ -2878,10 +2878,31 @@ fn helper_keeps_nested_form_resource_scopes_isolated() {
 #[test]
 fn remove_page_allows_an_empty_document() {
     let mut pdf = open(build_n_page_pdf(1));
+    let pages_handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+    pdf.resolve_object_handle(&pages_handle).unwrap();
 
     PageDocumentHelper::new(&mut pdf)
         .remove_page(ObjectRef::new(3, 0))
         .unwrap();
+
+    let pages = pages_handle
+        .as_dictionary()
+        .expect("canonical /Pages handle must remain a dictionary");
+    assert_eq!(
+        pages
+            .get(b"/Kids".as_slice())
+            .and_then(ObjectHandle::as_array)
+            .map(|kids| kids.len()),
+        Some(0),
+        "canonical /Kids must be empty before legacy resolution"
+    );
+    assert_eq!(
+        pages
+            .get(b"/Count".as_slice())
+            .and_then(ObjectHandle::as_integer),
+        Some(0),
+        "canonical /Count must be zero before legacy resolution"
+    );
 
     assert!(PageDocumentHelper::new(&mut pdf)
         .get_all_pages()
@@ -2905,10 +2926,35 @@ fn remove_page_allows_an_empty_direct_catalog_pages_root() {
     };
     catalog.insert("Pages", Object::Dictionary(pages));
     pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+    let catalog_handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&catalog_handle).unwrap();
+    let pages_handle = catalog_handle
+        .as_dictionary()
+        .and_then(|dict| dict.get(b"/Pages".as_slice()).cloned())
+        .expect("direct /Pages handle must be present");
 
     PageDocumentHelper::new(&mut pdf)
         .remove_page(ObjectRef::new(3, 0))
         .unwrap();
+
+    let pages = pages_handle
+        .as_dictionary()
+        .expect("direct /Pages handle must remain a dictionary");
+    assert_eq!(
+        pages
+            .get(b"/Kids".as_slice())
+            .and_then(ObjectHandle::as_array)
+            .map(|kids| kids.len()),
+        Some(0),
+        "canonical direct /Kids must be empty before legacy resolution"
+    );
+    assert_eq!(
+        pages
+            .get(b"/Count".as_slice())
+            .and_then(ObjectHandle::as_integer),
+        Some(0),
+        "canonical direct /Count must be zero before legacy resolution"
+    );
 
     let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
