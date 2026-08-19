@@ -293,10 +293,19 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             // cov:ignore-end
         }
 
-        // QPDF::removePage keeps the existing /Pages handle, erases its
-        // children, updates /Count, and leaves the root without /Parent
-        // (QPDF_pages.cc:264-275). These live mutations also preserve a
-        // direct catalog /Pages root without re-materializing the catalog.
+        // QPDF::removePage itself only erases the removed child and updates
+        // /Count on the existing /Pages handle (QPDF_pages.cc:253-266); it
+        // does not touch /Type or /Parent. /Type repair is a precondition
+        // that removePage's findPage()->flattenPagesTree() call chain
+        // reaches via getAllPagesInternal (QPDF_pages.cc:89-91), and a
+        // correctly-identified root simply has no /Parent to begin with by
+        // the time removePage runs -- getAllPages's climb-up loop
+        // (QPDF_pages.cc:50-66) only ever walks up TO the true root, never
+        // past it, so nothing here is "removing" a /Parent qpdf itself
+        // wrote. This final-page path folds both preconditions into the
+        // same live mutation rather than reaching them as a side effect of
+        // walking the (now-empty) tree, and also preserves a direct catalog
+        // /Pages root without re-materializing the catalog.
         root.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
         root.replace_key(b"/Kids", ObjectHandle::array(Vec::new()))?;
         root.replace_key(b"/Count", ObjectHandle::integer(0))?;
