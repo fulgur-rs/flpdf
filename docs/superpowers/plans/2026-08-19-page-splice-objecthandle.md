@@ -28,10 +28,11 @@ delegates to that owner in `QPDFPageDocumentHelper.cc:37-52`.
   changed from Draft to Ready.
 
 The `cov:ignore` markers cover only invariant-impossible branches: the
-`ObjectHandle` ownership edge for `/Kids` has only same-`Pdf` children, and
-`usize` page-count overflow cannot be constructed by a finite PDF object tree.
-The private count-mismatch error edge is directly exercised because the public
-entry point rejects the same malformed tree during its full preflight walk.
+`ObjectHandle` ownership edge for `/Kids` has only same-`Pdf` children, a fresh
+object allocated by `make_indirect_object_handle` always has an indirect
+identity, and `usize` page-count overflow cannot be constructed by a finite
+PDF object tree. Direct `/Kids`, missing `/Kids`, leaf-count failures, and the
+private count-mismatch edge are covered by focused tests.
 
 ## Implementation sequence
 

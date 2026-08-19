@@ -258,9 +258,11 @@ fn normalize_insert_pages<R: Read + Seek>(
         pdf.resolve_object_handle(&page)?;
         let copy = page.shallow_copy()?;
         let indirect = pdf.make_indirect_object_handle(copy)?;
+        // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
         let copy_ref = indirect.object_ref().ok_or_else(|| {
             Error::Internal("shallow page copy did not receive an indirect identity".to_owned())
         })?;
+        // cov:ignore-end
         occupied.insert(copy_ref);
         normalized.push(copy_ref);
     }
@@ -590,6 +592,24 @@ mod tests {
         ])
     }
 
+    fn build_pages_with_direct_kid_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                "<< /Type /Pages /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] /Count 1 >>",
+            ),
+        ])
+    }
+
+    fn build_empty_pages_without_kids_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Count 0 >>"),
+            (3, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
     fn build_pdf(parts: &[(u32, &str)]) -> Vec<u8> {
         let mut out: Vec<u8> = b"%PDF-1.5\n".to_vec();
         let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
@@ -802,6 +822,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_page_kid_is_rejected_by_the_public_walk() {
+        let mut pdf = open(build_pages_with_direct_kid_pdf());
+        let err = splice_pages(&mut pdf, 0..1, &[]).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn missing_kids_is_replaced_when_inserting_into_an_empty_tree() {
+        let mut pdf = open(build_empty_pages_without_kids_pdf());
+        splice_pages(&mut pdf, 0..0, &[ObjectRef::new(3, 0)]).unwrap();
+        assert_eq!(page_list(&mut pdf), vec![ObjectRef::new(3, 0)]);
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("Count"), Some(&Object::Integer(1)));
+        assert_eq!(
+            root.get("Kids")
+                .and_then(Object::as_array)
+                .map(|items| items.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn inserting_an_existing_page_shallow_copies_it() {
         let mut pdf = open(build_flat_pdf());
         let original = ObjectRef::new(3, 0);
@@ -885,6 +927,44 @@ mod tests {
             matches!(err, Error::Unsupported(ref message) if message.contains("/Count 2") && message.contains("1")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn splice_subtree_rejects_a_direct_page_kid() {
+        let mut pdf = open(build_pages_with_direct_kid_pdf());
+        let mut insert_done = false;
+        let err = splice_subtree(
+            &mut pdf,
+            ObjectRef::new(2, 0),
+            0,
+            &(0..1),
+            &[],
+            &mut insert_done,
+            0,
+            DEFAULT_MAX_PAGE_TREE_DEPTH,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn leaf_count_of_rejects_a_non_dictionary_node() {
+        let mut pdf = open(build_pages_not_dictionary_pdf());
+        let err = leaf_count_of(&mut pdf, ObjectRef::new(2, 0)).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn leaf_count_of_rejects_negative_and_missing_counts() {
+        let mut negative = open(build_pages_with_count_pdf(
+            "<< /Type /Pages /Kids [] /Count -1 >>",
+        ));
+        let negative_err = leaf_count_of(&mut negative, ObjectRef::new(2, 0)).unwrap_err();
+        assert!(matches!(negative_err, Error::Unsupported(_)));
+
+        let mut missing = open(build_pages_with_count_pdf("<< /Type /Pages /Kids [] >>"));
+        let missing_err = leaf_count_of(&mut missing, ObjectRef::new(2, 0)).unwrap_err();
+        assert!(matches!(missing_err, Error::Unsupported(_)));
     }
 
     #[test]
