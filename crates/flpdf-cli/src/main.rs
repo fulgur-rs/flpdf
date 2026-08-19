@@ -805,9 +805,9 @@ struct PageOpArgs {
     /// Write one output file per N-page group instead of a single file
     /// (qpdf `--split-pages[=n]`, default n=1).
     ///
-    /// File names are derived by `page_split::split_output_path` (8.7's
-    /// contract): a `-first-last` suffix is inserted before the `.pdf`
-    /// extension. Compatible with `--pages`.
+    /// File names follow qpdf's `doSplitPages` naming: a `-first-last`
+    /// suffix is inserted before the `.pdf` extension. Compatible with
+    /// `--pages`.
     #[arg(
         long = "split-pages",
         num_args = 0..=1,

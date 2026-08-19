@@ -62,7 +62,7 @@
 //! Obsolete intermediate `/Pages` nodes are intentionally left as orphan
 //! objects (unreachable from the page tree) for the unreferenced-resource
 //! pruning layer to remove, mirroring the precedent set by
-//! [`crate::page_split`]. They do not affect output validity.
+//! [`crate::job::QPDFJob::split_pages`]. They do not affect output validity.
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::{

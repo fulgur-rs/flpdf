@@ -597,7 +597,7 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 
 ### B. `QPDFJob::handlePageSpecs` 相当の分解 — 4,158 行
 
-`job/page_specs.rs` / `job/page_split.rs` / `page_merge.rs`(1117) / `page_rotate.rs`(632) / `page_split.rs`(naming helpers) / `page_extract.rs`(435) /
+`job/page_specs.rs` / `job/page_split.rs` / `page_merge.rs`(1117) / `page_rotate.rs`(632) / `page_extract.rs`(435) /
 `page_range.rs`(379) / `page_splice.rs`(304) / `page_combine.rs`(278) / `page_plan.rs`(210) /
 `rotate_spec.rs`(204) / `page_collate.rs`(145)
 
