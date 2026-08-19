@@ -761,7 +761,7 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
 fn split_pages_one_filename_matches_qpdf() {
     // qpdf 11.9.0: `3p --split-pages=1` → q-1.pdf, q-2.pdf, q-3.pdf.
     // flpdf now matches: chunk_size==1 uses the single-number suffix
-    // (page_split::split_output_path). Regression guard for flpdf-s5e.
+    // (job::page_split::chunk_output_path). Regression guard for flpdf-s5e.
     let qdir = tempfile::tempdir().unwrap();
     let fdir = tempfile::tempdir().unwrap();
     let src = fixture_abs(THREE_PAGE);

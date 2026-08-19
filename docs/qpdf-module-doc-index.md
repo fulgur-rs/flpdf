@@ -88,7 +88,6 @@
 | `crates/flpdf/src/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/page_rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/page_splice.rs` | correspondence | \`QPDFPageDocumentHelper.cc:37-52\` delegates page insertion/removal to the page-tree owner |
-| `crates/flpdf/src/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` output naming helpers |
 | `crates/flpdf/src/page_tree_rebuild.rs` | correspondence | QPDF_pages.cc page-tree repair plus QPDFJob.cc page-selection rebuilding |
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
 | `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |
