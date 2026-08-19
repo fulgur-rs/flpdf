@@ -495,29 +495,24 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     // describe the encoded form are stripped because the coalesced data is
     // raw decoded bytes (the writer re-derives Length / re-applies a filter).
     let mut new_dict: Option<Dictionary> = None;
-    for (i, (elem, content_handle)) in refs.iter().zip(content_handles.iter()).enumerate() {
-        let stream: Stream = match elem {
-            // Follow the full holder chain per element so a doubly-indirect
-            // array entry (`ref → ref → stream`) is coalesced rather than dropped.
-            Object::Reference(r) => match resolve_ref_chain(pdf, elem)?.0.into_stream() {
-                Some(s) => s,
-                None => {
-                    return Err(Error::Unsupported(format!(
-                        "/Contents array element {r} on page {page_ref} does not resolve to a stream"
-                    )));
-                }
-            },
-            Object::Stream(s) => s.clone(),
-            other => {
-                let type_name = object_type_name(other);
-                return Err(Error::Unsupported(format!(
-                    "/Contents array element of type {type_name} on page {page_ref} is not a stream or reference"
-                )));
-            }
-        };
-
+    for (i, content_handle) in content_handles.iter().enumerate() {
+        let stream_handle = pdf.resolve_object_handle_to_terminal(content_handle)?;
+        let stream_dict_handle = content_stream_dict(&stream_handle, page_ref)?;
         if i == 0 {
-            let mut d = stream.dict.clone();
+            // `content_stream_dict` returns the live stream dictionary. Its
+            // materialization copies only dictionary entries and does not read
+            // the stream payload, so the canonical raw-data read below remains
+            // the sole provider invocation for this stream.
+            let mut d = match stream_dict_handle.materialize()? {
+                Object::Dictionary(dict) => dict,
+                // cov:ignore-start: every ObjectHandle stream owns a dictionary;
+                // this guards a broken internal stream invariant without panicking.
+                _ => {
+                    return Err(Error::Internal(
+                        "content stream handle did not contain a dictionary".to_owned(),
+                    ));
+                } // cov:ignore-end
+            };
             // Stripped: encode-form keys (Filter/DecodeParms/DP/Length/DL)
             // and external-data keys (F/FFilter/FDecodeParms) — see the
             // stream-dictionary entries in ISO 32000-1 Table 5. The
@@ -539,8 +534,6 @@ pub fn coalesce_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
             new_dict = Some(d);
         }
 
-        let stream_handle = pdf.resolve_object_handle_to_terminal(content_handle)?;
-        let stream_dict_handle = content_stream_dict(&stream_handle, page_ref)?;
         let stream_data = stream_handle.get_raw_stream_data()?;
         let decoded = decode_stream_data_from_handle(
             &stream_dict_handle,

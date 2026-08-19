@@ -10,7 +10,9 @@
 use flpdf::{
     pages, parse_content_operations, Dictionary, Object, ObjectRef, ParseControl, Pdf, Stream,
 };
+use std::cell::Cell;
 use std::io::Cursor;
+use std::rc::Rc;
 
 // ── Minimal PDF builder helpers ───────────────────────────────────────────────
 
@@ -570,5 +572,42 @@ fn coalesce_array_element_chain_to_non_stream_errors() {
     assert!(
         matches!(&err, flpdf::Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
         "expected Unsupported(\"…does not resolve to a stream\"), got {err:?}"
+    );
+}
+
+/// The first stream's dictionary and payload must come from the same
+/// ObjectHandle route. A legacy materialization followed by the canonical raw
+/// payload read would invoke a deferred provider twice.
+#[test]
+fn coalesce_reads_provider_backed_first_stream_once_for_metadata_and_payload() {
+    let bytes = build_pdf(
+        "[4 0 R 5 0 R]",
+        &[(4, stream_obj(4, b"q Q")), (5, stream_obj(5, b"BT ET"))],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    let first_stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&first_stream)
+        .expect("first stream should resolve");
+
+    let calls = Rc::new(Cell::new(0));
+    let provider_calls = Rc::clone(&calls);
+    first_stream
+        .replace_stream_data_with_callback(
+            move |pipeline| {
+                provider_calls.set(provider_calls.get() + 1);
+                pipeline.write(b"q Q").map_err(flpdf::Error::from)?;
+                pipeline.finish().map_err(flpdf::Error::from)
+            },
+            None,
+            None,
+        )
+        .expect("provider should be registered on the indirect stream");
+
+    pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed");
+
+    assert_eq!(
+        calls.get(),
+        1,
+        "coalescing must not materialize the provider-backed stream before the canonical raw read"
     );
 }
