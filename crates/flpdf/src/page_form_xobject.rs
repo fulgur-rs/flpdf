@@ -35,20 +35,38 @@
 //!
 //! The XObject stream holds the page's decoded, coalesced content bytes
 //! uncompressed; the writer applies compression on output.
+//!
+//! qpdf 11.9.0 keeps this operation warning-based when the effective `/BBox`
+//! is absent or malformed: `QPDFPageObjectHelper::getFormXObjectForPage`
+//! creates the stream, calls `warnIfPossible`, and continues
+//! (`libqpdf/QPDFPageObjectHelper.cc:706-733`). The production wrapper below
+//! therefore delegates directly to the canonical `PageObjectHelper` instead
+//! of pre-validating the box through a legacy `Object` snapshot. Attribute
+//! inheritance and content streaming remain owned by the live handle route
+//! (`libqpdf/QPDFPageObjectHelper.cc:220-310,439-476`;
+//! `libqpdf/QPDFObjectHandle.cc:1289-1341`).
+//!
+//! The historical raw-object geometry/import helpers are `cfg(test)` only;
+//! they are retained solely for old unit fixtures and cannot be reached by a
+//! production consumer.
 
-// The two entry points (`get_form_xobject_for_page`, `import_page_as_form_xobject`)
-// and their private helpers are consumed by the overlay/underlay content-wiring
-// and CLI layers, which are not yet implemented. Until those call sites land,
-// allow the unused-code lint at the module level (exercised by unit tests here).
-#![allow(dead_code)]
-
-use std::collections::BTreeSet;
+// The production entry points below are consumed by the overlay/underlay
+// content-wiring path. The old raw-object geometry helpers remain only as
+// `cfg(test)` fixtures for historical edge coverage; the production module has
+// one canonical PageObjectHelper/ObjectHandle implementation.
 use std::io::{Read, Seek};
 
-use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
+use crate::{Error, ObjectRef, Pdf, Result};
+
+#[cfg(test)]
+use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
+#[cfg(test)]
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-use crate::{Error, Matrix, Object, ObjectRef, Pdf, Result};
+#[cfg(test)]
+use crate::{Matrix, Object};
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 /// Convert the page at `page_ref` into a Form XObject within the same document,
 /// insert it as a new object, and return its [`ObjectRef`].
@@ -62,25 +80,14 @@ use crate::{Error, Matrix, Object, ObjectRef, Pdf, Result};
 ///
 /// # Errors
 ///
-/// - [`Error::Unsupported`] when `page_ref` is not a `/Type /Page` dictionary,
-///   when a required box rectangle is malformed, or when the object-number space
-///   is exhausted.
+/// - [`Error::Unsupported`] when `page_ref` is not a `/Type /Page` dictionary
+///   or when the object-number space is exhausted.
 /// - Any error propagated from [`Pdf::resolve`] or content extraction.
 pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<ObjectRef> {
     let mut helper = PageObjectHelper::new(page_ref, pdf);
-    let bbox = helper.get_trim_box(false, false)?;
-    let valid_bbox = bbox
-        .as_array()
-        .map(|items| items.len() >= 4)
-        .unwrap_or(false);
-    if !valid_bbox {
-        return Err(Error::Unsupported(format!(
-            "page {page_ref} has no valid /TrimBox, /CropBox, or /MediaBox for the Form XObject /BBox"
-        )));
-    }
     let form = helper.get_form_xobject_for_page(true)?;
     // cov:ignore-start: Pdf::new_stream registers every canonical Form as an
     // indirect document-owned object; this is an allocation invariant guard.
@@ -105,6 +112,7 @@ pub(crate) fn get_form_xobject_for_page<R: Read + Seek>(
 /// - [`Error::Unsupported`] when the source page cannot be converted or when
 ///   the destination object-number space is exhausted.
 /// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
+#[cfg(test)]
 pub(crate) fn import_page_as_form_xobject<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
@@ -156,6 +164,7 @@ where
 ///   destination object-number space is exhausted, or when an imported XObject
 ///   is unexpectedly absent from the copy map.
 /// - Any error propagated from [`Pdf::resolve`] or the cross-document copier.
+#[cfg(test)]
 pub(crate) fn import_pages_as_form_xobjects<RS, RT>(
     dest: &mut Pdf<RT>,
     source: &mut Pdf<RS>,
@@ -205,6 +214,8 @@ where
 /// `/CropBox` and `/MediaBox` are inheritable and resolved through the `/Parent`
 /// chain — matching qpdf's `getTrimBox`/`getCropBox`/`getMediaBox` fallback and
 /// flpdf's own [`PageObjectHelper::crop_box`](crate::PageObjectHelper::crop_box).
+#[cfg(test)]
+#[allow(dead_code)]
 fn effective_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -226,6 +237,7 @@ fn effective_box_array<R: Read + Seek>(
 
 /// Read a box `key` from the leaf page dictionary only (not inheritable), as a
 /// raw rectangle array. Returns `Ok(None)` when absent or null.
+#[cfg(test)]
 fn leaf_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -244,6 +256,7 @@ fn leaf_box_array<R: Read + Seek>(
 
 /// Walk the `/Parent` chain looking for an inheritable box `key` as a raw
 /// rectangle array. Cycle- and depth-guarded.
+#[cfg(test)]
 fn inherited_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -291,6 +304,7 @@ fn inherited_box_array<R: Read + Seek>(
 
 /// Coerce a box value (a direct array or a reference to one) into a raw
 /// rectangle array, validating it has at least four elements.
+#[cfg(test)]
 fn resolve_rect_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     val: Object,
@@ -333,6 +347,7 @@ fn resolve_rect_array<R: Read + Seek>(
 /// normalizes corners with min/max, so the extents are always non-negative even for
 /// a reversed box (`urx < llx` or `ury < lly`): `width = |urx - llx|`,
 /// `height = |ury - lly|`.
+#[cfg(test)]
 fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
     let n = |o: &Object| -> f64 {
         match o {
@@ -355,6 +370,7 @@ fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
 /// (`isNull`), and computes the matrix from *value*; the two are tracked
 /// separately so a present-but-malformed attribute still forces emission while
 /// contributing its qpdf default to the matrix.
+#[cfg(test)]
 pub(crate) struct PageTransform {
     /// `/Rotate` is present (non-null) somewhere in the inheritance chain.
     pub rotate_present: bool,
@@ -369,6 +385,8 @@ pub(crate) struct PageTransform {
 
 /// Read a page's `/Rotate` and `/UserUnit` the way qpdf's `getAttribute` does:
 /// `/Rotate` is inheritable (walk the `/Parent` chain), `/UserUnit` is leaf-only.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn read_page_transform<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -387,6 +405,7 @@ pub(crate) fn read_page_transform<R: Read + Seek>(
 /// inheritable `getAttribute("/Rotate", false)`. Returns `(present, raw_int)`:
 /// `present` is whether any node carried a non-null `/Rotate`; `raw_int` is its
 /// integer value (0 when present-but-not-an-integer). Cycle- and depth-guarded.
+#[cfg(test)]
 fn inherited_rotate_attribute<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
@@ -440,6 +459,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 /// Read the leaf page's `/UserUnit` (not inheritable). Returns `(present, value)`:
 /// `present` is whether the leaf carried a non-null `/UserUnit`; `value` is its
 /// numeric value (1.0 when present-but-not-a-number).
+#[cfg(test)]
 fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<(bool, f64)> {
     let uu_val = {
         let page_obj = pdf.resolve_borrowed(page_ref)?;
@@ -476,6 +496,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
 /// `invert` inverts the destination-page transform (used by overlay placement):
 /// `scale` becomes `1/scale` (identity when `scale == 0`) and `rotate` becomes
 /// `360 - rotate` before the switch.
+#[cfg(test)]
 pub(crate) fn get_matrix_for_transformations(
     t: &PageTransform,
     width: f64,
@@ -512,6 +533,7 @@ pub(crate) fn get_matrix_for_transformations(
 /// qpdf 11.9.0 overlay output, an indirect `/Group` becomes a direct dictionary
 /// in the Form XObject (`/Group << ... >>`, no separate object). `/Group` is not
 /// inheritable (ISO 32000-1 Table 30), so only the leaf page is consulted.
+#[cfg(test)]
 fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<Option<Object>> {
     let group_val = {
         let page_obj = pdf.resolve_borrowed(page_ref)?;
@@ -532,6 +554,7 @@ fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<O
 /// `xobject_ref` (the XObject itself plus every object reachable through its
 /// references). Iterative DFS with canonical-handle identity as the cycle
 /// guard.
+#[cfg(test)]
 pub(crate) fn xobject_object_closure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
@@ -584,6 +607,8 @@ pub(crate) fn xobject_object_closure<R: Read + Seek>(
 
 /// Allocate the next available object reference (`max(numbers) + 1`, generation
 /// 0), matching the allocation pattern used elsewhere in the crate.
+#[cfg(test)]
+#[allow(dead_code)]
 fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     let n = pdf
         .object_refs()
@@ -794,34 +819,37 @@ mod tests {
     }
 
     #[test]
-    fn page_to_form_xobject_rejects_short_box_array() {
-        // A rectangle with < 4 elements is malformed.
+    fn page_to_form_xobject_creates_form_for_short_box_array_with_warning() {
+        // qpdf keeps the Form XObject and warns when /BBox is malformed; the
+        // canonical helper must not turn that warning into an error.
         let mut pdf = open(one_page_doc("/TrimBox [0 0 5]", "x", &[]));
-        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
-        assert!(matches!(err, Err(Error::Unsupported(_))));
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(form_stream(&mut pdf, xref).dict.get("BBox").is_some());
     }
 
     #[test]
-    fn page_to_form_xobject_rejects_non_array_box() {
-        // A /TrimBox that is a name, not an array, is malformed.
+    fn page_to_form_xobject_creates_form_for_non_array_box_with_warning() {
+        // A /TrimBox that is a name, not an array, is malformed, but qpdf
+        // creates the Form XObject and emits a warning.
         let mut pdf = open(one_page_doc("/TrimBox /NotARect", "x", &[]));
-        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
-        assert!(matches!(err, Err(Error::Unsupported(_))));
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(form_stream(&mut pdf, xref).dict.get("BBox").is_some());
     }
 
     #[test]
-    fn page_to_form_xobject_rejects_box_ref_to_non_array() {
+    fn page_to_form_xobject_creates_form_for_box_ref_to_non_array_with_warning() {
         // /CropBox is an indirect ref that resolves to a dictionary, not an
-        // array — exercises the reference-arm error path in inherited_box_array.
+        // array. qpdf keeps the copied value in /BBox and warns.
         let bad = (6u32, "<< /Type /Foo >>");
         let mut pdf = open(one_page_doc("/CropBox 6 0 R", "x", &[bad]));
-        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
-        assert!(matches!(err, Err(Error::Unsupported(_))));
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(form_stream(&mut pdf, xref).dict.get("BBox").is_some());
     }
 
     #[test]
-    fn page_to_form_xobject_errors_when_no_box_anywhere() {
-        // No /TrimBox, /CropBox, or /MediaBox on the page or its parent.
+    fn page_to_form_xobject_creates_form_when_no_box_exists_with_warning() {
+        // No /TrimBox, /CropBox, or /MediaBox on the page or its parent. qpdf
+        // stores a null /BBox (which the dictionary omits) and warns.
         let page = "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>";
         let content = "<< /Length 1 >>\nstream\nx\nendstream";
         let mut pdf = open(build_pdf(
@@ -833,8 +861,8 @@ mod tests {
             ],
             1,
         ));
-        let err = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0));
-        assert!(matches!(err, Err(Error::Unsupported(_))));
+        let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(form_stream(&mut pdf, xref).dict.get("BBox").is_none());
     }
 
     #[test]
