@@ -2208,8 +2208,111 @@ mod tests {
         out
     }
 
+    /// Build two leaves that point at the same indirect `/Resources` object.
+    fn build_shared_resources_heuristic_pdf() -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 5 0 R >>",
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 5 0 R >>",
+            ),
+            (5, "<< >>"),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, out.len() as u64);
+            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+
+        let xref_start = out.len() as u64;
+        let total = 6u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for number in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    /// Build a page tree that repeats one canonical leaf handle in `/Kids`.
+    fn build_duplicate_page_heuristic_pdf() -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let objects = [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R 3 0 R] /Count 2 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"),
+        ];
+        for (number, body) in objects {
+            offsets.insert(number, out.len() as u64);
+            out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+
+        let xref_start = out.len() as u64;
+        let total = 4u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for number in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    /// Remove the trailer's `/Root` from a valid fixture.
+    fn build_rootless_heuristic_pdf() -> Vec<u8> {
+        let mut out = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 100 100] >>",
+            "<< >>",
+        );
+        let marker = b"/Root 1 0 R";
+        let start = out
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("fixture trailer should contain /Root");
+        out[start..start + marker.len()].fill(b' ');
+        out
+    }
+
+    /// Build a valid catalog whose `/Pages` key is explicitly null.
+    fn build_null_pages_heuristic_pdf() -> Vec<u8> {
+        let mut out = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /MediaBox [0 0 100 100] >>",
+            "<< >>",
+        );
+        let marker = b"/Pages 2 0 R";
+        let replacement = b"/Pages null ";
+        let start = out
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("fixture catalog should contain /Pages");
+        out[start..start + marker.len()].copy_from_slice(replacement);
+        out
+    }
+
     #[test]
     fn pages_auto_resource_heuristic_matches_qpdf_trigger_shapes() {
+        let mut rootless = Pdf::open(Cursor::new(build_rootless_heuristic_pdf())).unwrap();
+        assert!(!should_remove_unreferenced_resources(&mut rootless).unwrap());
+
+        let mut pages_null = Pdf::open(Cursor::new(build_null_pages_heuristic_pdf())).unwrap();
+        assert!(!should_remove_unreferenced_resources(&mut pages_null).unwrap());
+
+        let mut duplicate_nodes =
+            Pdf::open(Cursor::new(build_duplicate_page_heuristic_pdf())).unwrap();
+        assert!(!should_remove_unreferenced_resources(&mut duplicate_nodes).unwrap());
+
         let mut page_local = Pdf::open(Cursor::new(build_page_with_resources_carrier_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources 4 0 R >>",
             "<< /Font << >> >>",
@@ -2229,6 +2332,10 @@ mod tests {
         let mut shared_xobject =
             Pdf::open(Cursor::new(build_shared_xobject_heuristic_pdf())).unwrap();
         assert!(should_remove_unreferenced_resources(&mut shared_xobject).unwrap());
+
+        let mut shared_resources =
+            Pdf::open(Cursor::new(build_shared_resources_heuristic_pdf())).unwrap();
+        assert!(should_remove_unreferenced_resources(&mut shared_resources).unwrap());
     }
 
     /// Run a prune in `mode` and return the `/Font` sub-dictionary keys of the
