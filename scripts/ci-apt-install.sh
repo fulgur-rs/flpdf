@@ -7,7 +7,9 @@
 # those only bound idle time on a connection apt considers alive, and do not
 # reliably fire on this failure shape. Wrap the whole operation in a hard
 # shell-level `timeout` instead, so a stalled mirror is killed and retried
-# rather than hanging for the runner's full job timeout.
+# rather than hanging for the runner's full job timeout. `--kill-after`
+# escalates to SIGKILL if apt/sudo/a child ignores the initial SIGTERM,
+# since `timeout`'s own default signal is not guaranteed to be honored.
 set -euo pipefail
 
 apt_opts=(
@@ -17,8 +19,8 @@ apt_opts=(
 )
 
 for attempt in 1 2 3; do
-  if timeout 90 sudo apt-get "${apt_opts[@]}" update \
-    && timeout 180 sudo apt-get "${apt_opts[@]}" install -y "$@"; then
+  if timeout --kill-after=10 90 sudo apt-get "${apt_opts[@]}" update \
+    && timeout --kill-after=10 180 sudo apt-get "${apt_opts[@]}" install -y "$@"; then
     exit 0
   fi
   echo "apt-get attempt $attempt failed or timed out; retrying..." >&2
