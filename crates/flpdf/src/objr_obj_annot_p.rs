@@ -3,7 +3,7 @@
 //! structure-tree object reference (`/Type /OBJR`) `/Obj`, after page
 //! extraction.
 //!
-//! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page
+//! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree for a subset extraction, an annotation on a removed page is normally
 //! garbage-collected with that page. But when a structure-tree object reference
 //! (`/Type /OBJR`, ISO 32000-2 §14.7.4.4) keeps the annotation alive through its
@@ -54,7 +54,7 @@
 //!   structure element's parent) is left unchanged. A `/P` resolving to `null`
 //!   *is* treated as a removed page and dropped (see the note above).
 
-use crate::page_tree_rebuild::RebuildResult;
+use crate::pages::tree_rebuild::RebuildResult;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,7 +65,7 @@ use std::io::{Read, Seek};
 /// parity).
 ///
 /// `result` is the [`RebuildResult`] returned by
-/// [`crate::page_tree_rebuild::rebuild_page_tree`]; its `ref_map` encodes the
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`]; its `ref_map` encodes the
 /// old → new page mapping (a page absent from the map was removed; a page
 /// present maps to `ref_map[old][0]`). `objr_obj_targets` are the OBJR `/Obj`
 /// references collected during the structure-tree walk

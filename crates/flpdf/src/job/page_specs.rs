@@ -248,7 +248,7 @@ pub fn handle_page_specs<R: Read + Seek + 'static>(
         .map(|&(source_index, group_index)| grouped_refs[offsets[source_index] + group_index])
         .collect();
     if final_refs != grouped_refs {
-        crate::page_tree_rebuild::rebuild_page_tree(&mut merged, &final_refs)?;
+        crate::pages::tree_rebuild::rebuild_page_tree(&mut merged, &final_refs)?;
     }
 
     if any_page_labels {

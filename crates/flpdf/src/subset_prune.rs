@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDFPageObjectHelper.cc resource pruning plus QPDFWriter.cc full-rewrite reachability.
 //! Resource pruning after page-subset extraction.
 //!
-//! After [`crate::page_tree_rebuild::rebuild_page_tree`] has restructured the
+//! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has restructured the
 //! document so that only the selected pages remain reachable from `/Root`,
 //! two kinds of "garbage" may linger in the object table:
 //!
@@ -54,7 +54,7 @@ use std::io::{Read, Seek};
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Prune unreferenced resources from a PDF whose page tree has already been
-/// rebuilt by [`crate::page_tree_rebuild::rebuild_page_tree`].
+/// rebuilt by [`crate::pages::tree_rebuild::rebuild_page_tree`].
 ///
 /// Two passes are performed when `mode` is not [`RemoveUnreferencedResources::No`]:
 ///
@@ -255,8 +255,8 @@ mod tests {
     use super::*;
     use crate::check::check_reader;
     use crate::object::MAX_INLINE_DEPTH;
-    use crate::page_tree_rebuild::rebuild_page_tree;
     use crate::pages::page_refs;
+    use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;

@@ -6,7 +6,7 @@
 //! materialization, page insertion/removal, resource pruning, and annotation
 //! flattening. The helper holds no copied page-tree state.
 
-use crate::page_tree_rebuild::{rebuild_page_tree, RebuildResult};
+use crate::pages::tree_rebuild::{rebuild_page_tree, RebuildResult};
 use crate::{Error, ObjectHandle, ObjectRef, PageObjectHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};

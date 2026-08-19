@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations.
 //! Outline and named-destination remapping after page extraction.
 //!
-//! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page tree
+//! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page tree
 //! for a subset extraction, this module updates the document's `/Outlines` tree,
 //! `/Names /Dests` name-tree (and the legacy `/Catalog /Dests` dictionary), the
 //! link annotations (`/Dest`, `/A /GoTo /D`) on every surviving page, and the
@@ -59,7 +59,7 @@
 //!
 //! Single-document only. Multi-input cross-document merge is a separate path.
 
-use crate::page_tree_rebuild::RebuildResult;
+use crate::pages::tree_rebuild::RebuildResult;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -121,7 +121,7 @@ impl Surviving {
 /// rebuild (qpdf `--pages` parity).
 ///
 /// `result` is the [`RebuildResult`] returned by
-/// [`crate::page_tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
 /// old → new page reference mapping (a page absent from the map was removed; a
 /// page present maps to `ref_map[old][0]`, the first new occurrence), and
 /// `removed_pages` is the set of dropped original page leaves.
@@ -901,7 +901,7 @@ fn dest_page_ref_resolved_depth<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::check::check_reader;
-    use crate::page_tree_rebuild::rebuild_page_tree;
+    use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;

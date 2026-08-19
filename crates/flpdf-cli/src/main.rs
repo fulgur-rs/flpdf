@@ -15,7 +15,7 @@ use flpdf::{
     page_collate::collate,
     page_combine::{CombinedPage, CombinedPlan},
     page_rotate::apply_rotate_to_pages,
-    page_tree_rebuild::rebuild_page_tree,
+    pages::tree_rebuild::rebuild_page_tree,
     struct_tree_pg::drop_struct_elem_dangling_pg,
     subset_prune::prune_after_subset,
     thread_bead_p::drop_thread_bead_dangling_p,
@@ -4172,7 +4172,7 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 ///
 /// Processing order is fixed as follows:
 ///   1. page_combine / page_collate → selected ObjectRef list
-///   2. page_tree_rebuild::rebuild_page_tree → RebuildResult
+///   2. pages::tree_rebuild::rebuild_page_tree → RebuildResult
 ///   3. apply_rotate_to_pages (on the rebuilt OUTPUT leaves; qpdf-observed)
 ///      3.5. /PageLabels reconstruction (per selected page, qpdf
 ///      `handlePageSpecs`-observed)

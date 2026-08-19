@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads.
 //! Article-thread bead `/P` reference drop after page extraction.
 //!
-//! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page
+//! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree for a subset extraction, this module walks the article-thread beads
 //! (ISO 32000-2 §12.4.3) and updates each bead's `/P` (the page the bead
 //! belongs to) to match qpdf's `--pages` behaviour:
@@ -65,7 +65,7 @@
 //!
 //! This module's surviving-page rule matches that observation: it remaps a
 //! bead's `/P` to `ref_map[old]`'s first new occurrence. Note that
-//! [`crate::page_tree_rebuild::rebuild_page_tree`] keeps the **first**
+//! [`crate::pages::tree_rebuild::rebuild_page_tree`] keeps the **first**
 //! occurrence of a surviving page under its original [`ObjectRef`] (only the
 //! 2nd+ duplicate copies get fresh numbers), so for every surviving page the
 //! first new ref equals the original ref and the remap is an identity — the
@@ -74,7 +74,7 @@
 //! document; cross-document merge — which could renumber a first occurrence —
 //! is out of scope here.)
 
-use crate::page_tree_rebuild::RebuildResult;
+use crate::pages::tree_rebuild::RebuildResult;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,7 +84,7 @@ use std::io::{Read, Seek};
 /// (qpdf `--pages` parity).
 ///
 /// `result` is the [`RebuildResult`] returned by
-/// [`crate::page_tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
 /// old → new page reference mapping: a page absent from the map was removed; a
 /// page present maps to `ref_map[old][0]` (first new occurrence).
 ///
@@ -469,7 +469,7 @@ mod tests {
         // from its original (ref_map[old][0] != old), a bead /P pointing at it
         // must be REMAPPED to that new ref, not dropped. A single-document
         // `rebuild_page_tree` never produces this (it keeps the first occurrence
-        // under the original ref, page_tree_rebuild.rs), so this fixture builds
+        // under the original ref, pages/tree_rebuild.rs), so this fixture builds
         // the RebuildResult by hand to exercise the otherwise-unreachable remap
         // arm and pin the qpdf first-occurrence rule for a future cross-doc path.
         let mut pdf = open(&base_objs());

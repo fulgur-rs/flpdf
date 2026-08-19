@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDFJob.cc removal of unreferenced form fields after page selection.
 //! AcroForm field preservation after page-subset extraction.
 //!
-//! After [`crate::page_tree_rebuild::rebuild_page_tree`] has rebuilt the page
+//! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree so that only the selected pages remain reachable from `/Root`, this
 //! module prunes the `/AcroForm /Fields` array to remove any top-level field
 //! whose **all** widget annotations live on dropped pages.  Fields that have at
@@ -54,7 +54,7 @@
 //! collisions with qpdf-style suffix renaming) is explicitly **out of scope**
 //! here and is not currently supported.  The single-document API boundary makes the cross-doc case
 //! unreachable at this layer, so no `Error::Unsupported` stub is needed; see
-//! the comment in `page_tree_rebuild` for the same rationale.
+//! the comment in `pages::tree_rebuild` for the same rationale.
 //!
 //! Heavy AcroForm operations (flattening, rendering appearance streams) are out
 //! of scope; this module handles only the
@@ -62,7 +62,7 @@
 
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
-use crate::page_tree_rebuild::RebuildResult;
+use crate::pages::tree_rebuild::RebuildResult;
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
@@ -86,7 +86,7 @@ type WidgetPageMap = HashMap<ObjectHandleIdentity, (ObjectHandle, ObjectRef)>;
 /// `/P` back-pointers.
 ///
 /// `result` is the [`RebuildResult`] from
-/// [`crate::page_tree_rebuild::rebuild_page_tree`].  Its `new_kids` encodes
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`].  Its `new_kids` encodes
 /// the retained pages; its `ref_map` maps old page refs to new page refs.
 ///
 /// The function mutates `pdf` in place and is a no-op when there is no
@@ -129,7 +129,7 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // `.or_insert` on that identity naturally keeps the first occurrence's
     // page, matching the /P update rule used by outline_dest_remap for
     // /Dest. A *direct* widget, however, is embedded inside the deep-cloned
-    // page dictionary (`page_tree_rebuild.rs`'s own doc: "deep-clone the
+    // page dictionary (`pages/tree_rebuild.rs`'s own doc: "deep-clone the
     // post-materialization page dictionary"), so each duplicate occurrence
     // gets its own distinct direct widget with its own distinct identity --
     // visiting only the first occurrence would leave every later
@@ -464,8 +464,8 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::check::check_reader;
-    use crate::page_tree_rebuild::rebuild_page_tree;
     use crate::pages::page_refs;
+    use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
     use crate::Pdf;
     use std::collections::BTreeMap;
@@ -708,7 +708,7 @@ mod tests {
     fn duplicate_page_selection_updates_every_direct_widget_occurrence() {
         // qpdf precedent (`--pages in.pdf 1,1`): a duplicate page selection
         // deep-clones the page dictionary per occurrence
-        // (page_tree_rebuild.rs's own doc), so a *direct* widget on that
+        // (pages/tree_rebuild.rs's own doc), so a *direct* widget on that
         // page is a genuinely distinct object per occurrence -- unlike an
         // indirect widget, which stays the same shared object regardless of
         // which occurrence references it. Selecting the same source page

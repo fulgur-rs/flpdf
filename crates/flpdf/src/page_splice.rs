@@ -2,7 +2,7 @@
 //! `QPDF_pages.cc:81-188,203-304` normalizes page-tree types, direct/duplicate kids, and maintains `/Kids`, `/Count`, and `/Parent` during those mutations.
 //! Surgical in-place splice of the `/Pages` tree.
 //!
-//! Unlike [`crate::page_tree_rebuild`], which always produces a flat single-level
+//! Unlike [`crate::pages::tree_rebuild`], which always produces a flat single-level
 //! tree, [`splice_pages`] preserves the existing multi-level `/Pages` structure
 //! and performs a targeted depth-first walk to insert/remove pages at a specific
 //! position, updating `/Count` at every ancestor node and repointing `/Parent`
