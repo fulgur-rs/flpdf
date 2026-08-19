@@ -2976,6 +2976,21 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         && pdf.encryption_ref().is_none()
         && pdf.deleted_object_refs().is_empty();
     let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
+    // QPDFWriter::write calls initializeSpecialStreams() -- which repairs the
+    // page tree via QPDF::getAllPages() (promoting a direct /Kids leaf to a
+    // fresh indirect object, cloning a duplicate leaf) -- before any object
+    // numbering (QPDFWriter.cc:2113-2115, ahead of preserveObjectStreams/
+    // generateObjectStreams). Run the same repair here, before the
+    // Catalog-first walk below, so any object it mints is already part of
+    // the graph the walk numbers. Running this after the walk (as an earlier
+    // version of this function did) left freshly-minted refs outside every
+    // numbering map, causing a hard failure for a page tree that needed
+    // repair in QDF/content-normalization mode.
+    let qdf_page_refs = if options.qdf || options.content_normalization {
+        Some(crate::PageDocumentHelper::new(pdf).get_all_pages()?)
+    } else {
+        None
+    };
     // The specialized writer is a live ObjectHandle consumer. Its
     // Catalog-first walk must therefore use the same canonical graph as the
     // emission loop; the legacy raw-Object walk would parse a content holder
@@ -3371,9 +3386,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // QPDFWriter::initializeSpecialStreams delegates page enumeration to
         // QPDF::getAllPages(), whose live ObjectHandle lookup accepts a direct
         // Catalog /Pages dictionary (QPDFWriter.cc:1916; QPDF_pages.cc:47-71).
-        // Keep this consumer on the canonical page-document helper so the
-        // direct-root and page-tree repair boundary is shared with qpdf.
-        let page_refs = crate::PageDocumentHelper::new(pdf).get_all_pages()?;
+        // The repair-and-enumerate pass already ran once, before the
+        // Catalog-first numbering walk above, so any object it mints is
+        // numbered; reuse that snapshot instead of repairing (a no-op the
+        // second time) and enumerating again.
+        let page_refs = qdf_page_refs
+            .as_ref()
+            .expect("qdf_page_refs is Some whenever options.qdf || options.content_normalization");
         for (idx, page_ref) in page_refs.iter().enumerate() {
             let seq = (idx as u32).saturating_add(1);
             if options.qdf {

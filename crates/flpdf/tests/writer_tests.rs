@@ -1350,6 +1350,50 @@ fn write_qdf_traverses_direct_catalog_pages_root() {
     );
 }
 
+/// The QDF pre-scan's page-tree repair (promoting a direct `/Kids` leaf to a
+/// fresh indirect object, matching `QPDF_pages.cc:110-114`) must run before
+/// the Catalog-first numbering walk, not after it -- qpdf's own
+/// `QPDFWriter::write` calls `initializeSpecialStreams()` (which triggers
+/// the same repair) before any object-numbering pass
+/// (`QPDFWriter.cc:2113-2115`). Running the repair after numbering leaves a
+/// freshly-minted object outside every numbering map, which previously
+/// crashed with "QDF reference ... absent from emission map" instead of
+/// writing valid output.
+#[test]
+fn write_qdf_promotes_a_direct_kids_leaf_before_numbering() {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let off1 = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = bytes.len();
+    bytes.extend_from_slice(
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] >>\nendobj\n",
+    );
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let mut output = Vec::new();
+    write_qdf_output(&mut pdf, &mut output)
+        .expect("QDF writer must promote and number a direct /Kids leaf without erroring");
+    assert!(
+        output
+            .windows(b"%% Page 1\n".len())
+            .any(|w| w == b"%% Page 1\n"),
+        "the promoted leaf must still receive its QDF page marker"
+    );
+    let report = check_reader(Cursor::new(output)).expect("QDF output must be readable");
+    assert!(
+        report.valid,
+        "direct-Kids-leaf QDF output must pass flpdf check: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
 /// Even under `no_original_object_ids = true` (qpdf's `--no-original-object-ids`),
 /// the QDF page/contents markers must still be emitted — qpdf keeps them
 /// regardless of that flag; only `%% Original object ID:` is suppressed.
