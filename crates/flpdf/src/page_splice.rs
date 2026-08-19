@@ -177,6 +177,7 @@ fn page_refs_for_splice<R: Read + Seek>(
     Ok(pages)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_page_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
