@@ -74,7 +74,7 @@ fn merge_job_label_ranges(ranges: Vec<JobLabelEntry>) -> Vec<JobLabelEntry> {
 /// This is the Rust boundary corresponding to
 /// `QPDFJob::handlePageSpecs` (`libqpdf/QPDFJob.cc:2360-2632`). The low-level
 /// page tree and foreign-object responsibilities remain in
-/// [`merge_documents`] and its page helpers. The job layer owns:
+/// [`crate::page_merge::merge_documents`] and its page helpers. The job layer owns:
 ///
 /// - per-spec range resolution and source-index validation;
 /// - qpdf's round-robin `--collate` order across specifications;
