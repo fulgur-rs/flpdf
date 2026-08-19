@@ -1,5 +1,5 @@
 //! qpdf correspondence: `QPDFPageDocumentHelper.cc:37-52` delegates page insertion/removal to the page-tree owner.
-//! `QPDF_pages.cc:97-188,203-304` normalizes direct/duplicate kids and maintains `/Kids`, `/Count`, and `/Parent` during those mutations.
+//! `QPDF_pages.cc:81-188,203-304` normalizes page-tree types, direct/duplicate kids, and maintains `/Kids`, `/Count`, and `/Parent` during those mutations.
 //! Surgical in-place splice of the `/Pages` tree.
 //!
 //! Unlike [`crate::page_tree_rebuild`], which always produces a flat single-level
@@ -7,6 +7,10 @@
 //! and performs a targeted depth-first walk to insert/remove pages at a specific
 //! position, updating `/Count` at every ancestor node and repointing `/Parent`
 //! on inserted pages.
+//! This topology is intentional for this surgical primitive: qpdf's public
+//! `QPDF::insertPage`/`removePage` callers flatten first
+//! (`QPDF_pages.cc:209,256`), while this bounded page-extraction/merge route
+//! preserves the caller's subtree and applies the same page-owner invariants.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 #[cfg(test)]
@@ -165,6 +169,7 @@ fn page_refs_for_splice<R: Read + Seek>(
         pages_ref,
         0,
         max_depth,
+        true,
         &mut pages,
         &mut seen,
         &mut visited,
@@ -177,6 +182,7 @@ fn collect_page_refs<R: Read + Seek>(
     node_ref: ObjectRef,
     depth: usize,
     max_depth: usize,
+    is_root: bool,
     pages: &mut Vec<ObjectRef>,
     seen: &mut HashSet<ObjectRef>,
     visited: &mut HashSet<ObjectRef>,
@@ -197,9 +203,18 @@ fn collect_page_refs<R: Read + Seek>(
 
     let node_type = node.try_get_key(b"/Type")?;
     pdf.resolve_object_handle(&node_type)?;
-    if node_type.as_name().as_deref() != Some(b"Pages") {
+    let has_kids = is_root || node.try_has_key(b"/Kids")?;
+    if !has_kids {
+        if node_type.as_name().as_deref() != Some(b"Page") {
+            node.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
+            pdf.mark_object_handle_dirty(&node)?;
+        }
         pages.push(node_ref);
         return Ok(1);
+    }
+    if node_type.as_name().as_deref() != Some(b"Pages") {
+        node.replace_key(b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
+        pdf.mark_object_handle_dirty(&node)?;
     }
     if !visited.insert(node_ref) {
         return Err(Error::Unsupported(format!(
@@ -240,9 +255,7 @@ fn collect_page_refs<R: Read + Seek>(
 
         let child = pdf.get_object_handle(child_ref);
         pdf.resolve_object_handle(&child)?;
-        let child_type = child.try_get_key(b"/Type")?;
-        pdf.resolve_object_handle(&child_type)?;
-        let child_is_pages = child_type.as_name().as_deref() == Some(b"Pages");
+        let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
         let child_ref = if !child_is_pages && !seen.insert(child_ref) {
             let copy = child.shallow_copy()?;
             let indirect = pdf.make_indirect_object_handle(copy)?;
@@ -287,8 +300,16 @@ fn collect_page_refs<R: Read + Seek>(
 
     let mut actual_count = 0usize;
     for child_ref in kids {
-        let child_count =
-            collect_page_refs(pdf, child_ref, depth + 1, max_depth, pages, seen, visited)?;
+        let child_count = collect_page_refs(
+            pdf,
+            child_ref,
+            depth + 1,
+            max_depth,
+            false,
+            pages,
+            seen,
+            visited,
+        )?;
         // cov:ignore-start: usize page-count overflow cannot be constructed by a finite PDF object tree
         actual_count = actual_count.checked_add(child_count).ok_or_else(|| {
             Error::Unsupported(format!("page count overflow at /Pages node {node_ref}"))
@@ -725,6 +746,22 @@ mod tests {
         ])
     }
 
+    fn build_pages_with_malformed_types_pdf() -> Vec<u8> {
+        build_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /NotPages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /NotPages /Parent 2 0 R /Kids [4 0 R] /Count 1 >>",
+            ),
+            (
+                4,
+                "<< /Type /NotPage /Parent 3 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (5, "<< /Type /NotPage /MediaBox [0 0 612 792] >>"),
+        ])
+    }
+
     fn build_direct_pages_root_pdf() -> Vec<u8> {
         build_pdf(&[
             (
@@ -1023,6 +1060,25 @@ mod tests {
         let root = dict_of(&mut round_trip, ObjectRef::new(2, 0));
         let kids = root.get("Kids").and_then(Object::as_array).unwrap();
         assert!(matches!(kids.first(), Some(Object::Reference(_))));
+    }
+
+    #[test]
+    fn malformed_page_tree_types_are_normalized_by_the_public_walk() {
+        let mut pdf = open(build_pages_with_malformed_types_pdf());
+        splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap();
+
+        assert_eq!(
+            dict_of(&mut pdf, ObjectRef::new(2, 0)).get("Type"),
+            Some(&Object::Name(b"Pages".to_vec()))
+        );
+        assert_eq!(
+            dict_of(&mut pdf, ObjectRef::new(3, 0)).get("Type"),
+            Some(&Object::Name(b"Pages".to_vec()))
+        );
+        assert_eq!(
+            dict_of(&mut pdf, ObjectRef::new(4, 0)).get("Type"),
+            Some(&Object::Name(b"Page".to_vec()))
+        );
     }
 
     #[test]
