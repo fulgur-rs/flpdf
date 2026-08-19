@@ -593,6 +593,10 @@ mod tests {
         );
     }
 
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "the test exercises the canonical live-allocation identity set"
+    )]
     #[test]
     fn collect_page_tree_nodes_handles_duplicate_and_malformed_handles() {
         let pages = ObjectHandle::dictionary(vec![
