@@ -20,8 +20,8 @@
 //!
 //! `RotateMode::Assign` is not used here; it is reserved for a future issue.
 //! The additive sign-encoded form is the natural representation because
-//! `compose_rotate` accepts signed `degrees` and `normalize_rotate` handles
-//! negatives correctly (e.g. `Add(-90)` on existing=0 gives 270).
+//! `compose_rotate` accepts signed `degrees` and normalizes negatives
+//! correctly (e.g. `Add(-90)` on existing=0 gives 270).
 //!
 //! ## Page-range
 //!

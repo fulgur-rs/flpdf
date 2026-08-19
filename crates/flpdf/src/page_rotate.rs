@@ -47,8 +47,8 @@ pub enum RotateMode {
 
 /// A rotation operation: mode plus angle in degrees.
 ///
-/// Angles need not be multiples of 90; they will be composed and then
-/// normalized to one of `{0, 90, 180, 270}` by [`normalize_rotate`].
+/// Angles need not be multiples of 90; they will be composed via
+/// [`compose_rotate`] and normalized to one of `{0, 90, 180, 270}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RotateOp {
     /// Whether this is an assignment or an additive rotation.
@@ -79,6 +79,11 @@ pub struct RotateOp {
 /// values.  Our policy is to snap to the nearest valid boundary rather than
 /// rejecting them, so a malformed `/Rotate` never aborts a page operation.
 ///
+/// Takes `i64` — the widest type among its callers ([`compose_rotate`]'s
+/// composed sums and raw PDF `/Rotate` integers, which are `i64`) — so no
+/// caller needs a narrowing cast that could truncate or overflow before
+/// normalization.
+///
 /// Examples:
 /// - `  0` → `  0`
 /// - ` 90` → ` 90`
@@ -89,15 +94,6 @@ pub struct RotateOp {
 /// - `-90` → `270`
 /// - ` 45` → ` 90`  (rounded up — nearest boundary)
 /// - ` 44` → `  0`  (rounded down — nearest boundary)
-pub fn normalize_rotate(deg: i32) -> i32 {
-    normalize_rotate_i64(deg as i64)
-}
-
-/// Normalize an `i64` rotation to `{0, 90, 180, 270}`.
-///
-/// Internal helper so every entry point — public `i32` API, composed sums,
-/// and raw PDF `/Rotate` integers (which are `i64`) — normalizes *without*
-/// a narrowing cast that could truncate or overflow before normalization.
 fn normalize_rotate_i64(deg: i64) -> i32 {
     // Round `deg` to the nearest 90° boundary, then keep within [0, 360).
     // Widen to i128: `deg + 45` would overflow i64 for inputs near
@@ -368,56 +364,56 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pure function tests: normalize_rotate
+    // Pure function tests: normalize_rotate_i64
     // -----------------------------------------------------------------------
 
     #[test]
     fn normalize_standard_values() {
-        assert_eq!(normalize_rotate(0), 0);
-        assert_eq!(normalize_rotate(90), 90);
-        assert_eq!(normalize_rotate(180), 180);
-        assert_eq!(normalize_rotate(270), 270);
+        assert_eq!(normalize_rotate_i64(0), 0);
+        assert_eq!(normalize_rotate_i64(90), 90);
+        assert_eq!(normalize_rotate_i64(180), 180);
+        assert_eq!(normalize_rotate_i64(270), 270);
     }
 
     #[test]
     fn normalize_wraparound() {
-        assert_eq!(normalize_rotate(360), 0);
-        assert_eq!(normalize_rotate(450), 90);
-        assert_eq!(normalize_rotate(540), 180);
-        assert_eq!(normalize_rotate(720), 0);
+        assert_eq!(normalize_rotate_i64(360), 0);
+        assert_eq!(normalize_rotate_i64(450), 90);
+        assert_eq!(normalize_rotate_i64(540), 180);
+        assert_eq!(normalize_rotate_i64(720), 0);
     }
 
     #[test]
     fn normalize_negative() {
-        assert_eq!(normalize_rotate(-90), 270);
-        assert_eq!(normalize_rotate(-180), 180);
-        assert_eq!(normalize_rotate(-270), 90);
-        assert_eq!(normalize_rotate(-360), 0);
-        assert_eq!(normalize_rotate(-450), 270);
+        assert_eq!(normalize_rotate_i64(-90), 270);
+        assert_eq!(normalize_rotate_i64(-180), 180);
+        assert_eq!(normalize_rotate_i64(-270), 90);
+        assert_eq!(normalize_rotate_i64(-360), 0);
+        assert_eq!(normalize_rotate_i64(-450), 270);
     }
 
     #[test]
     fn normalize_non_multiple_of_90_rounds_to_nearest() {
         // 44 → closest multiple is 0 (44 < 45)
-        assert_eq!(normalize_rotate(44), 0);
+        assert_eq!(normalize_rotate_i64(44), 0);
         // 45 → rounds up to 90
-        assert_eq!(normalize_rotate(45), 90);
+        assert_eq!(normalize_rotate_i64(45), 90);
         // 89 → rounds up to 90
-        assert_eq!(normalize_rotate(89), 90);
+        assert_eq!(normalize_rotate_i64(89), 90);
         // 91 → rounds down to 90
-        assert_eq!(normalize_rotate(91), 90);
+        assert_eq!(normalize_rotate_i64(91), 90);
         // 134 → rounds down to 90 (134 - 90 = 44 < 45)
-        assert_eq!(normalize_rotate(134), 90);
+        assert_eq!(normalize_rotate_i64(134), 90);
         // 135 → rounds up to 180
-        assert_eq!(normalize_rotate(135), 180);
+        assert_eq!(normalize_rotate_i64(135), 180);
     }
 
     #[test]
-    fn normalize_extreme_i32_inputs_do_not_overflow() {
-        // `deg + 45` must not overflow i32 near the bounds; widening to i64
+    fn normalize_extreme_i64_inputs_do_not_overflow() {
+        // `deg + 45` must not overflow i64 near the bounds; widening to i128
         // keeps these well-defined instead of panicking (debug) / wrapping.
-        let max = normalize_rotate(i32::MAX);
-        let min = normalize_rotate(i32::MIN);
+        let max = normalize_rotate_i64(i64::MAX);
+        let min = normalize_rotate_i64(i64::MIN);
         assert!(matches!(max, 0 | 90 | 180 | 270));
         assert!(matches!(min, 0 | 90 | 180 | 270));
     }

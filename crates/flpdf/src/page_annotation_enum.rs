@@ -7,9 +7,6 @@
 //! [`AnnotationObjectHelper`]. For Widget annotations it also resolves the
 //! owning AcroForm field object when an indirect identity is available.
 //!
-//! [`enumerate_document_annotations`] is a convenience wrapper that applies
-//! [`enumerate_page_annotations`] to every leaf page in the document.
-//!
 //! # Widget-to-field linkage
 //!
 //! Widget-to-field association follows qpdf's
@@ -17,9 +14,8 @@
 //! `QPDFFormFieldObjectHelper::getTopLevelField` composition. Matching qpdf's
 //! own `analyze()` memoization (invoked lazily, only by a caller that needs a
 //! field association), the `annotation_to_field_map` is built at most once per
-//! [`enumerate_document_annotations`] call — shared across every page rather
-//! than rebuilt per page — and only when a page actually has a Widget
-//! annotation; a widget-free page never triggers it, so an unrelated
+//! [`enumerate_page_annotations`] call and only when the page actually has a
+//! Widget annotation; a widget-free page never triggers it, so an unrelated
 //! malformed field tree elsewhere in the document cannot fail its
 //! enumeration. Each mapped field is then walked to its top-level field with
 //! the helper's cycle guard. A document without an `/AcroForm` `/Fields`
@@ -127,18 +123,6 @@ impl PartialEq for EnumeratedAnnotation {
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn enumerate_page_annotations<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<Vec<EnumeratedAnnotation>> {
-    let mut field_refs_by_annotation = None;
-    enumerate_page_annotations_with_cache(pdf, page_ref, &mut field_refs_by_annotation)
-}
-
-/// [`enumerate_page_annotations`]'s body, taking the qpdf-analyze-equivalent
-/// map as an in/out cache so [`enumerate_document_annotations`] can share one
-/// map across every page instead of rebuilding it (and re-walking every page
-/// for the orphan-widget pass) per page.
 ///
 /// Mirrors qpdf's own laziness: `QPDFAcroFormDocumentHelper::analyze()` is
 /// memoized on `cache_valid` and only invoked by callers (`getFieldForAnnotation`,
@@ -147,10 +131,9 @@ pub fn enumerate_page_annotations<R: Read + Seek>(
 /// mean an unrelated malformed field tree elsewhere in the document (e.g. one
 /// exceeding the AcroForm depth cap) fails ordinary annotation enumeration on
 /// pages that have no widgets and so never need that tree at all.
-fn enumerate_page_annotations_with_cache<R: Read + Seek>(
+pub fn enumerate_page_annotations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-    field_refs_by_annotation: &mut Option<BTreeMap<ObjectRef, ObjectRef>>,
 ) -> Result<Vec<EnumeratedAnnotation>> {
     // Step 1: obtain canonical annotation handles (PageObjectHelper is
     // dropped after this call). Direct dictionaries must remain in this list.
@@ -203,12 +186,7 @@ fn enumerate_page_annotations_with_cache<R: Read + Seek>(
     // present on this page. The map contains only qpdf analyze associations;
     // non-Widgets and unassociated Widgets remain None.
     if has_widget {
-        if field_refs_by_annotation.is_none() {
-            *field_refs_by_annotation = Some(build_field_refs_by_annotation(pdf)?);
-        }
-        let map = field_refs_by_annotation
-            .as_ref()
-            .expect("populated immediately above");
+        let map = build_field_refs_by_annotation(pdf)?;
         for annotation in &mut result {
             if annotation.is_widget {
                 annotation.field_ref = annotation
@@ -240,48 +218,6 @@ fn build_field_refs_by_annotation<R: Read + Seek>(
                 .map(|top_level| (annot_ref, top_level))
         })
         .collect::<Result<BTreeMap<_, _>>>()
-}
-
-/// Enumerate and classify all annotations in the document, one entry per leaf
-/// page.
-///
-/// Returns a `Vec` of `(page_ref, annotations)` pairs in page order.
-///
-/// # Errors
-///
-/// Propagates any error from [`crate::pages::page_refs`] or
-/// [`enumerate_page_annotations`].
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::fs::File;
-/// use std::io::BufReader;
-/// use flpdf::Pdf;
-/// use flpdf::page_annotation_enum::enumerate_document_annotations;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
-/// for (page_ref, annots) in enumerate_document_annotations(&mut pdf)? {
-///     println!("page {page_ref}: {} annotations", annots.len());
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn enumerate_document_annotations<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<Vec<(ObjectRef, Vec<EnumeratedAnnotation>)>> {
-    let page_refs = crate::pages::page_refs(pdf)?;
-    let mut out = Vec::with_capacity(page_refs.len());
-    // One shared, lazily-built map across every page -- matching qpdf's own
-    // per-QPDFAcroFormDocumentHelper-instance memoization of analyze() --
-    // instead of each page's enumeration re-walking the whole field tree and
-    // every page's /Annots for the orphan-widget pass.
-    let mut field_refs_by_annotation = None;
-    for page_ref in page_refs {
-        let annots =
-            enumerate_page_annotations_with_cache(pdf, page_ref, &mut field_refs_by_annotation)?;
-        out.push((page_ref, annots));
-    }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -655,63 +591,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: enumerate_document_annotations reuses one field-association map
-    // across every page instead of rebuilding it per page.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn document_enumeration_reuses_the_field_map_across_pages() {
-        let mut bytes = b"%PDF-1.4\n".to_vec();
-        let off1 = bytes.len();
-        bytes.extend_from_slice(
-            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
-              /AcroForm << /Fields [5 0 R 6 0 R] >> >>\nendobj\n",
-        );
-        let off2 = bytes.len();
-        bytes.extend_from_slice(
-            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
-        );
-        let off3 = bytes.len();
-        bytes.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-              /Annots [5 0 R] >>\nendobj\n",
-        );
-        let off4 = bytes.len();
-        bytes.extend_from_slice(
-            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-              /Annots [6 0 R] >>\nendobj\n",
-        );
-        let off5 = bytes.len();
-        bytes.extend_from_slice(
-            b"5 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /FT /Tx >>\nendobj\n",
-        );
-        let off6 = bytes.len();
-        bytes.extend_from_slice(
-            b"6 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /FT /Tx >>\nendobj\n",
-        );
-        let xref_start = bytes.len();
-        let xref = format!(
-            "xref\n0 7\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n\
-             {off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n{off6:010} 00000 n \n"
-        );
-        bytes.extend_from_slice(xref.as_bytes());
-        bytes.extend_from_slice(
-            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let result = enumerate_document_annotations(&mut pdf).unwrap();
-        assert_eq!(result.len(), 2);
-        let (page1_ref, page1_annots) = &result[0];
-        assert_eq!(*page1_ref, ObjectRef::new(3, 0));
-        assert_eq!(page1_annots[0].field_ref, Some(ObjectRef::new(5, 0)));
-        let (page2_ref, page2_annots) = &result[1];
-        assert_eq!(*page2_ref, ObjectRef::new(4, 0));
-        assert_eq!(page2_annots[0].field_ref, Some(ObjectRef::new(6, 0)));
-    }
-
-    // -----------------------------------------------------------------------
     // Test: a page with no widgets must not pay for (or fail on) an
     // unrelated malformed field tree elsewhere in the document. Matches
     // qpdf's own laziness: analyze() is only invoked by a caller that needs
@@ -858,25 +737,6 @@ mod tests {
         assert!(a.is_widget);
         // qpdf's canonical composition returns the top-level field (obj 5).
         assert_eq!(a.field_ref, Some(ObjectRef::new(5, 0)));
-    }
-
-    // -----------------------------------------------------------------------
-    // Test: enumerate_document_annotations covers all pages
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn enumerate_document_annotations_covers_all_pages() {
-        // Single page with one Text annotation
-        let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Text >>\nendobj\n";
-        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4)]);
-        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-
-        let result = enumerate_document_annotations(&mut pdf).unwrap();
-        assert_eq!(result.len(), 1);
-        let (pref, annots) = &result[0];
-        assert_eq!(*pref, ObjectRef::new(3, 0));
-        assert_eq!(annots.len(), 1);
-        assert_eq!(annots[0].subtype.as_deref(), Some(b"Text" as &[u8]));
     }
 
     // -----------------------------------------------------------------------
