@@ -767,4 +767,36 @@ mod tests {
             format!("open {}: No such file or directory", missing.display())
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_attachment_reports_permission_denied_without_os_error_suffix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let unreadable = dir.path().join("unreadable.bin");
+        std::fs::write(&unreadable, b"payload").expect("write payload");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("restrict permissions");
+        let (mut job, _, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        let error = job
+            .add_attachment(&mut pdf, add_options(unreadable.clone(), b"payload-key"))
+            .expect_err("unreadable source file must fail");
+        assert_eq!(
+            error.to_string(),
+            format!("open {}: Permission denied", unreadable.display())
+        );
+    }
 }
