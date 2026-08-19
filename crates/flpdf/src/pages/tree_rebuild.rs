@@ -142,11 +142,7 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     };
     let value = pdf.resolve_object_handle_to_terminal(&value)?;
     let value = value.materialize()?;
-    if matches!(value, Object::Null) {
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
+    Ok(Some(value))
 }
 
 /// `true` when `dict` carries `key` as something other than `null`
@@ -838,6 +834,10 @@ mod tests {
 
         assert_eq!(
             resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "BleedBox", 10).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "/BleedBox", 10).unwrap(),
             None
         );
     }

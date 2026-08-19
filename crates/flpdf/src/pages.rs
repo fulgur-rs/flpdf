@@ -694,7 +694,6 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
     let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
     match resources.materialize()? {
         Object::Dictionary(dictionary) => Ok(Some(dictionary)),
-        Object::Null => Ok(None),
         _ => match resources_ref {
             Some(resources_ref) => Err(Error::Unsupported(format!(
                 "/Resources reference {resources_ref} on page {page_ref} does not resolve to a dictionary"
@@ -898,6 +897,13 @@ mod tests {
             (b"/Parent".to_vec(), ObjectHandle::null()),
         ]);
         let mut empty = Pdf::empty().expect("empty PDF should be constructible");
+        let non_dictionary = PageParentCursor::from_handle(ObjectHandle::integer(42));
+        assert!(
+            page_parent_entries(&mut empty, &non_dictionary, b"/Resources")
+                .expect("non-dictionary parent lookup should succeed")
+                .is_none()
+        );
+
         let cursor = PageParentCursor::from_handle(direct_parent.clone());
         let (resources, parent) = page_parent_entries(&mut empty, &cursor, b"/Resources")
             .expect("direct parent lookup should succeed")
@@ -923,6 +929,13 @@ mod tests {
             ],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let depth_error =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 0)
+                .expect_err("a zero page-tree depth limit should fail before walking");
+        assert!(depth_error
+            .to_string()
+            .contains("page tree depth exceeds maximum of 0 at 3 0 R"));
+
         let inherited = resolve_inherited_handle_with_max_depth(
             &mut pdf,
             ObjectRef::new(3, 0),
@@ -941,6 +954,17 @@ mod tests {
         )
         .expect("absent /Rotate lookup should succeed")
         .is_none());
+
+        let mut non_dictionary_pdf = Pdf::empty().expect("empty PDF should be constructible");
+        non_dictionary_pdf.set_object(ObjectRef::new(3, 0), Object::Integer(42));
+        assert!(resolve_inherited_handle_with_max_depth(
+            &mut non_dictionary_pdf,
+            ObjectRef::new(3, 0),
+            b"/Resources",
+            10,
+        )
+        .expect("non-dictionary page lookup should succeed")
+        .is_none());
     }
 
     #[test]
@@ -949,15 +973,18 @@ mod tests {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).into_owned()
             }
+            // cov:ignore-start: the optional qpdf oracle probe skips when qpdf is absent or exits unsuccessfully in a CI environment.
             Ok(_) | Err(_) => {
                 eprintln!("qpdf 11.9.0 is unavailable; skipping page-tree oracle probe");
                 return;
-            }
+            } // cov:ignore-end
         };
+        // cov:ignore-start: the optional qpdf oracle probe skips when a different qpdf version is installed.
         if !version.starts_with("qpdf version 11.9.") {
             eprintln!("qpdf 11.9.0 is unavailable; skipping page-tree oracle probe");
             return;
         }
+        // cov:ignore-end
 
         let bytes = pdf_from_objects(
             1,
@@ -988,7 +1015,7 @@ mod tests {
         assert!(
             flatten.status.success(),
             "qpdf --pages probe failed: {}",
-            String::from_utf8_lossy(&flatten.stderr)
+            String::from_utf8_lossy(&flatten.stderr) // cov:ignore: assertion failure arm, only evaluated when the qpdf probe fails
         );
 
         let shown = Command::new("qpdf")
@@ -999,7 +1026,7 @@ mod tests {
         assert!(
             shown.status.success(),
             "qpdf --show-object probe failed: {}",
-            String::from_utf8_lossy(&shown.stderr)
+            String::from_utf8_lossy(&shown.stderr) // cov:ignore: assertion failure arm, only evaluated when the qpdf probe fails
         );
         let shown = String::from_utf8_lossy(&shown.stdout);
         assert!(shown.contains("/Resources"), "qpdf output: {shown}");
