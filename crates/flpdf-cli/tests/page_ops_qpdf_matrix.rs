@@ -36,7 +36,13 @@ use std::process::Command as Shell;
 // `flpdf --check` is implicitly exercised by --show-pages succeeding).
 
 const THREE_PAGE: &str = "../../tests/fixtures/compat/three-page.pdf";
+const ONE_PAGE: &str = "../../tests/fixtures/compat/one-page.pdf";
+const TWO_PAGE: &str = "../../tests/fixtures/compat/two-page.pdf";
 const ONE_PAGE_V17: &str = "../../tests/fixtures/compat/one-page-v17.pdf";
+const PRIMARY_CATALOG_METADATA: &str =
+    "../../tests/fixtures/compat/catalog-otherpage-other-info-two-page.pdf";
+const PRIMARY_CATALOG_NO_INFO: &str =
+    "../../tests/fixtures/compat/catalog-otherpage-other-two-page.pdf";
 
 /// Absolute path to a fixture (so a per-cell `cwd` change is unnecessary).
 fn fixture_abs(rel: &str) -> PathBuf {
@@ -91,6 +97,20 @@ fn flpdf_ok(args: &[&str]) -> String {
         .assert()
         .success();
     String::from_utf8_lossy(&out.get_output().stdout).into_owned()
+}
+
+/// Show one qpdf object from an output file. Object numbers differ between
+/// tools, so the metadata tests assert structural keys and stable ID[0]
+/// ownership rather than byte-identical serialization.
+fn show_qpdf_object(path: &Path, object: &str) -> String {
+    let selector = format!("--show-object={object}");
+    let (ok, stdout) = run_qpdf(&[selector.as_str(), path.to_str().unwrap()]);
+    assert!(ok, "qpdf object inspection failed for {object}: {stdout}");
+    stdout
+}
+
+fn first_id_hex(trailer: &str) -> Option<&str> {
+    trailer.split("/ID [ <").nth(1)?.split('>').next()
 }
 
 /// Page count read from `path` via flpdf's `--show-npages`. Applied uniformly
@@ -1556,6 +1576,141 @@ fn pages_secondary_version_floor_matches_qpdf() {
     let forced_header = b"%PDF-1.4\n";
     assert!(std::fs::read(&q_force).unwrap().starts_with(forced_header));
     assert!(std::fs::read(&f_force).unwrap().starts_with(forced_header));
+}
+
+#[test]
+fn pages_preserves_primary_catalog_and_trailer_metadata() {
+    // QPDFJob mutates the authenticated primary in place
+    // (QPDFJob.cc:2462-2472), so page selection must not replace its Catalog or
+    // trailer with secondary metadata. The object numbers and generated ID[1]
+    // differ after rewriting; compare stable ownership and remapped shape.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping primary metadata differential"
+        );
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let metadata_primary = fixture_abs(PRIMARY_CATALOG_METADATA);
+    let one_page = fixture_abs(ONE_PAGE);
+    let q_primary = tmp.path().join("q-primary.pdf");
+    let f_primary = tmp.path().join("f-primary.pdf");
+
+    let (q_ok, stderr) = run_qpdf(&[
+        metadata_primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        one_page.to_str().unwrap(),
+        "1",
+        "--",
+        q_primary.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q_primary.exists(),
+        "qpdf metadata merge failed: {stderr}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            metadata_primary.to_str().unwrap(),
+            f_primary.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            one_page.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+
+    let q_trailer = show_qpdf_object(&q_primary, "trailer");
+    let f_trailer = show_qpdf_object(&f_primary, "trailer");
+    let q_catalog = show_qpdf_object(&q_primary, "1");
+    let f_catalog = show_qpdf_object(&f_primary, "1");
+    assert!(q_trailer.contains("/Info"));
+    assert!(f_trailer.contains("/Info"));
+    assert!(q_catalog.contains("/Ref2"));
+    assert!(f_catalog.contains("/Ref2"));
+
+    // A primary ID's first element is stable across a qpdf rewrite and is the
+    // identity that qpdf preserves when it carries the primary document base.
+    let two_page = fixture_abs(TWO_PAGE);
+    let q_id = tmp.path().join("q-id.pdf");
+    let f_id = tmp.path().join("f-id.pdf");
+    let (q_ok, stderr) = run_qpdf(&[
+        two_page.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        one_page.to_str().unwrap(),
+        "1",
+        "--",
+        q_id.to_str().unwrap(),
+    ]);
+    assert!(q_ok || q_id.exists(), "qpdf ID merge failed: {stderr}");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            two_page.to_str().unwrap(),
+            f_id.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            one_page.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+    let q_id_trailer = show_qpdf_object(&q_id, "trailer");
+    let f_id_trailer = show_qpdf_object(&f_id, "trailer");
+    let q_id_hex = first_id_hex(&q_id_trailer);
+    let f_id_hex = first_id_hex(&f_id_trailer);
+    assert_eq!(q_id_hex, f_id_hex);
+
+    // Conversely, metadata carried only by a secondary must not appear when
+    // the primary has no corresponding `/Info`. This primary fixture has an
+    // unrelated `/Ref2`, so the check also proves that primary Catalog keys
+    // remain while the secondary `/Info` is excluded.
+    let plain_primary = fixture_abs(PRIMARY_CATALOG_NO_INFO);
+    let q_secondary = tmp.path().join("q-secondary.pdf");
+    let f_secondary = tmp.path().join("f-secondary.pdf");
+    let (q_ok, stderr) = run_qpdf(&[
+        plain_primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        one_page.to_str().unwrap(),
+        "1",
+        "--",
+        q_secondary.to_str().unwrap(),
+    ]);
+    assert!(
+        q_ok || q_secondary.exists(),
+        "qpdf secondary metadata merge failed: {stderr}"
+    );
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            plain_primary.to_str().unwrap(),
+            f_secondary.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            one_page.to_str().unwrap(),
+            "1",
+            "--",
+        ])
+        .assert()
+        .success();
+    for path in [&q_secondary, &f_secondary] {
+        let trailer = show_qpdf_object(path, "trailer");
+        let catalog = show_qpdf_object(path, "1");
+        assert!(!trailer.contains("/Info"));
+        assert!(catalog.contains("/Ref2"));
+    }
 }
 
 #[test]

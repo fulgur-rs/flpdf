@@ -2,11 +2,11 @@
 //! Multi-document page merge (qpdf `--pages` parity).
 //!
 //! [`merge_documents`] copies selected pages from N source documents into one
-//! fresh target. `inputs[0]` is the primary: its document-level information
-//! (outlines, named destinations, AcroForm `/DR` `/DA`) is inherited; later
-//! inputs contribute pages and form fields only. Shared resources within one
-//! input are de-duplicated; form-field name collisions are resolved by qpdf's
-//! `<name>+<N>` renaming rule.
+//! fresh target. `inputs[0]` is the primary: its Catalog/trailer state is the
+//! document base, with page-tree, PageLabels, and AcroForm fields updated by
+//! the merge-specific consumers; later inputs contribute pages and form fields
+//! only. Shared resources within one input are de-duplicated; form-field name
+//! collisions are resolved by qpdf's `<name>+<N>` renaming rule.
 //!
 //! `/PageLabels` is the one document-level structure that is **not**
 //! primary-only: it is reconstructed from every input's own labels, one entry
@@ -21,9 +21,9 @@
 //! here (there is nothing from a secondary input to collide with).
 //!
 //! The target document is built via [`Pdf::empty`] (qpdf's
-//! `QPDF::emptyPDF()`). Its merge-specific union copy retains the
-//! document-level and AcroForm handling needed by `QPDFJob::handlePageSpecs`;
-//! each source is nevertheless prepared through
+//! `QPDF::emptyPDF()`). Its merge-specific union copy retains the primary
+//! Catalog/trailer graph and the AcroForm handling needed by
+//! `QPDFJob::handlePageSpecs`; each source is nevertheless prepared through
 //! [`PageDocumentHelper::push_inherited_attributes_to_pages`] and each copied
 //! leaf is reparented through a live destination handle, matching qpdf's
 //! `insertPage` boundary. Neither the empty-document construction nor this
@@ -60,9 +60,12 @@ pub struct MergeInput<'a, R: Read + Seek + 'static> {
     pub pages: Vec<usize>,
 }
 
-/// Primary-only document-level structures discovered on `inputs[0]`'s catalog,
-/// to be inherited by the merged output (qpdf `--pages` takes outlines, named
-/// destinations, and `/OpenAction` from the primary input only).
+/// Primary-only document-level structures discovered on `inputs[0]`'s catalog
+/// and trailer, to be inherited by the merged output. qpdf `--pages` keeps the
+/// authenticated primary document as the base and mutates its page-owned
+/// structures in place; the complete Catalog/trailer snapshots are therefore
+/// retained, while the explicit carrier fields below remain for the fallback
+/// wiring path and destination-specific tests.
 ///
 /// Each field captures how the structure is held so it can be wired onto the
 /// fresh output catalog after the primary copy renumbers it:
@@ -76,6 +79,14 @@ pub struct MergeInput<'a, R: Read + Seek + 'static> {
 ///   are reconstructed from the renumber map once.
 #[derive(Default)]
 struct PrimaryDocLevel {
+    /// The primary Catalog snapshot. It is remapped onto the fresh target
+    /// after the copy; `/Pages` is deliberately supplied by the merged page
+    /// tree, while the other keys follow qpdf's primary-in-place ownership.
+    catalog: Option<Dictionary>,
+    /// The primary trailer snapshot. Writer-owned structural keys are replaced
+    /// later, but `/Info`, `/ID`, and unknown trailer metadata remain primary-
+    /// owned and are carried into the target.
+    trailer: Option<Dictionary>,
     /// Indirect `/Outlines` root ref, if present.
     outlines: Option<ObjectRef>,
     /// Direct (inline-on-catalog) `/Outlines` root dictionary. ISO 32000 permits
@@ -109,12 +120,16 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     let Some(catalog_ref) = source.root_ref() else {
         return Ok(PrimaryDocLevel::default()); // cov:ignore: an opened Pdf always has a /Root
     };
-    let catalog_obj = source.resolve_borrowed(catalog_ref)?;
-    let Some(catalog) = catalog_obj.as_dict() else {
+    let catalog = source.resolve_borrowed(catalog_ref)?.as_dict().cloned();
+    let Some(catalog) = catalog else {
         return Ok(PrimaryDocLevel::default()); // cov:ignore: a /Root always resolves to a dictionary catalog
     };
 
-    let mut doc = PrimaryDocLevel::default();
+    let mut doc = PrimaryDocLevel {
+        catalog: Some(catalog.clone()),
+        trailer: Some(source.trailer().clone()),
+        ..Default::default()
+    };
     // /Outlines — an indirect root ref, or a direct (inline) root dict on the
     // catalog (ISO 32000 permits either, like the other catalog-level carriers).
     match catalog.get("Outlines") {
@@ -132,7 +147,9 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     let names_val = catalog.get("Names").cloned();
     let names_dict = match names_val {
         // /Names may sit behind a holder chain (a ref to a ref to the dict); follow
-        // it so the inherited /Dests name tree is not dropped.
+        // it so the inherited /Dests name tree is not dropped. The generic primary
+        // Catalog copy below now retains sibling name trees as well; these fields
+        // preserve the older carrier-specific fallback path.
         Some(value @ Object::Reference(_)) => resolve_ref_chain(source, &value)?.0.into_dict(),
         Some(Object::Dictionary(d)) => Some(d),
         _ => None,
@@ -144,12 +161,6 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
             doc.names_dests_inline = Some(d.clone());
         }
     }
-
-    // Re-resolve the catalog: the /Names resolve above borrowed `source`.
-    let catalog_obj = source.resolve_borrowed(catalog_ref)?;
-    let Some(catalog) = catalog_obj.as_dict() else {
-        return Ok(doc); // cov:ignore: catalog was a dict moments ago; cannot change
-    };
 
     // Legacy /Catalog /Dests — indirect dict or inline dict on the catalog.
     match catalog.get("Dests") {
@@ -216,6 +227,57 @@ fn fold_doc_level_closure<R: Read + Seek>(
     Ok(())
 }
 
+/// Fold the complete primary Catalog and trailer metadata into the primary
+/// copy closure. qpdf's `handlePageSpecs` edits the authenticated primary in
+/// place (`QPDFJob.cc:2462-2472`), so the Catalog's non-page keys and trailer
+/// references remain reachable even when they are not part of a selected page
+/// closure. `/Pages` and writer-owned trailer structure are supplied by the
+/// fresh target/writer instead.
+fn fold_primary_metadata_closure<R: Read + Seek>(
+    source: &mut Pdf<R>,
+    doc: &PrimaryDocLevel,
+    closure: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if let Some(catalog) = &doc.catalog {
+        for (key, value) in catalog.iter() {
+            if key == b"Pages" {
+                continue;
+            }
+            extend_object_closure(source, value, closure)?;
+        }
+    } // cov:ignore: a successful primary merge always has a dictionary catalog
+
+    if let Some(trailer) = &doc.trailer {
+        for (key, value) in trailer.iter() {
+            // `/Root`, `/Size`, `/Prev`, `/Encrypt`, and xref-stream keys are
+            // rebuilt by the target/writer. `/ID` is direct in valid PDFs, and
+            // any nested references in an unknown trailer value are still
+            // intentionally collected below.
+            if matches!(
+                key,
+                b"Root"
+                    | b"Size"
+                    | b"Prev"
+                    | b"Encrypt"
+                    | b"Type"
+                    | b"W"
+                    | b"Index"
+                    | b"XRefStm"
+                    | b"Length"
+                    | b"Filter"
+                    | b"DecodeParms"
+                    | b"F"
+                    | b"FFilter"
+                    | b"FDecodeParms"
+            ) {
+                continue;
+            }
+            extend_object_closure(source, value, closure)?;
+        }
+    } // cov:ignore: a parsed PDF trailer is always present with the primary catalog
+    Ok(())
+}
+
 /// Wire the primary's inherited document-level structures onto the fresh output
 /// catalog after the primary copy. Indirect roots are wired to their copied ref
 /// via the renumber `map`; inline-on-catalog direct objects (never copied because
@@ -234,6 +296,23 @@ fn wire_doc_level<RTgt: Read + Seek>(
     let Some(mut catalog) = catalog_obj.as_dict().cloned() else {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     };
+
+    if let Some(primary_catalog) = &doc.catalog {
+        // qpdf keeps the primary Catalog object and mutates only the keys owned
+        // by page selection (`QPDFJob.cc:2590-2632`). The fresh target already
+        // owns the new `/Pages` reference; every other primary Catalog entry is
+        // copied as one generic graph so metadata such as `/Names` siblings,
+        // `/ViewerPreferences`, `/Metadata`, and producer-specific keys retain
+        // their original shape and ownership.
+        for (key, value) in primary_catalog.iter() {
+            if key == b"Pages" {
+                continue;
+            }
+            catalog.insert(key, remap_refs_in_object(value.clone(), map));
+        }
+        target.set_object(catalog_ref, Object::Dictionary(catalog));
+        return Ok(());
+    } // cov:ignore: discover_primary_doc_level always supplies the primary catalog on this route
 
     if let Some(outlines) = doc.outlines {
         if let Some(&new_ref) = map.get(&outlines) {
@@ -291,6 +370,56 @@ fn wire_doc_level<RTgt: Read + Seek>(
 
     target.set_object(catalog_ref, Object::Dictionary(catalog));
     Ok(())
+}
+
+/// Carry the primary trailer onto the fresh target while leaving writer-owned
+/// structural entries in target space. qpdf's full rewrite preserves primary
+/// `/Info`, `/ID[0]`, and unknown trailer metadata, but rebuilds `/Root`,
+/// `/Size`, xref-history keys, and encryption through the writer boundary.
+fn wire_primary_trailer<RTgt: Read + Seek>(
+    target: &mut Pdf<RTgt>,
+    doc: &PrimaryDocLevel,
+    map: &BTreeMap<ObjectRef, ObjectRef>,
+) {
+    let Some(primary_trailer) = &doc.trailer else {
+        return; // cov:ignore: a primary catalog snapshot always captures the parsed trailer
+    };
+    let Some(root_ref) = target.root_ref() else {
+        return; // cov:ignore: Pdf::empty always supplies the target catalog root
+    };
+    let current_size = target.trailer().get("Size").cloned();
+    let mut trailer = primary_trailer.clone();
+    for key in [
+        "Root",
+        "Size",
+        "Prev",
+        "Encrypt",
+        "Type",
+        "W",
+        "Index",
+        "XRefStm",
+        "Length",
+        "Filter",
+        "DecodeParms",
+        "F",
+        "FFilter",
+        "FDecodeParms",
+    ] {
+        trailer.remove(key);
+    }
+    for value in trailer.values_mut() {
+        let original = std::mem::replace(value, Object::Null);
+        *value = remap_refs_in_object(original, map);
+    }
+    if let Some(size) = current_size {
+        trailer.insert("Size", size);
+    }
+    trailer.insert("Root", Object::Reference(root_ref));
+    target.trailer = trailer;
+    // No writer path should retain a handle lifted from the empty target's old
+    // trailer after this replacement. This is the same canonical-trailer
+    // identity reset used by JSON document import/update paths.
+    target.trailer_handle_memo = None;
 }
 
 /// Resolve qpdf's `--pages` form-field name collision: return `base` when it is
@@ -762,12 +891,16 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// selection is the qpdf `--empty` analog — the merge then starts from an empty
 /// base and inherits no document-level information (a blank primary has none).
 ///
-/// Document-level information is inherited from the **primary** input
-/// (`inputs[0]`) only: its `/Outlines` tree, `/Names /Dests` named destinations
-/// (and the legacy `/Catalog /Dests` dictionary), and `/OpenAction` are copied
-/// into the output and their destinations remapped to the copied page refs.
-/// Later inputs contribute pages only — their outlines and named destinations
-/// are not merged. A direct (inline) `/Names /Dests` name-tree root is inherited
+/// The primary input (`inputs[0]`) remains the document base: its Catalog and
+/// trailer metadata (including `/Info`, `/ID`, unknown trailer entries, and
+/// unrelated Catalog keys) are copied with indirect references remapped, while
+/// the merged page tree and writer-owned trailer structure are rebuilt in the
+/// target. Its `/Outlines` tree, `/Names /Dests` named destinations (and the
+/// legacy `/Catalog /Dests` dictionary), and `/OpenAction` therefore remain
+/// primary-only as part of that Catalog graph. Later inputs contribute pages
+/// and selected form fields only — their Catalog/trailer metadata, outlines,
+/// and named destinations are not merged. A direct (inline) `/Names /Dests`
+/// name-tree root is inherited
 /// in either ISO 32000-2 §7.9.6 shape: a `/Names` leaf has its destinations
 /// remapped, and a `/Kids` root has its sub-leaves copied and its `/Kids`
 /// references remapped to those copies, so the named destinations survive in
@@ -1005,12 +1138,19 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
         for &page_ref in &unique {
             extend_page_object_closure(input.source, page_ref, &mut closure)?;
         }
+        // Keep the page-only reachability boundary so the later AcroForm pass
+        // can distinguish fields selected by a page from fields reachable only
+        // through the primary Catalog's complete `/AcroForm` graph.
+        let page_closure = closure.clone();
 
         // Fold the primary's document-level carriers (outline tree, name-tree
         // /Dests, legacy /Dests, /OpenAction) into the closure BEFORE copying so
         // the same single copy pass copies and remaps them — no separate
         // post-copy remap. A no-op for secondary inputs (empty doc_level).
         fold_doc_level_closure(input.source, &doc_level, &mut closure)?;
+        if is_primary {
+            fold_primary_metadata_closure(input.source, &doc_level, &mut closure)?;
+        }
 
         // Fold the primary's `/AcroForm /DR` / `/DA` fonts into the closure so a
         // `/DA` resource (e.g. `/Helv`) is copied and the output `/DR` can point
@@ -1064,6 +1204,7 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
         // A no-op for secondary inputs (empty doc_level).
         if is_primary {
             wire_doc_level(&mut target, &doc_level, &map)?;
+            wire_primary_trailer(&mut target, &doc_level, &map);
         }
 
         // Record this input's kept top-level fields (those whose source ref was
@@ -1091,32 +1232,34 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
         let mut retained_widgets: BTreeSet<ObjectRef> = BTreeSet::new();
         collect_retained_widget_refs(input.source, &seen, &mut retained_widgets)?;
         for (src_field_ref, partial_name) in source_fields {
-            if let Some(&target_ref) = map.get(&src_field_ref) {
-                let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-                let trimmed = trim_field_kids(
-                    input.source,
-                    &mut target,
-                    src_field_ref,
-                    &seen,
-                    &retained_widgets,
-                    &map,
-                    &mut orphan_pages,
-                    0,
-                    &mut visited,
-                )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
-                if let Some(survivors) = trimmed {
-                    if survivors.is_empty() {
-                        // No widget survived: drop the whole field (do not record
-                        // it). Its widgets' orphan pages are nulled below.
-                        continue;
+            if page_closure.contains(&src_field_ref) {
+                if let Some(&target_ref) = map.get(&src_field_ref) {
+                    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+                    let trimmed = trim_field_kids(
+                        input.source,
+                        &mut target,
+                        src_field_ref,
+                        &seen,
+                        &retained_widgets,
+                        &map,
+                        &mut orphan_pages,
+                        0,
+                        &mut visited,
+                    )?; // cov:ignore: `?` Err arm — trim_field_kids errors only on the depth guard, unreachable on well-formed input
+                    if let Some(survivors) = trimmed {
+                        if survivors.is_empty() {
+                            // No widget survived: drop the whole field (do not record
+                            // it). Its widgets' orphan pages are nulled below.
+                            continue;
+                        }
+                        rewrite_field_kids(&mut target, src_field_ref, &survivors, &map)?;
                     }
-                    rewrite_field_kids(&mut target, src_field_ref, &survivors, &map)?;
+                    kept_fields.push(KeptField {
+                        target_ref,
+                        partial_name,
+                        is_primary,
+                    });
                 }
-                kept_fields.push(KeptField {
-                    target_ref,
-                    partial_name,
-                    is_primary,
-                });
             }
         }
 
