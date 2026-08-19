@@ -288,9 +288,11 @@ fn collect_page_refs<R: Read + Seek>(
         }
 
         if !child_is_pages {
+            // cov:ignore-start: direct leaves are promoted before identity lookup
             let child_ref = child.object_ref().ok_or_else(|| {
                 Error::Internal("page-tree leaf has no indirect identity".to_owned())
             })?;
+            // cov:ignore-end
             if !seen.insert(child_ref) {
                 let copy = child.shallow_copy()?;
                 let indirect = pdf.make_indirect_object_handle(copy)?;
@@ -603,9 +605,11 @@ fn splice_subtree<R: Read + Seek>(
     // Write back the modified node.
     let new_count = old_count as i64 + net_delta;
     if new_count < 0 {
+        // cov:ignore-start: validated /Count equals the finite leaf total, so removal cannot underflow it
         return Err(Error::Unsupported(format!(
-            "splice: negative page count {new_count} for node {node_label}"
+            "splice: negative page count {new_count} for node {node_label}",
         )));
+        // cov:ignore-end
     }
     node.replace_key(b"/Count", ObjectHandle::integer(new_count))?;
     if let Some(kids_handle) = kids_handle {
@@ -763,6 +767,7 @@ mod tests {
             ),
             (3, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
             (4, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
+            (5, "<< /Type /Page /MediaBox [0 0 612 792] >>"),
         ])
     }
 
@@ -1121,9 +1126,12 @@ mod tests {
         let kids = root.try_get_key(b"/Kids").unwrap();
         pdf.resolve_object_handle(&kids).unwrap();
         let root_kids = kids.as_array().expect("root /Kids array");
-        let [intermediate] = root_kids.as_slice() else {
-            panic!("root should retain one direct intermediate /Pages node");
-        };
+        assert_eq!(
+            root_kids.len(),
+            1,
+            "root should retain one direct intermediate /Pages node"
+        );
+        let intermediate = &root_kids[0];
         assert!(intermediate.is_direct());
         let count = intermediate.try_get_key(b"/Count").unwrap();
         pdf.resolve_object_handle(&count).unwrap();
@@ -1133,6 +1141,38 @@ mod tests {
         let child_kids = child_kids.as_array().expect("intermediate /Kids array");
         assert_eq!(child_kids.len(), 1);
         assert_eq!(child_kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
+    }
+
+    #[test]
+    fn insertion_into_direct_intermediate_does_not_fabricate_parent_ref() {
+        let mut pdf = open(build_pages_with_direct_intermediate_two_pages_pdf());
+        splice_pages(&mut pdf, 1..1, &[ObjectRef::new(5, 0)]).unwrap();
+
+        let root = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&root).unwrap();
+        let root_kids = root.try_get_key(b"/Kids").unwrap();
+        pdf.resolve_object_handle(&root_kids).unwrap();
+        let root_kids = root_kids.as_array().expect("root /Kids array");
+        assert_eq!(root_kids.len(), 1);
+        let intermediate = &root_kids[0];
+        assert!(intermediate.is_direct());
+        let child_kids = intermediate.try_get_key(b"/Kids").unwrap();
+        pdf.resolve_object_handle(&child_kids).unwrap();
+        let child_kids = child_kids.as_array().expect("intermediate /Kids array");
+        let child_refs: Vec<_> = child_kids
+            .iter()
+            .map(|child| child.object_ref().expect("page child reference"))
+            .collect();
+        assert_eq!(
+            child_refs,
+            vec![
+                ObjectRef::new(3, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(4, 0)
+            ]
+        );
+        let inserted = dict_of(&mut pdf, ObjectRef::new(5, 0));
+        assert!(inserted.get("Parent").is_none());
     }
 
     #[test]
@@ -1356,6 +1396,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn splice_subtree_rejects_depth_limit_before_walking() {
+        let mut pdf = open(build_flat_pdf());
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let mut insert_done = false;
+        let err =
+            splice_subtree(&mut pdf, pages, 0, &(0..0), &[], &mut insert_done, 0, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(ref message) if message.contains("depth exceeds 0")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn splice_subtree_rejects_negative_count_before_leaf_walk() {
+        let mut pdf = open(build_pages_with_count_pdf(
+            "<< /Type /Pages /Kids [] /Count -1 >>",
+        ));
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let mut insert_done = false;
+        let err = splice_subtree(
+            &mut pdf,
+            pages,
+            0,
+            &(0..0),
+            &[],
+            &mut insert_done,
+            0,
+            DEFAULT_MAX_PAGE_TREE_DEPTH,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(ref message) if message.contains("negative /Count -1")),
+            "got {err:?}"
+        );
     }
 
     #[test]
