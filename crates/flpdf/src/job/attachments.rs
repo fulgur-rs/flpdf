@@ -868,8 +868,9 @@ mod tests {
             .expect("restrict permissions");
         if std::fs::File::open(&unreadable).is_ok() {
             // Root (or CAP_DAC_OVERRIDE) bypasses Unix permission bits
-            // entirely, so this scenario cannot be exercised as such.
-            return;
+            // entirely, so this scenario cannot be exercised as such. CI
+            // runs unprivileged, so this branch is never taken there.
+            return; // cov:ignore: only reachable when the test runs as root
         }
         let (mut job, _, _) = job_with_captures();
         let mut pdf = job
