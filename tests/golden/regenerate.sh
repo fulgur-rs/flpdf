@@ -3067,6 +3067,15 @@ qpdf --static-id --qdf --warning-exit-0 \
     "$REF/qdf-ignore-newline/qdf-static-id.pdf"
 echo "qdf-ignore-newline/qdf-static-id.pdf"
 
+# --- multi-contents-one-page: QDF coalesce-contents conditional separator
+# The first decoded content stream already ends in LF. qpdf's
+# pipeContentStreams must not add a second LF before the following stream.
+mkdir -p "$REF/multi-contents-one-page"
+qpdf --qdf --coalesce-contents --static-id --warning-exit-0 \
+    "$FIX/multi-contents-one-page.pdf" \
+    "$REF/multi-contents-one-page/coalesce-qdf.pdf"
+echo "multi-contents-one-page/coalesce-qdf.pdf"
+
 
 echo ""
 
