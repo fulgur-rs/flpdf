@@ -178,13 +178,19 @@ impl QPDFJob {
                 .replace_embedded_file(&option.key, filespec)?;
 
             if option.verbose {
-                self.logger().info(format!(
-                    "{}: attached {} as {} with key {}\n",
-                    self.message_prefix(),
-                    option.path.display(),
-                    String::from_utf8_lossy(&option.filename),
-                    String::from_utf8_lossy(&option.key)
-                ))?;
+                // qpdf writes `filename`/`key` as raw bytes
+                // (`QPDFJob.cc:2066-2068`); build the diagnostic as bytes
+                // too so a non-UTF-8 value isn't replaced with U+FFFD.
+                let mut message = Vec::new();
+                message.extend_from_slice(self.message_prefix().as_bytes());
+                message.extend_from_slice(b": attached ");
+                message.extend_from_slice(option.path.display().to_string().as_bytes());
+                message.extend_from_slice(b" as ");
+                message.extend_from_slice(&option.filename);
+                message.extend_from_slice(b" with key ");
+                message.extend_from_slice(&option.key);
+                message.push(b'\n');
+                self.logger().info(message)?;
             }
         }
 
@@ -508,6 +514,58 @@ mod tests {
         assert!(info.contains(" as renamed.txt with key payload-key\n"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn add_attachment_verbose_diagnostic_preserves_non_utf8_filename_and_key() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ));
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let attachment = dir.path().join("payload.txt");
+        std::fs::write(&attachment, b"attachment payload").expect("write payload");
+        let (mut job, info, _) = job_with_captures();
+        let mut pdf = job
+            .open(
+                Cursor::new(bytes.to_vec()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open fixture");
+
+        // Invalid UTF-8: a lone continuation byte, which `from_utf8_lossy`
+        // would replace with U+FFFD (b"\xEF\xBF\xBD").
+        let non_utf8_filename = vec![b'f', 0x80, b'.', b't', b'x', b't'];
+        let non_utf8_key = vec![b'k', 0x80];
+        job.add_attachment(
+            &mut pdf,
+            AttachmentAddOptions {
+                path: attachment,
+                key: non_utf8_key.clone(),
+                filename: non_utf8_filename.clone(),
+                mimetype: None,
+                description: None,
+                creation_date: Some(b"D:20240101120000Z".to_vec()),
+                modification_date: Some(b"D:20240101120000Z".to_vec()),
+                replace: false,
+                verbose: true,
+            },
+        )
+        .expect("add attachment");
+
+        let info = info.lock().expect("info capture");
+        let mut expected = b" as ".to_vec();
+        expected.extend_from_slice(&non_utf8_filename);
+        expected.extend_from_slice(b" with key ");
+        expected.extend_from_slice(&non_utf8_key);
+        expected.push(b'\n');
+        assert!(
+            info.windows(expected.len())
+                .any(|window| window == expected),
+            "expected raw non-UTF-8 bytes in verbose diagnostic, got {info:?}"
+        );
+    }
+
     fn add_options(path: std::path::PathBuf, key: &[u8]) -> AttachmentAddOptions {
         AttachmentAddOptions {
             path,
@@ -808,6 +866,11 @@ mod tests {
         std::fs::write(&unreadable, b"payload").expect("write payload");
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
             .expect("restrict permissions");
+        if std::fs::File::open(&unreadable).is_ok() {
+            // Root (or CAP_DAC_OVERRIDE) bypasses Unix permission bits
+            // entirely, so this scenario cannot be exercised as such.
+            return;
+        }
         let (mut job, _, _) = job_with_captures();
         let mut pdf = job
             .open(
