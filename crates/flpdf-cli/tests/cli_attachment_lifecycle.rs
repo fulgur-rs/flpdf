@@ -774,16 +774,22 @@ fn lifecycle_7_add_success_and_duplicate_diagnostics_match_qpdf() {
     assert_eq!(qpdf_add.status.code(), Some(0));
     assert_eq!(flpdf_add.status.code(), Some(0));
     assert_eq!(qpdf_add.stderr, flpdf_add.stderr);
+    // qpdf's Windows text stdout is CRLF while flpdf writes LF; compare the
+    // diagnostic content independently of the platform line ending.
     let qpdf_verbose = qpdf_add
         .stdout
         .split(|byte| *byte == b'\n')
         .next()
         .unwrap_or_default();
+    let qpdf_verbose = qpdf_verbose.strip_suffix(&[b'\r']).unwrap_or(qpdf_verbose);
     let flpdf_verbose = flpdf_add
         .stdout
         .split(|byte| *byte == b'\n')
         .next()
         .unwrap_or_default();
+    let flpdf_verbose = flpdf_verbose
+        .strip_suffix(&[b'\r'])
+        .unwrap_or(flpdf_verbose);
     assert_eq!(
         qpdf_verbose, flpdf_verbose,
         "the verbose attached diagnostic must match qpdf"
