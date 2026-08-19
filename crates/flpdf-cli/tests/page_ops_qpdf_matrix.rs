@@ -1391,6 +1391,10 @@ fn pages_secondary_version_floor_matches_qpdf() {
     // configures the writer (QPDFJob.cc:1714-1715, 2847-2918). A PDF 1.7
     // secondary must therefore raise the fresh multi-source output above the
     // merged document's PDF 1.3 baseline.
+    if !qpdf_available() {
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping version-floor differential");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let primary = fixture_abs(THREE_PAGE);
     let secondary = fixture_abs(ONE_PAGE_V17);
@@ -1511,6 +1515,12 @@ fn pages_secondary_version_floor_matches_qpdf() {
 fn pages_secondary_extension_level_matches_qpdf() {
     // The source extension level is part of qpdf's accumulated input version
     // and must reach the fresh output Catalog as well as the header.
+    if !qpdf_available() {
+        eprintln!(
+            "qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping extension-level differential"
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let primary = fixture_abs(THREE_PAGE);
     let secondary = fixture_abs("../../tests/fixtures/compat/one-page-enc-u.pdf");
