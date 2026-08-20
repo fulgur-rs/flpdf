@@ -45,7 +45,7 @@ impl PageParentCursor {
         Self { handle }
     }
 
-    fn handle(&self) -> ObjectHandle {
+    pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle.clone()
     }
 }
