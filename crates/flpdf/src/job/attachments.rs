@@ -7,6 +7,25 @@ use crate::{Error, ObjectHandle, Pdf, Result};
 use std::io::{Read, Seek};
 use std::path::PathBuf;
 
+/// qpdf's per-file configuration for `QPDFJob::copyAttachments`.
+///
+/// `path` is retained only for the `copying attachments from PATH` verbose
+/// diagnostic and the `file: PATH, key: ...` duplicate-key message; `source`
+/// must already be opened (and authenticated) by the caller before being
+/// passed to [`QPDFJob::copy_attachments`], matching this crate's existing
+/// job boundary where document I/O stays a caller concern
+/// (`QPDFJob::list_attachments`/`show_attachment` accept an already-open
+/// [`Pdf`] the same way).
+#[derive(Debug, Clone)]
+pub struct AttachmentCopyOptions {
+    /// Source PDF path, used only for diagnostics.
+    pub path: PathBuf,
+    /// Prefix prepended to each copied key.
+    pub prefix: Vec<u8>,
+    /// Emit qpdf's `copying attachments from ...` / `  key -> new_key` diagnostics.
+    pub verbose: bool,
+}
+
 /// qpdf's per-file configuration for `QPDFJob::addAttachments`.
 ///
 /// The path is retained by the provider-backed embedded-file stream; the
@@ -216,6 +235,88 @@ impl QPDFJob {
         options: AttachmentAddOptions,
     ) -> Result<()> {
         self.add_attachments(pdf, std::slice::from_ref(&options))
+    }
+
+    /// Copy every embedded file from `source` into `target` through the
+    /// shared qpdf job lifecycle.
+    ///
+    /// This is the Rust translation of `QPDFJob::copyAttachments`:
+    /// `QPDFJob.cc:2089-2135`. Page mode is changed before duplicate
+    /// detection; each source filespec's object graph is copied through the
+    /// canonical [`Pdf::copy_foreign_object`] cross-document primitive and
+    /// inserted into the target's `/EmbeddedFiles` name tree; a duplicate
+    /// key is reported only after every entry has been processed, matching
+    /// qpdf's aggregate error boundary. Warnings observed on `source` (e.g.
+    /// from a repaired open) are folded into this job's own warning state,
+    /// matching qpdf's `other->anyWarnings()` check (`QPDFJob.cc:2116-2118`).
+    pub fn copy_attachments<R1, R2>(
+        &mut self,
+        target: &mut Pdf<R1>,
+        source: &mut Pdf<R2>,
+        options: &AttachmentCopyOptions,
+    ) -> Result<()>
+    where
+        R1: Read + Seek + 'static,
+        R2: Read + Seek + 'static,
+    {
+        target.set_logger(self.logger());
+        self.set_attachment_page_mode(target)?;
+
+        if options.verbose {
+            let mut message = Vec::new();
+            message.extend_from_slice(self.message_prefix().as_bytes());
+            message.extend_from_slice(b": copying attachments from ");
+            message.extend_from_slice(options.path.display().to_string().as_bytes());
+            message.push(b'\n');
+            self.logger().info(message)?;
+        }
+
+        let other_attachments = source.embedded_files().get_embedded_files()?;
+        let mut duplicates: Vec<String> = Vec::new();
+        for (key, filespec) in other_attachments {
+            let mut new_key = options.prefix.clone();
+            new_key.extend_from_slice(&key);
+
+            let exists = target
+                .embedded_files()
+                .get_embedded_file(&new_key)?
+                .is_some();
+            if exists {
+                duplicates.push(format!(
+                    "file: {}, key: {}",
+                    options.path.display(),
+                    String::from_utf8_lossy(&new_key)
+                ));
+                continue;
+            }
+
+            let copied = target.copy_foreign_object(&filespec)?;
+            target
+                .embedded_files()
+                .replace_embedded_file(&new_key, copied)?;
+
+            if options.verbose {
+                let mut message = Vec::new();
+                message.extend_from_slice(b"  ");
+                message.extend_from_slice(&key);
+                message.extend_from_slice(b" -> ");
+                message.extend_from_slice(&new_key);
+                message.push(b'\n');
+                self.logger().info(message)?;
+            }
+        }
+
+        self.record_document_warnings(source);
+
+        if duplicates.is_empty() {
+            return Ok(());
+        }
+
+        Err(Error::System(format!(
+            "{} already has attachments with keys that conflict with attachments from other files: {}. Use --prefix with --copy-attachments-from or manually copy individual attachments.",
+            self.input_name(),
+            duplicates.join("; ")
+        )))
     }
 
     fn set_attachment_page_mode<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
@@ -888,5 +989,281 @@ mod tests {
             error.to_string(),
             format!("open {}: Permission denied", unreadable.display())
         );
+    }
+
+    // ── copy_attachments ─────────────────────────────────────────────────────
+
+    use super::AttachmentCopyOptions;
+
+    fn minimal_fixture_bytes() -> Vec<u8> {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/minimal.pdf"
+        ))
+        .to_vec()
+    }
+
+    /// Build a fresh minimal-fixture `Pdf` (own throwaway `QPDFJob`, not the
+    /// caller's) with `entries` embedded through [`QPDFJob::add_attachments`].
+    fn pdf_with_attachments(
+        dir: &std::path::Path,
+        prefix: &str,
+        entries: &[(&[u8], &[u8])],
+    ) -> Pdf<Cursor<Vec<u8>>> {
+        let mut job = QPDFJob::new();
+        let mut pdf = job
+            .open(
+                Cursor::new(minimal_fixture_bytes()),
+                "fixture.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open minimal fixture");
+        let options: Vec<AttachmentAddOptions> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (key, content))| {
+                let path = dir.join(format!("{prefix}-{i}.bin"));
+                std::fs::write(&path, content).expect("write payload");
+                AttachmentAddOptions {
+                    path,
+                    key: key.to_vec(),
+                    filename: key.to_vec(),
+                    mimetype: None,
+                    description: None,
+                    creation_date: None,
+                    modification_date: None,
+                    replace: false,
+                    verbose: false,
+                }
+            })
+            .collect();
+        job.add_attachments(&mut pdf, &options)
+            .expect("build attachment fixture");
+        pdf
+    }
+
+    fn copy_options(
+        path: std::path::PathBuf,
+        prefix: &[u8],
+        verbose: bool,
+    ) -> AttachmentCopyOptions {
+        AttachmentCopyOptions {
+            path,
+            prefix: prefix.to_vec(),
+            verbose,
+        }
+    }
+
+    #[test]
+    fn copy_attachments_copies_object_graph_with_prefix_and_verbose_diagnostics() {
+        let source_bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/attachment-two-page.pdf"
+        ));
+        let mut source =
+            Pdf::open(Cursor::new(source_bytes.to_vec())).expect("open source fixture");
+
+        let (mut job, info, _) = job_with_captures();
+        let mut target = job
+            .open(
+                Cursor::new(minimal_fixture_bytes()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open target fixture");
+
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from("donor.pdf"), b"src-", true),
+        )
+        .expect("copy attachments");
+
+        let root_ref = target.root_ref().expect("catalog root");
+        let Object::Dictionary(root) = target.resolve(root_ref).expect("resolve catalog") else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        assert_eq!(
+            root.get("PageMode"),
+            Some(&Object::Name(b"UseAttachments".to_vec())),
+            "copyAttachments always sets /PageMode, even for a single entry"
+        );
+
+        let copied =
+            extract_attachment(&mut target, b"src-attachment.txt").expect("extract copied file");
+        assert_eq!(
+            copied,
+            b"This is a small text attachment for PDF fixture testing.\nGenerated by flpdf test corpus setup.\n"
+        );
+
+        let info = String::from_utf8_lossy(&info.lock().expect("info capture")).into_owned();
+        assert!(
+            info.contains("qpdf: copying attachments from donor.pdf\n"),
+            "info was: {info:?}"
+        );
+        assert!(
+            info.contains("  attachment.txt -> src-attachment.txt\n"),
+            "info was: {info:?}"
+        );
+    }
+
+    #[test]
+    fn copy_attachments_aggregates_duplicate_keys_and_still_copies_the_rest() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut source = pdf_with_attachments(
+            dir.path(),
+            "src",
+            &[
+                (b"a".as_slice(), b"content a".as_slice()),
+                (b"b".as_slice(), b"content b".as_slice()),
+                (b"c".as_slice(), b"content c".as_slice()),
+            ],
+        );
+        let mut target = pdf_with_attachments(
+            dir.path(),
+            "tgt",
+            &[
+                (b"a".as_slice(), b"existing a".as_slice()),
+                (b"b".as_slice(), b"existing b".as_slice()),
+            ],
+        );
+
+        let mut job = QPDFJob::new();
+        job.set_input_name("target.pdf");
+        let error = job
+            .copy_attachments(
+                &mut target,
+                &mut source,
+                &copy_options(std::path::PathBuf::from("donor.pdf"), b"", false),
+            )
+            .expect_err("colliding keys must be reported");
+
+        assert_eq!(
+            error.to_string(),
+            "target.pdf already has attachments with keys that conflict with attachments from other files: file: donor.pdf, key: a; file: donor.pdf, key: b. Use --prefix with --copy-attachments-from or manually copy individual attachments."
+        );
+
+        // qpdf processes every entry before throwing: the non-colliding key
+        // is still copied even though the batch as a whole reports an error.
+        let copied = extract_attachment(&mut target, b"c").expect("non-colliding key copied");
+        assert_eq!(copied, b"content c");
+        assert!(target
+            .embedded_files()
+            .get_embedded_file(b"a")
+            .expect("lookup")
+            .is_some());
+    }
+
+    #[test]
+    fn copy_attachments_returns_ok_for_an_empty_source_and_still_sets_page_mode() {
+        let (mut job, _, _) = job_with_captures();
+        let mut source = Pdf::open(Cursor::new(minimal_fixture_bytes())).expect("open donor");
+        let mut target = job
+            .open(
+                Cursor::new(minimal_fixture_bytes()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open target fixture");
+
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from("donor.pdf"), b"", false),
+        )
+        .expect("empty source copies nothing but still succeeds");
+
+        let root_ref = target.root_ref().expect("catalog root");
+        let Object::Dictionary(root) = target.resolve(root_ref).expect("resolve catalog") else {
+            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
+        };
+        assert_eq!(
+            root.get("PageMode"),
+            Some(&Object::Name(b"UseAttachments".to_vec()))
+        );
+        assert!(!job.has_warnings());
+    }
+
+    #[test]
+    fn copy_attachments_records_source_warnings_even_with_no_attachments() {
+        // A `startxref` offset past EOF forces `repair: true` recovery,
+        // which records a `Severity::Warning` repair diagnostic on the
+        // opened document (qpdf: "file is damaged" / "Attempting to
+        // reconstruct cross-reference table").
+        let mut bytes = minimal_fixture_bytes();
+        // The fixture's own trailer/startxref tail is replaced with one
+        // pointing far beyond the file's length.
+        let cut = bytes
+            .windows(4)
+            .rposition(|w| w == b"xref")
+            .expect("fixture must contain an xref keyword");
+        bytes.truncate(cut);
+        bytes.extend_from_slice(
+            b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n999999\n%%EOF\n",
+        );
+        let source_options = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+        let mut source = Pdf::open_with_options(Cursor::new(bytes), source_options)
+            .expect("open damaged donor with recovery");
+        assert!(
+            !source.repair_diagnostics().entries().is_empty(),
+            "fixture must actually trigger a repair diagnostic"
+        );
+
+        let (mut job, _, _) = job_with_captures();
+        let mut target = job
+            .open(
+                Cursor::new(minimal_fixture_bytes()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open target fixture");
+
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from("donor.pdf"), b"", false),
+        )
+        .expect("damaged-but-recovered source with no attachments still succeeds");
+
+        assert!(
+            job.has_warnings(),
+            "source's repair diagnostics must fold into the job's own warning state"
+        );
+    }
+
+    #[test]
+    fn copy_attachments_encrypted_source_password_open_has_no_attachments() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+        );
+        let file = std::fs::File::open(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+        let source_options = PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..PdfOpenOptions::default()
+        };
+        let mut source = Pdf::open_with_options(std::io::BufReader::new(file), source_options)
+            .expect("open encrypted source");
+
+        let (mut job, _, _) = job_with_captures();
+        let mut target = job
+            .open(
+                Cursor::new(minimal_fixture_bytes()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open target fixture");
+
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from(path), b"", false),
+        )
+        .expect("encrypted fixture has no attachments; copy must succeed with zero entries");
     }
 }

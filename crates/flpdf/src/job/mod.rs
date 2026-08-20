@@ -12,7 +12,7 @@ mod lifecycle;
 mod page_specs;
 mod page_split;
 
-pub use attachments::AttachmentAddOptions;
+pub use attachments::{AttachmentAddOptions, AttachmentCopyOptions};
 pub use json::{
     write_json, write_qpdf_json_v2_selected_objects_to_output_with_options,
     write_qpdf_json_v2_selected_objects_with_options, JsonJobError, JsonJobOptions, JsonJobOutput,

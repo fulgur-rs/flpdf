@@ -3,8 +3,8 @@
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
 use flpdf::job::{
-    AttachmentAddOptions, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData,
-    PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
+    AttachmentAddOptions, AttachmentCopyOptions, JobExitCode, JsonJobError, JsonJobOptions,
+    JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -38,7 +38,7 @@ use flpdf::{
     PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources,
     Severity, StreamDataMode, WriterConfiguration,
 };
-use flpdf::{copy_attachments_from, fix_qdf, remove_attachment};
+use flpdf::{fix_qdf, remove_attachment};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -1754,6 +1754,7 @@ fn main() {
             &args.password,
             args.copy_attachments_from,
             args.deterministic_id,
+            args.verbose,
         )
     } else if args.linearize {
         // --linearize is incompatible with the page-extraction pipeline:
@@ -6524,10 +6525,29 @@ fn run_copy_attachments_from(
     password: &PasswordArgs,
     tokens: Vec<String>,
     deterministic_id: bool,
+    verbose: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
     let args = parse_copy_attachments_segment(tokens)?;
+
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let options = pdf_open_options(repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let mut pdf = job
+        .open(BufReader::new(file), input.display().to_string(), options)
+        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
+
+    if pdf.uses_weak_crypto() {
+        job.logger().warn(format!(
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
+            input.display()
+        ))?;
+    }
 
     // Open the source with its own password (independent of the target's).
     // qpdf's recovery permission is enabled on the document by default; the
@@ -6539,35 +6559,39 @@ fn run_copy_attachments_from(
         ..PdfOpenOptions::default()
     };
     configure_document_logger(&mut src_options, &args.file);
-    let src_file = File::open(&args.file)
-        .map_err(|e| format!("--copy-attachments-from: cannot open {:?}: {e}", args.file))?;
+    let src_file =
+        File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
     let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
-        .map_err(|e| format!("--copy-attachments-from: failed to open source PDF: {e}"))?;
+        .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
 
-    let mut target = open_pdf(&input, repair, password)?;
+    job.copy_attachments(
+        &mut pdf,
+        &mut src,
+        &AttachmentCopyOptions {
+            path: args.file,
+            prefix: args.prefix.unwrap_or_default(),
+            verbose,
+        },
+    )?;
 
-    let prefix = args.prefix.as_deref();
-    let count = copy_attachments_from(&mut target, &mut src, prefix)?;
-    eprintln!("copied {count} attachment(s)");
-
-    let options = WriterOptions {
+    let writer_options = WriterOptions {
         deterministic_id,
         ..WriterOptions::default()
     };
-    let mut standard_output = None;
     write_with_pdf_writer(
-        &mut target,
+        &mut pdf,
         &output,
         &mut standard_output,
-        &options,
+        &writer_options,
         false,
         None,
     )?;
-    finish_warning_state(
-        !target.repair_diagnostics().entries().is_empty()
-            || !src.repair_diagnostics().entries().is_empty(),
-        true,
-    )
+    if verbose && output.as_os_str() != "-" {
+        job.logger()
+            .info(format!("{}: wrote file {}\n", progname(), output.display()))?;
+    }
+    job.record_document_warnings(&pdf);
+    finish_job_exit_status(job.complete(true)?)
 }
 
 #[cfg(test)]
