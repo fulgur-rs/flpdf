@@ -36,6 +36,7 @@
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::object_copy::copy_objects;
+use crate::object_handle::canonical_dictionary_key;
 use crate::page_closure::{extend_object_closure, extend_page_object_closure};
 use crate::page_extract::{
     append_selection_kids, null_copied_removed_pages, resolve_dict, target_pages_root,
@@ -46,7 +47,8 @@ use crate::ref_chain::resolve_ref_chain;
 use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::subset_prune::sweep_unreachable_objects;
 use crate::{
-    Dictionary, Error, Object, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, Result,
+    Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf,
+    Result,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -120,7 +122,15 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     let Some(catalog_ref) = source.root_ref() else {
         return Ok(PrimaryDocLevel::default()); // cov:ignore: an opened Pdf always has a /Root
     };
-    let catalog = source.resolve_borrowed(catalog_ref)?.as_dict().cloned();
+    // The downstream closure copier still accepts the legacy `Dictionary`
+    // snapshot. Resolve the catalog through its canonical handle first, then
+    // cross that explicit bridge once at the raw closure boundary; do not use
+    // the legacy borrowed resolver to discover document-level state.
+    let catalog_handle = source.get_object_handle(catalog_ref);
+    let catalog = source
+        .resolve_object_handle_to_terminal(&catalog_handle)?
+        .materialize()?
+        .into_dict();
     let Some(catalog) = catalog else {
         return Ok(PrimaryDocLevel::default()); // cov:ignore: a /Root always resolves to a dictionary catalog
     };
@@ -292,10 +302,11 @@ fn wire_doc_level<RTgt: Read + Seek>(
     let Some(catalog_ref) = target.root_ref() else {
         return Ok(()); // cov:ignore: the seed target always has a /Root catalog
     };
-    let catalog_obj = target.resolve_borrowed(catalog_ref)?;
-    let Some(mut catalog) = catalog_obj.as_dict().cloned() else {
+    let catalog_handle = target.get_object_handle(catalog_ref);
+    let catalog = target.resolve_object_handle_to_terminal(&catalog_handle)?;
+    if catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
-    };
+    }
 
     if let Some(primary_catalog) = &doc.catalog {
         // qpdf keeps the primary Catalog object and mutates only the keys owned
@@ -308,24 +319,25 @@ fn wire_doc_level<RTgt: Read + Seek>(
             if key == b"Pages" {
                 continue;
             }
-            catalog.insert(key, remap_refs_in_object(value.clone(), map));
+            let remapped = remap_refs_in_object(value.clone(), map);
+            let value = target.lift_object_to_handle(&remapped)?;
+            let key = canonical_dictionary_key(key);
+            catalog.replace_key(&key, value)?;
         }
-        target.set_object(catalog_ref, Object::Dictionary(catalog));
+        target.mark_object_handle_dirty(&catalog)?;
         return Ok(());
     } // cov:ignore: discover_primary_doc_level always supplies the primary catalog on this route
 
     if let Some(outlines) = doc.outlines {
         if let Some(&new_ref) = map.get(&outlines) {
-            catalog.insert("Outlines", Object::Reference(new_ref));
+            catalog.replace_key(b"/Outlines", target.get_object_handle(new_ref))?;
         }
     } else if let Some(inline) = &doc.outlines_inline {
         // The inline root dict lived on the primary catalog (never copied);
         // rebuild it with its item refs (`/First`, `/Last`) remapped to the copied
         // items, mirroring the inline `/Names` and legacy `/Dests` reconstruction.
-        catalog.insert(
-            "Outlines",
-            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
-        );
+        let remapped = remap_refs_in_object(Object::Dictionary(inline.clone()), map);
+        catalog.replace_key(b"/Outlines", target.lift_object_to_handle(&remapped)?)?;
     }
     // /Names /Dests: indirect root → wire copied ref; inline root → reconstruct
     // it from the renumber map (the catalog is never copied). Remap the direct
@@ -335,9 +347,11 @@ fn wire_doc_level<RTgt: Read + Seek>(
     // (sibling name trees are not merged).
     if let Some(dests) = doc.names_dests {
         if let Some(&new_ref) = map.get(&dests) {
-            let mut names = Dictionary::new();
-            names.insert("Dests", Object::Reference(new_ref));
-            catalog.insert("Names", Object::Dictionary(names));
+            let names = ObjectHandle::dictionary(vec![(
+                b"/Dests".to_vec(),
+                target.get_object_handle(new_ref),
+            )]);
+            catalog.replace_key(b"/Names", names)?;
         }
     } else if let Some(inline) = &doc.names_dests_inline {
         let mut names = Dictionary::new();
@@ -345,30 +359,30 @@ fn wire_doc_level<RTgt: Read + Seek>(
             "Dests",
             remap_refs_in_object(Object::Dictionary(inline.clone()), map),
         );
-        catalog.insert("Names", Object::Dictionary(names));
+        let remapped = remap_refs_in_object(Object::Dictionary(names), map);
+        catalog.replace_key(b"/Names", target.lift_object_to_handle(&remapped)?)?;
     }
     // Legacy /Catalog /Dests: indirect → wire copied ref; inline → remap the
     // complete direct carrier once, preserving any indirect holder structure.
     if let Some(legacy) = doc.legacy_dests_ref {
         if let Some(&new_ref) = map.get(&legacy) {
-            catalog.insert("Dests", Object::Reference(new_ref));
+            catalog.replace_key(b"/Dests", target.get_object_handle(new_ref))?;
         }
     } else if let Some(inline) = &doc.legacy_dests_inline {
-        catalog.insert(
-            "Dests",
-            remap_refs_in_object(Object::Dictionary(inline.clone()), map),
-        );
+        let remapped = remap_refs_in_object(Object::Dictionary(inline.clone()), map);
+        catalog.replace_key(b"/Dests", target.lift_object_to_handle(&remapped)?)?;
     }
     // /OpenAction: indirect → wire copied ref; inline → reconstruct from the map.
     if let Some(oa_ref) = doc.open_action_ref {
         if let Some(&new_ref) = map.get(&oa_ref) {
-            catalog.insert("OpenAction", Object::Reference(new_ref));
+            catalog.replace_key(b"/OpenAction", target.get_object_handle(new_ref))?;
         }
     } else if let Some(inline) = &doc.open_action_inline {
-        catalog.insert("OpenAction", remap_refs_in_object(inline.clone(), map));
+        let remapped = remap_refs_in_object(inline.clone(), map);
+        catalog.replace_key(b"/OpenAction", target.lift_object_to_handle(&remapped)?)?;
     }
 
-    target.set_object(catalog_ref, Object::Dictionary(catalog));
+    target.mark_object_handle_dirty(&catalog)?;
     Ok(())
 }
 
@@ -541,21 +555,20 @@ fn resolve_field_partial_name<R: Read + Seek>(
     source: &mut Pdf<R>,
     field_ref: ObjectRef,
 ) -> Result<Option<Vec<u8>>> {
-    let t_value = {
-        let Some(field) = source.resolve_borrowed(field_ref)?.as_dict() else {
-            return Ok(None); // cov:ignore: a top-level field ref always resolves to a dictionary
-        };
-        field.get("T").cloned()
-    };
-    let resolved = match t_value {
-        // `/T` may be stored through more than one indirect hop; follow the whole
-        // chain (not a one-hop resolve) so a multi-hop name string is read and
-        // used for collision renaming rather than yielding `None`.
-        Some(value @ Object::Reference(_)) => resolve_ref_chain(source, &value)?.0,
-        Some(other) => other,
-        None => return Ok(None),
-    };
-    Ok(resolved.as_string().map(<[u8]>::to_vec))
+    let field_handle = source.get_object_handle(field_ref);
+    let field = source.resolve_object_handle_to_terminal(&field_handle)?;
+    if field.try_as_dictionary()?.is_none() {
+        return Ok(None); // cov:ignore: a top-level field ref always resolves to a dictionary
+    }
+    let t_value = field.try_get_key(b"/T")?;
+    if t_value.is_null() {
+        return Ok(None);
+    }
+    // `/T` may be stored through more than one indirect hop; follow the whole
+    // chain (not a one-hop resolve) so a multi-hop name string is read and
+    // used for collision renaming rather than yielding `None`.
+    let resolved = source.resolve_object_handle_to_terminal(&t_value)?;
+    Ok(resolved.as_string())
 }
 
 /// Remove `/AcroForm` from the target's catalog, if present.
@@ -569,11 +582,13 @@ fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
     let Some(catalog_ref) = target.root_ref() else {
         return Ok(()); // cov:ignore: the seed target always has a /Root catalog
     };
-    let Some(mut catalog) = target.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+    let catalog_handle = target.get_object_handle(catalog_ref);
+    let catalog = target.resolve_object_handle_to_terminal(&catalog_handle)?;
+    if catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
-    };
-    catalog.remove("AcroForm");
-    target.set_object(catalog_ref, Object::Dictionary(catalog));
+    }
+    catalog.remove_key(b"/AcroForm");
+    target.mark_object_handle_dirty(&catalog)?;
     Ok(())
 }
 
@@ -604,20 +619,23 @@ fn build_merged_acroform<R: Read + Seek>(
     }
 
     let acroform_ref = target.acroform().ensure_acroform_ref()?;
-    let mut acroform = match target.resolve_borrowed(acroform_ref)?.as_dict().cloned() {
-        Some(dict) => dict,
-        None => return Ok(()), // cov:ignore: ensure_acroform_ref always yields a dictionary
-    };
+    let acroform_handle = target.get_object_handle(acroform_ref);
+    let acroform = target.resolve_object_handle_to_terminal(&acroform_handle)?;
+    if acroform.try_as_dictionary()?.is_none() {
+        return Ok(()); // cov:ignore: ensure_acroform_ref always yields a dictionary
+    }
 
     // Inherit the primary's /DR and /DA, remapping any indirect refs to the
     // copied objects. `/DA` is usually a direct string (a no-op under remap),
     // but per ISO 32000-2 any value may be stored as an indirect reference; a
     // verbatim copy would leave a source object number dangling in the output.
     if let Some(dr) = &primary.dr {
-        acroform.insert("DR", remap_refs_in_object(dr.clone(), map));
+        let remapped = remap_refs_in_object(dr.clone(), map);
+        acroform.replace_key(b"/DR", target.lift_object_to_handle(&remapped)?)?;
     }
     if let Some(da) = &primary.da {
-        acroform.insert("DA", remap_refs_in_object(da.clone(), map));
+        let remapped = remap_refs_in_object(da.clone(), map);
+        acroform.replace_key(b"/DA", target.lift_object_to_handle(&remapped)?)?;
     }
 
     // Seed `used` with the primary's field names (verbatim — the primary is the
@@ -632,7 +650,7 @@ fn build_merged_acroform<R: Read + Seek>(
         }
     }
 
-    let mut fields: Vec<Object> = Vec::with_capacity(kept.len());
+    let mut fields = Vec::with_capacity(kept.len());
     for field in kept {
         if !field.is_primary {
             if let Some(name) = &field.partial_name {
@@ -641,11 +659,11 @@ fn build_merged_acroform<R: Read + Seek>(
                 rename_field(target, field.target_ref, unique)?;
             }
         }
-        fields.push(Object::Reference(field.target_ref));
+        fields.push(target.get_object_handle(field.target_ref));
     }
-    acroform.insert("Fields", Object::Array(fields));
+    acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
 
-    target.set_object(acroform_ref, Object::Dictionary(acroform));
+    target.mark_object_handle_dirty(&acroform)?;
     Ok(())
 }
 
@@ -655,11 +673,13 @@ fn rename_field<R: Read + Seek>(
     field_ref: ObjectRef,
     name: Vec<u8>,
 ) -> Result<()> {
-    let Some(mut field) = target.resolve_borrowed(field_ref)?.as_dict().cloned() else {
+    let field_handle = target.get_object_handle(field_ref);
+    let field = target.resolve_object_handle_to_terminal(&field_handle)?;
+    if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
-    };
-    field.insert("T", Object::String(name));
-    target.set_object(field_ref, Object::Dictionary(field));
+    }
+    field.replace_key(b"/T", ObjectHandle::string(name))?;
+    target.mark_object_handle_dirty(&field)?;
     Ok(())
 }
 
@@ -671,27 +691,27 @@ fn field_kid_refs<R: Read + Seek>(
     source: &mut Pdf<R>,
     field_ref: ObjectRef,
 ) -> Result<Option<Vec<ObjectRef>>> {
-    let kids_value = {
-        let Some(field) = source.resolve_borrowed(field_ref)?.as_dict() else {
-            return Ok(None); // cov:ignore: a field ref always resolves to a dictionary
-        };
-        match field.get("Kids") {
-            Some(value) => value.clone(),
-            None => return Ok(None),
-        }
-    };
-    let (resolved, _) = resolve_ref_chain(source, &kids_value)?;
-    let Object::Array(items) = resolved else {
+    let field_handle = source.get_object_handle(field_ref);
+    let field = source.resolve_object_handle_to_terminal(&field_handle)?;
+    if field.try_as_dictionary()?.is_none() {
+        return Ok(None); // cov:ignore: a field ref always resolves to a dictionary
+    }
+    let kids_value = field.try_get_key(b"/Kids")?;
+    if kids_value.is_null() {
+        return Ok(None);
+    }
+    let resolved = source.resolve_object_handle_to_terminal(&kids_value)?;
+    let Some(items) = resolved.try_as_array()? else {
         return Ok(Some(Vec::new())); // cov:ignore: a /Kids value resolves to an array in practice
     };
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
-        if let Object::Reference(r) = item {
+        let (_, terminal_ref) = source.resolve_object_handle_to_terminal_ref(&item)?;
+        if let Some(r) = terminal_ref {
             // A `/Kids` element may be a reference to a reference to the field/
             // widget; resolve the holder chain to the terminal ref so trimming
             // compares the same ref that retained-`/Annots` membership records.
-            let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
-            refs.push(terminal.unwrap_or(r));
+            refs.push(r);
         } // cov:ignore: llvm-cov gap-region artifact on the brace closing a `?`-bearing block; the body (the `refs.push`) is covered
     }
     Ok(Some(refs))
@@ -714,28 +734,27 @@ fn collect_retained_widget_refs<R: Read + Seek>(
     retained: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
     for &page_ref in selected_pages {
-        let annots_val = {
-            let page_obj = source.resolve_borrowed(page_ref)?;
-            let Some(page_dict) = page_obj.as_dict() else {
-                continue; // cov:ignore: a selected page ref always resolves to a dictionary
-            };
-            page_dict.get("Annots").cloned()
-        };
-        let Some(annots_val) = annots_val else {
+        let page_handle = source.get_object_handle(page_ref);
+        let page = source.resolve_object_handle_to_terminal(&page_handle)?;
+        if page.try_as_dictionary()?.is_none() {
+            continue; // cov:ignore: a selected page ref always resolves to a dictionary
+        }
+        let annots_val = page.try_get_key(b"/Annots")?;
+        if annots_val.is_null() {
             continue;
-        };
+        }
         // /Annots: an inline array or an indirect reference to one.
-        let (concrete, _) = resolve_ref_chain(source, &annots_val)?;
-        let Object::Array(elems) = concrete else {
+        let concrete = source.resolve_object_handle_to_terminal(&annots_val)?;
+        let Some(elems) = concrete.try_as_array()? else {
             continue; // cov:ignore: a non-array /Annots is malformed
         };
         for elem in elems {
-            if let Object::Reference(r) = elem {
+            let (_, terminal_ref) = source.resolve_object_handle_to_terminal_ref(&elem)?;
+            if let Some(r) = terminal_ref {
                 // An `/Annots` element may be a reference to a reference to the
                 // widget; resolve the holder chain to the terminal widget ref so it
                 // matches the field-tree kid ref recorded by `field_kid_refs`.
-                let (_, terminal) = resolve_ref_chain(source, &Object::Reference(r))?;
-                retained.insert(terminal.unwrap_or(r));
+                retained.insert(r);
             }
         }
     }
@@ -749,19 +768,19 @@ fn widget_page_ref<R: Read + Seek>(
     source: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
-    let p_value = {
-        let Some(widget) = source.resolve_borrowed(widget_ref)?.as_dict() else {
-            return Ok(None); // cov:ignore: a widget ref always resolves to a dictionary
-        };
-        match widget.get("P") {
-            Some(value) => value.clone(),
-            // `/P` is optional (ISO 32000-2 §12.5.2): a widget may omit it. Such
-            // a widget's survival is decided by retained-`/Annots` membership in
-            // trim_field_kids, not by this back-pointer.
-            None => return Ok(None),
-        }
-    };
-    let (_, last_ref) = resolve_ref_chain(source, &p_value)?;
+    let widget_handle = source.get_object_handle(widget_ref);
+    let widget = source.resolve_object_handle_to_terminal(&widget_handle)?;
+    if widget.try_as_dictionary()?.is_none() {
+        return Ok(None); // cov:ignore: a widget ref always resolves to a dictionary
+    }
+    let p_value = widget.try_get_key(b"/P")?;
+    if p_value.is_null() {
+        // `/P` is optional (ISO 32000-2 §12.5.2): a widget may omit it. Such
+        // a widget's survival is decided by retained-`/Annots` membership in
+        // trim_field_kids, not by this back-pointer.
+        return Ok(None);
+    }
+    let (_, last_ref) = source.resolve_object_handle_to_terminal_ref(&p_value)?;
     Ok(last_ref)
 }
 
@@ -883,19 +902,19 @@ fn rewrite_field_kids<R: Read + Seek>(
     let Some(target_field_ref) = map.get(&src_field_ref).copied() else {
         return Ok(()); // cov:ignore: a survivor's parent field is always in the copy map
     };
-    let Some(mut field) = target
-        .resolve_borrowed(target_field_ref)?
-        .as_dict()
-        .cloned()
-    else {
+    let field_handle = target.get_object_handle(target_field_ref);
+    let field = target.resolve_object_handle_to_terminal(&field_handle)?;
+    if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
-    };
-    let kids: Vec<Object> = survivors
-        .iter()
-        .filter_map(|src| map.get(src).map(|&t| Object::Reference(t)))
-        .collect();
-    field.insert("Kids", Object::Array(kids));
-    target.set_object(target_field_ref, Object::Dictionary(field));
+    }
+    let mut kids = Vec::with_capacity(survivors.len());
+    for src in survivors {
+        if let Some(&target_ref) = map.get(src) {
+            kids.push(target.get_object_handle(target_ref));
+        }
+    }
+    field.replace_key(b"/Kids", ObjectHandle::array(kids))?;
+    target.mark_object_handle_dirty(&field)?;
     Ok(())
 }
 
@@ -1357,10 +1376,10 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
 mod tests {
     use super::{
         discover_primary_doc_level, fold_doc_level_closure, merge_documents, unique_field_name,
-        MergeInput,
+        wire_doc_level, MergeInput, PrimaryDocLevel,
     };
     use crate::page_closure::extend_page_object_closure;
-    use crate::{Object, ObjectRef, Pdf};
+    use crate::{Dictionary, Object, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
@@ -1397,6 +1416,19 @@ mod tests {
     }
 
     #[test]
+    fn page_merge_production_route_has_no_legacy_borrowed_resolution() {
+        let production = include_str!("page_merge.rs")
+            .split_once("#[cfg(test)]")
+            .expect("page_merge test module marker")
+            .0;
+        assert_eq!(
+            production.matches("resolve_borrowed").count(),
+            0,
+            "page_merge production must use the canonical ObjectHandle resolver"
+        );
+    }
+
+    #[test]
     fn unique_field_name_keeps_unused_base() {
         assert_eq!(unique_field_name(b"name", &used(&[])), b"name".to_vec());
         assert_eq!(
@@ -1430,6 +1462,109 @@ mod tests {
             unique_field_name(b"name+1", &used(&[b"name", b"name+1"])),
             b"name+1+1".to_vec()
         );
+    }
+
+    #[test]
+    fn wire_doc_level_indirect_carriers_use_canonical_handles() {
+        let mut target = Pdf::empty().unwrap();
+        let mapped = ObjectRef::new(2, 0);
+        let outlines = ObjectRef::new(10, 0);
+        let names = ObjectRef::new(11, 0);
+        let legacy = ObjectRef::new(12, 0);
+        let open_action = ObjectRef::new(13, 0);
+        let map = BTreeMap::from([
+            (outlines, mapped),
+            (names, mapped),
+            (legacy, mapped),
+            (open_action, mapped),
+        ]);
+
+        wire_doc_level(
+            &mut target,
+            &PrimaryDocLevel {
+                catalog: None,
+                trailer: None,
+                outlines: Some(outlines),
+                outlines_inline: None,
+                names_dests: Some(names),
+                names_dests_inline: None,
+                legacy_dests_ref: Some(legacy),
+                legacy_dests_inline: None,
+                open_action_ref: Some(open_action),
+                open_action_inline: None,
+            },
+            &map,
+        )
+        .unwrap();
+
+        let catalog = target.get_object_handle(ObjectRef::new(1, 0));
+        assert_eq!(
+            catalog.try_get_key(b"/Outlines").unwrap().object_ref(),
+            Some(mapped)
+        );
+        assert_eq!(
+            catalog
+                .try_get_key(b"/Names")
+                .unwrap()
+                .try_get_key(b"/Dests")
+                .unwrap()
+                .object_ref(),
+            Some(mapped)
+        );
+        assert_eq!(
+            catalog.try_get_key(b"/Dests").unwrap().object_ref(),
+            Some(mapped)
+        );
+        assert_eq!(
+            catalog.try_get_key(b"/OpenAction").unwrap().object_ref(),
+            Some(mapped)
+        );
+    }
+
+    #[test]
+    fn wire_doc_level_inline_carriers_use_canonical_handles() {
+        let mut target = Pdf::empty().unwrap();
+        let mapped = ObjectRef::new(2, 0);
+        let source_ref = ObjectRef::new(20, 0);
+        let mut outlines = Dictionary::new();
+        outlines.insert("First", Object::Reference(source_ref));
+        let mut names_dests = Dictionary::new();
+        names_dests.insert("Names", Object::Reference(source_ref));
+        let mut legacy_dests = Dictionary::new();
+        legacy_dests.insert("legacy", Object::Reference(source_ref));
+        let mut action = Dictionary::new();
+        action.insert(
+            "D",
+            Object::Array(vec![
+                Object::Reference(source_ref),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+        let map = BTreeMap::from([(source_ref, mapped)]);
+
+        wire_doc_level(
+            &mut target,
+            &PrimaryDocLevel {
+                catalog: None,
+                trailer: None,
+                outlines: None,
+                outlines_inline: Some(outlines),
+                names_dests: None,
+                names_dests_inline: Some(names_dests),
+                legacy_dests_ref: None,
+                legacy_dests_inline: Some(legacy_dests),
+                open_action_ref: None,
+                open_action_inline: Some(Object::Dictionary(action)),
+            },
+            &map,
+        )
+        .unwrap();
+
+        let catalog = target.get_object_handle(ObjectRef::new(1, 0));
+        assert!(!catalog.try_get_key(b"/Outlines").unwrap().is_null());
+        assert!(!catalog.try_get_key(b"/Names").unwrap().is_null());
+        assert!(!catalog.try_get_key(b"/Dests").unwrap().is_null());
+        assert!(!catalog.try_get_key(b"/OpenAction").unwrap().is_null());
     }
 
     /// A malformed indirect document-level root may itself be an unselected
