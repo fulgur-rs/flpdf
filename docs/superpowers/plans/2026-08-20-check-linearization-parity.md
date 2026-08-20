@@ -76,7 +76,7 @@ Run `cargo test -p flpdf --test check_tests` and `cargo test -p flpdf-cli --test
 
 Compare `qpdf --check tests/fixtures/compat/linearized-one-page.pdf` with `cargo run --quiet --bin flpdf -- --check tests/fixtures/compat/linearized-one-page.pdf`; require exit 0, identical stdout, and no flpdf warning summary.
 
-- [ ] **Step 2: Run repository quality gates**
+- [x] **Step 2: Run repository quality gates**
 
 Run `cargo fmt --all -- --check`, focused tests, `cargo test --workspace`, all-features clippy, strict private-item rustdoc, qpdf module-doc checks, and `scripts/patch-coverage.sh --base origin/main`; changed executable lines must be fully covered.
 
