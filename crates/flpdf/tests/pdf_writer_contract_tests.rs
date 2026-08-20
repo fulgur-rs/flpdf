@@ -89,7 +89,7 @@ fn qpdf_progress_for_bytes(source: &[u8], options: &[&str]) -> flpdf::Result<Vec
     command.arg(&input_path).arg(&output_path);
     let output = command.output()?;
     assert!(
-        output.status.success(),
+        output.status.success() || (options.contains(&"--qdf") && output.status.code() == Some(3)),
         "qpdf --progress failed: {output:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -211,6 +211,33 @@ fn synthetic_many_reachable_object_pdf(count: u32) -> Vec<u8> {
     bytes
 }
 
+fn synthetic_direct_leaf_kid_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Count 1 /Kids [<< /Type /Page /MediaBox [0 0 612 792] /Contents 3 0 R >>] >>".as_slice(),
+        b"<< /Length 0 >>\nstream\n\nendstream".as_slice(),
+    ];
+
+    for (number, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", number + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn flpdf_progress_for_bytes(source: &[u8], linearized: bool) -> flpdf::Result<(Vec<u8>, Vec<u8>)> {
     let mut pdf = Pdf::open(Cursor::new(source.to_vec()))?;
     let events = Rc::new(RefCell::new(Vec::<u8>::new()));
@@ -227,6 +254,21 @@ fn flpdf_progress_for_bytes(source: &[u8], linearized: bool) -> flpdf::Result<(V
     let output = writer.get_buffer()?;
     let events = events.borrow().clone();
     Ok((events, output))
+}
+
+fn flpdf_qdf_progress_for_bytes(source: &[u8]) -> flpdf::Result<Vec<u8>> {
+    let mut pdf = Pdf::open(Cursor::new(source.to_vec()))?;
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_qdf_mode(true);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+    let events = events.borrow().clone();
+    Ok(events)
 }
 
 struct FailingWriter;
@@ -2484,6 +2526,17 @@ fn pdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
     assert!(events.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(events.iter().all(|percent| *percent <= 100));
     assert_eq!(&*events, &qpdf_progress_for_minimal()?);
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_qdf_repair_progress_matches_qpdf_after_page_object_mint() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let source = synthetic_direct_leaf_kid_pdf();
+    let expected = qpdf_progress_for_bytes(&source, &["--qdf"])?;
+    let actual = flpdf_qdf_progress_for_bytes(&source)?;
+
+    assert_eq!(actual, expected);
     Ok(())
 }
 

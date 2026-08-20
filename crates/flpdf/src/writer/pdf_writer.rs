@@ -499,6 +499,16 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         }
         self.validate_supported_settings()?;
         let mut options = self.prepared_write_options()?;
+        // qpdf's QPDFWriter::doWriteSetup runs initializeSpecialStreams before
+        // QPDFWriter::write snapshots getObjectCount for progress
+        // (QPDFWriter.cc:2114-2115, 2189-2193). The QDF and explicit content
+        // normalization routes use the same page-tree repair boundary, which
+        // can promote direct /Kids leaves or clone duplicate leaves. Prepare
+        // that graph before taking the progress snapshot so every emitted
+        // repaired object is represented in events_expected.
+        if options.qdf || options.content_normalization {
+            crate::PageDocumentHelper::new(self.pdf).get_all_pages()?;
+        }
         crate::writer::configure_progress_for_pdf(
             self.pdf,
             &options,
