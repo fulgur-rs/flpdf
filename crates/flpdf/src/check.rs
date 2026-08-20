@@ -246,12 +246,6 @@ pub fn check_pdf_with_limits<R: Read + Seek + 'static>(
             false
         }
     };
-    if linearized {
-        diagnostics.push(Diagnostic::warning(
-            "linearized PDF detected: rewrite support preserves hint object but does not recompute linearization tables",
-            None,
-        ));
-    }
 
     // Decode every page's content stream(s); a genuine decode failure is a
     // stream-encoding error. qpdf --check does the same and exits 2 on a broken

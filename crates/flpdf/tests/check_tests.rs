@@ -51,19 +51,19 @@ fn check_preserves_repair_warnings_before_terminal_open_error() {
 }
 
 #[test]
-fn check_reports_linearized_pdf_warning() {
+fn check_reports_linearized_pdf_without_warning() {
     let input = linearized_fixture_pdf();
     let report = check_reader(Cursor::new(input)).unwrap();
 
     assert!(report.valid);
-    assert!(report
+    assert!(!report
         .diagnostics
         .entries()
         .iter()
         .any(|entry| entry.severity == Severity::Warning && entry.message.contains("linearized")));
     // The summary mirrors qpdf's structural detector: the first object carries
     // a `/Linearized` dictionary. `/L` is intentionally absent because this
-    // test covers the check-layer warning, not the `/L` predicate itself.
+    // test covers the check-layer informational line, not the `/L` predicate.
     assert!(report.summary.expect("summary present").linearized);
 }
 

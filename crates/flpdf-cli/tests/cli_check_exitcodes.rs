@@ -418,10 +418,9 @@ fn check_appends_adobe_extension_level_to_version() {
 }
 
 /// A file whose first object is a `/Linearized` dictionary prints
-/// `File is linearized`. flpdf's structural detector also pushes the
-/// linearization advisory warning, so the run exits 3 (and therefore omits the
-/// trailing reassurance note). Full qpdf-accurate behaviour is tracked in
-/// flpdf-u1ro.
+/// `File is linearized`. A valid linearized document is clean for `--check`:
+/// qpdf does not treat detection itself as a warning, so the run exits 0 and
+/// includes the trailing reassurance note.
 #[test]
 fn check_linearized_pdf_reports_linearized_line() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -431,9 +430,13 @@ fn check_linearized_pdf_reports_linearized_line() {
     cmd.env_remove("FLPDF_PROGNAME")
         .args(["--check", f.path().to_str().unwrap()])
         .assert()
-        .code(3)
+        .code(0)
         .stdout(predicate::str::contains("File is linearized\n"))
-        .stdout(predicate::str::contains("File is not linearized").not());
+        .stdout(predicate::str::contains("File is not linearized").not())
+        .stdout(predicate::str::contains(
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+        ))
+        .stderr(predicate::str::is_empty());
 }
 
 // ---------------------------------------------------------------------------
