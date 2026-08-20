@@ -246,23 +246,50 @@ fn page_tree_root_handle<R: Read + Seek>(
     }
 }
 
-/// Remove qpdf's four inheritable keys from every original `/Pages` node.
+/// Warn about discarded unknown keys and remove qpdf's four inheritable keys
+/// from every original `/Pages` node.
 ///
 /// The selected leaves have already received their effective values when this
 /// runs. Keeping this cleanup on live handles matters when the writer is asked
 /// to preserve otherwise-unreferenced objects: the old intermediate nodes are
 /// then still serialized, but no longer retain stale inherited attributes.
+///
+/// `QPDF::flattenPagesTree` asks `pushInheritedAttributesToPage` to warn while
+/// walking an intermediate `/Pages` node. The retained root is excluded by its
+/// missing `/Parent`; structural keys are also excluded because they are part
+/// of the page-tree representation rather than inheritable page attributes.
 fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     nodes: &[ObjectHandle],
 ) -> Result<()> {
+    let inheritable_keys = [
+        b"/CropBox".as_slice(),
+        b"/MediaBox".as_slice(),
+        b"/Resources".as_slice(),
+        b"/Rotate".as_slice(),
+    ];
+    let structural_keys = [
+        b"/Type".as_slice(),
+        b"/Parent".as_slice(),
+        b"/Kids".as_slice(),
+        b"/Count".as_slice(),
+    ];
+
     for node in nodes {
-        for key in [
-            b"/CropBox".as_slice(),
-            b"/MediaBox".as_slice(),
-            b"/Resources".as_slice(),
-            b"/Rotate".as_slice(),
-        ] {
+        if node.try_has_key(b"/Parent")? {
+            for key in node.try_get_keys()? {
+                if !inheritable_keys.contains(&key.as_slice())
+                    && !structural_keys.contains(&key.as_slice())
+                {
+                    pdf.push_warning(format!(
+                        "Unknown key {} in /Pages object is being discarded as a result of flattening the /Pages tree",
+                        String::from_utf8_lossy(&key)
+                    ))?;
+                }
+            }
+        }
+
+        for key in inheritable_keys {
             node.remove_key(key);
         }
         pdf.mark_object_handle_dirty(node)?;
@@ -841,6 +868,39 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(10, 0))),
             "the selected page must retain the root-inherited /CropBox handle"
         );
+    }
+
+    #[test]
+    fn rebuild_warns_for_unknown_keys_only_on_flattened_pages_nodes() {
+        let mut pdf = open(build_nested_pdf());
+
+        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        root.insert("UserUnit", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+        let mut intermediate = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        intermediate.insert("UserUnit", Object::Integer(2));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(intermediate));
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)])
+            .expect("page-tree rebuild must preserve qpdf warning behavior");
+
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .find(|message| message.contains("Unknown key /UserUnit"));
+        assert_eq!(
+            warning,
+            Some(
+                "Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree"
+            ),
+            "only the flattened intermediate /Pages node should warn"
+        );
+
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get("UserUnit"), Some(&Object::Integer(1)));
     }
 
     #[test]
