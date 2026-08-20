@@ -9,9 +9,9 @@
 
 ### Task 2: RED/GREEN
 
-- [ ] Add a job-check unit regression for contextless object descriptions.
-- [ ] Add/strengthen the CLI qpdf differential assertion.
-- [ ] Implement the smallest emitter classification and run focused GREEN
+- [x] Add a job-check unit regression for contextless object descriptions.
+- [x] Add/strengthen the CLI qpdf differential assertion.
+- [x] Implement the smallest emitter classification and run focused GREEN
   tests.
 
 ### Task 3: Verify and hand off

@@ -591,6 +591,15 @@ fn check_object_warning_uses_qpdf_space_before_object_context() {
         .stderr(predicate::str::contains(format!(
             "WARNING: {input} (object 5 0, offset 232): expected endobj\n"
         )))
+        .stderr(predicate::str::contains(
+            "WARNING: page object 3 0:  object is supposed to be a stream or an array of streams but is neither\n"
+        ))
+        .stderr(
+            predicate::str::contains(format!(
+                "WARNING: {input}: page object 3 0: object is supposed to be a stream"
+            ))
+            .not(),
+        )
         .stderr(
             predicate::str::contains(format!(
                 "WARNING: {input}: (object 5 0, offset 232): expected endobj"
