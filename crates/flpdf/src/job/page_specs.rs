@@ -759,10 +759,12 @@ mod tests {
     }
 
     /// Resolve `value` one level: follow an `Object::Reference` through
-    /// `pdf`, or return a non-reference value unchanged.
+    /// `pdf`, or return a non-reference value unchanged. Defensive against
+    /// `/AcroForm` becoming an indirect object under other merge paths; the
+    /// fixture this helper serves keeps it direct.
     fn resolve_one_level(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: Object) -> Object {
         match value {
-            Object::Reference(reference) => pdf.resolve(reference).expect("resolve reference"),
+            Object::Reference(reference) => pdf.resolve(reference).expect("resolve reference"), // cov:ignore: this fixture's /AcroForm is never re-indirected
             other => other,
         }
     }
