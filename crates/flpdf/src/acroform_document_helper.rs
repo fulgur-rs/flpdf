@@ -1241,8 +1241,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         result
     }
 
-    #[allow(dead_code)]
-    fn canonical_get_or_create_acroform(&mut self) -> Result<ObjectHandle> {
+    pub(crate) fn canonical_get_or_create_acroform(&mut self) -> Result<ObjectHandle> {
         let root_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let root = self.pdf.get_object_handle(root_ref);
         let root = self.pdf.resolve_object_handle_to_terminal(&root)?;
