@@ -601,6 +601,33 @@ fn plain_page_pdf() -> Vec<u8> {
     ])
 }
 
+/// Two-page primary with an inline/direct `/AcroForm` dictionary. Its field is
+/// on selected page 1 so qpdf must mutate the existing direct dictionary
+/// rather than replace it with an indirect object.
+fn acroform_inline_primary_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [5 0 R] /NeedAppearances true >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [5 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (Inline) \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+    ])
+}
+
+fn acroform_is_direct(path: &Path) -> bool {
+    let text = qdf(path);
+    let marker_at = text.find("/AcroForm").expect("catalog AcroForm");
+    text[marker_at + "/AcroForm".len()..]
+        .trim_start()
+        .starts_with("<<")
+}
+
 /// qpdf only rebuilds `/AcroForm /Fields` when the primary's *original*
 /// `/Fields` resolved to an array (`QPDFJob.cc:2609-2610`,
 /// `hasAcroForm() && fields.isArray()`). An `/AcroForm` with no `/Fields` at
@@ -847,5 +874,64 @@ fn unselected_primary_field_names_reserve_suffixes_regardless_of_string_encoding
     assert_eq!(
         flpdf_fields, qpdf_fields,
         "flpdf must decode /T before comparing collision candidates against reserved names"
+    );
+}
+
+/// qpdf's `getOrCreateAcroForm` returns an existing direct dictionary and
+/// mutates it in place (`QPDFAcroFormDocumentHelper.cc:38-59`). A page merge
+/// must therefore keep an inline primary `/AcroForm` direct after rebuilding
+/// its fields instead of routing it through the legacy indirect-ref helper.
+#[test]
+fn inline_primary_acroform_stays_direct_after_pages_merge() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(&primary, acroform_inline_primary_pdf()).expect("write primary");
+    std::fs::write(&secondary, plain_page_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert!(
+        acroform_is_direct(&qpdf_output),
+        "qpdf keeps the primary inline AcroForm direct"
+    );
+    assert!(
+        acroform_is_direct(&flpdf_output),
+        "flpdf must preserve the primary inline AcroForm representation"
+    );
+    assert_eq!(
+        observable_fields(&acroform_json(&flpdf_output)),
+        observable_fields(&qpdf_acroform_json(&qpdf_output)),
+        "preserving directness must not change the merged field contents"
     );
 }

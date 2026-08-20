@@ -637,9 +637,7 @@ fn build_merged_acroform<R: Read + Seek>(
         return Ok(());
     }
 
-    let acroform_ref = target.acroform().ensure_acroform_ref()?;
-    let acroform_handle = target.get_object_handle(acroform_ref);
-    let acroform = target.resolve_object_handle_to_terminal(&acroform_handle)?;
+    let acroform = target.acroform().canonical_get_or_create_acroform()?;
     if acroform.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: ensure_acroform_ref always yields a dictionary
     }
