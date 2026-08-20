@@ -812,6 +812,40 @@ mod tests {
     }
 
     #[test]
+    fn widget_non_reference_page_value_is_preserved() {
+        let mut pdf = open(build_acroform_pdf());
+        let mut widget = dict_of(&mut pdf, ObjectRef::new(7, 0));
+        widget.insert("P", Object::Integer(7));
+        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(widget));
+
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        assert_eq!(
+            dict_of(&mut pdf, ObjectRef::new(7, 0)).get("P"),
+            Some(&Object::Integer(7)),
+            "qpdf writer does not infer page ownership from a non-reference /P value"
+        );
+    }
+
+    #[test]
+    fn widget_non_page_reference_is_preserved() {
+        let mut pdf = open(build_acroform_pdf());
+        let mut widget = dict_of(&mut pdf, ObjectRef::new(7, 0));
+        widget.insert("P", Object::Reference(ObjectRef::new(6, 0)));
+        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(widget));
+
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        assert_eq!(
+            dict_of(&mut pdf, ObjectRef::new(7, 0)).get("P"),
+            Some(&Object::Reference(ObjectRef::new(6, 0))),
+            "qpdf does not rewrite a non-page /P target through an owner heuristic"
+        );
+    }
+
+    #[test]
     fn direct_field_kid_is_not_promoted_to_retained_widget() {
         let mut pdf = open(build_direct_field_kid_pdf());
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
