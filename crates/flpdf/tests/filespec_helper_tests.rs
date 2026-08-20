@@ -1148,6 +1148,22 @@ fn qpdf_path_factories_read_payload_and_make_filespec() {
     );
 }
 
+#[test]
+fn qpdf_path_factory_maps_open_errors_at_the_provider_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing-attachment.bin");
+    let mut pdf = Pdf::empty().unwrap();
+
+    let Err(error) = EmbeddedFileStream::create_ef_stream_from_path(&mut pdf, &missing) else {
+        panic!("a missing provider path must fail while computing embedded metadata");
+    };
+
+    assert_eq!(
+        error.to_string(),
+        format!("open {}: No such file or directory", missing.display())
+    );
+}
+
 struct ChunkedProvider {
     chunks: Vec<Vec<u8>>,
     calls: Rc<Cell<usize>>,

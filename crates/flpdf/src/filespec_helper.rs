@@ -98,6 +98,28 @@ use std::rc::Rc;
 
 const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 
+// qpdf's `QUtil::safe_fopen` reports `"open " + filename + ": " +
+// strerror(errno)` (`libqpdf/QUtil.cc:512-515`, `QPDFSystemError.cc:12-27`),
+// with no numeric error code. `std::io::Error`'s `Display` appends a
+// `" (os error N)"` suffix that qpdf's message lacks; strip it so the two
+// diagnostics match byte-for-byte. A missing file is special-cased to
+// qpdf's portable C-runtime wording ("No such file or directory") on every
+// host, since Rust's `std::io::Error` on Windows instead surfaces the
+// native Win32 FormatMessage text ("The system cannot find the file
+// specified.").
+pub(crate) fn qpdf_style_open_error(path: &Path, error: std::io::Error) -> Error {
+    let rendered = error.to_string();
+    let message = if error.kind() == std::io::ErrorKind::NotFound {
+        "No such file or directory"
+    } else {
+        error
+            .raw_os_error()
+            .and_then(|code| rendered.strip_suffix(&format!(" (os error {code})")))
+            .unwrap_or(&rendered)
+    };
+    Error::System(format!("open {}: {message}", path.display()))
+}
+
 fn next_object_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     let next = pdf
         .get_all_object_handles()?
@@ -265,7 +287,8 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let stream = pdf.new_stream()?;
         stream.replace_stream_data_with_callback(
             move |pipeline| {
-                let mut file = File::open(&path)?;
+                let mut file =
+                    File::open(&path).map_err(|error| qpdf_style_open_error(&path, error))?;
                 let mut buffer = [0_u8; 8192];
                 loop {
                     let read = file.read(&mut buffer)?;
@@ -1926,11 +1949,10 @@ mod tests {
         let result =
             add_attachment_from_path(&mut pdf, b"missing.txt", "/this/does/not/exist/missing.txt");
         assert!(result.is_err(), "must error when file does not exist");
-        // Should be an Io error
         let err = result.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Io(_)),
-            "expected Io error, got: {err:?}"
+        assert_eq!(
+            err.to_string(),
+            "open /this/does/not/exist/missing.txt: No such file or directory"
         );
     }
 
