@@ -15,6 +15,8 @@ const QPDF: &str = "/usr/bin/qpdf";
 const EXPECTED_QPDF_VERSION: &str = "11.9.0";
 const FIXTURE: &str = "../../tests/fixtures/compat/acroform-sig-widget.pdf";
 const NO_ACROFORM_FIXTURE: &str = "../../tests/fixtures/compat/link-annot-no-acroform.pdf";
+const MULTI_PAGE_FIXTURE: &str =
+    "../../tests/fixtures/compat/objstm-lin-acroform-widget-page1-page2.pdf";
 
 fn qpdf_available() -> bool {
     if !Path::new(QPDF).exists() {
@@ -346,6 +348,66 @@ fn repeated_single_source_acroform_copies_each_page_occurrence() {
         widget_page_position(&flpdf_output, "Approval+1"),
         1,
         "same-source repeated widget /P must point to the first page"
+    );
+}
+
+#[test]
+fn out_of_order_duplicate_selection_renames_fields_in_final_page_order() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(MULTI_PAGE_FIXTURE);
+    let source = temp.path().join("source.pdf");
+    std::fs::copy(&fixture, &source).expect("copy source");
+
+    // Page 3, then page 2, then page 3 again, then page 2 again: each
+    // source page's two output occurrences are interleaved rather than
+    // grouped, so the source-page-ref-keyed BTreeMap iteration this
+    // regression guards against would process them out of final order.
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&source)
+        .args(["--pages"])
+        .arg(&source)
+        .arg("3")
+        .arg(&source)
+        .arg("2")
+        .arg(&source)
+        .arg("3")
+        .arg(&source)
+        .arg("2")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&source)
+        .args(["--pages"])
+        .arg(&source)
+        .arg("3")
+        .arg(&source)
+        .arg("2")
+        .arg(&source)
+        .arg("3")
+        .arg(&source)
+        .arg("2")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_acroform_json(&qpdf_output);
+    let flpdf_json = acroform_json(&flpdf_output);
+    assert_eq!(
+        observable_fields(&flpdf_json),
+        observable_fields(&qpdf_json),
+        "interleaved duplicate selections must rename fields in qpdf's final page order, not source-page-ref order"
     );
 }
 

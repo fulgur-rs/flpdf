@@ -39,7 +39,7 @@ use flpdf::{
     RemoveUnreferencedResources, Severity, StreamDataMode, WriterConfiguration,
 };
 use flpdf::{fix_qdf, remove_attachment};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -4882,18 +4882,33 @@ fn copy_duplicate_page_annotations<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
 ) -> flpdf::Result<()> {
+    // `result.ref_map` groups every duplicate by its *source* page ref, so
+    // iterating `.values()` visits groups in BTreeMap key order rather than
+    // the final output order. `PageObjectHelper::copy_annotations` appends
+    // and collision-renames copied AcroForm fields immediately as each
+    // duplicate is processed, so that grouping can assign `+N` suffixes out
+    // of sequence relative to qpdf's own per-page copy events. Walk
+    // `result.new_kids` (already in selection order) instead, and process
+    // each duplicate only when its turn in the final page sequence arrives.
+    let mut first_occurrence: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
     for page_refs in result.ref_map.values() {
         let Some(&first_page) = page_refs.first() else {
             continue;
         };
-        let source_page = pdf.get_object_handle(first_page);
         for &duplicate_page in page_refs.iter().skip(1) {
-            let destination_page = pdf.get_object_handle(duplicate_page);
-            destination_page.remove_key(b"/Annots");
-            pdf.mark_object_handle_dirty(&destination_page)?;
-            PageObjectHelper::new(duplicate_page, pdf)
-                .copy_annotations(source_page.clone(), flpdf::Matrix::default())?;
+            first_occurrence.insert(duplicate_page, first_page);
         }
+    }
+    for &new_page in &result.new_kids {
+        let Some(&source_page_ref) = first_occurrence.get(&new_page) else {
+            continue;
+        };
+        let source_page = pdf.get_object_handle(source_page_ref);
+        let destination_page = pdf.get_object_handle(new_page);
+        destination_page.remove_key(b"/Annots");
+        pdf.mark_object_handle_dirty(&destination_page)?;
+        PageObjectHelper::new(new_page, pdf)
+            .copy_annotations(source_page, flpdf::Matrix::default())?;
     }
     Ok(())
 }
