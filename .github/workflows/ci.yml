@@ -30,6 +30,12 @@ jobs:
       - name: Check qpdf module correspondence
         run: python3 scripts/qpdf-module-docs.py --check
 
+      - name: Test qpdf-deviation marker checker
+        run: python3 -m unittest scripts/tests/test_qpdf_deviation_markers.py
+
+      - name: Check qpdf-deviation markers
+        run: python3 scripts/check-qpdf-deviation-markers.py --check
+
       - name: Test patch-coverage gate contract
         run: bash scripts/tests/patch-coverage-contract.sh
 

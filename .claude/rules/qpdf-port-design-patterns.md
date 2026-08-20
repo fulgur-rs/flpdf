@@ -154,6 +154,55 @@ C++ から Rust へ写すとき、qpdf 側にある要素を落とすのも、�
 `Error::Internal` へ、と 3 往復した。qpdf の基底クラス実装
 （`libqpdf/QPDFObjectHandle.cc:48-90`）を最初に読み切っていれば 1 度で済んだ。
 
+## 6. 複数の既存実装を共有 primitive へ統合する前に、qpdf 非対応の挙動を機械可読にマークする
+
+qpdf の 1 コンポーネントに対応する flpdf 実装が複数箇所に分散している状態
+（例: `page_object_helper.rs` 側と `pages.rs` 側がそれぞれ独立に継承属性を
+辿っていた）を 1 つの共有 primitive へ統合するとき、各実装が個別に持って
+いた「qpdf に対応物のない flpdf 固有の挙動」（境界条件のズレ、legacy な
+redirect 追跡、診断 warning の発行条件など）が、統合によって黙って消える
+か別の実装へ黙って混入する。これをレビュー（Codex Review 等）が事後的に
+発見するたびに「qpdf 対応のある regression だから直す」か「qpdf 対応物の
+ない独自挙動だから維持しない」かを都度精査・議論することになり、往復が
+かさむ。
+
+### ルール
+- 統合に着手する前に、既存の各実装を **境界条件・エラー経路・診断発行の
+  単位で** 突き合わせる（1 の「qpdf フィールド 1 つに対して flpdf のどれが
+  対応するかを 1:1 で明示する」の実装版）。
+- 突き合わせて見つかった「qpdf に対応物のない flpdf 固有の挙動」は、
+  実装を統合する前に、削除するにせよ残すにせよ機械可読にマークする:
+  - 関数・型・フィールド単位で切り離せるなら
+    `#[deprecated(note = "no qpdf counterpart; ...")]`。呼び出し元が
+    limited（典型的には `#[cfg(test)]` のみ）なら CI の `-D warnings` を
+    壊さないよう呼び出し元に `#[allow(deprecated)]` を局所的に付ける。
+    259 箇所規模の pub API 全体を一括 `#[deprecated]` にするような大規模
+    cutover には使わない（[[flpdf-pre-1-0-skip-backward-compat]] のとおり
+    CI を割る）。
+  - 分岐・ブロック単位でしか切り離せないなら
+    `// qpdf-deviation: <理由>` /
+    `// qpdf-deviation-start: <理由>` … `// qpdf-deviation-end`
+    （`// cov:ignore` と同じ文法。`scripts/check-qpdf-deviation-markers.py
+    --check` が書式を検証する）。
+- 統合後にレビューが指摘を出したら、まず「マーク済みか」を見る。マーク
+  済みならメンテナ判断の再確認で足り、未マークなら真の regression の疑いを
+  優先して精査する。
+- qpdf に対応物があるのに統合で境界条件や診断が壊れた場合はマークしない
+  — それは維持すべき regression であり、修正する。
+
+### 該当例
+PR #976（`pages.rs` の共有継承属性 walk への統合）で Codex Review が
+3 件の regression 候補を指摘した。うち 2 件（100 番目の祖先を検査する前に
+depth 上限に達する off-by-one、malformed parent での型 warning 消失）は
+qpdf `QPDFPageObjectHelper::getAttribute`（`libqpdf/QPDFPageObjectHelper.
+cc:236-247`）に対応がある真の regression で修正した。残り 1 件
+（`Pdf::set_object` による bare-reference の多段 redirect 追跡）は qpdf に
+対応物のない test-only の legacy bridge（`docs/qpdf-correspondence.md:386`
+に既存記載）で、メンテナ判断により維持しないと決めたが、これは実装の
+統合が終わってからレビューで発見・議論した結果であり、統合前に境界差分を
+洗い出して機械可読にマークしておけば、この 1 件は実装時点で切り離せて
+いた。
+
 ---
 
 ## 補足
@@ -163,5 +212,6 @@ C++ から Rust へ写すとき、qpdf 側にある要素を落とすのも、�
 - **既存 2 本との関係**: 本文書（設計）→ `pdf-rust-review-patterns.md`
   （実装・コードレビュー）→ `pdf-rust-doc-review-patterns.md`（公開 doc）の順で
   適用範囲が下りていく。設計を誤ると下 2 本は誤った設計を綺麗に磨くだけになる。
-- 1〜5 は「出発点」「中断シグナル」「前例の検証」「依存順序」「逐語訳の粒度」という、
-  qpdf 移植の設計段階に固有の落とし穴。
+- 1〜6 は「出発点」「中断シグナル」「前例の検証」「依存順序」「逐語訳の粒度」
+  「複数実装統合前の機械可読マーキング」という、qpdf 移植の設計段階に
+  固有の落とし穴。

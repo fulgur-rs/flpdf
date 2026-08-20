@@ -54,7 +54,15 @@ qpdf の C++ 固有の足場を Rust の標準的な仕組みで置き換える�
    （例: base64 のエンコード結果は同一。JSON の逐次出力順は qpdf のまま）
 3. **明示的に記録すること。** 当該モジュールの doc に逸脱理由を 1 行、
    [`docs/qpdf-correspondence.md`](docs/qpdf-correspondence.md) の ⚪ 行に該当箇所を
-   記載する。暗黙の逸脱を作らない。
+   記載する。暗黙の逸脱を作らない。加えて、該当コード自体を機械可読にマークする:
+   関数・型・フィールド単位で切り離せる逸脱は `#[deprecated(note = "...")]`、
+   分岐・ブロック単位の逸脱は `// qpdf-deviation: <理由>`（複数行は
+   `// qpdf-deviation-start: <理由>` … `// qpdf-deviation-end`）。CI の
+   `scripts/check-qpdf-deviation-markers.py --check` が書式を検証する。これにより、
+   複数の既存実装を 1 つの共有 primitive へ統合する際にレビューが「既知のマーク済み
+   逸脱」と「未マークの regression」を機械的に見分けられる
+   （[`.claude/rules/qpdf-port-design-patterns.md`](.claude/rules/qpdf-port-design-patterns.md)
+   6 参照）。
 
 (B) は「qpdf のやり方を尊重しつつ Rust として不自然な移植を避ける」ための枠であり、
 **qpdf の設計が気に入らないという理由での逸脱は pre-v1.0 では認めない**。
@@ -67,8 +75,9 @@ v1.0 以降は想定 consumer の要件に応じて qpdf 完全トレースを�
 
 issue に着手する前・設計やブレインストーミングを始める前に、
 [`.claude/rules/qpdf-port-design-patterns.md`](.claude/rules/qpdf-port-design-patterns.md)
-を読むこと。flpdf の現状から出発して設計を誤るパターンを 5 カテゴリで
-予防ルール化したもの（出発点／中断シグナル／前例の検証／依存順序／逐語訳の粒度）。
+を読むこと。flpdf の現状から出発して設計を誤るパターンを 6 カテゴリで
+予防ルール化したもの（出発点／中断シグナル／前例の検証／依存順序／逐語訳の粒度／
+複数実装統合前の機械可読マーキング）。
 **設計を誤ったまま実装に入ると、下の Coding Rules はもう効かない。**
 
 ## Coding Rules
