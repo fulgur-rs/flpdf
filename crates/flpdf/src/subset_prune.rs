@@ -73,8 +73,7 @@ use std::io::{Read, Seek};
 ///
 /// Calling this function on a PDF that has **not** been rebuilt (i.e. all
 /// pages are still reachable) is safe: no objects will be deleted by the GC
-/// pass, and the name-level prune is equivalent to calling
-/// `remove_unreferenced_resources` directly.
+/// pass, and the name-level prune still applies independently to each page.
 ///
 /// # Errors
 ///
