@@ -78,8 +78,9 @@
 //! ```
 
 use crate::nntree::HandleNameTree;
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+#[cfg(test)]
+use crate::Dictionary;
+use crate::{Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
@@ -92,6 +93,44 @@ pub struct EmbeddedFileDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
+fn embedded_files_tree_with_options<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    auto_repair: bool,
+    max_depth: Option<usize>,
+) -> Result<Option<HandleNameTree>> {
+    // cov:ignore-start: helper methods normally receive a parsed catalog root
+    let Some(catalog_ref) = pdf.root_ref() else {
+        return Ok(None); // cov:ignore: helper methods normally receive a parsed catalog root
+    };
+    // cov:ignore-end
+    let catalog = pdf.get_object_handle(catalog_ref);
+    pdf.resolve_object_handle(&catalog)?;
+    if catalog.try_as_dictionary()?.is_none() {
+        return Ok(None);
+    }
+
+    // Keep qpdf's getKey -> terminal-resolution order here. The public
+    // has_key facade must resolve the child to test nullness, which would
+    // move name-tree repair diagnostics before the tree walker sees the
+    // malformed child.
+    let names_seed = catalog.try_get_key(b"/Names")?;
+    let names = pdf.resolve_object_handle_to_terminal(&names_seed)?;
+    if names.try_as_dictionary()?.is_none() {
+        return Ok(None);
+    }
+    let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
+    let root = pdf.resolve_object_handle_to_terminal(&root_seed)?;
+    if root.try_as_dictionary()?.is_none() {
+        return Ok(None);
+    }
+
+    let mut tree = HandleNameTree::new(root, pdf.unique_id(), auto_repair);
+    if let Some(max_depth) = max_depth {
+        tree.set_max_depth(max_depth);
+    }
+    Ok(Some(tree))
+}
+
 impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// Create an embedded-files helper borrowing `pdf` mutably.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
@@ -99,31 +138,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     }
 
     fn embedded_files_tree(&mut self) -> Result<Option<HandleNameTree>> {
-        // cov:ignore-start: helper methods normally receive a parsed catalog root
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None); // cov:ignore: helper methods normally receive a parsed catalog root
-        };
-        // cov:ignore-end
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.pdf.resolve_object_handle(&catalog)?;
-        if catalog.try_as_dictionary()?.is_none() {
-            return Ok(None);
-        }
-        // Keep qpdf's getKey -> terminal-resolution order here. The public
-        // has_key facade must resolve the child to test nullness, which would
-        // move name-tree repair diagnostics before the tree walker sees the
-        // malformed child.
-        let names_seed = catalog.try_get_key(b"/Names")?;
-        let names = self.pdf.resolve_object_handle_to_terminal(&names_seed)?;
-        if names.try_as_dictionary()?.is_none() {
-            return Ok(None);
-        }
-        let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
-        let root = self.pdf.resolve_object_handle_to_terminal(&root_seed)?;
-        if root.try_as_dictionary()?.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(HandleNameTree::new(root, self.pdf.unique_id(), true)))
+        embedded_files_tree_with_options(self.pdf, true, None)
     }
 
     fn ensure_embedded_files_tree(&mut self) -> Result<Option<HandleNameTree>> {
@@ -317,15 +332,17 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
         _ => None,
     };
 
-    // ── Step 2: detach the name-tree entry ────────────────────────────────────
-    delete_embedded_file(pdf, key)?;
-
-    // ── Step 3: clear /AF references on catalog and all pages ─────────────────
-    // Done before the sweep so a stale `/AF` edge cannot keep the filespec
-    // artificially reachable.
+    // ── Step 2: clear /AF references on catalog and all pages ─────────────────
+    // Do this while the name-tree value still carries its indirect identity;
+    // qpdf's canonical replacement turns the removed filespec into null, so
+    // waiting until after removal would lose the identity needed to filter
+    // existing `/AF` arrays.
     if let Some(fs_ref) = filespec_ref_opt {
         clear_af_reference(pdf, fs_ref)?;
     }
+
+    // ── Step 3: detach the name-tree entry ───────────────────────────────────
+    delete_embedded_file(pdf, key)?;
 
     // ── Step 4: mark-and-sweep GC (qpdf model) ────────────────────────────────
     // Once the entry is detached and `/AF` cleared, the removed filespec, its
@@ -432,32 +449,18 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     dict_ref: ObjectRef,
     target_ref: ObjectRef,
 ) -> Result<()> {
-    let Some(mut dict) = pdf.resolve_borrowed(dict_ref)?.as_dict().cloned() else {
+    let dict = pdf.get_object_handle(dict_ref);
+    pdf.resolve_object_handle(&dict)?;
+    if dict.try_as_dictionary()?.is_none() {
         return Ok(());
-    };
+    }
 
-    // /AF may be a direct array or an indirect reference to an array.
-    let af_value = match dict.get("AF").cloned() {
-        Some(v) => v,
-        None => return Ok(()), // No /AF — nothing to do.
-    };
-
-    // `array_ref` is `Some(r)` when /AF is an indirect reference to the array
-    // object `r` (which must be patched, not just the parent dict).
-    let (array_ref, af_array): (Option<ObjectRef>, Vec<Object>) = match af_value {
-        Object::Array(arr) => (None, arr),
-        // /AF may be reached through more than one indirect hop
-        // (ref -> ref -> array); follow the chain so the terminal array — the
-        // object that actually holds the refs and is rewritten below — is read
-        // and patched, not an intermediate carrier.
-        Object::Reference(r) => {
-            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &Object::Reference(r))?;
-            match terminal.into_array() {
-                Some(arr) => (Some(terminal_ref.unwrap_or(r)), arr),
-                None => return Ok(()),
-            }
-        }
-        _ => return Ok(()),
+    // `/AF` may be a direct array or an indirect reference to an array. The
+    // terminal handle is the live array object that qpdf mutates in place.
+    let af_value = dict.try_get_key(b"/AF")?;
+    let terminal = pdf.resolve_object_handle_to_terminal(&af_value)?;
+    let Some(af_array) = terminal.try_as_array()? else {
+        return Ok(());
     };
 
     // Early no-op: if `target_ref` is not actually present, do NOT mutate the
@@ -466,41 +469,24 @@ fn remove_ref_from_af_in_dict<R: Read + Seek>(
     // (roborev #950-2).
     if !af_array
         .iter()
-        .any(|o| matches!(o, Object::Reference(r) if *r == target_ref))
+        .any(|o| o.object_ref().or_else(|| o.as_reference()) == Some(target_ref))
     {
         return Ok(());
     }
 
-    let filtered: Vec<Object> = af_array
+    let filtered: Vec<ObjectHandle> = af_array
         .into_iter()
-        .filter(|o| !matches!(o, Object::Reference(r) if *r == target_ref))
+        .filter(|o| o.object_ref().or_else(|| o.as_reference()) != Some(target_ref))
         .collect();
+    let is_empty = filtered.is_empty();
+    terminal.set_array_items(filtered)?;
+    pdf.mark_object_handle_dirty(&terminal)?;
 
-    match array_ref {
-        // Indirect /AF: patch the referenced array object so it no longer
-        // holds a stale reference to `target_ref`.  Never delete it — it may
-        // be shared by the catalog and page dicts; deleting on the first
-        // parent would dangle the rest (roborev #951).
-        Some(r) => {
-            let is_empty = filtered.is_empty();
-            pdf.set_object(r, Object::Array(filtered));
-            if is_empty {
-                // Drop the now-empty /AF key from this parent; the array
-                // object stays (a harmless orphan once nothing points at it).
-                dict.remove("AF");
-                pdf.set_object(dict_ref, Object::Dictionary(dict));
-            }
-            // non-empty: parent already points at `r` via /AF; leave it.
-        }
-        // Direct /AF array lives inside the parent dictionary.
-        None => {
-            if filtered.is_empty() {
-                dict.remove("AF");
-            } else {
-                dict.insert("AF", Object::Array(filtered));
-            }
-            pdf.set_object(dict_ref, Object::Dictionary(dict));
-        }
+    if is_empty {
+        // Drop the now-empty `/AF` key from this parent; a shared indirect
+        // array object remains intact for any other parent that references it.
+        dict.remove_key(b"/AF");
+        pdf.mark_object_handle_dirty(&dict)?;
     }
     Ok(())
 }
@@ -558,44 +544,18 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Vec<(Vec<u8>, ObjectRef)>> {
-    // ── Step 1: resolve catalog ───────────────────────────────────────────────
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(vec![]),
-    };
-    let names_value = match pdf.resolve_borrowed(catalog_ref)?.as_dict() {
-        Some(catalog) => catalog.get("Names").cloned(),
-        None => return Ok(vec![]),
-    };
-
-    let Some(names_value) = names_value else {
+    let Some(mut tree) = embedded_files_tree_with_options(pdf, true, Some(max_depth))? else {
         return Ok(vec![]);
     };
-
-    // ── Step 2: resolve /Names dictionary ────────────────────────────────────
-    // /Names may be an indirect reference or a direct inline dictionary.
-    let names_dict = match names_value {
-        // /Names may be reached through more than one indirect hop
-        // (ref -> ref -> dict); follow the chain to its terminal.
-        Object::Reference(r) => match resolve_ref_chain(pdf, &Object::Reference(r))?.0 {
-            Object::Dictionary(d) => d,
-            _ => return Ok(vec![]),
-        },
-        Object::Dictionary(d) => d,
-        _ => return Ok(vec![]),
-    };
-
-    // ── Step 3: walk the /EmbeddedFiles name tree (ref-only view) ─────────────
-    let ef_value = match names_dict.get("EmbeddedFiles").cloned() {
-        Some(v) => v,
-        None => return Ok(vec![]),
-    };
-    let mut tree = crate::NameTree::new(ef_value, false);
-    tree.set_max_depth(max_depth);
     Ok(tree
-        .as_map(pdf)?
+        .entries(pdf)?
         .into_iter()
-        .filter_map(|(key, value)| value.as_ref_id().map(|object_ref| (key, object_ref)))
+        .filter_map(|(key, value)| {
+            value
+                .object_ref()
+                .or_else(|| value.as_reference())
+                .map(|object_ref| (key, object_ref))
+        })
         .collect())
 }
 
@@ -607,36 +567,30 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
 ///
 /// The public reader [`list_embedded_files`] intentionally filters to indirect
 /// references, while mutation and copying preserve direct-dict entries.
+// qpdf-deviation: the raw Object projection remains only for the attachment cleanup cutover and is removed by flpdf-egzr.3.2.8.
 pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Vec<(Vec<u8>, Object)>> {
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(vec![]),
-    };
-    let Some(catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict() else {
+    let Some(mut tree) = embedded_files_tree_with_options(pdf, false, Some(max_depth))? else {
         return Ok(vec![]);
     };
+    tree.entries(pdf)?
+        .into_iter()
+        .map(|(key, value)| Ok((key, raw_object_from_handle(&value)?)))
+        .collect()
+}
 
-    let names_dict = match catalog.get("Names").cloned() {
-        // /Names may be reached through more than one indirect hop
-        // (ref -> ref -> dict); follow the chain to its terminal.
-        Some(Object::Reference(r)) => match resolve_ref_chain(pdf, &Object::Reference(r))?.0 {
-            Object::Dictionary(d) => d,
-            _ => return Ok(vec![]),
-        },
-        Some(Object::Dictionary(d)) => d,
-        _ => return Ok(vec![]),
-    };
-
-    let ef_value = match names_dict.get("EmbeddedFiles").cloned() {
-        Some(v) => v,
-        None => return Ok(vec![]),
-    };
-    let mut tree = crate::NameTree::new(ef_value, false);
-    tree.set_max_depth(max_depth);
-    Ok(tree.as_map(pdf)?.into_iter().collect())
+/// Project a live handle into the legacy raw-object boundary retained by the
+/// attachment cleanup route until `flpdf-egzr.3.2.8`. Indirect values remain
+/// references without resolving their bodies; direct values are materialized
+/// in place, matching the old `NameTree::as_map` projection.
+fn raw_object_from_handle(handle: &ObjectHandle) -> Result<Object> {
+    if let Some(object_ref) = handle.object_ref() {
+        Ok(Object::Reference(object_ref))
+    } else {
+        handle.materialize()
+    }
 }
 
 // ── Writer ────────────────────────────────────────────────────────────────────
@@ -658,61 +612,8 @@ pub fn insert_embedded_file<R: Read + Seek>(
     key: &[u8],
     filespec_ref: ObjectRef,
 ) -> Result<()> {
-    insert_embedded_file_value(pdf, key, Object::Reference(filespec_ref))
-}
-
-fn insert_embedded_file_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    key: &[u8],
-    value: Object,
-) -> Result<()> {
-    let Some(catalog_ref) = pdf.root_ref() else {
-        return Ok(());
-    };
-    let Some(mut catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
-        return Ok(());
-    };
-
-    enum NamesLocation {
-        Direct,
-        Indirect { terminal_ref: ObjectRef },
-        Missing,
-    }
-
-    let (location, mut names) = match catalog.get("Names").cloned() {
-        Some(value @ Object::Reference(source_ref)) => {
-            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &value)?;
-            match terminal.into_dict() {
-                Some(dictionary) => (
-                    NamesLocation::Indirect {
-                        terminal_ref: terminal_ref.unwrap_or(source_ref),
-                    },
-                    dictionary,
-                ),
-                None => (NamesLocation::Missing, Dictionary::new()),
-            }
-        }
-        Some(Object::Dictionary(dictionary)) => (NamesLocation::Direct, dictionary),
-        _ => (NamesLocation::Missing, Dictionary::new()),
-    };
-
-    let mut tree = match names.get("EmbeddedFiles").cloned() {
-        Some(root) => crate::NameTree::new(root, true),
-        None => crate::NameTree::new_empty(pdf, true)?,
-    };
-    tree.insert(pdf, key, value)?;
-    names.insert("EmbeddedFiles", tree.into_root());
-
-    match location {
-        NamesLocation::Indirect { terminal_ref } => {
-            pdf.set_object(terminal_ref, Object::Dictionary(names));
-        }
-        NamesLocation::Direct | NamesLocation::Missing => {
-            catalog.insert("Names", Object::Dictionary(names));
-        }
-    }
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-    Ok(())
+    let filespec = pdf.get_object_handle(filespec_ref);
+    pdf.embedded_files().replace_embedded_file(key, filespec)
 }
 
 /// Remove the entry with `key` from the catalog's `/Names /EmbeddedFiles`
@@ -726,55 +627,12 @@ fn insert_embedded_file_value<R: Read + Seek>(
 /// # Errors
 ///
 /// Propagates any error from [`Pdf::resolve`].
+// qpdf-deviation: this legacy wrapper detaches a name-tree entry without nulling a shared filespec; qpdf nulling belongs to EmbeddedFileDocumentHelper::remove_embedded_file and this route is removed by flpdf-egzr.3.2.8.
 pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
-    let Some(catalog_ref) = pdf.root_ref() else {
+    let Some(mut tree) = embedded_files_tree_with_options(pdf, true, None)? else {
         return Ok(false);
     };
-    let Some(mut catalog) = pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
-        return Ok(false);
-    };
-
-    enum NamesLocation {
-        Direct,
-        Indirect { terminal_ref: ObjectRef },
-    }
-
-    let (location, mut names) = match catalog.get("Names").cloned() {
-        Some(value @ Object::Reference(source_ref)) => {
-            let (terminal, terminal_ref) = resolve_ref_chain(pdf, &value)?;
-            let Some(dictionary) = terminal.into_dict() else {
-                return Ok(false);
-            };
-            (
-                NamesLocation::Indirect {
-                    terminal_ref: terminal_ref.unwrap_or(source_ref),
-                },
-                dictionary,
-            )
-        }
-        Some(Object::Dictionary(dictionary)) => (NamesLocation::Direct, dictionary),
-        _ => return Ok(false),
-    };
-    let Some(root) = names.get("EmbeddedFiles").cloned() else {
-        return Ok(false);
-    };
-
-    let mut tree = crate::NameTree::new(root, true);
-    if tree.remove(pdf, key)?.is_none() {
-        return Ok(false);
-    }
-
-    names.insert("EmbeddedFiles", tree.into_root());
-    match location {
-        NamesLocation::Direct => {
-            catalog.insert("Names", Object::Dictionary(names));
-        }
-        NamesLocation::Indirect { terminal_ref } => {
-            pdf.set_object(terminal_ref, Object::Dictionary(names));
-        }
-    }
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-    Ok(true)
+    Ok(tree.remove(pdf, key)?.is_some())
 }
 
 // ── Tests for remove_attachment ───────────────────────────────────────────────
@@ -918,6 +776,78 @@ mod tests {
         assert!(
             !pdf.is_dirty(names_ref),
             "an absent removal must not rewrite the unchanged /Names dictionary"
+        );
+    }
+
+    #[test]
+    fn legacy_insert_updates_retained_embedded_files_root() {
+        let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
+        let catalog_ref = pdf.root_ref().expect("root");
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve_object_handle(&catalog)
+            .expect("resolve catalog");
+        let retained_root = catalog.get_key(b"/Names").get_key(b"/EmbeddedFiles");
+        pdf.resolve_object_handle(&retained_root)
+            .expect("resolve embedded-files root");
+
+        let filespec_ref = ObjectRef::new(90, 0);
+        pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
+        insert_embedded_file(&mut pdf, b"new.txt", filespec_ref).expect("insert");
+
+        let pairs = retained_root
+            .get_key(b"/Names")
+            .as_array()
+            .expect("retained names array");
+        assert_eq!(pairs.len(), 4, "the retained root must observe insertion");
+        assert_eq!(pairs[2].as_string(), Some(b"new.txt".to_vec()));
+    }
+
+    #[test]
+    fn remove_attachment_updates_retained_af_array_handle() {
+        let mut pdf = open_minimal();
+        let filespec_ref = FileSpecBuilder::new("retained-af.txt", b"payload")
+            .build(&mut pdf)
+            .expect("build filespec");
+        insert_embedded_file(&mut pdf, b"retained-af.txt", filespec_ref).expect("insert");
+
+        let af_ref = ObjectRef::new(next_object_number(&mut pdf) + 1, 0);
+        pdf.set_object(af_ref, Object::Array(vec![Object::Reference(filespec_ref)]));
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dictionary")
+            .clone();
+        catalog.insert("AF", Object::Reference(af_ref));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+        let page_ref = crate::pages::page_refs(&mut pdf)
+            .expect("page refs")
+            .into_iter()
+            .next()
+            .expect("page");
+        let mut page = pdf
+            .resolve_borrowed(page_ref)
+            .expect("page")
+            .as_dict()
+            .expect("page dictionary")
+            .clone();
+        page.insert("AF", Object::Reference(af_ref));
+        pdf.set_object(page_ref, Object::Dictionary(page));
+
+        let retained_af = pdf.get_object_handle(af_ref);
+        pdf.resolve_object_handle(&retained_af)
+            .expect("resolve AF array");
+
+        assert!(
+            remove_attachment(&mut pdf, b"retained-af.txt").expect("remove"),
+            "attachment must be found"
+        );
+
+        assert_eq!(
+            retained_af.as_array().expect("retained AF array").len(),
+            0,
+            "the retained AF handle must observe qpdf-shaped in-place filtering"
         );
     }
 
@@ -2042,6 +1972,37 @@ mod tests {
         );
         assert_eq!(pairs[0].0, b"chain.txt");
         assert_eq!(pairs[0].1, Object::Reference(fs_ref));
+    }
+
+    #[test]
+    fn collect_pairs_preserves_direct_filespec_at_raw_boundary() {
+        let mut pdf = open_minimal();
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dictionary")
+            .clone();
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"direct.txt".to_vec()));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"direct".to_vec()),
+                Object::Dictionary(filespec),
+            ]),
+        );
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(root));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let pairs = collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
+            .expect("collect direct filespec");
+        assert!(matches!(pairs.as_slice(), [(_, Object::Dictionary(_))]));
     }
 
     // ── Test: empty removal preserves a 2-hop /Names holder chain (flpdf-3x23)
