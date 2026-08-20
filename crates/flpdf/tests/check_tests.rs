@@ -56,11 +56,11 @@ fn check_reports_linearized_pdf_without_warning() {
     let report = check_reader(Cursor::new(input)).unwrap();
 
     assert!(report.valid);
-    assert!(!report
-        .diagnostics
-        .entries()
-        .iter()
-        .any(|entry| entry.severity == Severity::Warning && entry.message.contains("linearized")));
+    assert!(
+        report.diagnostics.entries().is_empty(),
+        "qpdf-clean fixture produced diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
     // The repository fixture is qpdf-clean and its linearization parameter
     // dictionary is not object 1, covering the faithful detector route.
     assert!(report.summary.expect("summary present").linearized);
