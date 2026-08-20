@@ -10,20 +10,6 @@ use flpdf::job::{
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
-    acroform_field_prune::prune_acroform_after_subset,
-    objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
-    outline_dest_remap::remap_outline_and_dests,
-    page_collate::collate,
-    page_combine::{CombinedPage, CombinedPlan},
-    page_rotate::apply_rotate_to_pages,
-    pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
-    should_remove_unreferenced_resources,
-    struct_tree_pg::drop_struct_elem_dangling_pg,
-    subset_prune::prune_after_subset,
-    thread_bead_p::drop_thread_bead_dangling_p,
-    InputSpec, PageRange, RotateSpec,
-};
-use flpdf::{
     filters, flatten_rotation_on_pages,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
@@ -39,6 +25,19 @@ use flpdf::{
     RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
 };
 use flpdf::{fix_qdf, remove_attachment};
+use flpdf::{
+    objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
+    outline_dest_remap::remap_outline_and_dests,
+    page_collate::collate,
+    page_combine::{CombinedPage, CombinedPlan},
+    page_rotate::apply_rotate_to_pages,
+    pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
+    should_remove_unreferenced_resources,
+    struct_tree_pg::drop_struct_elem_dangling_pg,
+    subset_prune::prune_after_subset,
+    thread_bead_p::drop_thread_bead_dangling_p,
+    InputSpec, PageRange, RotateSpec,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -4137,7 +4136,7 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 ///   6. thread_bead_p::drop_thread_bead_dangling_p
 ///      6.5. objr_obj_annot_p::drop_objr_obj_annot_dangling_p
 ///   7. subset_prune::prune_after_subset (Auto/Yes/No)
-///   8. acroform_field_prune::prune_acroform_after_subset
+///   8. QPDFJob::prune_acroform_after_subset
 ///   9. write (or split_pages when --split-pages is set)
 ///
 /// Multi-source page specifications are handled by the job-level
@@ -4714,7 +4713,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     drop_thread_bead_dangling_p(&mut pdf, &result)?;
     drop_objr_obj_annot_dangling_p(&mut pdf, &result, &objr_obj_targets)?;
     prune_after_subset(&mut pdf, prune_mode.into())?;
-    prune_acroform_after_subset(&mut pdf, &result)?;
+    QPDFJob::prune_acroform_after_subset(&mut pdf, &result)?;
 
     let mut options = options;
     options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
