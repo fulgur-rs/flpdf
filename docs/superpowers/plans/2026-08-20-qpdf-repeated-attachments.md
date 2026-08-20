@@ -29,7 +29,7 @@ one flpdf batch attachment job.
 
 ### Task 4: Verify and hand off
 
-- [ ] Run fmt, strict rustdoc, all-features clippy, relevant/full tests,
+- [x] Run fmt, strict rustdoc, all-features clippy, relevant/full tests,
   qpdf-doc checks, deviation checks, and fresh patch coverage.
 - [ ] Rebase onto latest `origin/main`, rerun focused checks/coverage, push, and
   create a Draft PR without merging.
