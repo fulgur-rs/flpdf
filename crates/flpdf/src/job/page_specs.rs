@@ -94,10 +94,11 @@ fn collect_primary_fields(
 /// is complete, against a `pdf` that still holds every original field
 /// (including ones on pages that end up unselected). flpdf's caller runs
 /// this *before* the per-occurrence copy loop and scopes `fields` to the
-/// primary's first-occurrence pages only, because a name still held by an
-/// unselected primary field is never copied into `merged` at all and so
-/// cannot participate in the loop's collision-avoidance check. That gap is
-/// tracked separately (see the primary-fields-visibility follow-up).
+/// primary's first-occurrence pages only. As a result, a name still held by
+/// an unselected primary field is never copied into `merged` at all, so it
+/// cannot participate in the loop's collision-avoidance check -- a repeated
+/// or foreign field that would collide with that name in qpdf can receive
+/// the wrong `+N` suffix here.
 fn replace_merged_fields(
     merged: &mut Pdf<Cursor<Vec<u8>>>,
     fields: Vec<ObjectHandle>,
