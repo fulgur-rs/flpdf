@@ -260,6 +260,7 @@ impl QPDFJob {
         R2: Read + Seek + 'static,
     {
         target.set_logger(self.logger());
+        source.set_logger(self.logger());
         self.set_attachment_page_mode(target)?;
 
         if options.verbose {
@@ -1182,6 +1183,36 @@ mod tests {
             Some(&Object::Name(b"UseAttachments".to_vec()))
         );
         assert!(!job.has_warnings());
+    }
+
+    #[test]
+    fn copy_attachments_installs_the_job_logger_on_source_as_well_as_target() {
+        let (mut job, _, _) = job_with_captures();
+        let mut source = Pdf::open(Cursor::new(minimal_fixture_bytes())).expect("open donor");
+        let mut target = job
+            .open(
+                Cursor::new(minimal_fixture_bytes()),
+                "minimal.pdf",
+                PdfOpenOptions::default(),
+            )
+            .expect("open target fixture");
+
+        // Source starts with its own default logger, distinct from the job's.
+        assert_ne!(source.logger(), job.logger());
+
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from("donor.pdf"), b"", false),
+        )
+        .expect("empty source copy succeeds");
+
+        assert_eq!(
+            source.logger(),
+            job.logger(),
+            "a lazy warning raised while traversing source must reach the job's own sink, \
+             not source's original (possibly silent) logger"
+        );
     }
 
     #[test]
