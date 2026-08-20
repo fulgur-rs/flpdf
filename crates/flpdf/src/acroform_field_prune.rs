@@ -756,6 +756,43 @@ mod tests {
     }
 
     #[test]
+    fn indirect_widget_with_nulled_page_ref_has_p_removed() {
+        // `try_has_key` already treats a `/P` value that resolves to null in
+        // a *single* hop as absent (matching qpdf's `QPDF_Dictionary::hasKey`
+        // null-suppression), so this function's removal branch is reached
+        // only through the flpdf-only `Pdf::set_object` bare-reference
+        // bridge this file already documents (`collect_page_widgets`'s qpdf
+        // source citation): an indirect object whose own resolved value is
+        // itself another reference. Build that exact two-hop shape --
+        // widget 11's `/P` retargeted to a bridge object that redirects to
+        // the (now nulled) dropped page 5 -- so `try_has_key` sees a
+        // non-null direct child (the bridge) while
+        // `resolve_object_handle_to_terminal` chases through to null.
+        let mut pdf = open(build_acroform_pdf());
+        pdf.set_object(ObjectRef::new(5, 0), Object::Null);
+        pdf.set_object(
+            ObjectRef::new(99, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
+        let raw_widget = pdf.get_object_handle(ObjectRef::new(11, 0));
+        let widget = pdf.resolve_object_handle_to_terminal(&raw_widget).unwrap();
+        let bridge = pdf.get_object_handle(ObjectRef::new(99, 0));
+        widget.replace_key(b"/P", bridge).unwrap();
+        pdf.mark_object_handle_dirty(&widget).unwrap();
+        let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
+
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained).unwrap();
+
+        let widget_dict = dict_of(&mut pdf, ObjectRef::new(11, 0));
+        assert_eq!(
+            widget_dict.get("P"),
+            None,
+            "an indirect widget whose /P resolves to null through the \
+             flpdf-only redirect bridge must lose the key"
+        );
+    }
+
+    #[test]
     fn widget_non_reference_page_value_is_preserved() {
         let mut pdf = open(build_acroform_pdf());
         let mut widget = dict_of(&mut pdf, ObjectRef::new(7, 0));
