@@ -726,6 +726,19 @@ fn one_page_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+/// Build a one-page tree with an intermediate `/Pages` node carrying an
+/// unrecognized key. qpdf's flatten path warns before discarding that node;
+/// the retained root's own unknown keys are intentionally not part of this
+/// fixture.
+fn one_page_pdf_with_unknown_intermediate_pages_key() -> Vec<u8> {
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 /UserUnit 2 >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+    ])
+}
+
 #[test]
 fn top_level_linearize_rewrites_output() {
     let temp = tempfile::tempdir().unwrap();
@@ -5202,6 +5215,58 @@ fn pages_repaired_input_keeps_output_and_exits_three_with_output_summary() {
         ));
 
     assert!(output.exists(), "warning exit must retain extracted output");
+}
+
+#[test]
+fn pages_unknown_intermediate_key_matches_qpdf_warning_exit() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("unknown-intermediate-pages-key.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(&input, one_page_pdf_with_unknown_intermediate_pages_key()).unwrap();
+
+    let qpdf = std::process::Command::new("qpdf")
+        .arg(&input)
+        .args(["--pages", input.to_str().unwrap(), "1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_output)
+        .output()
+        .unwrap();
+
+    let warning =
+        "Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree";
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
+    let qpdf_warning_line = qpdf_stderr
+        .lines()
+        .find(|line| line.contains("Unknown key /UserUnit"))
+        .expect("qpdf must emit the unknown intermediate key warning");
+    let flpdf_warning_line = flpdf_stderr
+        .lines()
+        .find(|line| line.contains("Unknown key /UserUnit"))
+        .expect("flpdf must emit the unknown intermediate key warning");
+    assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {qpdf_stderr}");
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "flpdf stderr: {flpdf_stderr}"
+    );
+    assert_eq!(qpdf_warning_line, flpdf_warning_line);
+    assert!(qpdf_warning_line.contains(warning));
+    assert_eq!(qpdf_stderr.matches("Unknown key /UserUnit").count(), 1);
+    assert_eq!(flpdf_stderr.matches("Unknown key /UserUnit").count(), 1);
+    assert!(qpdf_output.exists());
+    assert!(flpdf_output.exists());
 }
 
 #[test]
