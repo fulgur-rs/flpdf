@@ -1974,6 +1974,37 @@ mod tests {
         assert_eq!(pairs[0].1, Object::Reference(fs_ref));
     }
 
+    #[test]
+    fn collect_pairs_preserves_direct_filespec_at_raw_boundary() {
+        let mut pdf = open_minimal();
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dictionary")
+            .clone();
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"direct.txt".to_vec()));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"direct".to_vec()),
+                Object::Dictionary(filespec),
+            ]),
+        );
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(root));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let pairs = collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
+            .expect("collect direct filespec");
+        assert!(matches!(pairs.as_slice(), [(_, Object::Dictionary(_))]));
+    }
+
     // ── Test: empty removal preserves a 2-hop /Names holder chain (flpdf-3x23)
     //
     // When the last /EmbeddedFiles entry is removed and the /Names dict still
