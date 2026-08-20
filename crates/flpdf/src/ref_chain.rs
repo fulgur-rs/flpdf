@@ -27,16 +27,6 @@ pub(crate) const MAX_REF_CHAIN_DEPTH: usize = 64;
 /// against, an indirect target). A cyclic / over-deep chain terminates at the
 /// bound and yields the last resolved value, so a hostile target cannot loop
 /// forever.
-// qpdf-deviation-start: chasing a stored reference-to-reference
-// (Object::Reference resolving to another Object::Reference) has no qpdf
-// counterpart -- QPDFParser::parse's top-level tt_integer case
-// (QPDFParser.cc:87-88) never applies parseRemainder's int_count/"R"
-// lookahead, and QPDF::replaceObject (QPDF.cc:1980-1991) rejects an
-// indirect replacement, so no parsed qpdf object graph can ever hold such a
-// chain; this primitive exists solely to chase the flpdf-only
-// Pdf::set_object bridge value shape. The single first-hop resolve below is
-// ordinary, qpdf-matching single-indirection resolution and is not itself
-// the deviation.
 pub fn resolve_ref_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: &Object,
@@ -48,8 +38,16 @@ pub fn resolve_ref_chain<R: Read + Seek>(
         return Ok((start.clone(), None));
     };
     let mut last_ref = Some(*first);
+    // This first hop is ordinary, qpdf-matching single-indirection resolution.
     let mut cur = pdf.resolve(*first)?;
-    // First hop taken above; follow the remaining hops up to the bound.
+    // qpdf-deviation-start: chasing a stored reference-to-reference
+    // (Object::Reference resolving to another Object::Reference) has no qpdf
+    // counterpart -- QPDFParser::parse's top-level tt_integer case
+    // (QPDFParser.cc:87-88) never applies parseRemainder's int_count/"R"
+    // lookahead, and QPDF::replaceObject (QPDF.cc:1980-1991) rejects an
+    // indirect replacement, so no parsed qpdf object graph can ever hold such
+    // a chain; only these additional hops (past the ordinary first one above)
+    // exist solely to chase the flpdf-only Pdf::set_object bridge value shape.
     for _ in 1..MAX_REF_CHAIN_DEPTH {
         match cur {
             Object::Reference(r) => {
@@ -59,9 +57,9 @@ pub fn resolve_ref_chain<R: Read + Seek>(
             _ => break,
         }
     }
+    // qpdf-deviation-end
     Ok((cur, last_ref))
 }
-// qpdf-deviation-end
 
 /// Follow a chain of [`Object::Reference`] indirections from `start` up to
 /// [`MAX_REF_CHAIN_DEPTH`], returning the last [`ObjectRef`] reached — the ref
@@ -77,23 +75,26 @@ pub fn resolve_ref_chain<R: Read + Seek>(
 /// # Errors
 ///
 /// Propagates any [`Error`](crate::Error) from resolving an object in the chain.
-// qpdf-deviation-start: same no-qpdf-counterpart reference-to-reference
-// chase as resolve_ref_chain above, keyed on the terminal ref instead of
-// the terminal value.
 pub(crate) fn terminal_ref_of_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
 ) -> Result<ObjectRef> {
     let mut cur = start;
+    // qpdf-deviation-start: same no-qpdf-counterpart reference-to-reference
+    // chase as resolve_ref_chain above, keyed on the terminal ref instead of
+    // the terminal value. The first loop iteration's resolve of `start` is
+    // ordinary, qpdf-matching single-indirection resolution; only a
+    // `Object::Reference(next)` result (a stored reference resolving to
+    // another reference) is the flpdf-only shape this loop exists to chase.
     for _ in 0..MAX_REF_CHAIN_DEPTH {
         match pdf.resolve_borrowed(cur)? {
             Object::Reference(next) => cur = *next,
             _ => break,
         }
     }
+    // qpdf-deviation-end
     Ok(cur)
 }
-// qpdf-deviation-end
 
 #[cfg(test)]
 mod tests {

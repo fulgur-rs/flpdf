@@ -280,11 +280,6 @@ impl QPDFJob {
 
         let other_attachments = source.embedded_files().get_embedded_files()?;
         let mut duplicates: Vec<String> = Vec::new();
-        // qpdf-deviation: QPDFJob::copyAttachments (QPDFJob.cc:2089-2135) is
-        // void and tracks no count; this counter exists only to feed
-        // flpdf-cli's unconditional "copied N attachment(s)" diagnostic,
-        // which qpdf never emits (qpdf's own copy diagnostics are
-        // verbose-gated and never report a count).
         let mut copied_count = 0usize;
         for (key, filespec) in other_attachments {
             let mut new_key = options.prefix.clone();

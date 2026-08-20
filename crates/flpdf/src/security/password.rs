@@ -72,15 +72,6 @@ fn decode_hex(raw: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
-// qpdf-deviation-start: qpdf never applies SASLprep (RFC 4013) on any
-// password path -- QPDF_encryption.cc documents this as known
-// non-compliance ("We are supposed to process the input string with the
-// SASLprep..." but doesn't), no stringprep/SASLprep implementation exists
-// anywhere in qpdf's source, and the auto/unicode/bytes password-mode
-// distinction (unlike hex-bytes) applies only when encrypting files, never
-// when opening them; qpdf's actual open-path retry mechanism is
-// QUtil::possible_repaired_encodings, an unrelated post-failure
-// single-byte-encoding guesser.
 fn unicode_password(raw: &[u8], revision: i64) -> Result<Vec<u8>> {
     if revision < 5 {
         return Err(EncryptedError::Malformed {
@@ -98,7 +89,6 @@ fn unicode_password(raw: &[u8], revision: i64) -> Result<Vec<u8>> {
     })?;
     Ok(prepped.into_owned().into_bytes())
 }
-// qpdf-deviation-end
 
 #[cfg(test)]
 mod tests {

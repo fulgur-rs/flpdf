@@ -227,12 +227,6 @@ pub enum NewlineBeforeEndstream {
     /// Matches qpdf's `(last_char != '\n')` check in QPDFWriter.cc:1560,
     /// which is what QDF form falls back to when the caller does not set
     /// [`NewlineBeforeEndstream::Yes`] explicitly.
-    // qpdf-deviation: qpdf reaches this last_char-conditional endstream
-    // newline for regular streams only as a qdf_mode side effect
-    // (QPDFWriter.cc:1560), bundled with QDF's other forced transformations;
-    // flpdf exposes it as a standalone policy independent of qdf, letting an
-    // otherwise ordinary non-QDF rewrite use this framing on regular
-    // streams -- a shape qpdf's own source cannot produce.
     No,
     /// Never insert a newline: the raw payload is written verbatim and
     /// `endstream` follows immediately, so exactly `/Length` bytes sit between

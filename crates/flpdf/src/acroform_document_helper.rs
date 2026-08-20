@@ -1654,13 +1654,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///   dictionary, or when the field-tree depth limit is exceeded. A direct
     ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error from [`Pdf::resolve`].
-    // qpdf-deviation: unconditional same-document whole-field-tree
-    // /AcroForm/DA stamp has no qpdf counterpart -- qpdf only writes an
-    // inherited /DA in the private adjustInheritedFields
-    // (QPDFAcroFormDocumentHelper.cc:442-484), invoked solely during a
-    // foreign (cross-document) field copy when source/destination
-    // /AcroForm defaults differ; qpdf otherwise resolves /DA lazily and
-    // never writes it back onto an existing same-document field.
     pub fn fix_appearance_inheritance(&mut self) -> Result<()> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(());
@@ -1701,15 +1694,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     ///   non-dictionary `/AcroForm` value is ignored, not rejected.
     /// - Any error propagated from [`copy_objects`] (for example a failed
     ///   [`Pdf::resolve`] on `source`).
-    // qpdf-deviation-start: page-free bulk AcroForm field copy (walking
-    // /AcroForm/Fields directly, merging /DR, rewriting /DA) has no qpdf
-    // counterpart -- qpdf only copies foreign fields via page-anchored
-    // transformAnnotations/fixCopiedAnnotations
-    // (QPDFAcroFormDocumentHelper.cc:698-936) plus name-only
-    // addAndRenameFormFields, and this cluster's own resource-rename scheme
-    // ("_flpdf" suffixes) does not mirror qpdf's actual
-    // QPDFObjectHandle::mergeResources numeric-suffix scheme
-    // (QPDFObjectHandle.cc:1123-1124) either.
     pub fn copy_fields_from<RS: Read + Seek>(
         &mut self,
         source: &mut Pdf<RS>,
@@ -1785,7 +1769,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         self.invalidate_cache();
         Ok(copied_top)
     }
-    // qpdf-deviation-end
 
     fn acroform_ref(&mut self) -> Result<Option<ObjectRef>> {
         let Some(root_ref) = self.pdf.root_ref() else {
