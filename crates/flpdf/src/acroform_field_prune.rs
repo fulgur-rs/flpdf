@@ -293,6 +293,16 @@ fn collect_page_widgets<R: Read + Seek>(
         page.get_annotations_filtered(Some(b"/Widget"))?
     };
     for widget in widgets {
+        // qpdf-deviation: chases flpdf's temporary Pdf::set_object
+        // bare-reference bridge (ObjectValue::Reference) to its terminal
+        // value; qpdf's resolved object graph has no reference-value type
+        // at all (QPDF::resolve, QPDF.cc:1699-1753, never returns a value
+        // that is itself another reference, and QPDF::replaceObject
+        // rejects an indirect handle, QPDF.cc:1980-1991), and
+        // QPDFAcroFormDocumentHelper::traverseField / QPDFJob.cc's field
+        // walk use plain one-hop getKey/getObjGen with no chase loop. Every
+        // other resolve_object_handle_to_terminal call in this file is the
+        // same deviation and is marked individually at its own site.
         let widget = pdf.resolve_object_handle_to_terminal(&widget)?;
         // First-occurrence rule: don't overwrite if already present from a
         // duplicate-page selection (ref_map iteration is in BTreeMap order,
@@ -333,6 +343,8 @@ fn field_has_retained_widget<R: Read + Seek>(
     }
 
     let field = pdf.get_object_handle(field_ref);
+    // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
+    // see collect_page_widgets's marker for the full citation.
     let field = pdf.resolve_object_handle_to_terminal(&field)?;
 
     // A merged field+widget dict is its own widget.
@@ -341,12 +353,16 @@ fn field_has_retained_widget<R: Read + Seek>(
     }
 
     // Walk /Kids: entries may be sub-fields (have /T) or pure widgets.
+    // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
+    // see collect_page_widgets's marker for the full citation.
     let kids = pdf.resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
     let Some(kids_arr) = kids.as_array() else {
         return Ok(false);
     };
 
     for kid in kids_arr {
+        // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
+        // bridge; see collect_page_widgets's marker for the full citation.
         let kid = pdf.resolve_object_handle_to_terminal(&kid)?;
         // qpdf's field-tree traversal ignores direct field/kid entries. Only
         // indirect kids can participate in `/Fields` association; direct
@@ -389,6 +405,8 @@ fn update_widget_page_ref<R: Read + Seek>(
     // owner-repair path below, where each independently cloned dictionary gets
     // the page that contains it.
     let preserve_existing_page = if widget.object_ref().is_some() {
+        // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
+        // bridge; see collect_page_widgets's marker for the full citation.
         let existing_page = pdf.resolve_object_handle_to_terminal(&widget.try_get_key(b"/P")?)?;
         existing_page
             .object_ref()
@@ -430,7 +448,10 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     }
 
     let field = pdf.get_object_handle(field_ref);
+    // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
+    // see collect_page_widgets's marker for the full citation.
     let field = pdf.resolve_object_handle_to_terminal(&field)?;
+    // qpdf-deviation: same bare-reference bridge chase as above.
     let kids = pdf.resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
     let Some(kids_arr) = kids.as_array() else {
         // Leaf node with no /Kids. Merged field+widget dicts that were
@@ -440,6 +461,8 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     };
 
     for kid in kids_arr {
+        // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
+        // bridge; see collect_page_widgets's marker for the full citation.
         let kid = pdf.resolve_object_handle_to_terminal(&kid)?;
         // qpdf ignores direct field-tree entries, so do not promote or mutate
         // a direct `/Kids` member here.
@@ -447,6 +470,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
             continue;
         };
 
+        // qpdf-deviation: same bare-reference bridge chase as above.
         let subtype = pdf.resolve_object_handle_to_terminal(&kid.try_get_key(b"/Subtype")?)?;
         let is_widget = subtype.as_name().as_deref() == Some(b"Widget".as_slice());
 

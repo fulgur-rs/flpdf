@@ -1971,6 +1971,11 @@ impl StreamFilter for CryptStreamFilter {
     /// `filters::reject_crypt_stage`. Sharing that provider's message — the
     /// same constant, not a second copy of it — is what keeps the public error
     /// unchanged if decoding is ever routed here instead.
+    // qpdf-deviation: no qpdf counterpart -- QPDFStreamFilter has no
+    // execute-time decode call (only setDecodeParms/getDecodePipeline), so
+    // this call shape (invoking a Crypt stage's decode step directly) is one
+    // qpdf can never produce; this refusal guards flpdf's own registry route
+    // rather than reproducing any qpdf behavior.
     fn pipe_decode_recovering(
         &mut self,
         _data: &[u8],

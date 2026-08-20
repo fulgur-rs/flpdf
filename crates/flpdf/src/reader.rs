@@ -2404,6 +2404,13 @@ impl<R: Read + Seek> Pdf<R> {
         trailer_refs
     }
 
+    // qpdf-deviation-start: registers the target handle of a bare top-level
+    // ObjectValue::Reference redirect (producible only via Pdf::set_object)
+    // so get_all_objects enumerates it; qpdf's top-level QPDFParser::parse
+    // (QPDFParser.cc:87-88) never attempts an N-G-R lookahead and
+    // QPDF::replaceObject (QPDF.cc:1980-1991) rejects an indirect handle, so
+    // qpdf's object graph can never hold this redirect shape and has no
+    // matching registration step.
     fn register_top_level_replacement_targets(&mut self) {
         // A bare `Object::Reference` supplied to `set_object` is represented
         // as an `ObjectValue::Reference` on the holder itself. Unlike an
@@ -2425,6 +2432,7 @@ impl<R: Read + Seek> Pdf<R> {
             self.get_object_handle(object_ref);
         }
     }
+    // qpdf-deviation-end
 
     /// Return qpdf's complete canonical object cache in `ObjectRef` order.
     ///
@@ -2664,6 +2672,11 @@ impl<R: Read + Seek> Pdf<R> {
             // `None` for an originally-direct handle.
             return Ok((handle.clone(), handle.object_ref()));
         };
+        // qpdf-deviation-start: chases a stored reference-as-value redirect
+        // across multiple hops. Only Pdf::set_object can create this shape;
+        // qpdf's QPDF::replaceObject (libqpdf/QPDF.cc:1980-1991) rejects an
+        // indirect replacement, so a parsed qpdf object graph can never hold
+        // a reference whose own value is another reference to chase here.
         for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
             let hop = self.get_object_handle(current_ref);
             self.resolve_object_handle(&hop)?;
@@ -2709,6 +2722,7 @@ impl<R: Read + Seek> Pdf<R> {
         // live-looking ref would let a caller compute an "offset of
         // terminal" for an object it was just told is null.
         Ok((ObjectHandle::null(), None))
+        // qpdf-deviation-end
     }
 
     fn lift_bounded(
@@ -2820,6 +2834,13 @@ impl<R: Read + Seek> Pdf<R> {
                 // recursive follow) -- `ObjectValue::Reference` is the handle
                 // graph's representation for exactly that case; see its own
                 // doc.
+                // qpdf-deviation: ObjectValue::Reference as an indirect
+                // object's own resolved value has no qpdf counterpart --
+                // QPDF::replaceObject/replaceReserved (QPDF.cc:1985-2016)
+                // both reject an indirect handle as a replacement value, and
+                // QPDFParser::parse never looks ahead for "N G R" at the top
+                // level, so only Pdf::set_object callers construct this
+                // redirect shape.
                 Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
                 Object::Operator(bytes) if allow_content_tokens => {
                     ObjectValue::Operator(bytes.clone())

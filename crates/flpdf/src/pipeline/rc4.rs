@@ -72,6 +72,11 @@ impl<'a> PlRc4<'a> {
         rc4: Rc4,
         out_buffer_size: usize,
     ) -> PipelineResult<Self> {
+        // qpdf-deviation: Pl_RC4's constructor (libqpdf/Pl_RC4.cc:5-16)
+        // never validates out_bufsize and 0 would spin forever in write();
+        // unreachable from any real PDF path since qpdf's own two call
+        // sites and every flpdf production caller pass the fixed default
+        // buffer size.
         if out_buffer_size == 0 {
             return Err(PipelineError::logic(
                 "Pl_RC4: output buffer size must be greater than zero",

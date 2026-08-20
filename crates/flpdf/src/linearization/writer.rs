@@ -3282,6 +3282,12 @@ fn write_pass1_debug_comments(writer: &mut dyn Write, comments: &[u8]) {
 /// not have one entry for every page hint. `from_pdf` always preserves this
 /// alignment; keeping the check separate makes the hand-built-plan failure
 /// observable without forcing a malformed plan through the full writer.
+// qpdf-deviation-start: no qpdf counterpart validates a persisted plan's
+// per_page_private_objects/page_hints vector-length agreement; qpdf computes
+// both inline in one pass (QPDF_linearization.cc calculateLinearizationData)
+// with no separate externally-constructible plan struct, and this Err arm is
+// reachable only via flpdf's own #[cfg(test)] hand-built-plan entry points,
+// never from parsing a real PDF.
 fn validate_per_page_private_objects(plan: &LinearizationPlan) -> Result<()> {
     if plan.per_page_private_objects.len() != plan.page_hints.len() {
         return Err(crate::Error::Unsupported(format!(
@@ -3293,6 +3299,7 @@ fn validate_per_page_private_objects(plan: &LinearizationPlan) -> Result<()> {
     }
     Ok(())
 }
+// qpdf-deviation-end
 
 fn write_linearized_impl<R: Read + Seek>(
     plan: &LinearizationPlan,

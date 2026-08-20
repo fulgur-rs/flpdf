@@ -261,6 +261,9 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     // explicit chase or the entry both serializes the wrong value and
     // (for a redirect-to-stream) is misrouted below, since `type_code()`
     // on the un-chased holder reports 13 (unresolved/reference), never 10.
+    // qpdf-deviation: chases a Pdf::set_object bare-reference redirect, a
+    // shape with no qpdf counterpart (QPDF::replaceObject rejects indirect
+    // replacement, libqpdf/QPDF.cc:1980-1991).
     let handle = pdf
         .resolve_object_handle_to_terminal(handle)
         .map_err(ConvertError::from)?;
@@ -311,6 +314,9 @@ fn write_file_mode_object_entry<R: Read + Seek>(
 
     // See the non-file writer: chase a `Pdf::set_object` bare-reference
     // redirect to its terminal value before dispatching.
+    // qpdf-deviation: chases a Pdf::set_object bare-reference redirect, a
+    // shape with no qpdf counterpart (QPDF::replaceObject rejects indirect
+    // replacement, libqpdf/QPDF.cc:1980-1991).
     let handle = pdf
         .resolve_object_handle_to_terminal(handle)
         .map_err(ConvertError::from)?;

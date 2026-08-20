@@ -186,6 +186,9 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// returned unchanged. Keeping this compatibility chase handle-native
     /// lets the outline consumer preserve live identity without reopening the
     /// raw `Object` route while the legacy replacement bridge is removed.
+    // qpdf-deviation: chases a Pdf::set_object bare-reference redirect that
+    // has no qpdf counterpart (QPDF::replaceObject rejects indirect
+    // replacement, libqpdf/QPDF.cc:1986-1991).
     fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle_to_terminal(&handle)
     }

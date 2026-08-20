@@ -155,6 +155,9 @@ pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
         // through that legacy mutation bridge is not a parsed qpdf object
         // shape. Do not classify its synthetic-null fallback as qpdf's
         // null-as-absent inheritance rule.
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_object_handle_to_terminal_ref).
         let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
         if !terminal.try_is_null()? {
             return Ok(Some(value));
@@ -425,6 +428,11 @@ fn collect_content_stream_entries<R: Read + Seek>(
         // full holder chain (`ref → ref → …`) once, then dispatch on the
         // terminal type so a doubly-indirect /Contents is not dropped.
         Object::Reference(_) => {
+            // qpdf-deviation: chases the holder chain past the first hop;
+            // qpdf's QPDFParser::parse never collapses a top-level object
+            // body into a Reference, so a value that resolves to another
+            // Reference cannot arise from parsing a real PDF -- only via
+            // flpdf's own Pdf::set_object.
             let (resolved, last) = resolve_ref_chain(pdf, contents)?;
             match resolved {
                 Object::Stream(s) => Ok(vec![(last, s)]),
@@ -471,6 +479,9 @@ fn collect_content_array_entries<R: Read + Seek>(
             // Follow the full holder chain per element so a doubly-indirect
             // array entry (`ref → ref → stream`) is not dropped.
             Object::Reference(r) => {
+                // qpdf-deviation: chases the holder chain past the first
+                // hop; see collect_content_stream_entries's marker for the
+                // full citation.
                 let (obj, last) = resolve_ref_chain(pdf, elem)?;
                 match obj.into_stream() {
                     Some(s) => out.push((last, s)),

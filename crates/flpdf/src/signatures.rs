@@ -184,10 +184,14 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         // target may be garbage-collected on a full rewrite), so only a
         // prior value that was *already* a direct integer 0 counts as
         // unchanged.
+        // qpdf-deviation-start: `changed` has no qpdf counterpart --
+        // QPDF::removeSecurityRestrictions is void, so nothing classifies
+        // the prior /SigFlags value.
         let previous = acroform.try_get_key(b"/SigFlags")?;
         let previous_resolved = pdf.resolve_object_handle_to_terminal(&previous)?;
         let already_zero =
             previous.object_ref().is_none() && previous_resolved.as_integer() == Some(0);
+        // qpdf-deviation-end
         acroform.replace_key(b"/SigFlags", ObjectHandle::integer(0))?;
         pdf.mark_object_handle_dirty(&acroform)?;
         if !already_zero {

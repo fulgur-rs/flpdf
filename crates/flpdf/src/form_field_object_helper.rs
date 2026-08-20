@@ -722,7 +722,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         // value. If the legacy redirect route has staged one here, expose
         // qpdf's null result at this document-level accessor rather than
         // leaking that obsolete representation through `/DR`.
+        // qpdf-deviation-start: qpdf's object model has no reference-valued
+        // object type at all (no QPDF_Reference class exists in libqpdf/),
+        // so getFieldFromAcroForm (QPDFFormFieldObjectHelper.cc:50-63)
+        // never checks for one; this filter exists only to catch flpdf's
+        // own Pdf::set_object legacy bare-reference redirect shape, which
+        // flpdf's own canonical parser also never produces.
         Ok((!value.is_null() && value.as_reference().is_none()).then_some(value))
+        // qpdf-deviation-end
     }
 
     fn utf8_string(value: &[u8]) -> String {

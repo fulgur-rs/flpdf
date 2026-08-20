@@ -94,11 +94,18 @@ impl<'a> PlSha2<'a> {
             ));
         }
         let identifier = &self.identifier;
+        // qpdf-deviation-start: Pl_SHA2::getRawDigest (Pl_SHA2.cc:59-66)
+        // unconditionally dereferences `crypto` here with no guard; if
+        // resetBits() was called but finalize() never was, it reads
+        // SHA2_native's raw C digest arrays before they are written --
+        // genuinely uninitialized memory (UB). This converts that into a
+        // defined logic error.
         self.raw_digest.as_deref().ok_or_else(|| {
             PipelineError::logic(format!(
                 "{identifier}: Pl_SHA2: digest requested before finish() computed one"
             ))
         })
+        // qpdf-deviation-end
     }
 
     pub(crate) fn get_hex_digest(&self) -> PipelineResult<String> {
@@ -114,12 +121,20 @@ impl Pipeline for PlSha2<'_> {
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
         let digest = match self.digest.as_mut() {
             Some(digest) => digest,
+            // qpdf-deviation-start: Pl_SHA2::write (Pl_SHA2.cc:17-37) has
+            // no guard here -- it unconditionally dereferences a
+            // default-constructed (null) `crypto` shared_ptr when bits=0
+            // was left uncommitted (resetBits() never called); this
+            // converts qpdf's null-pointer UB into a defined logic error.
+            // Unreachable from any parsed PDF: PlSha2 is pub(crate) and
+            // its only production caller (security/standard.rs) always
+            // passes bits in {256,384,512}.
             None => {
                 let identifier = &self.identifier;
                 return Err(PipelineError::logic(format!(
                     "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
                 )));
-            }
+            } // qpdf-deviation-end
         };
         self.in_progress = true;
         digest.update(data);
@@ -140,10 +155,15 @@ impl Pipeline for PlSha2<'_> {
             self.in_progress = false;
             return Ok(());
         }
+        // qpdf-deviation-start: Pl_SHA2::finish (Pl_SHA2.cc:39-47)
+        // unconditionally dereferences `crypto` here too, with the same
+        // null-pointer UB when bits=0 was left uncommitted; converts it
+        // into a defined logic error instead.
         let identifier = &self.identifier;
         Err(PipelineError::logic(format!(
             "{identifier}: Pl_SHA2: finish() called before resetBits() selected a digest size"
         )))
+        // qpdf-deviation-end
     }
 }
 

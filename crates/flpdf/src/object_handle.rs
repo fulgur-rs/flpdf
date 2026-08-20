@@ -942,6 +942,10 @@ pub(crate) enum ObjectValue {
     // array/dictionary entry that is a reference is represented as a
     // separate indirect `ObjectHandle`, never this variant -- see
     // `Pdf::lift_to_handle` and `materialize`'s own doc.
+    // qpdf-deviation: only Pdf::set_object builds an indirect object whose
+    // own resolved value is a bare reference; QPDF::replaceObject
+    // (QPDF.cc:1986-1991) throws on an indirect replacement and a top-level
+    // bare reference parses as Integer, so qpdf can never hold this shape.
     Reference(ObjectRef),
 }
 

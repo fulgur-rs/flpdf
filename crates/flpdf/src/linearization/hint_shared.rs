@@ -318,6 +318,16 @@ impl SharedObjectHintTable {
         // section by physical object number, so it is the entry at index
         // `first_page_entries` — 0 when there is no Part-8 section (meaningless per
         // Implementation Note 131; qpdf emits 0 too).
+        // qpdf-deviation-start: sentinel dispatch (generation==u16::MAX) has
+        // no qpdf counterpart -- qpdf's containers get a real original
+        // QPDFObjGen from makeIndirectObject (QPDFWriter.cc
+        // generateObjectStreams) and resolve uniformly via a single total
+        // obj_renumber map (QPDF_linearization.cc:1598); flpdf's
+        // RenumberMap never registers an original identity for containers
+        // (their number is assigned directly while building the renumber
+        // table), so this branch exists only to avoid aliasing a
+        // container's new number with an unrelated original object's
+        // number.
         let first_object_number: u32 =
             shared_hints
                 .get(first_page_entries as usize)
@@ -330,6 +340,7 @@ impl SharedObjectHintTable {
                             .map_or(0, |r| r.number)
                     }
                 });
+        // qpdf-deviation-end
 
         // ------------------------------------------------------------------
         // Step 3: build header bit-width fields.
