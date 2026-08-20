@@ -3014,8 +3014,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // the graph the walk numbers. Running this after the walk (as an earlier
     // version of this function did) left freshly-minted refs outside every
     // numbering map, causing a hard failure for a page tree that needed
-    // repair in QDF/content-normalization mode.
-    let qdf_page_refs = if options.qdf || options.content_normalization {
+    // repair in QDF/content-normalization/non-none-decode mode.
+    let qdf_page_refs = if options.qdf
+        || options.content_normalization
+        || options.decode_level != DecodeLevel::None
+    {
         Some(crate::PageDocumentHelper::new(pdf).get_all_pages()?)
     } else {
         None
