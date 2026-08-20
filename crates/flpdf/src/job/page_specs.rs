@@ -7,7 +7,9 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use crate::page_label_document_helper::LabelRange;
-use crate::page_merge::{merge_documents_with_resource_mode, MergeInput};
+use crate::page_merge::{
+    merge_documents_with_resource_mode, source_top_level_field_names, MergeInput,
+};
 use crate::page_plan::PagePlan;
 use crate::resources::RemoveUnreferencedResources;
 use crate::{
@@ -169,6 +171,18 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
 ) -> Result<()> {
     debug_assert_eq!(ordered_pages.len(), final_refs.len());
 
+    // qpdf analyzes the primary AcroForm before its final unselected-page
+    // prune (`QPDFJob.cc:2516-2521,2600-2629`). Keep every original primary
+    // top-level name visible to each later copy event, even when that field's
+    // page is not selected and its object is absent from the rebuilt `/Fields`.
+    let primary_field_names: BTreeSet<Vec<u8>> = match sources.first_mut() {
+        Some(primary) => source_top_level_field_names(primary)?
+            .into_iter()
+            .filter_map(|(_, name)| name)
+            .collect(),
+        None => BTreeSet::new(),
+    };
+
     // Resolve source page refs once, before the occurrence replay mutably
     // borrows individual source documents.
     let source_page_refs: Vec<Vec<ObjectRef>> = sources
@@ -266,12 +280,21 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
             // not create or merge a foreign destination `/DR`.
             let source_page = merged.get_object_handle(first_output_page);
             PageObjectHelper::new(final_refs[output_index], merged)
-                .copy_annotations(source_page, Matrix::default())?;
+                .copy_annotations_with_reserved_names(
+                    source_page,
+                    Matrix::default(),
+                    &primary_field_names,
+                )?; // cov:ignore: valid page selections exercise this route; malformed copy errors are covered by helper tests.
         } else {
             let source_page = sources[source_index].get_object_handle(source_page_ref);
             let source = &mut sources[source_index];
             let mut destination = PageObjectHelper::new(final_refs[output_index], merged);
-            destination.copy_annotations_from(source_page, Matrix::default(), source)?;
+            destination.copy_annotations_from_with_reserved_names(
+                source_page,
+                Matrix::default(),
+                source,
+                &primary_field_names,
+            )?; // cov:ignore: valid page selections exercise this route; malformed copy errors are covered by helper tests.
         }
     }
 

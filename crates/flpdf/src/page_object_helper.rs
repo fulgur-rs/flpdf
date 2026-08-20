@@ -134,7 +134,7 @@ use crate::tokenizer::{Token, TokenType};
 use crate::writer::DecodeLevel;
 use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -1003,6 +1003,17 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// (`libqpdf/QPDFPageObjectHelper.cc:992-1039`). The canonical AcroForm
     /// helper owns field-tree copying and qualified-name renaming.
     pub fn copy_annotations(&mut self, from_page: ObjectHandle, cm: Matrix) -> Result<()> {
+        self.copy_annotations_with_reserved_names(from_page, cm, &BTreeSet::new())
+    }
+
+    /// Same-document annotation copy with qpdf's still-live primary field-name
+    /// reservations applied to collision renaming.
+    pub(crate) fn copy_annotations_with_reserved_names(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_same_document_page_handle(self.pdf, &from_page)?;
@@ -1016,7 +1027,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let transformed = {
             let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
             let transformed = acroform.transform_annotations(old_annots, cm)?;
-            acroform.add_and_rename_form_fields(transformed.new_fields.clone())?;
+            acroform.add_and_rename_form_fields_with_reserved_names(
+                transformed.new_fields.clone(),
+                reserved_names,
+            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
             transformed
         };
         append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
@@ -1036,6 +1050,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         cm: Matrix,
         source: &mut Pdf<RS>,
     ) -> Result<()> {
+        self.copy_annotations_from_with_reserved_names(from_page, cm, source, &BTreeSet::new())
+    }
+
+    /// Foreign-document annotation copy with qpdf's still-live primary
+    /// field-name reservations applied to collision renaming.
+    pub(crate) fn copy_annotations_from_with_reserved_names<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
@@ -1048,7 +1074,10 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let transformed = {
             let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
             let transformed = acroform.transform_annotations_from(old_annots, cm, source)?;
-            acroform.add_and_rename_form_fields(transformed.new_fields.clone())?;
+            acroform.add_and_rename_form_fields_with_reserved_names(
+                transformed.new_fields.clone(),
+                reserved_names,
+            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
             transformed
         };
         append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;

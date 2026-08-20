@@ -489,6 +489,11 @@ struct PrimaryAcroForm {
     /// gate, `QPDFJob.cc:2609-2610`). Drives [`build_merged_acroform`]'s
     /// decision to rebuild or remove `/AcroForm`, independent of `/DR`/`/DA`.
     had_fields_array: bool,
+    /// Original names of every primary top-level field, including fields on
+    /// pages that are not selected. qpdf keeps those fields in its collision
+    /// index until the final page-pruning pass (`QPDFJob.cc:2516-2521,
+    /// 2600-2629`), so later inputs must not reuse their names or suffixes.
+    original_field_names: BTreeSet<Vec<u8>>,
 }
 
 /// Read the primary input's `/AcroForm /DR` and `/DA`, returning them with the
@@ -532,7 +537,7 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
 /// fields, in `/Fields` order, paired with the source field ref so a caller can
 /// map the ref through that input's copy map. A field whose `/T` is absent
 /// yields `None`.
-fn source_top_level_field_names<R: Read + Seek>(
+pub(crate) fn source_top_level_field_names<R: Read + Seek>(
     source: &mut Pdf<R>,
 ) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
     let top_fields = source.acroform().top_level_fields()?;
@@ -644,7 +649,7 @@ fn build_merged_acroform<R: Read + Seek>(
     // Seed `used` with the primary's field names (verbatim — the primary is the
     // base document and is never renamed), then append every kept field, in
     // order, renaming later inputs' colliding names via the qpdf `+N` rule.
-    let mut used: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut used = primary.original_field_names.clone();
     for field in kept {
         if field.is_primary {
             if let Some(name) = &field.partial_name {
@@ -1144,6 +1149,13 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
         // Source top-level field names, read before the copy severs numbering;
         // each is mapped through this input's copy map below.
         let source_fields = source_top_level_field_names(input.source)?;
+        if is_primary {
+            primary_acroform.original_field_names.extend(
+                source_fields
+                    .iter()
+                    .filter_map(|(_, name)| name.as_ref().cloned()),
+            );
+        }
 
         let all = page_refs(input.source)?;
         // Resolve the selected source page refs (range-checked, duplicates

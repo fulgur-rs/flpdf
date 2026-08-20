@@ -526,6 +526,45 @@ fn acroform_all_fields_on_page_two_pdf() -> Vec<u8> {
     ])
 }
 
+/// Two-page primary with `F` on the selected first page and `F+1` on the
+/// unselected second page. The latter name must still reserve its slot while
+/// qpdf copies a colliding field from a later input.
+fn acroform_primary_with_unselected_collision_name_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [5 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [7 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (F) \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"6 0 obj\n<< /Fields [5 0 R 7 0 R] >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (F+1) \
+          /Rect [0 0 10 10] /P 4 0 R >>\nendobj\n"
+            .to_vec(),
+    ])
+}
+
+/// Single-page secondary whose field collides with the primary's selected
+/// field and must therefore skip both primary names, `F` and `F+1`.
+fn acroform_secondary_collision_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (F) \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Fields [4 0 R] >>\nendobj\n".to_vec(),
+    ])
+}
+
 /// Unrelated single-page source with no AcroForm at all.
 fn plain_page_pdf() -> Vec<u8> {
     assemble_pdf(&[
@@ -650,5 +689,69 @@ fn acroform_with_all_fields_on_unselected_pages_is_removed_in_a_multi_source_mer
     assert_eq!(
         flpdf_json["acroform"]["hasacroform"], qpdf_json["acroform"]["hasacroform"],
         "flpdf must also drop the AcroForm rather than leaving an empty /Fields"
+    );
+}
+
+/// qpdf keeps all primary field names in its collision index until the final
+/// unselected-page cleanup (`QPDFJob.cc:2516-2521,2600-2629`). Therefore a
+/// later `F` must become `F+2` when the primary's unselected field is already
+/// named `F+1`, even though that primary field is absent from the output.
+#[test]
+fn unselected_primary_field_names_reserve_later_collision_suffixes() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(
+        &primary,
+        acroform_primary_with_unselected_collision_name_pdf(),
+    )
+    .expect("write primary");
+    std::fs::write(&secondary, acroform_secondary_collision_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_fields = observable_fields(&qpdf_acroform_json(&qpdf_output));
+    let flpdf_fields = observable_fields(&acroform_json(&flpdf_output));
+    assert_eq!(
+        qpdf_fields,
+        vec![
+            serde_json::json!({"partialname": "F", "pageposfrom1": 1}),
+            serde_json::json!({"partialname": "F+2", "pageposfrom1": 2}),
+        ],
+        "qpdf reserves the unselected primary field name"
+    );
+    assert_eq!(
+        flpdf_fields, qpdf_fields,
+        "flpdf must reserve every primary original field name before renaming foreign fields"
     );
 }

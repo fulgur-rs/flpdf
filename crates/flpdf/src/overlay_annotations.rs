@@ -503,8 +503,8 @@ impl DrMap {
 /// Returns the newly-added top-level field dest refs (one per distinct top
 /// field observed in this placement), to be collected across all placements
 /// on the dest page and passed to
-/// [`crate::AcroFormDocumentHelper::add_and_rename_form_fields`] once at the
-/// end.
+/// [`crate::AcroFormDocumentHelper::add_and_rename_form_fields_with_reserved_names`]
+/// once at the end.
 ///
 pub(crate) fn apply_placement<R: Read + Seek>(
     dest: &mut Pdf<R>,

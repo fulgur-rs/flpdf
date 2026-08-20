@@ -1084,14 +1084,26 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// `:235-362`). Fully-qualified names follow
     /// `QPDFFormFieldObjectHelper::getFullyQualifiedName`
     /// (`QPDFFormFieldObjectHelper.cc:104-127`).
+    #[cfg(test)]
     #[allow(clippy::mutable_key_type)]
     pub(crate) fn add_and_rename_form_fields(&mut self, fields: Vec<ObjectHandle>) -> Result<()> {
+        self.add_and_rename_form_fields_with_reserved_names(fields, &BTreeSet::new())
+    }
+
+    /// Append copied fields while reserving primary names that qpdf keeps in
+    /// its live collision index during `--pages` selection.
+    #[allow(clippy::mutable_key_type)]
+    pub(crate) fn add_and_rename_form_fields_with_reserved_names(
+        &mut self,
+        fields: Vec<ObjectHandle>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
         if fields.is_empty() {
             return Ok(());
         }
 
         self.analyze()?;
-        let existing_names: BTreeSet<String> = self
+        let mut existing_names: BTreeSet<String> = self
             .cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache")
@@ -1099,6 +1111,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             .keys()
             .cloned()
             .collect();
+        existing_names.extend(reserved_names.iter().map(|name| decode_field_name(name)));
         let mut renames = BTreeMap::<String, Vec<u8>>::new();
         let mut seen = HashSet::new();
         let mut queue: VecDeque<ObjectHandle> = fields.iter().cloned().collect();
