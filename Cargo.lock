@@ -339,6 +339,7 @@ dependencies = [
  "flpdf-libjpeg-compat",
  "getrandom",
  "hex",
+ "libc",
  "libjpeg-turbo-rs",
  "md-5",
  "serde_json",
@@ -347,6 +348,7 @@ dependencies = [
  "stringprep",
  "tempfile",
  "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
