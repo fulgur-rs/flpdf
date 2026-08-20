@@ -6000,6 +6000,42 @@ fn add_attachment_default_key_is_basename() {
 }
 
 #[test]
+fn add_attachment_repeated_segments_are_processed_as_one_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let first = temp.path().join("first.txt");
+    let second = temp.path().join("second.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&first, b"first").unwrap();
+    std::fs::write(&second, b"second").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            first.to_str().unwrap(),
+            "--key=one",
+            "--",
+            "--add-attachment",
+            second.to_str().unwrap(),
+            "--key=two",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("one"))
+        .stdout(predicate::str::contains("two"));
+}
+
+#[test]
 fn add_attachment_missing_path_fails_before_writing_output() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();

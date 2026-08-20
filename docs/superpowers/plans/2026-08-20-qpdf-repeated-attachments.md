@@ -9,23 +9,23 @@ one flpdf batch attachment job.
 
 - [x] Read qpdf 11.9.0 repeated attachment source paths and run the live probe.
 - [x] Create the design and implementation plan documents.
-- [ ] Commit the design baseline after `cargo check -p flpdf-cli`.
+- [x] Commit the design baseline after `cargo check -p flpdf-cli`.
 
 ### Task 2: RED regression
 
-- [ ] Add an end-to-end CLI test with two terminated attachment segments and
+- [x] Add an end-to-end CLI test with two terminated attachment segments and
   distinct keys.
-- [ ] Add raw-segment extraction tests for one and two groups.
-- [ ] Run the focused tests and record the current flattening failure.
+- [x] Add raw-segment extraction tests for one and two groups.
+- [x] Run the focused tests and record the current flattening failure.
 
 ### Task 3: Implement batch routing
 
-- [ ] Extract repeated attachment groups from raw argv while retaining a valid
+- [x] Extract repeated attachment groups from raw argv while retaining a valid
   clap dispatch marker.
-- [ ] Parse every group and call one `QPDFJob::add_attachments` batch.
-- [ ] Preserve singular syntax, ordering, duplicate aggregation, and output
+- [x] Parse every group and call one `QPDFJob::add_attachments` batch.
+- [x] Preserve singular syntax, ordering, duplicate aggregation, and output
   warning behavior.
-- [ ] Run focused GREEN tests and the repeated-segment live probe.
+- [x] Run focused GREEN tests and the repeated-segment live probe.
 
 ### Task 4: Verify and hand off
 
