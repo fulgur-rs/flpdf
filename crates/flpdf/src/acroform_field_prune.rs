@@ -388,17 +388,19 @@ fn update_widget_page_ref<R: Read + Seek>(
     // for indirect widgets. Direct inline widgets remain on the historical
     // owner-repair path below, where each independently cloned dictionary gets
     // the page that contains it.
-    if widget.object_ref().is_some() {
+    let preserve_existing_page = if widget.object_ref().is_some() {
         let existing_page = pdf.resolve_object_handle_to_terminal(&widget.try_get_key(b"/P")?)?;
-        if let Some(existing_ref) = existing_page.object_ref() {
-            if retained_page_refs.contains(&existing_ref) {
-                return Ok(());
-            }
-        }
+        existing_page
+            .object_ref()
+            .is_some_and(|existing_ref| retained_page_refs.contains(&existing_ref))
+    } else {
+        false
+    };
+    if !preserve_existing_page {
+        let page = pdf.get_object_handle(new_page_ref);
+        widget.replace_key(b"/P", page)?;
+        pdf.mark_object_handle_dirty(widget)?;
     }
-    let page = pdf.get_object_handle(new_page_ref);
-    widget.replace_key(b"/P", page)?;
-    pdf.mark_object_handle_dirty(widget)?;
     Ok(())
 }
 
@@ -765,6 +767,22 @@ mod tests {
 
         let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
         update_widget_page_ref(&mut pdf, &widget, ObjectRef::new(3, 0), &retained).unwrap();
+    }
+
+    #[test]
+    fn retained_indirect_widget_keeps_existing_page_reference() {
+        let mut pdf = open(build_acroform_pdf());
+        let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
+        let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
+
+        update_widget_page_ref(&mut pdf, &widget, ObjectRef::new(4, 0), &retained).unwrap();
+
+        let widget_dict = dict_of(&mut pdf, ObjectRef::new(7, 0));
+        assert_eq!(
+            widget_dict.get("P"),
+            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            "an indirect widget already owned by a retained page must keep /P"
+        );
     }
 
     #[test]

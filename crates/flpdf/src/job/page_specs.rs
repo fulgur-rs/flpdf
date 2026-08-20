@@ -62,10 +62,9 @@ fn collect_primary_fields(
             let widgets = acroform.get_widget_annotations_for_page(page_ref)?;
             for widget in widgets {
                 let field = acroform.get_field_for_annotation_handle(widget)?;
-                let Some(field_ref) = field.object_ref() else {
-                    continue;
-                };
-                field_refs.insert(acroform.get_top_level_field(field_ref)?);
+                if let Some(field_ref) = field.object_ref() {
+                    field_refs.insert(acroform.get_top_level_field(field_ref)?);
+                } // cov:ignore: structural brace has no LLVM executable counter
             }
         }
     }
@@ -229,11 +228,9 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
                 .copy_annotations(source_page, Matrix::default())?;
         } else {
             let source_page = sources[source_index].get_object_handle(source_page_ref);
-            PageObjectHelper::new(final_refs[output_index], merged).copy_annotations_from(
-                source_page,
-                Matrix::default(),
-                &mut sources[source_index],
-            )?;
+            let source = &mut sources[source_index];
+            let mut destination = PageObjectHelper::new(final_refs[output_index], merged);
+            destination.copy_annotations_from(source_page, Matrix::default(), source)?;
         }
     }
 
@@ -528,6 +525,13 @@ mod tests {
         .expect("open three-page fixture")
     }
 
+    fn acroform_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        Pdf::open_mem_owned(
+            include_bytes!("../../../../tests/fixtures/compat/acroform-sig-widget.pdf").to_vec(),
+        )
+        .expect("open AcroForm fixture")
+    }
+
     fn inherited_resources_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open_mem_owned(
             include_bytes!("../../../../tests/fixtures/compat/inherited-resources-one-page.pdf")
@@ -577,6 +581,42 @@ mod tests {
             &[invalid_final_ref],
         )
         .expect_err("an invalid destination page must escape the foreign copy route");
+    }
+
+    #[test]
+    fn rebuild_acroform_uses_foreign_copy_route_for_secondary_acroform() {
+        let mut merged = three_page_pdf();
+        let mut sources = vec![three_page_pdf(), acroform_pdf()];
+
+        rebuild_acroform_in_final_page_order(
+            &mut merged,
+            &mut sources,
+            &[vec![], vec![0]],
+            &[(1, 0)],
+            &[ObjectRef::new(3, 0)],
+        )
+        .expect("a secondary AcroForm page must use the foreign copy route");
+    }
+
+    #[test]
+    fn collect_primary_fields_ignores_direct_field_handles() {
+        let mut merged = three_page_pdf();
+        let page_ref = crate::pages::page_refs(&mut merged).unwrap()[0];
+        let page = merged.get_object_handle(page_ref);
+        let widget = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Annot".to_vec())),
+            (b"Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+        ]);
+        page.replace_key(b"/Annots", ObjectHandle::array(vec![widget]))
+            .unwrap();
+        merged.mark_object_handle_dirty(&page).unwrap();
+
+        assert!(
+            collect_primary_fields(&mut merged, &[page_ref])
+                .unwrap()
+                .is_empty(),
+            "direct field handles have no stable top-level object identity"
+        );
     }
 
     #[test]
