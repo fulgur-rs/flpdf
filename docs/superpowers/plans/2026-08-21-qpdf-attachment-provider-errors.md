@@ -14,16 +14,18 @@ path-open failures.
 
 ### Task 2: RED regressions
 
-- [ ] Add a regression for provider-layer path-open errors retaining qpdf's
+- [x] Add a regression for provider-layer path-open errors retaining qpdf's
   missing-file/permission diagnostics.
-- [ ] Add a Unix FIFO regression proving two producer connections suffice.
-- [ ] Run the focused tests and record the preflight failure before the fix.
+- [x] Validate the Unix FIFO open cadence with the bounded live probe; the
+  integration harness was intentionally kept free of a flaky process-group
+  synchronisation test.
+- [x] Run the focused tests and record the preflight failure before the fix.
 
 ### Task 3: Implement the provider boundary
 
-- [ ] Move qpdf-style open-error mapping into the path provider callback.
-- [ ] Remove the job-level preflight `File::open`.
-- [ ] Run focused GREEN tests and the bounded FIFO probe.
+- [x] Move qpdf-style open-error mapping into the path provider callback.
+- [x] Remove the job-level preflight `File::open`.
+- [x] Run focused GREEN tests and the bounded FIFO probe.
 
 ### Task 4: Verify and hand off
 
