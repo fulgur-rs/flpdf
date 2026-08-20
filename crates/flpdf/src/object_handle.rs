@@ -9787,12 +9787,11 @@ fn unparse_trailer_entries_with_ref_map(
     let mut id_value: Option<&ObjectHandle> = None;
     let mut encrypt_value: Option<&ObjectHandle> = None;
     for (key, value) in entries {
-        if suppress_null_values && value.try_is_null()? {
-            continue;
-        }
-        if is_removed_reference(value, removed_refs) {
-            continue;
-        }
+        // `/ID` and `/Encrypt` are installed by the writer in output space.
+        // They must not be discarded because their output reference happens
+        // to reuse an object number recorded in the source-side removal set.
+        // qpdf's writeTrailer handles these writer-owned keys separately from
+        // the ordinary trailer-child filtering (`QPDFWriter.cc:1174-1192`).
         match key.as_slice() {
             b"/ID" => {
                 id_value = Some(value);
@@ -9803,6 +9802,12 @@ fn unparse_trailer_entries_with_ref_map(
                 continue;
             }
             _ => {}
+        }
+        if suppress_null_values && value.try_is_null()? {
+            continue;
+        }
+        if is_removed_reference(value, removed_refs) {
+            continue;
         }
 
         if qdf {
