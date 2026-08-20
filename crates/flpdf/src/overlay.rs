@@ -27,10 +27,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+use crate::page_document_helper::PageDocumentHelper;
 use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
 use crate::page_range::PageRange;
-use crate::pages::page_refs;
 use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
@@ -447,7 +447,7 @@ where
     // Snapshot the source page list before mutating `dest`. The applied patches
     // change page dictionaries in place but never reorder or remove page
     // objects, so the 1-based page numbers stay valid.
-    let source_pages = page_refs(source)?;
+    let source_pages = PageDocumentHelper::new(source).get_all_pages()?;
     let n_source = u32_len(source_pages.len());
     let pairs = resolve_spec_pairs(n_source, from, to, repeat, n_dest)?;
 
@@ -570,7 +570,7 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    let n_dest = u32_len(page_refs(dest)?.len());
+    let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
     let sources = spec_page_sources(dest, source, kind, from, to, repeat, n_dest, 0)?;
     let mut source_documents = [source];
     apply_aggregated_sources(
@@ -647,16 +647,18 @@ where
 ///
 /// # Errors
 ///
-/// Propagates any error from [`page_refs`], [`page_ref_for`], the placement
+/// Propagates any error from [`PageDocumentHelper::get_all_pages`], [`page_ref_for`], the placement
 /// facade, or the source document handles.
 fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
     dest: &mut Pdf<R>,
     by_page: BTreeMap<u32, Vec<OverlaySource>>,
     source_documents: &mut [&mut Pdf<RS>],
 ) -> Result<()> {
-    // Snapshot the dest page refs once; the patches mutate page dicts in place
-    // but never reorder or remove page objects, so 1-based numbers stay valid.
-    let dest_pages = page_refs(dest)?;
+    // Snapshot the repaired dest page refs once; the patches mutate page dicts
+    // in place but never reorder or remove page objects, so 1-based numbers
+    // stay valid. qpdf prepares all destination pages before it reads any
+    // placement boxes or converts the page to a Form XObject.
+    let dest_pages = PageDocumentHelper::new(dest).get_all_pages()?;
     for (dest_page, sources) in by_page {
         let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
         apply_overlays_to_page_with_sources(dest, dest_ref, &sources, source_documents)?;
@@ -705,7 +707,9 @@ where
     // The dest page count is invariant while specs are mapped (sources are
     // applied only after the loop), so query the page tree once up front
     // instead of re-walking it per spec.
-    let n_dest = u32_len(page_refs(dest)?.len());
+    // qpdf's overlay job obtains the repaired destination page list before
+    // resolving any source ranges or performing placement.
+    let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
     let mut entries: Vec<(u32, OverlaySource)> = Vec::new();
     for (spec_index, spec) in specs.iter_mut().enumerate() {
         let sources = spec_page_sources(
@@ -773,7 +777,7 @@ pub struct OverlayVerbosePage {
 /// - [`Error::Parse`] when a `--from`/`--to`/`--repeat` range references a
 ///   page number outside its document (propagated from
 ///   [`PageRange::resolve`]).
-/// - Any error propagated from [`pages::page_refs`](crate::pages::page_refs)
+/// - Any error propagated from [`PageDocumentHelper::get_all_pages`]
 ///   — typically [`Error::Missing`] for a missing `/Root`/`/Pages`, or
 ///   [`Error::Unsupported`] for a malformed page tree.
 pub fn overlay_verbose_report<RS, RT>(
@@ -784,11 +788,15 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
-    let n_dest = u32_len(page_refs(dest)?.len());
+    let n_dest = u32_len(PageDocumentHelper::new(dest).get_all_pages()?.len());
     // Flatten every spec's (dest_page, source) pairs in declaration order.
     let mut flat: Vec<(u32, OverlayVerboseSource)> = Vec::new();
     for (spec_index, spec) in specs.iter_mut().enumerate() {
-        let n_source = u32_len(page_refs(&mut spec.source)?.len());
+        let n_source = u32_len(
+            PageDocumentHelper::new(&mut spec.source)
+                .get_all_pages()?
+                .len(),
+        );
         let pairs =
             resolve_spec_pairs(n_source, &spec.from, &spec.to, spec.repeat.as_ref(), n_dest)?;
         for (dest_page, src_page) in pairs {
@@ -2316,6 +2324,7 @@ mod byte_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pages::page_refs;
 
     // ---- place_form_xobject ----------------------------------------------
 
