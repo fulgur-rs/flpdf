@@ -499,13 +499,29 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         }
         self.validate_supported_settings()?;
         let mut options = self.prepared_write_options()?;
+        // Page-tree repair below mutates `self.pdf`'s object graph in place
+        // (promoting direct /Kids leaves, cloning duplicate leaves) and is not
+        // safe to retry from a partially-mutated state on failure. Close off
+        // retry here, before that first mutating call, rather than after
+        // configure_progress_for_pdf: everything from this point on follows
+        // this function's own one-shot contract (see doc above).
+        self.write_started = true;
+        // qpdf's QPDFWriter::doWriteSetup runs initializeSpecialStreams before
+        // QPDFWriter::write snapshots getObjectCount for progress
+        // (QPDFWriter.cc:2114-2115, 2189-2193). The QDF and explicit content
+        // normalization routes use the same page-tree repair boundary, which
+        // can promote direct /Kids leaves or clone duplicate leaves. Prepare
+        // that graph before taking the progress snapshot so every emitted
+        // repaired object is represented in events_expected.
+        if options.qdf || options.content_normalization {
+            crate::PageDocumentHelper::new(self.pdf).get_all_pages()?;
+        }
         crate::writer::configure_progress_for_pdf(
             self.pdf,
             &options,
             0,
             self.settings.linearization,
         )?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
-        self.write_started = true;
         let (bytes, result) = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
