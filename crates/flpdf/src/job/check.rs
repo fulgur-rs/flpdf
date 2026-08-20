@@ -111,29 +111,26 @@ fn check_document<R: Read + Seek + 'static>(
     let mut diagnostics_seen = 0;
 
     if pdf.root_ref().is_none() {
-        emit_error(
-            logger,
-            message_prefix,
-            input_name,
-            &"unable to find /Root dictionary",
-        )?;
+        let root_error = "unable to find /Root dictionary";
+        emit_error(logger, message_prefix, input_name, &root_error)?;
         return Err(CheckError::ErrorsDetected);
     }
 
     logger.info(format!("checking {input_name}\n"))?;
     let extension_level = pdf.adobe_extension_level();
     match extension_level {
-        Some(level) => logger.info(format!(
-            "PDF Version: {} extension level {level}\n",
-            pdf.version()
-        ))?,
+        Some(level) => {
+            let version = format!("PDF Version: {} extension level {level}\n", pdf.version());
+            logger.info(version)?;
+        }
         None => logger.info(format!("PDF Version: {}\n", pdf.version()))?,
     }
-    logger.info(if pdf.is_encrypted() {
+    let encryption = if pdf.is_encrypted() {
         "File is encrypted\n"
     } else {
         "File is not encrypted\n"
-    })?;
+    };
+    logger.info(encryption)?;
 
     let linearized = match pdf.is_linearized() {
         Ok(value) => value,
@@ -148,11 +145,9 @@ fn check_document<R: Read + Seek + 'static>(
             Ok(bytes) => bytes,
             Err(error) => {
                 warnings = true;
-                emit_warning(
-                    logger,
-                    input_name,
-                    format!("error encountered while checking linearization data: {error}"),
-                )?;
+                let message =
+                    format!("error encountered while checking linearization data: {error}");
+                emit_warning(logger, input_name, message)?;
                 Vec::new()
             }
         };
@@ -161,11 +156,9 @@ fn check_document<R: Read + Seek + 'static>(
                 Ok(()) | Err(LinearizationCheckError::NotLinearized) => {}
                 Err(error) => {
                     warnings = true;
-                    emit_warning(
-                        logger,
-                        input_name,
-                        format!("error encountered while checking linearization data: {error}"),
-                    )?;
+                    let message =
+                        format!("error encountered while checking linearization data: {error}");
+                    emit_warning(logger, input_name, message)?;
                 }
             }
         }
@@ -178,7 +171,7 @@ fn check_document<R: Read + Seek + 'static>(
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
-        return Err(CheckError::ErrorsDetected);
+        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     let writer_result = (|| -> Result<()> {
@@ -197,16 +190,12 @@ fn check_document<R: Read + Seek + 'static>(
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
-        return Err(CheckError::ErrorsDetected);
+        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     let pages = PageDocumentHelper::new(pdf)
         .get_all_pages()
-        .map_err(|error| {
-            emit_error(logger, message_prefix, input_name, &error)
-                .map(|_| CheckError::ErrorsDetected)
-                .unwrap_or(CheckError::Operation(error))
-        })?;
+        .map_err(|error| map_page_tree_error(logger, message_prefix, input_name, error))?;
     let mut page_errors = false;
     for (index, page_ref) in pages.into_iter().enumerate() {
         let mut page = PageObjectHelper::new(page_ref, pdf);
@@ -224,16 +213,29 @@ fn check_document<R: Read + Seek + 'static>(
         emit_new_diagnostics(pdf, diagnostics_seen, logger, message_prefix, input_name)?;
     warnings |= new_warnings;
     if new_errors {
-        return Err(CheckError::ErrorsDetected);
+        return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     if !warnings {
-        logger.info(format!(
+        let message = format!(
             "No syntax or stream encoding errors found; the file may still contain\nerrors that {message_prefix} cannot detect\n"
-        ))?;
+        );
+        logger.info(message)?;
     }
 
     Ok(CheckOutcome { warnings })
+}
+
+fn map_page_tree_error(
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    input_name: &str,
+    error: crate::Error,
+) -> CheckError {
+    match emit_error(logger, message_prefix, input_name, &error) {
+        Ok(()) => CheckError::ErrorsDetected,
+        Err(_) => CheckError::Operation(error),
+    }
 }
 
 fn emit_new_diagnostics<R: Read + Seek>(
@@ -244,13 +246,8 @@ fn emit_new_diagnostics<R: Read + Seek>(
     input_name: &str,
 ) -> std::result::Result<(bool, bool), CheckError> {
     let diagnostics = pdf.repair_diagnostics();
-    Ok(emit_diagnostics(
-        &diagnostics,
-        seen,
-        logger,
-        message_prefix,
-        input_name,
-    )?)
+    let result = emit_diagnostics(&diagnostics, seen, logger, message_prefix, input_name)?;
+    Ok(result)
 }
 
 fn emit_diagnostics(
@@ -330,10 +327,12 @@ fn emit_error(
 mod tests {
     use super::*;
     use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
-    use crate::{PdfOpenOptions, QPDFLogger};
-    use std::io::Cursor;
+    use crate::{Diagnostic, Diagnostics, Error, PdfOpenOptions, QPDFLogger};
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // cov:ignore-start: test-only logger capture pipeline is not production code
     struct Capture {
         bytes: Arc<Mutex<Vec<u8>>>,
     }
@@ -354,6 +353,447 @@ mod tests {
         fn finish(&mut self) -> PipelineResult<()> {
             Ok(())
         }
+    }
+    // cov:ignore-end
+
+    // cov:ignore-start: test-only failing logger pipeline is not production code
+    struct FailingCapture;
+
+    impl Pipeline for FailingCapture {
+        fn identifier(&self) -> &str {
+            "check test failing capture"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+            Err(crate::pipeline::PipelineError::runtime("logger failure"))
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+    // cov:ignore-end
+
+    struct ToggleReader {
+        reader: Cursor<Vec<u8>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl Read for ToggleReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(io::Error::other("test reader failure"));
+            }
+            self.reader.read(buffer)
+        }
+    }
+
+    impl Seek for ToggleReader {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(io::Error::other("test reader failure"));
+            }
+            self.reader.seek(position)
+        }
+    }
+
+    struct SnapshotFailReader {
+        reader: Cursor<Vec<u8>>,
+        armed: Arc<AtomicBool>,
+        snapshot: Arc<AtomicBool>,
+        start_zero_seeks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for SnapshotFailReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.snapshot.load(Ordering::Relaxed) {
+                return Err(io::Error::other("linearization snapshot failure"));
+            }
+            self.reader.read(buffer)
+        }
+    }
+
+    impl Seek for SnapshotFailReader {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            if self.armed.load(Ordering::Relaxed) && position == SeekFrom::Start(0) {
+                let previous = self.start_zero_seeks.fetch_add(1, Ordering::Relaxed);
+                if previous >= 1 {
+                    self.snapshot.store(true, Ordering::Relaxed);
+                }
+            }
+            self.reader.seek(position)
+        }
+    }
+
+    fn logger_with_capture(bytes: Arc<Mutex<Vec<u8>>>) -> QPDFLogger {
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(
+            Some(PipelineHandle::new(Capture {
+                bytes: Arc::clone(&bytes),
+            })),
+            Some(PipelineHandle::new(Capture { bytes })),
+        );
+        logger
+    }
+
+    fn missing_root_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n")
+                .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    fn extension_level_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 8 >> >> >>\nendobj\n",
+        );
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn page_tree_warning_pdf_bytes() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Parent 3 0 R /Kids [] /Count 0 >>\nendobj\n",
+        );
+        let off3 = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn single_page_content_pdf_bytes(content: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+        );
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn corrupt_content_stream_pdf_bytes() -> Vec<u8> {
+        let payload = b"this is not valid zlib data at all";
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+        );
+        let off4 = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(payload);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn check_error_and_diagnostic_helpers_keep_qpdf_locations() {
+        assert_eq!(CheckError::ErrorsDetected.to_string(), "errors detected");
+        let operation: CheckError = Error::Internal("operation failed".to_owned()).into();
+        assert_eq!(operation.to_string(), "operation failed");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.push(Diagnostic::warning(
+            "(object 5 0, offset 232): expected endobj",
+            Some(232),
+        ));
+        diagnostics.push(Diagnostic::warning(
+            "(trailer, offset 190): duplicated key",
+            Some(190),
+        ));
+        diagnostics.push(Diagnostic::warning("xref warning", Some(12)));
+        diagnostics.push(Diagnostic::warning("warning without offset", None));
+        diagnostics.push(Diagnostic::error("bad xref", Some(13)));
+
+        let (warnings, errors) = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", "input.pdf")
+            .expect("diagnostics should be delivered");
+        assert!(warnings);
+        assert!(errors);
+        emit_warning(&logger, "input.pdf", "linearization warning").unwrap();
+        emit_error(
+            &logger,
+            "qpdf",
+            "input.pdf",
+            &Error::Internal("fatal".to_owned()),
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("WARNING: input.pdf (offset 12): xref warning\n"));
+        assert!(output.contains("WARNING: input.pdf (object 5 0, offset 232): expected endobj\n"));
+        assert!(output.contains("qpdf: input.pdf (offset 13): bad xref\n"));
+        assert!(output.contains("WARNING: input.pdf: linearization warning\n"));
+        assert!(output.contains("qpdf: input.pdf: fatal\n"));
+    }
+
+    #[test]
+    fn document_check_reports_rootless_input_before_banner() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf =
+            Pdf::open(Cursor::new(missing_root_pdf_bytes())).expect("fixture should open");
+
+        let result = check_document(&mut pdf, &logger, "qpdf", "rootless.pdf");
+
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert_eq!(
+            output,
+            "qpdf: rootless.pdf: unable to find /Root dictionary\n"
+        );
+    }
+
+    #[test]
+    fn document_check_reports_extension_level_and_linearization_warning() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf =
+            Pdf::open(Cursor::new(extension_level_pdf_bytes())).expect("fixture should open");
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "extension.pdf")
+            .expect("extension fixture should check cleanly");
+        assert!(!outcome.warnings);
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("PDF Version: 1.7 extension level 8\n"));
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut linearized = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))))
+        .expect("linearized fixture should open");
+        let candidate = linearized
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = linearized.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/O", ObjectHandle::integer(999))
+            .expect("candidate should be mutable");
+
+        let outcome = check_document(&mut linearized, &logger, "qpdf", "linearized.pdf")
+            .expect("linearization errors are warnings");
+        assert!(outcome.warnings);
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains(
+            "WARNING: linearized.pdf: error encountered while checking linearization data:"
+        ));
+    }
+
+    #[test]
+    fn document_check_turns_linearization_source_read_failure_into_a_warning() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(AtomicBool::new(false));
+        let start_zero_seeks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pdf = Pdf::open(SnapshotFailReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/compat/linearized-one-page.pdf"
+                ))
+                .to_vec(),
+            ),
+            armed: Arc::clone(&armed),
+            snapshot: Arc::clone(&snapshot),
+            start_zero_seeks: Arc::clone(&start_zero_seeks),
+        })
+        .expect("linearized fixture should open");
+        armed.store(true, Ordering::Relaxed);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+
+        let result = check_document(&mut pdf, &logger, "qpdf", "snapshot-failure.pdf");
+        assert!(matches!(result, Err(CheckError::ErrorsDetected)));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains(
+            "WARNING: snapshot-failure.pdf: error encountered while checking linearization data:"
+        ));
+    }
+
+    #[test]
+    fn document_check_maps_reader_writer_and_page_failures() {
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut pdf = Pdf::open(ToggleReader {
+            reader: Cursor::new(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/fixtures/minimal.pdf"
+                ))
+                .to_vec(),
+            ),
+            fail: Arc::clone(&fail),
+        })
+        .expect("fixture should open");
+        fail.store(true, Ordering::Relaxed);
+        let mut read_probe = ToggleReader {
+            reader: Cursor::new(Vec::new()),
+            fail: Arc::clone(&fail),
+        };
+        assert!(read_probe.read(&mut [0u8; 1]).is_err());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        assert!(matches!(
+            check_document(&mut pdf, &logger, "qpdf", "reader-failure.pdf"),
+            Err(CheckError::ErrorsDetected)
+        ));
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut writer_pdf = Pdf::open(Cursor::new(corrupt_content_stream_pdf_bytes()))
+            .expect("corrupt stream fixture should open");
+        assert!(matches!(
+            check_document(&mut writer_pdf, &logger, "qpdf", "writer-failure.pdf"),
+            Err(CheckError::ErrorsDetected)
+        ));
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut page_tree_pdf =
+            Pdf::open(Cursor::new(page_tree_warning_pdf_bytes())).expect("fixture should open");
+        let failing_pdf_logger = QPDFLogger::create();
+        failing_pdf_logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+        page_tree_pdf.set_logger(failing_pdf_logger);
+        assert!(matches!(
+            check_document(&mut page_tree_pdf, &logger, "qpdf", "page-tree-failure.pdf"),
+            Err(CheckError::ErrorsDetected)
+        ));
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut page_pdf = Pdf::open(Cursor::new(single_page_content_pdf_bytes(b"<< /A 1")))
+            .expect("malformed content fixture should open");
+        assert!(matches!(
+            check_document(&mut page_pdf, &logger, "qpdf", "page-failure.pdf"),
+            Err(CheckError::ErrorsDetected)
+        ));
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("ERROR: page 1:"));
+
+        let mapped = map_page_tree_error(
+            &logger,
+            "qpdf",
+            "page-tree-failure.pdf",
+            Error::Internal("page tree failure".to_owned()),
+        );
+        assert!(matches!(mapped, CheckError::ErrorsDetected));
+        let failing_logger = QPDFLogger::create();
+        failing_logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+        let mapped = map_page_tree_error(
+            &failing_logger,
+            "qpdf",
+            "page-tree-failure.pdf",
+            Error::Internal("page tree failure".to_owned()),
+        );
+        assert!(matches!(
+            mapped,
+            CheckError::Operation(Error::Internal(message)) if message == "page tree failure"
+        ));
+    }
+
+    #[test]
+    fn diagnostic_delivery_errors_cross_the_job_check_boundary() {
+        let pdf = Pdf::open(Cursor::new(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/test_driver/missing_startxref.pdf"
+        ))))
+        .expect("warning fixture should open");
+        assert!(!pdf.repair_diagnostics().entries().is_empty());
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(None, Some(PipelineHandle::new(FailingCapture)));
+
+        let result = emit_new_diagnostics(&pdf, 0, &logger, "qpdf", "broken.pdf");
+
+        assert!(matches!(
+            result,
+            Err(CheckError::Operation(Error::System(message))) if message == "logger failure"
+        ));
     }
 
     #[test]
@@ -429,7 +869,7 @@ mod tests {
         ))
         .to_vec();
         let error = match job.open(Cursor::new(source), "open-repair-failure.pdf", options) {
-            Ok(_) => panic!("fixture must fail during repair"),
+            Ok(_) => panic!("fixture must fail during repair"), // cov:ignore: the repair-failure fixture must take the Err branch
             Err(error) => error,
         };
 
