@@ -124,7 +124,10 @@
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_rotate::resolve_inherited_rotate;
-use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::pages::{
+    is_inheritable_page_attribute, next_page_parent,
+    resolve_inherited_handle_from_node_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
+};
 use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
@@ -2150,41 +2153,33 @@ fn get_attribute_for_target<R: Read + Seek>(
     } else {
         object.clone()
     };
-    let inheritable =
-        !is_form && matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate");
+    let inheritable = !is_form && is_inheritable_page_attribute(key);
     let mut result = pdf.resolve_object_handle_to_terminal(&dict.try_get_key(key)?)?;
     let mut inherited = false;
 
     if result.is_null() && inheritable {
-        let mut node = dict.clone();
-        #[allow(
-            clippy::mutable_key_type,
-            reason = "page-tree cycle detection intentionally keys on canonical handle identity"
-        )]
-        let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
-        let mut depth = 0usize;
-        loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {description}"
-                )));
-            }
-            if !seen.insert(node.identity_key()) {
-                break;
-            }
-
-            let parent = pdf.resolve_object_handle_to_terminal(&node.try_get_key(b"/Parent")?)?;
-            if parent.is_null() {
-                break;
-            }
-            node = parent;
-            depth += 1;
-
-            let candidate = pdf.resolve_object_handle_to_terminal(&node.try_get_key(key)?)?;
-            if !candidate.is_null() {
-                result = candidate;
+        // qpdf's own loop (`QPDFPageObjectHelper.cc:236-247`) checks the
+        // leaf's key once before the loop, then its `while (seen.add(node)
+        // && node.hasKey("/Parent")) { node = node.getKey("/Parent"); result
+        // = node.getKey(name); ... }` body only ever advances to and
+        // examines an ancestor -- the leaf itself is never re-entered. The
+        // leaf's own key was already checked above (found null), so advance
+        // to the first parent before invoking the shared walk to mirror
+        // that same shape: otherwise the shared walk's depth count would
+        // charge one slot to re-examining the already-checked leaf, one
+        // level short of qpdf's structure (qpdf itself has no numeric depth
+        // cap -- DEFAULT_MAX_PAGE_TREE_DEPTH is flpdf's own DoS bound layered
+        // on top of qpdf's cycle-only guard).
+        let parent_ref = dict.try_get_key(b"/Parent")?;
+        if let Some(cursor) = next_page_parent(parent_ref)? {
+            if let Some(value) = resolve_inherited_handle_from_node_with_max_depth(
+                pdf,
+                cursor.handle(),
+                key,
+                DEFAULT_MAX_PAGE_TREE_DEPTH,
+            )? {
+                result = pdf.resolve_object_handle_to_terminal(&value)?;
                 inherited = true;
-                break;
             }
         }
     }
@@ -2221,6 +2216,78 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    /// Build a minimal valid PDF from a contiguous run of `1..=objects.len()`
+    /// objects, in `(object_number, body_literal)` order. `catalog_ref` is
+    /// the object number of the `/Catalog` object.
+    fn pdf_from_objects(catalog_ref: u32, objects: &[(u32, String)]) -> Vec<u8> {
+        let mut data: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<u64> = Vec::with_capacity(objects.len());
+        for (num, body) in objects {
+            offsets.push(data.len() as u64);
+            data.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        let xref_start = data.len() as u64;
+        let total = objects.len() + 1;
+        let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+        for off in &offsets {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        data.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {total} /Root {catalog_ref} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        data.extend_from_slice(trailer.as_bytes());
+        data
+    }
+
+    /// `get_attribute` (via `get_media_box`) must reach exactly qpdf's
+    /// depth: `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:236-247`)
+    /// checks the leaf's own key once, then its loop only ever advances to
+    /// and examines an ancestor. A value set on the 100th ancestor -- the
+    /// deepest level `DEFAULT_MAX_PAGE_TREE_DEPTH` still permits -- must be
+    /// found, not rejected one level short by charging the leaf a depth slot.
+    #[test]
+    fn get_media_box_reaches_the_100th_ancestor() {
+        // Objects 2..=101 are 100 nested /Pages nodes (2 = outermost, the
+        // 100th ancestor of the leaf; 101 = the leaf's immediate parent).
+        // /MediaBox is set only on object 2.
+        let mut objects: Vec<(u32, String)> =
+            vec![(1, "<< /Type /Catalog /Pages 2 0 R >>".to_string())];
+        for depth in 0..100u32 {
+            let num = 2 + depth;
+            let kid = num + 1;
+            let parent_entry = if depth == 0 {
+                String::new()
+            } else {
+                format!(" /Parent {} 0 R", num - 1)
+            };
+            let media_box_entry = if depth == 0 {
+                " /MediaBox [0 0 612 792]"
+            } else {
+                ""
+            };
+            objects.push((
+                num,
+                format!(
+                    "<< /Type /Pages /Kids [{kid} 0 R] /Count 1{parent_entry}{media_box_entry} >>"
+                ),
+            ));
+        }
+        let leaf_ref = 2 + 100;
+        objects.push((
+            leaf_ref,
+            format!("<< /Type /Page /Parent {} 0 R >>", leaf_ref - 1),
+        ));
+
+        let bytes = pdf_from_objects(1, &objects);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut helper = PageObjectHelper::new(ObjectRef::new(leaf_ref, 0), &mut pdf);
+        let media_box = helper
+            .get_media_box(false)
+            .expect("the 100th ancestor's /MediaBox must be reachable");
+        assert!(!media_box.try_is_null().expect("resolved handle"));
+    }
 
     /// `object_type_name` collapses both real variants to `"real"` — both
     /// forms should produce the same diagnostic string.

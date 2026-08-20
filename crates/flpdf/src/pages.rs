@@ -45,7 +45,7 @@ impl PageParentCursor {
         Self { handle }
     }
 
-    fn handle(&self) -> ObjectHandle {
+    pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle.clone()
     }
 }
@@ -60,6 +60,14 @@ impl fmt::Display for PageParentCursor {
 }
 
 /// Snapshot `key` and `/Parent` from a page-tree dictionary cursor.
+///
+/// Always attempts both lookups, even on a non-dictionary node: qpdf's own
+/// loop (`QPDFPageObjectHelper.cc:236-247`) calls `node.getKey(name)`
+/// unconditionally after advancing, and `QPDFObjectHandle::getKey`
+/// (`libqpdf/QPDFObjectHandle.cc:978-989`) reports a type warning and
+/// returns null on a non-dictionary receiver rather than silently skipping
+/// the access. [`ObjectHandle::try_get_key`] carries that same behavior, so
+/// short-circuiting here would drop the diagnostic.
 pub(crate) fn page_parent_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     cursor: &PageParentCursor,
@@ -67,9 +75,6 @@ pub(crate) fn page_parent_entries<R: Read + Seek>(
 ) -> Result<Option<(ObjectHandle, ObjectHandle)>> {
     let dict = cursor.handle();
     pdf.resolve_object_handle(&dict)?;
-    if dict.as_dictionary().is_none() {
-        return Ok(None);
-    }
     Ok(Some((
         dict.try_get_key(key)?,
         dict.try_get_key(b"/Parent")?,
@@ -98,25 +103,30 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
     Ok(Some(PageParentCursor::from_handle(parent)))
 }
 
-/// Resolve the first non-null inherited value as its live qpdf-shaped handle.
+/// Return whether qpdf permits `key` to inherit through a page `/Parent` chain.
 ///
-/// Ports the bottom-up `/Parent`-climbing half of
-/// `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:217-263`):
-/// climb ancestors looking for `key`, treating an explicit `null` as absent
-/// (ISO 32000-1 §7.3.9) and stopping at the first node that carries a
-/// non-null value. This is the canonical shared parent walk. The legacy
-/// public resource helper below still materializes its return type for
-/// existing callers; new page consumers must use this handle-native
-/// boundary instead.
-pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
+/// qpdf's `QPDFPageObjectHelper::getAttribute` permits inheritance only for
+/// `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate`
+/// (`libqpdf/QPDFPageObjectHelper.cc:224-237`).
+pub(crate) fn is_inheritable_page_attribute(key: &[u8]) -> bool {
+    matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate")
+}
+
+/// Resolve a page attribute from a live page-tree node and its ancestors.
+///
+/// This is the shared qpdf-shaped parent walk used by both page-tree
+/// consumers and [`crate::PageObjectHelper`]. The caller supplies the starting
+/// node so Form XObjects can keep qpdf's non-inheriting `getAttribute` path.
+pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    node: ObjectHandle,
     key: &[u8],
     max_depth: usize,
 ) -> Result<Option<ObjectHandle>> {
     let mut seen: Vec<ObjectHandle> = Vec::new();
-    let mut current = PageParentCursor::from_handle(pdf.get_object_handle(page_ref));
+    let mut current = PageParentCursor::from_handle(node);
     let mut depth = 0usize;
+    let inheritable = is_inheritable_page_attribute(key);
 
     loop {
         if depth >= max_depth {
@@ -150,12 +160,30 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
             return Ok(Some(value));
         }
 
+        if !inheritable {
+            return Ok(None);
+        }
         let Some(parent) = next_page_parent(parent)? else {
             return Ok(None);
         };
         current = parent;
         depth += 1;
     }
+}
+
+/// Resolve the first non-null inherited value for an indirect page object.
+///
+/// This is the canonical shared parent walk. The legacy public resource helper
+/// below still materializes its return type for existing callers; new page
+/// consumers must use this handle-native boundary instead.
+pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    key: &[u8],
+    max_depth: usize,
+) -> Result<Option<ObjectHandle>> {
+    let page = pdf.get_object_handle(page_ref);
+    resolve_inherited_handle_from_node_with_max_depth(pdf, page, key, max_depth)
 }
 
 /// Return every `Page` object in document order using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
@@ -942,11 +970,21 @@ mod tests {
             (b"/Parent".to_vec(), ObjectHandle::null()),
         ]);
         let mut empty = Pdf::empty().expect("empty PDF should be constructible");
+        // `page_parent_entries` always attempts the key lookups, mirroring
+        // qpdf's own `getKey` on a non-dictionary receiver
+        // (`libqpdf/QPDFObjectHandle.cc:978-989`), which reports a type
+        // warning rather than silently skipping. This bare handle has no
+        // owning document, so the warning has nowhere to go and escalates
+        // to a hard error, matching `ObjectHandle::type_warning`'s own
+        // documented no-context behavior.
         let non_dictionary = PageParentCursor::from_handle(ObjectHandle::integer(42));
+        let error = page_parent_entries(&mut empty, &non_dictionary, b"/Resources")
+            .expect_err("a non-dictionary parent with no warning sink must error");
         assert!(
-            page_parent_entries(&mut empty, &non_dictionary, b"/Resources")
-                .expect("non-dictionary parent lookup should succeed")
-                .is_none()
+            error
+                .to_string()
+                .contains("returning null for attempted key retrieval"),
+            "expected a dictionary type-warning error, got {error}"
         );
 
         let cursor = PageParentCursor::from_handle(direct_parent.clone());
@@ -1010,6 +1048,43 @@ mod tests {
         )
         .expect("non-dictionary page lookup should succeed")
         .is_none());
+    }
+
+    #[test]
+    fn inherited_walk_records_a_diagnostic_for_a_malformed_ancestor_instead_of_silence() {
+        // /Parent on the leaf's page-tree node resolves to a bare integer
+        // rather than a dictionary. A real, open document supplies a
+        // warning sink, so the type-warning from attempting `getKey` on
+        // that malformed node (qpdf's own behavior, see the comment on
+        // `page_parent_entries`) is recorded as a diagnostic rather than
+        // escalating to a hard error.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "42"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let before = pdf.repair_diagnostics().entries().len();
+
+        let result =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 10)
+                .expect("a malformed ancestor must not error when a warning sink exists");
+        assert!(
+            result.is_none(),
+            "expected no inherited value, got {result:?}"
+        );
+
+        let diagnostics = pdf.repair_diagnostics();
+        let new_entries: Vec<_> = diagnostics.entries().iter().skip(before).collect();
+        assert!(
+            new_entries.iter().any(|entry| entry
+                .message
+                .contains("returning null for attempted key retrieval")),
+            "expected a dictionary type-warning diagnostic, got {new_entries:?}"
+        );
     }
 
     #[test]
@@ -1113,6 +1188,29 @@ mod tests {
             result.is_none(),
             "expected no inherited value, got {result:?}"
         );
+    }
+
+    #[test]
+    fn page_attribute_inheritance_is_limited_to_qpdf_inheritable_keys() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /Custom 7 0 R >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (7, "<< /Value /Inherited >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        assert!(resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/Custom",
+            10,
+        )
+        .expect("unknown page attributes should be readable")
+        .is_none());
     }
 
     #[test]
