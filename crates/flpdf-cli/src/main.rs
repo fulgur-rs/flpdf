@@ -4733,8 +4733,24 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
                 .map(|cp| i64::from(cp.page.index_1based) - 1)
                 .collect();
             let entries = labels.labels_for_selection(&src_indices, 0)?;
-            let folded = flpdf::merge_adjacent_ranges(entries);
-            labels.write_reconstructed_labels(&folded)?;
+            // QPDFPageLabelDocumentHelper::getLabelForPage keeps the raw
+            // `/P` handle when QPDFJob reconstructs a selected range
+            // (libqpdf/QPDFPageLabelDocumentHelper.cc:37-49, 57-92).
+            // LabelRange intentionally collapses an absent prefix and an
+            // explicitly empty prefix to the same String, so recover the
+            // raw-key presence at the single-document selection boundary
+            // before installing the fresh `/PageLabels` dictionary.
+            let mut entries_with_prefix_presence = Vec::with_capacity(entries.len());
+            for ((index, range), source_index) in entries.into_iter().zip(src_indices.iter()) {
+                entries_with_prefix_presence.push((
+                    index,
+                    range,
+                    labels.label_prefix_is_present(*source_index)?,
+                ));
+            }
+            let folded =
+                flpdf::merge_adjacent_ranges_with_prefix_presence(entries_with_prefix_presence);
+            labels.write_reconstructed_labels_with_prefix_presence(&folded)?;
         }
     }
 

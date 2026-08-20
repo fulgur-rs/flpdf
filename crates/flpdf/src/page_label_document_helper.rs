@@ -235,6 +235,34 @@ pub fn merge_adjacent_ranges(ranges: Vec<(i64, LabelRange)>) -> Vec<(i64, LabelR
     out
 }
 
+/// qpdf's page-selection fold, retaining the raw presence of `/P` in each
+/// reconstructed label dictionary. An explicitly empty `/P` is not redundant
+/// with an absent `/P`: qpdf compares the raw handles while deciding whether
+/// to skip a subsequent entry (`QPDFPageLabelDocumentHelper.cc:57-79`).
+pub fn merge_adjacent_ranges_with_prefix_presence(
+    ranges: Vec<(i64, LabelRange, bool)>,
+) -> Vec<(i64, LabelRange, bool)> {
+    let mut out: Vec<(i64, LabelRange, bool)> = Vec::with_capacity(ranges.len());
+    for (idx, range, prefix_present) in ranges {
+        if let Some((prev_idx, prev_range, prev_prefix_present)) = out.last() {
+            let expected_start = idx
+                .checked_sub(*prev_idx)
+                .and_then(|gap| prev_range.start.checked_add(gap));
+            if let Some(expected_start) = expected_start {
+                if prev_range.style == range.style
+                    && prev_range.prefix == range.prefix
+                    && *prev_prefix_present == prefix_present
+                    && range.start == expected_start
+                {
+                    continue;
+                }
+            }
+        }
+        out.push((idx, range, prefix_present));
+    }
+    out
+}
+
 /// Upper bound on the numeric value [`to_roman`]/[`to_alpha`] will render.
 ///
 /// Values above this produce an empty numeric portion — a defensive cap against
@@ -664,7 +692,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// that distinction when `getLabelsForPageRange` copies raw label
     /// dictionaries; the JSON representation renders an empty Unicode prefix
     /// as `u:` while an absent prefix is omitted.
-    pub(crate) fn label_prefix_is_present(&mut self, page_idx: i64) -> Result<bool> {
+    pub fn label_prefix_is_present(&mut self, page_idx: i64) -> Result<bool> {
         let Some(tree) = self.pagelabels_tree()? else {
             return Ok(false);
         };
@@ -721,7 +749,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// explicit empty `/P` prefix. This is the raw-handle distinction qpdf's
     /// `getLabelsForPageRange` preserves and the compact [`LabelRange`] value
     /// intentionally does not expose in its public three-field shape.
-    pub(crate) fn write_reconstructed_labels_with_prefix_presence(
+    pub fn write_reconstructed_labels_with_prefix_presence(
         &mut self,
         entries: &[(i64, LabelRange, bool)],
     ) -> Result<()> {
@@ -2711,6 +2739,50 @@ mod tests {
             merge_adjacent_ranges(ranges.clone()),
             ranges,
             "different prefix must block the merge even when style/St line up"
+        );
+    }
+
+    #[test]
+    fn merge_adjacent_ranges_with_prefix_presence_keeps_raw_key_mismatch() {
+        let range = dec(1);
+        let raw_mismatch = vec![(0, range.clone(), false), (1, range.clone(), true)];
+        assert_eq!(
+            merge_adjacent_ranges_with_prefix_presence(raw_mismatch.clone()),
+            raw_mismatch,
+            "absent /P and explicit empty /P are distinct qpdf label dictionaries"
+        );
+
+        let redundant = vec![(0, range.clone(), true), (1, dec(2), true)];
+        assert_eq!(
+            merge_adjacent_ranges_with_prefix_presence(redundant),
+            vec![(0, range, true)],
+            "matching raw /P presence still permits qpdf's normal continuation fold"
+        );
+
+        assert_eq!(
+            merge_adjacent_ranges_with_prefix_presence(Vec::new()),
+            Vec::new()
+        );
+        let unsorted = vec![(10, dec(1), false), (5, dec(1), false)];
+        assert_eq!(
+            merge_adjacent_ranges_with_prefix_presence(unsorted.clone()),
+            unsorted
+        );
+        let overflow = vec![
+            (
+                0,
+                LabelRange {
+                    style: LabelStyle::Decimal,
+                    prefix: String::new(),
+                    start: i64::MAX,
+                },
+                false,
+            ),
+            (1, dec(1), false),
+        ];
+        assert_eq!(
+            merge_adjacent_ranges_with_prefix_presence(overflow.clone()),
+            overflow
         );
     }
 

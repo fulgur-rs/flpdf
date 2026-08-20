@@ -73,6 +73,35 @@ fn labeled_four_page_pdf() -> Vec<u8> {
     out
 }
 
+fn prefixed_two_page_pdf() -> Vec<u8> {
+    let objects: &[(u32, &str)] = &[
+        (
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /D /P (Chapter-) /St 1 >>] >> >>",
+        ),
+        (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+    ];
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut offsets = std::collections::BTreeMap::new();
+    for (n, body) in objects {
+        offsets.insert(*n, out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    let size = objects.iter().map(|(n, _)| *n).max().unwrap() + 1;
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for n in 1..size {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&n]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 fn read_ranges(path: &Path) -> Vec<(i64, flpdf::LabelRange)> {
     let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file))
@@ -80,6 +109,162 @@ fn read_ranges(path: &Path) -> Vec<(i64, flpdf::LabelRange)> {
     pdf.page_labels()
         .ranges()
         .unwrap_or_else(|e| panic!("read /PageLabels from {path:?}: {e}"))
+}
+
+fn qpdf_pagelabels_json(path: &Path) -> Vec<u8> {
+    let output = Shell::new(QPDF)
+        .args([
+            "--json=2",
+            "--json-key=pagelabels",
+            path.to_str().unwrap(),
+            "-",
+        ])
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        output.status.success(),
+        "qpdf JSON output failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn flpdf_pagelabels_json(path: &Path) -> Vec<u8> {
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-key=pagelabels", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "flpdf JSON output failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[test]
+fn cli_pages_preserves_explicit_empty_nonempty_and_absent_prefix() {
+    if !qpdf_available() {
+        eprintln!(
+            "[SKIP cli_pages_pagelabels_qpdf] {} 11.9.0 not on PATH — set QPDF env or install to run",
+            QPDF
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let explicit_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/json-diff/direct-outlines.pdf");
+    let qpdf_explicit = tmp.path().join("qpdf_explicit.pdf");
+    let status = Shell::new(QPDF)
+        .args([
+            explicit_source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1-2",
+            "--",
+            qpdf_explicit.to_str().unwrap(),
+        ])
+        .status()
+        .expect("qpdf should spawn");
+    assert!(status.success(), "qpdf --pages should succeed");
+
+    let flpdf_explicit = tmp.path().join("flpdf_explicit.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&explicit_source)
+        .args(["--pages", ".", "1-2", "--"])
+        .arg(&flpdf_explicit)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_pagelabels_json(&qpdf_explicit);
+    let flpdf_json = flpdf_pagelabels_json(&flpdf_explicit);
+    assert!(
+        String::from_utf8_lossy(&qpdf_json).contains("\"/P\": \"u:\""),
+        "the oracle fixture must exercise an explicitly empty /P: {}",
+        String::from_utf8_lossy(&qpdf_json)
+    );
+    assert_eq!(
+        flpdf_json, qpdf_json,
+        "single-document --pages must preserve qpdf's raw /P presence"
+    );
+
+    // The same route must not manufacture /P for a source whose range never
+    // had the key. This is the complementary absence case for the raw-key
+    // distinction above.
+    let absent_source = tmp.path().join("absent.pdf");
+    std::fs::write(&absent_source, labeled_four_page_pdf()).unwrap();
+    let qpdf_absent = tmp.path().join("qpdf_absent.pdf");
+    let status = Shell::new(QPDF)
+        .args([
+            absent_source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            "--",
+            qpdf_absent.to_str().unwrap(),
+        ])
+        .status()
+        .expect("qpdf should spawn");
+    assert!(status.success(), "qpdf --pages should succeed");
+    let flpdf_absent = tmp.path().join("flpdf_absent.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&absent_source)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_absent)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_pagelabels_json(&qpdf_absent);
+    let flpdf_json = flpdf_pagelabels_json(&flpdf_absent);
+    assert!(
+        !String::from_utf8_lossy(&qpdf_json).contains("\"/P\""),
+        "the absent-prefix fixture must not have /P: {}",
+        String::from_utf8_lossy(&qpdf_json)
+    );
+    assert_eq!(
+        flpdf_json, qpdf_json,
+        "single-document --pages must keep an absent /P absent"
+    );
+
+    let prefixed_source = tmp.path().join("prefixed.pdf");
+    std::fs::write(&prefixed_source, prefixed_two_page_pdf()).unwrap();
+    let qpdf_prefixed = tmp.path().join("qpdf_prefixed.pdf");
+    let status = Shell::new(QPDF)
+        .args([
+            prefixed_source.to_str().unwrap(),
+            "--pages",
+            ".",
+            "1",
+            "--",
+            qpdf_prefixed.to_str().unwrap(),
+        ])
+        .status()
+        .expect("qpdf should spawn");
+    assert!(status.success(), "qpdf --pages should succeed");
+    let flpdf_prefixed = tmp.path().join("flpdf_prefixed.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&prefixed_source)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_prefixed)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_pagelabels_json(&qpdf_prefixed);
+    let flpdf_json = flpdf_pagelabels_json(&flpdf_prefixed);
+    assert!(
+        String::from_utf8_lossy(&qpdf_json).contains("\"/P\": \"u:Chapter-\""),
+        "the non-empty-prefix fixture must retain /P: {}",
+        String::from_utf8_lossy(&qpdf_json)
+    );
+    assert_eq!(
+        flpdf_json, qpdf_json,
+        "single-document --pages must preserve a non-empty /P"
+    );
 }
 
 #[test]
