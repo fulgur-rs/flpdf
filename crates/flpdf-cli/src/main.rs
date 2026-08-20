@@ -3953,7 +3953,16 @@ fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<V
             continue;
         }
 
-        if arg != "--add-attachment" {
+        // qpdf registers `--add-attachment` as a bare option (`addBare`,
+        // QPDFJob_argv.cc:38), so `QPDFArgParser` silently discards any
+        // `=value` attached directly to the flag itself (the bare handler
+        // never reads its `parameter`, QPDFArgParser.cc:531-533) and the
+        // file always comes from the next plain positional token in the
+        // segment, if any -- confirmed against `/usr/bin/qpdf` 11.9.0:
+        // `--add-attachment=x --` errors "add attachment: no file
+        // specified" (nothing follows to serve as the file), while
+        // `--add-attachment=x y --` embeds `y` and silently drops `x`.
+        if arg != "--add-attachment" && !arg.starts_with("--add-attachment=") {
             residual.push(arg);
             continue;
         }
@@ -7349,6 +7358,43 @@ mod tests {
             .expect_err("an attachment group must have a terminator");
 
         assert_eq!(error.to_string(), "--add-attachment: missing -- terminator");
+    }
+
+    #[test]
+    fn extract_attachment_groups_discards_the_equals_value_like_qpdfs_bare_option() {
+        // qpdf's `--add-attachment` is a bare option (QPDFJob_argv.cc:38's
+        // addBare): `QPDFArgParser` silently discards any `=value` attached
+        // to the flag itself, so a later plain positional token becomes the
+        // file. Confirmed against /usr/bin/qpdf 11.9.0: `--add-attachment=
+        // bogus.txt payload.txt --` embeds `payload.txt` and drops `bogus.txt`.
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "--add-attachment=bogus.txt",
+            "payload.txt",
+            "--",
+            "out.pdf",
+        ]);
+        let (_, groups) = extract_attachment_groups(argv).unwrap();
+
+        assert_eq!(groups, vec![strs(&["payload.txt"])]);
+    }
+
+    #[test]
+    fn extract_attachment_groups_equals_form_with_no_positional_yields_an_empty_segment() {
+        // Confirmed against /usr/bin/qpdf 11.9.0: `--add-attachment=x --`
+        // errors "add attachment: no file specified" because nothing
+        // follows the discarded `=value` to serve as the file.
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "--add-attachment=payload.txt",
+            "--",
+            "out.pdf",
+        ]);
+        let (_, groups) = extract_attachment_groups(argv).unwrap();
+
+        assert_eq!(groups, vec![Vec::<String>::new()]);
     }
 
     #[test]
