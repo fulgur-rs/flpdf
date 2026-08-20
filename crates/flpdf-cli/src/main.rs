@@ -1600,13 +1600,19 @@ fn main() {
     // invocation. It is deliberately distinct from the library process
     // default so later save/info routing can be configured as one unit.
     let _ = cli_logger();
-    // Extract the `--overlay`/`--underlay` groups from the raw argv before clap
-    // parses (see `extract_overlay_groups`): clap's derive would flatten the
-    // repeated occurrences and lose the per-group boundaries and declaration
-    // order that byte-identical composition relies on. The residual argv (with
-    // those groups removed) is what clap sees.
+    // Extract overlay/underlay and repeated attachment groups from raw argv
+    // before clap parses: clap's derive would flatten repeated occurrences and
+    // lose the per-group boundaries that qpdf's job configuration preserves.
+    // The residual argv retains one dispatch marker for each operation.
     let rewritten_args = rewrite_qpdf_single_dash(std::env::args().collect());
     let (residual_args, overlay_specs) = match extract_overlay_groups(rewritten_args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("flpdf: {error}");
+            std::process::exit(2);
+        }
+    };
+    let (residual_args, attachment_segments) = match extract_attachment_groups(residual_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("flpdf: {error}");
@@ -1737,7 +1743,7 @@ fn main() {
             args.output,
             args.repair,
             &args.password,
-            args.add_attachment,
+            attachment_segments,
             args.deterministic_id,
             args.verbose,
         )
@@ -3851,10 +3857,17 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
         // scanning inside, so an `--overlay`/`--underlay` that is really a *value*
         // of one of these flags is not mistaken for a new overlay group. An
         // unterminated segment is copied to the end and left for clap to reject.
+        // `--add-attachment=...` (qpdf's bare-option equals-form, which discards
+        // the `=value` and reads the file from the segment's own positional
+        // token -- see extract_attachment_groups) starts the same opaque segment
+        // as `--add-attachment`; without this, a file whose name happens to be
+        // literally `--overlay`/`--underlay` inside such a segment would be
+        // misread as a new overlay group by this earlier pass.
         if matches!(
             arg.as_str(),
             "--encrypt" | "--pages" | "--add-attachment" | "--copy-attachments-from"
-        ) {
+        ) || arg.starts_with("--add-attachment=")
+        {
             residual.push(arg);
             for tok in iter.by_ref() {
                 let is_terminator = tok == "--";
@@ -3916,6 +3929,73 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
     }
 
     Ok((residual, specs))
+}
+
+/// Extract repeated qpdf `--add-attachment` segments before clap flattens
+/// their occurrences into one `Vec<String>`.
+///
+/// The first segment is retained in the residual argv as the clap dispatch
+/// marker; later segments are removed because the batch route below consumes
+/// the captured groups directly. Other value-terminated qpdf segments are
+/// copied as opaque units so an `--add-attachment` token used as one of their
+/// values is not mistaken for a top-level operation.
+fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Vec<String>>)> {
+    let mut residual = Vec::with_capacity(args.len());
+    let mut groups = Vec::new();
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        if matches!(
+            arg.as_str(),
+            "--encrypt" | "--pages" | "--copy-attachments-from"
+        ) {
+            residual.push(arg);
+            for token in iter.by_ref() {
+                let is_terminator = token == "--";
+                residual.push(token);
+                if is_terminator {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // qpdf registers `--add-attachment` as a bare option (`addBare`,
+        // QPDFJob_argv.cc:38), so `QPDFArgParser` silently discards any
+        // `=value` attached directly to the flag itself (the bare handler
+        // never reads its `parameter`, QPDFArgParser.cc:531-533) and the
+        // file always comes from the next plain positional token in the
+        // segment, if any -- confirmed against `/usr/bin/qpdf` 11.9.0:
+        // `--add-attachment=x --` errors "add attachment: no file
+        // specified" (nothing follows to serve as the file), while
+        // `--add-attachment=x y --` embeds `y` and silently drops `x`.
+        if arg != "--add-attachment" && !arg.starts_with("--add-attachment=") {
+            residual.push(arg);
+            continue;
+        }
+
+        let mut tokens = Vec::new();
+        let mut terminated = false;
+        for token in iter.by_ref() {
+            if token == "--" {
+                terminated = true;
+                break;
+            }
+            tokens.push(token);
+        }
+        if !terminated {
+            return Err("--add-attachment: missing -- terminator".into());
+        }
+
+        if groups.is_empty() {
+            residual.push("--add-attachment".to_owned());
+            residual.extend(tokens.iter().cloned());
+            residual.push("--".to_owned());
+        }
+        groups.push(tokens);
+    }
+
+    Ok((residual, groups))
 }
 
 /// Build the library [`flpdf::OverlaySpec`]s from the parsed CLI segments,
@@ -6318,17 +6398,32 @@ fn run_add_attachment(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
-    tokens: Vec<String>,
+    segments: Vec<Vec<String>>,
     deterministic_id: bool,
     verbose: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
-    let args = parse_add_attachment_segment(tokens)?;
-
-    let basename = path_basename(&args.file)?;
-    let key = args.key.unwrap_or_else(|| basename.clone());
-    let filename = args.filename.unwrap_or_else(|| basename.clone());
+    let attachment_options = segments
+        .into_iter()
+        .map(|tokens| {
+            let args = parse_add_attachment_segment(tokens)?;
+            let basename = path_basename(&args.file)?;
+            let key = args.key.unwrap_or_else(|| basename.clone());
+            let filename = args.filename.unwrap_or_else(|| basename.clone());
+            Ok(AttachmentAddOptions {
+                path: args.file,
+                key,
+                filename,
+                mimetype: args.mimetype,
+                description: args.description,
+                creation_date: args.creation_date,
+                modification_date: args.mod_date,
+                replace: args.replace,
+                verbose,
+            })
+        })
+        .collect::<CliResult<Vec<_>>>()?;
 
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let options = pdf_open_options(repair, password)?;
@@ -6348,20 +6443,7 @@ fn run_add_attachment(
         ))?;
     }
 
-    job.add_attachment(
-        &mut pdf,
-        AttachmentAddOptions {
-            path: args.file,
-            key,
-            filename,
-            mimetype: args.mimetype,
-            description: args.description,
-            creation_date: args.creation_date,
-            modification_date: args.mod_date,
-            replace: args.replace,
-            verbose,
-        },
-    )?;
+    job.add_attachments(&mut pdf, &attachment_options)?;
 
     let options = WriterOptions {
         deterministic_id,
@@ -7196,6 +7278,133 @@ mod tests {
     }
 
     #[test]
+    fn extract_single_attachment_group_leaves_a_clap_dispatch_marker() {
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "--add-attachment",
+            "one.txt",
+            "--key=one",
+            "--",
+            "out.pdf",
+        ]);
+        let (residual, groups) = extract_attachment_groups(argv).unwrap();
+
+        assert_eq!(
+            residual,
+            strs(&[
+                "flpdf",
+                "in.pdf",
+                "--add-attachment",
+                "one.txt",
+                "--key=one",
+                "--",
+                "out.pdf",
+            ])
+        );
+        assert_eq!(groups, vec![strs(&["one.txt", "--key=one"])]);
+    }
+
+    #[test]
+    fn extract_repeated_attachment_groups_preserves_order_and_boundaries() {
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "--add-attachment",
+            "one.txt",
+            "--key=one",
+            "--",
+            "--add-attachment",
+            "two.txt",
+            "--key=two",
+            "--",
+            "out.pdf",
+        ]);
+        let (residual, groups) = extract_attachment_groups(argv).unwrap();
+
+        assert_eq!(
+            residual,
+            strs(&[
+                "flpdf",
+                "in.pdf",
+                "--add-attachment",
+                "one.txt",
+                "--key=one",
+                "--",
+                "out.pdf",
+            ])
+        );
+        assert_eq!(
+            groups,
+            vec![
+                strs(&["one.txt", "--key=one"]),
+                strs(&["two.txt", "--key=two"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_attachment_groups_leaves_opaque_sibling_values_untouched() {
+        let argv = strs(&[
+            "flpdf",
+            "--pages",
+            "--add-attachment",
+            "one.txt",
+            "--",
+            "out.pdf",
+        ]);
+        let (residual, groups) = extract_attachment_groups(argv.clone()).unwrap();
+
+        assert_eq!(residual, argv);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn extract_attachment_groups_rejects_an_unterminated_group() {
+        let error = extract_attachment_groups(strs(&["flpdf", "--add-attachment", "one.txt"]))
+            .expect_err("an attachment group must have a terminator");
+
+        assert_eq!(error.to_string(), "--add-attachment: missing -- terminator");
+    }
+
+    #[test]
+    fn extract_attachment_groups_discards_the_equals_value_like_qpdfs_bare_option() {
+        // qpdf's `--add-attachment` is a bare option (QPDFJob_argv.cc:38's
+        // addBare): `QPDFArgParser` silently discards any `=value` attached
+        // to the flag itself, so a later plain positional token becomes the
+        // file. Confirmed against /usr/bin/qpdf 11.9.0: `--add-attachment=
+        // bogus.txt payload.txt --` embeds `payload.txt` and drops `bogus.txt`.
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "--add-attachment=bogus.txt",
+            "payload.txt",
+            "--",
+            "out.pdf",
+        ]);
+        let (_, groups) = extract_attachment_groups(argv).unwrap();
+
+        assert_eq!(groups, vec![strs(&["payload.txt"])]);
+    }
+
+    #[test]
+    fn extract_attachment_groups_equals_form_with_no_positional_yields_an_empty_segment() {
+        // Confirmed against /usr/bin/qpdf 11.9.0: `--add-attachment=x --`
+        // errors "add attachment: no file specified" because nothing
+        // follows the discarded `=value` to serve as the file.
+        let argv = strs(&[
+            "flpdf",
+            "in.pdf",
+            "--add-attachment=payload.txt",
+            "--",
+            "out.pdf",
+        ]);
+        let (_, groups) = extract_attachment_groups(argv).unwrap();
+
+        assert_eq!(groups, vec![Vec::<String>::new()]);
+    }
+
+    #[test]
     fn extract_single_overlay_group() {
         let argv = strs(&[
             "flpdf",
@@ -7436,6 +7645,18 @@ mod tests {
         let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
         assert!(specs.is_empty(), "got: {specs:?}");
         assert_eq!(residual, argv);
+    }
+
+    #[test]
+    fn extract_overlay_token_inside_equals_form_attachment_segment_is_not_a_group() {
+        // `--add-attachment=discarded` (qpdf's bare-option equals-form) starts the
+        // same opaque segment as `--add-attachment`. A file literally named
+        // `--overlay` as the segment's positional token must not be hijacked into
+        // a new overlay group by this earlier pass.
+        let argv = strs(&["--add-attachment=discarded", "--overlay", "--", "out.pdf"]);
+        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
+        assert!(specs.is_empty(), "no overlay group, got: {specs:?}");
+        assert_eq!(residual, argv, "attachment segment copied verbatim");
     }
 
     // --- build_overlay_specs --------------------------------------------

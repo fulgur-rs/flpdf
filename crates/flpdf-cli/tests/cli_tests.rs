@@ -6000,6 +6000,162 @@ fn add_attachment_default_key_is_basename() {
 }
 
 #[test]
+fn add_attachment_repeated_segments_are_processed_as_one_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let first = temp.path().join("first.txt");
+    let second = temp.path().join("second.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&first, b"first").unwrap();
+    std::fs::write(&second, b"second").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            first.to_str().unwrap(),
+            "--key=one",
+            "--",
+            "--add-attachment",
+            second.to_str().unwrap(),
+            "--key=two",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("one"))
+        .stdout(predicate::str::contains("two"));
+}
+
+#[test]
+fn add_attachment_missing_segment_terminator_is_a_usage_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("one.txt");
+    std::fs::write(&attachment, b"one").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--add-attachment: missing -- terminator",
+        ));
+}
+
+#[test]
+fn add_attachment_equals_form_with_no_positional_fails_instead_of_silently_embedding_nothing() {
+    // qpdf's `--add-attachment` is a bare option: `--add-attachment=x --`
+    // silently discards `x` and, finding no positional file token before
+    // the terminator, exits 2 ("add attachment: no file specified";
+    // confirmed against /usr/bin/qpdf 11.9.0). Before this fix, flpdf's
+    // pre-scanner did not recognize the `=`-form token at all, so it
+    // dispatched to the add-attachment path with an empty captured segment
+    // list and silently wrote a successful output with nothing embedded.
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("one.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&attachment, b"one").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            &format!("--add-attachment={}", attachment.to_str().unwrap()),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    assert!(!output.exists());
+}
+
+#[test]
+fn add_attachment_equals_form_with_a_positional_embeds_it_and_drops_the_equals_value() {
+    // Confirmed against /usr/bin/qpdf 11.9.0: `--add-attachment=bogus.txt
+    // payload.txt --` embeds `payload.txt` (the plain positional token)
+    // and silently drops `bogus.txt` (the discarded `=value`).
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let bogus = temp.path().join("bogus.txt");
+    let payload = temp.path().join("payload.txt");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&bogus, b"bogus").unwrap();
+    std::fs::write(&payload, b"payload").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            &format!("--add-attachment={}", bogus.to_str().unwrap()),
+            payload.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("payload.txt"))
+        .stdout(predicate::str::contains("bogus.txt").not());
+}
+
+#[test]
+fn add_attachment_equals_form_positional_named_overlay_is_not_hijacked_by_overlay_scanning() {
+    // The overlay/underlay group scanner runs before the attachment group
+    // scanner and, before this fix, matched on the exact string
+    // `--add-attachment` only -- so it did not recognize
+    // `--add-attachment=...` as the start of an opaque attachment segment
+    // and would misread a positional file literally named `--overlay`
+    // inside that segment as the start of a new overlay group.
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let overlay_named = temp.path().join("--overlay");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&overlay_named, b"payload").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(temp.path())
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment=discarded",
+            "--overlay",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", output.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--overlay"));
+}
+
+#[test]
 fn add_attachment_missing_path_fails_before_writing_output() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
