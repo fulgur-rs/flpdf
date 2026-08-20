@@ -16,7 +16,7 @@
 
 ### Task 3: Verify and hand off
 
-- [ ] Run fmt, strict rustdoc, all-features clippy, workspace tests, qpdf-doc
+- [x] Run fmt, strict rustdoc, all-features clippy, workspace tests, qpdf-doc
   checks, deviation checks, and fresh patch coverage.
 - [ ] Rebase latest origin/main, push, create Draft PR, and mark ready only
   after every CI check is green.
