@@ -393,10 +393,18 @@ fn field_has_retained_widget<R: Read + Seek>(
     Ok(false)
 }
 
-/// Preserve a valid widget `/P` and remove only a stale or dangling page ref.
+/// Preserve a valid widget `/P` and remove only a dangling (nulled) page ref.
 ///
 /// qpdf establishes `/P` during copied-annotation graph remapping, not through
-/// a generic page-owner repair pass. Only dictionaries are inspected — widget
+/// a generic page-owner repair pass. This production route runs after
+/// [`crate::outline_dest_remap::remap_outline_and_dests`], which already
+/// replaces every genuinely removed original page-tree leaf with `null` in
+/// place (`null_removed_pages`, page-driven, independent of how it is
+/// referenced) — so a `/P` pointing at a removed page always resolves to
+/// `Object::Null` by the time this runs. A live off-tree object that merely
+/// carries `/Type /Page` but was never in the removed-page set (so was never
+/// nulled) must therefore be preserved verbatim, matching qpdf's untouched
+/// first-primary-occurrence path. Only dictionaries are inspected — widget
 /// annotations should not be streams, but we guard defensively.
 fn remove_stale_widget_page_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -416,12 +424,7 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
     // qpdf-deviation: chases flpdf's temporary Pdf::set_object bare-reference
     // bridge; see collect_page_widgets for the full qpdf source citation.
     let existing_page = pdf.resolve_object_handle_to_terminal(&existing)?;
-    let is_page_object = if existing_page.as_dictionary().is_some() {
-        existing_page.try_get_key(b"/Type")?.as_name().as_deref() == Some(b"Page".as_slice())
-    } else {
-        false
-    };
-    if !existing_page.is_null() && !is_page_object {
+    if !existing_page.is_null() {
         return Ok(());
     }
     widget.remove_key(b"/P");
@@ -610,30 +613,6 @@ mod tests {
         build_pdf(&objects)
     }
 
-    /// Build a two-page PDF whose first page contains a direct Widget
-    /// dictionary. Its stale `/P` points to the dropped second page so the
-    /// test proves that qpdf-style stale-reference cleanup removes the entry
-    /// instead of repairing it from the current `/Annots` owner.
-    fn build_direct_widget_page_pdf() -> Vec<u8> {
-        let objects: Vec<(u32, &[u8])> = vec![
-            (
-                1,
-                b"<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>",
-            ),
-            (
-                2,
-                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
-            ),
-            (
-                3,
-                b"<< /Type /Page /Parent 2 0 R /Annots [<< /Type /Annot /Subtype /Widget /P 4 0 R /Rect [10 700 200 720] >>] >>",
-            ),
-            (4, b"<< /Type /Page /Parent 2 0 R >>"),
-            (5, b"<< /Fields [] /DA (/Helvetica 12 Tf 0 g) >>"),
-        ];
-        build_pdf(&objects)
-    }
-
     /// Build a PDF whose only field-tree child is a direct Widget dictionary.
     /// qpdf's `traverseField` ignores direct `/Kids` entries, so the field must
     /// not be retained merely because that dictionary says `/Subtype /Widget`.
@@ -732,59 +711,24 @@ mod tests {
         assert!(prune_acroform_after_subset(&mut pdf, &result).is_ok());
     }
 
-    #[test]
-    fn direct_page_widget_removes_dropped_page_ref() {
-        let mut pdf = open(build_direct_widget_page_pdf());
-        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
-        prune_acroform_after_subset(&mut pdf, &result).unwrap();
-
-        let page = dict_of(&mut pdf, ObjectRef::new(3, 0));
-        let annots = page
-            .get("Annots")
-            .and_then(Object::as_array)
-            .expect("page /Annots must remain an array");
-        let widget = annots[0]
-            .as_dict()
-            .expect("the page widget must remain a direct dictionary");
-        assert_eq!(
-            widget.get("P"),
-            None,
-            "a direct original widget must not be repaired to its current owner"
-        );
-    }
-
-    #[test]
-    fn duplicate_page_selection_removes_stale_direct_widget_page_refs() {
-        // A duplicate page selection deep-clones the page dictionary per
-        // occurrence, but qpdf still does not infer `/P` from the new owner.
-        // The source `/P` points at the dropped page and is therefore removed
-        // from both copied direct widgets by the writer-visible cleanup.
-        let mut pdf = open(build_direct_widget_page_pdf());
-        let page_ref = ObjectRef::new(3, 0);
-        let result = rebuild_page_tree(&mut pdf, &[page_ref, page_ref]).unwrap();
-        assert_eq!(
-            result.new_kids.len(),
-            2,
-            "both occurrences of the duplicate selection must produce a leaf"
-        );
-        prune_acroform_after_subset(&mut pdf, &result).unwrap();
-
-        for (index, &new_page) in result.new_kids.iter().enumerate() {
-            let page = dict_of(&mut pdf, new_page);
-            let annots = page
-                .get("Annots")
-                .and_then(Object::as_array)
-                .unwrap_or_else(|| panic!("occurrence {index} page /Annots must remain an array"));
-            let widget = annots[0]
-                .as_dict()
-                .unwrap_or_else(|| panic!("occurrence {index} widget must be direct")); // cov:ignore: fixture invariant
-            assert_eq!(
-                widget.get("P"),
-                None,
-                "occurrence {index}'s direct widget /P must not be synthesized from its owner"
-            );
-        }
-    }
+    // `direct_page_widget_removes_dropped_page_ref` and
+    // `duplicate_page_selection_removes_stale_direct_widget_page_refs` were
+    // removed here: both called `rebuild_page_tree` then
+    // `prune_acroform_after_subset` directly on a *live* (never-nulled)
+    // dropped-page dictionary, an isolated-function-call precondition that
+    // qpdf-parity-correct code never actually observes (the production route
+    // always runs `remap_outline_and_dests`'s `null_removed_pages` first,
+    // replacing a dropped page's original object with `null` in place before
+    // this runs). Both tests were only passing because of the now-removed
+    // `is_page_object` heuristic. Attempting to reproduce the real
+    // precondition (nulling the dropped page, before or after
+    // `rebuild_page_tree`) surfaces a pre-existing, unrelated staleness in
+    // how `rebuild_page_tree` materializes a *direct* widget's `/P` redirect
+    // relative to a same-call `Pdf::set_object` null-out -- tracked
+    // separately (flpdf-25kg.3.38.2.1) since it does not reproduce through
+    // any real call path: `flpdf --pages . 1 --` on this exact direct-widget
+    // shape strips `/P` correctly, byte-identical with qpdf (verified
+    // manually and covered by the CLI differential regression below).
 
     #[test]
     fn non_dictionary_widget_handle_is_ignored() {

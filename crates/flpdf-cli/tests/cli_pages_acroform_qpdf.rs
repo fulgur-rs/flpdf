@@ -1038,3 +1038,76 @@ fn original_indirect_widget_dangling_page_is_not_repaired() {
         "flpdf must not infer copy provenance from widget indirectness"
     );
 }
+
+/// Two-page primary whose kept page 1 carries a *direct* (inline) Widget
+/// annotation with `/P` pointing at page 2, which the selection drops. qpdf
+/// does not run `fixCopiedAnnotations` for the first primary occurrence
+/// (`QPDFJob.cc:2517-2585`), so the dropped page reference resolves to null
+/// (via qpdf's page-driven null-out, independent of how it is referenced)
+/// and the writer omits the key -- a live off-tree page-typed object that
+/// was never dropped from the selection must never be classified the same
+/// way (this scenario exercises the true dangling-`/P` shape directly,
+/// bypassing a pre-existing, unrelated staleness in `rebuild_page_tree`'s
+/// own widget materialization tracked separately as flpdf-25kg.3.38.2.1).
+fn acroform_original_direct_widget_with_dropped_sibling_page_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [<< /Type /Annot /Subtype /Widget /FT /Tx /T (DirectField) \
+          /P 4 0 R /Rect [0 0 10 10] >>] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Fields [] /DA (/Helvetica 12 Tf 0 g) >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// A direct (inline) widget's dangling `/P` to a dropped sibling page is
+/// stripped identically to an indirect widget's, matching qpdf.
+#[test]
+fn original_direct_widget_dropped_sibling_page_is_not_repaired() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    std::fs::write(
+        &primary,
+        acroform_original_direct_widget_with_dropped_sibling_page_pdf(),
+    )
+    .expect("write primary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages", "."])
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages", "."])
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    assert_eq!(
+        widget_page_ref(&qpdf_output, "DirectField"),
+        None,
+        "qpdf omits a direct original widget's dangling /P after null resolution"
+    );
+    assert_eq!(
+        widget_page_ref(&flpdf_output, "DirectField"),
+        None,
+        "flpdf must not repair a direct widget's /P to its current owner"
+    );
+}
