@@ -208,6 +208,17 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
         Ok(bytes)
     }
 
+    /// Read the logical PDF source, excluding any leading material that qpdf's
+    /// offset input source hides from the document. This is the source-byte
+    /// view consumed by qpdf's linearization checker, whose `/L`, `/H`, and
+    /// `/T` offsets are relative to the logical input (`QPDF_linearization.cc:
+    /// 84-155,159-245`).
+    fn read_logical_bytes(&self) -> Result<Vec<u8>> {
+        let bytes = self.read_underlying_bytes()?;
+        let header_offset = self.header_offset.min(bytes.len());
+        Ok(bytes[header_offset..].to_vec())
+    }
+
     fn last_offset(&self) -> u64 {
         self.last_offset.get()
     }
@@ -2384,6 +2395,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// later lazy resolution.
     pub(crate) fn source_length(&self) -> Result<u64> {
         self.core.borrow_mut().source_length()
+    }
+
+    /// Return the logical source bytes while restoring the resolver's current
+    /// input position. This is intentionally a reader-owned seam rather than a
+    /// second file open: qpdf's `QPDF::checkLinearization` reads the same
+    /// `m->file` that resolution and stream providers use.
+    pub(crate) fn source_bytes(&self) -> Result<Vec<u8>> {
+        self.core.borrow().input.read_logical_bytes()
     }
 
     /// Append the next chunk of input to `bytes`, reporting whether anything
