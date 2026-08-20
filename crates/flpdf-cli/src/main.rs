@@ -6600,7 +6600,7 @@ mod tests {
         let Err(error) =
             parse_add_attachment_segment(strs(&["payload.txt", "--mimetype=textplain"]))
         else {
-            panic!("the CLI parser must reject a mimetype without a slash");
+            panic!("the CLI parser must reject a mimetype without a slash"); // cov:ignore: parser regression guard
         };
 
         assert_eq!(
