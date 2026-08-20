@@ -701,6 +701,14 @@ where
     RS: Read + Seek,
     RT: Read + Seek,
 {
+    // qpdf returns before touching the destination page tree at all when there
+    // is nothing to overlay or underlay (QPDFJob.cc:1939-1941,
+    // `if (m->underlay.empty() && m->overlay.empty()) { return; }`). Match that:
+    // an empty `specs` slice must not trigger the repair pass below.
+    if specs.is_empty() {
+        return Ok(());
+    }
+
     // Map every spec first, collecting its per-dest-page sources in declaration
     // order. Each spec gets its own source-document foreign copier (separate
     // documents => separate qpdf identity maps).
@@ -758,7 +766,7 @@ pub struct OverlayVerbosePage {
 }
 
 /// Return the per-destination-page overlay/underlay plan without importing any
-/// source page or mutating the destination graph.
+/// source page or drawing on the destination.
 ///
 /// The returned vector covers every destination page in ascending order
 /// (`1..=n_dest`). Per-page sources are ordered underlays first (in declaration
@@ -768,7 +776,10 @@ pub struct OverlayVerbosePage {
 ///
 /// The source documents are taken by `&mut` because [`PageRange::resolve`]
 /// reads their page trees; the destination is taken by `&mut` for the same
-/// reason. Neither document's on-disk content is modified. Calling this before
+/// reason, and because [`PageDocumentHelper::get_all_pages`] repairs any page
+/// lacking an effective `/MediaBox` in place, matching qpdf's own
+/// `QPDFPageDocumentHelper::getAllPages` (qpdf 11.9.0). No source page is
+/// imported and no destination content stream is drawn on. Calling this before
 /// [`apply_overlay_specs`] on the same specs yields the paint plan that will be
 /// applied.
 ///
@@ -3756,6 +3767,35 @@ mod tests {
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
         assert!(!is_patched(&mut dest, dest_pages[0]));
         assert!(!is_patched(&mut dest, dest_pages[1]));
+    }
+
+    // An empty `specs` slice must return before touching the destination page
+    // tree at all (QPDFJob.cc:1939-1941, `if (m->underlay.empty() &&
+    // m->overlay.empty()) { return; }`), so a page lacking an effective
+    // `/MediaBox` must NOT be repaired by the get_all_pages() call this
+    // function would otherwise make to compute `n_dest`.
+    #[test]
+    fn apply_overlay_specs_empty_skips_boxless_page_repair() {
+        let mut dest = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+            1,
+        ));
+        let mut specs: Vec<OverlaySpec<std::io::Cursor<Vec<u8>>>> = Vec::new();
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+
+        let page_ref = ObjectRef {
+            number: 3,
+            generation: 0,
+        };
+        let page_dict = dest.resolve(page_ref).unwrap().into_dict().unwrap();
+        assert!(
+            page_dict.get("MediaBox").is_none(),
+            "empty specs must not trigger the page-tree repair pass"
+        );
     }
 
     #[test]
