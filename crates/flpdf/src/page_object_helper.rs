@@ -124,7 +124,10 @@
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_rotate::resolve_inherited_rotate;
-use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::pages::{
+    is_inheritable_page_attribute, resolve_inherited_handle_from_node_with_max_depth,
+    DEFAULT_MAX_PAGE_TREE_DEPTH,
+};
 use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
@@ -2150,42 +2153,19 @@ fn get_attribute_for_target<R: Read + Seek>(
     } else {
         object.clone()
     };
-    let inheritable =
-        !is_form && matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate");
+    let inheritable = !is_form && is_inheritable_page_attribute(key);
     let mut result = pdf.resolve_object_handle_to_terminal(&dict.try_get_key(key)?)?;
     let mut inherited = false;
 
     if result.is_null() && inheritable {
-        let mut node = dict.clone();
-        #[allow(
-            clippy::mutable_key_type,
-            reason = "page-tree cycle detection intentionally keys on canonical handle identity"
-        )]
-        let mut seen: HashSet<ObjectHandleIdentity> = HashSet::new();
-        let mut depth = 0usize;
-        loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "page tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {description}"
-                )));
-            }
-            if !seen.insert(node.identity_key()) {
-                break;
-            }
-
-            let parent = pdf.resolve_object_handle_to_terminal(&node.try_get_key(b"/Parent")?)?;
-            if parent.is_null() {
-                break;
-            }
-            node = parent;
-            depth += 1;
-
-            let candidate = pdf.resolve_object_handle_to_terminal(&node.try_get_key(key)?)?;
-            if !candidate.is_null() {
-                result = candidate;
-                inherited = true;
-                break;
-            }
+        if let Some(value) = resolve_inherited_handle_from_node_with_max_depth(
+            pdf,
+            dict.clone(),
+            key,
+            DEFAULT_MAX_PAGE_TREE_DEPTH,
+        )? {
+            result = pdf.resolve_object_handle_to_terminal(&value)?;
+            inherited = true;
         }
     }
 

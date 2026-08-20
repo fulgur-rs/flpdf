@@ -98,25 +98,30 @@ pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParent
     Ok(Some(PageParentCursor::from_handle(parent)))
 }
 
-/// Resolve the first non-null inherited value as its live qpdf-shaped handle.
+/// Return whether qpdf permits `key` to inherit through a page `/Parent` chain.
 ///
-/// Ports the bottom-up `/Parent`-climbing half of
-/// `QPDFPageObjectHelper::getAttribute` (`libqpdf/QPDFPageObjectHelper.cc:217-263`):
-/// climb ancestors looking for `key`, treating an explicit `null` as absent
-/// (ISO 32000-1 §7.3.9) and stopping at the first node that carries a
-/// non-null value. This is the canonical shared parent walk. The legacy
-/// public resource helper below still materializes its return type for
-/// existing callers; new page consumers must use this handle-native
-/// boundary instead.
-pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
+/// qpdf's `QPDFPageObjectHelper::getAttribute` permits inheritance only for
+/// `/MediaBox`, `/CropBox`, `/Resources`, and `/Rotate`
+/// (`libqpdf/QPDFPageObjectHelper.cc:224-237`).
+pub(crate) fn is_inheritable_page_attribute(key: &[u8]) -> bool {
+    matches!(key, b"/MediaBox" | b"/CropBox" | b"/Resources" | b"/Rotate")
+}
+
+/// Resolve a page attribute from a live page-tree node and its ancestors.
+///
+/// This is the shared qpdf-shaped parent walk used by both page-tree
+/// consumers and [`crate::PageObjectHelper`]. The caller supplies the starting
+/// node so Form XObjects can keep qpdf's non-inheriting `getAttribute` path.
+pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
+    node: ObjectHandle,
     key: &[u8],
     max_depth: usize,
 ) -> Result<Option<ObjectHandle>> {
     let mut seen: Vec<ObjectHandle> = Vec::new();
-    let mut current = PageParentCursor::from_handle(pdf.get_object_handle(page_ref));
+    let mut current = PageParentCursor::from_handle(node);
     let mut depth = 0usize;
+    let inheritable = is_inheritable_page_attribute(key);
 
     loop {
         if depth >= max_depth {
@@ -150,12 +155,30 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
             return Ok(Some(value));
         }
 
+        if !inheritable {
+            return Ok(None);
+        }
         let Some(parent) = next_page_parent(parent)? else {
             return Ok(None);
         };
         current = parent;
         depth += 1;
     }
+}
+
+/// Resolve the first non-null inherited value for an indirect page object.
+///
+/// This is the canonical shared parent walk. The legacy public resource helper
+/// below still materializes its return type for existing callers; new page
+/// consumers must use this handle-native boundary instead.
+pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    key: &[u8],
+    max_depth: usize,
+) -> Result<Option<ObjectHandle>> {
+    let page = pdf.get_object_handle(page_ref);
+    resolve_inherited_handle_from_node_with_max_depth(pdf, page, key, max_depth)
 }
 
 /// Return every `Page` object in document order using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
@@ -1113,6 +1136,29 @@ mod tests {
             result.is_none(),
             "expected no inherited value, got {result:?}"
         );
+    }
+
+    #[test]
+    fn page_attribute_inheritance_is_limited_to_qpdf_inheritable_keys() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /Custom 7 0 R >>"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (7, "<< /Value /Inherited >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        assert!(resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/Custom",
+            10,
+        )
+        .expect("unknown page attributes should be readable")
+        .is_none());
     }
 
     #[test]
