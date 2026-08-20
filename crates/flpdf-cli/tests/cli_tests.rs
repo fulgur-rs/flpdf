@@ -6036,6 +6036,28 @@ fn add_attachment_repeated_segments_are_processed_as_one_batch() {
 }
 
 #[test]
+fn add_attachment_missing_segment_terminator_is_a_usage_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let attachment = temp.path().join("one.txt");
+    std::fs::write(&attachment, b"one").unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            attachment.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--add-attachment: missing -- terminator",
+        ));
+}
+
+#[test]
 fn add_attachment_missing_path_fails_before_writing_output() {
     let temp = tempfile::tempdir().unwrap();
     let input = minimal_pdf_temp();
