@@ -4,10 +4,10 @@
 //! After [`crate::pages::tree_rebuild::rebuild_page_tree`] has rebuilt the page
 //! tree so that only the selected pages remain reachable from `/Root`, this
 //! module prunes the `/AcroForm /Fields` array to remove any top-level field
-//! whose **all** widget annotations live on dropped pages.  Fields that have at
-//! least one widget on a retained page are kept, and the `/P` (page
-//! back-pointer) on each retained widget is updated to the new page
-//! `ObjectRef`.
+//! whose **all** widget annotations live on dropped pages. Fields that have at
+//! least one widget on a retained page are kept. Stale or dangling `/P` page
+//! back-pointers are removed, but the current `/Annots` owner is never used to
+//! synthesize a new `/P`.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
@@ -23,9 +23,10 @@
 //!   - `/AcroForm /Fields` in output: `[FieldA, FieldB]` — FieldC removed.
 //!   - FieldB's `/Kids` still contains **both** B1 and B2; qpdf does **not**
 //!     prune dropped-page widget entries from `/Kids`.
-//!   - FieldA's `/P` is updated to the new page-1 object ref.
-//!   - B1's `/P` is updated to the new page-2 object ref.
-//!   - B2 has no `/P` (it was on the dropped page; qpdf leaves it without one).
+//!   - Existing `/P` entries that still resolve to retained pages remain
+//!     unchanged.
+//!   - B2 has no `/P` (its page was dropped; qpdf's page null-out and writer
+//!     null suppression remove the stale entry).
 //!   - `/AcroForm` remains on the catalog.
 //!
 //! `qpdf in.pdf --pages in.pdf 2 -- out.pdf` (all FieldA and FieldC widgets
@@ -40,10 +41,12 @@
 //! **flpdf matches qpdf exactly** on the above points:
 //!   - Field survival is determined at the **top-level `/Fields`** granularity.
 //!   - `/Kids` of a kept field are **not** pruned (matching qpdf).
-//!   - Widget `/P` is updated for widgets on retained pages.
-//!   - Widget `/P` is **removed** for widgets in kept fields' `/Kids` whose
-//!     page was dropped, preventing dangling refs after GC (matching qpdf:
-//!     B2 had no `/P` in the pages-1,2 extract output).
+//!   - Existing widget `/P` values that resolve to retained pages are kept.
+//!   - Stale or dangling widget `/P` values are **removed**, preventing
+//!     dangling refs after GC (matching qpdf: B2 had no `/P` in the pages-1,2
+//!     extract output).
+//!   - The first primary page occurrence is not passed through qpdf's
+//!     `fixCopiedAnnotations`; widget indirectness is not copy provenance.
 //!   - Empty `/Fields` → `/AcroForm` removed from catalog.
 //!
 //! # Scope — single document only
@@ -58,7 +61,7 @@
 //!
 //! Heavy AcroForm operations (flattening, rendering appearance streams) are out
 //! of scope; this module handles only the
-//! extract-time field/widget survival filter and `/P` back-pointer repair.
+//! extract-time field/widget survival filter and stale `/P` cleanup.
 
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
@@ -78,12 +81,14 @@ pub const DEFAULT_MAX_ACROFORM_DEPTH: usize = 100;
 
 /// Canonical widget identity plus the first retained page that contains it.
 /// qpdf's page annotation walk preserves direct dictionaries, so `ObjectRef`
-/// alone cannot represent every widget in the page subset.
+/// alone cannot represent every widget in the page subset. The page value is
+/// used for field survival and retained-page membership, not to synthesize
+/// widget `/P`.
 #[allow(clippy::mutable_key_type)]
 type WidgetPageMap = HashMap<ObjectHandleIdentity, (ObjectHandle, ObjectRef)>;
 
-/// Prune `/AcroForm /Fields` after a page-subset extraction and repair widget
-/// `/P` back-pointers.
+/// Prune `/AcroForm /Fields` after a page-subset extraction and remove stale
+/// widget `/P` back-pointers.
 ///
 /// `result` is the [`RebuildResult`] from
 /// [`crate::pages::tree_rebuild::rebuild_page_tree`].  Its `new_kids` encodes
@@ -205,18 +210,21 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         }
     }
 
-    // ── Step 5: update /P on retained widgets; strip /P from dropped widgets ─
-    // For each widget on a retained page, set /P to the (new) page ObjectRef,
-    // matching observed qpdf behaviour for both merged field+widget objects
-    // and pure-widget objects in /Kids.
+    // ── Step 5: preserve valid /P and remove stale page references ─────────
+    // qpdf does not infer a widget's page from the current /Annots owner. Its
+    // copy paths establish /P through the object-copy map, while the first
+    // primary occurrence is not passed through fixCopiedAnnotations. Keep an
+    // existing /P that resolves to a retained page and remove only a stale or
+    // dangling page reference; never synthesize a new /P from indirectness or
+    // current annotation membership.
     //
     // For dropped-page widgets that remain in a kept field's /Kids (qpdf does
     // not prune /Kids), we must *remove* /P so the widget does not hold a
     // dangling reference to the orphaned page dict after prune_after_subset
     // GCs it (qpdf 11.9.0 observed: B2 had no /P in pages-1,2 output).
     let retained_page_refs: BTreeSet<ObjectRef> = result.new_kids.iter().copied().collect();
-    for (widget, new_page_ref) in widget_to_page.values() {
-        update_widget_page_ref(pdf, widget, *new_page_ref, &retained_page_refs)?;
+    for (widget, _) in widget_to_page.values() {
+        remove_stale_widget_page_ref(pdf, widget, &retained_page_refs)?;
     }
     // Collect all widgets reachable from kept fields; strip /P from any that
     // are NOT in widget_to_page (i.e. live in a kept field's /Kids but were on
@@ -385,40 +393,39 @@ fn field_has_retained_widget<R: Read + Seek>(
     Ok(false)
 }
 
-/// Set `/P` on `widget` to `new_page_ref` through the live handle graph.
+/// Preserve a valid widget `/P` and remove only a stale or dangling page ref.
 ///
-/// Only updates dictionaries — streams are left unchanged (widget annotations
-/// should not be streams, but we guard defensively).
-fn update_widget_page_ref<R: Read + Seek>(
+/// qpdf establishes `/P` during copied-annotation graph remapping, not through
+/// a generic page-owner repair pass. Only dictionaries are inspected — widget
+/// annotations should not be streams, but we guard defensively.
+fn remove_stale_widget_page_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget: &ObjectHandle,
-    new_page_ref: ObjectRef,
     retained_page_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    if widget.as_dictionary().is_none() {
+    if widget.as_dictionary().is_none() || !widget.try_has_key(b"/P")? {
         return Ok(());
     }
-    // qpdf's copied-annotation routes preserve an existing widget `/P`: for a
-    // repeated primary page (same-document copy) and a foreign field copy it
-    // already points at the first output occurrence. Preserve that boundary
-    // for indirect widgets. Direct inline widgets remain on the historical
-    // owner-repair path below, where each independently cloned dictionary gets
-    // the page that contains it.
-    let preserve_existing_page = if widget.object_ref().is_some() {
-        // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
-        // bridge; see collect_page_widgets's marker for the full citation.
-        let existing_page = pdf.resolve_object_handle_to_terminal(&widget.try_get_key(b"/P")?)?;
-        existing_page
-            .object_ref()
-            .is_some_and(|existing_ref| retained_page_refs.contains(&existing_ref))
+    let existing = widget.try_get_key(b"/P")?;
+    let Some(existing_ref) = existing.object_ref() else {
+        return Ok(());
+    };
+    if retained_page_refs.contains(&existing_ref) {
+        return Ok(());
+    }
+    // qpdf-deviation: chases flpdf's temporary Pdf::set_object bare-reference
+    // bridge; see collect_page_widgets for the full qpdf source citation.
+    let existing_page = pdf.resolve_object_handle_to_terminal(&existing)?;
+    let is_page_object = if existing_page.as_dictionary().is_some() {
+        existing_page.try_get_key(b"/Type")?.as_name().as_deref() == Some(b"Page".as_slice())
     } else {
         false
     };
-    if !preserve_existing_page {
-        let page = pdf.get_object_handle(new_page_ref);
-        widget.replace_key(b"/P", page)?;
-        pdf.mark_object_handle_dirty(widget)?;
+    if !existing_page.is_null() && !is_page_object {
+        return Ok(());
     }
+    widget.remove_key(b"/P");
+    pdf.mark_object_handle_dirty(widget)?;
     Ok(())
 }
 
@@ -455,7 +462,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     let kids = pdf.resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
     let Some(kids_arr) = kids.as_array() else {
         // Leaf node with no /Kids. Merged field+widget dicts that were
-        // retained were already handled by update_widget_page_ref; dropped
+        // retained were already handled by remove_stale_widget_page_ref; dropped
         // merged fields are not in kept_fields, so there is nothing to strip.
         return Ok(());
     };
@@ -605,8 +612,8 @@ mod tests {
 
     /// Build a two-page PDF whose first page contains a direct Widget
     /// dictionary. Its stale `/P` points to the dropped second page so the
-    /// test proves that the retained-page update, rather than the source
-    /// value, is what survives.
+    /// test proves that qpdf-style stale-reference cleanup removes the entry
+    /// instead of repairing it from the current `/Annots` owner.
     fn build_direct_widget_page_pdf() -> Vec<u8> {
         let objects: Vec<(u32, &[u8])> = vec![
             (
@@ -726,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_page_widget_is_collected_and_updated() {
+    fn direct_page_widget_removes_dropped_page_ref() {
         let mut pdf = open(build_direct_widget_page_pdf());
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
@@ -741,21 +748,17 @@ mod tests {
             .expect("the page widget must remain a direct dictionary");
         assert_eq!(
             widget.get("P"),
-            Some(&Object::Reference(ObjectRef::new(3, 0))),
-            "direct page widget /P must be updated through its owner"
+            None,
+            "a direct original widget must not be repaired to its current owner"
         );
     }
 
     #[test]
-    fn duplicate_page_selection_updates_every_direct_widget_occurrence() {
-        // qpdf precedent (`--pages in.pdf 1,1`): a duplicate page selection
-        // deep-clones the page dictionary per occurrence
-        // (pages/tree_rebuild.rs's own doc), so a *direct* widget on that
-        // page is a genuinely distinct object per occurrence -- unlike an
-        // indirect widget, which stays the same shared object regardless of
-        // which occurrence references it. Selecting the same source page
-        // twice must update /P on both occurrences' own widget, not just
-        // the first.
+    fn duplicate_page_selection_removes_stale_direct_widget_page_refs() {
+        // A duplicate page selection deep-clones the page dictionary per
+        // occurrence, but qpdf still does not infer `/P` from the new owner.
+        // The source `/P` points at the dropped page and is therefore removed
+        // from both copied direct widgets by the writer-visible cleanup.
         let mut pdf = open(build_direct_widget_page_pdf());
         let page_ref = ObjectRef::new(3, 0);
         let result = rebuild_page_tree(&mut pdf, &[page_ref, page_ref]).unwrap();
@@ -777,9 +780,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("occurrence {index} widget must be direct")); // cov:ignore: fixture invariant
             assert_eq!(
                 widget.get("P"),
-                Some(&Object::Reference(new_page)),
-                "occurrence {index}'s direct widget /P must point at its own page {new_page}, \
-                 not a stale or shared reference"
+                None,
+                "occurrence {index}'s direct widget /P must not be synthesized from its owner"
             );
         }
     }
@@ -790,7 +792,7 @@ mod tests {
         let widget = ObjectHandle::integer(1);
 
         let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
-        update_widget_page_ref(&mut pdf, &widget, ObjectRef::new(3, 0), &retained).unwrap();
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained).unwrap();
     }
 
     #[test]
@@ -799,7 +801,7 @@ mod tests {
         let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
         let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
 
-        update_widget_page_ref(&mut pdf, &widget, ObjectRef::new(4, 0), &retained).unwrap();
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained).unwrap();
 
         let widget_dict = dict_of(&mut pdf, ObjectRef::new(7, 0));
         assert_eq!(
@@ -872,12 +874,13 @@ mod tests {
         );
     }
 
-    /// Widget /P updated to new page ref for retained-page widgets.
+    /// Missing original widget /P remains missing; qpdf does not infer an owner
+    /// from the current page /Annots membership.
     ///
     /// The test explicitly verifies the update fires by first stripping /P
     /// from the widgets, then running prune and asserting it is re-set.
     #[test]
-    fn widget_p_updated_to_new_page_ref() {
+    fn widget_p_missing_is_left_missing() {
         let mut pdf = open(build_acroform_pdf());
 
         // Pre-condition: strip /P from FieldA (7) and B1 (9) to confirm the
@@ -895,21 +898,13 @@ mod tests {
         let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
 
-        // FieldA (7): /P should be set to page-1 ref 3 0 R.
+        // FieldA (7): the absent /P must remain absent.
         let field_a = dict_of(&mut pdf, ObjectRef::new(7, 0));
-        assert_eq!(
-            field_a.get("P"),
-            Some(&Object::Reference(ObjectRef::new(3, 0))),
-            "FieldA /P should be set to page-1 ref"
-        );
+        assert_eq!(field_a.get("P"), None, "FieldA /P must not be synthesized");
 
-        // B1 (9): /P should be set to page-2 ref 4 0 R.
+        // B1 (9): the absent /P must remain absent.
         let b1 = dict_of(&mut pdf, ObjectRef::new(9, 0));
-        assert_eq!(
-            b1.get("P"),
-            Some(&Object::Reference(ObjectRef::new(4, 0))),
-            "B1 /P should be set to page-2 ref"
-        );
+        assert_eq!(b1.get("P"), None, "B1 /P must not be synthesized");
     }
 
     /// Dropped-page widget in a kept field's /Kids must have /P removed

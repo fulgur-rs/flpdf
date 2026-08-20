@@ -151,6 +151,27 @@ fn widget_page_position(path: &Path, partial_name: &str) -> usize {
         .expect("widget /P page")
 }
 
+fn widget_page_ref(path: &Path, partial_name: &str) -> Option<String> {
+    let text = qdf(path);
+    let marker = format!("/T ({partial_name})");
+    let marker_at = text.find(&marker).expect("field partial name");
+    let object_at = text[..marker_at]
+        .rfind(" 0 obj")
+        .expect("field object header");
+    let end = text[marker_at..]
+        .find("endobj")
+        .map(|offset| marker_at + offset)
+        .expect("field object end");
+    let object = &text[object_at..end];
+    object.split("/P ").nth(1).map(|value| {
+        value
+            .split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
 fn observable_fields(json: &Value) -> Vec<Value> {
     json["acroform"]["fields"]
         .as_array()
@@ -620,6 +641,22 @@ fn acroform_inline_primary_pdf() -> Vec<u8> {
     ])
 }
 
+/// One-page primary whose original indirect widget is attached to page 1 but
+/// carries a dangling `/P`. qpdf does not run `fixCopiedAnnotations` for the
+/// first primary occurrence (`QPDFJob.cc:2517-2585`), so the dangling page
+/// reference resolves to null and the writer omits the key. A generic repair
+/// based on widget indirectness changes the observable result.
+fn acroform_original_indirect_widget_with_dangling_page_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (Malformed) /Rect [0 0 10 10] /P 99 0 R >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< >>\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Fields [4 0 R] >>\nendobj\n".to_vec(),
+    ])
+}
+
 fn acroform_is_direct(path: &Path) -> bool {
     let text = qdf(path);
     let marker_at = text.find("/AcroForm").expect("catalog AcroForm");
@@ -933,5 +970,71 @@ fn inline_primary_acroform_stays_direct_after_pages_merge() {
         observable_fields(&acroform_json(&flpdf_output)),
         observable_fields(&qpdf_acroform_json(&qpdf_output)),
         "preserving directness must not change the merged field contents"
+    );
+}
+
+/// qpdf does not infer copy provenance from the widget's indirectness. An
+/// original widget with a dangling `/P` is not passed through
+/// `fixCopiedAnnotations`; qpdf nulls the dangling reference during the page
+/// operation and its writer omits the `/P` key. flpdf must not repair it to the
+/// page that currently contains the annotation merely because the widget is
+/// indirect.
+#[test]
+fn original_indirect_widget_dangling_page_is_not_repaired() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    std::fs::write(
+        &primary,
+        acroform_original_indirect_widget_with_dangling_page_pdf(),
+    )
+    .expect("write primary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let qpdf = Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(
+        qpdf.status.success() || qpdf.status.code() == Some(3),
+        "qpdf page operation failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .output()
+        .expect("flpdf should spawn");
+    assert!(
+        flpdf.status.success() || flpdf.status.code() == Some(3),
+        "flpdf page operation failed: {}",
+        String::from_utf8_lossy(&flpdf.stderr)
+    );
+
+    assert_eq!(
+        widget_page_ref(&qpdf_output, "Malformed"),
+        None,
+        "qpdf omits an original widget's dangling /P after null resolution"
+    );
+    assert_eq!(
+        widget_page_ref(&flpdf_output, "Malformed"),
+        None,
+        "flpdf must not infer copy provenance from widget indirectness"
     );
 }
