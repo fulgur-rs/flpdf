@@ -160,6 +160,21 @@ class ScanSourceTests(unittest.TestCase):
             errors,
         )
 
+    def test_char_literal_quote_masks_a_marker_on_the_same_line(self):
+        # Documented limitation (module docstring): a `"` inside a char/byte
+        # literal like `b'"'` is misread as opening a string, so a real `//`
+        # marker later on the same line is never seen and the line is
+        # flagged as malformed instead of accepted. This locks in the
+        # documented workaround (put the marker on its own line) so a future
+        # change to the shared scanning algorithm doesn't silently drift
+        # from what the docstring promises.
+        source = "        b'\"' => value, // qpdf-deviation: reason\n"
+        errors = self.module.scan_source(source)
+        self.assertEqual(
+            [(1, "qpdf-deviation must be a `// qpdf-deviation[-start|-end]` comment")],
+            errors,
+        )
+
 
 class CheckTests(unittest.TestCase):
     @classmethod

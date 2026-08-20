@@ -30,12 +30,19 @@ record. Files outside that tree (`tests/`, `build.rs`, `benches/`, `fuzz/`)
 are not scanned at all, matching `scripts/qpdf-module-docs.py`'s published-
 source-only scope.
 
-Known limitation, shared with `// cov:ignore`'s `_find_line_comment`: comment
-and string detection resets at every line, so a `//` sequence written inside
-a `/* ... */` block comment or a multi-line string literal is misread as a
-real line comment. This repository's style does not use block comments, so
-the risk is accepted rather than adding full lexical (multi-line) state
-tracking.
+Known limitations, shared with `// cov:ignore`'s `_find_line_comment`
+(scripts/patch-coverage.sh), whose exact scanning algorithm this mirrors:
+
+- Comment and string detection resets at every line, so a `//` sequence
+  written inside a `/* ... */` block comment or a multi-line string literal
+  is misread as a real line comment. This repository's style does not use
+  block comments, so the risk is accepted rather than adding full lexical
+  (multi-line) state tracking.
+- Single quotes are not tracked (so Rust lifetimes like `'a` do not confuse
+  the scanner), which means a char/byte literal containing a double quote,
+  such as `b'"'`, is misread as opening a string and can hide a real `//`
+  marker later on the same line. Put the marker on its own line in that
+  case.
 """
 
 from __future__ import annotations
