@@ -1,8 +1,6 @@
 //! qpdf correspondence: `QUtil::QPDFTime`, `get_current_qpdf_time`, and `qpdf_time_to_pdf_time`.
 //! Source details: `include/qpdf/QUtil.hh:227-261`, `libqpdf/QUtil.cc:868-934`.
 
-#![allow(unsafe_code)]
-
 use std::sync::OnceLock;
 
 /// qpdf's portable representation of a local wall-clock time.
@@ -81,74 +79,92 @@ pub(crate) fn default_pdf_date() -> &'static [u8] {
 }
 
 #[cfg(unix)]
-unsafe extern "C" {
-    fn tzset();
+#[allow(unsafe_code)]
+mod unix_platform {
+    use super::QpdfTime;
+
+    unsafe extern "C" {
+        fn tzset();
+    }
+
+    pub(super) fn current_qpdf_time() -> QpdfTime {
+        let now = {
+            // SAFETY: `time` accepts a null output pointer when only the return
+            // value is requested, as in qpdf's `time(nullptr)` call.
+            unsafe { libc::time(std::ptr::null_mut()) }
+        };
+        {
+            // SAFETY: `tzset` refreshes the C library's process timezone state;
+            // it takes no arguments and has no Rust-visible aliasing contract.
+            unsafe { tzset() };
+        }
+
+        let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let local_ptr = {
+            // SAFETY: `local` points to writable storage for one `libc::tm`, and
+            // `now` is a valid value returned by `time`.
+            unsafe { libc::localtime_r(&now, local.as_mut_ptr()) }
+        };
+        assert!(!local_ptr.is_null(), "localtime_r failed");
+        let local = {
+            // SAFETY: a non-null `localtime_r` result means the supplied storage
+            // was initialized with the converted calendar value.
+            unsafe { local.assume_init() }
+        };
+
+        QpdfTime::new(
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+            // qpdf stores minutes before UTC, while `tm_gmtoff` is seconds after
+            // UTC (`libqpdf/QUtil.cc:892-894`).
+            -(local.tm_gmtoff / 60) as i32,
+        )
+    }
 }
 
 #[cfg(unix)]
 fn current_qpdf_time() -> QpdfTime {
-    let now = {
-        // SAFETY: `time` accepts a null output pointer when only the return
-        // value is requested, as in qpdf's `time(nullptr)` call.
-        unsafe { libc::time(std::ptr::null_mut()) }
-    };
-    {
-        // SAFETY: `tzset` refreshes the C library's process timezone state;
-        // it takes no arguments and has no Rust-visible aliasing contract.
-        unsafe { tzset() };
-    }
-
-    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-    let local_ptr = {
-        // SAFETY: `local` points to writable storage for one `libc::tm`, and
-        // `now` is a valid value returned by `time`.
-        unsafe { libc::localtime_r(&now, local.as_mut_ptr()) }
-    };
-    assert!(!local_ptr.is_null(), "localtime_r failed");
-    let local = {
-        // SAFETY: a non-null `localtime_r` result means the supplied storage
-        // was initialized with the converted calendar value.
-        unsafe { local.assume_init() }
-    };
-
-    QpdfTime::new(
-        local.tm_year + 1900,
-        local.tm_mon + 1,
-        local.tm_mday,
-        local.tm_hour,
-        local.tm_min,
-        local.tm_sec,
-        // qpdf stores minutes before UTC, while `tm_gmtoff` is seconds after
-        // UTC (`libqpdf/QUtil.cc:892-894`).
-        -(local.tm_gmtoff / 60) as i32,
-    )
+    unix_platform::current_qpdf_time()
 }
 
 #[cfg(windows)]
-fn current_qpdf_time() -> QpdfTime {
+#[allow(unsafe_code)]
+mod windows_platform {
+    use super::QpdfTime;
     use windows_sys::Win32::Foundation::SYSTEMTIME;
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
     use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
 
-    let mut local = SYSTEMTIME::default();
-    let mut timezone = TIME_ZONE_INFORMATION::default();
-    // SAFETY: both Windows APIs receive pointers to initialized writable
-    // structures of the exact types declared by the Windows SDK. qpdf uses
-    // the same APIs and takes `TIME_ZONE_INFORMATION::Bias` directly.
-    unsafe {
-        GetLocalTime(&mut local);
-        let _ = GetTimeZoneInformation(&mut timezone);
-    }
+    pub(super) fn current_qpdf_time() -> QpdfTime {
+        let mut local = SYSTEMTIME::default();
+        let mut timezone = TIME_ZONE_INFORMATION::default();
+        // SAFETY: both Windows APIs receive pointers to initialized writable
+        // structures of the exact types declared by the Windows SDK. qpdf uses
+        // the same APIs and takes `TIME_ZONE_INFORMATION::Bias` directly.
+        unsafe {
+            GetLocalTime(&mut local);
+            let _ = GetTimeZoneInformation(&mut timezone);
+        }
 
-    QpdfTime::new(
-        i32::from(local.wYear),
-        i32::from(local.wMonth),
-        i32::from(local.wDay),
-        i32::from(local.wHour),
-        i32::from(local.wMinute),
-        i32::from(local.wSecond),
-        timezone.Bias,
-    )
+        QpdfTime::new(
+            i32::from(local.wYear),
+            i32::from(local.wMonth),
+            i32::from(local.wDay),
+            i32::from(local.wHour),
+            i32::from(local.wMinute),
+            i32::from(local.wSecond),
+            timezone.Bias,
+        )
+    }
+}
+
+#[cfg(windows)]
+fn current_qpdf_time() -> QpdfTime {
+    windows_platform::current_qpdf_time()
 }
 
 #[cfg(not(any(unix, windows)))]
