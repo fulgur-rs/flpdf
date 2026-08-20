@@ -3014,8 +3014,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // the graph the walk numbers. Running this after the walk (as an earlier
     // version of this function did) left freshly-minted refs outside every
     // numbering map, causing a hard failure for a page tree that needed
-    // repair in QDF/content-normalization mode.
-    let qdf_page_refs = if options.qdf || options.content_normalization {
+    // repair in QDF/content-normalization/non-none-decode mode.
+    let qdf_page_refs = if options.qdf
+        || options.content_normalization
+        || options.decode_level != DecodeLevel::None
+    {
         Some(crate::PageDocumentHelper::new(pdf).get_all_pages()?)
     } else {
         None
@@ -8308,6 +8311,44 @@ mod tests {
             out1, out2,
             "back-to-back writes on the same Pdf must be byte-identical even when \
              the source Catalog needed page-tree repair"
+        );
+    }
+
+    #[test]
+    fn emit_canonical_pdf_decode_level_repairs_direct_catalog_pages_before_numbering() {
+        // This calls emit_canonical_pdf directly, so PdfWriter's outer
+        // progress-snapshot repair cannot mask the specialized writer's own
+        // qpdf trigger. A non-none decode level must still promote the direct
+        // page leaf before Catalog-first numbering.
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Count 1 /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] >> >>\nendobj\n",
+        );
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("open");
+        let options = WriterOptions {
+            decode_level: DecodeLevel::Generalized,
+            extra_header_text: "% specialized\n".into(),
+            object_streams: ObjectStreamMode::Disable,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let count_before = pdf.get_object_count().unwrap();
+        let mut out = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("decoded rewrite");
+
+        assert_eq!(
+            pdf.get_object_count().unwrap(),
+            count_before + 1,
+            "non-none decode level must trigger direct /Kids page promotion"
         );
     }
 

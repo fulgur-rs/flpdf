@@ -88,8 +88,10 @@ fn qpdf_progress_for_bytes(source: &[u8], options: &[&str]) -> flpdf::Result<Vec
     command.args(options);
     command.arg(&input_path).arg(&output_path);
     let output = command.output()?;
+    let allows_warning =
+        options.contains(&"--qdf") || options.contains(&"--stream-data=uncompress");
     assert!(
-        output.status.success() || (options.contains(&"--qdf") && output.status.code() == Some(3)),
+        output.status.success() || (allows_warning && output.status.code() == Some(3)),
         "qpdf --progress failed: {output:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -261,6 +263,21 @@ fn flpdf_qdf_progress_for_bytes(source: &[u8]) -> flpdf::Result<Vec<u8>> {
     let events = Rc::new(RefCell::new(Vec::<u8>::new()));
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_qdf_mode(true);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+    let events = events.borrow().clone();
+    Ok(events)
+}
+
+fn flpdf_decode_level_progress_for_bytes(source: &[u8]) -> flpdf::Result<Vec<u8>> {
+    let mut pdf = Pdf::open(Cursor::new(source.to_vec()))?;
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_stream_data_mode(StreamDataMode::Uncompress);
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
@@ -2535,6 +2552,18 @@ fn pdf_writer_qdf_repair_progress_matches_qpdf_after_page_object_mint() -> flpdf
     let source = synthetic_direct_leaf_kid_pdf();
     let expected = qpdf_progress_for_bytes(&source, &["--qdf"])?;
     let actual = flpdf_qdf_progress_for_bytes(&source)?;
+
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn pdf_writer_decode_level_repair_progress_matches_qpdf_after_page_object_mint() -> flpdf::Result<()>
+{
+    qpdf_11_9_0()?;
+    let source = synthetic_direct_leaf_kid_pdf();
+    let expected = qpdf_progress_for_bytes(&source, &["--stream-data=uncompress"])?;
+    let actual = flpdf_decode_level_progress_for_bytes(&source)?;
 
     assert_eq!(actual, expected);
     Ok(())
