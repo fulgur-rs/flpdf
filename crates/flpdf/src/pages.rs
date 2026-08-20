@@ -78,8 +78,9 @@ pub(crate) fn page_parent_entries<R: Read + Seek>(
 
 /// Advance a page-tree parent cursor when `/Parent` is a dictionary handle.
 pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParentCursor>> {
-    parent.try_dereference()?;
-    if parent.is_null() || parent.as_dictionary().is_none() {
+    // Keep unresolved indirect parents as cursors so the caller's next loop
+    // iteration can apply its depth guard before resolving the boundary node.
+    if parent.is_null() || (!parent.is_indirect() && parent.as_dictionary().is_none()) {
         return Ok(None);
     }
     Ok(Some(PageParentCursor::from_handle(parent)))
@@ -858,8 +859,30 @@ mod tests {
     use super::*;
     use crate::filters::encode_stream_data;
     use crate::Dictionary;
-    use std::io::Cursor;
+    use std::cell::Cell;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
     use std::process::Command;
+    use std::rc::Rc;
+
+    struct ToggleReadFailure {
+        cursor: Cursor<Vec<u8>>,
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl Read for ToggleReadFailure {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail.get() {
+                return Err(std::io::Error::other("boundary parent read unexpectedly"));
+            }
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl Seek for ToggleReadFailure {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
 
     /// `object_type_name` collapses both real variants to `"real"` so that
     /// diagnostics do not leak the implementation detail that one form
@@ -975,6 +998,38 @@ mod tests {
         )
         .expect("non-dictionary page lookup should succeed")
         .is_none());
+    }
+
+    #[test]
+    fn inherited_walk_reports_depth_limit_before_dereferencing_boundary_parent() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let fail = Rc::new(Cell::new(false));
+        let reader = ToggleReadFailure {
+            cursor: Cursor::new(bytes),
+            fail: Rc::clone(&fail),
+        };
+        let mut pdf = Pdf::open(reader).expect("PDF should parse");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&page)
+            .expect("the current page should be readable before the boundary");
+        fail.set(true);
+        let error =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 1)
+                .expect_err("a boundary parent must report the depth limit before resolution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("page tree depth exceeds maximum of 1 at 2 0 R"),
+            "expected depth-limit error, got {error}"
+        );
     }
 
     #[test]
