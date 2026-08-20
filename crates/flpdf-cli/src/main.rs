@@ -36,7 +36,7 @@ use flpdf::{
     EncryptMethod, EncryptParams, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg,
     ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf,
     PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
-    RemoveUnreferencedResources, Severity, StreamDataMode, WriterConfiguration,
+    RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
 };
 use flpdf::{fix_qdf, remove_attachment};
 use std::collections::{BTreeMap, HashSet};

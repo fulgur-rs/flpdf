@@ -214,9 +214,10 @@ impl<R: Read + Seek + 'static> StreamInput<R> {
     /// `/T` offsets are relative to the logical input (`QPDF_linearization.cc:
     /// 84-155,159-245`).
     fn read_logical_bytes(&self) -> Result<Vec<u8>> {
-        let bytes = self.read_underlying_bytes()?;
+        let mut bytes = self.read_underlying_bytes()?;
         let header_offset = self.header_offset.min(bytes.len());
-        Ok(bytes[header_offset..].to_vec())
+        bytes.drain(..header_offset);
+        Ok(bytes)
     }
 
     fn last_offset(&self) -> u64 {
