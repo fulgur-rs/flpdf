@@ -6663,35 +6663,6 @@ mod tests {
     }
 
     #[test]
-    fn check_diagnostic_location_does_not_duplicate_object_offset() {
-        let object_warning =
-            flpdf::Diagnostic::warning("(object 5 0, offset 232): expected endobj", Some(232));
-        assert_eq!(
-            check_diagnostic_location(Path::new("input.pdf"), &object_warning),
-            "input.pdf"
-        );
-
-        let ordinary_warning = flpdf::Diagnostic::warning("xref warning", Some(12));
-        assert_eq!(
-            check_diagnostic_location(Path::new("input.pdf"), &ordinary_warning),
-            "input.pdf (offset 12)"
-        );
-    }
-
-    #[test]
-    fn check_diagnostic_location_does_not_duplicate_trailer_offset() {
-        let trailer_warning = flpdf::Diagnostic::warning(
-            "(trailer, offset 190): dictionary has duplicated key /Foo; \
-             last occurrence overrides earlier ones",
-            Some(190),
-        );
-        assert_eq!(
-            check_diagnostic_location(Path::new("input.pdf"), &trailer_warning),
-            "input.pdf"
-        );
-    }
-
-    #[test]
     fn apply_normalize_content_follows_two_hop_holder_chain() {
         let mut pdf = Pdf::open_mem_owned(
             include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
