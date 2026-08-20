@@ -31,6 +31,7 @@
 | `crates/flpdf/src/job/json_sections.rs` | correspondence | \`QPDFJob::doJSONPages\`, \`doJSONPageLabels\`, \`doJSONOutlines\`, \`doJSONAcroform\`, \`doJSONAttachments\`, and \`doJSONEncrypt\` section builders |
 | `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command and JSON section orchestration |
+| `crates/flpdf/src/job/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
@@ -83,7 +84,6 @@
 | `crates/flpdf/src/page_extract.rs` | correspondence | QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only |
 | `crates/flpdf/src/page_form_xobject.rs` | correspondence | QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper |
 | `crates/flpdf/src/page_label_document_helper.rs` | correspondence | \`QPDFPageLabelDocumentHelper.cc\` canonical page-label access and reconstruction |
-| `crates/flpdf/src/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
 | `crates/flpdf/src/page_object_helper.rs` | correspondence | QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules |
 | `crates/flpdf/src/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |
 | `crates/flpdf/src/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
