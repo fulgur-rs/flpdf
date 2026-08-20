@@ -3857,10 +3857,17 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
         // scanning inside, so an `--overlay`/`--underlay` that is really a *value*
         // of one of these flags is not mistaken for a new overlay group. An
         // unterminated segment is copied to the end and left for clap to reject.
+        // `--add-attachment=...` (qpdf's bare-option equals-form, which discards
+        // the `=value` and reads the file from the segment's own positional
+        // token -- see extract_attachment_groups) starts the same opaque segment
+        // as `--add-attachment`; without this, a file whose name happens to be
+        // literally `--overlay`/`--underlay` inside such a segment would be
+        // misread as a new overlay group by this earlier pass.
         if matches!(
             arg.as_str(),
             "--encrypt" | "--pages" | "--add-attachment" | "--copy-attachments-from"
-        ) {
+        ) || arg.starts_with("--add-attachment=")
+        {
             residual.push(arg);
             for tok in iter.by_ref() {
                 let is_terminator = tok == "--";
@@ -7638,6 +7645,18 @@ mod tests {
         let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
         assert!(specs.is_empty(), "got: {specs:?}");
         assert_eq!(residual, argv);
+    }
+
+    #[test]
+    fn extract_overlay_token_inside_equals_form_attachment_segment_is_not_a_group() {
+        // `--add-attachment=discarded` (qpdf's bare-option equals-form) starts the
+        // same opaque segment as `--add-attachment`. A file literally named
+        // `--overlay` as the segment's positional token must not be hijacked into
+        // a new overlay group by this earlier pass.
+        let argv = strs(&["--add-attachment=discarded", "--overlay", "--", "out.pdf"]);
+        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
+        assert!(specs.is_empty(), "no overlay group, got: {specs:?}");
+        assert_eq!(residual, argv, "attachment segment copied verbatim");
     }
 
     // --- build_overlay_specs --------------------------------------------
