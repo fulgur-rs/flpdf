@@ -362,10 +362,8 @@ fn wire_doc_level<RTgt: Read + Seek>(
         // The name-tree root was remapped above. Remapping this newly built
         // `/Names` holder as well would remap a destination twice when a new
         // target reference is also present as a source key in `map`.
-        catalog.replace_key(
-            b"/Names",
-            target.lift_object_to_handle(&Object::Dictionary(names))?,
-        )?;
+        let names_handle = target.lift_object_to_handle(&Object::Dictionary(names))?;
+        catalog.replace_key(b"/Names", names_handle)?;
     }
     // Legacy /Catalog /Dests: indirect → wire copied ref; inline → remap the
     // complete direct carrier once, preserving any indirect holder structure.
