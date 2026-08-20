@@ -153,14 +153,6 @@ impl QPDFJob {
                 continue;
             }
 
-            if let Some(mimetype) = option.mimetype.as_deref() {
-                if !mimetype.contains(&b'/') {
-                    return Err(Error::System(
-                        "mime type should be specified as type/subtype".to_string(),
-                    ));
-                }
-            }
-
             // qpdf's provider factory opens the path while constructing the
             // EmbeddedFile so that it can compute /Params /Size and /CheckSum.
             // Keep that failure at the job boundary to retain qpdf's `open
@@ -793,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn add_attachment_rejects_mimetype_without_type_subtype_separator() {
+    fn add_attachment_accepts_raw_mimetype_at_the_library_boundary() {
         let bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/minimal.pdf"
@@ -812,12 +804,12 @@ mod tests {
         let mut options = add_options(attachment, b"payload-key");
         options.mimetype = Some(b"textplain".to_vec());
 
-        let error = job
-            .add_attachment(&mut pdf, options)
-            .expect_err("invalid mimetype must fail");
+        job.add_attachment(&mut pdf, options)
+            .expect("library boundary must not validate mimetype syntax");
+        let attachments = list_attachment_info(&mut pdf).expect("list attachments");
         assert_eq!(
-            error.to_string(),
-            "mime type should be specified as type/subtype"
+            attachments[0].mimetype.as_deref(),
+            Some(b"textplain".as_slice())
         );
     }
 
