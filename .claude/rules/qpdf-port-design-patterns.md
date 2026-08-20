@@ -159,8 +159,8 @@ C++ から Rust へ写すとき、qpdf 側にある要素を落とすのも、�
 qpdf の 1 コンポーネントに対応する flpdf 実装が複数箇所に分散している状態
 （例: `page_object_helper.rs` 側と `pages.rs` 側がそれぞれ独立に継承属性を
 辿っていた）を 1 つの共有 primitive へ統合するとき、各実装が個別に持って
-いた「qpdf に対応物のない flpdf 固有の挙動」（CLAUDE.md の「qpdf に対応物が
-一切ない flpdf 固有の挙動」カテゴリ。(B) の恒久的な構造代替とは別物 —
+いた「qpdf に対応物のない flpdf 固有の挙動」（CLAUDE.md の逸脱分類 (C)。
+(B) の恒久的な構造代替とは別物 —
 境界条件のズレ、legacy な redirect 追跡、診断 warning の発行条件など）が、
 統合によって黙って消える
 か別の実装へ黙って混入する。これをレビュー（Codex Review 等）が事後的に
@@ -179,8 +179,9 @@ qpdf の 1 コンポーネントに対応する flpdf 実装が複数箇所に�
     limited（典型的には `#[cfg(test)]` のみ）なら CI の `-D warnings` を
     壊さないよう呼び出し元に `#[allow(deprecated)]` を局所的に付ける。
     259 箇所規模の pub API 全体を一括 `#[deprecated]` にするような大規模
-    cutover には使わない（[[flpdf-pre-1-0-skip-backward-compat]] のとおり
-    CI を割る）。
+    cutover には使わない（pre-v1.0 の flpdf は後方/前方互換を考慮しない方針
+    のため、大規模一括 `#[deprecated]` は個別の呼び出し元 `#[allow]` で
+    吸収しきれず CI の `-D warnings` を割る）。
   - 分岐・ブロック単位でしか切り離せないなら
     `// qpdf-deviation: <理由>` /
     `// qpdf-deviation-start: <理由>` … `// qpdf-deviation-end`
@@ -196,8 +197,9 @@ qpdf の 1 コンポーネントに対応する flpdf 実装が複数箇所に�
 PR #976（`pages.rs` の共有継承属性 walk への統合）で Codex Review が
 3 件の regression 候補を指摘した。うち 2 件（100 番目の祖先を検査する前に
 depth 上限に達する off-by-one、malformed parent での型 warning 消失）は
-qpdf `QPDFPageObjectHelper::getAttribute`（`libqpdf/QPDFPageObjectHelper.
-cc:236-247`）に対応がある真の regression で修正した。残り 1 件
+qpdf `QPDFPageObjectHelper::getAttribute`
+（`libqpdf/QPDFPageObjectHelper.cc:236-247`）に対応がある真の regression
+で修正した。残り 1 件
 （`Pdf::set_object` による bare-reference の多段 redirect 追跡）は qpdf に
 対応物のない test-only の legacy bridge（`docs/qpdf-correspondence.md:386`
 に既存記載）で、メンテナ判断により維持しないと決めたが、これは実装の

@@ -18,9 +18,11 @@ This file provides instructions and context for AI coding agents working on this
 - **逸脱は必ず明示**: byte-identical を達成できない／しない箇所は、PR・コミット・beads
   issue に理由を 1 行残す。暗黙の逸脱を作らない。
 
-### 逸脱の 2 分類
+### 逸脱の分類
 
-逸脱は「**出力バイトを変えるか**」で厳密に区別する。
+逸脱はまず「**出力バイトを変えるか**」で厳密に区別する。変える逸脱は (A) の
+1 点のみ。変えない逸脱はさらに「qpdf に対応する処理が存在するか」で
+(B) と、後述する対応物なしのカテゴリに分かれる。
 
 #### (A) 出力バイトを変える逸脱 — DEFLATE 実装のみ（唯一）
 
@@ -63,7 +65,7 @@ v1.0 以降は想定 consumer の要件に応じて qpdf 完全トレースを�
 
 この方針の bd メモリ版（`bd prime` で自動注入）: `bd recall pre-v1-0-qpdf-byte-identical-qtest-parity`。
 
-#### qpdf に対応物が一切ない flpdf 固有の挙動（(A)/(B) いずれでもない）
+#### (C) qpdf に対応物が一切ない flpdf 固有の挙動 — 出力バイトは変えないが (B) とは別枠
 
 (B) は「qpdf にある概念の入れ物だけを Rust の標準的な仕組みに置き換える」話
 （`InputSource` → `Read + Seek` のように、恒久的にそのまま使われ続ける）。

@@ -23,9 +23,12 @@ scripts/patch-coverage.sh:
 A marker must be a real `//` line comment. A reason is required on
 `qpdf-deviation` and `qpdf-deviation-start`; `qpdf-deviation-end` takes no
 text. Blocks must not nest and every `-start` needs a matching `-end`.
-Anything that mentions the token but is not a well-formed marker is an
-error, never a silent no-op -- a malformed marker that fails open would
-defeat the point of a grep-able record.
+Within the scanned tree (`crates/*/src/**/*.rs`), anything that mentions the
+token but is not a well-formed marker is an error, never a silent no-op --
+a malformed marker that fails open would defeat the point of a grep-able
+record. Files outside that tree (`tests/`, `build.rs`, `benches/`, `fuzz/`)
+are not scanned at all, matching `scripts/qpdf-module-docs.py`'s published-
+source-only scope.
 
 Known limitation, shared with `// cov:ignore`'s `_find_line_comment`: comment
 and string detection resets at every line, so a `//` sequence written inside
