@@ -54,15 +54,7 @@ qpdf の C++ 固有の足場を Rust の標準的な仕組みで置き換える�
    （例: base64 のエンコード結果は同一。JSON の逐次出力順は qpdf のまま）
 3. **明示的に記録すること。** 当該モジュールの doc に逸脱理由を 1 行、
    [`docs/qpdf-correspondence.md`](docs/qpdf-correspondence.md) の ⚪ 行に該当箇所を
-   記載する。暗黙の逸脱を作らない。加えて、該当コード自体を機械可読にマークする:
-   関数・型・フィールド単位で切り離せる逸脱は `#[deprecated(note = "...")]`、
-   分岐・ブロック単位の逸脱は `// qpdf-deviation: <理由>`（複数行は
-   `// qpdf-deviation-start: <理由>` … `// qpdf-deviation-end`）。CI の
-   `scripts/check-qpdf-deviation-markers.py --check` が書式を検証する。これにより、
-   複数の既存実装を 1 つの共有 primitive へ統合する際にレビューが「既知のマーク済み
-   逸脱」と「未マークの regression」を機械的に見分けられる
-   （[`.claude/rules/qpdf-port-design-patterns.md`](.claude/rules/qpdf-port-design-patterns.md)
-   6 参照）。
+   記載する。暗黙の逸脱を作らない。
 
 (B) は「qpdf のやり方を尊重しつつ Rust として不自然な移植を避ける」ための枠であり、
 **qpdf の設計が気に入らないという理由での逸脱は pre-v1.0 では認めない**。
@@ -70,6 +62,27 @@ v1.0 以降は想定 consumer の要件に応じて qpdf 完全トレースを�
 それは別途判断する。
 
 この方針の bd メモリ版（`bd prime` で自動注入）: `bd recall pre-v1-0-qpdf-byte-identical-qtest-parity`。
+
+#### qpdf に対応物が一切ない flpdf 固有の挙動（(A)/(B) いずれでもない）
+
+(B) は「qpdf にある概念の入れ物だけを Rust の標準的な仕組みに置き換える」話
+（`InputSource` → `Read + Seek` のように、恒久的にそのまま使われ続ける）。
+これに対し、qpdf 側に対応する処理自体が存在しない flpdf 固有の挙動
+（legacy な redirect 追跡、test-only bridge など）は (B) の条件 2（アルゴリズムは
+qpdf のまま）を満たさないため (B) には該当しない。出力バイトには影響しない
+という点だけが共通する、別カテゴリの逸脱。
+
+この種の逸脱は、記載（モジュール doc + `docs/qpdf-correspondence.md`）に加えて
+コード自体を機械可読にマークする: 関数・型・フィールド単位で切り離せるなら
+`#[deprecated(note = "...")]`（呼び出し元が限定的な場合に限る — 恒久的に
+広く使われる (B) の構造代替一般には付けない。CI の `-D warnings` が刺さる）、
+分岐・ブロック単位でしか切り離せないなら `// qpdf-deviation: <理由>`
+（`// qpdf-deviation-start: <理由>` … `// qpdf-deviation-end`）。CI の
+`scripts/check-qpdf-deviation-markers.py --check` が書式を検証する。これにより、
+複数の既存実装を 1 つの共有 primitive へ統合する際にレビューが「既知のマーク済み
+逸脱」と「未マークの regression」を機械的に見分けられる
+（[`.claude/rules/qpdf-port-design-patterns.md`](.claude/rules/qpdf-port-design-patterns.md)
+6 参照）。
 
 ### 設計に入る前に
 

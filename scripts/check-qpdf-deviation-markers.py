@@ -2,12 +2,15 @@
 """Validate `qpdf-deviation` markers across flpdf source files.
 
 A `qpdf-deviation` marker records a flpdf behavior that intentionally
-diverges from qpdf because qpdf has no counterpart for it (CLAUDE.md
-deviation classes (A)/(B)). Unlike `// cov:ignore` (patch-coverage.sh),
-which excludes changed lines from the coverage gate, this marker exists so
-the deviation itself can be found by grep and is not silently reintroduced
-as a "regression" during a later refactor that folds two existing
-implementations into one shared primitive.
+diverges from qpdf because qpdf has no counterpart for it at all (CLAUDE.md's
+"qpdf に対応物が一切ない flpdf 固有の挙動" category -- distinct from both
+deviation class (A), which changes output bytes, and class (B), which
+replaces a qpdf-counterpart concept's container with a permanent, widely used
+Rust idiom such as `InputSource` -> `Read + Seek`). Unlike `// cov:ignore`
+(patch-coverage.sh), which excludes changed lines from the coverage gate,
+this marker exists so the deviation itself can be found by grep and is not
+silently reintroduced as a "regression" during a later refactor that folds
+two existing implementations into one shared primitive.
 
 Marker forms, mirroring the `// cov:ignore` grammar in
 scripts/patch-coverage.sh:
@@ -23,6 +26,13 @@ text. Blocks must not nest and every `-start` needs a matching `-end`.
 Anything that mentions the token but is not a well-formed marker is an
 error, never a silent no-op -- a malformed marker that fails open would
 defeat the point of a grep-able record.
+
+Known limitation, shared with `// cov:ignore`'s `_find_line_comment`: comment
+and string detection resets at every line, so a `//` sequence written inside
+a `/* ... */` block comment or a multi-line string literal is misread as a
+real line comment. This repository's style does not use block comments, so
+the risk is accepted rather than adding full lexical (multi-line) state
+tracking.
 """
 
 from __future__ import annotations
@@ -80,15 +90,15 @@ def scan_source(source: str) -> list[tuple[int, str]]:
         if m:
             kind, colon, rest = m.group(1), m.group(2), m.group(3).strip()
             if kind == "-start":
-                if not rest:
-                    errors.append((i, "qpdf-deviation-start requires a reason"))
+                if not (colon and rest):
+                    errors.append((i, "qpdf-deviation-start requires ': <reason>'"))
                 else:
                     if in_block:
                         errors.append((i, "nested qpdf-deviation-start"))
                     in_block = True
                     start_line = i
             elif kind == "-end":
-                if rest:
+                if colon or rest:
                     errors.append((i, "qpdf-deviation-end takes no text"))
                 elif not in_block:
                     errors.append((i, "qpdf-deviation-end without matching start"))

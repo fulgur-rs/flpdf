@@ -69,7 +69,7 @@ class ScanSourceTests(unittest.TestCase):
         errors = self.module.scan_source(source)
         self.assertEqual(
             [
-                (1, "qpdf-deviation-start requires a reason"),
+                (1, "qpdf-deviation-start requires ': <reason>'"),
                 (2, "qpdf-deviation-end without matching start"),
             ],
             errors,
@@ -98,6 +98,34 @@ class ScanSourceTests(unittest.TestCase):
         errors = self.module.scan_source(source)
         self.assertEqual(
             [(1, "qpdf-deviation-end without matching start")], errors
+        )
+
+    def test_rejects_start_without_colon(self):
+        # No colon at all -- still errors, and the block never opens so the
+        # following `-end` also errors as unmatched (same shape as
+        # test_rejects_start_without_reason).
+        source = "// qpdf-deviation-start missing-colon\n// qpdf-deviation-end\n"
+        errors = self.module.scan_source(source)
+        self.assertEqual(
+            [
+                (1, "qpdf-deviation-start requires ': <reason>'"),
+                (2, "qpdf-deviation-end without matching start"),
+            ],
+            errors,
+        )
+
+    def test_rejects_end_with_colon(self):
+        # A colon-bearing `-end` is malformed and does not close the block,
+        # so the still-open `-start` also errors as unterminated (same shape
+        # as test_rejects_end_with_trailing_text).
+        source = "// qpdf-deviation-start: reason\n// qpdf-deviation-end:\n"
+        errors = self.module.scan_source(source)
+        self.assertEqual(
+            [
+                (2, "qpdf-deviation-end takes no text"),
+                (1, "qpdf-deviation-start without matching end"),
+            ],
+            errors,
         )
 
     def test_rejects_end_with_trailing_text(self):

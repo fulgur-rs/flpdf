@@ -159,8 +159,10 @@ C++ から Rust へ写すとき、qpdf 側にある要素を落とすのも、�
 qpdf の 1 コンポーネントに対応する flpdf 実装が複数箇所に分散している状態
 （例: `page_object_helper.rs` 側と `pages.rs` 側がそれぞれ独立に継承属性を
 辿っていた）を 1 つの共有 primitive へ統合するとき、各実装が個別に持って
-いた「qpdf に対応物のない flpdf 固有の挙動」（境界条件のズレ、legacy な
-redirect 追跡、診断 warning の発行条件など）が、統合によって黙って消える
+いた「qpdf に対応物のない flpdf 固有の挙動」（CLAUDE.md の「qpdf に対応物が
+一切ない flpdf 固有の挙動」カテゴリ。(B) の恒久的な構造代替とは別物 —
+境界条件のズレ、legacy な redirect 追跡、診断 warning の発行条件など）が、
+統合によって黙って消える
 か別の実装へ黙って混入する。これをレビュー（Codex Review 等）が事後的に
 発見するたびに「qpdf 対応のある regression だから直す」か「qpdf 対応物の
 ない独自挙動だから維持しない」かを都度精査・議論することになり、往復が
