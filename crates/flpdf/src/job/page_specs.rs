@@ -662,6 +662,30 @@ mod tests {
     }
 
     #[test]
+    fn replace_merged_fields_ignores_a_missing_merged_root_when_gated_open() {
+        let mut merged = pdf_without_root();
+        replace_merged_fields(&mut merged, Vec::new(), true)
+            .expect("a missing merged root has no AcroForm to rebuild, even past the gate");
+    }
+
+    #[test]
+    fn replace_merged_fields_removes_acroform_when_no_fields_survive() {
+        let mut merged = acroform_pdf();
+        replace_merged_fields(&mut merged, Vec::new(), true)
+            .expect("an empty survivor list removes /AcroForm");
+        let root_ref = merged.root_ref().expect("root");
+        let root = merged
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root dictionary");
+        assert!(
+            root.get("AcroForm").is_none(),
+            "qpdf removes /AcroForm entirely once the filtered field count reaches zero"
+        );
+    }
+
+    #[test]
     fn rebuild_acroform_propagates_annotation_copy_errors() {
         let mut merged = three_page_pdf();
         let invalid_final_ref = ObjectRef::new(999, 0);
