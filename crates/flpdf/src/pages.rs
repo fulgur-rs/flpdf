@@ -60,6 +60,14 @@ impl fmt::Display for PageParentCursor {
 }
 
 /// Snapshot `key` and `/Parent` from a page-tree dictionary cursor.
+///
+/// Always attempts both lookups, even on a non-dictionary node: qpdf's own
+/// loop (`QPDFPageObjectHelper.cc:236-247`) calls `node.getKey(name)`
+/// unconditionally after advancing, and `QPDFObjectHandle::getKey`
+/// (`libqpdf/QPDFObjectHandle.cc:978-989`) reports a type warning and
+/// returns null on a non-dictionary receiver rather than silently skipping
+/// the access. [`ObjectHandle::try_get_key`] carries that same behavior, so
+/// short-circuiting here would drop the diagnostic.
 pub(crate) fn page_parent_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     cursor: &PageParentCursor,
@@ -67,9 +75,6 @@ pub(crate) fn page_parent_entries<R: Read + Seek>(
 ) -> Result<Option<(ObjectHandle, ObjectHandle)>> {
     let dict = cursor.handle();
     pdf.resolve_object_handle(&dict)?;
-    if dict.as_dictionary().is_none() {
-        return Ok(None);
-    }
     Ok(Some((
         dict.try_get_key(key)?,
         dict.try_get_key(b"/Parent")?,
@@ -965,11 +970,21 @@ mod tests {
             (b"/Parent".to_vec(), ObjectHandle::null()),
         ]);
         let mut empty = Pdf::empty().expect("empty PDF should be constructible");
+        // `page_parent_entries` always attempts the key lookups, mirroring
+        // qpdf's own `getKey` on a non-dictionary receiver
+        // (`libqpdf/QPDFObjectHandle.cc:978-989`), which reports a type
+        // warning rather than silently skipping. This bare handle has no
+        // owning document, so the warning has nowhere to go and escalates
+        // to a hard error, matching `ObjectHandle::type_warning`'s own
+        // documented no-context behavior.
         let non_dictionary = PageParentCursor::from_handle(ObjectHandle::integer(42));
+        let error = page_parent_entries(&mut empty, &non_dictionary, b"/Resources")
+            .expect_err("a non-dictionary parent with no warning sink must error");
         assert!(
-            page_parent_entries(&mut empty, &non_dictionary, b"/Resources")
-                .expect("non-dictionary parent lookup should succeed")
-                .is_none()
+            error
+                .to_string()
+                .contains("returning null for attempted key retrieval"),
+            "expected a dictionary type-warning error, got {error}"
         );
 
         let cursor = PageParentCursor::from_handle(direct_parent.clone());
@@ -1033,6 +1048,43 @@ mod tests {
         )
         .expect("non-dictionary page lookup should succeed")
         .is_none());
+    }
+
+    #[test]
+    fn inherited_walk_records_a_diagnostic_for_a_malformed_ancestor_instead_of_silence() {
+        // /Parent on the leaf's page-tree node resolves to a bare integer
+        // rather than a dictionary. A real, open document supplies a
+        // warning sink, so the type-warning from attempting `getKey` on
+        // that malformed node (qpdf's own behavior, see the comment on
+        // `page_parent_entries`) is recorded as a diagnostic rather than
+        // escalating to a hard error.
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "42"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let before = pdf.repair_diagnostics().entries().len();
+
+        let result =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 10)
+                .expect("a malformed ancestor must not error when a warning sink exists");
+        assert!(
+            result.is_none(),
+            "expected no inherited value, got {result:?}"
+        );
+
+        let diagnostics = pdf.repair_diagnostics();
+        let new_entries: Vec<_> = diagnostics.entries().iter().skip(before).collect();
+        assert!(
+            new_entries.iter().any(|entry| entry
+                .message
+                .contains("returning null for attempted key retrieval")),
+            "expected a dictionary type-warning diagnostic, got {new_entries:?}"
+        );
     }
 
     #[test]
