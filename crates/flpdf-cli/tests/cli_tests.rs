@@ -6647,6 +6647,55 @@ fn copy_attachments_from_with_prefix() {
         .stdout(predicate::str::contains("pfx-original"));
 }
 
+/// qpdf 11.9.0 (observed): `--verbose --copy-attachments-from FILE` prints
+/// `copying attachments from FILE`, `  key -> new_key` per copied entry, and
+/// (once the operation writes an output file) `wrote file OUTPUT`.
+#[test]
+fn copy_attachments_from_verbose_prints_progress_and_wrote_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let source_input = minimal_pdf_temp();
+
+    let att = temp.path().join("original.txt");
+    std::fs::write(&att, b"original content").unwrap();
+    let source = temp.path().join("source.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            source_input.path().to_str().unwrap(),
+            "--add-attachment",
+            att.to_str().unwrap(),
+            "--key=original",
+            "--",
+            source.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let output = temp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--verbose",
+            input.path().to_str().unwrap(),
+            "--copy-attachments-from",
+            source.to_str().unwrap(),
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "copying attachments from {}",
+            source.display()
+        )))
+        .stdout(predicate::str::contains("  original -> original\n"))
+        .stdout(predicate::str::contains(format!(
+            "wrote file {}",
+            output.display()
+        )));
+}
+
 #[test]
 fn attachment_round_trip_add_list_show_remove_copy() {
     // Full end-to-end round-trip as described in the subtask acceptance criteria.
