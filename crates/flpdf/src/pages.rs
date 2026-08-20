@@ -126,7 +126,12 @@ pub(crate) fn resolve_inherited_handle_with_max_depth<R: Read + Seek>(
         // Parsed PDF references already have canonical indirect identity. The
         // terminal chase below only preserves the existing Pdf::set_object
         // redirect compatibility for callers that have not migrated yet; the
-        // returned handle remains the original live child handle.
+        // returned handle remains the original live child handle. qpdf's
+        // QPDF::replaceObject rejects an indirect replacement
+        // (libqpdf/QPDF.cc:1986-1991), so a bare-reference value cycle created
+        // through that legacy mutation bridge is not a parsed qpdf object
+        // shape. Do not classify its synthetic-null fallback as qpdf's
+        // null-as-absent inheritance rule.
         let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
         if !terminal.try_is_null()? {
             return Ok(Some(value));
@@ -1055,6 +1060,92 @@ mod tests {
         )
         .expect("absent /Rotate lookup should succeed")
         .is_none());
+    }
+
+    #[test]
+    fn inherited_reference_cycle_probe_matches_qpdf_11_9() {
+        let version = match Command::new("qpdf").arg("--version").output() {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            // cov:ignore-start: the optional qpdf oracle probe skips when qpdf is absent or exits unsuccessfully in a CI environment.
+            Ok(_) | Err(_) => {
+                eprintln!("qpdf 11.9.0 is unavailable; skipping inherited-cycle oracle probe");
+                return;
+            } // cov:ignore-end
+        };
+        // cov:ignore-start: the optional qpdf oracle probe skips when a different qpdf version is installed.
+        if !version.starts_with("qpdf version 11.9.") {
+            eprintln!("qpdf 11.9.0 is unavailable; skipping inherited-cycle oracle probe");
+            return;
+        }
+        // cov:ignore-end
+
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox 4 0 R >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+                (4, "5 0 R"),
+                (5, "4 0 R"),
+            ],
+        );
+        let dir = tempfile::tempdir().expect("temporary qpdf probe directory");
+        let input = dir.path().join("inherited-cycle.pdf");
+        std::fs::write(&input, &bytes).expect("write inherited-cycle probe input");
+
+        let checked = Command::new("qpdf")
+            .arg("--check")
+            .arg(&input)
+            .output()
+            .expect("run qpdf inherited-cycle check probe");
+        let qpdf_stderr = String::from_utf8_lossy(&checked.stderr);
+        eprintln!(
+            "qpdf inherited-cycle check: status={}, stderr={qpdf_stderr:?}",
+            checked.status
+        );
+
+        let pages = Command::new("qpdf")
+            .arg("--show-pages")
+            .arg(&input)
+            .output()
+            .expect("run qpdf inherited-cycle page probe");
+        let pages_stderr = String::from_utf8_lossy(&pages.stderr);
+        assert_eq!(pages.status.code(), Some(3));
+        assert!(String::from_utf8_lossy(&pages.stdout).contains("page 1: 3 0 R"));
+        assert!(pages_stderr.contains("MediaBox is undefined; setting to letter / ANSI A"));
+
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("inherited-cycle PDF should parse");
+        let flpdf_result = resolve_inherited_handle_with_max_depth(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            b"/MediaBox",
+            10,
+        )
+        .expect("cyclic inherited value should be inspected, not fatal");
+        eprintln!("flpdf inherited-cycle result: {flpdf_result:?}");
+        // QPDFParser::parse handles a top-level integer as the complete object
+        // (`QPDFParser.cc:87-88`); it does not parse the following `0 R` as an
+        // indirect-reference value. qpdf therefore diagnoses this shape as a
+        // malformed object, not as a recursive resolve loop.
+        assert_eq!(checked.status.code(), Some(3));
+        assert!(qpdf_stderr.contains("expected endobj"));
+        assert!(qpdf_stderr.contains("MediaBox is undefined; setting to letter / ANSI A"));
+        assert!(!qpdf_stderr.contains("loop detected resolving object"));
+
+        // The canonical flpdf parser likewise exposes object 4 as the
+        // inherited non-null value; the legacy bare-reference chase is only
+        // reachable after Pdf::set_object mutation, not from this parsed PDF.
+        let inherited = flpdf_result.expect("qpdf did not treat the malformed value as absent");
+        assert_eq!(inherited.object_ref(), Some(ObjectRef::new(4, 0)));
+        let terminal = pdf
+            .resolve_object_handle_to_terminal(&inherited)
+            .expect("resolve parsed inherited value");
+        assert_eq!(terminal.as_integer(), Some(5));
     }
 
     // -----------------------------------------------------------------------
