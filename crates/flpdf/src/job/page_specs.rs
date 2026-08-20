@@ -79,16 +79,45 @@ fn collect_primary_fields(
         .collect())
 }
 
+/// Rebuild the merged primary's `/AcroForm /Fields` with the primary's
+/// first-occurrence fields, mirroring the *gate and removal* half of qpdf's
+/// end-of-selection field prune (`QPDFJob.cc:2609-2629`). qpdf only touches
+/// `/AcroForm` when the *original* `/Fields` resolved to an array
+/// (`had_fields_array`, the same gate [`crate::page_merge`]'s
+/// `PrimaryAcroForm::had_fields_array` captures); an `/AcroForm` with no
+/// `/Fields` array (e.g. only `/NeedAppearances`) is left untouched. When the
+/// gate passes, qpdf keeps a non-empty rebuilt array or removes `/AcroForm`
+/// entirely if nothing survived -- it never leaves a stray empty `/Fields`.
+///
+/// This does *not* port qpdf's `referenced_fields` accumulation or its
+/// end-of-loop call timing: qpdf's prune runs once, after every page's copy
+/// is complete, against a `pdf` that still holds every original field
+/// (including ones on pages that end up unselected). flpdf's caller runs
+/// this *before* the per-occurrence copy loop and scopes `fields` to the
+/// primary's first-occurrence pages only, because a name still held by an
+/// unselected primary field is never copied into `merged` at all and so
+/// cannot participate in the loop's collision-avoidance check. That gap is
+/// tracked separately (see the primary-fields-visibility follow-up).
 fn replace_merged_fields(
     merged: &mut Pdf<Cursor<Vec<u8>>>,
     fields: Vec<ObjectHandle>,
+    had_fields_array: bool,
 ) -> Result<()> {
+    if !had_fields_array {
+        return Ok(());
+    }
     let Some(root_ref) = merged.root_ref() else {
         return Ok(());
     };
     let root = merged.get_object_handle(root_ref);
     let acroform = merged.resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
-    if acroform.as_dictionary().is_some() {
+    let Some(_) = acroform.as_dictionary() else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        root.remove_key(b"/AcroForm");
+        merged.mark_object_handle_dirty(&root)?;
+    } else {
         acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
         merged.mark_object_handle_dirty(&acroform)?;
     }
@@ -186,8 +215,19 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
             .then_some(final_refs[output_index])
         })
         .collect();
+    // qpdf's field prune (`QPDFJob.cc:2609-2610`, `hasAcroForm() &&
+    // fields.isArray()`) only fires when the primary's *original* `/Fields`
+    // was an array; an `/AcroForm` with no `/Fields` (e.g. only
+    // `/NeedAppearances`) is left untouched. `sources[0]` is the untouched
+    // primary document -- confirmed unmutated by the merge above even when
+    // the primary is also referenced as a later page-spec source -- so this
+    // reads the pre-merge value.
+    let had_fields_array = match sources.first_mut() {
+        Some(primary) => primary.acroform().has_fields_array()?,
+        None => false,
+    };
     let primary_fields = collect_primary_fields(merged, &primary_first_pages)?;
-    replace_merged_fields(merged, primary_fields)?;
+    replace_merged_fields(merged, primary_fields, had_fields_array)?;
 
     for (source_index, mappings) in first_output_for_source_page.iter().enumerate() {
         if mappings.is_empty() {
@@ -547,6 +587,59 @@ mod tests {
         .expect("open labelled fixture")
     }
 
+    /// Build a minimal PDF from a flat list of contiguously-numbered object
+    /// bodies (1-indexed from 1).
+    fn assemble_pdf(objects: &[&[u8]]) -> Vec<u8> {
+        use std::io::Write;
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let start_xref = bytes.len();
+        let _ = writeln!(&mut bytes, "xref\n0 {}", objects.len() + 1);
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for &offset in &offsets {
+            let _ = writeln!(&mut bytes, "{offset:010} 00000 n ");
+        }
+        let _ = writeln!(
+            &mut bytes,
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            objects.len() + 1,
+            start_xref
+        );
+        bytes
+    }
+
+    /// Single-page PDF whose `/AcroForm` has `/NeedAppearances` but no
+    /// `/Fields` key at all (qpdf's `had_fields_array` gate is false).
+    fn acroform_no_fields_array_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = assemble_pdf(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /AcroForm << /NeedAppearances true >> >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        ]);
+        Pdf::open_mem_owned(bytes).expect("open AcroForm-no-fields-array fixture")
+    }
+
+    /// Two-page PDF: page 1 has no widgets; page 2 (left unselected by the
+    /// tests below) carries the document's only field, "Orphan".
+    fn acroform_all_fields_on_page_two_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let bytes = assemble_pdf(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /AcroForm << /Fields [5 0 R] /NeedAppearances true >> >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>\nendobj\n",
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [5 0 R] >>\nendobj\n",
+            b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (Orphan) \
+              /Rect [0 0 10 10] /P 4 0 R >>\nendobj\n",
+        ]);
+        Pdf::open_mem_owned(bytes).expect("open AcroForm-orphan-field fixture")
+    }
+
     fn selected_page_count(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> usize {
         crate::pages::page_refs(pdf)
             .expect("read merged page tree")
@@ -639,6 +732,71 @@ mod tests {
                 "qpdf --pages default copies inherited /Resources directly onto the page: {page:?}"
             );
         }
+    }
+
+    /// Resolve `value` one level: follow an `Object::Reference` through
+    /// `pdf`, or return a non-reference value unchanged.
+    fn resolve_one_level(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: Object) -> Object {
+        match value {
+            Object::Reference(reference) => pdf.resolve(reference).expect("resolve reference"),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn handle_page_specs_preserves_an_acroform_with_no_fields_array_across_sources() {
+        let mut sources = vec![acroform_no_fields_array_pdf(), three_page_pdf()];
+        let specs = [
+            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(1, PageRange::parse("1").unwrap()),
+        ];
+
+        let mut merged = handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None)
+            .expect("merge across a fields-less-AcroForm primary and a secondary source");
+        let root_ref = merged.root_ref().expect("merged root");
+        let root = merged
+            .resolve(root_ref)
+            .expect("resolve merged root")
+            .into_dict()
+            .expect("merged root dictionary");
+        let acroform_value = root
+            .get("AcroForm")
+            .cloned()
+            .expect("qpdf leaves an /AcroForm with no /Fields array untouched, not removed");
+        let acroform = resolve_one_level(&mut merged, acroform_value)
+            .into_dict()
+            .expect("/AcroForm dictionary");
+        assert_eq!(
+            acroform.get("NeedAppearances"),
+            Some(&Object::Boolean(true))
+        );
+        assert!(
+            acroform.get("Fields").is_none(),
+            "no /Fields array existed originally; the merge must not manufacture one"
+        );
+    }
+
+    #[test]
+    fn handle_page_specs_removes_acroform_when_the_only_field_page_is_unselected() {
+        let mut sources = vec![acroform_all_fields_on_page_two_pdf(), three_page_pdf()];
+        let specs = [
+            // Only page 1 (no widgets); page 2's "Orphan" field is dropped.
+            PageSpecInput::new(0, PageRange::parse("1").unwrap()),
+            PageSpecInput::new(1, PageRange::parse("1").unwrap()),
+        ];
+
+        let mut merged = handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None)
+            .expect("merge with the only AcroForm field on an unselected page");
+        let root_ref = merged.root_ref().expect("merged root");
+        let root = merged
+            .resolve(root_ref)
+            .expect("resolve merged root")
+            .into_dict()
+            .expect("merged root dictionary");
+        assert!(
+            root.get("AcroForm").is_none(),
+            "qpdf removes /AcroForm entirely once its filtered field count reaches zero"
+        );
     }
 
     #[test]

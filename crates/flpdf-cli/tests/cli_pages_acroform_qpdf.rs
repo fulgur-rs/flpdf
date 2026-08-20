@@ -471,3 +471,184 @@ fn foreign_page_without_acroform_does_not_create_destination_dr() {
         "flpdf must not create destination /DR for a no-AcroForm source"
     );
 }
+
+/// Build a minimal PDF from a flat list of object bodies (1-indexed from 1).
+fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
+    use std::io::Write;
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for object in objects {
+        offsets.push(bytes.len() as u32);
+        bytes.extend_from_slice(object);
+    }
+    let start_xref = bytes.len();
+    let _ = writeln!(&mut bytes, "xref\n0 {}", objects.len() + 1);
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for &offset in &offsets {
+        let _ = writeln!(&mut bytes, "{offset:010} 00000 n ");
+    }
+    let _ = writeln!(
+        &mut bytes,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+        objects.len() + 1,
+        start_xref
+    );
+    bytes
+}
+
+/// Single-page primary with `/AcroForm << /NeedAppearances true >>` and no
+/// `/Fields` key at all.
+fn acroform_no_fields_array_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /NeedAppearances true >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// Two-page primary: page 1 has no widgets; page 2 (never selected below)
+/// carries the document's only field, "Orphan".
+fn acroform_all_fields_on_page_two_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [5 0 R] /NeedAppearances true >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [5 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (Orphan) \
+          /Rect [0 0 10 10] /P 4 0 R >>\nendobj\n"
+            .to_vec(),
+    ])
+}
+
+/// Unrelated single-page source with no AcroForm at all.
+fn plain_page_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n".to_vec(),
+    ])
+}
+
+/// qpdf only rebuilds `/AcroForm /Fields` when the primary's *original*
+/// `/Fields` resolved to an array (`QPDFJob.cc:2609-2610`,
+/// `hasAcroForm() && fields.isArray()`). An `/AcroForm` with no `/Fields` at
+/// all (only `/NeedAppearances` here) must survive a multi-source `--pages`
+/// merge untouched, even though the merge's page-selection rebuild pass now
+/// runs.
+#[test]
+fn acroform_without_fields_array_survives_a_multi_source_merge() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(&primary, acroform_no_fields_array_pdf()).expect("write primary");
+    std::fs::write(&secondary, plain_page_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_acroform_json(&qpdf_output);
+    let flpdf_json = acroform_json(&flpdf_output);
+    assert_eq!(
+        qpdf_json["acroform"]["hasacroform"], true,
+        "qpdf must keep the fields-less AcroForm"
+    );
+    assert_eq!(
+        flpdf_json["acroform"]["hasacroform"], qpdf_json["acroform"]["hasacroform"],
+        "flpdf must not drop an AcroForm that never had a /Fields array"
+    );
+    assert_eq!(
+        flpdf_json["acroform"]["needappearances"], qpdf_json["acroform"]["needappearances"],
+        "/NeedAppearances must survive alongside the rest of the AcroForm dict"
+    );
+}
+
+/// qpdf removes `/AcroForm` entirely once the filtered field count reaches
+/// zero (`QPDFJob.cc:2626-2629`). When the primary's only field lives on a
+/// page that is not selected, a multi-source `--pages` merge must drop
+/// `/AcroForm`, matching the single-source extraction path.
+#[test]
+fn acroform_with_all_fields_on_unselected_pages_is_removed_in_a_multi_source_merge() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(&primary, acroform_all_fields_on_page_two_pdf()).expect("write primary");
+    std::fs::write(&secondary, plain_page_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1") // only page 1; page 2's "Orphan" field is dropped
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_json = qpdf_acroform_json(&qpdf_output);
+    let flpdf_json = acroform_json(&flpdf_output);
+    assert_eq!(
+        qpdf_json["acroform"]["hasacroform"], false,
+        "qpdf drops an AcroForm whose only field's page was not selected"
+    );
+    assert_eq!(
+        flpdf_json["acroform"]["hasacroform"], qpdf_json["acroform"]["hasacroform"],
+        "flpdf must also drop the AcroForm rather than leaving an empty /Fields"
+    );
+}
