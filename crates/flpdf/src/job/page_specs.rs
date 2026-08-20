@@ -373,7 +373,7 @@ pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
         &grouped_pages,
         &ordered_pages,
         &final_refs,
-    )?;
+    )?; // cov:ignore: public page selection supplies validated refs; the fallible continuation is covered by the direct helper error test
 
     if any_page_labels {
         let folded = merge_job_label_ranges(label_entries);
@@ -447,6 +447,36 @@ mod tests {
         crate::pages::page_refs(pdf)
             .expect("read merged page tree")
             .len()
+    }
+
+    fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        pdf.trailer_handle().remove_key(b"/Root");
+        assert!(pdf.root_ref().is_none());
+        pdf
+    }
+
+    #[test]
+    fn rebuild_acroform_ignores_a_missing_merged_root() {
+        let mut merged = pdf_without_root();
+        let mut sources: Vec<Pdf<Cursor<Vec<u8>>>> = Vec::new();
+        rebuild_acroform_in_final_page_order(&mut merged, &mut sources, &[], &[], &[])
+            .expect("a missing merged root has no AcroForm to rebuild");
+    }
+
+    #[test]
+    fn rebuild_acroform_propagates_annotation_copy_errors() {
+        let mut merged = three_page_pdf();
+        let invalid_final_ref = ObjectRef::new(999, 0);
+        let mut sources = vec![three_page_pdf()];
+        rebuild_acroform_in_final_page_order(
+            &mut merged,
+            &mut sources,
+            &[vec![0]],
+            &[(0, 0)],
+            &[invalid_final_ref],
+        )
+        .expect_err("an invalid destination page must escape the foreign copy route");
     }
 
     #[test]
