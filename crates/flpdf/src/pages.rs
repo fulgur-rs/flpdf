@@ -78,8 +78,21 @@ pub(crate) fn page_parent_entries<R: Read + Seek>(
 
 /// Advance a page-tree parent cursor when `/Parent` is a dictionary handle.
 pub(crate) fn next_page_parent(parent: ObjectHandle) -> Result<Option<PageParentCursor>> {
-    parent.try_dereference()?;
-    if parent.is_null() || parent.as_dictionary().is_none() {
+    if parent.is_null() {
+        return Ok(None);
+    }
+    // Keep only a genuinely unresolved indirect parent as a cursor, so the
+    // caller's next loop iteration can apply its depth guard before
+    // resolving the boundary node. `is_indirect()` reflects identity, not
+    // resolution state, so an indirect handle already resolved (from an
+    // earlier, unrelated read) to a non-dictionary value must be rejected
+    // here rather than deferred — deferring it would let a malformed
+    // chain surface as a depth-limit error instead of terminating cleanly,
+    // and whether that happens would depend on incidental cache state.
+    if parent.is_indirect() && !parent.is_resolved() {
+        return Ok(Some(PageParentCursor::from_handle(parent)));
+    }
+    if parent.as_dictionary().is_none() {
         return Ok(None);
     }
     Ok(Some(PageParentCursor::from_handle(parent)))
@@ -858,8 +871,30 @@ mod tests {
     use super::*;
     use crate::filters::encode_stream_data;
     use crate::Dictionary;
-    use std::io::Cursor;
+    use std::cell::Cell;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
     use std::process::Command;
+    use std::rc::Rc;
+
+    struct ToggleReadFailure {
+        cursor: Cursor<Vec<u8>>,
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl Read for ToggleReadFailure {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail.get() {
+                return Err(std::io::Error::other("boundary parent read unexpectedly"));
+            }
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl Seek for ToggleReadFailure {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
 
     /// `object_type_name` collapses both real variants to `"real"` so that
     /// diagnostics do not leak the implementation detail that one form
@@ -975,6 +1010,109 @@ mod tests {
         )
         .expect("non-dictionary page lookup should succeed")
         .is_none());
+    }
+
+    #[test]
+    fn inherited_walk_reports_depth_limit_before_dereferencing_boundary_parent() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let fail = Rc::new(Cell::new(false));
+        let reader = ToggleReadFailure {
+            cursor: Cursor::new(bytes),
+            fail: Rc::clone(&fail),
+        };
+        let mut pdf = Pdf::open(reader).expect("PDF should parse");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&page)
+            .expect("the current page should be readable before the boundary");
+        fail.set(true);
+        let error =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 1)
+                .expect_err("a boundary parent must report the depth limit before resolution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("page tree depth exceeds maximum of 1 at 2 0 R"),
+            "expected depth-limit error, got {error}"
+        );
+    }
+
+    #[test]
+    fn inherited_walk_propagates_a_genuine_read_failure_past_the_depth_guard() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let fail = Rc::new(Cell::new(false));
+        let reader = ToggleReadFailure {
+            cursor: Cursor::new(bytes),
+            fail: Rc::clone(&fail),
+        };
+        let mut pdf = Pdf::open(reader).expect("PDF should parse");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&page)
+            .expect("the current page should be readable before the boundary");
+        fail.set(true);
+        // A depth limit well past the actual parent chain means the guard
+        // never fires, so the read failure on the /Parent object itself
+        // must surface as-is rather than being masked or misreported as a
+        // depth-limit error.
+        let error =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 10)
+                .expect_err("a genuine read failure must propagate");
+
+        assert!(
+            error
+                .to_string()
+                .contains("boundary parent read unexpectedly"),
+            "expected the underlying I/O error, got {error}"
+        );
+    }
+
+    #[test]
+    fn inherited_walk_rejects_an_already_resolved_non_dictionary_parent_without_depth_error() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "42"),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        // Resolve the malformed /Parent target ahead of the walk, mirroring
+        // an earlier, unrelated read that already populated the object
+        // cache. `is_indirect()` reflects identity, not resolution state,
+        // so `next_page_parent` must not defer this already-known
+        // non-dictionary value just because it is indirect.
+        let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&parent)
+            .expect("the malformed parent object should be readable");
+        assert!(parent.is_resolved());
+        assert!(parent.as_dictionary().is_none());
+
+        // A depth limit of exactly 1 means the malformed parent sits right
+        // at the boundary: if it were incorrectly deferred, the next loop
+        // iteration's depth check would fire first and report a depth-limit
+        // error instead of the correct clean termination.
+        let result =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 1)
+                .expect("a malformed non-dictionary parent must not error");
+        assert!(
+            result.is_none(),
+            "expected no inherited value, got {result:?}"
+        );
     }
 
     #[test]
