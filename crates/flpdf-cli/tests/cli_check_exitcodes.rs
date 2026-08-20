@@ -732,6 +732,29 @@ fn check_error_diagnostics_use_qpdf_stderr_format() {
         .stdout(predicate::str::is_empty());
 }
 
+#[test]
+fn rewrite_rejects_a_missing_root_before_creating_output() {
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    input.write_all(&missing_root_pdf_bytes()).unwrap();
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let output_path = output.path().to_path_buf();
+    drop(output);
+    let input_path = input.path().to_str().unwrap().to_string();
+    let output_path_string = output_path.to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args([&input_path, &output_path_string])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(format!(
+            "flpdf: {input_path}: unable to find /Root dictionary"
+        )))
+        .stdout(predicate::str::is_empty());
+
+    assert!(!output_path.exists());
+}
+
 /// Fatal open errors carry the input path: `<progname>: <file>: <msg>`
 /// (observed qpdf shape: `qpdf: notpdf.pdf: unable to find trailer
 /// dictionary while recovering damaged file`).

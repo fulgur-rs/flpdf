@@ -197,7 +197,12 @@ impl QPDFJob {
         self.input_name = input_name.clone();
         options.logger = Some(self.logger.clone());
         options.description = input_name;
-        let pdf = Pdf::open_with_options(source, options)?;
+        let mut pdf = Pdf::open_with_options(source, options)?;
+        // qpdf's createQPDF calls getVersionAsPDFVersion immediately after
+        // processFile; that path enters getExtensionLevel and therefore
+        // QPDF::getRoot before any job operation emits output
+        // (libqpdf/QPDFJob.cc:429-480,1696-1716; QPDF.cc:2306-2368).
+        pdf.root_handle()?;
         self.record_document_warnings(&pdf);
         Ok(pdf)
     }
@@ -326,5 +331,64 @@ impl QPDFJob {
         } else {
             Ok(JobExitCode::Success)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Error, PdfOpenOptions};
+    use std::io::Cursor;
+
+    fn trailer_root_pdf(root: &str) -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let xref_start = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 1 /Root {root} >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn open_rejects_a_dangling_root_before_returning_a_job_document() {
+        let mut job = QPDFJob::new();
+
+        assert!(matches!(
+            job.open(
+                Cursor::new(trailer_root_pdf("99 0 R")),
+                "dangling-root.pdf",
+                PdfOpenOptions::default(),
+            ),
+            Err(Error::System(message)) if message == "unable to find /Root dictionary"
+        ));
+    }
+
+    #[test]
+    fn open_rejects_a_non_dictionary_root_before_returning_a_job_document() {
+        let mut job = QPDFJob::new();
+
+        assert!(matches!(
+            job.open(
+                Cursor::new(trailer_root_pdf("42")),
+                "wrong-type-root.pdf",
+                PdfOpenOptions::default(),
+            ),
+            Err(Error::System(message)) if message == "unable to find /Root dictionary"
+        ));
+    }
+
+    #[test]
+    fn open_accepts_a_direct_dictionary_root() {
+        let mut job = QPDFJob::new();
+
+        assert!(job
+            .open(
+                Cursor::new(trailer_root_pdf("<< /Type /Catalog >>")),
+                "direct-root.pdf",
+                PdfOpenOptions::default(),
+            )
+            .is_ok());
     }
 }

@@ -3,7 +3,7 @@
 use crate::cache::ObjectCache;
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::EncryptionState;
-use crate::{Dictionary, Object, ObjectHandle, ObjectRef, XrefForm};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -389,6 +389,20 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
         self.trailer.get_ref("Root")
+    }
+
+    /// Return the live catalog handle after applying qpdf's `QPDF::getRoot`
+    /// dictionary gate (`libqpdf/QPDF.cc:2329-2368`). The trailer value may
+    /// be an indirect reference, so resolve it through the canonical handle
+    /// graph before checking its type. A missing, dangling, or non-dictionary
+    /// `/Root` is a document-level error rather than a missing-key fallback.
+    pub fn root_handle(&mut self) -> Result<ObjectHandle> {
+        let candidate = self.trailer_key_handle(b"Root");
+        let root = self.resolve_object_handle_to_terminal(&candidate)?;
+        if root.as_dictionary().is_none() {
+            return Err(Error::System("unable to find /Root dictionary".into()));
+        }
+        Ok(root)
     }
 }
 

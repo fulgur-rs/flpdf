@@ -885,13 +885,7 @@ mod tests {
         let attachment = dir.path().join("payload.txt");
         std::fs::write(&attachment, b"payload").expect("write payload");
         let (mut job, _, _) = job_with_captures();
-        let mut pdf = job
-            .open(
-                Cursor::new(rootless_fixture_bytes()),
-                "rootless.pdf",
-                PdfOpenOptions::default(),
-            )
-            .expect("open fixture");
+        let mut pdf = Pdf::open(Cursor::new(rootless_fixture_bytes())).expect("open fixture");
 
         let error = job
             .add_attachment(&mut pdf, add_options(attachment, b"payload-key"))
