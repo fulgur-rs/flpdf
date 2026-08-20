@@ -5247,17 +5247,24 @@ fn pages_unknown_intermediate_key_matches_qpdf_warning_exit() {
         "Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree";
     let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
     let flpdf_stderr = String::from_utf8_lossy(&flpdf.stderr);
+    let qpdf_warning_line = qpdf_stderr
+        .lines()
+        .find(|line| line.contains("Unknown key /UserUnit"))
+        .expect("qpdf must emit the unknown intermediate key warning");
+    let flpdf_warning_line = flpdf_stderr
+        .lines()
+        .find(|line| line.contains("Unknown key /UserUnit"))
+        .expect("flpdf must emit the unknown intermediate key warning");
     assert_eq!(qpdf.status.code(), Some(3), "qpdf stderr: {qpdf_stderr}");
     assert_eq!(
         flpdf.status.code(),
         qpdf.status.code(),
         "flpdf stderr: {flpdf_stderr}"
     );
-    assert!(qpdf_stderr.contains(warning), "qpdf stderr: {qpdf_stderr}");
-    assert!(
-        flpdf_stderr.contains(warning),
-        "flpdf stderr: {flpdf_stderr}"
-    );
+    assert_eq!(qpdf_warning_line, flpdf_warning_line);
+    assert!(qpdf_warning_line.contains(warning));
+    assert_eq!(qpdf_stderr.matches("Unknown key /UserUnit").count(), 1);
+    assert_eq!(flpdf_stderr.matches("Unknown key /UserUnit").count(), 1);
     assert!(qpdf_output.exists());
     assert!(flpdf_output.exists());
 }

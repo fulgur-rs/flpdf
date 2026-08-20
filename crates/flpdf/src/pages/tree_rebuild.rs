@@ -258,6 +258,9 @@ fn page_tree_root_handle<R: Read + Seek>(
 /// walking an intermediate `/Pages` node. The retained root is excluded by its
 /// missing `/Parent`; structural keys are also excluded because they are part
 /// of the page-tree representation rather than inheritable page attributes.
+/// qpdf prefixes each warning with the current `Pages object` description; the
+/// parenthesized prefix below lets the resolver add the input filename in the
+/// same position.
 fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     nodes: &[ObjectHandle],
@@ -276,13 +279,23 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
     ];
 
     for node in nodes {
+        let pages_object = node.object_ref().map_or_else(
+            || "Pages object".to_owned(),
+            |object_ref| {
+                format!(
+                    "Pages object: object {} {}",
+                    object_ref.number, object_ref.generation
+                )
+            },
+        );
+
         if node.try_has_key(b"/Parent")? {
             for key in node.try_get_keys()? {
                 if !inheritable_keys.contains(&key.as_slice())
                     && !structural_keys.contains(&key.as_slice())
                 {
                     pdf.push_warning(format!(
-                        "Unknown key {} in /Pages object is being discarded as a result of flattening the /Pages tree",
+                        "({pages_object}): Unknown key {} in /Pages object is being discarded as a result of flattening the /Pages tree",
                         String::from_utf8_lossy(&key)
                     ))?;
                 }
@@ -886,16 +899,15 @@ mod tests {
             .expect("page-tree rebuild must preserve qpdf warning behavior");
 
         let diagnostics = pdf.repair_diagnostics();
-        let warning = diagnostics
+        let warnings: Vec<_> = diagnostics
             .entries()
             .iter()
             .map(|entry| entry.message.as_str())
-            .find(|message| message.contains("Unknown key /UserUnit"));
+            .filter(|message| message.contains("Unknown key /UserUnit"))
+            .collect();
         assert_eq!(
-            warning,
-            Some(
-                "Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree"
-            ),
+            warnings,
+            ["(Pages object: object 3 0): Unknown key /UserUnit in /Pages object is being discarded as a result of flattening the /Pages tree"],
             "only the flattened intermediate /Pages node should warn"
         );
 
