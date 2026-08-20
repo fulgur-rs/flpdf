@@ -31,10 +31,14 @@ feature and not a change to the correspondence row for the D1 helper.
 3. For `/AF` cleanup owned by `remove_attachment`, mutate the live array handle
    in place. Remove `/AF` from its parent only when the resulting array is
    empty, and preserve shared indirect arrays.
-4. Keep `collect_embedded_file_pairs_raw` only as the explicitly recorded raw
-   projection boundary needed by the remaining attachment cleanup route. An
-   indirect handle is projected as its `ObjectRef`; a direct handle is
-   materialized only at that boundary. No new legacy bridge is introduced.
+4. Keep `collect_embedded_file_pairs_raw` and the module-level
+   `delete_embedded_file` as the explicitly recorded raw attachment-cleanup
+   boundary until the final consumer cutover. They use live tree handles, but
+   do not null the removed filespec; the public `EmbeddedFileDocumentHelper`
+   remains the qpdf-exact API that nulls an indirect removed value. An
+   indirect raw-projection value is represented by its `ObjectRef`; a direct
+   value is materialized only at that boundary. No new legacy bridge is
+   introduced.
 
 ## Scope boundaries
 
@@ -60,9 +64,12 @@ Canonical handle resolution errors propagate unchanged. Missing/non-dictionary
 paths retain the existing `Ok(None)`, `Ok(false)`, or empty-list behavior.
 Handle mutation uses the existing ownership checks and
 `Pdf::mark_object_handle_dirty`; it does not rewrite a cloned dictionary with
-`Pdf::set_object`. Removing an indirect filespec uses the existing canonical
-`remove_object_handle` behavior, matching qpdf's null replacement, while
-`remove_attachment` retains its separate `/AF` and reachability responsibilities.
+`Pdf::set_object`. The qpdf public helper continues to use
+`remove_object_handle` for null replacement. The module-level raw detach
+wrapper intentionally leaves that nulling to its existing attachment cleanup
+owner so a filespec still referenced by another live name tree remains
+reachable; `remove_attachment` retains its separate `/AF` and reachability
+responsibilities.
 
 ## Verification
 

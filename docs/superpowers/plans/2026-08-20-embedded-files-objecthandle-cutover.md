@@ -79,12 +79,15 @@ Use the shared handle-tree helper for `list_embedded_files_with_max_depth` and
 at the raw boundary project indirect values as `Object::Reference` and direct
 values through the existing bounded materialization API.
 
-- [ ] **Step 3: Delegate insert/remove wrappers to the canonical helper**
+- [ ] **Step 3: Cut over insert/remove wrappers without changing ownership**
 
 Make `insert_embedded_file` obtain the canonical filespec handle and call
-`replace_embedded_file`. Make `delete_embedded_file` call
-`remove_embedded_file`, preserving qpdf's indirect-null behavior and the
-existing public boolean result.
+`replace_embedded_file`. Make `delete_embedded_file` use a
+`HandleNameTree` removal and preserve its existing raw detach contract; do
+not call `remove_embedded_file` there because that qpdf helper nulls an
+indirect filespec, while the attachment cleanup owner must preserve a
+filespec still referenced by another live name tree. Keep the qpdf nulling
+behavior in `EmbeddedFileDocumentHelper::remove_embedded_file`.
 
 - [ ] **Step 4: Run the GREEN regression and focused suite**
 

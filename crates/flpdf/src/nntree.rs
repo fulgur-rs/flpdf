@@ -1239,6 +1239,10 @@ impl HandleNameTree {
         }
     }
 
+    pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
+        self.inner.max_depth = Some(max_depth);
+    }
+
     pub(crate) fn find<R: Read + Seek, K: AsRef<[u8]>>(
         &mut self,
         pdf: &mut Pdf<R>,
