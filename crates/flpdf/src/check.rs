@@ -214,7 +214,17 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     // (libqpdf/QPDFJob.cc:429-480,1696-1716; QPDF.cc:2306-2368).
     // Keep the already-open JSON consumer below rootless: only this byte-input
     // boundary corresponds to qpdf's ordinary createQPDF path.
-    pdf.root_handle()?;
+    if let Err(error) = pdf.root_handle() {
+        // The open above may have succeeded only after repair reconstructed
+        // the xref table; those diagnostics live on `pdf`, not on this fresh
+        // root-gate error, so carry them the same way a failed open would
+        // (`Error::with_open_diagnostics`, matching this function's own
+        // documented `Error::OpenFailure` contract).
+        return Err(Error::with_open_diagnostics(
+            error,
+            pdf.repair_diagnostics(),
+        ));
+    }
 
     Ok(check_pdf_with_limits(&mut pdf, limits))
 }

@@ -5482,7 +5482,8 @@ fn probe_encryption(
     configure_document_logger(&mut options, input);
     match Pdf::open_with_options(BufReader::new(file), options) {
         Ok(mut pdf) => {
-            pdf.root_handle()?;
+            pdf.root_handle()
+                .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
             Ok(EncryptionProbe::Opened {
                 encrypted: pdf.is_encrypted(),
             })
@@ -6639,6 +6640,55 @@ mod tests {
         );
 
         assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
+    }
+
+    #[test]
+    fn probe_encryption_prefixes_a_dangling_root_error_with_the_input_path() {
+        let input = b"%PDF-1.4\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n9\n%%EOF\n";
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing-root.pdf");
+        std::fs::write(&path, input).expect("write missing-root fixture");
+
+        let Err(error) = probe_encryption(&path, false, &PasswordArgs::default()) else {
+            panic!("a missing /Root must be a hard error");
+        };
+
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "error should carry the input path like other open boundaries: {error}"
+        );
+        assert!(error
+            .to_string()
+            .contains("unable to find /Root dictionary"));
+    }
+
+    #[test]
+    fn check_diagnostic_location_does_not_duplicate_object_offset() {
+        let object_warning =
+            flpdf::Diagnostic::warning("(object 5 0, offset 232): expected endobj", Some(232));
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &object_warning),
+            "input.pdf"
+        );
+
+        let ordinary_warning = flpdf::Diagnostic::warning("xref warning", Some(12));
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &ordinary_warning),
+            "input.pdf (offset 12)"
+        );
+    }
+
+    #[test]
+    fn check_diagnostic_location_does_not_duplicate_trailer_offset() {
+        let trailer_warning = flpdf::Diagnostic::warning(
+            "(trailer, offset 190): dictionary has duplicated key /Foo; \
+             last occurrence overrides earlier ones",
+            Some(190),
+        );
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &trailer_warning),
+            "input.pdf"
+        );
     }
 
     #[test]

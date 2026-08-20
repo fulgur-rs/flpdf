@@ -129,6 +129,31 @@ fn check_reports_repaired_xref_warning() {
 }
 
 #[test]
+fn check_preserves_repair_warnings_when_the_root_gate_fails() {
+    // The xref is corrupted the same way as `corrupt_xref_pdf`, forcing
+    // reconstruction (which accumulates repair diagnostics on the
+    // successfully-opened `Pdf`), but /Root points at a nonexistent object.
+    // `pdf.root_handle()` therefore fails *after* a successful open, so this
+    // exercises the root-gate error path distinctly from
+    // `check_preserves_repair_warnings_before_terminal_open_error`, whose
+    // fixture fails to open at all.
+    let input = corrupt_xref_dangling_root_pdf();
+    let error = check_reader(Cursor::new(input)).expect_err("dangling /Root must be terminal");
+
+    let (source, diagnostics) = error
+        .open_failure()
+        .expect("repair diagnostics must survive the root-gate error");
+    assert!(
+        matches!(source, Error::System(message) if message == "unable to find /Root dictionary")
+    );
+    assert!(diagnostics
+        .entries()
+        .iter()
+        .any(|entry| entry.severity == Severity::Warning
+            && entry.message == "Attempting to reconstruct cross-reference table"));
+}
+
+#[test]
 fn check_preserves_encrypted_classification_after_repair_warnings() {
     let mut input = encrypted_v1_owner_password_fixture();
     let xref = input
@@ -194,6 +219,20 @@ fn corrupt_xref_pdf() -> Vec<u8> {
         *byte = b'z';
     }
     corrupted
+}
+
+/// `corrupt_xref_pdf`'s reconstruction path, but /Root points at a
+/// nonexistent object instead of the real catalog, so the open succeeds
+/// (with repair diagnostics) while `Pdf::root_handle` still fails.
+fn corrupt_xref_dangling_root_pdf() -> Vec<u8> {
+    let mut bytes = corrupt_xref_pdf();
+    let root_ref = b"/Root 1 0 R";
+    let pos = bytes
+        .windows(root_ref.len())
+        .position(|window| window == root_ref)
+        .expect("fixture should contain /Root 1 0 R");
+    bytes.splice(pos..pos + root_ref.len(), b"/Root 99 0 R".iter().copied());
+    bytes
 }
 
 fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
