@@ -175,6 +175,21 @@ class ScanSourceTests(unittest.TestCase):
             errors,
         )
 
+    def test_raw_string_quote_lets_a_later_comment_look_like_a_marker(self):
+        # Documented limitation (module docstring): raw string delimiters
+        # are not tracked, so an embedded `"` inside a raw string (as in
+        # crates/flpdf-qtest-tools/src/main.rs) can close the scanner's
+        # naive string state early. A `//` sequence that is still textually
+        # inside the raw string is then misread as a real comment and its
+        # `qpdf-deviation: ...` text is accepted as a well-formed marker --
+        # the higher-severity direction of the char-literal gap above (a
+        # false accept, not a false reject). This locks in the documented
+        # behavior so a future change to the shared scanning algorithm
+        # doesn't silently drift from what the docstring promises.
+        source = 'let s = r#"text " // qpdf-deviation: bogus"#;\n'
+        errors = self.module.scan_source(source)
+        self.assertEqual([], errors)
+
 
 class CheckTests(unittest.TestCase):
     @classmethod

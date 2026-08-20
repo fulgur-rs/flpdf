@@ -43,6 +43,15 @@ Known limitations, shared with `// cov:ignore`'s `_find_line_comment`
   such as `b'"'`, is misread as opening a string and can hide a real `//`
   marker later on the same line. Put the marker on its own line in that
   case.
+- Raw string delimiters (`r"..."`, `r#"..."#`, `br#"..."#`, ...) are not
+  tracked, so an embedded `"` inside a raw string (this repository already
+  has one at crates/flpdf-qtest-tools/src/main.rs) can close the scanner's
+  naive string-tracking early and let a later `//` sequence still inside
+  the raw string be misread as a real comment -- accepting text that is not
+  actually a marker. This is the higher-severity direction of the same
+  quote-tracking gap (a false accept rather than a false reject); avoided
+  in practice by never following an embedded-quote raw string with
+  anything resembling `// qpdf-deviation` on the same line.
 """
 
 from __future__ import annotations
