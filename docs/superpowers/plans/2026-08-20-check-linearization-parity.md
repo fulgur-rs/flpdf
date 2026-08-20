@@ -18,6 +18,13 @@
 - Use RED→GREEN tests and fresh changed-line patch coverage at 100%.
 - Keep `flpdf-25kg.3.1` and the QPDFJob consumer stack open until the PR is integrated.
 
+**Scope boundary:** The regression uses the repository's qpdf-validated
+`linearized-one-page.pdf` fixture and covers the clean `--check` status path:
+the informational line, exit 0, and the two-line tail. It does not claim to
+complete qpdf's deeper hint-table cross-validation; that existing
+`check-linearization` responsibility and its physical-offset follow-up remain
+tracked by `flpdf-1quo`.
+
 ---
 
 ### Task 1: Lock the qpdf regression at the CLI boundary

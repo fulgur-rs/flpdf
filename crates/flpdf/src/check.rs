@@ -15,7 +15,7 @@ use std::io::{Read, Seek};
 /// Result of [`check_reader`].
 ///
 /// `valid` is `true` when no [`Diagnostic`] of severity `Error` was produced. Warnings
-/// alone (e.g. linearization advisories) do not flip the flag.
+/// alone (for example parser or recovery warnings) do not flip the flag.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CheckReport {
