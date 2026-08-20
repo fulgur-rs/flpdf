@@ -224,7 +224,7 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // GCs it (qpdf 11.9.0 observed: B2 had no /P in pages-1,2 output).
     let retained_page_refs: BTreeSet<ObjectRef> = result.new_kids.iter().copied().collect();
     for (widget, _) in widget_to_page.values() {
-        remove_stale_widget_page_ref(pdf, widget, &retained_page_refs)?;
+        remove_stale_widget_page_ref(pdf, widget, &retained_page_refs, &result.removed_pages)?;
     }
     // Collect all widgets reachable from kept fields; strip /P from any that
     // are NOT in widget_to_page (i.e. live in a kept field's /Kids but were on
@@ -396,20 +396,27 @@ fn field_has_retained_widget<R: Read + Seek>(
 /// Preserve a valid widget `/P` and remove only a dangling (nulled) page ref.
 ///
 /// qpdf establishes `/P` during copied-annotation graph remapping, not through
-/// a generic page-owner repair pass. This production route runs after
+/// a generic page-owner repair pass. In the production route, this runs after
 /// [`crate::outline_dest_remap::remap_outline_and_dests`], which already
 /// replaces every genuinely removed original page-tree leaf with `null` in
 /// place (`null_removed_pages`, page-driven, independent of how it is
-/// referenced) — so a `/P` pointing at a removed page always resolves to
-/// `Object::Null` by the time this runs. A live off-tree object that merely
-/// carries `/Type /Page` but was never in the removed-page set (so was never
-/// nulled) must therefore be preserved verbatim, matching qpdf's untouched
+/// referenced) — so a `/P` pointing at a removed page already resolves to
+/// `Object::Null` by the time this runs there. This function is also a public
+/// API entry point that a caller may invoke directly after
+/// [`crate::pages::tree_rebuild::rebuild_page_tree`] without that null-out
+/// step, so `removed_pages` (the same original-leaf drop set the null-out
+/// pass keys on) is checked independently of the target's current null
+/// state — a widget's `/P` pointing at a genuinely dropped page is always
+/// removed, whether or not it has been nulled yet. A live off-tree object
+/// that merely carries `/Type /Page` but was never in the removed-page set
+/// must therefore be preserved verbatim, matching qpdf's untouched
 /// first-primary-occurrence path. Only dictionaries are inspected — widget
 /// annotations should not be streams, but we guard defensively.
 fn remove_stale_widget_page_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget: &ObjectHandle,
     retained_page_refs: &BTreeSet<ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if widget.as_dictionary().is_none() || !widget.try_has_key(b"/P")? {
         return Ok(());
@@ -419,6 +426,11 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
         return Ok(());
     };
     if retained_page_refs.contains(&existing_ref) {
+        return Ok(());
+    }
+    if removed_pages.contains(&existing_ref) {
+        widget.remove_key(b"/P");
+        pdf.mark_object_handle_dirty(widget)?;
         return Ok(());
     }
     // qpdf-deviation: chases flpdf's temporary Pdf::set_object bare-reference
@@ -736,7 +748,7 @@ mod tests {
         let widget = ObjectHandle::integer(1);
 
         let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
-        remove_stale_widget_page_ref(&mut pdf, &widget, &retained).unwrap();
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained, &BTreeSet::new()).unwrap();
     }
 
     #[test]
@@ -745,7 +757,7 @@ mod tests {
         let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
         let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
 
-        remove_stale_widget_page_ref(&mut pdf, &widget, &retained).unwrap();
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained, &BTreeSet::new()).unwrap();
 
         let widget_dict = dict_of(&mut pdf, ObjectRef::new(7, 0));
         assert_eq!(
@@ -781,7 +793,7 @@ mod tests {
         pdf.mark_object_handle_dirty(&widget).unwrap();
         let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
 
-        remove_stale_widget_page_ref(&mut pdf, &widget, &retained).unwrap();
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained, &BTreeSet::new()).unwrap();
 
         let widget_dict = dict_of(&mut pdf, ObjectRef::new(11, 0));
         assert_eq!(
@@ -789,6 +801,32 @@ mod tests {
             None,
             "an indirect widget whose /P resolves to null through the \
              flpdf-only redirect bridge must lose the key"
+        );
+    }
+
+    #[test]
+    fn standalone_caller_removes_p_for_a_removed_page_before_null_out_runs() {
+        // A library caller may invoke `prune_acroform_after_subset` directly
+        // after `rebuild_page_tree`, without the production route's prior
+        // `remap_outline_and_dests` null-out pass. Simulate that ordering:
+        // widget 11's `/P 5 0 R` target (page 5) is still a live dictionary
+        // (never nulled), but page 5 is a genuinely dropped original leaf, so
+        // it is reported via `removed_pages`. The removal must not depend on
+        // the target's null state to match qpdf's actual removal set.
+        let mut pdf = open(build_acroform_pdf());
+        let raw_widget = pdf.get_object_handle(ObjectRef::new(11, 0));
+        let widget = pdf.resolve_object_handle_to_terminal(&raw_widget).unwrap();
+        let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
+        let removed_pages = BTreeSet::from([ObjectRef::new(5, 0)]);
+
+        remove_stale_widget_page_ref(&mut pdf, &widget, &retained, &removed_pages).unwrap();
+
+        let widget_dict = dict_of(&mut pdf, ObjectRef::new(11, 0));
+        assert_eq!(
+            widget_dict.get("P"),
+            None,
+            "a widget /P pointing at a page reported as removed must lose \
+             the key even when the target has not been nulled yet"
         );
     }
 
