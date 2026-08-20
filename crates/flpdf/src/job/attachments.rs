@@ -2,7 +2,8 @@
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::attachment_list::format_attachment_list_with_sink;
-use crate::filespec_helper::{extract_attachment, format_pdf_date, FileSpec};
+use crate::filespec_helper::{extract_attachment, FileSpec};
+use crate::qpdf_time::default_pdf_date;
 use crate::{Error, ObjectHandle, Pdf, Result};
 use std::io::{Read, Seek};
 use std::path::PathBuf;
@@ -31,11 +32,10 @@ pub struct AttachmentCopyOptions {
 /// The path is retained by the provider-backed embedded-file stream; the
 /// payload is not materialized by the job. `creation_date` and
 /// `modification_date` carry raw PDF date strings so an explicit qpdf date is
-/// preserved byte-for-byte. When omitted, the job supplies the current date
-/// in UTC (`D:YYYYMMDDHHMMSSZ`). qpdf instead derives its default date from
-/// local wall-clock time plus the system's UTC offset, emitting `Z` only
-/// when that offset is zero and `+HH'MM'`/`-HH'MM'` otherwise
-/// (`QUtil::get_current_qpdf_time`, `libqpdf/QUtil.cc:867-934`).
+/// preserved byte-for-byte. When omitted, the job supplies qpdf's process-stable
+/// local-wall-clock date with its UTC offset (`QUtil::get_current_qpdf_time`
+/// and `QPDFJob::AttConfig::endAddAttachment`, `libqpdf/QUtil.cc:867-934`,
+/// `libqpdf/QPDFJob_config.cc:911-936`).
 #[derive(Debug, Clone)]
 pub struct AttachmentAddOptions {
     /// Path whose bytes are embedded.
@@ -56,41 +56,6 @@ pub struct AttachmentAddOptions {
     pub replace: bool,
     /// Emit qpdf's `attached ... with key ...` diagnostic.
     pub verbose: bool,
-}
-
-fn current_pdf_date() -> Vec<u8> {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = (seconds / 86_400) as i64;
-    let seconds_today = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format_pdf_date(
-        year,
-        month,
-        day,
-        (seconds_today / 3_600) as u8,
-        ((seconds_today / 60) % 60) as u8,
-        (seconds_today % 60) as u8,
-    )
-}
-
-// Howard Hinnant's proleptic Gregorian conversion, with the Unix epoch at
-// 1970-01-01. `current_pdf_date` supplies a non-negative Unix day count.
-fn civil_from_days(days_since_epoch: i64) -> (u16, u8, u8) {
-    let shifted = days_since_epoch + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_part = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
-    let month = month_part + if month_part < 10 { 3 } else { -9 };
-    let year = year + i64::from(month <= 2);
-    (year as u16, month as u8, day as u8)
 }
 
 impl QPDFJob {
@@ -119,7 +84,7 @@ impl QPDFJob {
         self.set_attachment_page_mode(pdf)?;
 
         let mut duplicated_keys = Vec::new();
-        let default_date = current_pdf_date();
+        let default_date = default_pdf_date().to_vec();
         for option in options {
             let exists = {
                 let mut embedded_files = pdf.embedded_files();

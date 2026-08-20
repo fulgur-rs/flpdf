@@ -18,14 +18,14 @@
 - Modify: `Cargo.toml`
 - Modify: `crates/flpdf/Cargo.toml`
 
-- [ ] **Step 1: Declare platform dependencies**
+- [x] **Step 1: Declare platform dependencies**
 
 Add `windows-sys = "0.61"` to workspace dependencies, add
 `libc.workspace = true` to `crates/flpdf` dependencies, and add a Windows-only
 `windows-sys` dependency with `Win32_System_SystemInformation` and
 `Win32_System_Time` features.
 
-- [ ] **Step 2: Commit the design/dependency baseline**
+- [x] **Step 2: Commit the design/dependency baseline**
 
 Run `cargo check -p flpdf`, then commit only the design and manifest changes.
 
@@ -35,7 +35,7 @@ Run `cargo check -p flpdf`, then commit only the design and manifest changes.
 - Create: `crates/flpdf/src/qpdf_time.rs`
 - Modify: `crates/flpdf/src/lib.rs`
 
-- [ ] **Step 1: Write pure formatter tests first**
+- [x] **Step 1: Write pure formatter tests first**
 
 Add tests for the qpdf sign contract:
 
@@ -48,7 +48,7 @@ assert_eq!(format_qpdf_time(QpdfTime::new(2026, 8, 20, 22, 47, 33, 60)), b"D:202
 Register the private module in `lib.rs` but do not add the production
 formatter/acquisition implementation before running the test.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -65,30 +65,30 @@ not implemented.
 - Modify: `crates/flpdf/src/qpdf_time.rs`
 - Modify: `crates/flpdf/src/job/attachments.rs`
 
-- [ ] **Step 1: Implement pure formatting and stable capture**
+- [x] **Step 1: Implement pure formatting and stable capture**
 
 Implement the `QpdfTime` value, `format_qpdf_time`, and a `OnceLock<Vec<u8>>`
 default-date accessor. Keep the formatter independent of the system clock so
 all offset branches are directly testable.
 
-- [ ] **Step 2: Implement the Unix source route**
+- [x] **Step 2: Implement the Unix source route**
 
 Use `time`, `tzset`, `localtime_r`, and `tm_gmtoff` behind the isolated module
 unsafe boundary. Convert seconds-after-UTC to qpdf's minutes-before-UTC with
 the exact negation used by qpdf.
 
-- [ ] **Step 3: Implement the Windows source route**
+- [x] **Step 3: Implement the Windows source route**
 
 Use `GetLocalTime` and `GetTimeZoneInformation`, taking `Bias` exactly as
 qpdf does. Keep the FFI calls and safety comments inside `qpdf_time.rs`.
 
-- [ ] **Step 4: Wire attachments to the cached default**
+- [x] **Step 4: Wire attachments to the cached default**
 
 Remove `current_pdf_date` and `civil_from_days` from `job/attachments.rs`.
 Use the qpdf-time cached bytes for both omitted date fields and retain the
 existing explicit-date branches unchanged.
 
-- [ ] **Step 5: Run GREEN**
+- [x] **Step 5: Run GREEN**
 
 Run:
 
@@ -106,7 +106,7 @@ capture.
 **Files:**
 - Inspect: `crates/flpdf/src/qpdf_time.rs`, `crates/flpdf/src/job/attachments.rs`, and qpdf probe outputs
 
-- [ ] **Step 1: Run the timezone differential probe**
+- [x] **Step 1: Run the timezone differential probe**
 
 Run these commands from the repository root, using the same input and
 attachment in separate output files:
@@ -119,8 +119,8 @@ qpdf --json=2 --json-key=attachments "$probe_dir/qpdf.pdf" - | jq -r '.attachmen
 qpdf --json=2 --json-key=attachments "$probe_dir/flpdf.pdf" - | jq -r '.attachments | to_entries[] | .value.streams["/F"].creationdate, .value.streams["/F"].modificationdate'
 ```
 
-Expected suffix: `+09'00'` in both outputs; both fields must be equal within
-each output.
+Observed suffix: `+09'00'` in both qpdf and flpdf outputs; both fields were
+equal within each output.
 
 - [ ] **Step 2: Run repository gates**
 
