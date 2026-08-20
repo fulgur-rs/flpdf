@@ -6,7 +6,10 @@
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
-use crate::linearization::{check_linearization, LinearizationCheckError};
+use crate::linearization::{
+    check_linearization, check_linearization_parameters, LinearizationCheckError,
+    LinearizationParameterCheck,
+};
 use crate::pipeline::Discard;
 use crate::{DecodeLevel, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter};
 use crate::{ObjectHandle, QPDFLogger, Result, Severity};
@@ -152,8 +155,29 @@ fn check_document<R: Read + Seek + 'static>(
             }
         };
         if !source_bytes.is_empty() {
-            match check_linearization(pdf, &source_bytes) {
-                Ok(()) | Err(LinearizationCheckError::NotLinearized) => {}
+            match check_linearization_parameters(pdf) {
+                Ok(LinearizationParameterCheck::Clean) => {
+                    match check_linearization(pdf, &source_bytes) {
+                        Ok(()) | Err(LinearizationCheckError::NotLinearized) => {}
+                        Err(error) => {
+                            warnings = true;
+                            let message = format!(
+                                "error encountered while checking linearization data: {error}"
+                            );
+                            emit_warning(logger, input_name, message)?;
+                        }
+                    }
+                }
+                Ok(LinearizationParameterCheck::Warning(message)) => {
+                    warnings = true;
+                    emit_warning(logger, input_name, message)?;
+                }
+                Ok(LinearizationParameterCheck::Error(message)) => {
+                    warnings = true;
+                    let message =
+                        format!("error encountered while checking linearization data: {message}");
+                    emit_warning(logger, input_name, message)?;
+                }
                 Err(error) => {
                     warnings = true;
                     let message =
@@ -662,9 +686,239 @@ mod tests {
             .expect("linearization errors are warnings");
         assert!(outcome.warnings);
         let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("WARNING: linearized.pdf: first page object (/O) mismatch\n"));
+    }
+
+    fn check_linearized_candidate_warning(key: &[u8], value: ObjectHandle) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/linearized-one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(key, value)
+            .expect("candidate should be mutable");
+
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "linearized.pdf")
+            .expect("linearization errors are warnings");
+        assert!(outcome.warnings);
+        let captured = output.lock().expect("capture output").clone();
+        String::from_utf8(captured).unwrap()
+    }
+
+    #[test]
+    fn document_check_uses_qpdf_first_page_object_warning() {
+        let output = check_linearized_candidate_warning(b"/O", ObjectHandle::integer(7));
+
+        assert!(output.contains("WARNING: linearized.pdf: first page object (/O) mismatch\n"));
+        assert!(!output.contains("linearization check failed:"));
+    }
+
+    #[test]
+    fn document_check_uses_qpdf_page_count_warning() {
+        let output = check_linearized_candidate_warning(b"/N", ObjectHandle::integer(2));
+
+        assert!(output.contains(
+            "WARNING: linearized.pdf: error encountered while checking linearization data: \
+             linearization hint table: /N does not match number of pages\n"
+        ));
+        assert!(!output.contains("linearization check failed:"));
+    }
+
+    #[test]
+    fn document_check_uses_qpdf_linearization_dictionary_type_warning() {
+        let output = check_linearized_candidate_warning(b"/P", ObjectHandle::name(b"Bad".to_vec()));
+
+        assert!(output.contains(
+            "WARNING: linearized.pdf: error encountered while checking linearization data: \
+             linearization dictionary: some keys in linearization dictionary are of the wrong type\n"
+        ));
+        assert!(!output.contains("/P is present but is neither an integer nor null"));
+    }
+
+    #[test]
+    fn document_check_accepts_integer_linearization_p() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/linearized-one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/P", ObjectHandle::integer(-1))
+            .expect("candidate should be mutable");
+
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "linearized.pdf")
+            .expect("integer /P should be accepted");
+        assert!(!outcome.warnings);
+        let captured = output.lock().expect("capture output").clone();
+        let output = String::from_utf8(captured).unwrap();
+        assert!(!output.contains("linearization data"));
+    }
+
+    #[test]
+    fn document_check_keeps_strict_linearization_warnings_after_parameter_preflight() {
+        let output = check_linearized_candidate_warning(
+            b"/H",
+            ObjectHandle::array(vec![ObjectHandle::integer(601)]),
+        );
+
+        assert!(
+            output.contains(
+                "WARNING: linearized.pdf: error encountered while checking linearization data: \
+                 linearization check failed: /H has the wrong number of items (expected 2 or 4, got 1)\n"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn document_check_downgrades_linearization_parameter_probe_failure() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/linearized-one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("linearized fixture should open");
+
+        let root = pdf.get_object_handle(pdf.root_ref().expect("root should exist"));
+        root.try_dereference().expect("root should resolve");
+        let pages_ref = root
+            .try_get_key(b"/Pages")
+            .expect("pages key should resolve")
+            .object_ref()
+            .expect("pages should be indirect");
+        let pages = pdf.get_object_handle(pages_ref);
+        pages.try_dereference().expect("pages should resolve");
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(vec![pages.clone()]))
+            .expect("pages should be mutable");
+
+        assert!(check_linearization_parameters(&mut pdf).is_err());
+
+        let _ = check_document(&mut pdf, &logger, "qpdf", "linearized.pdf");
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
         assert!(output.contains(
             "WARNING: linearized.pdf: error encountered while checking linearization data:"
         ));
+    }
+
+    #[test]
+    fn linearization_parameter_preflight_accepts_a_non_linearized_document() {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b' ', 1024));
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n1\nendobj\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n").as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("fixture should open");
+
+        assert_eq!(
+            check_linearization_parameters(&mut pdf).expect("preflight should complete"),
+            LinearizationParameterCheck::Clean
+        );
+    }
+
+    #[test]
+    fn linearization_parameter_preflight_accepts_a_non_dictionary_candidate() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/linearized-one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        pdf.replace_object_handle(candidate, ObjectHandle::integer(1))
+            .expect("candidate should be replaceable");
+
+        assert_eq!(
+            check_linearization_parameters(&mut pdf).expect("preflight should complete"),
+            LinearizationParameterCheck::Clean
+        );
+    }
+
+    #[test]
+    fn linearization_parameter_preflight_accepts_an_empty_page_tree() {
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/linearized-one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/N", ObjectHandle::integer(0))
+            .expect("candidate should be mutable");
+
+        let root = pdf.get_object_handle(pdf.root_ref().expect("root should exist"));
+        let pages_value = root
+            .try_get_key(b"/Pages")
+            .expect("pages key should resolve");
+        let pages_ref = pages_value
+            .object_ref()
+            .or_else(|| pages_value.as_reference())
+            .expect("pages should be indirect");
+        let pages = pdf.get_object_handle(pages_ref);
+        pages.try_dereference().expect("pages should resolve");
+        pages
+            .replace_key(b"/Kids", ObjectHandle::array(Vec::new()))
+            .expect("pages should be mutable");
+        pages
+            .replace_key(b"/Count", ObjectHandle::integer(0))
+            .expect("pages should be mutable");
+
+        assert_eq!(
+            check_linearization_parameters(&mut pdf).expect("preflight should complete"),
+            LinearizationParameterCheck::Clean
+        );
     }
 
     #[test]
