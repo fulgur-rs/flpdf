@@ -283,6 +283,18 @@ fn extension_level_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
+fn linearized_with_parameter_replacement(marker: &[u8], replacement: &[u8]) -> Vec<u8> {
+    assert_eq!(marker.len(), replacement.len());
+    let mut bytes =
+        include_bytes!("../../../tests/fixtures/compat/linearized-one-page.pdf").to_vec();
+    let start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("linearization parameter marker should exist");
+    bytes[start..start + marker.len()].copy_from_slice(replacement);
+    bytes
+}
+
 // ---------------------------------------------------------------------------
 // Tests: exit 0 — clean PDF
 // ---------------------------------------------------------------------------
@@ -400,6 +412,97 @@ fn check_linearized_pdf_reports_linearized_line() {
             "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
         ))
         .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn check_linearized_o_mismatch_uses_qpdf_warning() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&linearized_with_parameter_replacement(
+        b"/O 6 /E", b"/O 7 /E",
+    ))
+    .unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let output = cmd
+        .env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("File is linearized\n"));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "WARNING: {path}: first page object (/O) mismatch\n\
+             flpdf: operation succeeded with warnings\n"
+        )
+    );
+}
+
+#[test]
+fn check_linearized_n_mismatch_uses_qpdf_warning() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&linearized_with_parameter_replacement(
+        b"/N 1 /T", b"/N 2 /T",
+    ))
+    .unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let output = cmd
+        .env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("File is linearized\n"));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "WARNING: {path}: error encountered while checking linearization data: \
+             linearization hint table: /N does not match number of pages\n\
+             flpdf: operation succeeded with warnings\n"
+        )
+    );
+}
+
+#[test]
+fn check_linearized_p_wrong_type_uses_qpdf_warning() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    // Keep the mutation length-preserving: replacing /E with a malformed /P
+    // leaves the xref table valid while exercising qpdf's all-keys type gate.
+    f.write_all(&linearized_with_parameter_replacement(
+        b"/E 1198", b"/P /Bad",
+    ))
+    .unwrap();
+    let path = f.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let output = cmd
+        .env_remove("FLPDF_PROGNAME")
+        .args(["--check", &path])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("File is linearized\n"));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "WARNING: {path}: error encountered while checking linearization data: \
+             linearization dictionary: some keys in linearization dictionary are of the wrong type\n\
+             flpdf: operation succeeded with warnings\n"
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------

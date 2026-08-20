@@ -27,6 +27,7 @@ pub use check::{
     check_linearization, check_linearization_bytes, check_linearization_path, CheckResult,
     LinearizationCheckError,
 };
+pub(crate) use check::{check_linearization_parameters, LinearizationParameterCheck};
 pub use hint_page::{bits_needed, PageOffsetEntry, PageOffsetHeader, PageOffsetHintTable};
 pub use hint_shared::{
     SharedGroupEntry, SharedObjectEntry, SharedObjectHeader, SharedObjectHintTable,

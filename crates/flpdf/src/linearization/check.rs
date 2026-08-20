@@ -144,6 +144,94 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
+/// Outcome of qpdf's linearization-parameter loading phase for the generic
+/// document check.
+///
+/// `QPDF::readLinearizationData` (`QPDF_linearization.cc:161-230`) runs before
+/// `checkLinearizationInternal` and reports malformed parameter dictionaries as
+/// warnings. A first-page-object mismatch is a later soft warning
+/// (`QPDF_linearization.cc:419-433`), not a malformed-dictionary error. Keep
+/// this small preflight separate from [`check_linearization`], whose stricter
+/// structural checks are also used by `check-linearization`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinearizationParameterCheck {
+    Clean,
+    Warning(&'static str),
+    Error(&'static str),
+}
+
+/// Replay the `/N`, `/O`, and `/P` responsibility boundary used by qpdf's
+/// generic document check.
+///
+/// The required-key type gate follows qpdf's all-keys check, so a malformed
+/// `/P` reports the same dictionary-level diagnostic as malformed `/H`, `/O`,
+/// `/E`, `/N`, or `/T`. `/N` is checked against the page tree while loading
+/// linearization data; `/O` is compared to the first page only after that load
+/// succeeds. Hint-stream internals remain owned by [`check_linearization`]'s
+/// separate strict route.
+pub(crate) fn check_linearization_parameters<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<LinearizationParameterCheck> {
+    let Some(object_ref) = pdf.linearization_candidate_ref()? else {
+        return Ok(LinearizationParameterCheck::Clean); // cov:ignore: the caller already accepted the same linearization candidate
+    };
+    let candidate = pdf.get_object_handle(object_ref);
+    let Some(_) = candidate.try_as_dictionary()? else {
+        return Ok(LinearizationParameterCheck::Clean);
+    };
+
+    let h = candidate.try_get_key(b"/H")?;
+    let o = candidate.try_get_key(b"/O")?;
+    let e = candidate.try_get_key(b"/E")?;
+    let n = candidate.try_get_key(b"/N")?;
+    let t = candidate.try_get_key(b"/T")?;
+    let p = candidate.try_get_key(b"/P")?;
+
+    let h_is_array = resolved_is_array(&h)?;
+    let o_is_integer = resolved_is_integer(&o)?;
+    let e_is_integer = resolved_is_integer(&e)?;
+    let n_is_integer = resolved_is_integer(&n)?;
+    let t_is_integer = resolved_is_integer(&t)?;
+    let p_is_valid = {
+        p.try_dereference()?;
+        p.try_is_null()? || p.as_integer().is_some()
+    };
+    if !(h_is_array && o_is_integer && e_is_integer && n_is_integer && t_is_integer && p_is_valid) {
+        return Ok(LinearizationParameterCheck::Error(
+            "linearization dictionary: some keys in linearization dictionary are of the wrong type",
+        ));
+    }
+
+    let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
+    let page_count = pages.len() as i64;
+    if n.as_integer() != Some(page_count) {
+        return Ok(LinearizationParameterCheck::Error(
+            "linearization hint table: /N does not match number of pages",
+        ));
+    }
+
+    let Some(first_page) = pages.first() else {
+        return Ok(LinearizationParameterCheck::Clean);
+    };
+    if o.as_integer() != Some(first_page.number as i64) {
+        return Ok(LinearizationParameterCheck::Warning(
+            "first page object (/O) mismatch",
+        ));
+    }
+
+    Ok(LinearizationParameterCheck::Clean)
+}
+
+fn resolved_is_array(handle: &ObjectHandle) -> Result<bool> {
+    handle.try_dereference()?;
+    Ok(handle.as_array().is_some())
+}
+
+fn resolved_is_integer(handle: &ObjectHandle) -> Result<bool> {
+    handle.try_dereference()?;
+    Ok(handle.as_integer().is_some())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
