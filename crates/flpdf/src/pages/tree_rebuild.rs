@@ -526,6 +526,8 @@ mod tests {
     use super::*;
     use crate::check::check_reader;
     use crate::pages::page_refs;
+    use crate::pipeline::test_support::NthWriteFailure;
+    use crate::pipeline::PipelineHandle;
     use crate::writer::write_qpdf_to_memory;
     use crate::Object;
     use crate::Pdf;
@@ -913,6 +915,29 @@ mod tests {
 
         let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
         assert_eq!(root.get("UserUnit"), Some(&Object::Integer(1)));
+    }
+
+    #[test]
+    fn rebuild_propagates_unknown_pages_warning_sink_failure() {
+        let mut pdf = open(build_nested_pdf());
+
+        let mut intermediate = dict_of(&mut pdf, ObjectRef::new(3, 0));
+        intermediate.insert("UserUnit", Object::Integer(2));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(intermediate));
+
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
+        pdf.set_logger(logger);
+
+        assert!(matches!(
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)]),
+            Err(Error::System(ref message)) if message == "sink write failure 1"
+        ));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Unknown key /UserUnit")));
     }
 
     #[test]
