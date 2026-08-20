@@ -236,7 +236,8 @@ pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::{PageDocumentHelper, PageInput};
 pub use page_extract::{extract_page, extract_pages};
 pub use page_label_document_helper::{
-    merge_adjacent_ranges, LabelRange, LabelStyle, PageLabelDocumentHelper,
+    merge_adjacent_ranges, merge_adjacent_ranges_with_prefix_presence, LabelRange, LabelStyle,
+    PageLabelDocumentHelper,
 };
 pub use page_merge::{merge_documents, MergeInput};
 pub use page_object_helper::{PageBox, PageObjectHelper};
