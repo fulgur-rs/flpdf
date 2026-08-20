@@ -214,8 +214,9 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // not prune /Kids), we must *remove* /P so the widget does not hold a
     // dangling reference to the orphaned page dict after prune_after_subset
     // GCs it (qpdf 11.9.0 observed: B2 had no /P in pages-1,2 output).
+    let retained_page_refs: BTreeSet<ObjectRef> = result.new_kids.iter().copied().collect();
     for (widget, new_page_ref) in widget_to_page.values() {
-        update_widget_page_ref(pdf, widget, *new_page_ref)?;
+        update_widget_page_ref(pdf, widget, *new_page_ref, &retained_page_refs)?;
     }
     // Collect all widgets reachable from kept fields; strip /P from any that
     // are NOT in widget_to_page (i.e. live in a kept field's /Kids but were on
@@ -376,9 +377,24 @@ fn update_widget_page_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget: &ObjectHandle,
     new_page_ref: ObjectRef,
+    retained_page_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if widget.as_dictionary().is_none() {
         return Ok(());
+    }
+    // qpdf's copied-annotation routes preserve an existing widget `/P`: for a
+    // repeated primary page (same-document copy) and a foreign field copy it
+    // already points at the first output occurrence. Preserve that boundary
+    // for indirect widgets. Direct inline widgets remain on the historical
+    // owner-repair path below, where each independently cloned dictionary gets
+    // the page that contains it.
+    if widget.object_ref().is_some() {
+        let existing_page = pdf.resolve_object_handle_to_terminal(&widget.try_get_key(b"/P")?)?;
+        if let Some(existing_ref) = existing_page.object_ref() {
+            if retained_page_refs.contains(&existing_ref) {
+                return Ok(());
+            }
+        }
     }
     let page = pdf.get_object_handle(new_page_ref);
     widget.replace_key(b"/P", page)?;
@@ -747,7 +763,8 @@ mod tests {
         let mut pdf = open(build_no_acroform_pdf());
         let widget = ObjectHandle::integer(1);
 
-        update_widget_page_ref(&mut pdf, &widget, ObjectRef::new(3, 0)).unwrap();
+        let retained = BTreeSet::from([ObjectRef::new(3, 0)]);
+        update_widget_page_ref(&mut pdf, &widget, ObjectRef::new(3, 0), &retained).unwrap();
     }
 
     #[test]

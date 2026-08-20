@@ -10,8 +10,11 @@ use crate::page_label_document_helper::LabelRange;
 use crate::page_merge::{merge_documents_with_resource_mode, MergeInput};
 use crate::page_plan::PagePlan;
 use crate::resources::RemoveUnreferencedResources;
-use crate::{Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange, Pdf, Result};
-use std::collections::BTreeMap;
+use crate::{
+    AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
+    Pdf, Result,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
 /// One parsed `--pages` specification, referring to a source in the job's
@@ -48,6 +51,70 @@ type OrderedPage = (usize, usize);
 /// addition to the typed compatibility projection.
 type JobLabelEntry = (i64, LabelRange, bool);
 
+fn collect_primary_fields(
+    merged: &mut Pdf<Cursor<Vec<u8>>>,
+    pages: &[ObjectRef],
+) -> Result<Vec<ObjectHandle>> {
+    let mut field_refs = BTreeSet::new();
+    {
+        let mut acroform = AcroFormDocumentHelper::new(merged);
+        for &page_ref in pages {
+            let widgets = acroform.get_widget_annotations_for_page(page_ref)?;
+            for widget in widgets {
+                let field = acroform.get_field_for_annotation_handle(widget)?;
+                let Some(field_ref) = field.object_ref() else {
+                    continue;
+                };
+                field_refs.insert(acroform.get_top_level_field(field_ref)?);
+            }
+        }
+    }
+    let primary_order = {
+        let mut acroform = AcroFormDocumentHelper::new(merged);
+        acroform.top_level_fields()?
+    };
+    Ok(primary_order
+        .into_iter()
+        .filter(|field_ref| field_refs.contains(field_ref))
+        .map(|field_ref| merged.get_object_handle(field_ref))
+        .collect())
+}
+
+fn replace_merged_fields(
+    merged: &mut Pdf<Cursor<Vec<u8>>>,
+    fields: Vec<ObjectHandle>,
+) -> Result<()> {
+    let Some(root_ref) = merged.root_ref() else {
+        return Ok(());
+    };
+    let root = merged.get_object_handle(root_ref);
+    let acroform = merged.resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+    if acroform.as_dictionary().is_some() {
+        acroform.replace_key(b"/Fields", ObjectHandle::array(fields))?;
+        merged.mark_object_handle_dirty(&acroform)?;
+    }
+    Ok(())
+}
+
+/// Repair grouped-copy annotation `/P` values after the final page order is
+/// restored. qpdf installs this back-pointer at each final page-copy event,
+/// while the structural merge initially copies pages in source-group order.
+fn set_annotation_page_refs(
+    merged: &mut Pdf<Cursor<Vec<u8>>>,
+    page_ref: ObjectRef,
+    first_output_page: ObjectRef,
+) -> Result<()> {
+    let annotations = PageObjectHelper::new(page_ref, merged).get_annotation_handles(None)?;
+    let page = merged.get_object_handle(first_output_page);
+    for annotation in annotations {
+        if annotation.try_has_key(b"/P")? {
+            annotation.replace_key(b"/P", page.clone())?;
+            merged.mark_object_handle_dirty(&annotation)?;
+        }
+    }
+    Ok(())
+}
+
 /// Rebuild the copied page annotations and form fields in qpdf's final page
 /// order.
 ///
@@ -59,12 +126,11 @@ type JobLabelEntry = (i64, LabelRange, bool);
 /// `addAndRenameFormFields` resolve names against the fields already added.
 ///
 /// The initial page merge has already copied page-owned annotations and built a
-/// grouped `/AcroForm /Fields` array. Clear those two occurrence-sensitive
-/// carriers, seed the canonical foreign copier with the first output page for
-/// each source page (the `/P` back-pointer qpdf preserves for repeated pages),
-/// and replay the source annotations in `ordered_pages` order. The existing
-/// `PageObjectHelper::copy_annotations_from` facade owns the qpdf-shaped field
-/// tree/annotation transform and collision rename route.
+/// grouped `/AcroForm /Fields` array. Retain the primary's first-occurrence
+/// fields and no-AcroForm foreign annotations, while replaying only the
+/// occurrence-sensitive copies in `ordered_pages` order. The existing
+/// `PageObjectHelper` facades own the same-document and foreign field-tree
+/// transforms and collision-rename routes.
 fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
     merged: &mut Pdf<Cursor<Vec<u8>>>,
     sources: &mut [Pdf<R>],
@@ -74,32 +140,20 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
 ) -> Result<()> {
     debug_assert_eq!(ordered_pages.len(), final_refs.len());
 
-    // Remove the grouped merge's field list while retaining primary-owned
-    // /DR, /DA, /SigFlags, and other AcroForm defaults. If no source carried an
-    // AcroForm, the first annotation transform will create it only when needed.
-    if let Some(root_ref) = merged.root_ref() {
-        let root = merged.get_object_handle(root_ref);
-        let acroform =
-            merged.resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
-        if acroform.as_dictionary().is_some() {
-            acroform.replace_key(b"/Fields", ObjectHandle::array(Vec::new()))?;
-            merged.mark_object_handle_dirty(&acroform)?;
-        }
-    }
-
-    // The page merge's annotations are the source-group copies. They must not
-    // be appended to the per-occurrence copies below.
-    for &page_ref in final_refs {
-        let page = merged.get_object_handle(page_ref);
-        page.remove_key(b"/Annots");
-        merged.mark_object_handle_dirty(&page)?;
-    }
-
     // Resolve source page refs once, before the occurrence replay mutably
     // borrows individual source documents.
     let source_page_refs: Vec<Vec<ObjectRef>> = sources
         .iter_mut()
         .map(crate::pages::page_refs)
+        .collect::<Result<_>>()?;
+
+    // qpdf's branch is based on document ownership. The primary's first
+    // occurrence remains on the primary route; repeated primary pages use the
+    // same-document copier; only a secondary source with an AcroForm enters
+    // the foreign resource/field route.
+    let source_has_acroform: Vec<bool> = sources
+        .iter_mut()
+        .map(|source| source.acroform().has_acro_form())
         .collect::<Result<_>>()?;
 
     // qpdf's foreign ObjCopier has already mapped each source page to the first
@@ -115,26 +169,72 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
             .entry(source_page_ref)
             .or_insert(final_refs[output_index]);
     }
-    for (source_index, mappings) in first_output_for_source_page.into_iter().enumerate() {
+
+    // The grouped merge already copied the primary's first-occurrence field
+    // trees. Keep those handles, discard secondary grouped fields, and let
+    // the per-occurrence routes append only the copies qpdf would append.
+    let primary_first_pages: Vec<ObjectRef> = ordered_pages
+        .iter()
+        .enumerate()
+        .filter_map(|(output_index, &(source_index, group_index))| {
+            if source_index != 0 {
+                return None;
+            }
+            let source_page_index = grouped_pages[source_index][group_index];
+            let source_page_ref = source_page_refs[source_index][source_page_index];
+            (first_output_for_source_page[source_index].get(&source_page_ref)
+                == Some(&final_refs[output_index]))
+            .then_some(final_refs[output_index])
+        })
+        .collect();
+    let primary_fields = collect_primary_fields(merged, &primary_first_pages)?;
+    replace_merged_fields(merged, primary_fields)?;
+
+    for (source_index, mappings) in first_output_for_source_page.iter().enumerate() {
         if mappings.is_empty() {
             continue;
         }
         let source_id = sources[source_index].unique_id();
         let mut object_map = merged.take_foreign_object_map(source_id);
-        object_map.extend(mappings);
+        object_map.extend(mappings.iter().map(|(&source, &target)| (source, target)));
         merged.set_foreign_object_map(source_id, object_map);
     }
 
     for (output_index, &(source_index, group_index)) in ordered_pages.iter().enumerate() {
         let source_page_index = grouped_pages[source_index][group_index];
         let source_page_ref = source_page_refs[source_index][source_page_index];
-        let source_page = sources[source_index].get_object_handle(source_page_ref);
-        let mut destination = PageObjectHelper::new(final_refs[output_index], merged);
-        destination.copy_annotations_from(
-            source_page,
-            Matrix::default(),
-            &mut sources[source_index],
-        )?;
+        let first_output_page = first_output_for_source_page[source_index]
+            .get(&source_page_ref)
+            .copied()
+            .ok_or(Error::Missing("first output page for source page"))?;
+        let is_primary_first = source_index == 0 && first_output_page == final_refs[output_index];
+
+        if is_primary_first || (!source_has_acroform[source_index] && source_index != 0) {
+            // The grouped page copy already owns these annotations. Keep them
+            // for qpdf's primary-first and foreign-no-AcroForm branches, but
+            // repair `/P` after the grouped→final page-order reconstruction.
+            set_annotation_page_refs(merged, final_refs[output_index], first_output_page)?;
+            continue;
+        }
+
+        let destination_page = merged.get_object_handle(final_refs[output_index]);
+        destination_page.remove_key(b"/Annots");
+        merged.mark_object_handle_dirty(&destination_page)?;
+
+        if source_index == 0 {
+            // A repeated primary page is a same-document transform: it must
+            // not create or merge a foreign destination `/DR`.
+            let source_page = merged.get_object_handle(first_output_page);
+            PageObjectHelper::new(final_refs[output_index], merged)
+                .copy_annotations(source_page, Matrix::default())?;
+        } else {
+            let source_page = sources[source_index].get_object_handle(source_page_ref);
+            PageObjectHelper::new(final_refs[output_index], merged).copy_annotations_from(
+                source_page,
+                Matrix::default(),
+                &mut sources[source_index],
+            )?;
+        }
     }
 
     Ok(())

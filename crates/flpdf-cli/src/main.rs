@@ -15,7 +15,7 @@ use flpdf::{
     page_collate::collate,
     page_combine::{CombinedPage, CombinedPlan},
     page_rotate::apply_rotate_to_pages,
-    pages::tree_rebuild::rebuild_page_tree,
+    pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
     subset_prune::prune_after_subset,
@@ -34,9 +34,9 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version, AcroFormDocumentHelper, CompressStreams, CopyEncryptionSource,
     EncryptMethod, EncryptParams, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg,
-    ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf, PdfOpenOptions, PdfVersion,
-    PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger, RemoveUnreferencedResources,
-    Severity, StreamDataMode, WriterConfiguration,
+    ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf,
+    PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
+    RemoveUnreferencedResources, Severity, StreamDataMode, WriterConfiguration,
 };
 use flpdf::{fix_qdf, remove_attachment};
 use std::collections::HashSet;
@@ -4723,6 +4723,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     };
 
     let result = rebuild_page_tree(&mut pdf, &selected)?;
+    copy_duplicate_page_annotations(&mut pdf, &result)?;
     apply_rotate_specs(&mut pdf, &page_ops.rotate, &result.new_kids)?;
 
     if reconstruct_labels {
@@ -4869,6 +4870,32 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
         }
     }
     finish_operation_warnings_with_prior(&pdf, creates_output, prior_warnings)
+}
+
+/// Apply qpdf's same-document `fixCopiedAnnotations` boundary to duplicate
+/// page slots created by [`rebuild_page_tree`]. The page rebuild intentionally
+/// shallow-copies only the page dictionary, so its `/Annots` carrier still
+/// points at the first occurrence. qpdf replaces that carrier with a fresh
+/// annotation/field-tree copy for every repeated primary page before it
+/// resolves field-name collisions.
+fn copy_duplicate_page_annotations<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    result: &RebuildResult,
+) -> flpdf::Result<()> {
+    for page_refs in result.ref_map.values() {
+        let Some(&first_page) = page_refs.first() else {
+            continue;
+        };
+        let source_page = pdf.get_object_handle(first_page);
+        for &duplicate_page in page_refs.iter().skip(1) {
+            let destination_page = pdf.get_object_handle(duplicate_page);
+            destination_page.remove_key(b"/Annots");
+            pdf.mark_object_handle_dirty(&destination_page)?;
+            PageObjectHelper::new(duplicate_page, pdf)
+                .copy_annotations(source_page.clone(), flpdf::Matrix::default())?;
+        }
+    }
+    Ok(())
 }
 
 /// Apply each `--rotate` spec (in order) to `target_pages`, resolving each
