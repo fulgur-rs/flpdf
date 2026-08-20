@@ -4274,7 +4274,7 @@ impl ObjectHandle {
             result.push(self.clone());
         } else if !self.is_null() {
             self.warn_through_context(format!(
-                "{description}: object is supposed to be a stream or an array of streams but is neither"
+                "{description}:  object is supposed to be a stream or an array of streams but is neither"
             ))?;
         }
 

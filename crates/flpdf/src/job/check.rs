@@ -287,6 +287,10 @@ fn emit_diagnostics(
         match diagnostic.severity {
             Severity::Warning => {
                 warnings = true;
+                if is_contextless_object_warning(&diagnostic.message) {
+                    logger.warn(format!("WARNING: {}\n", diagnostic.message))?;
+                    continue;
+                }
                 let location = diagnostic_location(input_name, diagnostic);
                 let separator = if diagnostic.message.starts_with("(object ")
                     || diagnostic.message.starts_with("(trailer,")
@@ -307,6 +311,15 @@ fn emit_diagnostics(
         }
     }
     Ok((warnings, errors))
+}
+
+/// qpdf's ObjectHandle::objectWarning uses an empty filename and zero offset
+/// in its QPDFExc, so its description is already the complete warning prefix
+/// (`libqpdf/QPDFObjectHandle.cc:2203-2212`, `libqpdf/QPDFExc.cc:19-49`).
+fn is_contextless_object_warning(message: &str) -> bool {
+    ["object ", "page object ", "content stream object "]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
 }
 
 fn emit_warning(logger: &QPDFLogger, input_name: &str, message: impl AsRef<str>) -> Result<()> {
@@ -611,6 +624,10 @@ mod tests {
         ));
         diagnostics.push(Diagnostic::warning("xref warning", Some(12)));
         diagnostics.push(Diagnostic::warning("warning without offset", None));
+        diagnostics.push(Diagnostic::warning(
+            "page object 3 0:  object is supposed to be a stream or an array of streams but is neither",
+            None,
+        ));
         diagnostics.push(Diagnostic::error("bad xref", Some(13)));
 
         let (warnings, errors) = emit_diagnostics(&diagnostics, 0, &logger, "qpdf", "input.pdf")
@@ -631,6 +648,11 @@ mod tests {
         assert!(output.contains("WARNING: input.pdf (object 5 0, offset 232): expected endobj\n"));
         assert!(output.contains("qpdf: input.pdf (offset 13): bad xref\n"));
         assert!(output.contains("WARNING: input.pdf: linearization warning\n"));
+        assert!(output.contains(
+            "WARNING: page object 3 0:  object is supposed to be a stream or an array of streams but is neither\n"
+        ));
+        assert!(!output
+            .contains("WARNING: input.pdf: page object 3 0: object is supposed to be a stream"));
         assert!(output.contains("qpdf: input.pdf: fatal\n"));
     }
 
