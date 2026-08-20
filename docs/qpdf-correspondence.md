@@ -238,10 +238,11 @@ paths and Windows directory-open failures for both metadata helpers.
 比較する回帰テストは `cli_pages_root_inheritable_qpdf.rs` が所有する。
 
 `flpdf-egzr.3.2.6.26` では、subset extraction 後の name-level resource prune を
-document-wide の `resources::remove_unreferenced_resources` から切り離し、保持された各
-leaf の `PageObjectHelper::remove_unreferenced_resources` へ委譲する。これは qpdf の
+document-wide の独自 aggregate route ではなく、保持された各 leaf の
+`PageObjectHelper::remove_unreferenced_resources` へ委譲する形に揃えた。これは qpdf の
 `QPDFPageObjectHelper.cc:539-649` に合わせた parse-gated な page-local route であり、
 剪定対象は `/Font` と `/XObject` のみ（各 category は shallow copy 後に変更）である。
+旧 aggregate API とそれ専用の回帰テストは、qpdf 11.9.0 に対応物がないため削除した。
 `QPDFJob.cc:2251-2337` の Auto 判定は tree rebuild 前に済ませ、`subset_prune` はその
 結果が prune を許可した場合だけこの per-page route を実行する。xref-level の orphan
 mark-and-sweep は引き続き `subset_prune` の責務として残す。共有 `/XObject` category、
