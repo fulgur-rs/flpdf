@@ -36,7 +36,7 @@
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::object_copy::copy_objects;
-use crate::object_handle::canonical_dictionary_key;
+use crate::object_handle::canonical_dictionary_key_from_legacy;
 use crate::page_closure::{extend_object_closure, extend_page_object_closure};
 use crate::page_extract::{
     append_selection_kids, null_copied_removed_pages, resolve_dict, target_pages_root,
@@ -321,7 +321,7 @@ fn wire_doc_level<RTgt: Read + Seek>(
             }
             let remapped = remap_refs_in_object(value.clone(), map);
             let value = target.lift_object_to_handle(&remapped)?;
-            let key = canonical_dictionary_key(key);
+            let key = canonical_dictionary_key_from_legacy(key);
             catalog.replace_key(&key, value)?;
         }
         target.mark_object_handle_dirty(&catalog)?;
@@ -359,8 +359,13 @@ fn wire_doc_level<RTgt: Read + Seek>(
             "Dests",
             remap_refs_in_object(Object::Dictionary(inline.clone()), map),
         );
-        let remapped = remap_refs_in_object(Object::Dictionary(names), map);
-        catalog.replace_key(b"/Names", target.lift_object_to_handle(&remapped)?)?;
+        // The name-tree root was remapped above. Remapping this newly built
+        // `/Names` holder as well would remap a destination twice when a new
+        // target reference is also present as a source key in `map`.
+        catalog.replace_key(
+            b"/Names",
+            target.lift_object_to_handle(&Object::Dictionary(names))?,
+        )?;
     }
     // Legacy /Catalog /Dests: indirect → wire copied ref; inline → remap the
     // complete direct carrier once, preserving any indirect holder structure.
@@ -1525,6 +1530,7 @@ mod tests {
     fn wire_doc_level_inline_carriers_use_canonical_handles() {
         let mut target = Pdf::empty().unwrap();
         let mapped = ObjectRef::new(2, 0);
+        let remapped_again = ObjectRef::new(30, 0);
         let source_ref = ObjectRef::new(20, 0);
         let mut outlines = Dictionary::new();
         outlines.insert("First", Object::Reference(source_ref));
@@ -1540,7 +1546,7 @@ mod tests {
                 Object::Name(b"Fit".to_vec()),
             ]),
         );
-        let map = BTreeMap::from([(source_ref, mapped)]);
+        let map = BTreeMap::from([(source_ref, mapped), (mapped, remapped_again)]);
 
         wire_doc_level(
             &mut target,
@@ -1562,9 +1568,52 @@ mod tests {
 
         let catalog = target.get_object_handle(ObjectRef::new(1, 0));
         assert!(!catalog.try_get_key(b"/Outlines").unwrap().is_null());
-        assert!(!catalog.try_get_key(b"/Names").unwrap().is_null());
+        assert_eq!(
+            catalog
+                .try_get_key(b"/Names")
+                .unwrap()
+                .try_get_key(b"/Dests")
+                .unwrap()
+                .try_get_key(b"/Names")
+                .unwrap()
+                .object_ref(),
+            Some(mapped),
+            "inline /Names /Dests is remapped exactly once"
+        );
         assert!(!catalog.try_get_key(b"/Dests").unwrap().is_null());
         assert!(!catalog.try_get_key(b"/OpenAction").unwrap().is_null());
+    }
+
+    #[test]
+    fn wire_doc_level_preserves_legacy_leading_slash_dictionary_key() {
+        let mut target = Pdf::empty().unwrap();
+        let mut primary_catalog = Dictionary::new();
+        primary_catalog.insert(b"/Escaped", Object::Integer(7));
+
+        wire_doc_level(
+            &mut target,
+            &PrimaryDocLevel {
+                catalog: Some(primary_catalog),
+                ..Default::default()
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        let catalog = target.get_object_handle(ObjectRef::new(1, 0));
+        assert_eq!(
+            catalog
+                .try_get_key(b"//Escaped")
+                .unwrap()
+                .try_as_integer()
+                .unwrap(),
+            Some(7),
+            "a legacy key body beginning with '/' still gets qpdf's delimiter"
+        );
+        assert!(
+            !catalog.try_has_key(b"/Escaped").unwrap(),
+            "the legacy key must not lose its leading slash body"
+        );
     }
 
     /// A malformed indirect document-level root may itself be an unselected
