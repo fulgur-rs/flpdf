@@ -11,6 +11,7 @@ use super::page_merge::{
 };
 use crate::page_label_document_helper::LabelRange;
 use crate::page_plan::PagePlan;
+use crate::pages::tree_rebuild::RebuildResult;
 use crate::resources::RemoveUnreferencedResources;
 use crate::{
     AcroFormDocumentHelper, Error, Matrix, ObjectHandle, ObjectRef, PageObjectHelper, PageRange,
@@ -551,6 +552,27 @@ pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
 }
 
 impl super::QPDFJob {
+    /// Apply the qpdf `QPDFJob::handlePageSpecs` final AcroForm field filter
+    /// for the single-document page-selection route.
+    ///
+    /// qpdf performs this operation inline after all selected-page copies and
+    /// after unselected primary pages have been nulled
+    /// (`QPDFJob.cc:2597-2632`). The multi-source path above owns its
+    /// occurrence-aware copy and field filtering in the same job module; the
+    /// single-source CLI path supplies its rebuilt-page result here so the
+    /// operation is still owned by `job/`, not by CLI orchestration.
+    ///
+    /// The lower-level field-tree walk remains the one canonical
+    /// `acroform_field_prune` implementation. This method only establishes
+    /// the QPDFJob operation boundary and adds no alternate repair or
+    /// compatibility route.
+    pub fn prune_acroform_after_subset<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        result: &RebuildResult,
+    ) -> Result<()> {
+        crate::acroform_field_prune::prune_acroform_after_subset(pdf, result)
+    }
+
     /// Execute qpdf's page-specification and multi-source copy operation.
     pub fn handle_page_specs<R: Read + Seek + 'static>(
         &mut self,
@@ -846,6 +868,28 @@ mod tests {
         assert!(
             root.get("AcroForm").is_none(),
             "qpdf removes /AcroForm entirely once its filtered field count reaches zero"
+        );
+    }
+
+    #[test]
+    fn qpdf_job_owns_single_document_acroform_prune_boundary() {
+        let mut pdf = acroform_all_fields_on_page_two_pdf();
+        let original_pages = crate::pages::page_refs(&mut pdf).expect("original page refs");
+        let result = crate::pages::tree_rebuild::rebuild_page_tree(&mut pdf, &[original_pages[0]])
+            .expect("rebuild the selected page");
+
+        QPDFJob::prune_acroform_after_subset(&mut pdf, &result)
+            .expect("job-owned AcroForm pruning");
+
+        let root_ref = pdf.root_ref().expect("root");
+        let root = pdf
+            .resolve(root_ref)
+            .expect("resolve root")
+            .into_dict()
+            .expect("root dictionary");
+        assert!(
+            root.get("AcroForm").is_none(),
+            "the job boundary must remove an empty AcroForm after page selection"
         );
     }
 
