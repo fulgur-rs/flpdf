@@ -6564,7 +6564,7 @@ fn run_copy_attachments_from(
     let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
 
-    job.copy_attachments(
+    let count = job.copy_attachments(
         &mut pdf,
         &mut src,
         &AttachmentCopyOptions {
@@ -6573,6 +6573,7 @@ fn run_copy_attachments_from(
             verbose,
         },
     )?;
+    eprintln!("copied {count} attachment(s)");
 
     let writer_options = WriterOptions {
         deterministic_id,

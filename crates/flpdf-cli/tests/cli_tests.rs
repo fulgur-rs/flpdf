@@ -6592,7 +6592,8 @@ fn copy_attachments_from_copies_all_entries() {
             output.to_str().unwrap(),
         ])
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains("copied 2 attachment(s)"));
 
     Command::cargo_bin("flpdf")
         .unwrap()
