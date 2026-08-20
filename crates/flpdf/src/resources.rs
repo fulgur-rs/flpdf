@@ -1137,4 +1137,79 @@ mod tests {
     fn form_stream_dict_rejects_non_stream_handle() {
         assert!(form_stream_dict(&ObjectHandle::integer(1)).is_err());
     }
+
+    #[test]
+    fn form_resource_collection_rejects_malformed_content() {
+        assert!(collect_used_names_for_form(b"<0g>").is_none());
+    }
+
+    // ISO 32000-1 §8.6.8: only /DeviceGray, /DeviceRGB, /DeviceCMYK, /Pattern
+    // may be selected by a page-content cs/CS operator without a
+    // /Resources/ColorSpace entry. is_builtin_color_space_cs_op excludes only
+    // those four from the recorded used-names set; any other name (including
+    // one that merely resembles a builtin, like /ICCBased) is a real resource
+    // reference and must be recorded.
+    #[test]
+    fn color_space_operator_excludes_only_the_four_builtin_names() {
+        let used = collect_used_names_for_form(b"/DeviceGray cs /Custom cs")
+            .expect("well-formed content should parse");
+        let color_spaces = used.get(b"ColorSpace".as_slice());
+        assert!(
+            color_spaces.is_none_or(|names| !names.contains(b"DeviceGray".as_slice())),
+            "/DeviceGray is a built-in device colour space, not a resource reference"
+        );
+        assert!(
+            color_spaces.is_some_and(|names| names.contains(b"Custom".as_slice())),
+            "/Custom is not built-in and must be recorded as a used /ColorSpace name"
+        );
+    }
+
+    // ISO 32000-1 Table 93: an inline image's /CS may be a built-in device name
+    // (full or abbreviated) with no /Resources/ColorSpace entry, or a resource
+    // reference. is_builtin_inline_image_cs excludes only the built-in set;
+    // record_direct_names must otherwise record the name from
+    // ResourceFinder::names_by_resource_type.
+    #[test]
+    fn inline_image_cs_excludes_only_the_builtin_names() {
+        let used = collect_used_names_for_form(b"BI /CS /DeviceGray /W 1 /H 1 /BPC 8 ID \x00 EI")
+            .expect("well-formed inline image should parse");
+        assert!(
+            used.get(b"ColorSpace".as_slice())
+                .is_none_or(|names| !names.contains(b"DeviceGray".as_slice())),
+            "a built-in inline-image /CS name is not a /Resources/ColorSpace reference"
+        );
+
+        let used = collect_used_names_for_form(b"BI /CS /Foo /W 1 /H 1 /BPC 8 ID \x00 EI")
+            .expect("well-formed inline image should parse");
+        assert!(
+            used.get(b"ColorSpace".as_slice())
+                .is_some_and(|names| names.contains(b"Foo".as_slice())),
+            "a non-built-in inline-image /CS name must be recorded as a used /ColorSpace name"
+        );
+    }
+
+    // ResourceCallbacks::stop_incomplete/finish_inline_header gate every
+    // malformed BI/ID/EI shape the same way regardless of Page or Form scope
+    // (collect_used_names_for_form and remove_unreferenced_resources_on_page
+    // share this callback machinery), so exercising the Form-scope entry
+    // point covers the same parser paths the removed Page-scope
+    // collect_test_content helper did.
+    #[test]
+    fn resource_callbacks_reject_malformed_inline_image_protocol() {
+        let malformed: &[&[u8]] = &[
+            // Header keys must be names.
+            b"BI 1 /Foo ID payload EI",
+            // Header objects must form key/value pairs.
+            b"BI /CS ID payload EI",
+            // BI starts only at an operation boundary.
+            b"1 BI /CS /Foo ID payload EI",
+        ];
+
+        for content in malformed {
+            assert!(
+                collect_used_names_for_form(content).is_none(),
+                "malformed content was accepted: {content:?}"
+            );
+        }
+    }
 }
