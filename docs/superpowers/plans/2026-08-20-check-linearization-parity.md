@@ -80,6 +80,6 @@ Compare `qpdf --check tests/fixtures/compat/linearized-one-page.pdf` with `cargo
 
 Run `cargo fmt --all -- --check`, focused tests, `cargo test --workspace`, all-features clippy, strict private-item rustdoc, qpdf module-doc checks, and `scripts/patch-coverage.sh --base origin/main`; changed executable lines must be fully covered.
 
-- [ ] **Step 3: Commit, rebase, push, and create a non-draft PR**
+- [x] **Step 3: Commit, rebase, push, and create a non-draft PR**
 
 Rebase onto latest `origin/main`, push the feature branch, create the PR with qpdf source/probe/test/coverage/Beads evidence, wait for all CI and `codecov/patch`, and leave it Ready without merging.
