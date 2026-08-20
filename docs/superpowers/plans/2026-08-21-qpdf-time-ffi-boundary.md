@@ -15,7 +15,7 @@
 
 ### Task 3: Verify and hand off
 
-- [ ] Run fmt, strict rustdoc, workspace tests, qpdf-doc checks, deviation
+- [x] Run fmt, strict rustdoc, workspace tests, qpdf-doc checks, deviation
   checks, and fresh patch coverage.
 - [ ] Rebase the stacked branch onto the current parent PR head, push, and open
   a Draft PR without merging.
