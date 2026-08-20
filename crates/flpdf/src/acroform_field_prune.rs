@@ -293,6 +293,16 @@ fn collect_page_widgets<R: Read + Seek>(
         page.get_annotations_filtered(Some(b"/Widget"))?
     };
     for widget in widgets {
+        // qpdf-deviation: chases flpdf's temporary Pdf::set_object
+        // bare-reference bridge (ObjectValue::Reference) to its terminal
+        // value; qpdf's resolved object graph has no reference-value type
+        // at all (QPDF::resolve, QPDF.cc:1699-1753, never returns a value
+        // that is itself another reference, and QPDF::replaceObject
+        // rejects an indirect handle, QPDF.cc:1980-1991), and
+        // QPDFAcroFormDocumentHelper::traverseField / QPDFJob.cc's field
+        // walk use plain one-hop getKey/getObjGen with no chase loop. The
+        // same rationale covers every other resolve_object_handle_to_terminal
+        // call in this file.
         let widget = pdf.resolve_object_handle_to_terminal(&widget)?;
         // First-occurrence rule: don't overwrite if already present from a
         // duplicate-page selection (ref_map iteration is in BTreeMap order,

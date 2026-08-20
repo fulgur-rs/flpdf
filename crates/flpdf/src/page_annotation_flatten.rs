@@ -1002,6 +1002,9 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
 /// their first referenced value is the terminal PDF object. This predicate is
 /// therefore the boundary that permits the compatibility bridge without
 /// broadening it to ordinary parsed indirect values.
+// qpdf-deviation: detects a Pdf::set_object bare-reference redirect, a shape
+// with no qpdf counterpart (QPDF::replaceObject rejects indirect
+// replacement, libqpdf/QPDF.cc:1986-1991).
 fn has_bare_reference_redirect<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     owner_ref: ObjectRef,
@@ -1025,6 +1028,8 @@ fn has_bare_reference_redirect<R: Read + Seek>(
 /// [`has_bare_reference_redirect`]. A direct `/AP` dictionary has no
 /// `ObjectRef` of its own, so its `/N` child must be inspected through the
 /// live `ObjectHandle` rather than through the legacy object cache.
+// qpdf-deviation: same no-qpdf-counterpart redirect shape as
+// has_bare_reference_redirect, checked through a direct handle instead.
 fn has_bare_reference_redirect_in_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     owner: &ObjectHandle,

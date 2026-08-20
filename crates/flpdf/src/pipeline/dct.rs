@@ -166,6 +166,11 @@ impl Pipeline for PlDct<'_> {
             // representable `usize` limit, so saturating to `usize::MAX`
             // and comparing `> limit` rejects exactly the same inputs a
             // `None`-on-overflow branch would, without an unreachable arm.
+            // qpdf-deviation-start: qpdf's Pl_DCT has no output-size cap
+            // anywhere in its decode path; this rejects declared JPEG
+            // width x height x bpp against the caller's opt-in
+            // DecodeLimits::max_output before the default libjpeg-turbo-rs
+            // backend's eager whole-image decode on the first scanline read.
             if let Some(limit) = self.max_output {
                 if row_length.saturating_mul(height) > limit {
                     return Err(PipelineError::runtime(format!(
@@ -173,6 +178,7 @@ impl Pipeline for PlDct<'_> {
                     )));
                 }
             }
+            // qpdf-deviation-end
 
             let mut row = vec![0u8; row_length];
 

@@ -173,6 +173,12 @@ impl LabelRange {
     /// Render the display label for `value` (§12.4.2): `prefix` followed by the
     /// style-formatted number. [`LabelStyle::None`] and non-positive numeric
     /// values contribute no numeric portion.
+    // qpdf-deviation-start: page-label rendering to a display string
+    // (roman/alpha/decimal, ISO 32000-1 §12.4.2) has no qpdf counterpart --
+    // QPDFPageLabelDocumentHelper.cc only produces/consumes the raw
+    // /S,/P,/St dictionary and qpdf never computes a rendered numeral
+    // string anywhere in its source (doJSONPageLabels emits the raw dict
+    // via getJSON, never a rendered label).
     pub fn format(&self, value: i64) -> String {
         let mut s = self.prefix.clone();
         match self.style {
@@ -185,6 +191,7 @@ impl LabelRange {
         }
         s
     }
+    // qpdf-deviation-end
 }
 
 /// Collapse a later `(first_page_idx, LabelRange)` entry into its
@@ -263,6 +270,9 @@ pub fn merge_adjacent_ranges_with_prefix_presence(
     out
 }
 
+// qpdf-deviation-start: page-label rendering (this const and the two
+// functions below) has no qpdf counterpart -- see the marker on
+// LabelRange::format for the full citation.
 /// Upper bound on the numeric value [`to_roman`]/[`to_alpha`] will render.
 ///
 /// Values above this produce an empty numeric portion — a defensive cap against
@@ -316,6 +326,7 @@ fn to_alpha(value: i64, upper: bool) -> String {
     let ch = if upper { b'A' + letter } else { b'a' + letter } as char;
     (0..count).map(|_| ch).collect()
 }
+// qpdf-deviation-end
 
 /// High-level helper for a document's `/PageLabels` number tree.
 ///
@@ -570,12 +581,15 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded.
     /// - Any error from [`Pdf::resolve`].
+    // qpdf-deviation-start: page-label rendering has no qpdf counterpart --
+    // see the marker on LabelRange::format for the full citation.
     pub fn label_string_for_page(&mut self, page_idx: i64) -> Result<String> {
         match self.label_for_page(page_idx)? {
             Some(effective) => Ok(effective.format(effective.start)),
             None => Ok((page_idx + 1).to_string()),
         }
     }
+    // qpdf-deviation-end
 
     /// qpdf `getLabelsForPageRange` port: collect the label entries needed to
     /// reproduce the labels of pages `start_idx..=end_idx` if they were
@@ -907,6 +921,13 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
     ///   exceeded while reading the existing tree.
     /// - Any error from [`Pdf::resolve`].
+    // qpdf-deviation-start: index-shift-and-preserve update of an existing
+    // /PageLabels tree (this method and remove_pages below) has no qpdf
+    // counterpart -- QPDF::insertPage/removePage (libqpdf/QPDF_pages.cc:
+    // 205-276) never touch /PageLabels, and QPDFJob's only two
+    // label-rebuilding paths (--set-page-labels, --pages' handlePageSpecs)
+    // always rebuild /Nums from scratch via getLabelsForPageRange per
+    // output page instead of shifting an existing tree's surviving keys.
     pub fn insert_pages(&mut self, at: usize, count: usize) -> Result<()> {
         if count == 0 {
             return Ok(());
@@ -1078,6 +1099,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let merged = merge_adjacent_ranges(result);
         self.write_labels(&merged)
     }
+    // qpdf-deviation-end
 
     /// Rebuild `/PageLabels` from sorted entries and patch the catalog. Empty
     /// entries → remove `/PageLabels`.

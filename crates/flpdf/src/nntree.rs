@@ -120,10 +120,13 @@ enum NodeIdentity {
     /// The live allocation identity for a direct canonical ObjectHandle.
     Direct(ObjectHandleIdentity),
     /// Synthetic path-only handles used by raw compatibility tests.
+    // qpdf-deviation-start: no qpdf counterpart; NNTree.hh's PathElement
+    // always holds a live QPDFObjectHandle, never a path-only identity.
     Path {
         anchor: NodeAnchor,
         direct_kids: Vec<usize>,
     },
+    // qpdf-deviation-end
 }
 
 /// A node path keeps the qpdf diagnostic anchor and the live node handle
@@ -2464,6 +2467,9 @@ impl<K: TreeKey> NNTree<K> {
     /// payload is another reference; retaining this conditional keeps the
     /// canonical route free of a second reference-chain traversal while still
     /// letting old consumers observe their terminal node identity.
+    // qpdf-deviation: the collapsed redirect shape has no qpdf counterpart
+    // (QPDF::replaceObject rejects indirect replacement,
+    // libqpdf/QPDF.cc:1986-1991); only Pdf::set_object can produce it.
     fn legacy_terminal_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -2483,6 +2489,8 @@ impl<K: TreeKey> NNTree<K> {
         // bare reference value. qpdf's object graph never stores that
         // redirect inside an indirect handle, but the existing Pdf bridge can
         // still produce it; traverse it only at this compatibility boundary.
+        // qpdf-deviation: this compatibility-boundary chase has no qpdf
+        // counterpart (see reader.rs::resolve_object_handle_to_terminal_ref).
         let root = pdf.resolve_object_handle_to_terminal(&root)?;
         Ok(root.object_ref().map_or_else(
             || NodeHandle::root_with_handle(root.clone()),

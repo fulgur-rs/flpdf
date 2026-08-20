@@ -885,6 +885,12 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::parse(0, "fix_qdf: no objects found before xref"));
     }
 
+    // qpdf-deviation-start: qpdf's fix-qdf st_at_xref state has no check for
+    // this combination -- it unconditionally calls QPDFXRefEntry::getOffset()
+    // on every xref entry, which throws std::logic_error for the type-2
+    // entries an object stream's members produce, so real qpdf crashes via
+    // an uncaught exception here instead of detecting and rejecting the
+    // input; flpdf instead proactively rejects it.
     if !is_xref_stream_form
         && objects
             .iter()
@@ -905,6 +911,7 @@ pub fn fix_qdf(input: &[u8]) -> Result<Vec<u8>> {
                 .into(),
         ));
     }
+    // qpdf-deviation-end
 
     // qpdf's fix-qdf requires objects numbered exactly `1..N` in file order
     // (QdfFixer::checkObjId fatals on `stoi(id) != ++last_obj`) — and this ONE
