@@ -39,6 +39,7 @@ const THREE_PAGE: &str = "../../tests/fixtures/compat/three-page.pdf";
 const ONE_PAGE: &str = "../../tests/fixtures/compat/one-page.pdf";
 const TWO_PAGE: &str = "../../tests/fixtures/compat/two-page.pdf";
 const ONE_PAGE_V17: &str = "../../tests/fixtures/compat/one-page-v17.pdf";
+const ENCRYPTED_R4_EMPTY_PASSWORD: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const PRIMARY_CATALOG_METADATA: &str =
     "../../tests/fixtures/compat/catalog-otherpage-other-info-two-page.pdf";
 const PRIMARY_CATALOG_NO_INFO: &str =
@@ -1403,6 +1404,55 @@ fn pages_encrypted_primary_plaintext_secondary_preserves_primary_encryption() {
         npages_of_with_password(&q, "secretpw"),
         npages_of_with_password(&f, "secretpw")
     );
+}
+
+#[test]
+fn pages_empty_password_encrypted_primary_preserves_primary_encryption() {
+    // qpdf 11.9.0 accepts the empty user password for this R4 fixture and
+    // keeps the authenticated primary as the encrypted output/base document
+    // when a plaintext secondary contributes a page.
+    if !qpdf_available() {
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping empty-password encryption differential");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let primary = fixture_abs(ENCRYPTED_R4_EMPTY_PASSWORD);
+    let secondary = fixture_abs(TWO_PAGE);
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    let (q_ok, q_stderr) = run_qpdf(&[
+        primary.to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        secondary.to_str().unwrap(),
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(q_ok || q.exists(), "qpdf page merge failed: {q_stderr}");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            primary.to_str().unwrap(),
+            "--password=",
+            "--pages",
+            ".",
+            "1",
+            secondary.to_str().unwrap(),
+            "1",
+            "--",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_qpdf_encrypted_output(&q, "");
+    assert_qpdf_encrypted_output(&f, "");
+    assert_qpdf_rejects_password(&q, "wrong");
+    assert_qpdf_rejects_password(&f, "wrong");
 }
 
 #[test]
