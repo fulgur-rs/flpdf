@@ -3343,6 +3343,115 @@ fn one_page_pdf_with_page_local_indirect_resources() -> Vec<u8> {
     ])
 }
 
+fn qpdf_11_9_available() -> bool {
+    std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    == Some("qpdf version 11.9.0")
+        })
+        .unwrap_or(false)
+}
+
+fn image_xobject(num: u32) -> Vec<u8> {
+    let mut object = format!(
+        "{num} 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n"
+    )
+    .into_bytes();
+    object.push(0);
+    object.extend_from_slice(b"\nendstream\nendobj\n");
+    object
+}
+
+fn two_page_pdf_with_shared_xobject_category() -> Vec<u8> {
+    let content1 = [
+        b"7 0 obj\n<< /Length 10 >>\nstream\n".as_slice(),
+        b"q /X1 Do Q",
+        b"\nendstream\nendobj\n",
+    ]
+    .concat();
+    let content2 = [
+        b"8 0 obj\n<< /Length 10 >>\nstream\n".as_slice(),
+        b"q /X2 Do Q",
+        b"\nendstream\nendobj\n",
+    ]
+    .concat();
+    let image1 = image_xobject(10);
+    let image2 = image_xobject(11);
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 7 0 R /Resources 5 0 R >>\nendobj\n",
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 8 0 R /Resources 6 0 R >>\nendobj\n",
+        b"5 0 obj\n<< /XObject 9 0 R >>\nendobj\n",
+        b"6 0 obj\n<< /XObject 9 0 R >>\nendobj\n",
+        content1.as_slice(),
+        content2.as_slice(),
+        b"9 0 obj\n<< /X1 10 0 R /X2 11 0 R >>\nendobj\n",
+        image1.as_slice(),
+        image2.as_slice(),
+    ])
+}
+
+fn one_page_pdf_with_inherited_other_resource_categories() -> Vec<u8> {
+    let content = b"BT /F1 12 Tf ET";
+    let stream = [
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+        content.to_vec(),
+        b"\nendstream\nendobj\n".to_vec(),
+    ]
+    .concat();
+    let image = image_xobject(6);
+    build_classic_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 5 0 R >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] /Contents 4 0 R >>\nendobj\n",
+        stream.as_slice(),
+        b"5 0 obj\n<< /Font << /F1 << /Type /Font >> /UnusedFont << /Type /Font >> >> /XObject << /UnusedXObject 6 0 R >> /ColorSpace << /UnusedColorSpace /DeviceRGB >> /Pattern << /UnusedPattern << >> >> /Shading << /UnusedShading << >> >> /ExtGState << /UnusedExtGState << >> >> /Properties << /UnusedProperties << >> >> >>\nendobj\n",
+        image.as_slice(),
+    ])
+}
+
+fn resource_category_keys_from_path(
+    path: &std::path::Path,
+    page_index: usize,
+    category: &str,
+) -> Vec<String> {
+    let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
+    let page_ref = pages::page_refs(&mut pdf).unwrap()[page_index];
+    let page = pdf.resolve(page_ref).unwrap();
+    let resources = match page {
+        Object::Dictionary(page) => match page.get("Resources").cloned() {
+            Some(Object::Reference(resources_ref)) => pdf.resolve(resources_ref).unwrap(),
+            Some(Object::Dictionary(resources)) => Object::Dictionary(resources),
+            other => panic!("page resources should be a dictionary or reference: {other:?}"),
+        },
+        other => panic!("page should be a dictionary: {other:?}"),
+    };
+    let Object::Dictionary(resources) = resources else {
+        panic!("resources should resolve to a dictionary");
+    };
+    let category = match resources.get(category).cloned() {
+        Some(Object::Reference(category_ref)) => pdf.resolve(category_ref).unwrap(),
+        Some(Object::Dictionary(category)) => Object::Dictionary(category),
+        None => return Vec::new(),
+        other => panic!("resource category should be a dictionary: {other:?}"),
+    };
+    let Object::Dictionary(category) = category else {
+        panic!("resource category should resolve to a dictionary");
+    };
+    category
+        .iter()
+        .map(|(name, _)| String::from_utf8(name.to_vec()).unwrap())
+        .collect()
+}
+
 fn one_page_pdf_with_indirect_contents_array(content: &[u8]) -> Vec<u8> {
     let stream = [
         format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).into_bytes(),
@@ -5474,6 +5583,172 @@ fn pages_extraction_resource_modes_match_qpdf_copy_boundary() {
                 "{label}: qpdf must leave an unshared page-local indirect /Resources reference intact; got {resources:?}"
             );
         }
+    }
+}
+
+#[test]
+fn pages_shared_xobject_category_matches_qpdf_per_page_pruning() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("shared-xobject-category.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(&input, two_page_pdf_with_shared_xobject_category()).unwrap();
+
+    let qpdf = std::process::Command::new("qpdf")
+        .arg(&input)
+        .args(["--pages", input.to_str().unwrap(), "1-2", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf --pages failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "1-2", "--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    for page_index in 0..2 {
+        let qpdf_keys = resource_category_keys_from_path(&qpdf_output, page_index, "XObject");
+        let flpdf_keys = resource_category_keys_from_path(&flpdf_output, page_index, "XObject");
+        assert_eq!(
+            qpdf_keys, flpdf_keys,
+            "page {page_index}: flpdf shared /XObject pruning must match qpdf"
+        );
+    }
+    assert_eq!(
+        resource_category_keys_from_path(&flpdf_output, 0, "XObject"),
+        vec!["X1"]
+    );
+    assert_eq!(
+        resource_category_keys_from_path(&flpdf_output, 1, "XObject"),
+        vec!["X2"]
+    );
+}
+
+#[test]
+fn pages_duplicate_selection_matches_qpdf_resource_copy_boundary() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("duplicate-shared-xobject-category.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(&input, two_page_pdf_with_shared_xobject_category()).unwrap();
+
+    let qpdf = std::process::Command::new("qpdf")
+        .arg(&input)
+        .args(["--pages", input.to_str().unwrap(), "1,1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf --pages duplicate selection failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "1,1", "--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    for page_index in 0..2 {
+        assert_eq!(
+            resource_category_keys_from_path(&qpdf_output, page_index, "XObject"),
+            resource_category_keys_from_path(&flpdf_output, page_index, "XObject"),
+            "page {page_index}: duplicate selection resource pruning must match qpdf"
+        );
+    }
+    assert_eq!(
+        resource_category_keys_from_path(&flpdf_output, 0, "XObject"),
+        vec!["X1"]
+    );
+    assert_eq!(
+        resource_category_keys_from_path(&flpdf_output, 1, "XObject"),
+        vec!["X1"]
+    );
+}
+
+#[test]
+fn pages_inherited_resource_non_target_categories_match_qpdf() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("inherited-resource-categories.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    std::fs::write(
+        &input,
+        one_page_pdf_with_inherited_other_resource_categories(),
+    )
+    .unwrap();
+
+    let qpdf = std::process::Command::new("qpdf")
+        .arg(&input)
+        .args(["--pages", input.to_str().unwrap(), "1", "--"])
+        .arg(&qpdf_output)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf --pages failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&input)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    for category in [
+        "Font",
+        "XObject",
+        "ColorSpace",
+        "Pattern",
+        "Shading",
+        "ExtGState",
+        "Properties",
+    ] {
+        assert_eq!(
+            resource_category_keys_from_path(&qpdf_output, 0, category),
+            resource_category_keys_from_path(&flpdf_output, 0, category),
+            "/{category} pruning must match qpdf"
+        );
+    }
+    assert_eq!(
+        resource_category_keys_from_path(&flpdf_output, 0, "Font"),
+        vec!["F1"]
+    );
+    assert!(resource_category_keys_from_path(&flpdf_output, 0, "XObject").is_empty());
+    for category in [
+        "ColorSpace",
+        "Pattern",
+        "Shading",
+        "ExtGState",
+        "Properties",
+    ] {
+        assert_eq!(
+            resource_category_keys_from_path(&flpdf_output, 0, category),
+            vec![format!("Unused{category}")]
+        );
     }
 }
 

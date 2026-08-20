@@ -47,7 +47,7 @@
 
 use crate::object::MAX_INLINE_DEPTH;
 use crate::page_object_helper::PageObjectHelper;
-use crate::resources::{remove_unreferenced_resources, RemoveUnreferencedResources};
+use crate::resources::RemoveUnreferencedResources;
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -59,14 +59,11 @@ use std::io::{Read, Seek};
 ///
 /// Two passes are performed when `mode` is not [`RemoveUnreferencedResources::No`]:
 ///
-/// 1. **Name-level prune** (`remove_unreferenced_resources`): removes entries
-///    from each page's `/Resources` sub-dictionaries (`/Font`, `/XObject`, …)
-///    that are not referenced by any content stream of the retained pages.
-///    After `rebuild_page_tree` pushes inherited attributes onto each leaf,
-///    qpdf-promoted non-scalar `/Resources` values may remain shared indirect
-///    handles. The resource pass follows those handles before pruning, so
-///    [`RemoveUnreferencedResources::Auto`] preserves qpdf's shared-identity
-///    boundary while removing names unused by retained pages.
+/// 1. **Name-level prune** (`PageObjectHelper::remove_unreferenced_resources`):
+///    applies qpdf's parse-gated, page-local `/Font` and `/XObject` pruning to
+///    each retained output page. The helper copies an inherited or indirect
+///    `/Resources` value only after content parsing succeeds, and copies each
+///    category before mutating it.
 ///
 /// 2. **xref-level GC** (`collect_reachable` + `delete_object`): walks every
 ///    `Object::Reference` reachable from `/Root` (transitively), then calls
@@ -76,13 +73,12 @@ use std::io::{Read, Seek};
 ///
 /// Calling this function on a PDF that has **not** been rebuilt (i.e. all
 /// pages are still reachable) is safe: no objects will be deleted by the GC
-/// pass, and the name-level prune is equivalent to calling
-/// `remove_unreferenced_resources` directly.
+/// pass, and the name-level prune still applies independently to each page.
 ///
 /// # Errors
 ///
-/// Propagates errors from [`remove_unreferenced_resources`]. The GC
-/// reachability pass deliberately *swallows* [`Pdf::resolve`] errors
+/// Propagates errors from the page-local resource helper. The GC reachability
+/// pass deliberately *swallows* [`Pdf::resolve`] errors
 /// (an unresolvable object is conservatively treated as reachable and
 /// kept), so a resolve failure there does not abort the prune.
 pub fn prune_after_subset<R: Read + Seek>(
@@ -95,23 +91,14 @@ pub fn prune_after_subset<R: Read + Seek>(
 
     // qpdf's --pages path calls QPDFPageObjectHelper::removeUnreferencedResources
     // on each copied page before it adds that page to the output
-    // (QPDFJob.cc:2520-2555). That helper obtains `/Resources` through
-    // getAttribute("/Resources", true), so an inherited or indirect resource
-    // dictionary is shallow-copied directly onto the page before any resource
-    // entries are removed (QPDFPageObjectHelper.cc:539-649). The aggregate
-    // resource pass below owns cross-group category protection, but it must see
-    // the same page-local resource boundary as qpdf's page-copy operation.
+    // (QPDFJob.cc:2520-2555). Keep that responsibility at the page helper
+    // boundary: it parse-gates before getAttribute("/Resources", true), then
+    // shallow-copies only the Font and XObject category dictionaries before
+    // mutating them (QPDFPageObjectHelper.cc:539-649).
     for page_ref in crate::pages::page_refs(pdf)? {
         let mut helper = PageObjectHelper::new(page_ref, pdf);
-        let _ = helper.get_resources(true)?;
+        helper.remove_unreferenced_resources()?;
     }
-
-    // ── Pass 1: name-level prune ──────────────────────────────────────────────
-    // Delegate entirely to the existing per-page name pruning logic.
-    // After rebuild_page_tree, each leaf carries an explicit /Resources key.
-    // qpdf-promoted non-scalar values may still be shared indirect handles;
-    // the resource walker follows those handles before applying the mode.
-    remove_unreferenced_resources(pdf, mode)?;
 
     // ── Pass 2: xref-level GC ─────────────────────────────────────────────────
     sweep_unreachable_objects(pdf)?;
@@ -488,6 +475,74 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
     }
 
+    /// Build a compact classic-xref PDF from contiguous object bodies.
+    fn build_pdf_from_bodies(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(bodies.len());
+        for (index, body) in bodies.iter().enumerate() {
+            let number = index + 1;
+            offsets.push(out.len() as u64);
+            out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+
+        let xref_start = out.len() as u64;
+        let total = bodies.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    fn stream_body(data: &[u8]) -> Vec<u8> {
+        let mut body = format!("<< /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\nendstream");
+        body
+    }
+
+    fn resource_category_keys<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        page_ref: ObjectRef,
+        category: &str,
+    ) -> Vec<String> {
+        let page = pdf.resolve(page_ref).expect("page should resolve");
+        let resources = match page {
+            Object::Dictionary(page) => match page.get("Resources").cloned() {
+                Some(Object::Reference(resources_ref)) => pdf
+                    .resolve(resources_ref)
+                    .expect("resources should resolve"),
+                Some(Object::Dictionary(resources)) => Object::Dictionary(resources),
+                other => panic!("page resources should be a dictionary or reference: {other:?}"), // cov:ignore: fixture-shape guard
+            },
+            other => panic!("page should be a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
+        };
+        let category = match resources {
+            Object::Dictionary(resources) => match resources.get(category).cloned() {
+                Some(Object::Reference(category_ref)) => pdf
+                    .resolve(category_ref)
+                    .expect("resource category should resolve"),
+                Some(Object::Dictionary(category)) => Object::Dictionary(category),
+                None => return Vec::new(),
+                other => panic!("resource category should be a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
+            },
+            other => panic!("resources should be a dictionary: {other:?}"), // cov:ignore: fixture-shape guard
+        };
+        let Object::Dictionary(category) = category else {
+            panic!("resolved resource category should be a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        category
+            .iter()
+            .map(|(name, _)| String::from_utf8(name.to_vec()).expect("resource name is UTF-8"))
+            .collect()
+    }
+
     // ── Helper ────────────────────────────────────────────────────────────────
 
     /// True if the given ObjectRef resolves to a non-null live object.
@@ -527,11 +582,14 @@ mod tests {
             "font F2 should be deleted"
         );
 
-        // Name-level: page1 /Font entry for F1 must survive.
-        // (obj 5 = font dict { /F1 6 0 R }; obj 6 = font F1)
-        assert!(
-            is_live(&mut pdf, ObjectRef::new(5, 0)),
-            "font dict for page1 should survive"
+        // Name-level: page1 /Font entry for F1 must survive. The canonical
+        // qpdf helper shallow-copies the indirect category dictionary before
+        // pruning, so the original obj 5 is intentionally no longer an
+        // identity invariant after xref-level GC.
+        assert_eq!(
+            resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "Font"),
+            vec!["F1"],
+            "page1 must retain its used F1 resource"
         );
         assert!(
             is_live(&mut pdf, ObjectRef::new(6, 0)),
@@ -702,6 +760,125 @@ mod tests {
             "pruned PDF must be valid: {:?}",
             report.diagnostics
         );
+    }
+
+    #[test]
+    fn malformed_page_does_not_materialize_indirect_resources_before_parse_gate() {
+        let bytes = build_pdf_from_bodies(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>".to_vec(),
+            stream_body(b"[ /F1"),
+            b"<< /Font << /F1 << /Type /Font >> /F2 << /Type /Font >> >> >>".to_vec(),
+        ]);
+        let mut pdf = open(bytes);
+        let page_ref = ObjectRef::new(3, 0);
+        let resources_ref = ObjectRef::new(5, 0);
+
+        rebuild_page_tree(&mut pdf, &[page_ref]).unwrap();
+        prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
+
+        let page = pdf.resolve(page_ref).unwrap();
+        let Object::Dictionary(page) = page else {
+            panic!("selected page should remain a dictionary"); // cov:ignore: fixture-shape guard
+        };
+        assert_eq!(
+            page.get("Resources"),
+            Some(&Object::Reference(resources_ref)),
+            "parse failure must leave the page's indirect /Resources ownership unchanged"
+        );
+        assert!(
+            is_live(&mut pdf, resources_ref),
+            "the untouched indirect /Resources object must remain reachable"
+        );
+    }
+
+    #[test]
+    fn resource_category_keys_resolves_indirect_holders() {
+        let bytes = build_pdf_from_bodies(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 4 0 R >>".to_vec(),
+            b"<< /Font 5 0 R >>".to_vec(),
+            b"<< /F1 << /Type /Font >> >>".to_vec(),
+        ]);
+        let mut pdf = open(bytes);
+
+        assert_eq!(
+            resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "Font"),
+            vec!["F1"]
+        );
+        assert!(resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "XObject").is_empty());
+    }
+
+    #[test]
+    fn shared_xobject_category_is_pruned_independently_per_page() {
+        let bytes = build_pdf_from_bodies(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R /Resources 5 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R /Resources 6 0 R >>".to_vec(),
+            b"<< /XObject 9 0 R >>".to_vec(),
+            b"<< /XObject 9 0 R >>".to_vec(),
+            stream_body(b"q /X1 Do Q"),
+            stream_body(b"q /X2 Do Q"),
+            b"<< /X1 10 0 R /X2 11 0 R >>".to_vec(),
+            b"<< /Type /XObject /Subtype /Image >>".to_vec(),
+            b"<< /Type /XObject /Subtype /Image >>".to_vec(),
+        ]);
+        let mut pdf = open(bytes);
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(4, 0)]).unwrap();
+        prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
+
+        assert_eq!(
+            resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "XObject"),
+            vec!["X1"],
+            "page 1 must prune the shared category against its own content"
+        );
+        assert_eq!(
+            resource_category_keys(&mut pdf, ObjectRef::new(4, 0), "XObject"),
+            vec!["X2"],
+            "page 2 must prune the shared category against its own content"
+        );
+    }
+
+    #[test]
+    fn subset_page_pruning_retains_non_font_and_non_xobject_categories() {
+        let bytes = build_pdf_from_bodies(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources 5 0 R >>".to_vec(),
+            stream_body(b"BT /F1 12 Tf ET"),
+            b"<< /Font << /F1 << /Type /Font >> /UnusedFont << /Type /Font >> >> /XObject << /UnusedXObject << >> >> /ColorSpace << /UnusedColorSpace /DeviceRGB >> /Pattern << /UnusedPattern << >> >> /Shading << /UnusedShading << >> >> /ExtGState << /UnusedExtGState << >> >> /Properties << /UnusedProperties << >> >> >>".to_vec(),
+        ]);
+        let mut pdf = open(bytes);
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
+        prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
+
+        assert_eq!(
+            resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "Font"),
+            vec!["F1"],
+            "Font remains a qpdf page-copy pruning category"
+        );
+        assert!(
+            resource_category_keys(&mut pdf, ObjectRef::new(3, 0), "XObject").is_empty(),
+            "XObject remains a qpdf page-copy pruning category"
+        );
+        for category in [
+            "ColorSpace",
+            "Pattern",
+            "Shading",
+            "ExtGState",
+            "Properties",
+        ] {
+            assert_eq!(
+                resource_category_keys(&mut pdf, ObjectRef::new(3, 0), category),
+                vec![format!("Unused{category}")],
+                "qpdf page-copy pruning must not remove /{category} entries"
+            );
+        }
     }
 
     /// Build a 2-page PDF where the trailer has an /Info reference.
