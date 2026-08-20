@@ -6228,6 +6228,9 @@ fn parse_add_attachment_segment(tokens: Vec<String>) -> CliResult<AddAttachmentA
         } else if let Some(v) = token.strip_prefix("--filename=") {
             filename = Some(v.as_bytes().to_vec());
         } else if let Some(v) = token.strip_prefix("--mimetype=") {
+            if !v.contains('/') {
+                return Err("mime type should be specified as type/subtype".into());
+            }
             mimetype = Some(v.as_bytes().to_vec());
         } else if let Some(v) = token.strip_prefix("--description=") {
             description = Some(v.as_bytes().to_vec());
@@ -6589,6 +6592,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "open missing.json: No such file or directory"
+        );
+    }
+
+    #[test]
+    fn parse_add_attachment_rejects_mimetype_without_type_subtype_separator() {
+        let Err(error) =
+            parse_add_attachment_segment(strs(&["payload.txt", "--mimetype=textplain"]))
+        else {
+            panic!("the CLI parser must reject a mimetype without a slash");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "mime type should be specified as type/subtype"
         );
     }
 

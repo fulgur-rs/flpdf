@@ -9,22 +9,22 @@ boundary while keeping the library attachment consumer raw and composable.
 
 - [x] Read qpdf 11.9.0 source and run the invalid-mimetype live probe.
 - [x] Create the design and implementation plan documents.
-- [ ] Commit the design baseline after `cargo check -p flpdf`.
+- [x] Commit the design baseline after `cargo check -p flpdf`.
 
 ### Task 2: Write RED tests
 
-- [ ] Add a direct library test proving `textplain` reaches the embedded-file
+- [x] Add a direct library test proving `textplain` reaches the embedded-file
   subtype setter instead of being rejected by `add_attachments`.
-- [ ] Add a CLI parser test proving `--mimetype=textplain` is rejected with
+- [x] Add a CLI parser test proving `--mimetype=textplain` is rejected with
   qpdf's exact primary diagnostic.
-- [ ] Run the focused tests and record the expected failure before the fix.
+- [x] Run the focused tests and record the expected failure before the fix.
 
 ### Task 3: Implement the boundary correction
 
-- [ ] Validate mimetype slash presence in `parse_add_attachment_segment`.
-- [ ] Remove mimetype validation from `QPDFJob::add_attachments`.
-- [ ] Update the direct-library regression test and retain CLI error coverage.
-- [ ] Run focused GREEN tests and the invalid-mimetype live probe.
+- [x] Validate mimetype slash presence in `parse_add_attachment_segment`.
+- [x] Remove mimetype validation from `QPDFJob::add_attachments`.
+- [x] Update the direct-library regression test and retain CLI error coverage.
+- [x] Run focused GREEN tests and the invalid-mimetype live probe.
 
 ### Task 4: Verify, rebase, and hand off
 
