@@ -15,7 +15,7 @@ use std::io::{Read, Seek};
 /// Result of [`check_reader`].
 ///
 /// `valid` is `true` when no [`Diagnostic`] of severity `Error` was produced. Warnings
-/// alone (e.g. linearization advisories) do not flip the flag.
+/// alone (for example parser or recovery warnings) do not flip the flag.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CheckReport {
@@ -246,12 +246,6 @@ pub fn check_pdf_with_limits<R: Read + Seek + 'static>(
             false
         }
     };
-    if linearized {
-        diagnostics.push(Diagnostic::warning(
-            "linearized PDF detected: rewrite support preserves hint object but does not recompute linearization tables",
-            None,
-        ));
-    }
 
     // Decode every page's content stream(s); a genuine decode failure is a
     // stream-encoding error. qpdf --check does the same and exits 2 on a broken

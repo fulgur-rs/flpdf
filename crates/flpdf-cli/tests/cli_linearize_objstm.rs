@@ -193,15 +193,20 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
     );
 
     // Structural sanity via flpdf's own checker (back_patch + xref
-    // consistency).  The qpdf-compatible shallow detector now recognizes the
-    // generated first-object dictionary, so the existing linearization advisory
-    // warning makes `check` exit 3; warning/exit policy remains owned by the
-    // downstream check-status slice.
+    // consistency).  The qpdf-compatible shallow detector recognizes the
+    // generated first-object dictionary. A valid linearized document is clean
+    // for `check`, matching qpdf 11.9.0's informational linearization line and
+    // exit-0 policy.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["check", out.to_str().unwrap()])
         .assert()
-        .code(3);
+        .code(0)
+        .stdout(predicates::str::contains("File is linearized\n"))
+        .stdout(predicates::str::contains(
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+        ))
+        .stderr(predicates::str::is_empty());
 }
 
 // ---------------------------------------------------------------------------

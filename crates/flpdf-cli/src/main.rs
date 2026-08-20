@@ -2684,9 +2684,9 @@ fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) -> CliResult<(
     } else {
         "File is not encrypted\n"
     });
-    // The linearization status reflects the structural detector (object (1,0)
-    // only). qpdf-accurate detection — plus the entangled warning / exit-code /
-    // trailing-line behaviour — is tracked in flpdf-u1ro.
+    // The status comes from the qpdf `isLinearized`-equivalent detector: the
+    // first 1024-byte candidate scan plus `/Linearized` and `/L` validation.
+    // Deeper hint-table validation remains on the `check-linearization` route.
     output.push_str(if summary.linearized {
         "File is linearized\n"
     } else {

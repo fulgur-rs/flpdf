@@ -283,45 +283,6 @@ fn extension_level_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
-/// Valid PDF whose first object (object 1) carries `/Linearized 1` and an
-/// accurate `/L`. The detector reports it as linearized, which pushes the
-/// existing "linearized PDF detected" advisory warning → exit 3. The warning
-/// and exit-code policy is tracked separately in flpdf-u1ro.
-fn linearized_obj1_pdf_bytes() -> Vec<u8> {
-    let mut pdf = Vec::new();
-    pdf.extend_from_slice(b"%PDF-1.4\n");
-    let off1 = pdf.len();
-    pdf.extend_from_slice(
-        b"1 0 obj\n<< /Linearized 1 /L 0000000000 /H [ 0 0 ] /O 4 /E 0 /N 1 /T 0 >>\nendobj\n",
-    );
-    let off2 = pdf.len();
-    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
-    let off3 = pdf.len();
-    pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
-    let off4 = pdf.len();
-    pdf.extend_from_slice(
-        b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-    );
-    let xref_start = pdf.len();
-    pdf.extend_from_slice(
-        format!(
-            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
-        )
-        .as_bytes(),
-    );
-    pdf.extend_from_slice(
-        format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
-    );
-    let l_start = pdf
-        .windows(b"/L ".len())
-        .position(|window| window == b"/L ")
-        .expect("linearization fixture has /L")
-        + b"/L ".len();
-    let file_size = format!("{:010}", pdf.len());
-    pdf[l_start..l_start + file_size.len()].copy_from_slice(file_size.as_bytes());
-    pdf
-}
-
 // ---------------------------------------------------------------------------
 // Tests: exit 0 — clean PDF
 // ---------------------------------------------------------------------------
@@ -417,23 +378,28 @@ fn check_appends_adobe_extension_level_to_version() {
         ));
 }
 
-/// A file whose first object is a `/Linearized` dictionary prints
-/// `File is linearized`. flpdf's structural detector also pushes the
-/// linearization advisory warning, so the run exits 3 (and therefore omits the
-/// trailing reassurance note). Full qpdf-accurate behaviour is tracked in
-/// flpdf-u1ro.
+/// qpdf's repository fixture is a valid linearized document. `--check` reports
+/// it as linearized without treating detection itself as a warning, so the run
+/// exits 0 and includes the trailing reassurance note.
 #[test]
 fn check_linearized_pdf_reports_linearized_line() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(&linearized_obj1_pdf_bytes()).unwrap();
+    f.write_all(include_bytes!(
+        "../../../tests/fixtures/compat/linearized-one-page.pdf"
+    ))
+    .unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.env_remove("FLPDF_PROGNAME")
         .args(["--check", f.path().to_str().unwrap()])
         .assert()
-        .code(3)
+        .code(0)
         .stdout(predicate::str::contains("File is linearized\n"))
-        .stdout(predicate::str::contains("File is not linearized").not());
+        .stdout(predicate::str::contains("File is not linearized").not())
+        .stdout(predicate::str::contains(
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+        ))
+        .stderr(predicate::str::is_empty());
 }
 
 // ---------------------------------------------------------------------------
