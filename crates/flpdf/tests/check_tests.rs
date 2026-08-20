@@ -14,6 +14,17 @@ fn check_reports_valid_minimal_pdf() {
 }
 
 #[test]
+fn check_rejects_a_missing_root_at_the_input_boundary() {
+    let input =
+        b"%PDF-1.4\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n9\n%%EOF\n";
+
+    assert!(matches!(
+        check_reader(Cursor::new(input.to_vec())),
+        Err(Error::System(message)) if message == "unable to find /Root dictionary"
+    ));
+}
+
+#[test]
 fn check_reports_missing_header() {
     let input = std::io::Cursor::new(b"not a pdf".to_vec());
     let report = check_reader(input).unwrap();

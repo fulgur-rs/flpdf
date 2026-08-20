@@ -91,9 +91,10 @@ pub fn check_reader<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckR
 ///
 /// - When `options.repair` is set, behaves like [`check_reader`]: encrypted,
 ///   system, and internal terminal sources are propagated from the open path,
-///   possibly inside [`Error::OpenFailure`] when repair diagnostics were
-///   collected; other input-facing open failures become an error [`Diagnostic`]
-///   inside an `Ok(CheckReport)`.
+///   as is a missing, dangling, or non-dictionary `/Root`, possibly inside
+///   [`Error::OpenFailure`] when repair diagnostics were collected; other
+///   input-facing open failures become an error [`Diagnostic`] inside an
+///   `Ok(CheckReport)`.
 /// - When `options.repair` is clear, any error from [`Pdf::open_with_options`] is
 ///   propagated unchanged (e.g. [`Error::Io`], [`Error::Parse`], [`Error::Encrypted`]).
 /// - A failed linearization probe via [`Pdf::is_linearized`] is recorded as a
@@ -206,6 +207,14 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     } else {
         Pdf::open_with_options(reader, options)?
     };
+
+    // qpdf's input job resolves the document version immediately after
+    // processFile; getVersionAsPDFVersion enters getExtensionLevel and hence
+    // QPDF::getRoot before any check report is emitted
+    // (libqpdf/QPDFJob.cc:429-480,1696-1716; QPDF.cc:2306-2368).
+    // Keep the already-open JSON consumer below rootless: only this byte-input
+    // boundary corresponds to qpdf's ordinary createQPDF path.
+    pdf.root_handle()?;
 
     Ok(check_pdf_with_limits(&mut pdf, limits))
 }

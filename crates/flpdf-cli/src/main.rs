@@ -2629,6 +2629,9 @@ fn build_copy_encryption_source(
     configure_document_logger(&mut opts, path);
     let mut donor = Pdf::open_with_options(reader, opts)
         .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
+    donor
+        .root_handle()
+        .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
 
     // Validate the donor is encrypted.
     let info = donor
@@ -3966,7 +3969,10 @@ fn build_overlay_specs(
             ..Default::default()
         };
         configure_document_logger(&mut options, &path);
-        let source = Pdf::open_with_options(BufReader::new(file), options)
+        let mut source = Pdf::open_with_options(BufReader::new(file), options)
+            .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
+        source
+            .root_handle()
             .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
 
         let kind = match spec.kind {
@@ -5475,9 +5481,12 @@ fn probe_encryption(
     options.allow_weak_crypto = true;
     configure_document_logger(&mut options, input);
     match Pdf::open_with_options(BufReader::new(file), options) {
-        Ok(pdf) => Ok(EncryptionProbe::Opened {
-            encrypted: pdf.is_encrypted(),
-        }),
+        Ok(mut pdf) => {
+            pdf.root_handle()?;
+            Ok(EncryptionProbe::Opened {
+                encrypted: pdf.is_encrypted(),
+            })
+        }
         // A wrong/empty password: the document is definitely encrypted, we
         // just have not authenticated it. qpdf treats this as "encrypted,
         // password required".
@@ -5874,8 +5883,11 @@ fn open_pdf_file_impl(
     if suppress_warnings {
         options.suppress_warnings = true;
     }
-    configure_document_logger(&mut options, input);
-    let pdf = Pdf::open_with_options(BufReader::new(file), options)
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let pdf = job
+        .open(BufReader::new(file), input.display().to_string(), options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     // Skip the weak-crypto warning on the forced (inspection) path: the user
     // supplied no `--allow-weak-crypto` flag to acknowledge, and qpdf emits no
@@ -6488,6 +6500,8 @@ fn run_copy_attachments_from(
     let src_file =
         File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
     let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)
+        .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
+    src.root_handle()
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
 
     let count = job.copy_attachments(
