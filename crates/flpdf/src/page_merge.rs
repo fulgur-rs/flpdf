@@ -43,6 +43,7 @@ use crate::page_extract::{
 };
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::page_refs;
+use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
 use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::subset_prune::sweep_unreachable_objects;
@@ -557,8 +558,18 @@ pub(crate) fn source_top_level_field_names<R: Read + Seek>(
     Ok(out)
 }
 
-/// Resolve a field's `/T` partial name. `/T` may be an indirect reference
-/// (review rule 2); a resolved non-string or absent `/T` yields `None`.
+/// Resolve a field's `/T` partial name, decoded to qpdf's UTF-8 view. `/T`
+/// may be an indirect reference (review rule 2); a resolved non-string or
+/// absent `/T` yields `None`.
+///
+/// qpdf's collision index compares `getFullyQualifiedName()`, itself built
+/// from `getUTF8Value()`-decoded `/T` segments
+/// (`QPDFFormFieldObjectHelper::getFullyQualifiedName`,
+/// `QPDFAcroFormDocumentHelper.cc:82-103`) — never the raw stored bytes. A
+/// `/T` stored as UTF-16BE (or PDFDocEncoded with non-ASCII bytes) must
+/// therefore be decoded before it is stored or compared here, or an ASCII
+/// collision candidate could byte-mismatch a semantically identical reserved
+/// name and collide with it in the output.
 fn resolve_field_partial_name<R: Read + Seek>(
     source: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -576,7 +587,7 @@ fn resolve_field_partial_name<R: Read + Seek>(
     // chain (not a one-hop resolve) so a multi-hop name string is read and
     // used for collision renaming rather than yielding `None`.
     let resolved = source.resolve_object_handle_to_terminal(&t_value)?;
-    Ok(resolved.as_string())
+    Ok(resolved.as_string().map(|raw| utf8_value(&raw)))
 }
 
 /// Remove `/AcroForm` from the target's catalog, if present.
@@ -664,7 +675,14 @@ fn build_merged_acroform<R: Read + Seek>(
             if let Some(name) = &field.partial_name {
                 let unique = unique_field_name(name, &used);
                 used.insert(unique.clone());
-                rename_field(target, field.target_ref, unique)?;
+                // qpdf only rewrites `/T` when an actual collision produced a
+                // suffix (`if (!append.empty())`,
+                // `QPDFAcroFormDocumentHelper.cc:97-102`); a field whose name
+                // was already unique keeps its original `/T` bytes/encoding
+                // untouched.
+                if unique != *name {
+                    rename_field(target, field.target_ref, unique)?;
+                }
             }
         }
         fields.push(target.get_object_handle(field.target_ref));
@@ -675,7 +693,10 @@ fn build_merged_acroform<R: Read + Seek>(
     Ok(())
 }
 
-/// Overwrite the copied field's `/T` with `name` as a direct string.
+/// Overwrite the copied field's `/T` with `name` (qpdf's UTF-8-decoded,
+/// collision-suffixed name), re-encoded through
+/// [`new_unicode_string`] to match qpdf's own rename write
+/// (`QPDFObjectHandle::newUnicodeString`, `QPDFAcroFormDocumentHelper.cc:99-102`).
 fn rename_field<R: Read + Seek>(
     target: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -686,7 +707,7 @@ fn rename_field<R: Read + Seek>(
     if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
-    field.replace_key(b"/T", ObjectHandle::string(name))?;
+    field.replace_key(b"/T", ObjectHandle::string(new_unicode_string(&name)))?;
     target.mark_object_handle_dirty(&field)?;
     Ok(())
 }
@@ -1675,6 +1696,107 @@ mod tests {
         assert!(
             !closure.contains(&ObjectRef::new(10, 0)),
             "the boundary page's /Contents must not enter the copy map"
+        );
+    }
+
+    /// [`merge_documents`] is a public library primitive
+    /// (`pub use page_merge::merge_documents` in `lib.rs`), independently
+    /// callable without the CLI `--pages` job's later
+    /// `rebuild_acroform_in_final_page_order` correction pass
+    /// (`job/page_specs.rs`), which redoes the per-occurrence field copy
+    /// through a route that already decodes reserved names. This test
+    /// exercises [`build_merged_acroform`]'s own collision avoidance
+    /// directly, matching qpdf's `addAndRenameFormFields`
+    /// (`QPDFAcroFormDocumentHelper.cc:62-103`): the primary's unselected
+    /// field reserves `F+1` even though it is stored as a UTF-16BE text
+    /// string (`<FEFF0046002B0031>`, BOM-prefixed), so the secondary's `F`
+    /// must resolve to `F+2`, not byte-collide past the undecoded
+    /// reservation and reuse `F+1`.
+    #[test]
+    fn merge_documents_reserves_unselected_primary_names_regardless_of_string_encoding() {
+        let primary_bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+                (2, "<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+                ),
+                (
+                    4,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [7 0 R] >>",
+                ),
+                (
+                    5,
+                    "<< /Type /Annot /Subtype /Widget /FT /Tx /T (F) /Rect [0 0 10 10] /P 3 0 R >>",
+                ),
+                (6, "<< /Fields [5 0 R 7 0 R] >>"),
+                (
+                    7,
+                    "<< /Type /Annot /Subtype /Widget /FT /Tx /T <FEFF0046002B0031> \
+                     /Rect [0 0 10 10] /P 4 0 R >>",
+                ),
+            ],
+            1,
+        );
+        let secondary_bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 5 0 R >>"),
+                (2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+                (
+                    3,
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>",
+                ),
+                (
+                    4,
+                    "<< /Type /Annot /Subtype /Widget /FT /Tx /T (F) /Rect [0 0 10 10] /P 3 0 R >>",
+                ),
+                (5, "<< /Fields [4 0 R] >>"),
+            ],
+            1,
+        );
+
+        let mut primary = Pdf::open_mem_owned(primary_bytes).unwrap();
+        let mut secondary = Pdf::open_mem_owned(secondary_bytes).unwrap();
+        let mut inputs = [
+            MergeInput {
+                source: &mut primary,
+                pages: vec![0],
+            },
+            MergeInput {
+                source: &mut secondary,
+                pages: vec![0],
+            },
+        ];
+        let mut merged = merge_documents(&mut inputs).unwrap();
+
+        let catalog_ref = merged.root_ref().unwrap();
+        let catalog = merged.resolve(catalog_ref).unwrap().into_dict().unwrap();
+        let acroform_ref = catalog.get_ref("AcroForm").expect("/AcroForm");
+        let acroform = merged.resolve(acroform_ref).unwrap().into_dict().unwrap();
+        let fields = acroform
+            .get("Fields")
+            .and_then(Object::as_array)
+            .expect("/Fields array");
+        let names: Vec<Vec<u8>> = fields
+            .iter()
+            .map(|field| {
+                let field_ref = field.as_ref_id().expect("field is an indirect ref");
+                let field_dict = merged.resolve(field_ref).unwrap().into_dict().unwrap();
+                field_dict
+                    .get("T")
+                    .and_then(Object::as_string)
+                    .expect("/T string")
+                    .to_vec()
+            })
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![b"F".to_vec(), b"F+2".to_vec()],
+            "the secondary's colliding field must resolve to F+2, matching qpdf's \
+             getUTF8Value()-decoded collision index, not F+1 from an undecoded byte \
+             comparison against the UTF-16BE-encoded reservation"
         );
     }
 }

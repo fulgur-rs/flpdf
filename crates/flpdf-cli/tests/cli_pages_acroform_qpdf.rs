@@ -549,6 +549,33 @@ fn acroform_primary_with_unselected_collision_name_pdf() -> Vec<u8> {
     ])
 }
 
+/// Same shape as [`acroform_primary_with_unselected_collision_name_pdf`],
+/// except the unselected field's reserved name is stored as a UTF-16BE
+/// text string (`<FEFF0046002B0031>`, the BOM-prefixed encoding of `F+1`)
+/// rather than a PDFDocEncoded literal. qpdf's collision index compares
+/// `getUTF8Value()`-decoded names (`QPDFAcroFormDocumentHelper.cc:82-103`),
+/// so this reservation must be honored identically regardless of the
+/// stored string's encoding.
+fn acroform_primary_with_unselected_utf16_collision_name_pdf() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [5 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Annots [7 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (F) \
+          /Rect [0 0 10 10] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"6 0 obj\n<< /Fields [5 0 R 7 0 R] >>\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T <FEFF0046002B0031> \
+          /Rect [0 0 10 10] /P 4 0 R >>\nendobj\n"
+            .to_vec(),
+    ])
+}
+
 /// Single-page secondary whose field collides with the primary's selected
 /// field and must therefore skip both primary names, `F` and `F+1`.
 fn acroform_secondary_collision_pdf() -> Vec<u8> {
@@ -753,5 +780,72 @@ fn unselected_primary_field_names_reserve_later_collision_suffixes() {
     assert_eq!(
         flpdf_fields, qpdf_fields,
         "flpdf must reserve every primary original field name before renaming foreign fields"
+    );
+}
+
+/// Same scenario as
+/// [`unselected_primary_field_names_reserve_later_collision_suffixes`], but
+/// the unselected primary field's reserved name (`F+1`) is stored as a
+/// UTF-16BE text string rather than a PDFDocEncoded literal. Comparing raw
+/// stored bytes (instead of qpdf's `getUTF8Value()`-decoded comparison)
+/// would fail to recognize the ASCII candidate `F+1` as already reserved
+/// and collide with it, choosing `F+1` instead of qpdf's `F+2`.
+#[test]
+fn unselected_primary_field_names_reserve_suffixes_regardless_of_string_encoding() {
+    if !qpdf_available() {
+        eprintln!("[SKIP cli_pages_acroform_qpdf] qpdf 11.9.0 is unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let primary = temp.path().join("primary.pdf");
+    let secondary = temp.path().join("secondary.pdf");
+    std::fs::write(
+        &primary,
+        acroform_primary_with_unselected_utf16_collision_name_pdf(),
+    )
+    .expect("write primary");
+    std::fs::write(&secondary, acroform_secondary_collision_pdf()).expect("write secondary");
+
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    Shell::new(QPDF)
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&qpdf_output)
+        .assert()
+        .success();
+
+    let flpdf_output = temp.path().join("flpdf.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg(&primary)
+        .args(["--pages"])
+        .arg(&primary)
+        .arg("1")
+        .arg(&secondary)
+        .arg("1")
+        .args(["--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_fields = observable_fields(&qpdf_acroform_json(&qpdf_output));
+    let flpdf_fields = observable_fields(&acroform_json(&flpdf_output));
+    assert_eq!(
+        qpdf_fields,
+        vec![
+            serde_json::json!({"partialname": "F", "pageposfrom1": 1}),
+            serde_json::json!({"partialname": "F+2", "pageposfrom1": 2}),
+        ],
+        "qpdf reserves the unselected primary field name regardless of its string encoding"
+    );
+    assert_eq!(
+        flpdf_fields, qpdf_fields,
+        "flpdf must decode /T before comparing collision candidates against reserved names"
     );
 }
