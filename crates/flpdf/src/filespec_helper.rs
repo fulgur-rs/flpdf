@@ -1949,11 +1949,10 @@ mod tests {
         let result =
             add_attachment_from_path(&mut pdf, b"missing.txt", "/this/does/not/exist/missing.txt");
         assert!(result.is_err(), "must error when file does not exist");
-        // Should be an Io error
         let err = result.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Io(_)),
-            "expected Io error, got: {err:?}"
+        assert_eq!(
+            err.to_string(),
+            "open /this/does/not/exist/missing.txt: No such file or directory"
         );
     }
 
