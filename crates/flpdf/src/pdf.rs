@@ -219,6 +219,16 @@ impl<R: Read + Seek> Pdf<R> {
         &self.version
     }
 
+    /// Return the logical bytes of the input source, excluding any leading
+    /// material skipped by the PDF header parser.
+    ///
+    /// This is a crate-visible source seam for qpdf consumers that inspect
+    /// physical offsets against the same document input, notably
+    /// `QPDF::checkLinearization` (`libqpdf/QPDF_linearization.cc:84-245`).
+    pub(crate) fn source_bytes(&self) -> crate::Result<Vec<u8>> {
+        self.resolver.source_bytes()
+    }
+
     /// Configure this document as a qpdf source whose lazy stream data must
     /// be materialized when it is copied into another document. This is
     /// qpdf's `QPDF::setImmediateCopyFrom` (`include/qpdf/QPDF.hh:242-257`):

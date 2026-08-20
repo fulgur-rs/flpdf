@@ -619,7 +619,7 @@ fn check_error_diagnostics_use_qpdf_stderr_format() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(format!(
-            "flpdf: {path}: trailer is missing /Root\n"
+            "flpdf: {path}: unable to find /Root dictionary\n"
         )))
         .stderr(predicate::str::contains("PDF check failed").not())
         .stderr(predicate::str::contains("error: ").not())

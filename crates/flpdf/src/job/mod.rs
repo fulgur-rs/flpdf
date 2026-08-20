@@ -6,6 +6,7 @@
 //! `doJSON*` section builders, and the attachment inspection consumers.
 
 mod attachments;
+mod check;
 mod json;
 mod json_sections;
 mod lifecycle;
@@ -13,6 +14,7 @@ mod page_specs;
 mod page_split;
 
 pub use attachments::{AttachmentAddOptions, AttachmentCopyOptions};
+pub use check::CheckError;
 pub use json::{
     write_json, write_qpdf_json_v2_selected_objects_to_output_with_options,
     write_qpdf_json_v2_selected_objects_with_options, JsonJobError, JsonJobOptions, JsonJobOutput,

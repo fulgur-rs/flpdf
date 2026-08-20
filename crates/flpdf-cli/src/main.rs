@@ -3,8 +3,9 @@
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
 use flpdf::job::{
-    AttachmentAddOptions, AttachmentCopyOptions, JobExitCode, JsonJobError, JsonJobOptions,
-    JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
+    AttachmentAddOptions, AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError,
+    JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions,
+    UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -23,8 +24,7 @@ use flpdf::{
     InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    check_pdf_with_limits, check_reader_with_options_and_limits, filters,
-    flatten_rotation_on_pages,
+    filters, flatten_rotation_on_pages,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path, LinearizationCheckError,
@@ -36,7 +36,7 @@ use flpdf::{
     EncryptMethod, EncryptParams, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg,
     ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf,
     PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
-    RemoveUnreferencedResources, Severity, StreamDataMode, WriterConfiguration,
+    RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
 };
 use flpdf::{fix_qdf, remove_attachment};
 use std::collections::{BTreeMap, HashSet};
@@ -1717,12 +1717,7 @@ fn main() {
     } else if args.show_linearization {
         run_show_linearization(args.input)
     } else if args.check {
-        run_check(
-            args.input,
-            args.repair,
-            &args.password,
-            filters::DecodeLimits::default(),
-        )
+        run_check(args.input, args.repair, &args.password)
     } else if args.list_attachments {
         run_list_attachments(args.input, args.repair, &args.password, args.verbose)
     } else if let Some(key) = args.show_attachment {
@@ -2160,7 +2155,7 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
     if cli.json_input {
         let mut pdf = job.create_from_json(file, input.display().to_string())?;
         apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-        return run_job_inspection_on_pdf(cli, input, &mut job, &mut pdf);
+        return run_job_inspection_on_pdf(cli, &mut job, &mut pdf);
     }
 
     let mut options = pdf_open_options(cli.repair, &cli.password)?;
@@ -2171,9 +2166,13 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
         options.allow_weak_crypto = true;
         options.suppress_warnings = true;
     }
-    let mut pdf = job
-        .open(BufReader::new(file), input.display().to_string(), options)
-        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    let mut pdf = match job.open(BufReader::new(file), input.display().to_string(), options) {
+        Ok(pdf) => pdf,
+        Err(error) => {
+            job.report_open_failure(&error)?;
+            return Err(error_with_file(input, actionable_password_error(error)));
+        }
+    };
     if pdf.uses_weak_crypto() && !cli.check {
         logger_warn(format!(
             "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
@@ -2181,18 +2180,16 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
         ))?;
     }
     apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
-    run_job_inspection_on_pdf(cli, input, &mut job, &mut pdf)
+    run_job_inspection_on_pdf(cli, &mut job, &mut pdf)
 }
 
 fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     cli: &Cli,
-    input: &Path,
     job: &mut QPDFJob,
     pdf: &mut Pdf<R>,
 ) -> CliResult<()> {
-    let decode_limits = filters::DecodeLimits::default();
     if cli.check {
-        return run_check_pdf(input, pdf, decode_limits);
+        return finish_check_job(job.check(pdf));
     }
     if cli.show_npages {
         let logger = job.logger();
@@ -2273,12 +2270,7 @@ fn run_json_document<R: Read + Seek>(
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
     match command {
-        Commands::Check(cmd) => run_check(
-            Some(cmd.input),
-            cmd.repair,
-            &cmd.password,
-            filters::DecodeLimits::default(),
-        ),
+        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password),
         Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
             Ok(()) => logger_info("linearization OK\n"),
             Err(LinearizationCheckError::NotLinearized) => {
@@ -2544,14 +2536,12 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
     }
 }
 
-fn run_check(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    decode_limits: filters::DecodeLimits,
-) -> CliResult<()> {
+fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
     let mut options = pdf_open_options(repair, password)?;
     // qpdf treats `--check` as a read-only inspection, like `--show-encryption`,
     // `--requires-password`, and `--is-encrypted`: an RC4 / R=5 (weak-crypto)
@@ -2560,139 +2550,17 @@ fn run_check(
     // qpdf 11.9.0). Force the gate open here. Authentication still runs first,
     // so a wrong password fails exactly as before.
     options.allow_weak_crypto = true;
-    configure_document_logger(&mut options, &input);
-    // `check_reader` aggregates parser and checker warnings into one ordered
-    // report. Suppress immediate document delivery here, then route every
-    // report warning through the same CLI logger exactly once below.
+    // The job emits the collected diagnostics once, after the qpdf check
+    // banner, and owns the shared warning completion boundary.
     options.suppress_warnings = true;
-    let report = check_reader_with_options_and_limits(BufReader::new(file), options, decode_limits)
-        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-    finish_check_report(&input, report)
-}
-
-fn run_check_pdf<R: Read + Seek + 'static>(
-    input: &Path,
-    pdf: &mut Pdf<R>,
-    decode_limits: filters::DecodeLimits,
-) -> CliResult<()> {
-    finish_check_report(input, check_pdf_with_limits(pdf, decode_limits))
-}
-
-fn finish_check_report(input: &Path, report: flpdf::CheckReport) -> CliResult<()> {
-    // The library always emits a weak-crypto advisory when a weak file opens
-    // (flpdf check.rs: "encrypted PDF uses weak crypto; processing continued").
-    // Because `--check` forces the gate open as an inspection rather than the
-    // user opting in, suppress that advisory so the run matches qpdf's clean
-    // exit 0; qpdf emits no such warning for `--check`.
-    let is_weak_crypto_advisory = |d: &flpdf::Diagnostic| {
-        d.severity == Severity::Warning && d.message.contains("weak crypto")
+    let mut pdf = match job.open(BufReader::new(file), input.display().to_string(), options) {
+        Ok(pdf) => pdf,
+        Err(error) => {
+            job.report_open_failure(&error)?;
+            return Err(error_with_file(&input, actionable_password_error(error)));
+        }
     };
-    for diagnostic in report.diagnostics.entries() {
-        if is_weak_crypto_advisory(diagnostic) {
-            continue;
-        }
-        let location = check_diagnostic_location(input, diagnostic);
-        match diagnostic.severity {
-            Severity::Warning => {
-                let separator = if diagnostic.message.starts_with("(object ")
-                    || diagnostic.message.starts_with("(trailer,")
-                {
-                    " "
-                } else {
-                    ": "
-                };
-                let warning = format!("WARNING: {location}{separator}{}\n", diagnostic.message);
-                cli_logger().warn(warning)?
-            }
-            Severity::Error => logger_error(format!(
-                "{}: {location}: {}\n",
-                progname(),
-                diagnostic.message
-            ))?, // cov:ignore: exercised by check error subprocess integration tests
-        }
-    }
-
-    // Map the check result to qpdf-compatible exit codes:
-    //   0 — no errors, no warnings (clean)
-    //   2 — errors found (invalid / unprocessable)
-    //   3 — warnings only, no errors (recoverable issues)
-    //
-    // Source: https://qpdf.readthedocs.io/en/stable/cli.html#exit-status
-    //         qpdf/include/qpdf/Constants.h: qpdf_exit_error=2, qpdf_exit_warning=3
-    let has_warnings = report
-        .diagnostics
-        .entries()
-        .iter()
-        .any(|d| d.severity == Severity::Warning && !is_weak_crypto_advisory(d));
-
-    if !report.valid {
-        // Errors found — exit 2.  The error diagnostics above are already in
-        // qpdf shape; qpdf prints no extra summary line in this case.
-        return Err(Box::new(CliExitError {
-            code: ExitCode::Errors,
-            message: String::new(),
-        }));
-    }
-
-    // Valid document (exit 0 or 3): emit qpdf's stdout "checking" block. The
-    // summary is present whenever the document opened, which is implied by
-    // `report.valid`; the `if let` is a defensive match.
-    if let Some(summary) = &report.summary {
-        print_check_block(input, summary)?;
-    }
-
-    if has_warnings {
-        // Warnings without errors — exit 3. qpdf still prints the block above,
-        // but omits the trailing "No syntax ..." note. `--check` is inspection
-        // (`creates_output = false`), and qpdf's `writeQPDF` routes both the
-        // output and inspection arms through the same shared warning-summary
-        // block (`QPDFJob.cc:486-504`) rather than a `--check`-only path;
-        // `finish_warning_state` is that same shared boundary.
-        return finish_warning_state(true, false); // cov:ignore: exercised by check warning subprocess integration tests
-    }
-
-    // Clean — exit 0. qpdf closes a clean check with this two-line note; the
-    // subject mirrors progname() so it is byte-identical under FLPDF_PROGNAME=qpdf.
-    logger_info(format!(
-        "No syntax or stream encoding errors found; the file may still contain\nerrors that {} cannot detect\n",
-        progname()
-    ))?; // cov:ignore: exercised by clean check subprocess integration tests
-    Ok(())
-}
-
-/// Print qpdf's `--check` document summary block to stdout.
-///
-/// Mirrors qpdf 11.9.0's stdout for a successfully-opened document: the
-/// `checking <file>` banner, header version, encryption status and
-/// linearization status. `<file>` is echoed verbatim as supplied on the command
-/// line (qpdf prints the argument, not a canonicalised path).
-fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) -> CliResult<()> {
-    let mut output = format!("checking {}\n", input.display());
-    // qpdf appends "extension level N" to the version when the catalog declares
-    // an Adobe extension level (`/Extensions /ADBE /ExtensionLevel`).
-    match summary.extension_level {
-        Some(level) => output.push_str(&format!(
-            "PDF Version: {} extension level {level}\n",
-            summary.version
-        )),
-        None => output.push_str(&format!("PDF Version: {}\n", summary.version)),
-    }
-    // Interim: encrypted files emit a single line. The detailed qpdf
-    // `R = / P = / permission / method` block is tracked in flpdf-oox1.
-    output.push_str(if summary.encrypted {
-        "File is encrypted\n"
-    } else {
-        "File is not encrypted\n"
-    });
-    // The status comes from the qpdf `isLinearized`-equivalent detector: the
-    // first 1024-byte candidate scan plus `/Linearized` and `/L` validation.
-    // Deeper hint-table validation remains on the `check-linearization` route.
-    output.push_str(if summary.linearized {
-        "File is linearized\n"
-    } else {
-        "File is not linearized\n"
-    });
-    logger_info(output)
+    finish_check_job(job.check(&mut pdf))
 }
 
 /// Wire `--encrypt` / `--copy-encryption` onto `options`, shared by the
@@ -5959,8 +5827,8 @@ fn open_pdf_for_inspection(
 /// Mirrors `run_check`'s own two-part inspection policy exactly (forced
 /// weak-crypto gate, same reasoning as [`open_pdf_for_inspection`]; plus
 /// `suppress_warnings` so open/update-time repair diagnostics are collected
-/// rather than delivered live, since `finish_check_report` re-emits the
-/// same diagnostics from `pdf.repair_diagnostics()` afterward -- without
+/// rather than delivered live, since the qpdf-shaped job check re-emits the
+/// same diagnostics from the document after its check banner -- without
 /// this, a `--repair`-triggered warning prints twice). `--show-npages`/
 /// `--show-pages` do not need either policy: like their non-JSON siblings
 /// `run_show_npages`/`run_show_pages`, they use the plain [`open_pdf`]
@@ -6141,20 +6009,6 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
     }
 }
 
-fn check_diagnostic_location(input: &Path, diagnostic: &flpdf::Diagnostic) -> String {
-    // Object- and trailer-prefixed messages already carry qpdf's
-    // `(object N G, offset M)` or `(trailer, offset M)` context. Passing
-    // their structured offset to `diagnostic_location` would duplicate it as
-    // `file (offset M) (object N G, offset M)`. qpdf's
-    // `damagedPDF(input, offset, message)` keeps that context in the message
-    // while the input path remains the sole outer location.
-    if diagnostic.message.starts_with("(object ") || diagnostic.message.starts_with("(trailer,") {
-        diagnostic_location(input, None)
-    } else {
-        diagnostic_location(input, diagnostic.offset)
-    }
-}
-
 /// Finish a successful operation after all requested output has been emitted.
 /// qpdf aggregates warnings from both open-time and lazy object resolution;
 /// the summary shape depends on whether this route created a PDF output.
@@ -6182,6 +6036,20 @@ fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
             code: ExitCode::Warnings,
             message: String::new(),
         })),
+    }
+}
+
+/// Map the qpdf-shaped check consumer's result to the CLI exit contract.
+/// Diagnostics have already been emitted by [`QPDFJob::check`]; this adapter
+/// only selects qpdf's error (2), warning (3), or success (0) process status.
+fn finish_check_job(result: std::result::Result<JobExitCode, CheckError>) -> CliResult<()> {
+    match result {
+        Ok(status) => finish_job_exit_status(status),
+        Err(CheckError::ErrorsDetected) => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
+        Err(CheckError::Operation(error)) => Err(Box::new(error)),
     }
 }
 
@@ -6757,35 +6625,6 @@ mod tests {
         );
 
         assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
-    }
-
-    #[test]
-    fn check_diagnostic_location_does_not_duplicate_object_offset() {
-        let object_warning =
-            flpdf::Diagnostic::warning("(object 5 0, offset 232): expected endobj", Some(232));
-        assert_eq!(
-            check_diagnostic_location(Path::new("input.pdf"), &object_warning),
-            "input.pdf"
-        );
-
-        let ordinary_warning = flpdf::Diagnostic::warning("xref warning", Some(12));
-        assert_eq!(
-            check_diagnostic_location(Path::new("input.pdf"), &ordinary_warning),
-            "input.pdf (offset 12)"
-        );
-    }
-
-    #[test]
-    fn check_diagnostic_location_does_not_duplicate_trailer_offset() {
-        let trailer_warning = flpdf::Diagnostic::warning(
-            "(trailer, offset 190): dictionary has duplicated key /Foo; \
-             last occurrence overrides earlier ones",
-            Some(190),
-        );
-        assert_eq!(
-            check_diagnostic_location(Path::new("input.pdf"), &trailer_warning),
-            "input.pdf"
-        );
     }
 
     #[test]
