@@ -1411,6 +1411,10 @@ fn pages_empty_password_encrypted_primary_preserves_primary_encryption() {
     // qpdf 11.9.0 accepts the empty user password for this R4 fixture and
     // keeps the authenticated primary as the encrypted output/base document
     // when a plaintext secondary contributes a page.
+    if !qpdf_available() {
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} unavailable; skipping empty-password encryption differential");
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let primary = fixture_abs(ENCRYPTED_R4_EMPTY_PASSWORD);
     let secondary = fixture_abs(TWO_PAGE);
