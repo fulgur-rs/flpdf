@@ -268,7 +268,7 @@ pub fn extract_page<R: Read + Seek>(
 /// the first copy, matching qpdf's observed duplicate-page output. `used`
 /// tracks which copied page objects already appear in `kids`, so this may be
 /// called once per input (with `used`/`kids` accumulating across calls) by
-/// [`crate::page_merge::merge_documents`], its sole caller.
+/// [`crate::job::merge_documents`], its sole caller.
 ///
 /// New object numbers for clones are allocated above the current maximum in
 /// `target`, recomputed on entry so repeated calls into a growing target do

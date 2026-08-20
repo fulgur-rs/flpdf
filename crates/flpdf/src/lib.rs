@@ -132,7 +132,6 @@ pub mod page_document_helper;
 pub mod page_extract;
 pub(crate) mod page_form_xobject;
 pub mod page_label_document_helper;
-pub mod page_merge;
 pub mod page_object_helper;
 pub mod page_plan;
 pub mod page_range;
@@ -211,6 +210,7 @@ pub use filespec_helper::{
     FileSpecBuilder,
 };
 pub use form_field_object_helper::FormFieldObjectHelper;
+pub use job::{merge_documents, MergeInput};
 pub use matrix::{Matrix, Rectangle};
 pub use name_number_tree::{
     build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,
@@ -240,7 +240,6 @@ pub use page_label_document_helper::{
     merge_adjacent_ranges, merge_adjacent_ranges_with_prefix_presence, LabelRange, LabelStyle,
     PageLabelDocumentHelper,
 };
-pub use page_merge::{merge_documents, MergeInput};
 pub use page_object_helper::{PageBox, PageObjectHelper};
 pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};

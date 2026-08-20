@@ -6,10 +6,10 @@
 //! object copying to the canonical multi-document merge primitive. The source
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
-use crate::page_label_document_helper::LabelRange;
-use crate::page_merge::{
+use super::page_merge::{
     merge_documents_with_resource_mode, source_top_level_field_names, MergeInput,
 };
+use crate::page_label_document_helper::LabelRange;
 use crate::page_plan::PagePlan;
 use crate::resources::RemoveUnreferencedResources;
 use crate::{
@@ -85,7 +85,7 @@ fn collect_primary_fields(
 /// first-occurrence fields, mirroring the *gate and removal* half of qpdf's
 /// end-of-selection field prune (`QPDFJob.cc:2609-2629`). qpdf only touches
 /// `/AcroForm` when the *original* `/Fields` resolved to an array
-/// (`had_fields_array`, the same gate [`crate::page_merge`]'s
+/// (`had_fields_array`, the same gate in the job-owned page-merge module's
 /// `PrimaryAcroForm::had_fields_array` captures); an `/AcroForm` with no
 /// `/Fields` array (e.g. only `/NeedAppearances`) is left untouched. When the
 /// gate passes, qpdf keeps a non-empty rebuilt array or removes `/AcroForm`
@@ -328,7 +328,7 @@ fn merge_job_label_ranges(ranges: Vec<JobLabelEntry>) -> Vec<JobLabelEntry> {
 /// This is the Rust boundary corresponding to
 /// `QPDFJob::handlePageSpecs` (`libqpdf/QPDFJob.cc:2360-2632`). The low-level
 /// page tree and foreign-object responsibilities remain in
-/// [`crate::page_merge::merge_documents`] and its page helpers. The job layer owns:
+/// [`crate::job::merge_documents`] and its page helpers. The job layer owns:
 ///
 /// - per-spec range resolution and source-index validation;
 /// - qpdf's round-robin `--collate` order across specifications;
