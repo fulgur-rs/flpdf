@@ -1033,6 +1033,42 @@ mod tests {
     }
 
     #[test]
+    fn inherited_walk_propagates_a_genuine_read_failure_past_the_depth_guard() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let fail = Rc::new(Cell::new(false));
+        let reader = ToggleReadFailure {
+            cursor: Cursor::new(bytes),
+            fail: Rc::clone(&fail),
+        };
+        let mut pdf = Pdf::open(reader).expect("PDF should parse");
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&page)
+            .expect("the current page should be readable before the boundary");
+        fail.set(true);
+        // A depth limit well past the actual parent chain means the guard
+        // never fires, so the read failure on the /Parent object itself
+        // must surface as-is rather than being masked or misreported as a
+        // depth-limit error.
+        let error =
+            resolve_inherited_handle_with_max_depth(&mut pdf, ObjectRef::new(3, 0), b"/Rotate", 10)
+                .expect_err("a genuine read failure must propagate");
+
+        assert!(
+            error
+                .to_string()
+                .contains("boundary parent read unexpectedly"),
+            "expected the underlying I/O error, got {error}"
+        );
+    }
+
+    #[test]
     fn page_parent_handle_walk_matches_qpdf_11_9_flatten_probe() {
         let version = match Command::new("qpdf").arg("--version").output() {
             Ok(output) if output.status.success() => {
