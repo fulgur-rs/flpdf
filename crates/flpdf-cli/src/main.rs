@@ -4174,6 +4174,13 @@ fn pages_progress_filename(p: &std::path::Path) -> String {
 /// reconstruction, and spec-order restoration. The in-place route below is
 /// retained for a single source so the existing post-rebuild consumers can
 /// continue to operate on the original object graph.
+// qpdf-deviation: this single-source in-place pipeline duplicates
+// job/page_specs.rs's handle_page_specs (the multi-source job route) rather
+// than routing single-source --pages through it. qpdf itself has no such
+// split -- QPDFJob::handlePageSpecs (libqpdf/QPDFJob.cc:2360-2632) is always
+// used, regardless of input count. Unifying the two routes is tracked
+// separately (flpdf-hxmj) since it requires re-verifying all nine steps'
+// behavior, not just the acroform-pruning step that surfaced this.
 #[allow(clippy::too_many_arguments)]
 fn run_page_extraction(
     primary_input: &std::path::Path,
