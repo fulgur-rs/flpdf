@@ -3802,6 +3802,20 @@ fn single_dash_option_name(arg: &str) -> Option<&str> {
     rest.split("=").next()
 }
 
+/// Return the canonical spelling of a qpdf bare option that starts a
+/// value-terminated segment. qpdf's generic argument parser strips an
+/// attached `=value` before dispatching the bare handler, so the scanners must
+/// do the same before clap sees the residual argv.
+fn qpdf_bare_segment_flag(arg: &str) -> Option<&'static str> {
+    match long_option_name(arg) {
+        Some("encrypt") => Some("--encrypt"),
+        Some("pages") => Some("--pages"),
+        Some("add-attachment") => Some("--add-attachment"),
+        Some("copy-attachments-from") => Some("--copy-attachments-from"),
+        _ => None,
+    }
+}
+
 /// Rewrite recognized qpdf-style single-dash long options into double-dash form.
 ///
 /// Recognition follows the clap command tree at top level. Within qpdf
@@ -3896,12 +3910,8 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
         // as `--add-attachment`; without this, a file whose name happens to be
         // literally `--overlay`/`--underlay` inside such a segment would be
         // misread as a new overlay group by this earlier pass.
-        if matches!(
-            arg.as_str(),
-            "--encrypt" | "--pages" | "--add-attachment" | "--copy-attachments-from"
-        ) || arg.starts_with("--add-attachment=")
-        {
-            residual.push(arg);
+        if let Some(flag) = qpdf_bare_segment_flag(&arg) {
+            residual.push(flag.to_owned());
             for tok in iter.by_ref() {
                 let is_terminator = tok == "--";
                 residual.push(tok);
@@ -3978,11 +3988,9 @@ fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<V
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
-        if matches!(
-            arg.as_str(),
-            "--encrypt" | "--pages" | "--copy-attachments-from"
-        ) {
-            residual.push(arg);
+        if let Some(flag) = qpdf_bare_segment_flag(&arg).filter(|flag| *flag != "--add-attachment")
+        {
+            residual.push(flag.to_owned());
             for token in iter.by_ref() {
                 let is_terminator = token == "--";
                 residual.push(token);
@@ -4002,7 +4010,7 @@ fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<V
         // `--add-attachment=x --` errors "add attachment: no file
         // specified" (nothing follows to serve as the file), while
         // `--add-attachment=x y --` embeds `y` and silently drops `x`.
-        if arg != "--add-attachment" && !arg.starts_with("--add-attachment=") {
+        if qpdf_bare_segment_flag(&arg) != Some("--add-attachment") {
             residual.push(arg);
             continue;
         }
@@ -7706,7 +7714,63 @@ mod tests {
         let argv = strs(&["--add-attachment=discarded", "--overlay", "--", "out.pdf"]);
         let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
         assert!(specs.is_empty(), "no overlay group, got: {specs:?}");
-        assert_eq!(residual, argv, "attachment segment copied verbatim");
+        assert_eq!(
+            residual,
+            strs(&["--add-attachment", "--overlay", "--", "out.pdf"]),
+            "qpdf discards the equals value on a bare segment option"
+        );
+    }
+
+    #[test]
+    fn extract_overlay_groups_normalizes_equals_form_sibling_segments() {
+        for (equals_form, bare_form) in [
+            ("--encrypt=discarded", "--encrypt"),
+            ("--pages=discarded", "--pages"),
+            (
+                "--copy-attachments-from=discarded",
+                "--copy-attachments-from",
+            ),
+        ] {
+            let argv = strs(&["in.pdf", equals_form, "--overlay", "--", "out.pdf"]);
+            let (residual, specs) = extract_overlay_groups(argv).unwrap();
+            assert!(specs.is_empty(), "no overlay group, got: {specs:?}");
+            assert_eq!(
+                residual,
+                strs(&["in.pdf", bare_form, "--overlay", "--", "out.pdf"]),
+                "equals value must be discarded like qpdf for {equals_form}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_attachment_groups_normalizes_equals_form_sibling_segments() {
+        for (equals_form, bare_form) in [
+            ("--encrypt=discarded", "--encrypt"),
+            ("--pages=discarded", "--pages"),
+            (
+                "--copy-attachments-from=discarded",
+                "--copy-attachments-from",
+            ),
+        ] {
+            let argv = strs(&[
+                "flpdf",
+                "in.pdf",
+                equals_form,
+                "source.pdf",
+                "--",
+                "out.pdf",
+            ]);
+            let (residual, groups) = extract_attachment_groups(argv).unwrap();
+            assert!(
+                groups.is_empty(),
+                "sibling segment must not become attachment groups"
+            );
+            assert_eq!(
+                residual,
+                strs(&["flpdf", "in.pdf", bare_form, "source.pdf", "--", "out.pdf"]),
+                "equals value must be discarded like qpdf for {equals_form}"
+            );
+        }
     }
 
     // --- build_overlay_specs --------------------------------------------
