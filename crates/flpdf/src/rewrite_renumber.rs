@@ -36,6 +36,7 @@ use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
 use crate::Pdf;
+use crate::XrefEntry;
 
 /// Maps an original object reference to its assigned new reference.
 ///
@@ -66,20 +67,18 @@ impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
     }
 }
 
-/// Return whether `object_ref` is a source ObjStm container that qpdf
-/// reconstructs rather than enqueues as an ordinary output object.
-///
-/// qpdf's Preserve mapping retains source ObjStm membership
-/// (`QPDFWriter.cc:1939-1967`) but emits a rebuilt container. Keep source xref
-/// streams in this legacy coordinator: qpdf's preserve path retains the source
-/// xref section as part of its split xref output.
-fn is_qpdf_source_objstm_container<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
-) -> crate::Result<bool> {
-    let handle = pdf.get_object_handle(object_ref);
-    pdf.resolve_object_handle(&handle)?;
-    handle.try_is_stream_of_type(b"ObjStm", b"")
+/// Return the source object references that actually own compressed xref
+/// entries. qpdf derives this mapping from its xref table
+/// (`QPDF.cc:2381-2390`), not from an object's dictionary `/Type`; an ordinary
+/// orphan stream merely typed `/ObjStm` remains a preserve-unreferenced object.
+fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<ObjectRef> {
+    pdf.source_xref_entries()
+        .into_values()
+        .filter_map(|entry| match entry {
+            XrefEntry::Compressed { stream, .. } => Some(ObjectRef::new(stream, 0)),
+            XrefEntry::Free { .. } | XrefEntry::Uncompressed { .. } => None,
+        })
+        .collect()
 }
 
 /// A map from original object references to their qpdf-style Catalog-first
@@ -278,6 +277,7 @@ impl CanonicalCatalogFirstRenumber {
             .ok_or_else(|| Error::Unsupported("plain rewrite: trailer has no /Root".to_string()))?;
         let mut seeds = if preserve_unreferenced_objects {
             let mut seeds = Vec::new();
+            let source_objstm_containers = qpdf_source_objstm_containers(pdf);
             for object_ref in pdf
                 .get_all_object_handles()?
                 .into_iter()
@@ -285,7 +285,7 @@ impl CanonicalCatalogFirstRenumber {
             {
                 if object_ref.number == 0
                     || removed_refs.contains(&object_ref)
-                    || is_qpdf_source_objstm_container(pdf, object_ref)?
+                    || source_objstm_containers.contains(&object_ref)
                 {
                     continue;
                 }
