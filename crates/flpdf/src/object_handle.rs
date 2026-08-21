@@ -5353,9 +5353,9 @@ impl ObjectHandle {
     /// contradiction with [`Self::is_resolved`] returning `true` for the
     /// same handle, but it is not: the *value* is known (it is a reference),
     /// while the *referenced object's own type* is not known without following
-    /// the chain further. This issue resolves only the handle's own canonical
-    /// slot, so the flpdf-only reference bridge continues to report `13`
-    /// (`ot_unresolved`) until the later reference/value refactor.
+    /// the chain further. `type_code`/`type_name` inspect only the handle's
+    /// own canonical slot; they do not follow a bare-reference value to the
+    /// object it points at.
     ///
     /// # Errors
     ///
