@@ -396,6 +396,31 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         decode_stream_data_from_handle(&stream_dict, data.as_ref(), DecodeLimits::default())
     }
 
+    /// Pipe the decoded payload through the canonical qpdf stream pipeline.
+    ///
+    /// This combines `QPDFFileSpecObjectHelper::getEmbeddedFileStream`
+    /// (`libqpdf/QPDFFileSpecObjectHelper.cc:61-77`) with
+    /// `QPDFObjectHandle::pipeStreamData` (`libqpdf/QPDFObjectHandle.cc:1301-1324`).
+    /// A filter failure is returned as `Ok(false)` after the owning document
+    /// has received its warning, matching qpdf's `doShowAttachment` caller,
+    /// which intentionally ignores that boolean.
+    pub(crate) fn pipe_stream_data(&self, pipeline: &mut dyn Pipeline) -> Result<bool> {
+        let Some((stream, _, _)) = self.resolved_stream()? else {
+            return Err(Error::Unsupported(
+                "expected an /EmbeddedFile stream object".to_string(),
+            ));
+        };
+        let mut filtering_attempted = false;
+        stream.pipe_stream_data(
+            pipeline,
+            &mut filtering_attempted,
+            0,
+            DecodeLevel::All,
+            false,
+            false,
+        )
+    }
+
     /// Return the MIME type from `/Subtype`, as raw bytes.
     ///
     /// `/Subtype` is a PDF name, e.g. `b"application/pdf"`.  Returns `None`
@@ -1507,6 +1532,22 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "EmbeddedFile factory received a non-stream object"
+        );
+    }
+
+    #[test]
+    fn pipe_stream_data_rejects_a_null_embedded_file_handle() {
+        let mut pdf = open_minimal();
+        let embedded_file = EmbeddedFileStream::new(ObjectHandle::null(), &mut pdf)
+            .expect("a direct null handle is a valid wrapper input");
+        let mut discard = crate::pipeline::Discard;
+
+        let error = embedded_file
+            .pipe_stream_data(&mut discard)
+            .expect_err("a null embedded file stream must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: expected an /EmbeddedFile stream object"
         );
     }
 
