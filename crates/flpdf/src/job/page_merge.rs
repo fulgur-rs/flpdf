@@ -1301,7 +1301,36 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // (unmapped refs) by `rewrite_refs`.
         let mut copy_seed: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
         let primary_live = if is_primary && preserve_primary_unreferenced {
-            let primary_live = input.source.live_object_refs();
+            // Exclude `/Type /ObjStm` container refs: an object-stream
+            // container is a writer-owned compression artifact, not
+            // semantic content. qpdf's writer independently decides
+            // container membership for whatever gets enqueued
+            // (`QPDFWriter::enqueueObject` redirects a compressible member
+            // to its container rather than writing the member directly,
+            // `QPDFWriter.cc:1093-1103`) and regenerates each container's
+            // bytes fresh from that current membership
+            // (`getCompressibleObjGens`, `QPDFWriter.cc:1955-2003`) --- it
+            // never writes a source container's raw bytes verbatim. Each
+            // compressed member's own ref still resolves to its correct
+            // logical value via `source.resolve()` regardless of
+            // compression, so excluding only the container here does not
+            // lose any member; flpdf's own writer
+            // (`writer/object_streams.rs`) already owns (re)compressing the
+            // copied members into fresh containers. Without this exclusion,
+            // the container's raw stream would be copied as an ordinary
+            // object, duplicating its still-live members' content in a
+            // second, dangling copy that nothing in the output references.
+            let mut primary_live = Vec::new();
+            for object_ref in input.source.live_object_refs() {
+                if input
+                    .source
+                    .get_object_handle(object_ref)
+                    .try_is_stream_of_type(b"ObjStm", b"")?
+                {
+                    continue;
+                }
+                primary_live.push(object_ref);
+            }
             closure.extend(primary_live.iter().copied());
             // `page_refs(input.source)` above already succeeded for this same
             // primary in this same loop iteration (nothing between the two
