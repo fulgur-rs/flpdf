@@ -711,6 +711,73 @@ fn non_dictionary_outline_item_emits_qpdf_has_key_get_key_warnings_on_accessors(
 }
 
 #[test]
+fn outline_json_warning_order_matches_qpdf_add_outlines_to_json() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 42 >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    flpdf::job::build_outlines_section(&mut pdf).expect("outline JSON should degrade to defaults");
+
+    let kinds = warning_messages(&pdf)
+        .into_iter()
+        .map(|message| {
+            if message.ends_with("returning false for a key containment request") {
+                "F"
+            } else if message.ends_with("returning null for attempted key retrieval") {
+                "N"
+            } else {
+                panic!("unexpected warning: {message}");
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["N", "N", "F", "F", "N", "F", "F", "N"]);
+}
+
+#[test]
+fn nested_outline_json_warning_order_keeps_kids_after_parent_fields() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (parent) /Parent 4 0 R /First 42 0 R /Last 42 0 R /Count 1 >>",
+            ),
+            (42, "42"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+    flpdf::job::build_outlines_section(&mut pdf).expect("nested outline JSON should succeed");
+
+    let kinds = warning_messages(&pdf)
+        .into_iter()
+        .map(|message| {
+            if message.ends_with("returning false for a key containment request") {
+                "F"
+            } else if message.ends_with("returning null for attempted key retrieval") {
+                "N"
+            } else {
+                panic!("unexpected warning: {message}");
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["N", "N", "F", "F", "N", "F", "F", "N"]);
+}
+
+#[test]
 fn indirect_null_first_has_no_outlines_and_materializes_no_item() {
     let bytes = build_pdf(
         &[

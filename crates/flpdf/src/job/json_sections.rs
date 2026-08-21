@@ -430,23 +430,27 @@ fn outline_item_to_json<R: Read + Seek>(
     helper: &mut crate::OutlineDocumentHelper<'_, R>,
 ) -> Result<Json, ConvertError> {
     let item = &tree[id];
+    // qpdf's QPDFJob::addOutlinesToJson computes the object first, then these
+    // fields in this order (`QPDFJob.cc:1119-1138`). The accessors emit
+    // warnings at computation time, so this is observable even though the
+    // JSON dictionary serializer later sorts the keys.
+    let object = match item.source_ref {
+        Some(reference) => Json::make_string(reference.to_string()),
+        None => pdf_object_to_json(&item.object)?,
+    };
+    let title = item.get_title(helper)?;
     let dest = pdf_dest_to_json(&item.get_dest(helper)?)?;
+    let count = item.get_count(helper)?;
     let destpageposfrom1 = item
         .get_dest_page(helper)?
         .object_ref()
         .and_then(|reference| page_numbers.get(&reference).copied())
         .map(Json::make_int)
         .unwrap_or_else(Json::make_null);
-    let count = item.get_count(helper)?;
-    let title = item.get_title(helper)?;
     let mut kids = Vec::with_capacity(item.kids.len());
     for kid in item.kids.iter().copied() {
         kids.push(outline_item_to_json(tree, kid, page_numbers, helper)?);
     }
-    let object = match item.source_ref {
-        Some(reference) => Json::make_string(reference.to_string()),
-        None => pdf_object_to_json(&item.object)?,
-    };
 
     json_dictionary([
         ("dest".to_string(), dest),
