@@ -140,6 +140,35 @@ fn synthetic_unreferenced_object_pdf() -> Vec<u8> {
     bytes
 }
 
+fn synthetic_typed_orphan_objstm_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".as_slice(),
+        b"<< /Length 0 >>\nstream\n\nendstream".as_slice(),
+        b"<< /Type /ObjStm /N 1 /First 4 /Length 4 /Marker (typed-orphan) >>\nstream\n1 0\nendstream".as_slice(),
+    ];
+    let mut offsets = Vec::with_capacity(objects.len());
+
+    for (number, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", number + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn synthetic_many_object_pdf(count: u32) -> Vec<u8> {
     assert!(count >= 2);
     let mut bytes = b"%PDF-1.4\n".to_vec();
@@ -2336,6 +2365,75 @@ fn preserve_encrypt_generate_keeps_orphans_outside_objstm() -> flpdf::Result<()>
         objstm_member_counts(&flpdf_dump_path)?,
         vec![1],
         "preserved orphans must remain plain when Generate is combined with encryption"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn preserve_does_not_drop_orphan_stream_typed_objstm_without_compressed_xref() -> flpdf::Result<()>
+{
+    qpdf_11_9_0()?;
+    let source = synthetic_typed_orphan_objstm_pdf();
+    let dir = tempfile::tempdir()?;
+    let input_path = dir.path().join("input.pdf");
+    let qpdf_path = dir.path().join("qpdf.pdf");
+    let flpdf_path = dir.path().join("flpdf.pdf");
+    let qpdf_dump_path = dir.path().join("qpdf-qdf.pdf");
+    let flpdf_dump_path = dir.path().join("flpdf-qdf.pdf");
+    std::fs::write(&input_path, &source)?;
+
+    let qpdf_status = Command::new("qpdf")
+        .args([
+            "--object-streams=preserve",
+            "--preserve-unreferenced",
+            "--static-id",
+            "--encrypt",
+            "",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input_path)
+        .arg(&qpdf_path)
+        .status()?;
+    assert!(qpdf_status.success(), "qpdf typed-orphan preserve failed");
+
+    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec()));
+    writer.set_output_memory()?;
+    writer.write()?;
+    std::fs::write(&flpdf_path, writer.get_buffer()?)?;
+
+    for (input, output) in [
+        (&qpdf_path, &qpdf_dump_path),
+        (&flpdf_path, &flpdf_dump_path),
+    ] {
+        let status = Command::new("qpdf")
+            .args(["--password=", "--qdf", "--preserve-unreferenced"])
+            .arg(input)
+            .arg(output)
+            .status()?;
+        assert!(
+            status.success(),
+            "qpdf QDF dump failed for {}",
+            input.display()
+        );
+    }
+
+    assert!(contains_bytes(
+        &std::fs::read(&qpdf_dump_path)?,
+        b"typed-orphan"
+    ));
+    assert!(
+        contains_bytes(&std::fs::read(&flpdf_dump_path)?, b"typed-orphan"),
+        "an orphan typed /ObjStm without compressed xref membership must be preserved"
     );
 
     Ok(())
