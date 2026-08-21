@@ -194,6 +194,13 @@ fail to compile until the migration in Task 3 is applied.
 - Modify: `crates/flpdf/src/reader/resolver.rs`
 - Modify: `crates/flpdf/src/stream_filter.rs`
 - Modify: `crates/flpdf/src/writer.rs`
+- Modify: `crates/flpdf-qtest-tools/src/compare.rs`
+- Modify: `crates/flpdf-qtest-tools/src/driver/test_0_1.rs`
+- Modify: `crates/flpdf-qtest-tools/src/driver/test_02_09.rs`
+- Modify: `crates/flpdf-qtest-tools/src/driver/test_34_41.rs`
+- Modify: `crates/flpdf-qtest-tools/src/driver/test_72_79.rs`
+- Modify: `crates/flpdf-qtest-tools/src/driver/test_88_98.rs`
+- Modify: `crates/flpdf-qtest-tools/src/metadata.rs`
 
 - [ ] **Step 1: Propagate in `object_handle.rs` fallible methods**
 
@@ -259,7 +266,7 @@ already-resolved, and `ObjectValue::Reference` cases.
 Run:
 
 ```bash
-rg -n '\\.type_(code|name)\\(\\)' crates/flpdf/src crates/flpdf/tests
+rg -n '\\.type_(code|name)\\(\\)' crates
 ```
 
 Every executable occurrence must either use `?`, `expect`/`unwrap` in a
@@ -317,7 +324,7 @@ bd dep cycles
 - [ ] **Step 4: Commit and publish the implementation branch**
 
 ```bash
-git add crates/flpdf/src/object_handle.rs crates/flpdf/src/document_json.rs crates/flpdf/src/filespec_helper.rs crates/flpdf/src/json_inspect.rs crates/flpdf/src/linearization/check.rs crates/flpdf/src/page_object_helper.rs crates/flpdf/src/pages/repair.rs crates/flpdf/src/reader.rs crates/flpdf/src/reader/resolver.rs crates/flpdf/src/stream_filter.rs crates/flpdf/src/writer.rs
+git add crates/flpdf/src/object_handle.rs crates/flpdf/src/document_json.rs crates/flpdf/src/filespec_helper.rs crates/flpdf/src/json_inspect.rs crates/flpdf/src/linearization/check.rs crates/flpdf/src/page_object_helper.rs crates/flpdf/src/pages/repair.rs crates/flpdf/src/reader.rs crates/flpdf/src/reader/resolver.rs crates/flpdf/src/stream_filter.rs crates/flpdf/src/writer.rs crates/flpdf-qtest-tools/src/compare.rs crates/flpdf-qtest-tools/src/driver/test_0_1.rs crates/flpdf-qtest-tools/src/driver/test_02_09.rs crates/flpdf-qtest-tools/src/driver/test_34_41.rs crates/flpdf-qtest-tools/src/driver/test_72_79.rs crates/flpdf-qtest-tools/src/driver/test_88_98.rs crates/flpdf-qtest-tools/src/metadata.rs
 git commit -m "refactor: make object type inspection fallible"
 git push -u origin feature/flpdf-25kg-8-type-result
 ```
@@ -325,4 +332,3 @@ git push -u origin feature/flpdf-25kg-8-type-result
 Do not close `flpdf-25kg.8` until the branch/PR lifecycle explicitly confirms
 the implementation is complete; preserve the dependency edge blocking
 `flpdf-25kg.9`.
-
