@@ -3688,10 +3688,11 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         detail: &str,
     ) -> Result<()> {
-        self.push_warning(format!(
+        let message = format!(
             "error decoding stream data for object {} {}: {detail}",
             object_ref.number, object_ref.generation
-        ))?;
+        );
+        self.push_warning(message)?;
         self.push_warning("stream will be re-processed without filtering to avoid data loss")?;
         Ok(())
     }
