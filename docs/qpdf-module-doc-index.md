@@ -9,7 +9,6 @@
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
-| `crates/flpdf/src/check.rs` | correspondence | QPDFJob.cc document-check surface over reader diagnostics |
 | `crates/flpdf/src/content_normalizer.rs` | mirror | libqpdf/ContentNormalizer.cc |
 | `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |

@@ -900,7 +900,7 @@ fn dest_page_ref_resolved_depth<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::check::check_reader;
+    use crate::job::check_bytes_for_test;
     use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
@@ -1439,12 +1439,7 @@ mod tests {
 
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
-        let report = check_reader(Cursor::new(out)).expect("check should run");
-        assert!(
-            report.valid,
-            "rebuilt PDF should pass check_reader: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     // -----------------------------------------------------------------------

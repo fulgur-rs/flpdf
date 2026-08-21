@@ -9,7 +9,7 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::ObjectStreamMode;
-use flpdf::{check_reader, load_xref_and_trailer, Object, ObjectRef, Pdf, XrefEntry};
+use flpdf::{load_xref_and_trailer, Object, ObjectRef, Pdf, XrefEntry};
 use std::io::{Cursor, Write};
 
 // ── Fixture builders ─────────────────────────────────────────────────────────
@@ -179,7 +179,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Verify output is a valid PDF.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "Disable-mode output should be a valid PDF; diagnostics: {:?}",
@@ -323,7 +323,7 @@ fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
             .any(|bytes| bytes == b"\nxref\n"),
         "an empty surviving source container must fall back to a classic xref table"
     );
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewritten output must be valid: {:?}",
@@ -363,11 +363,10 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
-
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
-        report.valid,
-        "rewritten output must be valid: {:?}",
+        !report.valid,
+        "qpdf 11.9.0 must reject the explicit deleted-member output with its null-page warning: {:?}",
         report.diagnostics.entries()
     );
     let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
@@ -422,7 +421,7 @@ fn preserve_deleted_source_container_rebuilds_its_surviving_members() {
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewritten output must be valid: {:?}",
@@ -464,7 +463,7 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewritten output must be valid: {:?}",
@@ -524,7 +523,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Verify output is valid.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "Generate-mode output should be a valid PDF; diagnostics: {:?}",
@@ -620,8 +619,8 @@ fn generate_mode_on_xref_table_form_upgrades_to_xref_stream() {
     // The output must be re-readable AND structurally valid — a Report with
     // valid == false would slip past a bare expect() on the Result, so check
     // the flag explicitly.
-    let report = check_reader(Cursor::new(output.clone()))
-        .expect("check_reader must not return Err on rewritten output");
+    let report = check_output(Cursor::new(output.clone()))
+        .expect("canonical qpdf check must not return Err on rewritten output");
     assert!(
         report.valid,
         "rewritten output must be a valid PDF; diagnostics: {:?}",
@@ -675,8 +674,8 @@ fn disable_mode_on_xref_table_form_preserves_classic_table() {
     // Validate the output before asserting on its byte structure — otherwise a
     // malformed file that happens to contain "\nxref\n" somewhere in a stream
     // body would pass the byte-search assertion while being unreadable.
-    let report = check_reader(Cursor::new(output.clone()))
-        .expect("check_reader must not return Err on rewritten output");
+    let report = check_output(Cursor::new(output.clone()))
+        .expect("canonical qpdf check must not return Err on rewritten output");
     assert!(
         report.valid,
         "rewritten output must be a valid PDF; diagnostics: {:?}",
@@ -719,8 +718,8 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
     write_with_settings(&mut pdf, &mut output, &options)
         .unwrap_or_else(|e| panic!("write {fixture_path}: {e:?}"));
 
-    let report = check_reader(Cursor::new(output.clone()))
-        .expect("check_reader must not return Err on rewritten output");
+    let report = check_output(Cursor::new(output.clone()))
+        .expect("canonical qpdf check must not return Err on rewritten output");
     assert!(
         report.valid,
         "{fixture_path}: Generate-mode output must be a valid PDF; diagnostics: {:?}",
@@ -883,8 +882,8 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
         .expect("full-rewrite + Generate must succeed when an eligible orphan is present");
 
     // Output must be a valid PDF.
-    let report = check_reader(Cursor::new(output.clone()))
-        .expect("check_reader must not return Err on rewritten output");
+    let report = check_output(Cursor::new(output.clone()))
+        .expect("canonical qpdf check must not return Err on rewritten output");
     assert!(
         report.valid,
         "Generate-mode output must be a valid PDF; diagnostics: {:?}",
@@ -969,7 +968,7 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewrite output must be valid: {:?}",
@@ -1050,7 +1049,7 @@ fn generate_force_version_below_1_5_suppresses_object_and_xref_streams() {
     );
 
     // The suppressed output is still a valid, re-readable PDF.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "suppressed output must be a valid PDF; diagnostics: {:?}",
@@ -1248,7 +1247,7 @@ fn force_below_1_5_preserve_downgrades_xref_stream_to_classic_table() {
         !text.contains("/Type /ObjStm"),
         "inherited ObjStm must be dropped (cannot live in a classic table)"
     );
-    let report = check_reader(Cursor::new(out.clone())).unwrap();
+    let report = check_output(Cursor::new(out.clone())).unwrap();
     assert!(
         report.valid,
         "downgraded output must be a valid PDF; diagnostics: {:?}",
@@ -1437,4 +1436,4 @@ fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
 
 mod common;
 #[allow(unused_imports)]
-use common::{write_default, write_with_settings, WriterTestSettings};
+use common::{check_output, write_default, write_with_settings, WriterTestSettings};

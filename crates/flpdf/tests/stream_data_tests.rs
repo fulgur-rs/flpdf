@@ -7,15 +7,12 @@
 //!   (a) `Preserve` — FlateDecode-wrapped stream keeps its /Filter verbatim.
 //!   (b) `Uncompress` — FlateDecode-wrapped stream is decoded; /Filter absent.
 //!   (c) `Compress` — uncompressed stream gains /FlateDecode and shrinks.
-//!   (d) `Preserve` — output passes `check_reader` (structural validity check).
+//!   (d) `Preserve` — output passes the canonical qpdf job check.
 //!   (e) `Preserve` — round-trip stability: second rewrite matches first rewrite.
 //!   (f) Backward compat: `stream_data = None` behaves identically to
 //!       the existing `compress_streams` path (no regression).
 
-use flpdf::{
-    check_reader, filters, CompressStreams, Dictionary, Object, ObjectRef, Pdf, Stream,
-    StreamDataMode,
-};
+use flpdf::{filters, CompressStreams, Dictionary, Object, ObjectRef, Pdf, Stream, StreamDataMode};
 use std::io::Cursor;
 
 // ---------------------------------------------------------------------------
@@ -215,7 +212,7 @@ fn rewrite_stream_data_compress_wraps_uncompressed() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) Preserve output passes check_reader
+// (d) Preserve output passes the canonical qpdf job check
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -227,7 +224,7 @@ fn rewrite_stream_data_preserve_passes_check() {
     opts.stream_data = Some(StreamDataMode::Preserve);
     let out = full_rewrite(&src, &opts);
 
-    let report = check_reader(Cursor::new(out)).expect("check_reader");
+    let report = check_output(Cursor::new(out)).expect("canonical qpdf check");
     assert!(
         report.valid,
         "preserve-mode output must be structurally valid; diagnostics: {:?}",
@@ -303,4 +300,4 @@ fn stream_data_none_falls_back_to_compress_streams() {
 
 mod common;
 #[allow(unused_imports)]
-use common::{write_default, write_with_settings, WriterTestSettings};
+use common::{check_output, write_default, write_with_settings, WriterTestSettings};

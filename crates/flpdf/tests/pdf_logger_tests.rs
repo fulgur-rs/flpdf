@@ -1,5 +1,6 @@
+use flpdf::job::QPDFJob;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{check_reader_with_options, Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
+use flpdf::{Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -222,9 +223,12 @@ fn check_with_repair_propagates_warning_delivery_failure() {
     logger.set_warn(Some(PipelineHandle::new(FailingSink)));
     let (bytes, _) = warnings_only_corrupt_xref_bytes();
 
+    let mut job = QPDFJob::new();
+    job.set_logger(logger.clone());
     assert!(matches!(
-        check_reader_with_options(
+        job.open(
             Cursor::new(bytes),
+            "check.pdf",
             PdfOpenOptions {
                 repair: true,
                 logger: Some(logger),

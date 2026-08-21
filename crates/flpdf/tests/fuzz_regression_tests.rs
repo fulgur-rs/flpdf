@@ -8,6 +8,8 @@
 //! nightly/libFuzzer dependency, making them durable gates independent of the
 //! fuzzer itself.
 
+use flpdf::job::QPDFJob;
+use flpdf::PdfOpenOptions;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +21,17 @@ fn roundtrip(data: &[u8]) {
     // does it: `Pdf<R>` requires `R: 'static`, so the input cannot be borrowed.
     let shared: Arc<[u8]> = Arc::from(data);
 
-    let _ = flpdf::check_reader(Cursor::new(Arc::clone(&shared)));
+    let mut job = QPDFJob::new();
+    if let Ok(mut pdf) = job.open(
+        Cursor::new(Arc::clone(&shared)),
+        "fuzz-regression.pdf",
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        let _ = job.check(&mut pdf);
+    }
 
     // The writer gets a freshly parsed handle (writing mutates handle state, so
     // a shared handle would feed it a post-write document — a sequence no real

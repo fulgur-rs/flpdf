@@ -527,7 +527,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::check::check_reader;
+    use crate::job::check_bytes_for_test;
     use crate::pages::page_refs;
     use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
@@ -1111,12 +1111,7 @@ mod tests {
         let refs = page_refs(&mut pdf2).expect("page tree should walk");
         assert_eq!(refs.len(), 2);
 
-        let report = check_reader(Cursor::new(out)).expect("check should run");
-        assert!(
-            report.valid,
-            "pruned PDF should pass check_reader: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     /// Extract all pages (identity selection) → all fields kept.

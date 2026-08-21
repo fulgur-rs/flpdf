@@ -34,19 +34,18 @@ class ObjectHandleConsumerCutoverTests(unittest.TestCase):
         self.assertIn("decode_stream_data_from_handle", source)
         self.assertIn("ObjectHandle::dictionary", source)
 
-    def test_check_production_uses_handle_content_streams(self):
-        source = production_source(ROOT / "crates/flpdf/src/check.rs")
+    def test_job_check_production_uses_canonical_handle_content_streams(self):
+        source = production_source(ROOT / "crates/flpdf/src/job/check.rs")
 
         for legacy in (
-            "crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, Pdf",
             "Object::",
-            "page_content_stream_entries(",
+            "resolve_borrowed",
             "decode_stream_data_with_limits_and_warnings(",
         ):
-            self.assertNotIn(legacy, source, f"check production still uses {legacy}")
+            self.assertNotIn(legacy, source, f"job check production still uses {legacy}")
 
         self.assertIn("PageObjectHelper", source)
-        self.assertIn("decode_stream_data_recovering_from_handle", source)
+        self.assertIn("QPDFJob", source)
 
 
 if __name__ == "__main__":

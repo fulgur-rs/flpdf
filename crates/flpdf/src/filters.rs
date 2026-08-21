@@ -7,12 +7,14 @@ use crate::pipeline::test_support::ascii85_fixture_bytes;
 use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
+#[cfg(test)]
+use crate::stream_filter::DECODE_OUTPUT_LIMIT_PREFIX;
 use crate::stream_filter::{
     decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
     encode_run_length, is_decoded_filter as stream_is_decoded_filter,
     passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
     undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
-    FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
+    FilterSpec, CRYPT_STAGE_UNSUPPORTED,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -330,6 +332,7 @@ fn decode_stream_data_recovering_with_limits_and_mode(
 /// configured cap) as a warning rather than a stream-encoding error. The
 /// sentinel is internal to flpdf — the trailing byte count is flpdf's own value —
 /// so PDF content cannot forge a corrupt-stream message into this shape.
+#[cfg(test)]
 pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
     matches!(error, Error::Unsupported(message) if message.starts_with(DECODE_OUTPUT_LIMIT_PREFIX))
 }
@@ -3108,7 +3111,7 @@ mod tests {
     /// the same way every other filter's `OutputBuffer::write` cap does —
     /// as [`is_decode_output_limit_error`] — all the way through
     /// `map_stage_error` -> `map_pipeline_error` -> `Error::Unsupported` at
-    /// this public entry point. `check.rs`'s content-stream pass relies on
+    /// this public entry point. The qpdf job-check content-stream pass relies on
     /// that exact classification to downgrade a cap trip to a warning
     /// instead of a stream-encoding error; a stray identifier prefix on the
     /// message (this sentinel intentionally carries none, see

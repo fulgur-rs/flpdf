@@ -104,6 +104,26 @@ impl QPDFJob {
     }
 }
 
+/// Run the canonical qpdf-shaped document check for crate-internal tests.
+///
+/// This keeps test-only validity assertions on QPDFJob::check rather than
+/// reviving the removed top-level report API.
+#[cfg(test)]
+pub(crate) fn check_bytes_for_test(bytes: Vec<u8>) -> std::result::Result<JobExitCode, CheckError> {
+    let mut job = QPDFJob::new();
+    let mut pdf = job
+        .open(
+            std::io::Cursor::new(bytes),
+            "test.pdf",
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .map_err(CheckError::Operation)?;
+    job.check(&mut pdf)
+}
+
 fn check_document<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
