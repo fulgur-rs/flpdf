@@ -49,10 +49,12 @@ handler, not `reader.rs`:
    127 bytes before calling the decrypt/validation helpers:
    `check_user_password_r5`, `check_owner_password_r5`,
    `check_user_password_r6`, and `check_owner_password_r6`.
-3. The existing password encoding/SASLprep step remains available to the
-   reader path, but V=5 truncation is removed from the generic normalization
-   helper. This keeps the reader facade as a delegating caller while putting
-   the qpdf encryption rule beside the corresponding authentication checks.
+3. The password encoding step remains available to the reader path, but
+   Unicode mode validates UTF-8 and preserves the supplied bytes. qpdf's
+   reader-side implementation does not apply the SASLprep mentioned in its
+   specification comment. V=5 truncation is removed from the generic
+   normalization helper and remains beside the corresponding authentication
+   checks.
 4. Writer-side `compute_u_ue_r5`, `compute_o_oe_r5`, `compute_u_ue_r6`, and
    `compute_o_oe_r6` continue to pass their raw password bytes to the hash
    primitives. No writer-specific compatibility branch is introduced.
@@ -72,15 +74,12 @@ must remain usable by writer construction with untruncated input.
 
 ### Password normalization
 
-`normalize_password` continues to resolve `PasswordMode`, decode hex bytes,
-and apply the existing V=5 SASLprep behavior. It no longer performs the
-encryption-specific 127-byte truncation. The reader passes the normalized
+`normalize_password` continues to resolve `PasswordMode` and decode hex
+bytes. Unicode mode validates UTF-8 and returns the original bytes, matching
+qpdf 11.9.0; it no longer applies SASLprep. The helper also does not perform
+the encryption-specific 127-byte truncation. The reader passes the validated
 bytes to the security checks, which apply the qpdf truncation immediately
-before authentication. This preserves the order “normalize, then truncate”
-without adding code to the shrinking reader facade.
-
-The SASLprep behavior itself remains a non-goal and stays tracked by
-`flpdf-9hc.3.16`.
+before authentication.
 
 ## Tests and acceptance criteria
 
@@ -117,5 +116,6 @@ repository's patch-coverage gate.
 ## Scope boundary
 
 This issue changes only V=5 password truncation ownership and its tests. It
-does not unify R=5/R=6 hashing, change SASLprep, alter public APIs, or modify
-the qpdf source mirror.
+does not unify R=5/R=6 hashing, alter public APIs, or modify the qpdf source
+mirror. The later reader-parity follow-up `flpdf-1f1y` removes the separate
+SASLprep mismatch after live qpdf 11.9.0 verification.

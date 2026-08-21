@@ -1514,8 +1514,9 @@ struct PasswordArgs {
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<PathBuf>,
     /// How to interpret --password bytes before key derivation. Defaults to
-    /// `auto` which picks `bytes` for V<5 documents and `unicode` (SASLprep)
-    /// for V=5 R=5/R=6. Mirrors qpdf's --password-mode flag.
+    /// `auto` which picks `bytes` for V<5 documents and `unicode` (UTF-8
+    /// validation without normalization) for V=5 R=5/R=6. Mirrors qpdf's
+    /// --password-mode flag.
     #[arg(long = "password-mode", value_enum, default_value_t = CliPasswordMode::Auto)]
     password_mode: CliPasswordMode,
     /// Permit deprecated RC4-backed handlers and revision 5 encryption.

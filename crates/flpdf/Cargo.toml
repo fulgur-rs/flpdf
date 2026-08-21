@@ -20,7 +20,6 @@ aes.workspace = true
 cbc.workspace = true
 md-5.workspace = true
 sha2.workspace = true
-stringprep.workspace = true
 hex.workspace = true
 getrandom.workspace = true
 libc.workspace = true

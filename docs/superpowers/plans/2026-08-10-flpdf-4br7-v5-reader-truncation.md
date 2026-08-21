@@ -78,9 +78,9 @@ cargo test -p flpdf --test qpdf_v5_password_parity
    `check_owner_password_r6`, pass the helper's prefix to the corresponding
    decrypt routine. Keep the lower-level decrypt/hash functions raw.
 5. Remove `truncate_to` and its V=5 truncation branch from
-   `normalize_password`; retain mode resolution, hex decoding, SASLprep, and
-   legacy behavior. Update comments so they distinguish normalization from
-   qpdf's encryption check boundary.
+   `normalize_password`; retain mode resolution, hex decoding, UTF-8
+   validation, raw-byte pass-through, and legacy behavior. Update comments so
+   they distinguish normalization from qpdf's encryption check boundary.
 6. Update `V5R6EncryptParams` and hash/compute docs that currently claim the
    hash helper truncates passwords.
 

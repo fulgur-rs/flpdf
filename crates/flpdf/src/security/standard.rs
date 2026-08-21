@@ -1245,16 +1245,17 @@ pub(crate) fn compute_o_oe_r6(
 
 /// User-supplied configuration for [`build_v5_r6_encrypt_dict`].
 ///
-/// Passwords MUST be SASLprep-normalized bytes per the V=5 spec; the
-/// caller is responsible for running [`crate::security::password::normalize_password`]
-/// with `PasswordMode::Unicode` before invoking this builder.
+/// Passwords are consumed as the byte strings supplied by the caller. The
+/// qpdf 11.9.0 reader validates Unicode-mode input as UTF-8 but does not apply
+/// SASLprep before V=5 authentication; this lower-level builder likewise does
+/// not normalize or truncate its inputs.
 pub(crate) struct V5R6EncryptParams<'a> {
-    /// SASLprep'd user password bytes. Writer-side Algorithm 2.B consumes all
-    /// supplied bytes; the reader-side authentication entry points apply the
-    /// qpdf 127-byte prefix rule before hashing.
+    /// User password bytes. Writer-side Algorithm 2.B consumes all supplied
+    /// bytes; the reader-side authentication entry points apply the qpdf
+    /// 127-byte prefix rule before hashing.
     pub user_password: &'a [u8],
-    /// SASLprep'd owner password bytes. Unlike V<5 there is no empty-owner
-    /// fallback to the user password — the caller decides what to pass.
+    /// Owner password bytes. Unlike V<5 there is no empty-owner fallback to
+    /// the user password — the caller decides what to pass.
     pub owner_password: &'a [u8],
     /// `/P` permission flags (signed 32-bit, also encoded into `/Perms`).
     pub p: i32,
@@ -4421,9 +4422,9 @@ mod tests {
         }
     }
 
-    /// SASLprep'd non-ASCII passwords (mirrors `tests/fixtures/encrypted/
+    /// Non-ASCII UTF-8 passwords (mirrors `tests/fixtures/encrypted/
     /// v5-aes-256-r6-utf8.pdf` coverage) must round-trip through the V=5 R=6
-    /// builder + reader pair when the caller has already normalized them.
+    /// builder + reader pair as the supplied UTF-8 bytes.
     #[test]
     fn build_v5_r6_encrypt_dict_round_trips_utf8_passwords() {
         use crate::security::password::{normalize_password, PasswordMode};

@@ -35,7 +35,6 @@ aes = "0.9"
 cbc = { version = "0.2", features = ["block-padding"] }
 md-5 = "0.11"
 sha2 = "0.11"
-stringprep = "0.1"
 hex = "0.4"
 libc = "0.2"
 windows-sys = "0.61"
