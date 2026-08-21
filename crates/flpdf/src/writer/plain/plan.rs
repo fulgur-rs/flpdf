@@ -137,7 +137,18 @@ impl PlainWritePlan {
                     .map(|members| ObjectStreamGroup::Synthetic { members })
                     .collect();
                 let removed = &compressible.removed_refs;
-                let renumber = renumber_plain(pdf, &renumber_groups, removed, false)?;
+                // qpdf's Generate pass only puts its reachable compressible set
+                // into synthetic ObjStms (`QPDFWriter.cc:1970-2007`), while
+                // `enqueueObjectsStandard` separately seeds every source object
+                // when preserve-unreferenced is enabled (`QPDFWriter.cc:2907-2914`).
+                // Keep that distinction: preserved orphans receive plain slots
+                // instead of being silently dropped from the generated rewrite.
+                let renumber = renumber_plain(
+                    pdf,
+                    &renumber_groups,
+                    removed,
+                    options.preserve_unreferenced_objects,
+                )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the Generate preserve path is exercised by the writer contract test.
                 build_container_aware(renumber, renumber_groups, compressible.removed_refs)?
             }
         };

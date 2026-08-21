@@ -2098,6 +2098,27 @@ fn pdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Resul
     assert!(contains_bytes(&preserved_output, marker));
     assert!(!contains_bytes(&preserved_output, b"/Prev"));
 
+    let mut qdf_pdf = Pdf::open(Cursor::new(synthetic_unreferenced_object_pdf()))?;
+    let mut qdf_writer = PdfWriter::new(&mut qdf_pdf);
+    qdf_writer.set_qdf_mode(true);
+    qdf_writer.set_preserve_unreferenced_objects(true);
+    qdf_writer.set_static_id(true);
+    qdf_writer.set_output_memory()?;
+    qdf_writer.write()?;
+    let qdf_output = qdf_writer.get_buffer()?;
+    assert!(contains_bytes(&qdf_output, marker));
+    assert!(contains_bytes(&qdf_output, b"%QDF-1.0"));
+
+    let mut generated_pdf = Pdf::open(Cursor::new(synthetic_unreferenced_object_pdf()))?;
+    let mut generated_writer = PdfWriter::new(&mut generated_pdf);
+    generated_writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    generated_writer.set_preserve_unreferenced_objects(true);
+    generated_writer.set_static_id(true);
+    generated_writer.set_output_memory()?;
+    generated_writer.write()?;
+    let generated_output = generated_writer.get_buffer()?;
+    assert!(contains_bytes(&generated_output, marker));
+
     let dir = tempfile::tempdir()?;
     let output_path = dir.path().join("preserved-unreferenced.pdf");
     std::fs::write(&output_path, preserved_output)?;

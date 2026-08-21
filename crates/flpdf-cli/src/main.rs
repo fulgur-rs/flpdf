@@ -330,6 +330,7 @@ struct Cli {
               "add_attachment", "remove_attachment", "list_attachments",
               "show_attachment", "copy_attachments_from",
               "no_original_object_ids", "qdf", "coalesce_contents",
+              "preserve_unreferenced",
           ],
           help = "Generate JSON v2 output (qpdf --json compatible)")]
     json: Option<String>,
@@ -521,6 +522,14 @@ struct Cli {
     /// rewrite-mode positionals.
     #[arg(long = "qdf")]
     qdf: bool,
+
+    /// Preserve input objects that are not reachable from trailer roots
+    /// (qpdf `--preserve-unreferenced`). The default is disabled.
+    #[arg(
+        long = "preserve-unreferenced",
+        help = "Preserve unreferenced input objects in writer output"
+    )]
+    preserve_unreferenced: bool,
 
     /// Normalize PDF page content streams (qpdf --normalize-content=y|n).
     ///
@@ -1008,6 +1017,10 @@ struct QdfCommand {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
+    /// Preserve input objects that are not reachable from trailer roots
+    /// (qpdf `--preserve-unreferenced`).
+    #[arg(long = "preserve-unreferenced")]
+    preserve_unreferenced: bool,
 }
 
 /// Args for `qdf-fix` (qpdf `fix-qdf` equivalent). No password / no Pdf
@@ -1154,6 +1167,10 @@ struct RewriteCommand {
     /// --linearize (QDF is inherently non-linearized).
     #[arg(long = "qdf")]
     qdf: bool,
+    /// Preserve input objects that are not reachable from trailer roots
+    /// (qpdf `--preserve-unreferenced`). The default is disabled.
+    #[arg(long = "preserve-unreferenced")]
+    preserve_unreferenced: bool,
     /// Object stream behaviour for the output. Mirrors qpdf
     /// `--object-streams=preserve|disable|generate`. Default: `preserve`.
     ///
@@ -1735,6 +1752,7 @@ fn main() {
             &args.password,
             &key,
             args.deterministic_id,
+            args.preserve_unreferenced,
         )
     } else if !args.add_attachment.is_empty() {
         run_add_attachment(
@@ -1744,6 +1762,7 @@ fn main() {
             &args.password,
             attachment_segments,
             args.deterministic_id,
+            args.preserve_unreferenced,
             args.verbose,
         )
     } else if !args.copy_attachments_from.is_empty() {
@@ -1754,6 +1773,7 @@ fn main() {
             &args.password,
             args.copy_attachments_from,
             args.deterministic_id,
+            args.preserve_unreferenced,
             args.verbose,
         )
     } else if args.linearize {
@@ -1772,6 +1792,7 @@ fn main() {
             deterministic_id: args.deterministic_id,
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
+            preserve_unreferenced_objects: args.preserve_unreferenced,
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             ..WriterOptions::default()
@@ -1858,6 +1879,7 @@ fn main() {
             deterministic_id: args.deterministic_id,
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
+            preserve_unreferenced_objects: args.preserve_unreferenced,
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
@@ -1920,6 +1942,7 @@ fn main() {
             deterministic_id: args.deterministic_id,
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
+            preserve_unreferenced_objects: args.preserve_unreferenced,
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
@@ -2300,7 +2323,13 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 run_show_pages(Some(cmd.input), cmd.repair, &cmd.password)
             }
         }
-        Commands::Qdf(cmd) => run_qdf(Some(cmd.input), Some(cmd.output), cmd.repair, &cmd.password),
+        Commands::Qdf(cmd) => run_qdf(
+            Some(cmd.input),
+            Some(cmd.output),
+            cmd.repair,
+            &cmd.password,
+            cmd.preserve_unreferenced,
+        ),
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => run_show_encryption(&cmd.input, cmd.repair, &cmd.password),
@@ -2364,6 +2393,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 min_version: cmd.min_version,
                 force_version: cmd.force_version,
                 no_original_object_ids: cmd.no_original_object_ids,
+                preserve_unreferenced_objects: cmd.preserve_unreferenced,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
                 // output preparation directly.
                 qdf: cmd.qdf,
@@ -5140,6 +5170,7 @@ fn run_qdf(
     output: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
+    preserve_unreferenced: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
@@ -5150,6 +5181,7 @@ fn run_qdf(
     // The `qdf` subcommand is the canonical PdfWriter QDF mode.
     let options = WriterOptions {
         qdf: true,
+        preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
     write_with_pdf_writer(
@@ -6392,6 +6424,7 @@ fn path_basename(path: &std::path::Path) -> CliResult<Vec<u8>> {
 }
 
 /// `--add-attachment FILE [sub-flags] -- output.pdf`
+#[allow(clippy::too_many_arguments)]
 fn run_add_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -6399,6 +6432,7 @@ fn run_add_attachment(
     password: &PasswordArgs,
     segments: Vec<Vec<String>>,
     deterministic_id: bool,
+    preserve_unreferenced: bool,
     verbose: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
@@ -6446,6 +6480,7 @@ fn run_add_attachment(
 
     let options = WriterOptions {
         deterministic_id,
+        preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
     write_with_pdf_writer(
@@ -6472,6 +6507,7 @@ fn run_remove_attachment(
     password: &PasswordArgs,
     key: &str,
     deterministic_id: bool,
+    preserve_unreferenced: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
@@ -6485,6 +6521,7 @@ fn run_remove_attachment(
 
     let options = WriterOptions {
         deterministic_id,
+        preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
     let mut standard_output = None;
@@ -6541,6 +6578,7 @@ fn run_show_attachment(
 }
 
 /// `--copy-attachments-from FILE [--password=P] [--prefix=X] -- input output`
+#[allow(clippy::too_many_arguments)]
 fn run_copy_attachments_from(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -6548,6 +6586,7 @@ fn run_copy_attachments_from(
     password: &PasswordArgs,
     tokens: Vec<String>,
     deterministic_id: bool,
+    preserve_unreferenced: bool,
     verbose: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
@@ -6602,6 +6641,7 @@ fn run_copy_attachments_from(
 
     let writer_options = WriterOptions {
         deterministic_id,
+        preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
     write_with_pdf_writer(

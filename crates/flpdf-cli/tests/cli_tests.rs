@@ -675,6 +675,135 @@ fn qdf_subcommand_dumps_all_reachable_objects() {
 }
 
 #[test]
+fn preserve_unreferenced_retains_orphan_across_writer_cli_surfaces() {
+    let fixture = fixture_with_orphan_object();
+    let temp = tempfile::tempdir().unwrap();
+    let input = fixture.path();
+
+    for (name, args) in [
+        ("rewrite", vec!["rewrite", "--preserve-unreferenced"]),
+        (
+            "rewrite-disable",
+            vec![
+                "rewrite",
+                "--preserve-unreferenced",
+                "--object-streams=disable",
+            ],
+        ),
+        (
+            "rewrite-generate",
+            vec![
+                "rewrite",
+                "--preserve-unreferenced",
+                "--object-streams=generate",
+            ],
+        ),
+        ("qdf", vec!["qdf", "--preserve-unreferenced"]),
+        ("top-level", vec!["--preserve-unreferenced"]),
+    ] {
+        let output = temp.path().join(format!("{name}.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(input)
+            .arg(&output)
+            .assert()
+            .success();
+        let rendered = std::fs::read(&output).unwrap();
+        assert!(
+            contains(&rendered, b"/Type /Orphan"),
+            "{name} preserve-unreferenced route must retain the orphan object"
+        );
+    }
+
+    let qpdf_output = temp.path().join("qpdf-qdf.pdf");
+    let qpdf_status = std::process::Command::new("qpdf")
+        .args(["--qdf", "--preserve-unreferenced", "--static-id"])
+        .arg(input)
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(
+        qpdf_status.success(),
+        "qpdf preserve-unreferenced probe failed"
+    );
+    let qpdf_rendered = std::fs::read(qpdf_output).unwrap();
+    assert_eq!(
+        contains(&qpdf_rendered, b"/Type /Orphan"),
+        contains(
+            &std::fs::read(temp.path().join("qdf.pdf")).unwrap(),
+            b"/Type /Orphan"
+        ),
+        "flpdf qdf preserve-unreferenced must match qpdf's orphan reachability"
+    );
+}
+
+#[test]
+fn preserve_unreferenced_is_accepted_for_inspection_only_check() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--preserve-unreferenced",
+            "--check",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn preserve_unreferenced_linearize_matches_qpdf_reachability() {
+    let fixture = fixture_with_orphan_object();
+    let input = fixture.path();
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf-linearized.pdf");
+    let flpdf_output = temp.path().join("flpdf-linearized.pdf");
+
+    let qpdf_status = std::process::Command::new("qpdf")
+        .args(["--linearize", "--preserve-unreferenced", "--static-id"])
+        .arg(input)
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(qpdf_status.success(), "qpdf linearize probe failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--preserve-unreferenced", "--linearize", "--static-id"])
+        .arg(input)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let xref_count = |path: &std::path::Path| {
+        let output = std::process::Command::new("qpdf")
+            .args(["--show-xref"])
+            .arg(path)
+            .output()
+            .expect("qpdf --show-xref");
+        assert!(output.status.success(), "qpdf --show-xref failed");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    };
+
+    assert!(
+        !contains(&std::fs::read(&qpdf_output).unwrap(), b"/Type /Orphan"),
+        "qpdf linearize does not preserve unreachable objects"
+    );
+    assert!(
+        !contains(&std::fs::read(&flpdf_output).unwrap(), b"/Type /Orphan"),
+        "flpdf linearize must match qpdf's reachability policy"
+    );
+    assert_eq!(
+        xref_count(&flpdf_output),
+        xref_count(&qpdf_output),
+        "linearized preserve-unreferenced must match qpdf's object set"
+    );
+}
+
+#[test]
 fn rewrite_subcommand_rewrites_output() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
@@ -4931,6 +5060,16 @@ fn rewrite_help_shows_newline_before_endstream_default_never() {
         .stdout(predicate::str::contains("default: never"));
 }
 
+#[test]
+fn rewrite_help_shows_preserve_unreferenced() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("preserve-unreferenced"));
+}
+
 // ── combination tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -6477,6 +6616,7 @@ fn remove_attachment_removes_existing_key() {
         .args([
             out1.to_str().unwrap(),
             "--remove-attachment=removeme",
+            "--preserve-unreferenced",
             out2.to_str().unwrap(),
         ])
         .assert()
