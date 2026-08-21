@@ -10,9 +10,27 @@
 
 use libfuzzer_sys::fuzz_target;
 use flpdf::job::QPDFJob;
-use flpdf::PdfOpenOptions;
+use flpdf::{PdfOpenOptions, QPDFLogger};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// A logger whose info/warn/error sinks all discard, shared across fuzz
+/// iterations. `job::QPDFJob::check`'s banner and diagnostic output would
+/// otherwise go to the job's default logger, which routes to real process
+/// stdout/stderr (qpdf's own fuzzer never drives `QPDFJob` for the same
+/// reason -- it calls `QPDF`/`QPDFWriter` directly with `Pl_Discard`).
+fn discard_logger() -> QPDFLogger {
+    static LOGGER: OnceLock<QPDFLogger> = OnceLock::new();
+    LOGGER
+        .get_or_init(|| {
+            let logger = QPDFLogger::create();
+            logger.set_info(Some(logger.discard()));
+            logger.set_warn(Some(logger.discard()));
+            logger.set_error(Some(logger.discard()));
+            logger
+        })
+        .clone()
+}
 
 fuzz_target!(|data: &[u8]| {
     // `Pdf<R>` requires `R: 'static`, and libFuzzer lends `data` only for the
@@ -26,6 +44,7 @@ fuzz_target!(|data: &[u8]| {
     // runs the canonical qpdf document-check consumer, exercising the
     // recovery branches the strict open skips.
     let mut job = QPDFJob::new();
+    job.set_logger(discard_logger());
     if let Ok(mut pdf) = job.open(
         Cursor::new(Arc::clone(&shared)),
         "fuzz-regression.pdf",

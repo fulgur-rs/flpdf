@@ -118,11 +118,13 @@ are not treated as vulnerabilities on their own:
   `max_output` to bound each `FlateDecode` / `LZWDecode` stage). qpdf's CLI has
   no corresponding flag, so `flpdf-cli` does not expose this cap either; a
   content stream that exceeds a caller-supplied limit is reported as a
-  warning, not as corruption. The limit bounds the generalized-filter decode
-  the check pass performs; a content stream
-  carrying an explicit `/Crypt` filter is decoded during object resolution
-  (unbounded) before the check pass sees it, so it is not yet bounded. flpdf's
-  other document paths still place no output cap by default.
+  warning, not as corruption. `job::QPDFJob::check` (the `--check` route)
+  does not take a `DecodeLimits` parameter and decodes page content streams
+  unbounded, matching qpdf's own uncapped `qpdf_dl_all` traversal — the
+  opt-in limit is only reachable through the ordinary decode APIs
+  (`Pdf::resolve`, page/resource/attachment access, `PdfWriter`), not through
+  `--check`. flpdf's other document paths still place no output cap by
+  default.
 - **PDF permission enforcement.** Owner-password usage restrictions
   (printing, copying, …) are advisory metadata under the PDF specification.
   flpdf, like qpdf, can remove them (`--remove-restrictions`); this is a

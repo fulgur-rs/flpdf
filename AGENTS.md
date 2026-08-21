@@ -30,7 +30,7 @@
 - High-signal focused checks:
   - `cargo test -p flpdf --test reader_tests`
   - `cargo test -p flpdf --test xref_tests`
-  - `cargo test -p flpdf --test check_tests`
+  - `cargo test -p flpdf job::check::tests`
   - `cargo test -p flpdf --test writer_tests`
   - `cargo test -p flpdf-cli --test cli_tests`
   - `cargo test -p flpdf-cli --test compat_matrix_tests` (skips if `qpdf` is not installed)
