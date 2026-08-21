@@ -4,6 +4,17 @@
 //! This is the canonical value boundary for the JSON input importer. It builds
 //! document-owned `ObjectHandle` values and never routes through the legacy
 //! `Object`/`Pdf::set_object` representation.
+//!
+//! The importer has two intentional category (B) internal substitutions whose
+//! observable JSON contract is pinned to qpdf:
+//!
+//! - `validate_pdf_version` is a Rust byte-slice implementation of
+//!   `QPDF::validatePDFVersion` (`libqpdf/QPDF.cc:366-384`), with the caller's
+//!   full-consumption check from `QPDF_json.cc:503-518` preserved.
+//! - `JsonDescription` is constructed per handle by
+//!   `ObjectHandle::set_description_json`, instead of mutating qpdf's shared
+//!   `QPDFValue::Description` in `QPDF_json.cc:721-730`; input name, object
+//!   identity, and parsed offset remain the same.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

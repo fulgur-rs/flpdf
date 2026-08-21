@@ -30,6 +30,9 @@ jobs:
       - name: Check qpdf module correspondence
         run: python3 scripts/qpdf-module-docs.py --check
 
+      - name: Test qpdf JSON input correspondence contract
+        run: python3 -m unittest scripts/tests/test_json_input_correspondence.py
+
       - name: Test qpdf-deviation marker checker
         run: python3 -m unittest scripts/tests/test_qpdf_deviation_markers.py
 
