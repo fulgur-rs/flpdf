@@ -951,6 +951,53 @@ pub(crate) enum ObjectValue {
     Reference(ObjectRef),
 }
 
+impl ObjectValue {
+    /// Return qpdf's value-layer type ordinal.
+    ///
+    /// qpdf stores this as `QPDFValue::type_code` and lets
+    /// `QPDFObject::getTypeCode` read it directly
+    /// (`libqpdf/qpdf/QPDFObject_private.hh:42-50`). The enum match is the
+    /// Rust equivalent of each `QPDFValue` subclass initializing that field.
+    pub(crate) fn type_code(&self) -> u8 {
+        match self {
+            Self::Null => 2,
+            Self::Boolean(_) => 3,
+            Self::Integer(_) => 4,
+            Self::Real(_) | Self::RealLiteral { .. } => 5,
+            Self::String(_) => 6,
+            Self::Name(_) => 7,
+            Self::Array(_) => 8,
+            Self::Dictionary(_) => 9,
+            Self::Stream { .. } => 10,
+            Self::Operator(_) => 11,
+            Self::InlineImage(_) => 12,
+            Self::Reference(_) => 13,
+        }
+    }
+
+    /// Return qpdf's value-layer type name.
+    ///
+    /// This mirrors `QPDFValue::type_name`, which
+    /// `QPDFObject::getTypeName` reads alongside `type_code`
+    /// (`libqpdf/qpdf/QPDFObject_private.hh:52-60`).
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean(_) => "boolean",
+            Self::Integer(_) => "integer",
+            Self::Real(_) | Self::RealLiteral { .. } => "real",
+            Self::String(_) => "string",
+            Self::Name(_) => "name",
+            Self::Array(_) => "array",
+            Self::Dictionary(_) => "dictionary",
+            Self::Stream { .. } => "stream",
+            Self::Operator(_) => "operator",
+            Self::InlineImage(_) => "inline-image",
+            Self::Reference(_) => "unresolved",
+        }
+    }
+}
+
 /// qpdf stores dictionary names in their canonical name-string form, including
 /// the leading slash (`QPDFObjectHandle.hh:747-780`; `QPDF_Dictionary.cc:97-153`).
 /// The legacy `Object`/`Dictionary` bridge deliberately omits that slash, so
@@ -5378,55 +5425,39 @@ impl ObjectHandle {
         }
         self.try_dereference()?;
         self.with_value(|value| {
-            Ok(match value.expect(
-                "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
-            ) {
-                ObjectValue::Null => 2,
-                ObjectValue::Boolean(_) => 3,
-                ObjectValue::Integer(_) => 4,
-                ObjectValue::Real(_) | ObjectValue::RealLiteral { .. } => 5,
-                ObjectValue::String(_) => 6,
-                ObjectValue::Name(_) => 7,
-                ObjectValue::Array(_) => 8,
-                ObjectValue::Dictionary(_) => 9,
-                ObjectValue::Stream { .. } => 10,
-                ObjectValue::Operator(_) => 11,
-                ObjectValue::InlineImage(_) => 12,
-                // See this method's own doc for why this maps to
-                // `ot_unresolved`: a real, reachable state (via
-                // `Pdf::set_object`), not speculative dead code — see
-                // `resolved_to_a_reference_indirect_handle_reports_unresolved`
-                // for a test that exercises it via the same `set_resolved`
-                // call `Pdf::set_object` itself makes.
-                ObjectValue::Reference(_) => 13,
-            })
+            Ok(value
+                .expect(
+                    "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
+                )
+                .type_code())
         })
     }
 
-    /// The qpdf-compatible type name string for [`Self::type_code`]'s
-    /// ordinal (`libqpdf/QPDFObjectHandle.cc:240-250`'s `getTypeName`, via
-    /// each `QPDFValue` subclass's own registered name, e.g.
-    /// `libqpdf/QPDF_InlineImage.cc:6`). Resolution errors from
-    /// [`Self::type_code`] are propagated unchanged.
+    /// The qpdf-compatible type name string for this handle's value.
+    /// `QPDFObjectHandle::getTypeName` dereferences and delegates to
+    /// `QPDFObject::getTypeName` (`libqpdf/QPDFObjectHandle.cc:247-250`),
+    /// which reads the value-layer `type_name` field. Resolution errors are
+    /// propagated unchanged.
     pub fn type_name(&self) -> Result<&'static str> {
-        Ok(match self.type_code()? {
-            1 => "reserved",
-            2 => "null",
-            3 => "boolean",
-            4 => "integer",
-            5 => "real",
-            6 => "string",
-            7 => "name",
-            8 => "array",
-            9 => "dictionary",
-            10 => "stream",
-            11 => "operator",
-            12 => "inline-image",
-            14 => "destroyed",
-            // `type_code` only ever returns 13 for any other value it can
-            // produce, so this is exhaustive in practice, not a silent
-            // catch-all for an unhandled ordinal.
-            _ => "unresolved",
+        {
+            // Reserved and destroyed are handle states rather than
+            // ObjectValue payloads, so retain their qpdf sentinel names at
+            // this layer.
+            let slot_ref = self.0.borrow();
+            let state = slot_ref.state.borrow();
+            match &*state {
+                ObjectState::Reserved => return Ok("reserved"),
+                ObjectState::Destroyed => return Ok("destroyed"),
+                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
+            }
+        }
+        self.try_dereference()?;
+        self.with_value(|value| {
+            Ok(value
+                .expect(
+                    "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
+                )
+                .type_name())
         })
     }
 
@@ -13135,6 +13166,54 @@ mod is_resolved_visibility_tests {
 #[cfg(test)]
 mod type_code_tests {
     use super::*;
+
+    #[test]
+    fn object_values_report_qpdf_type_codes_and_names() {
+        let cases = [
+            (ObjectValue::Null, 2, "null"),
+            (ObjectValue::Boolean(true), 3, "boolean"),
+            (ObjectValue::Integer(1), 4, "integer"),
+            (ObjectValue::Real(1.5), 5, "real"),
+            (
+                ObjectValue::RealLiteral {
+                    value: 0.4,
+                    literal: b".4".to_vec(),
+                },
+                5,
+                "real",
+            ),
+            (ObjectValue::String(b"s".to_vec()), 6, "string"),
+            (ObjectValue::Name(b"N".to_vec()), 7, "name"),
+            (ObjectValue::Array(Vec::new()), 8, "array"),
+            (
+                ObjectValue::Dictionary(std::collections::BTreeMap::new()),
+                9,
+                "dictionary",
+            ),
+            (
+                ObjectValue::Stream {
+                    stream_dict: ObjectHandle::dictionary(Vec::new()),
+                    stream_data: None,
+                    stream_provider: None,
+                    stream_length: 0,
+                },
+                10,
+                "stream",
+            ),
+            (ObjectValue::Operator(b"q".to_vec()), 11, "operator"),
+            (ObjectValue::InlineImage(b"d".to_vec()), 12, "inline-image"),
+            (
+                ObjectValue::Reference(ObjectRef::new(7, 0)),
+                13,
+                "unresolved",
+            ),
+        ];
+
+        for (value, code, name) in cases {
+            assert_eq!(value.type_code(), code, "{name}");
+            assert_eq!(value.type_name(), name);
+        }
+    }
 
     #[test]
     fn direct_scalar_and_container_type_codes_match_qpdf_ordinals() {
