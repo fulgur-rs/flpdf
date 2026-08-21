@@ -207,6 +207,97 @@ qpdf `QPDFPageObjectHelper::getAttribute`
 洗い出して機械可読にマークしておけば、この 1 件は実装時点で切り離せて
 いた。
 
+## 7. メソッド名は qpdf の識別子から機械的に導出し、引用前に実在を検証する
+
+flpdf のメソッド名は「qpdf のどの識別子を訳したものか」が常に一意に
+辿れることを設計目標とする。命名を Rust の一般的な慣用に寄せるか
+qpdf の識別子に寄せるかで両者が対立するとき、このクレートは
+**qpdf 識別子への 1:1 対応（grep 可能性）を優先する**。
+
+### ルール
+
+- **qpdf の `getX()`/`isX()`/`hasX()` のうち、実際に計算・解決・qpdf の
+  既定値/フォールバック処理を伴うものは prefix を落とさず
+  `get_x`/`is_x`/`has_x` に写す**。`page_object_helper.rs`
+  （`get_media_box`/`get_crop_box`/`get_resources` 等、いずれも
+  `&mut self -> Result<...>` で継承属性 walk 等の実処理を伴う）と
+  `annotation_helper.rs`（`get_subtype`/`get_rect`/`get_flags` 等）が
+  確立した支配的な慣行で、Rust API Guidelines の C-GETTER（単純 getter は
+  `get_` を省く）とは逆方向だが、それは意図的な選択。理由は「qpdf の
+  `getTitle()` を読んだ人が flpdf 側で `grep get_title` すれば一致する」
+  という 1:1 対応をコードの見た目より優先するため。
+  **例外は、格納済みフィールドをそのまま返すだけの bare getter**
+  （`&self -> T` で PDF I/O・解決・フォールバック計算を一切伴わない）—
+  `job/lifecycle.rs` の `logger()`（`self.logger.clone()` 一行）・
+  `message_prefix()`（`&self.message_prefix` 一行）はこちらに該当し、
+  qpdf の `getLogger()`/`getMessagePrefix()` に対応するが prefix を
+  落としても支配的慣行と矛盾しない（C-GETTER 通りで正しい）。
+  **副作用/計算を伴う getter で prefix を落としているものは、支配的慣行との
+  真の食い違いとして扱う** — `form_field_object_helper.rs` の
+  `flags`/`partial_name`/`value`（いずれも `&mut self -> Result<...>` で
+  inheritable attribute 解決を伴い、qpdf の
+  `getFlags`/`getPartialName`/`getValue` を直接写している）が該当し、
+  `get_flags`/`get_partial_name`/`get_value` へ寄せる余地がある。
+  `filespec_helper.rs` の `size()`/`get_size()`・`creation_date()`/
+  `get_creation_date()` のような prefix なし/ありの併存は、見かけは同じでも
+  中身が違う **意図した 2 層**（`size()` は `/Params /Size` の生の
+  `Option<i64>`、`get_size()` はそれを負値/欠損を 0 にする qpdf の既定値
+  ロジックまで含めて写した `usize`）なので、これは食い違いではなく
+  むしろ良い実例——prefix の有無が「qpdf の `getX()` の既定値処理まで
+  含めて再現しているか」の目印になっている。新規コードで似た二層構造を
+  作るときはこの区別を踏襲する。
+  新規コードは、計算を伴う getter では `get_` を保持する側に合わせ、
+  `form_field_object_helper.rs` のような drop 済み箇所は見つけ次第 issue化の
+  対象とする（このルール自体を根拠に一括リネームを今すぐ強制はしない —
+  3 の「前例は qpdf 対応を確認してから根拠にする」と同様、この不一致自体を
+  新しい前例の論拠にしない）。
+- **qpdf の `doX()`（`QPDFJob` のコマンドディスパッチ）は `do` を落として
+  `x()` に写す**。`do` 自体に意味はなく、動作を表すのは残りの語だけ
+  だから: `doCheck`→`check`、`doInspection`→`inspect`、
+  `doListAttachments`→`list_attachments`、`doSplitPages`→`split_pages`。
+  `handleX()` は `handle` 自体に「入力を受けて処理を実行する」という
+  意味があるので落とさない: `handlePageSpecs`→`handle_page_specs`。
+- **戻り値の形が qpdf と違うために動詞ごと変えるのは許容される—ただし
+  crate 内で一貫していること**。`doJSONPages`/`doJSONPageLabels`/
+  `doJSONOutlines`/`doJSONAcroform`/`doJSONEncrypt`/`doJSONAttachments`
+  （qpdf 側は `void` で pipeline に直接書く）→
+  `build_pages_section`/`build_pagelabels_section`/…（flpdf 側は `Json`
+  値を返す設計）は 6 箇所全てに同じ「`do`+`JSON`を落とし`build_`+`_section`
+  を付与」パターンが適用されており、単発の思いつきではなく意図した変換だと
+  判断できる。1 箇所だけ動詞が違う場合はそちらを疑う。
+- **qpdf 側に個別の識別子が無い（より大きな private メソッド内の
+  インラインコードの抽出）場合、flpdf 側の独自命名は逸脱ではない**。
+  訳す元の識別子が存在しないのだから「qpdf 名への翻訳」という基準自体が
+  適用されない。`prune_acroform_after_subset`
+  （qpdf 側は `QPDFJob::handlePageSpecs` 内のインラインコード、
+  `QPDFJob.cc:2610-2632`）はこの例。ただし doc comment 側で
+  「これは qpdf の `QPDFJob::prune_acroform_after_subset` の移植」のように
+  **実在しない qpdf 識別子をでっち上げて引用してはならない**（次項）。
+- **doc comment で qpdf の識別子（`QPDFJob::doX` 等）を引用する前に、
+  pinned qpdf source（`scripts/fetch-qpdf-source.sh --print-path` /
+  `libqpdf/*.cc`・`include/qpdf/*.hh`）に grep して実在を確認する**。
+  「qpdf の命名スタイルに合ってそう」は実在の証拠にならない。特に
+  `doX`/`handleX` は似た名前が両方存在する（`handleUnderOverlay` と
+  `doUnderOverlayForPage` など）ため、雰囲気で片方を選んで引用すると誤る。
+
+### 該当例
+
+`docs/qpdf-correspondence.md` が `QPDFJob::prune_acroform_after_subset` を
+実在する qpdf メソッドであるかのように記載していた（実際は
+`handlePageSpecs` 内のインラインコードで、qpdf 側に個別の識別子は無い）。
+同じセッションで `job/overlay.rs` の doc comment 4 箇所が
+`QPDFJob::doUnderOverlay`（qpdf に実在しない）を引用していたことも
+判明した。実在するのは `QPDFJob::handleUnderOverlay`
+（`QPDFJob.cc:1937`、複数の `--overlay`/`--underlay` グループをまとめて
+処理する側）と、その内部から呼ばれる `QPDFJob::doUnderOverlayForPage`
+（`QPDFJob.cc:1859`、1 ページ分のコンテンツ文字列を組み立てる側）で、
+4 箇所とも前者の責務を指していたため `handleUnderOverlay` に修正した。
+どちらも「qpdf 風の識別子をパターンマッチで作文し、実在確認しないまま
+docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job/*.rs`
+全 17 ファイル・228 関数を対象にした命名監査では、この 2 件の doc
+記載ミス以外に high confidence の命名乖離は見つからなかった——
+`doX`→`x`、`handleX`→`handle_x` の変換自体は一貫して正確に行われていた。
+
 ---
 
 ## 補足
@@ -216,6 +307,6 @@ qpdf `QPDFPageObjectHelper::getAttribute`
 - **既存 2 本との関係**: 本文書（設計）→ `pdf-rust-review-patterns.md`
   （実装・コードレビュー）→ `pdf-rust-doc-review-patterns.md`（公開 doc）の順で
   適用範囲が下りていく。設計を誤ると下 2 本は誤った設計を綺麗に磨くだけになる。
-- 1〜6 は「出発点」「中断シグナル」「前例の検証」「依存順序」「逐語訳の粒度」
-  「複数実装統合前の機械可読マーキング」という、qpdf 移植の設計段階に
-  固有の落とし穴。
+- 1〜7 は「出発点」「中断シグナル」「前例の検証」「依存順序」「逐語訳の粒度」
+  「複数実装統合前の機械可読マーキング」「メソッド名の導出と実在検証」という、
+  qpdf 移植の設計段階に固有の落とし穴。
