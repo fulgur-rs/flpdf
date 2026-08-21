@@ -66,6 +66,22 @@ impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
     }
 }
 
+/// Return whether `object_ref` is a source ObjStm container that qpdf
+/// reconstructs rather than enqueues as an ordinary output object.
+///
+/// qpdf's Preserve mapping retains source ObjStm membership
+/// (`QPDFWriter.cc:1939-1967`) but emits a rebuilt container. Keep source xref
+/// streams in this legacy coordinator: qpdf's preserve path retains the source
+/// xref section as part of its split xref output.
+fn is_qpdf_source_objstm_container<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    object_ref: ObjectRef,
+) -> crate::Result<bool> {
+    let handle = pdf.get_object_handle(object_ref);
+    pdf.resolve_object_handle(&handle)?;
+    handle.try_is_stream_of_type(b"ObjStm", b"")
+}
+
 /// A map from original object references to their qpdf-style Catalog-first
 /// numbers, plus the visitation order that produced them.
 #[allow(dead_code)]
@@ -261,11 +277,21 @@ impl CanonicalCatalogFirstRenumber {
             .root_ref()
             .ok_or_else(|| Error::Unsupported("plain rewrite: trailer has no /Root".to_string()))?;
         let mut seeds = if preserve_unreferenced_objects {
-            pdf.get_all_object_handles()?
+            let mut seeds = Vec::new();
+            for object_ref in pdf
+                .get_all_object_handles()?
                 .into_iter()
                 .filter_map(|handle| handle.object_ref())
-                .filter(|object_ref| object_ref.number != 0 && !removed_refs.contains(object_ref))
-                .collect()
+            {
+                if object_ref.number == 0
+                    || removed_refs.contains(&object_ref)
+                    || is_qpdf_source_objstm_container(pdf, object_ref)?
+                {
+                    continue;
+                }
+                seeds.push(object_ref);
+            }
+            seeds
         } else {
             Vec::new()
         };
@@ -1451,6 +1477,31 @@ mod tests {
 
         assert_eq!(map.new_for_original(ObjectRef::new(0, 0)), None);
         assert!(map.pairs().all(|(_output, source)| source.number != 0));
+    }
+
+    #[test]
+    fn preserving_unreferenced_objects_does_not_seed_source_objstm() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/null-visible-preserve-unreachable.pdf");
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(path).expect("open ObjStm fixture"),
+        ))
+        .expect("ObjStm fixture must open");
+        let objects = pdf
+            .get_all_object_handles()
+            .expect("enumerate source objects");
+        assert!(
+            objects
+                .iter()
+                .any(|handle| handle.object_ref() == Some(ObjectRef::new(9, 0))),
+            "fixture must expose its source ObjStm to the preserve seed set"
+        );
+
+        let map = CanonicalCatalogFirstRenumber::build_qpdf(&mut pdf, true, true, &BTreeSet::new())
+            .expect("preserve-unreferenced renumbering must succeed");
+
+        assert_eq!(map.new_for_original(ObjectRef::new(9, 0)), None);
+        assert!(map.new_for_original(ObjectRef::new(5, 0)).is_some());
     }
 
     #[test]

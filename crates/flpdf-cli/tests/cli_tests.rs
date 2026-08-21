@@ -739,6 +739,56 @@ fn preserve_unreferenced_retains_orphan_across_writer_cli_surfaces() {
 }
 
 #[test]
+fn preserve_unreferenced_remove_attachment_matches_qpdf() {
+    let input = "../../tests/fixtures/compat/attachment-two-page.pdf";
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf-remove-preserve.pdf");
+    let flpdf_output = temp.path().join("flpdf-remove-preserve.pdf");
+
+    let qpdf_status = std::process::Command::new("qpdf")
+        .args([
+            "--remove-attachment=attachment.txt",
+            "--preserve-unreferenced",
+            "--static-id",
+        ])
+        .arg(input)
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(qpdf_status.success(), "qpdf attachment removal failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input,
+            "--remove-attachment=attachment.txt",
+            "--preserve-unreferenced",
+        ])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let xref_count = |path: &std::path::Path| {
+        let output = std::process::Command::new("qpdf")
+            .args(["--show-xref"])
+            .arg(path)
+            .output()
+            .expect("qpdf --show-xref");
+        assert!(output.status.success(), "qpdf --show-xref failed");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    };
+
+    assert_eq!(
+        xref_count(&flpdf_output),
+        xref_count(&qpdf_output),
+        "preserve-unreferenced attachment removal must retain qpdf's detached objects"
+    );
+}
+
+#[test]
 fn preserve_unreferenced_is_accepted_for_inspection_only_check() {
     Command::cargo_bin("flpdf")
         .unwrap()

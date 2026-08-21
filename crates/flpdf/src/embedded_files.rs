@@ -256,7 +256,13 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             return Ok(false);
         };
         if let Some(object_ref) = removed.object_ref() {
-            self.pdf.remove_object_handle(object_ref)?;
+            // qpdf's removeEmbeddedFile keeps the xref slot as a null object
+            // (`QPDFEmbeddedFileDocumentHelper.cc:115-119`). The writer then
+            // decides whether the detached Filespec and its streams are
+            // emitted: ordinary rewrites garbage-collect them, while
+            // preserve-unreferenced retains them.
+            self.pdf
+                .replace_object_handle(object_ref, ObjectHandle::null())?;
         }
         Ok(true)
     }

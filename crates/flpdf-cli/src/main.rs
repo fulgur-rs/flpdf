@@ -2,6 +2,7 @@
 
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
+use flpdf::fix_qdf;
 use flpdf::job::{
     AttachmentAddOptions, AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError,
     JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions,
@@ -24,7 +25,6 @@ use flpdf::{
     PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
 };
-use flpdf::{fix_qdf, remove_attachment};
 use flpdf::{
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
     outline_dest_remap::remap_outline_and_dests,
@@ -6514,7 +6514,7 @@ fn run_remove_attachment(
 
     let mut pdf = open_pdf(&input, repair, password)?;
 
-    let found = remove_attachment(&mut pdf, key.as_bytes())?;
+    let found = pdf.embedded_files().remove_embedded_file(key.as_bytes())?;
     if !found {
         return Err(format!("--remove-attachment: key {:?} not found in document", key).into());
     }
