@@ -1342,9 +1342,9 @@ pub(crate) struct WriterOptions {
 
     /// Preserve source objects that are not reachable from the trailer roots.
     ///
-    /// The plain emitter currently honors it only with
-    /// [`ObjectStreamMode::Disable`]; object-stream membership for Preserve and
-    /// Generate remains a bounded follow-up.
+    /// The plain emitter honors it across [`ObjectStreamMode::Disable`],
+    /// [`ObjectStreamMode::Preserve`], and [`ObjectStreamMode::Generate`]
+    /// planning, while still excluding explicitly removed identities.
     pub preserve_unreferenced_objects: bool,
 
     /// Stream compression policy for the full-rewrite path.
@@ -3851,7 +3851,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // emission loop; the legacy raw-Object walk would parse a content holder
     // once for numbering and make the writer report its recovery warning a
     // second time when the live handle is emitted.
-    let renumber = CanonicalCatalogFirstRenumber::build_qpdf(pdf, true, false, &removed_refs)?;
+    // qpdf's `--qdf --preserve-unreferenced` still seeds the standard writer
+    // with every input object; QDF changes formatting and ObjStm policy, not
+    // the reachability setting (`QPDFWriter.cc:2907-2914`). Keep the setting
+    // alive on this specialized coordinator, which is the route QDF uses.
+    let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
+        pdf,
+        true,
+        options.preserve_unreferenced_objects,
+        &removed_refs,
+    )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the preserve qdf call is exercised by the writer contract test.
+
     // The new /Root reference (always seeded first by the walk, so present).
     let new_root = renumber
         .new_for_original(root_ref)

@@ -2098,6 +2098,27 @@ fn pdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Resul
     assert!(contains_bytes(&preserved_output, marker));
     assert!(!contains_bytes(&preserved_output, b"/Prev"));
 
+    let mut qdf_pdf = Pdf::open(Cursor::new(synthetic_unreferenced_object_pdf()))?;
+    let mut qdf_writer = PdfWriter::new(&mut qdf_pdf);
+    qdf_writer.set_qdf_mode(true);
+    qdf_writer.set_preserve_unreferenced_objects(true);
+    qdf_writer.set_static_id(true);
+    qdf_writer.set_output_memory()?;
+    qdf_writer.write()?;
+    let qdf_output = qdf_writer.get_buffer()?;
+    assert!(contains_bytes(&qdf_output, marker));
+    assert!(contains_bytes(&qdf_output, b"%QDF-1.0"));
+
+    let mut generated_pdf = Pdf::open(Cursor::new(synthetic_unreferenced_object_pdf()))?;
+    let mut generated_writer = PdfWriter::new(&mut generated_pdf);
+    generated_writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    generated_writer.set_preserve_unreferenced_objects(true);
+    generated_writer.set_static_id(true);
+    generated_writer.set_output_memory()?;
+    generated_writer.write()?;
+    let generated_output = generated_writer.get_buffer()?;
+    assert!(contains_bytes(&generated_output, marker));
+
     let dir = tempfile::tempdir()?;
     let output_path = dir.path().join("preserved-unreferenced.pdf");
     std::fs::write(&output_path, preserved_output)?;
@@ -2107,6 +2128,124 @@ fn pdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Resul
         .output()?;
     assert!(check.status.success(), "qpdf --check failed: {check:?}");
 
+    Ok(())
+}
+
+#[test]
+fn preserve_encrypt_does_not_emit_a_source_objstm_twice() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let source =
+        include_bytes!("../../../tests/fixtures/compat/null-visible-preserve-unreachable.pdf");
+    let dir = tempfile::tempdir()?;
+    let input_path = dir.path().join("input.pdf");
+    let qpdf_path = dir.path().join("qpdf.pdf");
+    let flpdf_path = dir.path().join("flpdf.pdf");
+    std::fs::write(&input_path, source)?;
+
+    let qpdf_status = Command::new("qpdf")
+        .args([
+            "--object-streams=preserve",
+            "--preserve-unreferenced",
+            "--static-id",
+            "--encrypt",
+            "",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input_path)
+        .arg(&qpdf_path)
+        .status()?;
+    assert!(qpdf_status.success(), "qpdf preserve+encrypt failed");
+
+    let mut pdf = Pdf::open(Cursor::new(source.to_vec()))?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec()));
+    writer.set_output_memory()?;
+    writer.write()?;
+    let flpdf_output = writer.get_buffer()?;
+    std::fs::write(&flpdf_path, &flpdf_output)?;
+
+    let xref_count = |path: &std::path::Path| -> flpdf::Result<usize> {
+        let output = Command::new("qpdf")
+            .args(["--show-xref"])
+            .arg(path)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "qpdf --show-xref failed: {output:?}"
+        );
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count())
+    };
+
+    assert_eq!(xref_count(&flpdf_path)?, xref_count(&qpdf_path)?);
+    assert_eq!(
+        flpdf_output
+            .windows(b"/Type /ObjStm".len())
+            .filter(|part| *part == b"/Type /ObjStm")
+            .count(),
+        1,
+        "preserve+encrypt must not emit the source ObjStm alongside its rebuilt container"
+    );
+    assert_qpdf_check(&flpdf_output)?;
+
+    let qpdf_normalized_path = dir.path().join("qpdf-normalized.pdf");
+    let qpdf_normalized_status = Command::new("qpdf")
+        .args([
+            "--object-streams=preserve",
+            "--preserve-unreferenced",
+            "--normalize-content=y",
+            "--static-id",
+            "--encrypt",
+            "",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input_path)
+        .arg(&qpdf_normalized_path)
+        .status()?;
+    assert!(
+        qpdf_normalized_status.success(),
+        "qpdf preserve+encrypt+normalize failed"
+    );
+
+    let mut normalized_pdf = Pdf::open(Cursor::new(source.to_vec()))?;
+    let mut normalized_writer = PdfWriter::new(&mut normalized_pdf);
+    normalized_writer.set_object_stream_mode(ObjectStreamMode::Preserve);
+    normalized_writer.set_preserve_unreferenced_objects(true);
+    normalized_writer.set_content_normalization(true);
+    normalized_writer.set_static_id(true);
+    normalized_writer.set_static_aes_iv(true);
+    normalized_writer
+        .set_encryption_parameters(EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec()));
+    normalized_writer.set_output_memory()?;
+    normalized_writer.write()?;
+    let normalized_output = normalized_writer.get_buffer()?;
+    let normalized_path = dir.path().join("flpdf-normalized.pdf");
+    std::fs::write(&normalized_path, &normalized_output)?;
+    assert_eq!(
+        xref_count(&normalized_path)?,
+        xref_count(&qpdf_normalized_path)?
+    );
+    assert_eq!(
+        normalized_output
+            .windows(b"/Type /ObjStm".len())
+            .filter(|part| *part == b"/Type /ObjStm")
+            .count(),
+        1,
+        "normalized preserve+encrypt must not emit the source ObjStm twice"
+    );
+    assert_qpdf_check(&normalized_output)?;
     Ok(())
 }
 
