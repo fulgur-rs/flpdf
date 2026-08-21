@@ -33,11 +33,19 @@ use std::io::{Read, Seek};
 use std::ops::Index;
 use std::sync::OnceLock;
 
-/// Extract an outline dictionary's `/key` entry, or `None` when the object
-/// is not a dictionary or lacks that key. Shared by [`OutlineItem::get_title`],
-/// [`OutlineItem::get_count`], and [`OutlineItem::get_dest`].
+/// Extract an outline dictionary's `/key` entry, or `None` when the key is
+/// absent. Mirrors qpdf's `hasKey(key)`-gated `getKey(key)` shape used by
+/// `getTitle()`/`getCount()`/`getDest()`'s `/Dest` check
+/// (`libqpdf/QPDFOutlineObjectHelper.cc:52-54,87-88,97-98`): `try_has_key`
+/// alone decides, so a non-dictionary `object` reports through `try_has_key`'s
+/// own qpdf-matching `typeWarning("dictionary", "returning false for a key
+/// containment request")` instead of being silently swallowed by an upfront
+/// dictionary check. Shared by [`OutlineItem::get_title`],
+/// [`OutlineItem::get_count`], and [`OutlineItem::get_dest`]'s `/Dest` arm —
+/// NOT its `/A` arm, which qpdf reads unconditionally rather than
+/// `hasKey`-gated (see [`OutlineItem::get_dest`]).
 fn outline_dict_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
-    if object.try_as_dictionary()?.is_none() || !object.try_has_key(key)? {
+    if !object.try_has_key(key)? {
         return Ok(None);
     }
     Ok(Some(object.try_get_key(key)?))
@@ -61,14 +69,16 @@ fn count_from_handle(value: &ObjectHandle) -> Result<i32> {
 /// Resolve a node's `/A` action to its GoTo destination, mirroring the
 /// inline `/A` branch of qpdf's `getDest()`
 /// (`libqpdf/QPDFOutlineObjectHelper.cc:47-58`): the action must be a
-/// dictionary with `/S /GoTo` and a `/D` entry.
+/// dictionary with `/S /GoTo` and a `/D` entry. `action` is the raw,
+/// unconditional `getKey("/A")` result (qpdf never `hasKey`-gates this read,
+/// unlike `/Title`/`/Count`/`/Dest`; see [`outline_dict_key`]), so a
+/// non-dictionary receiver's warning here is `try_get_key`'s own
+/// `typeWarning("dictionary", "returning null for attempted key
+/// retrieval")`, not `try_has_key`'s "containment request" text.
 fn goto_action_dest<R: Read + Seek>(
     helper: &mut OutlineDocumentHelper<'_, R>,
-    action: Option<ObjectHandle>,
+    action: ObjectHandle,
 ) -> Result<Option<ObjectHandle>> {
-    let Some(action) = action else {
-        return Ok(None);
-    };
     let action = helper.resolve_value_handle(action)?;
     if action.try_as_dictionary()?.is_none() {
         return Ok(None);
@@ -151,6 +161,8 @@ impl OutlineItem {
     /// qpdf's own `if (dest.isName() || dest.isString())` dispatch to
     /// `m->dh.resolveNamedDest()`. A candidate that is neither name nor
     /// string (an explicit destination array, typically) is returned as-is.
+    /// `/A` is only read when `/Dest` is absent, matching qpdf's
+    /// `if (hasKey("/Dest")) {...} else if ((A = getKey("/A"))...)`.
     ///
     /// # Errors
     ///
@@ -161,10 +173,9 @@ impl OutlineItem {
         helper: &mut OutlineDocumentHelper<'_, R>,
     ) -> Result<ObjectHandle> {
         let dest_src = outline_dict_key(&self.object, b"/Dest")?;
-        let action_src = outline_dict_key(&self.object, b"/A")?;
         let candidate = match dest_src {
             Some(dest) => Some(dest),
-            None => goto_action_dest(helper, action_src)?,
+            None => goto_action_dest(helper, self.object.try_get_key(b"/A")?)?,
         };
         let Some(candidate) = candidate else {
             return Ok(ObjectHandle::null());

@@ -612,6 +612,104 @@ fn non_dictionary_first_is_still_an_outline_item_with_default_accessors() {
     assert!(tree[id].kids.is_empty());
 }
 
+/// Regression test for flpdf-t1wr: `get_title`/`get_count`/`get_dest` must
+/// each emit qpdf's `hasKey`/`getKey` type warning when the outline item
+/// itself resolves to a non-dictionary object, matching
+/// `getTitle`/`getCount`/`getDest` (`libqpdf/QPDFOutlineObjectHelper.cc:47-98`)
+/// calling `hasKey`/`getKey` directly on `this->oh` with no upfront
+/// `isDictionary()` guard. Confirmed against live qpdf 11.9.0: running
+/// `qpdf --json --json-key=outlines` on this same fixture emits exactly 8
+/// warnings (4x "returning false for a key containment request" from
+/// `hasKey(/Title)`, `hasKey(/Dest)` x2, `hasKey(/Count)`; 4x "returning
+/// null for attempted key retrieval" from `get_tree`'s `/First`/`/Next`
+/// chase and `getKey(/A)` x2 inside the two `getDest()` calls that
+/// `addOutlinesToJson` makes for "dest" and "destpageposfrom1").
+#[test]
+fn non_dictionary_outline_item_emits_qpdf_has_key_get_key_warnings_on_accessors() {
+    let bytes = build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines << /First 42 >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+    let id;
+    let tree = {
+        let mut helper = pdf.outline();
+        let tree = helper.get_tree().unwrap();
+        id = tree.roots()[0];
+        tree
+    };
+    // `get_tree`'s own /First and /Next chase over the non-dictionary 42
+    // already emits two qpdf-matching getKey warnings before any accessor runs.
+    let after_tree = warning_messages(&pdf);
+    assert_eq!(after_tree.len(), 2, "{after_tree:?}");
+    for message in &after_tree {
+        assert!(
+            message.ends_with(
+                "operation for dictionary attempted on object of type integer: \
+                 returning null for attempted key retrieval"
+            ),
+            "{after_tree:?}"
+        );
+    }
+
+    {
+        let mut helper = pdf.outline();
+        assert_eq!(tree[id].get_title(&mut helper).unwrap(), "");
+    }
+    let after_title = warning_messages(&pdf);
+    assert_eq!(after_title.len(), 3, "{after_title:?}");
+    assert!(
+        after_title[2].ends_with(
+            "operation for dictionary attempted on object of type integer: \
+             returning false for a key containment request"
+        ),
+        "{after_title:?}"
+    );
+
+    {
+        let mut helper = pdf.outline();
+        assert_eq!(tree[id].get_count(&mut helper).unwrap(), 0);
+    }
+    let after_count = warning_messages(&pdf);
+    assert_eq!(after_count.len(), 4, "{after_count:?}");
+    assert!(
+        after_count[3].ends_with(
+            "operation for dictionary attempted on object of type integer: \
+             returning false for a key containment request"
+        ),
+        "{after_count:?}"
+    );
+
+    let dest = {
+        let mut helper = pdf.outline();
+        tree[id].get_dest(&mut helper).unwrap()
+    };
+    assert!(dest.is_null());
+    let after_dest = warning_messages(&pdf);
+    assert_eq!(after_dest.len(), 6, "{after_dest:?}");
+    assert!(
+        after_dest[4].ends_with(
+            "operation for dictionary attempted on object of type integer: \
+             returning false for a key containment request"
+        ),
+        "{after_dest:?}: hasKey(/Dest)"
+    );
+    assert!(
+        after_dest[5].ends_with(
+            "operation for dictionary attempted on object of type integer: \
+             returning null for attempted key retrieval"
+        ),
+        "{after_dest:?}: getKey(/A)"
+    );
+}
+
 #[test]
 fn indirect_null_first_has_no_outlines_and_materializes_no_item() {
     let bytes = build_pdf(
