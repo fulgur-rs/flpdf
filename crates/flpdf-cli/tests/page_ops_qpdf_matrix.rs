@@ -1871,7 +1871,7 @@ fn pages_qdf_with_encrypted_primary_produces_cleartext_output() {
 fn pages_stream_data_uncompress_with_encrypted_primary_produces_cleartext_output() {
     // qpdf's implicit encryption preservation requires DecodeLevel::None
     // (PdfWriter::prepared_write_options's can_preserve guard,
-    // writer/pdf_writer.rs:589-596). --stream-data=uncompress/compress
+    // writer.rs:645-652). --stream-data=uncompress/compress
     // raise the decode level above None, so the --pages merge path must
     // not carry the primary's encryption donor forward in that case
     // either, the same way it must not for --qdf.

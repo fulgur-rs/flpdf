@@ -22,7 +22,7 @@
 // generic reader as `R: Read + Seek + 'static` rather than the bare
 // `R: Read + Seek` used elsewhere in this crate: both `PageDocumentHelper`
 // and `PdfWriter` are themselves defined as `<R: Read + Seek + 'static>`
-// (`page_document_helper.rs`'s and `writer/pdf_writer.rs`'s own struct
+// (`page_document_helper.rs`'s and `writer.rs`'s own struct
 // definitions), so a function generic over an unqualified `R: Read + Seek`
 // cannot construct either -- this is a Rust generic-bounds requirement of
 // those two existing flpdf types, orthogonal to qpdf parity, not a

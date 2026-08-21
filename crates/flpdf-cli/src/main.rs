@@ -4724,12 +4724,12 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // Carry the authenticated donor explicitly to the final writer; split
     // chunks remain cleartext, matching qpdf's fresh chunk writers. Gate on
     // the same conditions as `PdfWriter::prepared_write_options`'s implicit
-    // `can_preserve` (`writer/pdf_writer.rs:589-596`) so an explicit source
+    // `can_preserve` (`writer.rs:645-652`) so an explicit source
     // doesn't bypass qpdf's QDF-is-always-cleartext contract
     // (`cell_a_encrypted_input_is_transparently_decrypted_by_qdf`) or its
     // `decode_level == DecodeLevel::None` requirement: `--stream-data`
     // `Uncompress`/`Compress` raise the writer's decode level above `None`
-    // (`WriterConfiguration::set_stream_data_mode`, `writer/pdf_writer.rs:100-108`),
+    // (`WriterConfiguration::set_stream_data_mode`, `writer.rs:127-142`),
     // which `can_preserve` would likewise refuse to auto-preserve through.
     if page_ops.split_pages.is_none()
         && options.copy_encryption.is_none()

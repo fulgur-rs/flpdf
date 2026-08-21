@@ -147,12 +147,11 @@
 | `crates/flpdf/src/thread_bead_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for article beads |
 | `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |
 | `crates/flpdf/src/tokenizer.rs` | mirror | libqpdf/QPDFTokenizer.cc |
-| `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc responsibilities shared with writer submodules and linearization |
+| `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc writer lifecycle and responsibilities shared with writer submodules and linearization |
 | `crates/flpdf/src/writer/encrypted_strings.rs` | correspondence | QPDFWriter.cc:785-803 encryption-dictionary binary-key hex selection, QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities |
 | `crates/flpdf/src/writer/encryption_state.rs` | correspondence | QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state |
 | `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |
 | `crates/flpdf/src/writer/pclm.rs` | correspondence | \`QPDFWriter::enqueueObjectsPCLm\` |
-| `crates/flpdf/src/writer/pdf_writer.rs` | correspondence | QPDFWriter.cc writer lifecycle, output configuration, and qpdf-shaped setting validation |
 | `crates/flpdf/src/writer/plain/body.rs` | correspondence | QPDFWriter.cc plain object-body emission split from planning and xref output |
 | `crates/flpdf/src/writer/plain/mod.rs` | correspondence | QPDFWriter.cc standard write pipeline split across plain writer modules |
 | `crates/flpdf/src/writer/plain/plan.rs` | correspondence | QPDFWriter.cc standard-write object placement and renumber planning |
