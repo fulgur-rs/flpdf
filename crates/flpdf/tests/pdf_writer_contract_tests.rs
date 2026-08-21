@@ -2250,6 +2250,98 @@ fn preserve_encrypt_does_not_emit_a_source_objstm_twice() -> flpdf::Result<()> {
 }
 
 #[test]
+fn preserve_encrypt_generate_keeps_orphans_outside_objstm() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let source = synthetic_unreferenced_object_pdf();
+    let dir = tempfile::tempdir()?;
+    let input_path = dir.path().join("input.pdf");
+    let qpdf_path = dir.path().join("qpdf.pdf");
+    let flpdf_path = dir.path().join("flpdf.pdf");
+    let qpdf_dump_path = dir.path().join("qpdf-qdf.pdf");
+    let flpdf_dump_path = dir.path().join("flpdf-qdf.pdf");
+    std::fs::write(&input_path, &source)?;
+
+    let qpdf_status = Command::new("qpdf")
+        .args([
+            "--object-streams=generate",
+            "--preserve-unreferenced",
+            "--static-id",
+            "--encrypt",
+            "",
+            "owner",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(&input_path)
+        .arg(&qpdf_path)
+        .status()?;
+    assert!(qpdf_status.success(), "qpdf generate+encrypt failed");
+
+    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_preserve_unreferenced_objects(true);
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec()));
+    writer.set_output_memory()?;
+    writer.write()?;
+    std::fs::write(&flpdf_path, writer.get_buffer()?)?;
+
+    for (input, output) in [
+        (&qpdf_path, &qpdf_dump_path),
+        (&flpdf_path, &flpdf_dump_path),
+    ] {
+        let status = Command::new("qpdf")
+            .args(["--password=", "--qdf", "--preserve-unreferenced"])
+            .arg(input)
+            .arg(output)
+            .status()?;
+        assert!(
+            status.success(),
+            "qpdf QDF dump failed for {}",
+            input.display()
+        );
+    }
+
+    let objstm_member_counts = |path: &std::path::Path| -> flpdf::Result<Vec<usize>> {
+        let bytes = std::fs::read(path)?;
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(text
+            .split("endobj")
+            .filter_map(|object| {
+                if !object.contains("/Type /ObjStm") {
+                    return None;
+                }
+                object.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("/N ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+            })
+            .collect())
+    };
+    let qpdf_dump = std::fs::read(&qpdf_dump_path)?;
+    let flpdf_dump = std::fs::read(&flpdf_dump_path)?;
+    assert!(contains_bytes(&qpdf_dump, b"unreferenced-marker"));
+    assert!(contains_bytes(&flpdf_dump, b"unreferenced-marker"));
+
+    assert_eq!(
+        objstm_member_counts(&qpdf_dump_path)?,
+        vec![1],
+        "qpdf must keep only the reachable Pages member in encrypted generated ObjStm"
+    );
+    assert_eq!(
+        objstm_member_counts(&flpdf_dump_path)?,
+        vec![1],
+        "preserved orphans must remain plain when Generate is combined with encryption"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn memory_full_rewrite_has_fresh_output() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
     let mut writer = PdfWriter::new(&mut pdf);

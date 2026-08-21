@@ -3915,7 +3915,23 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     } else {
         object_streams::planner_config_from_options(options)
     };
-    let mut plan = object_streams::plan_object_streams(pdf, &planner_config)?;
+    let generated_reachable = if options.preserve_unreferenced_objects
+        && planner_config.mode == ObjectStreamMode::Generate
+    {
+        Some(
+            object_streams::compressible_objgens_qpdf_plan(pdf)?
+                .eligible
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+        )
+    } else {
+        None
+    };
+    let mut plan = object_streams::plan_object_streams_with_reachability(
+        pdf,
+        &planner_config,
+        generated_reachable.as_ref(),
+    )?; // cov:ignore: LLVM attributes this multiline planner-call terminator to the call setup; both reachability branches are exercised by writer tests
 
     // Drop ObjStm members that are not reachable from the trailer seed. The
     // planner draws candidates from the full live-object universe with a

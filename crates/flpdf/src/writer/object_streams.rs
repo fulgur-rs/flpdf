@@ -210,6 +210,22 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     config: &PlannerConfig,
 ) -> crate::Result<PackingPlan> {
+    plan_object_streams_with_reachability(pdf, config, None)
+}
+
+/// Plan object streams with an optional qpdf-reachable candidate set.
+///
+/// The specialized writer uses this only for Generate combined with
+/// `preserveUnreferencedObjects`: qpdf's `generateObjectStreams` always takes
+/// its members from `getCompressibleObjGens` and never lets the preserve flag
+/// expand that set (`QPDFWriter.cc:1970-2006`). The ordinary planner keeps its
+/// historical unconstrained unit-test entry point through
+/// [`plan_object_streams`].
+pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::Pdf<R>,
+    config: &PlannerConfig,
+    reachable: Option<&BTreeSet<ObjectRef>>,
+) -> crate::Result<PackingPlan> {
     if config.mode == ObjectStreamMode::Disable {
         return Ok(PackingPlan::default());
     }
@@ -226,7 +242,9 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
             None,
             Some(config.batch_size_cap),
         ),
-        ObjectStreamMode::Generate => plan_generate(pdf, config, &ctx, &length_exclusions),
+        ObjectStreamMode::Generate => {
+            plan_generate(pdf, config, &ctx, &length_exclusions, reachable)
+        }
     }
 }
 
@@ -603,6 +621,7 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     config: &PlannerConfig,
     ctx: &EligibilityContext,
     length_exclusions: &BTreeSet<ObjectRef>,
+    reachable: Option<&BTreeSet<ObjectRef>>,
 ) -> crate::Result<PackingPlan> {
     // Collect refs, excluding free (deleted) entries — they resolve to Null but
     // are not real objects and must never be placed in an ObjStm.
@@ -630,7 +649,9 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
 
     for obj_ref in refs {
-        if length_exclusions.contains(&obj_ref) {
+        if length_exclusions.contains(&obj_ref)
+            || reachable.is_some_and(|reachable| !reachable.contains(&obj_ref))
+        {
             continue;
         }
         let obj = pdf.get_object_handle(obj_ref);
