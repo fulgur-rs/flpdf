@@ -33,6 +33,9 @@ jobs:
       - name: Test qpdf JSON input correspondence contract
         run: python3 -m unittest scripts/tests/test_json_input_correspondence.py
 
+      - name: Test ObjectHandle consumer cutover contract
+        run: python3 -m unittest scripts/tests/test_object_handle_consumer_cutover.py
+
       - name: Test qpdf-deviation marker checker
         run: python3 -m unittest scripts/tests/test_qpdf_deviation_markers.py
 

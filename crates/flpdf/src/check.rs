@@ -6,10 +6,12 @@
 //! cause downstream tools to fail.
 
 use crate::filters::{
-    decode_stream_data_with_limits_and_warnings, is_decode_output_limit_error, DecodeLimits,
+    decode_stream_data_recovering_from_handle, is_decode_output_limit_error, DecodeLimits,
+    StreamDecodeEvent,
 };
+use crate::page_object_helper::PageObjectHelper;
 use crate::stream_filter::normalize_filter_name;
-use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, Pdf, PdfOpenOptions};
+use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, Pdf, PdfOpenOptions};
 use std::io::{Read, Seek};
 
 /// Result of [`check_reader`].
@@ -315,26 +317,32 @@ const GENERALIZED_FILTERS: [&[u8]; 5] = [
 ];
 
 /// Return `true` when `dict`'s `/Filter` is absent (no-op decode) or names only
-/// generalized codecs flpdf decodes. A `/Filter` stored as an indirect
-/// reference, a non-name entry, or any non-generalized codec yields `false`
-/// (the stream is not classified as decodable, so a later decode failure is not
-/// reported as a stream-encoding error).
-fn content_filter_chain_is_generalized(dict: &Dictionary) -> bool {
+/// generalized codecs flpdf decodes. The handle path resolves the filter holder
+/// and each array item, matching qpdf's typed `QPDFObjectHandle` accessors.
+fn content_filter_chain_is_generalized(dict: &ObjectHandle) -> crate::Result<bool> {
     fn is_generalized(name: &[u8]) -> bool {
         GENERALIZED_FILTERS.contains(&normalize_filter_name(name))
     }
-    // An indirect `/Filter` on a content stream is essentially never seen;
-    // treating it conservatively as "skip" trades a vanishing parity gap for
-    // zero false positives — flpdf must never report a valid image-bearing
-    // stream as corrupt.
-    match dict.get("Filter") {
-        None => true,
-        Some(Object::Name(name)) => is_generalized(name),
-        Some(Object::Array(elems)) => elems
-            .iter()
-            .all(|e| matches!(e, Object::Name(n) if is_generalized(n))),
-        Some(_) => false,
+    let filter = dict.try_get_key(b"/Filter")?;
+    filter.try_dereference()?;
+    if filter.is_null() {
+        return Ok(true);
     }
+    if let Some(name) = filter.try_as_name()? {
+        return Ok(is_generalized(&name));
+    }
+    if let Some(elements) = filter.try_as_array()? {
+        for element in elements {
+            let Some(name) = element.try_as_name()? else {
+                return Ok(false);
+            };
+            if !is_generalized(&name) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Decode each page's content stream(s) and push an error `Diagnostic` for any
@@ -343,6 +351,11 @@ fn content_filter_chain_is_generalized(dict: &Dictionary) -> bool {
 /// corruption from an unsupported codec. Structural problems that block
 /// enumeration downgrade to a warning so the already-opened document still
 /// yields a report.
+// qpdf's `QPDFPageObjectHelper::getPageContents` delegates to the canonical
+// `QPDFObjectHandle::getPageContents` path (`QPDFPageObjectHelper.cc:439-442`,
+// `QPDFObjectHandle.cc:1438-1493`). Keep the stream handles live through raw
+// source access and the handle-native filter decoder rather than projecting
+// them into the legacy `Object`/`Stream` pair.
 fn check_content_streams<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     diagnostics: &mut Diagnostics,
@@ -358,12 +371,42 @@ fn check_content_streams<R: Read + Seek>(
             return;
         }
     };
+    check_content_streams_for_pages(pdf, diagnostics, limits, &page_refs);
+}
+
+fn check_content_streams_for_pages<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    diagnostics: &mut Diagnostics,
+    limits: DecodeLimits,
+    page_refs: &[crate::ObjectRef],
+) {
     // --check is a deliberate full-document audit (like qpdf): every page's
     // content stream is decoded, so this whole-document walk intentionally
     // relaxes flpdf's usual lazy-load / bounded-traversal discipline.
     for (index, page_ref) in page_refs.iter().enumerate() {
         let page_number = index + 1; // 1-based, matching qpdf's "page N"
-        let entries = match crate::pages::page_content_stream_entries(pdf, *page_ref) {
+        let invalid_contents = match page_contents_is_invalid(pdf, *page_ref) {
+            Ok(invalid) => invalid,
+            Err(error) => {
+                diagnostics.push(Diagnostic::warning(
+                    format!("page {page_number}: could not read content streams: {error}"),
+                    None,
+                ));
+                continue;
+            }
+        };
+        if invalid_contents {
+            diagnostics.push(Diagnostic::warning(
+                format!("page {page_number}: could not read content streams: invalid /Contents"),
+                None,
+            ));
+            continue;
+        }
+        let entries = {
+            let mut page = PageObjectHelper::new(*page_ref, pdf);
+            page.get_page_contents()
+        };
+        let entries = match entries {
             Ok(entries) => entries,
             Err(error) => {
                 diagnostics.push(Diagnostic::warning(
@@ -373,62 +416,121 @@ fn check_content_streams<R: Read + Seek>(
                 continue;
             }
         };
-        for (stream_ref, stream) in entries {
-            if !content_filter_chain_is_generalized(&stream.dict) {
+        for content in entries {
+            // cov:ignore-start: QPDFObjectHandle::getPageContents resolves each returned content
+            // handle before returning it, so the canonical stream list cannot fail a second
+            // resolution here; this is only a defensive guard for a foreign synthetic handle.
+            let (stream, stream_ref) = match pdf.resolve_object_handle_to_terminal_ref(&content) {
+                Ok((stream, stream_ref)) => (stream, stream_ref),
+                Err(error) => {
+                    diagnostics.push(Diagnostic::warning(
+                        format!("page {page_number}: could not read content streams: {error}"),
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            // cov:ignore-end
+            // cov:ignore-start: ObjectHandle::get_page_contents only returns stream handles whose
+            // stream dictionaries have already passed the qpdf stream-type check; malformed
+            // stream dictionaries fail in that canonical helper before this defensive guard.
+            let Some(stream_dict) = stream.as_stream_dict() else {
+                diagnostics.push(Diagnostic::warning(
+                    format!("page {page_number}: could not read content streams: expected stream"),
+                    None,
+                ));
                 continue;
+            };
+            // cov:ignore-end
+            match content_filter_chain_is_generalized(&stream_dict) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::warning(
+                        format!("page {page_number}: could not read content streams: {error}"),
+                        None,
+                    ));
+                    continue;
+                }
             }
+            let data = match stream.get_raw_stream_data() {
+                Ok(data) => data,
+                Err(error) => {
+                    diagnostics.push(Diagnostic::warning(
+                        format!("page {page_number}: could not read content streams: {error}"),
+                        None,
+                    ));
+                    continue;
+                }
+            };
             // qpdf renders the location as "content stream object N G" (no
             // trailing " R"); format the number/generation pair directly.
             let location = match stream_ref {
                 Some(r) => format!("content stream object {} {}", r.number, r.generation),
                 None => "inline content stream".to_string(),
             };
-            let mut decode_warnings = Vec::new();
-            let result = decode_stream_data_with_limits_and_warnings(
-                &stream.dict,
-                &stream.data,
-                limits,
-                &mut |message, _code| {
-                    decode_warnings.push(message.to_string());
-                    Ok(())
-                },
-            );
-            for warning in decode_warnings {
-                diagnostics.push(Diagnostic::warning(
-                    format!("page {page_number}: {location}: {warning}"),
-                    None,
-                ));
-            }
-            // A decode `Err` is one of two things:
-            //   * the opt-in output cap tripped — the stream is intact, just
-            //     larger than the configured limit, so this is a deliberate
-            //     decode-bomb guard, reported as a WARNING (qpdf's posture:
-            //     exceeding flate_max_memory is a warning, not an error);
-            //   * any other failure means the stream cannot be decoded as
-            //     declared (corrupt payload, `/Filter` chain past the cap, bad
-            //     `/DecodeParms`) — a genuine stream-encoding ERROR.
-            if let Err(error) = result {
-                if is_decode_output_limit_error(&error) {
-                    // The guard only trips when a cap is set, so `max_output` is
-                    // always `Some` here; `unwrap_or_default` echoes the cap into
-                    // the diagnostic without an unreachable branch or a panic.
-                    let limit = limits.max_output.unwrap_or_default();
-                    diagnostics.push(Diagnostic::warning(
-                        format!(
-                            "page {page_number}: {location}: decoded output exceeds the configured limit of {limit} bytes; skipped (decode-bomb guard)"
-                        ),
-                        None,
-                    ));
-                } else {
-                    diagnostics.push(Diagnostic::error(
-                        format!(
-                            "page {page_number}: {location}: errors while decoding content stream"
-                        ),
-                        None,
-                    ));
+            match decode_stream_data_recovering_from_handle(&stream_dict, data.as_ref(), limits) {
+                Ok(outcome) => {
+                    for event in outcome.events {
+                        match event {
+                            StreamDecodeEvent::Data(_) => {}
+                            StreamDecodeEvent::Warning(warning) => {
+                                diagnostics.push(Diagnostic::warning(
+                                    format!("page {page_number}: {location}: {}", warning.message),
+                                    None,
+                                ));
+                            }
+                            StreamDecodeEvent::Error(error) => {
+                                push_decode_error(
+                                    diagnostics,
+                                    page_number,
+                                    &location,
+                                    limits,
+                                    error,
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    push_decode_error(diagnostics, page_number, &location, limits, error);
                 }
             }
         }
+    }
+}
+
+fn page_contents_is_invalid<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: crate::ObjectRef,
+) -> crate::Result<bool> {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    let contents = page.try_get_key(b"/Contents")?;
+    contents.try_dereference()?;
+    Ok(!contents.is_null() && contents.as_array().is_none() && contents.as_stream_dict().is_none())
+}
+
+fn push_decode_error(
+    diagnostics: &mut Diagnostics,
+    page_number: usize,
+    location: &str,
+    limits: DecodeLimits,
+    error: crate::Error,
+) {
+    if is_decode_output_limit_error(&error) {
+        let limit = limits.max_output.unwrap_or_default();
+        diagnostics.push(Diagnostic::warning(
+            format!(
+                "page {page_number}: {location}: decoded output exceeds the configured limit of {limit} bytes; skipped (decode-bomb guard)"
+            ),
+            None,
+        ));
+    } else {
+        diagnostics.push(Diagnostic::error(
+            format!("page {page_number}: {location}: errors while decoding content stream"),
+            None,
+        ));
     }
 }
 
@@ -436,15 +538,18 @@ fn check_content_streams<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::filters::encode_stream_data;
-    use crate::{ObjectRef, Severity, Stream};
+    use crate::{Dictionary, Object, ObjectRef, Severity, Stream};
     use std::io::Cursor;
+    use std::rc::Rc;
 
     #[test]
     fn filter_chain_classification() {
         // FlateDecode alone → generalized.
-        let mut flate = Dictionary::new();
-        flate.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        assert!(content_filter_chain_is_generalized(&flate));
+        let flate = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        assert!(content_filter_chain_is_generalized(&flate).unwrap());
 
         // Every remaining generalized codec is classified as decodable, so a
         // typo in any GENERALIZED_FILTERS entry flips one of these assertions.
@@ -453,51 +558,181 @@ mod tests {
             &b"ASCIIHexDecode"[..],
             &b"RunLengthDecode"[..],
         ] {
-            let mut dict = Dictionary::new();
-            dict.insert("Filter", Object::Name(codec.to_vec()));
-            assert!(content_filter_chain_is_generalized(&dict));
+            let dict = ObjectHandle::dictionary(vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::name(codec.to_vec()),
+            )]);
+            assert!(content_filter_chain_is_generalized(&dict).unwrap());
         }
 
         // No /Filter → trivially decodable (no-op decode).
-        let none = Dictionary::new();
-        assert!(content_filter_chain_is_generalized(&none));
+        let none = ObjectHandle::dictionary(Vec::new());
+        assert!(content_filter_chain_is_generalized(&none).unwrap());
 
         // DCTDecode (image codec) → not generalized.
-        let mut dct = Dictionary::new();
-        dct.insert("Filter", Object::Name(b"DCTDecode".to_vec()));
-        assert!(!content_filter_chain_is_generalized(&dct));
+        let dct = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"DCTDecode".to_vec()),
+        )]);
+        assert!(!content_filter_chain_is_generalized(&dct).unwrap());
 
         // Mixed array with a non-generalized member → not generalized.
-        let mut mixed = Dictionary::new();
-        mixed.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"ASCII85Decode".to_vec()),
-                Object::Name(b"DCTDecode".to_vec()),
+        let mixed = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"ASCII85Decode".to_vec()),
+                ObjectHandle::name(b"DCTDecode".to_vec()),
             ]),
-        );
-        assert!(!content_filter_chain_is_generalized(&mixed));
+        )]);
+        assert!(!content_filter_chain_is_generalized(&mixed).unwrap());
 
         // Array of only generalized codecs → generalized.
-        let mut all_generalized = Dictionary::new();
-        all_generalized.insert(
-            "Filter",
-            Object::Array(vec![
-                Object::Name(b"ASCII85Decode".to_vec()),
-                Object::Name(b"FlateDecode".to_vec()),
+        let all_generalized = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"ASCII85Decode".to_vec()),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
             ]),
-        );
-        assert!(content_filter_chain_is_generalized(&all_generalized));
+        )]);
+        assert!(content_filter_chain_is_generalized(&all_generalized).unwrap());
 
-        // Indirect /Filter → cannot judge → skip (not generalized).
-        let mut indirect = Dictionary::new();
-        indirect.insert("Filter", Object::Reference(ObjectRef::new(9, 0)));
-        assert!(!content_filter_chain_is_generalized(&indirect));
+        // Indirect /Filter is resolved through the canonical handle route.
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let filter_ref = ObjectRef::new(9, 0);
+        pdf.set_object(filter_ref, Object::Name(b"FlateDecode".to_vec()));
+        let indirect = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            pdf.get_object_handle(filter_ref),
+        )]);
+        assert!(content_filter_chain_is_generalized(&indirect).unwrap());
 
         // Non-name, non-array /Filter (e.g. an integer) → not generalized.
-        let mut weird = Dictionary::new();
-        weird.insert("Filter", Object::Integer(42));
-        assert!(!content_filter_chain_is_generalized(&weird));
+        let weird =
+            ObjectHandle::dictionary(vec![(b"/Filter".to_vec(), ObjectHandle::integer(42))]);
+        assert!(!content_filter_chain_is_generalized(&weird).unwrap());
+
+        let non_name_array = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+                ObjectHandle::integer(42),
+            ]),
+        )]);
+        assert!(!content_filter_chain_is_generalized(&non_name_array).unwrap());
+    }
+
+    fn install_page_contents(pdf: &mut Pdf<Cursor<Vec<u8>>>, contents: ObjectHandle) {
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&page).unwrap();
+        page.replace_key(b"/Contents", contents).unwrap();
+        pdf.mark_object_handle_dirty(&page).unwrap();
+    }
+
+    fn check_direct_page_content(contents: ObjectHandle) -> Diagnostics {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        install_page_contents(&mut pdf, contents);
+        let mut diagnostics = Diagnostics::default();
+        check_content_streams_for_pages(
+            &mut pdf,
+            &mut diagnostics,
+            DecodeLimits::default(),
+            &[ObjectRef::new(3, 0)],
+        );
+        diagnostics
+    }
+
+    #[test]
+    fn handle_check_reports_a_page_helper_error_as_a_warning() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let mut diagnostics = Diagnostics::default();
+        check_content_streams_for_pages(
+            &mut pdf,
+            &mut diagnostics,
+            DecodeLimits::default(),
+            &[ObjectRef::new(2, 0)],
+        );
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic
+                    .message
+                    .contains("could not read content streams")
+        }));
+    }
+
+    #[test]
+    fn handle_check_reports_page_helper_error_for_a_stream_without_a_dictionary() {
+        let stream = ObjectHandle::stream(ObjectHandle::integer(7), Rc::new(Vec::new()));
+        let diagnostics = check_direct_page_content(stream);
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic
+                    .message
+                    .contains("could not read content streams")
+        }),);
+    }
+
+    #[test]
+    fn handle_check_reports_filter_resolution_failure_as_a_warning() {
+        let stream_dict = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), 0),
+        )]);
+        let stream = ObjectHandle::stream(stream_dict, Rc::new(b"payload".to_vec()));
+        let diagnostics = check_direct_page_content(stream);
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic
+                    .message
+                    .contains("could not read content streams")
+        }));
+    }
+
+    #[test]
+    fn handle_check_reports_raw_provider_failure_as_a_warning() {
+        let stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let stream = pdf.make_indirect_object_handle(stream).unwrap();
+        stream
+            .replace_stream_data_with_callback(
+                |_| Err(Error::System("provider failed".to_string())),
+                None,
+                None,
+            )
+            .unwrap();
+        install_page_contents(&mut pdf, stream);
+        let mut diagnostics = Diagnostics::default();
+        check_content_streams_for_pages(
+            &mut pdf,
+            &mut diagnostics,
+            DecodeLimits::default(),
+            &[ObjectRef::new(3, 0)],
+        );
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic
+                    .message
+                    .contains("could not read content streams")
+        }));
+    }
+
+    #[test]
+    fn handle_check_reports_filter_construction_failure_as_a_decode_error() {
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"/DecodeParms".to_vec(), ObjectHandle::integer(42)),
+        ]);
+        let stream = ObjectHandle::stream(stream_dict, Rc::new(b"payload".to_vec()));
+        let diagnostics = check_direct_page_content(stream);
+        assert!(diagnostics.entries().iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic
+                    .message
+                    .contains("errors while decoding content stream")
+        }));
     }
 
     /// Minimal valid single-page PDF (`%PDF-1.4`), not encrypted, not linearized.

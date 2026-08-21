@@ -619,9 +619,13 @@ fn filespec_factories_reject_exhausted_object_number_space() {
 
     let filespec_error = FileSpec::create_file_spec(&mut pdf, b"report.txt", embedded_file)
         .expect_err("Filespec factory must reject the exhausted allocation boundary");
+    // qpdf's QPDF::nextObjGen uses the signed object-id boundary for every
+    // makeIndirectObject call (`libqpdf/QPDF.cc:1872-1879`), including the
+    // Filespec factory. The old Object-based helper exposed its own
+    // "object-number space exhausted" text; that is not a qpdf contract.
     assert!(
-        matches!(filespec_error, Error::Unsupported(message) if message == "object-number space exhausted"),
-        "Filespec factory must return an allocation error instead of wrapping object 0"
+        matches!(filespec_error, Error::Unsupported(message) if message == "max object id is too high to create new objects"),
+        "Filespec factory must return qpdf's allocation error instead of wrapping object 0"
     );
 }
 
