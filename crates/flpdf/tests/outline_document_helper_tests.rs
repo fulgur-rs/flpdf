@@ -50,12 +50,12 @@ fn outline_object(item: &OutlineItem) -> Object {
 
 fn outline_dest(item: &OutlineItem, pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
     let mut helper = pdf.outline();
-    materialized(&item.dest(&mut helper).unwrap())
+    materialized(&item.get_dest(&mut helper).unwrap())
 }
 
 fn outline_dest_page(item: &OutlineItem, pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Object {
     let mut helper = pdf.outline();
-    let page = item.dest_page(&mut helper).unwrap();
+    let page = item.get_dest_page(&mut helper).unwrap();
     page.object_ref()
         .map(Object::Reference)
         .unwrap_or_else(|| materialized(&page))
@@ -141,7 +141,7 @@ fn get_outlines_for_page_uses_qpdf_breadth_first_order() {
     let titles: Vec<_> = tree
         .get_outlines_for_page(&mut helper, Some(ObjectRef::new(3, 0)))
         .unwrap()
-        .map(|(_id, item)| item.title(&mut helper).unwrap())
+        .map(|(_id, item)| item.get_title(&mut helper).unwrap())
         .collect();
 
     assert_eq!(titles, ["A", "B", "A1", "B1"]);
@@ -156,7 +156,7 @@ fn get_outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
     let titles: Vec<_> = tree
         .get_outlines_for_page(&mut helper, None)
         .unwrap()
-        .map(|(_id, item)| item.title(&mut helper).unwrap())
+        .map(|(_id, item)| item.get_title(&mut helper).unwrap())
         .collect();
 
     assert_eq!(
@@ -172,7 +172,7 @@ fn get_outlines_for_page_none_matches_qpdf_objgen_zero_bucket() {
     let zero_ref_titles: Vec<_> = tree
         .get_outlines_for_page(&mut helper, Some(ObjectRef::new(0, 0)))
         .unwrap()
-        .map(|(_id, item)| item.title(&mut helper).unwrap())
+        .map(|(_id, item)| item.get_title(&mut helper).unwrap())
         .collect();
     assert_eq!(zero_ref_titles, titles);
 }
@@ -275,7 +275,7 @@ fn titles_match_qpdf_get_utf8_value() {
         let mut helper = pdf.outline();
         let tree = helper.get_tree().unwrap();
         assert_eq!(
-            tree[tree.roots()[0]].title(&mut helper).unwrap(),
+            tree[tree.roots()[0]].get_title(&mut helper).unwrap(),
             expected,
             "{title_object}"
         );
@@ -292,7 +292,7 @@ fn titles_match_qpdf_get_utf8_value() {
     let mut pdf = Pdf::open(Cursor::new(single_outline_without_title())).unwrap();
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
     assert!(warning_messages(&pdf).is_empty());
 }
 
@@ -324,7 +324,7 @@ fn counts_match_qpdf_get_int_value_as_int() {
         let mut helper = pdf.outline();
         let tree = helper.get_tree().unwrap();
         assert_eq!(
-            tree[tree.roots()[0]].count(&mut helper).unwrap(),
+            tree[tree.roots()[0]].get_count(&mut helper).unwrap(),
             expected,
             "{count_object}"
         );
@@ -345,7 +345,7 @@ fn counts_match_qpdf_get_int_value_as_int() {
     let mut pdf = Pdf::open(Cursor::new(single_outline_with_item_fields(""))).unwrap();
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
-    assert_eq!(tree[tree.roots()[0]].count(&mut helper).unwrap(), 0);
+    assert_eq!(tree[tree.roots()[0]].get_count(&mut helper).unwrap(), 0);
     assert!(warning_messages(&pdf).is_empty());
 }
 
@@ -367,7 +367,7 @@ fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
             let mut helper = pdf.outline();
             let tree = helper.get_tree().unwrap();
             assert_eq!(
-                tree[tree.roots()[0]].title(&mut helper).unwrap(),
+                tree[tree.roots()[0]].get_title(&mut helper).unwrap(),
                 "",
                 "title {object}"
             );
@@ -386,7 +386,7 @@ fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
             let mut helper = pdf.outline();
             let tree = helper.get_tree().unwrap();
             assert_eq!(
-                tree[tree.roots()[0]].count(&mut helper).unwrap(),
+                tree[tree.roots()[0]].get_count(&mut helper).unwrap(),
                 0,
                 "count {object}"
             );
@@ -419,10 +419,10 @@ fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
         let mut helper = pdf.outline();
         let tree = helper.get_tree().unwrap();
         let expected = if key == "Title" {
-            assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
+            assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
             "operation for string attempted on object of type stream: returning empty string"
         } else {
-            assert_eq!(tree[tree.roots()[0]].count(&mut helper).unwrap(), 0);
+            assert_eq!(tree[tree.roots()[0]].get_count(&mut helper).unwrap(), 0);
             "operation for integer attempted on object of type stream: returning 0"
         };
         let warnings = warning_messages(&pdf);
@@ -452,10 +452,10 @@ fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
         let mut helper = pdf.outline();
         let tree = helper.get_tree().unwrap();
         let expected = if key == "Title" {
-            assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
+            assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
             "operation for string attempted on object of type unresolved: returning empty string"
         } else {
-            assert_eq!(tree[tree.roots()[0]].count(&mut helper).unwrap(), 0);
+            assert_eq!(tree[tree.roots()[0]].get_count(&mut helper).unwrap(), 0);
             "operation for integer attempted on object of type unresolved: returning 0"
         };
         let warnings = warning_messages(&pdf);
@@ -477,13 +477,13 @@ fn present_null_scalar_is_treated_as_a_missing_key_like_qpdf_haskey() {
     let mut pdf = Pdf::open(Cursor::new(single_outline_with_title("null"))).unwrap();
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
     assert!(warning_messages(&pdf).is_empty());
 
     let mut pdf = Pdf::open(Cursor::new(single_outline_with_count("null"))).unwrap();
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
-    assert_eq!(tree[tree.roots()[0]].count(&mut helper).unwrap(), 0);
+    assert_eq!(tree[tree.roots()[0]].get_count(&mut helper).unwrap(), 0);
     assert!(warning_messages(&pdf).is_empty());
 }
 
@@ -546,9 +546,9 @@ fn direct_outlines_first_and_next_are_materialized() {
     let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 2);
     assert_eq!(tree[tree.roots()[0]].source_ref, None);
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "A");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "A");
     assert_eq!(tree[tree.roots()[1]].source_ref, None);
-    assert_eq!(tree[tree.roots()[1]].title(&mut helper).unwrap(), "B");
+    assert_eq!(tree[tree.roots()[1]].get_title(&mut helper).unwrap(), "B");
 
     // qpdf 11.9.0 `--json=2 --json-key=outlines` on
     // `/tmp/direct-outline-fixture.pdf` reports two direct roots. The first raw
@@ -606,8 +606,8 @@ fn non_dictionary_first_is_still_an_outline_item_with_default_accessors() {
     let id = tree.roots()[0];
 
     assert_eq!(outline_object(&tree[id]), Object::Integer(42));
-    assert_eq!(tree[id].title(&mut helper).unwrap(), "");
-    assert_eq!(tree[id].count(&mut helper).unwrap(), 0);
+    assert_eq!(tree[id].get_title(&mut helper).unwrap(), "");
+    assert_eq!(tree[id].get_count(&mut helper).unwrap(), 0);
     assert_eq!(outline_dest(&tree[id], &mut pdf), Object::Null);
     assert!(tree[id].kids.is_empty());
 }
@@ -673,7 +673,7 @@ fn indirect_null_next_terminates_the_root_sibling_chain() {
     let tree = helper.get_tree().unwrap();
 
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "A");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "A");
 }
 
 #[test]
@@ -703,7 +703,7 @@ fn construction_integerizes_a_bare_reference_item() {
     assert_eq!(tree.roots().len(), 1);
     assert_eq!(item.source_ref, Some(ObjectRef::new(5, 0)));
     assert_eq!(outline_object(item), Object::Integer(6));
-    assert_eq!(item.title(&mut helper).unwrap(), "");
+    assert_eq!(item.get_title(&mut helper).unwrap(), "");
 }
 
 #[test]
@@ -726,8 +726,8 @@ fn top_level_indirect_next_cycle_stops_before_duplicate_root() {
     let tree = helper.get_tree().unwrap();
 
     assert_eq!(tree.roots().len(), 2);
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "A");
-    assert_eq!(tree[tree.roots()[1]].title(&mut helper).unwrap(), "B");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "A");
+    assert_eq!(tree[tree.roots()[1]].get_title(&mut helper).unwrap(), "B");
 }
 
 #[test]
@@ -753,11 +753,11 @@ fn nested_indirect_next_cycle_stops_before_duplicate_child() {
 
     assert_eq!(tree[root].kids.len(), 2);
     assert_eq!(
-        tree[tree[root].kids[0]].title(&mut helper).unwrap(),
+        tree[tree[root].kids[0]].get_title(&mut helper).unwrap(),
         "Child A"
     );
     assert_eq!(
-        tree[tree[root].kids[1]].title(&mut helper).unwrap(),
+        tree[tree[root].kids[1]].get_title(&mut helper).unwrap(),
         "Child B"
     );
 }
@@ -824,18 +824,18 @@ fn get_tree_materializes_tree_with_titles_counts_parents() {
 
     // Two top-level nodes: A, B.
     assert_eq!(roots.len(), 2);
-    assert_eq!(tree[roots[0]].title(&mut helper).unwrap(), "A");
+    assert_eq!(tree[roots[0]].get_title(&mut helper).unwrap(), "A");
     assert_eq!(tree[roots[0]].parent, None);
-    assert_eq!(tree[roots[0]].count(&mut helper).unwrap(), 1);
-    assert_eq!(tree[roots[1]].title(&mut helper).unwrap(), "B");
-    assert_eq!(tree[roots[1]].count(&mut helper).unwrap(), 2);
+    assert_eq!(tree[roots[0]].get_count(&mut helper).unwrap(), 1);
+    assert_eq!(tree[roots[1]].get_title(&mut helper).unwrap(), "B");
+    assert_eq!(tree[roots[1]].get_count(&mut helper).unwrap(), 2);
 
     // A has one child A1.
     assert_eq!(tree[roots[0]].kids.len(), 1);
     let a1 = tree[roots[0]].kids[0];
-    assert_eq!(tree[a1].title(&mut helper).unwrap(), "A1");
+    assert_eq!(tree[a1].get_title(&mut helper).unwrap(), "A1");
     assert_eq!(tree[a1].parent, Some(roots[0]));
-    assert_eq!(tree[a1].count(&mut helper).unwrap(), 0); // /Count absent -> 0 (qpdf)
+    assert_eq!(tree[a1].get_count(&mut helper).unwrap(), 0); // /Count absent -> 0 (qpdf)
     assert_eq!(tree[a1].source_ref, Some(ObjectRef::new(6, 0)));
 }
 
@@ -903,13 +903,13 @@ fn preorder_yields_lossless_arena_items() {
     let tree = helper.get_tree().unwrap();
     let titles: Vec<String> = tree
         .preorder()
-        .map(|(_depth, _id, item)| item.title(&mut helper).unwrap())
+        .map(|(_depth, _id, item)| item.get_title(&mut helper).unwrap())
         .collect();
     assert_eq!(titles, vec!["A", "A1", "B"]); // pre-order: A, its child A1, then B
 
     let seen: Vec<(String, usize, usize)> = tree
         .preorder()
-        .map(|(depth, _id, item)| (item.title(&mut helper).unwrap(), depth, item.kids.len()))
+        .map(|(depth, _id, item)| (item.get_title(&mut helper).unwrap(), depth, item.kids.len()))
         .collect();
     assert_eq!(
         seen,
@@ -1017,7 +1017,7 @@ fn cyclic_outline_terminates() {
     let tree = helper.get_tree().unwrap();
     let titles: Vec<String> = tree
         .preorder()
-        .map(|(_depth, _id, item)| item.title(&mut helper).unwrap())
+        .map(|(_depth, _id, item)| item.get_title(&mut helper).unwrap())
         .collect();
     // Visits X and Y once each, then the cycle back to 5 is cut by `visited`.
     assert_eq!(titles, vec!["X", "Y"]);
@@ -1454,7 +1454,7 @@ fn title_resolves_indirect_reference() {
     let mut pdf = Pdf::open(Cursor::new(indirect_title_pdf())).unwrap();
     let roots = root_items(&mut pdf);
     let mut helper = pdf.outline();
-    assert_eq!(roots[0].title(&mut helper).unwrap(), "RealTitle");
+    assert_eq!(roots[0].get_title(&mut helper).unwrap(), "RealTitle");
 }
 
 /// The outline root's `/First` resolves to a non-dictionary object (a stray
@@ -1675,7 +1675,7 @@ fn short_first_name_tree_pair_is_fatal_after_the_repair_warning() {
         // oracle test).
         let items = root_items(&mut pdf);
         let mut helper = pdf.outline();
-        let error = items[0].dest(&mut helper).unwrap_err();
+        let error = items[0].get_dest(&mut helper).unwrap_err();
         match error {
             Error::Parse { offset, message } => {
                 assert_eq!(offset, 0, "{label}");
@@ -1731,7 +1731,7 @@ fn direct_first_child_short_pair_repairs_from_the_mutated_root() {
     // surfaces once `dest()` is actually called on the item.
     let items = root_items(&mut pdf);
     let mut helper = pdf.outline();
-    let error = items[0].dest(&mut helper).unwrap_err();
+    let error = items[0].get_dest(&mut helper).unwrap_err();
     match error {
         Error::Parse { offset, message } => {
             assert_eq!(offset, 0);
@@ -1898,7 +1898,7 @@ fn first_invalid_name_tree_key_fails_during_qpdf_style_repair() {
         // only surfaces once `dest()` is actually called on the item.
         let items = root_items(&mut pdf);
         let mut helper = pdf.outline();
-        let error = items[0].dest(&mut helper).unwrap_err();
+        let error = items[0].get_dest(&mut helper).unwrap_err();
         assert_eq!(
             error.to_string(),
             "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type",
@@ -2329,7 +2329,7 @@ fn invalid_first_name_tree_key_is_fatal_without_mutating_the_direct_root() {
     // surfaces once `dest()` is actually called on the item.
     let items = root_items(&mut pdf);
     let mut helper = pdf.outline();
-    let error = items[0].dest(&mut helper).unwrap_err();
+    let error = items[0].get_dest(&mut helper).unwrap_err();
     assert_eq!(
         error.to_string(),
         "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
@@ -2897,7 +2897,7 @@ fn malformed_name_tree_with_only_an_initial_invalid_key_is_fatal() {
     // surfaces once `dest()` is actually called on the item.
     let items = root_items(&mut pdf);
     let mut helper = pdf.outline();
-    let error = items[0].dest(&mut helper).unwrap_err();
+    let error = items[0].get_dest(&mut helper).unwrap_err();
     assert_eq!(
         error.to_string(),
         "parse error at byte 0: Name/Number tree node: item at index 0 is not the right type"
@@ -4389,7 +4389,7 @@ fn direct_reference_valued_cursor_is_chased_to_its_target() {
     let roots = root_items(&mut pdf);
     assert_eq!(roots.len(), 1);
     let mut helper = pdf.outline();
-    assert_eq!(roots[0].title(&mut helper).unwrap(), "Target");
+    assert_eq!(roots[0].get_title(&mut helper).unwrap(), "Target");
     assert_eq!(outline_dest(&roots[0], &mut pdf), page_dest(3));
 }
 
@@ -4441,8 +4441,8 @@ fn direct_sibling_next_cycle_terminates_the_top_level_walk() {
     let roots = root_items(&mut pdf);
     assert_eq!(roots.len(), 2);
     let mut helper = pdf.outline();
-    assert_eq!(roots[0].title(&mut helper).unwrap(), "A");
-    assert_eq!(roots[1].title(&mut helper).unwrap(), "B");
+    assert_eq!(roots[0].get_title(&mut helper).unwrap(), "A");
+    assert_eq!(roots[1].get_title(&mut helper).unwrap(), "B");
 }
 
 /// Same reciprocal direct-dictionary `/Next` cycle as
@@ -4491,10 +4491,16 @@ fn direct_child_sibling_next_cycle_terminates_the_frame_walk() {
     let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
     let parent_item = &tree[tree.roots()[0]];
-    assert_eq!(parent_item.title(&mut helper).unwrap(), "Parent");
+    assert_eq!(parent_item.get_title(&mut helper).unwrap(), "Parent");
     assert_eq!(parent_item.kids.len(), 2);
-    assert_eq!(tree[parent_item.kids[0]].title(&mut helper).unwrap(), "A");
-    assert_eq!(tree[parent_item.kids[1]].title(&mut helper).unwrap(), "B");
+    assert_eq!(
+        tree[parent_item.kids[0]].get_title(&mut helper).unwrap(),
+        "A"
+    );
+    assert_eq!(
+        tree[parent_item.kids[1]].get_title(&mut helper).unwrap(),
+        "B"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -4565,7 +4571,7 @@ fn direct_reference_valued_cursor_self_loop_is_recorded_before_a_second_visit() 
     let roots = root_items(&mut pdf);
     assert_eq!(roots.len(), 1);
     let mut helper = pdf.outline();
-    assert_eq!(roots[0].title(&mut helper).unwrap(), "Target");
+    assert_eq!(roots[0].get_title(&mut helper).unwrap(), "Target");
 }
 
 /// Same reciprocal-cycle shape as
@@ -4618,11 +4624,11 @@ fn direct_reference_valued_child_cursor_self_loop_is_recorded_before_a_second_vi
     let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
     let parent_item = &tree[tree.roots()[0]];
-    assert_eq!(parent_item.title(&mut helper).unwrap(), "Parent");
+    assert_eq!(parent_item.get_title(&mut helper).unwrap(), "Parent");
     // Object 8 must appear exactly once among the parent's kids.
     assert_eq!(parent_item.kids.len(), 1);
     assert_eq!(
-        tree[parent_item.kids[0]].title(&mut helper).unwrap(),
+        tree[parent_item.kids[0]].get_title(&mut helper).unwrap(),
         "Child"
     );
 }
@@ -4692,8 +4698,8 @@ fn two_page_single_outline_pdf() -> Vec<u8> {
 /// qpdf's `getTitle()`/`getCount()`/`getDest()`/`getDestPage()`
 /// (`libqpdf/QPDFOutlineObjectHelper.cc:47-98`) hold no cache and re-read
 /// `this->oh` fresh on every call — only `getParent()`/`getKids()` are
-/// captured once, in the constructor. `OutlineItem::title`/`count`/`dest`/
-/// `dest_page` mirror that: they read `OutlineItem::object` (a live,
+/// captured once, in the constructor. `OutlineItem::get_title`/`get_count`/
+/// `get_dest`/`get_dest_page` mirror that: they read `OutlineItem::object` (a live,
 /// shared-identity handle) fresh on every call instead of returning a
 /// value frozen at `get_tree()` time. A mutation applied through the public
 /// `ObjectHandle::replace_key` API between two calls must be visible on the
@@ -4707,10 +4713,10 @@ fn title_count_dest_recompute_live_after_object_mutation() {
     let tree = helper.get_tree().unwrap();
     let item = tree[tree.roots()[0]].clone();
 
-    assert_eq!(item.title(&mut helper).unwrap(), "One");
-    assert_eq!(item.count(&mut helper).unwrap(), 1);
+    assert_eq!(item.get_title(&mut helper).unwrap(), "One");
+    assert_eq!(item.get_count(&mut helper).unwrap(), 1);
     assert_eq!(
-        item.dest_page(&mut helper).unwrap().object_ref(),
+        item.get_dest_page(&mut helper).unwrap().object_ref(),
         Some(ObjectRef::new(3, 0))
     );
 
@@ -4728,17 +4734,17 @@ fn title_count_dest_recompute_live_after_object_mutation() {
         .unwrap();
 
     assert_eq!(
-        item.title(&mut helper).unwrap(),
+        item.get_title(&mut helper).unwrap(),
         "Two",
         "title() must not return a value frozen before the mutation"
     );
     assert_eq!(
-        item.count(&mut helper).unwrap(),
+        item.get_count(&mut helper).unwrap(),
         -2,
         "count() must not return a value frozen before the mutation"
     );
     assert_eq!(
-        item.dest_page(&mut helper).unwrap().object_ref(),
+        item.get_dest_page(&mut helper).unwrap().object_ref(),
         Some(ObjectRef::new(6, 0)),
         "dest_page() must not return a value frozen before the mutation"
     );
@@ -4780,7 +4786,7 @@ fn dest_dict_cache_holds_stale_value_within_one_helper_session() {
 
     // Populate `dest_dict` from the original catalog `/Dests`.
     assert_eq!(
-        item.dest_page(&mut helper).unwrap().object_ref(),
+        item.get_dest_page(&mut helper).unwrap().object_ref(),
         Some(ObjectRef::new(3, 0))
     );
 
@@ -4794,7 +4800,7 @@ fn dest_dict_cache_holds_stale_value_within_one_helper_session() {
 
     // Same helper session: `dest_dict` still holds the old handle.
     assert_eq!(
-        item.dest_page(&mut helper).unwrap().object_ref(),
+        item.get_dest_page(&mut helper).unwrap().object_ref(),
         Some(ObjectRef::new(3, 0)),
         "cached dest_dict must not observe a /Dests swap mid-session"
     );
@@ -4804,7 +4810,7 @@ fn dest_dict_cache_holds_stale_value_within_one_helper_session() {
     drop(helper);
     let mut fresh_helper = pdf.outline();
     assert_eq!(
-        item.dest_page(&mut fresh_helper).unwrap().object_ref(),
+        item.get_dest_page(&mut fresh_helper).unwrap().object_ref(),
         Some(ObjectRef::new(6, 0)),
         "a new helper session must observe the swapped /Dests"
     );

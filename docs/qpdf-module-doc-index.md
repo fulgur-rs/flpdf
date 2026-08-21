@@ -70,8 +70,8 @@
 | `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding |
 | `crates/flpdf/src/optimization/inherited_attrs.rs` | correspondence | QPDF_optimization.cc inherited-page-attribute push |
 | `crates/flpdf/src/outline_dest_remap.rs` | correspondence | QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations |
-| `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline_object_helper.rs |
-| `crates/flpdf/src/outline_object_helper.rs` | correspondence | QPDFOutlineObjectHelper.cc compatibility surface split from the document helper |
+| `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc — construction, \`hasOutlines\`, and \`resolveNamedDest\`; \`QPDFOutlineObjectHelper.cc\` accessors live in outline_object_helper.rs |
+| `crates/flpdf/src/outline_object_helper.rs` | correspondence | QPDFOutlineObjectHelper.cc getTitle/getCount/getDest/getDestPage, split from the document helper's QPDFOutlineDocumentHelper.cc responsibilities |
 | `crates/flpdf/src/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/overlay_annotations.rs` | correspondence | QPDFPageObjectHelper.cc, QPDFAcroFormDocumentHelper.cc, ResourceFinder.cc, and QPDFObjectHandle.cc overlay responsibilities |
 | `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs |

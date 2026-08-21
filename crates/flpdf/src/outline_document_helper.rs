@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFOutlineDocumentHelper.cc and QPDFOutlineObjectHelper.cc responsibilities split with outline_object_helper.rs.
+//! qpdf correspondence: QPDFOutlineDocumentHelper.cc — construction, `hasOutlines`, and `resolveNamedDest`; `QPDFOutlineObjectHelper.cc` accessors live in outline_object_helper.rs.
 //! High-level outline (`/Outlines`) document helper.
 //!
 //! [`OutlineDocumentHelper`] wraps a `&mut Pdf<R>` and materializes the document
@@ -17,7 +17,7 @@
 //! if helper.has_outlines()? {
 //!     let tree = helper.get_tree()?;
 //!     for (depth, _id, item) in tree.preorder() {
-//!         let title = item.title(&mut helper)?;
+//!         let title = item.get_title(&mut helper)?;
 //!         println!("{:indent$}{}", "", title, indent = (depth - 1) * 2);
 //!     }
 //! }
@@ -114,7 +114,7 @@ struct SiblingSeen {
 /// as the caller holds that C++ object). [`Pdf::outline`] mints a new
 /// instance on every call, so that cache only spans calls made through the
 /// same `&mut OutlineDocumentHelper` — callers that want the caching
-/// benefit across many [`crate::OutlineItem::dest`] calls (as
+/// benefit across many [`crate::OutlineItem::get_dest`] calls (as
 /// [`crate::json_inspect::build_outlines_section`] does for a whole
 /// outline-tree walk) must hold one instance and reuse it, the same way a
 /// qpdf caller reuses one `QPDFOutlineDocumentHelper`.
@@ -176,7 +176,11 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(!first.try_is_null()?)
     }
 
-    fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
+    /// Resolve `handle` in place. Backs [`OutlineItem::get_title`] and
+    /// [`OutlineItem::get_count`], which each resolve one level of
+    /// indirection off an already-obtained `/Title`/`/Count` value the same
+    /// way qpdf's `QPDFObjectHandle` transparently dereferences on access.
+    pub(crate) fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
         self.pdf.resolve_object_handle(handle)
     }
 
@@ -189,7 +193,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     // qpdf-deviation: chases a Pdf::set_object bare-reference redirect that
     // has no qpdf counterpart (QPDF::replaceObject rejects indirect
     // replacement, libqpdf/QPDF.cc:1986-1991).
-    fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
+    pub(crate) fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle_to_terminal(&handle)
     }
 
@@ -433,108 +437,6 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(Some(id))
     }
 
-    /// Extract an outline dictionary's `/key` entry, or `None` when the
-    /// object is not a dictionary or lacks that key. Shared by
-    /// [`Self::resolve_item_title`], [`Self::resolve_item_count`], and
-    /// [`Self::resolve_item_dest`].
-    fn outline_dict_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
-        if object.try_as_dictionary()?.is_none() || !object.try_has_key(key)? {
-            return Ok(None);
-        }
-        Ok(Some(object.try_get_key(key)?))
-    }
-
-    /// Decode `/Title` from a live outline object, mirroring qpdf's
-    /// `getTitle()` (`libqpdf/QPDFOutlineObjectHelper.cc:91-98`), which
-    /// re-reads `/Title` on every call rather than caching it. Backs
-    /// [`crate::OutlineItem::title`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates errors resolving `/Title` or emitting a type-mismatch warning.
-    pub(crate) fn resolve_item_title(&mut self, object: &ObjectHandle) -> Result<String> {
-        let title_src = Self::outline_dict_key(object, b"/Title")?;
-        resolve_title(self.pdf, title_src)
-    }
-
-    /// Read `/Count` from a live outline object, mirroring qpdf's
-    /// `getCount()` (`libqpdf/QPDFOutlineObjectHelper.cc:81-88`), which
-    /// re-reads `/Count` on every call rather than caching it. Backs
-    /// [`crate::OutlineItem::count`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates errors resolving `/Count` or emitting a type-mismatch warning.
-    pub(crate) fn resolve_item_count(&mut self, object: &ObjectHandle) -> Result<i32> {
-        let count_src = Self::outline_dict_key(object, b"/Count")?;
-        resolve_count(self.pdf, count_src)
-    }
-
-    /// Resolve a live outline object's destination, mirroring qpdf's
-    /// `getDest()` (`libqpdf/QPDFOutlineObjectHelper.cc:47-69`), which
-    /// re-reads `/Dest`/`/A` on every call rather than caching the result.
-    /// Backs [`crate::OutlineItem::dest`].
-    ///
-    /// # Errors
-    ///
-    /// Propagates errors resolving the destination or the catalog's
-    /// named-destination tables.
-    pub(crate) fn resolve_item_dest(&mut self, object: &ObjectHandle) -> Result<ObjectHandle> {
-        let dest_src = Self::outline_dict_key(object, b"/Dest")?;
-        let action_src = Self::outline_dict_key(object, b"/A")?;
-        let dest = self.resolve_node_dest(dest_src, action_src)?;
-        self.resolve_handle(&dest)?;
-        Ok(dest)
-    }
-
-    /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
-    fn resolve_node_dest(
-        &mut self,
-        dest: Option<ObjectHandle>,
-        action: Option<ObjectHandle>,
-    ) -> Result<ObjectHandle> {
-        let Some(candidate) = (if let Some(dest) = dest {
-            Some(dest)
-        } else {
-            self.goto_action_dest(action)?
-        }) else {
-            return Ok(ObjectHandle::null());
-        };
-
-        let candidate = self.resolve_value_handle(candidate)?;
-        if let Some(name) = candidate.try_as_name()? {
-            return self.resolve_legacy_node_dest(&name);
-        }
-        if let Some(bytes) = candidate.as_string() {
-            return self.resolve_name_tree_node_dest(&bytes);
-        }
-        Ok(candidate)
-    }
-
-    fn goto_action_dest(&mut self, action: Option<ObjectHandle>) -> Result<Option<ObjectHandle>> {
-        let Some(action) = action else {
-            return Ok(None);
-        };
-        let action = self.resolve_value_handle(action)?;
-        if action.try_as_dictionary()?.is_none() {
-            return Ok(None);
-        }
-        // Chase the same `Pdf::set_object` redirect this file's other
-        // dest-resolution call sites already chase (`resolve_node_dest`'s
-        // `candidate`, `resolve_legacy_node_dest`'s `value`,
-        // `resolve_name_tree_node_dest`'s `found`, and this function's own
-        // `action` above): `try_is_name_and_equals` only dereferences its
-        // receiver once and never follows a bare-reference-valued result.
-        let subtype = self.resolve_value_handle(action.try_get_key(b"/S")?)?;
-        if !subtype.try_is_name_and_equals(b"GoTo")? {
-            return Ok(None);
-        }
-        if !action.try_has_key(b"/D")? {
-            return Ok(None);
-        }
-        Ok(Some(action.try_get_key(b"/D")?))
-    }
-
     /// Return the cached `/Dests` catalog entry, fetching and caching it on
     /// first use (matching qpdf's `dest_dict.isInitialized()` guard, which
     /// caches the fetch outcome unconditionally, including a missing entry).
@@ -550,41 +452,46 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         Ok(dests)
     }
 
-    fn resolve_legacy_node_dest(&mut self, name: &[u8]) -> Result<ObjectHandle> {
+    /// Resolve a name-object named destination through the catalog's legacy
+    /// `/Dests` dictionary — the `name.isName()` branch of qpdf's
+    /// `resolveNamedDest()` (`libqpdf/QPDFOutlineDocumentHelper.cc:65-73`).
+    fn resolve_named_dest_by_name(&mut self, name: &[u8]) -> Result<Option<ObjectHandle>> {
         let dests = self.cached_dest_dict()?;
         if dests.try_as_dictionary()?.is_none() {
-            return Ok(ObjectHandle::null());
+            return Ok(None);
         }
         let mut key = Vec::with_capacity(name.len() + 1);
         key.push(b'/');
         key.extend_from_slice(name);
         if !dests.try_has_key(&key)? {
-            return Ok(ObjectHandle::null());
+            return Ok(None);
         }
         // Chase the selected entry the same way every other exit path in
-        // this file does (`resolve_node_dest`'s `candidate`,
-        // `goto_action_dest`'s `action`, `resolve_name_tree_node_dest`'s
-        // `found`): a `Pdf::set_object` legacy redirect can still sit behind
-        // this dictionary entry even after `dests` itself was chased above.
+        // this file does: a `Pdf::set_object` legacy redirect can still sit
+        // behind this dictionary entry even after `dests` itself was chased
+        // in `cached_dest_dict`.
         let value = dests.try_get_key(&key)?;
-        self.resolve_value_handle(value)
+        Ok(Some(self.resolve_value_handle(value)?))
     }
 
-    fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<ObjectHandle> {
+    /// Resolve a string named destination through the catalog's
+    /// `/Names/Dests` name tree — the `name.isString()` branch of qpdf's
+    /// `resolveNamedDest()` (`libqpdf/QPDFOutlineDocumentHelper.cc:74-85`).
+    fn resolve_named_dest_by_string(&mut self, bytes: &[u8]) -> Result<Option<ObjectHandle>> {
         let lookup =
             crate::pdf_string::normalized_utf8_value(&crate::pdf_string::utf8_value(bytes));
         if self.names_dest.is_none() {
             let Some(names) = self.catalog_value_handle(b"/Names")? else {
-                return Ok(ObjectHandle::null());
+                return Ok(None);
             };
             let names = self.resolve_value_handle(names)?;
             if names.try_as_dictionary()?.is_none() || !names.try_has_key(b"/Dests")? {
-                return Ok(ObjectHandle::null());
+                return Ok(None);
             }
             let root = names.try_get_key(b"/Dests")?;
             let root = self.resolve_value_handle(root)?;
             if root.try_as_dictionary()?.is_none() {
-                return Ok(ObjectHandle::null());
+                return Ok(None);
             }
             self.names_dest = Some(HandleNameTree::new(root, self.pdf.unique_id(), true));
         }
@@ -596,7 +503,29 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         found
             .map(|value| self.resolve_value_handle(value))
             .transpose()
-            .map(|value| value.unwrap_or_else(ObjectHandle::null))
+    }
+
+    /// If `name` is a name object, look it up in the catalog's `/Dests`
+    /// dictionary; if it is a string, look it up in the name tree pointed
+    /// to by `/Names/Dests`; otherwise resolve to null. Mirrors qpdf's
+    /// `resolveNamedDest(QPDFObjectHandle name)`
+    /// (`libqpdf/QPDFOutlineDocumentHelper.cc:60-90`). Backs
+    /// [`crate::OutlineItem::get_dest`], which — like qpdf's `getDest()` —
+    /// only calls this once it has already established `name` is a name or
+    /// string; a candidate that is neither stays with the caller unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors resolving the catalog's named-destination tables.
+    pub(crate) fn resolve_named_dest(&mut self, name: ObjectHandle) -> Result<ObjectHandle> {
+        let found = if let Some(name_bytes) = name.try_as_name()? {
+            self.resolve_named_dest_by_name(&name_bytes)?
+        } else if let Some(bytes) = name.as_string() {
+            self.resolve_named_dest_by_string(&bytes)?
+        } else {
+            None
+        };
+        Ok(found.unwrap_or_else(ObjectHandle::null))
     }
 
     fn catalog_value_handle(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
@@ -616,42 +545,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-/// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
-fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<ObjectHandle>) -> Result<String> {
-    let Some(value) = value else {
-        return Ok(String::new());
-    };
-    pdf.resolve_object_handle(&value)?;
-    qpdf_title(&value)
-}
-
-fn qpdf_title(value: &ObjectHandle) -> Result<String> {
-    if let Some(bytes) = value.as_string() {
-        Ok(String::from_utf8_lossy(&crate::pdf_string::utf8_value(&bytes)).into_owned())
-    } else {
-        value.type_warning("string", "returning empty string")?;
-        Ok(String::new())
-    }
-}
-
-/// Read an outline `/Count`, resolving one level of indirection (review rule 2/3).
-fn resolve_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<ObjectHandle>) -> Result<i32> {
-    let Some(value) = value else {
-        return Ok(0);
-    };
-    pdf.resolve_object_handle(&value)?;
-    qpdf_count(&value)
-}
-
-fn qpdf_count(value: &ObjectHandle) -> Result<i32> {
-    value.try_get_int_value_as_int()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{mark_direct_sibling_seen, qpdf_count, qpdf_title};
-    use crate::pipeline::test_support::NthWriteFailure;
-    use crate::pipeline::PipelineHandle;
+    use super::mark_direct_sibling_seen;
     use crate::{ObjectHandle, ObjectRef};
 
     /// Mirrors `form_field_object_helper.rs`'s
@@ -676,32 +572,5 @@ mod tests {
 
         let other_direct = ObjectHandle::dictionary(Vec::new());
         assert!(mark_direct_sibling_seen(&mut direct_seen, &other_direct));
-    }
-
-    #[test]
-    fn scalar_warning_sink_failures_propagate() {
-        for title in [true, false] {
-            let mut pdf = crate::Pdf::empty().unwrap();
-            let logger = crate::QPDFLogger::create();
-            logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
-            pdf.set_logger(logger);
-
-            let result = if title {
-                let value = pdf
-                    .lift_object_to_handle(&crate::Object::Integer(42))
-                    .unwrap();
-                qpdf_title(&value).map(|_| ())
-            } else {
-                let value = pdf
-                    .lift_object_to_handle(&crate::Object::String(b"wrong".to_vec()))
-                    .unwrap();
-                qpdf_count(&value).map(|_| ())
-            };
-            assert!(matches!(
-                result,
-                Err(crate::Error::System(ref message)) if message == "sink write failure 1"
-            ));
-            assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
-        }
     }
 }

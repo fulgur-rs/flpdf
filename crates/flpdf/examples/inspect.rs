@@ -44,7 +44,7 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("outline:");
         for (depth, _id, item) in outline.preorder() {
-            let title = item.title(&mut outline_helper)?;
+            let title = item.get_title(&mut outline_helper)?;
             println!("{}- {}", "  ".repeat(depth), title);
         }
     }

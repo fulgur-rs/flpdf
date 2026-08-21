@@ -115,7 +115,7 @@ fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> 
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
     let target = tree[tree.roots()[0]]
-        .dest_page(&mut helper)
+        .get_dest_page(&mut helper)
         .unwrap()
         .object_ref()
         .expect("dest must resolve to a page ref");
