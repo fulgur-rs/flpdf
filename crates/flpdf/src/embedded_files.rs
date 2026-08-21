@@ -285,21 +285,33 @@ impl<R: Read + Seek> Pdf<R> {
 /// 1. Looks up `key` in the catalog's `/Names /EmbeddedFiles` name tree.
 ///    Returns `Ok(false)` — without error — if the key is absent.
 /// 2. Calls [`EmbeddedFileDocumentHelper::remove_embedded_file`], which
-///    removes the name-tree entry and replaces an indirect Filespec with null,
-///    matching qpdf's `removeEmbeddedFile` contract. Associated-files
-///    (`/AF`) arrays are not modified.
+///    removes the name-tree entry and **unconditionally** replaces an
+///    indirect Filespec with null, matching qpdf's `removeEmbeddedFile`
+///    contract — regardless of any other live reference to that same object
+///    (an `/AF` entry, a `/Dests` / `/JavaScript` name tree, another
+///    Filespec). Associated-files (`/AF`) arrays are not modified, so an
+///    `/AF` entry that pointed at the removed Filespec now points at null.
 /// 3. **Mark-and-sweep GC** (`crate::subset_prune::sweep_unreachable_objects`):
 ///    every indirect object no longer reachable from `/Root` or the trailer
-///    is physically deleted. This drops the removed `/Filespec`, *all* its
-///    `/EF` streams (including a filespec carrying distinct streams under
-///    several `/EF` keys), any sub-objects reachable only through it, and the
-///    orphan ghost name-tree nodes left by the rebuild — in one pass, with no
-///    per-feature reachability heuristics.
+///    is physically deleted. This always drops the Filespec's original
+///    content — its `/EF` streams (including a filespec carrying distinct
+///    streams under several `/EF` keys) and any sub-objects reachable only
+///    through it become unreachable the instant step 2 nulls the Filespec,
+///    so the sweep removes them regardless of what else is live. The null
+///    object *slot* the Filespec occupied is a separate question: it
+///    survives the sweep, still emitted as `null`, if something else (most
+///    commonly `/AF`) still holds an indirect reference to that object
+///    number; otherwise the slot itself is swept away too. The sweep also
+///    drops the orphan ghost name-tree nodes left by the rebuild — all in
+///    one pass, with no per-feature reachability heuristics.
 ///
-/// The conservative-share semantics are automatic: an `/EmbeddedFile` stream
-/// still reachable from another live object (e.g. shared between two
-/// filespecs, or a filespec still referenced by a live `/Dests` /
-/// `/JavaScript` name tree) stays reachable and therefore survives the sweep.
+/// The conservative-share semantics only protect content that was never
+/// routed through the removed Filespec in the first place: an `/EmbeddedFile`
+/// stream shared by a *different*, still-live Filespec object stays
+/// reachable through that other Filespec and survives. A `/Dests` /
+/// `/JavaScript` name tree entry that points at the *same* Filespec object
+/// being removed does **not** preserve it — step 2 nulls that object
+/// unconditionally, so the other name tree ends up pointing at null too.
 ///
 /// # Blast radius
 ///
