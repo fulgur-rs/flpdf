@@ -548,7 +548,48 @@ impl<R: Read + Seek> Pdf<R> {
 #[cfg(test)]
 mod tests {
     use super::mark_direct_sibling_seen;
-    use crate::{ObjectHandle, ObjectRef};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
+    use std::io::Cursor;
+
+    fn minimal_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n")
+                .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// qpdf's `resolveNamedDest` falls through to a null result when `name`
+    /// is neither a Name nor a String (`libqpdf/QPDFOutlineDocumentHelper.cc`
+    /// :60-90's `if (name.isName()) {...} else if (name.isString()) {...}`
+    /// has no other branch). `OutlineItem::get_dest`'s `is_named` gate never
+    /// passes such a candidate through in the normal call path, so this
+    /// exercises `resolve_named_dest` directly to cover that fall-through.
+    #[test]
+    fn resolve_named_dest_returns_null_for_a_non_name_non_string_candidate() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).unwrap();
+        let mut helper = pdf.outline();
+
+        let resolved = helper
+            .resolve_named_dest(ObjectHandle::integer(42))
+            .unwrap();
+
+        assert!(
+            resolved.try_is_null().unwrap(),
+            "a non-name, non-string candidate must resolve to null"
+        );
+    }
 
     /// Mirrors `form_field_object_helper.rs`'s
     /// `direct_seen_set_ignores_indirect_handles_and_tracks_direct_identity`:

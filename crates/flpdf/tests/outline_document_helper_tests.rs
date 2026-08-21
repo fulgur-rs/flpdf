@@ -1325,11 +1325,12 @@ fn non_dictionary_legacy_dests_resolve_to_null() {
 /// redirect bridge `OutlineDocumentHelper::resolve_value_handle`'s own doc
 /// describes (`Pdf::set_object` can install this state in a canonical slot;
 /// a normal indirect child parsed from a real PDF never does). The other
-/// three dest-resolution call sites in this module (`resolve_node_dest`,
-/// `goto_action_dest`, `resolve_name_tree_node_dest`) already chase this
-/// redirect to its terminal value via `resolve_value_handle`; the legacy
-/// `/Dests` dictionary lookup must reach the same object 9 array rather than
-/// exposing the still-redirected object 8 handle.
+/// dest-resolution call sites (`OutlineItem::get_dest` in
+/// outline_object_helper.rs, `resolve_named_dest_by_string`) already chase
+/// this redirect to its terminal value via `resolve_value_handle`; the legacy
+/// `/Dests` dictionary lookup (`resolve_named_dest_by_name`) must reach the
+/// same object 9 array rather than exposing the still-redirected object 8
+/// handle.
 fn named_dest_legacy_redirect_chain_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -3875,7 +3876,7 @@ fn action_indirect_a_contributes_the_node_destination() {
 /// Regression: `/A /S` stored as an indirect reference (obj 8) to a Name.
 /// The destination fallback path must see through the holder reference.
 #[test]
-fn resolve_node_dest_follows_indirect_s_name() {
+fn get_dest_follows_indirect_s_name() {
     let pdf_bytes = build_pdf(
         &[
             (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
@@ -4293,8 +4294,8 @@ fn outline_action_sd_without_d_has_null_destination() {
 /// freshly allocated obj 9 holding the real `/GoTo` name. This is the same
 /// flpdf-internal `Pdf::set_object` redirect-bridge shape
 /// `resolve_value_handle`'s own doc describes, and that this file's other
-/// dest-resolution call sites (`resolve_node_dest`'s `candidate`,
-/// `resolve_legacy_node_dest`'s `value`, `resolve_name_tree_node_dest`'s
+/// dest-resolution call sites (`OutlineItem::get_dest`'s `candidate`,
+/// `resolve_named_dest_by_name`'s `value`, `resolve_named_dest_by_string`'s
 /// `found`, and `goto_action_dest`'s own `action` holder — see
 /// `outline_destination_resolves_through_multi_hop_action_holder_chain`
 /// above) already chase via `resolve_value_handle` before inspecting the
