@@ -7117,6 +7117,60 @@ fn copy_attachments_from_with_prefix() {
         .stdout(predicate::str::contains("pfx-original"));
 }
 
+#[test]
+fn bare_segment_equals_forms_discard_attached_values_like_qpdf() {
+    let temp = tempfile::tempdir().unwrap();
+    let one_page = "../../tests/fixtures/compat/one-page.pdf";
+
+    let encrypted = temp.path().join("encrypted.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--encrypt=discarded",
+            "user",
+            "owner",
+            "256",
+            "--",
+            one_page,
+        ])
+        .arg(&encrypted)
+        .assert()
+        .success();
+
+    let pages = temp.path().join("pages.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([one_page, "--pages=discarded", one_page, "--"])
+        .arg(&pages)
+        .assert()
+        .success();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-npages", pages.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+
+    let copied = temp.path().join("copied.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            one_page,
+            "--copy-attachments-from=discarded",
+            "../../tests/fixtures/compat/attachment-two-page.pdf",
+            "--",
+        ])
+        .arg(&copied)
+        .assert()
+        .success();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", copied.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("attachment.txt"));
+}
+
 /// qpdf 11.9.0 (observed): `--verbose --copy-attachments-from FILE` prints
 /// `copying attachments from FILE`, `  key -> new_key` per copied entry, and
 /// (once the operation writes an output file) `wrote file OUTPUT`.
