@@ -126,6 +126,25 @@ pub fn prune_after_subset<R: Read + Seek>(
 /// this single, well-tested sweep is the one place that physically removes
 /// them — no per-feature ad-hoc reachability heuristics.
 pub(crate) fn sweep_unreachable_objects<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<usize> {
+    sweep_unreachable_objects_except(pdf, &BTreeSet::new())
+}
+
+/// Like [`sweep_unreachable_objects`], but treats every ref in `protect` as
+/// an additional reachability seed, so the objects it names (and everything
+/// they in turn reference) survive the sweep even though nothing in the
+/// document's own `/Root`/trailer graph points at them.
+///
+/// Used by the multi-source `--pages --preserve-unreferenced` merge
+/// (`job/page_merge.rs`) to keep the primary's preserved-orphan closure
+/// alive while still sweeping away incidental merge artifacts (copied
+/// ancestor `/Pages` nodes) that are not part of that closure — qpdf's own
+/// writer preserves unreferenced objects only when explicitly asked
+/// (`QPDFWriter.cc:2907-2913`), it does not disable reachability pruning for
+/// everything else.
+pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    protect: &BTreeSet<ObjectRef>,
+) -> Result<usize> {
     let root_ref = match pdf.root_ref() {
         Some(r) => r,
         None => return Ok(0), // no /Root → nothing can be proven unreachable
@@ -135,12 +154,14 @@ pub(crate) fn sweep_unreachable_objects<R: Read + Seek>(pdf: &mut Pdf<R>) -> Res
     // set after marking.
     let all_live = pdf.live_object_refs();
 
-    // Mark: traverse from /Root AND from the trailer (protects /Info,
-    // /Encrypt and any other trailer-only references from the sweep).
+    // Mark: traverse from /Root, from the trailer (protects /Info,
+    // /Encrypt and any other trailer-only references from the sweep), and
+    // from every explicitly protected ref.
     let trailer_refs = {
         let trailer_clone = Object::Dictionary(pdf.trailer().clone());
         let mut refs: Vec<ObjectRef> = Vec::new();
         walk_refs(&trailer_clone, 0, &mut refs)?;
+        refs.extend(protect.iter().copied());
         refs
     };
     let reachable = collect_reachable(pdf, root_ref, trailer_refs)?;

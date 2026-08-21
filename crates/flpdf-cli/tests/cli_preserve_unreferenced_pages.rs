@@ -156,3 +156,71 @@ fn multi_source_pages_preserve_primary_unreferenced_objects_like_qpdf() {
         "flpdf preserve output must retain the primary orphan marker"
     );
 }
+
+/// A preserved orphan may reference the primary's own structural roots
+/// directly (here, the Catalog via `/Owner`). qpdf keeps the primary `QPDF`
+/// in place, so that reference always resolves to the document's one true
+/// Catalog. flpdf's merge instead builds a fresh Catalog/`/Pages` pair and
+/// copies everything else into it, so the copy must seed the primary's
+/// original Catalog/`/Pages` refs onto their target equivalents -- otherwise
+/// the orphan's reference either becomes `Object::Null` (unseeded, dropped by
+/// `rewrite_refs`) or a needless duplicate Catalog copy. Assert full output
+/// byte-identity against qpdf 11.9.0 (not just QDF-normalized structure) so a
+/// duplicate-object regression (extra `/Size` entries) cannot slip through.
+#[test]
+fn multi_source_pages_preserve_orphan_reference_to_primary_catalog_resolves_to_target_catalog() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = fixture("primary-orphan-references-catalog.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_result = run_qpdf(&[
+        "--preserve-unreferenced",
+        "--pages",
+        ".",
+        "1",
+        "--",
+        "--static-id",
+        primary.to_str().unwrap(),
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf single-source --pages with --preserve-unreferenced failed: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--preserve-unreferenced",
+            "--pages",
+            ".",
+            "1",
+            "--",
+        ])
+        .arg("--static-id")
+        .arg(&primary)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_bytes = std::fs::read(&qpdf_output).expect("qpdf output should be readable");
+    let flpdf_bytes = std::fs::read(&flpdf_output).expect("flpdf output should be readable");
+    assert_eq!(
+        qpdf_bytes, flpdf_bytes,
+        "flpdf must reproduce qpdf's output byte-for-byte: the orphan's \
+         /Owner reference to the primary Catalog must resolve to the same \
+         single target Catalog object qpdf produces, not a duplicate copy \
+         or a null"
+    );
+}
