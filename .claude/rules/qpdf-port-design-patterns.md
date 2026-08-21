@@ -298,6 +298,87 @@ docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job
 記載ミス以外に high confidence の命名乖離は見つからなかった——
 `doX`→`x`、`handleX`→`handle_x` の変換自体は一貫して正確に行われていた。
 
+## 8. `pub` 境界も qpdf の public/private 境界に倣う
+
+**`pub`（クレート境界を超えて見える）ということは、対応する qpdf 側にも
+「本当に公開されている」ものが無ければならない。** qpdf の private メソッド
+内のインラインコードを切り出した flpdf 側の実装は、既定で `private`/
+`pub(crate)` に留める。
+
+qpdf 自身の CLI 実行ファイル（`qpdf/qpdf.cc`、わずか 62 行）は
+`QPDFJob` の小さな public surface（`initializeFromArgv`/`run`/
+`getExitCode` 等）しか呼ばない。`handlePageSpecs`/`doCheck`/
+`doListAttachments` のような private メソッド群は `run()` が内部で
+orchestrate するだけで、CLI 側からは一切触れない。flpdf-cli も
+`job.list_attachments(&mut pdf, verbose)`/`job.write_json(...)` のように
+`QPDFJob` の public メソッド経由で呼ぶ箇所ではこの構造を正しく踏襲できている。
+
+### ルール
+
+- `pub` にしてよい根拠は次のいずれか:
+  1. 対応する qpdf 側の識別子が実際に public である（例:
+     `QUtil::parse_numrange` は namespace 関数として真に public —
+     `QPDFJob::parseNumrange` という private ラッパー越しではなく
+     こちらを見る）。
+  2. qpdf 側は private でも、flpdf-cli（別 crate）が
+     **その `QPDFJob` 自身の public メソッド経由で** 呼んでいる
+     （`job.list_attachments()`/`job.write_json()`/`job.check()` 等、
+     qpdf の `run()` が private 実装を内部 orchestrate するのと同じ形）。
+  3. flpdf 独自の意図的なライブラリ機能として、crate ルートの doc
+     （`lib.rs` 冒頭）に明記されている（`merge_documents`/`extract_pages`
+     等。qpdf に単体の embeddable 対応物が無くても、flpdf が単体の
+     Rust PDF ライブラリとして提供すると決めた機能は該当）。
+  上記のどれにも当たらないなら `pub(crate)` 以下に落とす。
+- **QPDFJob.hh を読むときの罠**: `Config`/`PagesConfig`/`UOConfig` 等の
+  argv パーサー用ネストクラスは、それぞれ自分の `private:` を持つ。
+  ネストクラスの `};` で閉じた後、外側 `QPDFJob` 自身の直近の
+  `public:`/`private:` に戻る。ネストクラス内の `private:` を外側の
+  以降のメンバーにまで「漏らして」数えると、実際は public な
+  `run()`/`createQPDF()`/`writeQPDF()`/`hasWarnings()`/`getExitCode()`
+  等を private と誤判定する（実際にこのルール作成中に踏んだ）。
+  ネスト深さを追わない単純な正規表現抽出は信用せず、疑わしい箇所は
+  該当行の直前を目視で確認する。
+- flpdf-cli からも flpdf 自身の production コードからも参照されず、
+  `#[cfg(test)]` からしか届いていない `pub` 項目は、qpdf の private
+  対応物と同じ扱いにする——テストは同一クレート内なので `pub(crate)`
+  で十分。「かつて必要だったから `pub` のまま」を放置しない。
+- flpdf-cli が job/ の分解済み部品（型・関数）に **直接** 手を伸ばしている
+  箇所は、qpdf の CLI が `QPDFJob` の private 実装に一切触れない構造との
+  食い違いそのもの。visibility を pub のままにする理由にせず、
+  「`QPDFJob` 自身に public メソッドを生やしてそちら経由にできないか」を
+  検討する。今すぐ塞げない場合は issue化して構造 debt として記録する
+  （単純な visibility 変更では済まないことが多い — `flpdf-hxmj` 参照）。
+
+### 該当例
+
+`job/mod.rs` の `pub use` 一覧を flpdf-cli の実利用箇所と突き合わせたところ
+2 群に分かれた。(1) `list_attachment_info`/`format_attachment_list`/
+`format_attachment_list_with_sink`/`AttachmentInfo`、および
+`build_pages_section`/`build_outlines_section`/`build_pagelabels_section`/
+`build_acroform_section`/`build_encrypt_section`/`build_attachments_section`/
+`write_qpdf_json_v2_selected_objects_with_options`/
+`write_qpdf_json_v2_selected_objects_to_output_with_options` は、flpdf-cli
+からは `job.list_attachments()`/`job.write_json()` という `QPDFJob` の
+public メソッド経由でしか呼ばれておらず（`--list-attachments` は
+`run_list_attachments`→`job.list_attachments(&mut pdf, verbose)`）、これら
+自身の名前を直接参照しているのは `job/attachments.rs`/`job/json_sections.rs`
+自身の実装と、`json_inspect.rs` の `#[cfg(test)] mod tests`（972 行目以降）
+の JSON 出力形状テストだけだった——flpdf 自身の production コードからも
+呼ばれていない。qpdf の `doListAttachments`/`doJSON` が private のまま
+`run()` 越しにしか呼ばれないのと同じ形が既に実現できているので、
+`pub(crate)` に落として問題ない。(2) 一方 `prune_acroform_after_subset`・
+`RotateSpec`（`RotateSpec::parse`）・`PageRange`（`PageRange::parse`）は
+flpdf-cli の `main.rs` から直接呼ばれており、対応する qpdf 側は
+`handlePageSpecs` 内のインラインコード／`parseRotationParameter`／
+`QPDFJob::parseNumrange` という private メソッドのみ（`PageRange` の
+根底にある `QUtil::parse_numrange` は public だが、flpdf の 2 段階
+parse/resolve 構造そのものへの対応物ではない）。これは qpdf の CLI が
+`QPDFJob` の private 実装に触れない構造と食い違っており、
+`QPDFJob` 側に `handle_page_specs` 相当の public メソッドへ経路を
+一本化しない限り `pub(crate)` に落とせない——`flpdf-hxmj`
+（single-source と multi-source の `--pages` パイプライン統合）が
+この食い違いの解消先として既に追跡されている。
+
 ---
 
 ## 補足
@@ -307,6 +388,6 @@ docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job
 - **既存 2 本との関係**: 本文書（設計）→ `pdf-rust-review-patterns.md`
   （実装・コードレビュー）→ `pdf-rust-doc-review-patterns.md`（公開 doc）の順で
   適用範囲が下りていく。設計を誤ると下 2 本は誤った設計を綺麗に磨くだけになる。
-- 1〜7 は「出発点」「中断シグナル」「前例の検証」「依存順序」「逐語訳の粒度」
-  「複数実装統合前の機械可読マーキング」「メソッド名の導出と実在検証」という、
-  qpdf 移植の設計段階に固有の落とし穴。
+- 1〜8 は「出発点」「中断シグナル」「前例の検証」「依存順序」「逐語訳の粒度」
+  「複数実装統合前の機械可読マーキング」「メソッド名の導出と実在検証」
+  「`pub` 境界の qpdf 対応」という、qpdf 移植の設計段階に固有の落とし穴。
