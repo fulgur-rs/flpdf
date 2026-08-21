@@ -4632,9 +4632,8 @@ impl ObjectHandle {
     /// the stream filters are added in reverse `/Filter` order. The source
     /// is finally dispatched through the completed chain without a legacy
     /// `Object` materialization.
-    #[allow(dead_code)] // writer/inspection consumers are not on the canonical resolver route yet.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pipe_stream_data(
+    pub fn pipe_stream_data(
         &self,
         pipeline: &mut dyn Pipeline,
         filtering_attempted: &mut bool,

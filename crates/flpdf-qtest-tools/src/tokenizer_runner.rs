@@ -7,7 +7,8 @@ use std::path::Path;
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult,
+    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline, PipelineResult,
+    Result as FlpdfResult,
 };
 
 use crate::common::test_driver_program_name_bytes;
@@ -15,6 +16,26 @@ use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning
 
 pub enum RunOutcome {
     Exit(u8),
+}
+
+#[derive(Default)]
+struct ObjectStreamPipeline {
+    bytes: Vec<u8>,
+}
+
+impl Pipeline for ObjectStreamPipeline {
+    fn identifier(&self) -> &str {
+        "object stream data"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 pub fn run(
@@ -265,24 +286,35 @@ fn process(
         if !resolve_objstm_type(&mut pdf, &stream_dict) {
             continue;
         }
-        // qpdf's test_tokenizer calls getStreamData on the same canonical
-        // object it just inspected. Do not cross back through
-        // Pdf::resolve_borrowed here: a stream-length recovery on the
-        // ObjStm container would otherwise run a second time through the
-        // legacy source/xref route and emit a second warning sequence.
-        let decoded = match stream_handle.get_stream_data(DecodeLevel::Specialized) {
-            Ok(decoded) => decoded,
-            Err(e) => {
-                let _ = emit_new_diagnostics(
-                    &pdf,
-                    &mut diagnostics_written,
-                    &filename_diagnostic,
-                    stdout,
-                    stderr,
-                );
-                return Err(e.to_string());
-            }
-        };
+        // qpdf's test_tokenizer uses the public pipeStreamData overload so an
+        // unfilterable object stream can still be tokenized from raw bytes
+        // after its warning. Do not use getStreamData here: qpdf deliberately
+        // rejects raw pass-through from that decoded-data API. Keep the
+        // canonical handle and avoid Pdf::resolve_borrowed so a stream-length
+        // recovery emits only one warning sequence.
+        let mut sink = ObjectStreamPipeline::default();
+        let mut filtering_attempted = false;
+        if !stream_handle
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                DecodeLevel::Specialized,
+                false,
+                false,
+            )
+            .map_err(|e| e.to_string())?
+        {
+            let _ = emit_new_diagnostics(
+                &pdf,
+                &mut diagnostics_written,
+                &filename_diagnostic,
+                stdout,
+                stderr,
+            );
+            return Err("error getting decoded stream data".to_owned());
+        }
+        let decoded = sink.bytes;
         let _ = emit_new_diagnostics(
             &pdf,
             &mut diagnostics_written,
@@ -292,7 +324,7 @@ fn process(
         );
         let label = format!("OBJECT STREAM {}", obj_ref.number);
         dump_tokens(
-            decoded.as_ref(),
+            &decoded,
             &label,
             max_len,
             include_ignorable,
