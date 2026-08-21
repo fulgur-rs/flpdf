@@ -438,7 +438,11 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     };
     let bbox_w = (rect.urx - rect.llx).abs();
     let bbox_h = (rect.ury - rect.lly).abs();
-    if !bbox_w.is_finite() || !bbox_h.is_finite() || bbox_w < 1.0 || bbox_h < 1.0 {
+    // qpdf's QPDFObjectHandle::isRectangle validates only that all four
+    // entries are numbers (`QPDFObjectHandle.cc:788-800`). It does not impose
+    // a positive or minimum width/height before generateTextAppearance builds
+    // the appearance from the rectangle (`QPDFFormFieldObjectHelper.cc:766-851`).
+    if !bbox_w.is_finite() || !bbox_h.is_finite() {
         return Ok(None);
     }
 
@@ -506,7 +510,9 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     };
     let bbox_w = (rect.urx - rect.llx).abs();
     let bbox_h = (rect.ury - rect.lly).abs();
-    if !bbox_w.is_finite() || !bbox_h.is_finite() || bbox_w < 1.0 || bbox_h < 1.0 {
+    // Keep qpdf's numeric-rectangle contract: a finite subunit or zero-sized
+    // rectangle still reaches the ValueSetter/content builder.
+    if !bbox_w.is_finite() || !bbox_h.is_finite() {
         return Ok(None);
     }
 
@@ -3815,6 +3821,33 @@ mod tests {
     }
 
     #[test]
+    fn canonical_renderers_generate_appearances_for_subunit_rects_like_qpdf() {
+        let mut tx = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Tx /V (x) \
+              /DA (/Helv 10 Tf 0 g) /Rect [0 0 0.5 0.5]>>",
+        )))
+        .expect("parse subunit Tx rect");
+        assert!(
+            render_text_field_canonical(&mut tx, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("subunit Tx appearance")
+                .is_some(),
+            "qpdf generates Tx appearances for finite subunit rectangles"
+        );
+
+        let mut ch = Pdf::open(Cursor::new(build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Opt [(x)] \
+              /DA (/Helv 10 Tf 0 g) /Rect [0 0 0.5 0.5]>>",
+        )))
+        .expect("parse subunit Ch rect");
+        assert!(
+            render_choice_field_canonical(&mut ch, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("subunit Ch appearance")
+                .is_some(),
+            "qpdf generates Ch appearances for finite subunit rectangles"
+        );
+    }
+
+    #[test]
     fn canonical_choice_negative_ff_preserves_combo_bit() {
         // qpdf's `getFlags()` returns a signed C++ `int`
         // (`QPDFObjectHandle::getIntValueAsInt`, `QPDFObjectHandle.cc:525-540`,
@@ -3934,7 +3967,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_renderers_skip_wrong_and_degenerate_fields() {
+    fn canonical_renderers_skip_wrong_and_reject_malformed_fields() {
         let mut btn = Pdf::open(Cursor::new(build_btn_pdf_obj4(
             "<</Type /Annot /Subtype /Widget /FT /Btn /Rect [0 0 20 20]>>",
         )))
@@ -3977,25 +4010,31 @@ mod tests {
             "<</Type /Annot /Subtype /Widget /FT /Tx /V (x) /Rect [10 10 10 30]>>",
         )))
         .expect("parse zero-width Tx");
-        assert!(render_text_field_canonical(
-            &mut zero_width,
-            ObjectRef::new(4, 0),
-            ObjectRef::new(4, 0)
-        )
-        .expect("zero-width canonical Tx")
-        .is_none());
+        assert!(
+            render_text_field_canonical(
+                &mut zero_width,
+                ObjectRef::new(4, 0),
+                ObjectRef::new(4, 0)
+            )
+            .expect("zero-width canonical Tx")
+            .is_some(),
+            "qpdf accepts a zero-width numeric rectangle"
+        );
 
         let mut zero_height = Pdf::open(Cursor::new(build_btn_pdf_obj4(
             "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [10 10 30 10]>>",
         )))
         .expect("parse zero-height Ch");
-        assert!(render_choice_field_canonical(
-            &mut zero_height,
-            ObjectRef::new(4, 0),
-            ObjectRef::new(4, 0)
-        )
-        .expect("zero-height canonical Ch")
-        .is_none());
+        assert!(
+            render_choice_field_canonical(
+                &mut zero_height,
+                ObjectRef::new(4, 0),
+                ObjectRef::new(4, 0)
+            )
+            .expect("zero-height canonical Ch")
+            .is_some(),
+            "qpdf accepts a zero-height numeric rectangle"
+        );
 
         let mut tx_direct_stream =
             Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse direct Tx appearance");
