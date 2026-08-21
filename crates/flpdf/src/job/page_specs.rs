@@ -47,6 +47,13 @@ impl PageSpecInput {
     }
 }
 
+fn merge_preserving_primary<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    resource_mode: RemoveUnreferencedResources,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    merge_documents_with_resource_mode_and_preserve_primary(inputs, resource_mode, true)
+}
+
 /// A selected page represented by its source and its occurrence within the
 /// source's grouped merge input.
 type OrderedPage = (usize, usize);
@@ -519,11 +526,7 @@ pub fn handle_page_specs_with_resource_mode_and_preserve_unreferenced<R: Read + 
         })
         .collect();
     let mut merged = if preserve_unreferenced {
-        merge_documents_with_resource_mode_and_preserve_primary(
-            &mut merge_inputs,
-            resource_mode,
-            true,
-        )? // cov:ignore: LLVM attributes the successful multiline preservation call continuation to the call setup
+        merge_preserving_primary(&mut merge_inputs, resource_mode)?
     } else {
         merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?
     };
