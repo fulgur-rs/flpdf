@@ -238,10 +238,16 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `resolve_inherited_integer`/`resolve_inherited_handle` を介した inheritable
   attribute 解決を伴い、qpdf の `getFlags`/`getValue` を直接写している）が
   該当し、`get_flags`/`get_value` へ寄せる余地がある。同じファイルの
-  `partial_name()` は見た目が似ていても中身が違う——`string_key(self.field
-  .clone(), b"T")` を 1 回呼ぶだけの直接 lookup で、親を辿る解決を伴わない
-  （qpdf の `getPartialName` も `/T` 単体を返すのみ）。このため
-  `partial_name` は本項の「計算を伴う getter」の実例には含めない。
+  `partial_name()` も同列（PR #1015 Codex 再レビューで訂正——親を辿る
+  解決を伴わない点だけを見て一度は bare getter 側へ分類したが、それは
+  本項の基準ではない）: `string_key(self.field.clone(), b"T")` の内部で
+  `self.resolved(field)` によるフィールドの解決と、値が無いときの
+  空文字列へのフォールバック（`.unwrap_or_default()`）を行っており、
+  「計算・解決・フォールバック処理を伴う」という本項の基準を満たす。
+  qpdf の `getPartialName`（`QPDFFormFieldObjectHelper.cc:135-142`）も
+  `/T` を解決し文字列でなければ空文字列にフォールバックしており、
+  対応関係は正確。よって `partial_name` も `get_partial_name` へ寄せる
+  余地がある対象として `flags`/`value` と同じ扱いにする。
   `filespec_helper.rs` の `size()`/`get_size()`・`creation_date()`/
   `get_creation_date()` のような prefix なし/ありの併存は、見かけは同じでも
   中身が違う——`size()` は `/Params /Size` の生の `Option<i64>`、
@@ -401,9 +407,9 @@ orchestrate するだけで、CLI 側からは一切触れない。flpdf-cli も
 
 `job/mod.rs` の `pub use` 一覧を flpdf-cli・doctest・統合テスト
 （`tests/*.rs`、別 crate 扱いで `pub` しか見えない）・`lib.rs` の
-crate ルート re-export と突き合わせたところ、4 群に分かれた
-（最初の版はここを 2 群に単純化して誤り、PR #1015 の Codex レビューで
-是正した）。
+crate ルート re-export と突き合わせたところ、5 群に分かれた
+（最初の版はここを 2 群に単純化して誤り、PR #1015 の Codex レビュー
+（複数ラウンド）で段階的に是正した）。
 
 **(A) 既に legitimate — ただし free 関数自体の根拠には要注意
 （PR #1015 Codex 再レビューで是正）**: `prune_acroform_after_subset`/
@@ -425,23 +431,21 @@ pub-nessであって、free 関数自身の pub-ness ではない**。free 関�
 `flpdf-xsq1` で追跡し、`pub(crate)` へ狭めるか opening doc に明記するかの
 設計判断を別途行う。
 
-**(B) 既に legitimate — job/ 内部の話ではない（ただし1件は要 debt 化、
-PR #1015 Codex 再レビューで是正）**: `format_attachment_list`/
-`list_attachment_info`/`AttachmentInfo` の 3 つ。flpdf-cli からは
-`job.list_attachments()` という `QPDFJob` public メソッド経由でしか
-呼ばれないが、これは根拠として不要——`format_attachment_list` は
-`attachment_list.rs` 自身の `no_run` doctest、`list_attachment_info` は
-`tests/helper_api_tests.rs:506` の統合テストが個別に直接使っており、
-`AttachmentInfo` は `list_attachment_info` の戻り値型
-（`Vec<AttachmentInfo>`）である以上 private-in-public により最低でも
-同じ可視性が要る。**`format_attachment_list_with_sink` はこの3つとは
-別**: `attachment_list.rs` 内部からしか直接は呼ばれておらず、
-外部呼び出し元も opening doc への明記も無い。`lib.rs:199` で他の
-3つと同じ `pub use` 行に並んでいることは、単独の根拠にはならない
-（根拠が共有されるのは同一の re-export 行に並んでいるからではなく、
-各シンボル自身が独立に 3 根拠のどれかを満たすからでなければならない）。
-`format_attachment_list_with_sink` も `flpdf-xsq1` で debt として
-追跡する。
+**(B) 未検証の debt（PR #1015 Codex 再レビューで訂正）**:
+`format_attachment_list`/`format_attachment_list_with_sink`/
+`list_attachment_info`/`AttachmentInfo` の 4 つ。一度は
+`format_attachment_list`/`list_attachment_info`/`AttachmentInfo` の
+3 つだけを「doctest/統合テストが直接使っているので根拠 3 を満たす」として
+legitimate 側に残したが、これは (A) で free 関数
+`prune_acroform_after_subset` に適用した基準（re-export + 個別の
+テスト使用だけでは根拠 3 が要求する opening `//!` doc への明記を
+満たさない）と矛盾する二重基準だった。同じ基準を一貫して適用すると、
+4 つとも opening doc に明記が無い点は共通しており、`format_attachment_list`
+の doctest と `list_attachment_info` の統合テストは存在はするが
+opening doc 明記の代替にはならない。4 つまとめて `flpdf-xsq1` で
+debt として追跡し、`pub(crate)` へ狭めるか opening doc に明記するかの
+設計判断を別途行う（`AttachmentInfo` は `list_attachment_info` の
+戻り値型である以上、private-in-public によりその可視性判断に従属する）。
 
 **(C) `pub` のまま — 狭めるには API 縮小そのものが要る**:
 `build_pages_section`/`build_outlines_section`/`build_pagelabels_section`/
@@ -464,23 +468,40 @@ staged-migration の完了そのものが要る。これは可視性の issue �
 API 移行の issue なので、`flpdf-7bkv`（旧 `flpdf-wy3k` は前提の誤りにより
 close 済み）として追跡する。
 
-**(D) 未解消の debt**: `RotateSpec`（`RotateSpec::parse`）・
-`PageRange`（`PageRange::parse`）。`main.rs` から直接呼ばれており、
-対応する qpdf 側は `parseRotationParameter`／`QPDFJob::parseNumrange`
-という private メソッドのみで、`prune_acroform_after_subset`（(A)）と
-違って `QPDFJob` 側に対応する public メソッドの薄いラッパーが無い——
-真の意味で qpdf の CLI 構造と食い違っている。ただし `PageRange` は
-`RotateSpec` と同列には扱えない: `page_combine.rs` の
-`InputSpec::range`/`InputSpec::new`/`CombinedPlan::build`/
-`PagePlan::build` という **job/ の外側にある** public library API の
-一部としても使われ、これらは実行可能な doc example を持ち
-`lib.rs:233` から再輸出されている。つまり `flpdf-hxmj`
-（single-source/multi-source `--pages` パイプライン統合）で CLI 側の
-経路を一本化できても、`PageRange` 自体を `pub(crate)` に落とせるとは
-限らない——job/ 外の public API 依存を別途どうするか（型を分離するか、
-その依存ごと debt として受け入れるか）を `flpdf-hxmj` の issue 本文に
-明記する。`RotateSpec` にはこの library-API 側の依存は無く、CLI 経路の
-一本化だけで `pub(crate)` に落とせる見込み。
+**(D) 未解消の debt**: `RotateSpec`（`RotateSpec::parse`）。
+`main.rs` から直接呼ばれており、対応する qpdf 側は `QPDFJob.hh:482`
+private メソッド `parseRotationParameter` のみ（`QUtil` 等どこにも
+public な対応物が無いことを確認済み）で、`prune_acroform_after_subset`
+（(A)）と違って `QPDFJob` 側に対応する public メソッドの薄いラッパーも
+無い——真の意味で qpdf の CLI 構造と食い違っている。
+
+`PageRange` は根拠 1 に該当し debt ではない（PR #1015 Codex 再レビューで
+訂正）: 対応する qpdf 側は `QPDFJob::parseNumrange`
+（`QPDFJob.cc:418-425`）だが、この実装は例外処理を足しただけの薄い
+ラッパーで、実処理は `QUtil::parse_numrange`（`QUtil.hh:464`、namespace
+関数として真に public）に委譲している。根拠 1 の例示そのもの
+（`QPDFJob::parseNumrange` ではなく `QUtil::parse_numrange` を見る）が
+指す状況と一致するため、`PageRange::parse`（+`resolve`。2段階分割は
+flpdf 独自で qpdf 自体は1関数で行うが、分割自体は (B) の型で言う
+「入れ物」の違いに過ぎない）は根拠 1 で正当化される。加えて
+`page_combine.rs` の `InputSpec::range`/`InputSpec::new`/
+`CombinedPlan::build`/`PagePlan::build` という **job/ の外側にある**
+public library API の一部としても使われ、これらは実行可能な doc
+example を持ち `lib.rs:233` から再輸出されている——二重に legitimate。
+`RotateSpec` には `PageRange` のような library-API 側の依存は無く、
+`flpdf-hxmj`（single-source/multi-source `--pages` パイプライン統合）で
+CLI 経路を一本化すれば `pub(crate)` に落とせる見込み。
+
+**(E) 未検証の debt（PR #1015 Codex 再レビューで追加、スコープ外だった）**:
+`overlay_verbose_report`/`apply_overlay_specs`。`main.rs:3398-3414,
+4816-4832` が `QPDFJob` の public メソッドを経由せず `flpdf::` crate
+ルートから直接呼んでおり、根拠 1〜3 のいずれにも該当しない。この
+`(A)`〜`(D)` の監査は `job/mod.rs` の `pub use` 一覧を起点にしたもので、
+`main.rs` が job/ の型・関数を直接 import している箇所を全数走査した
+ものではなかった（**この文書は監査の網羅性を主張しない**——`job/mod.rs`
+起点で見つかった範囲の記録である）。`apply_overlay_specs` は既に
+`flpdf-ei0h`（命名）で追跡中のため、可視性側も同じ `flpdf-xsq1` に
+まとめて記録する。
 
 ---
 
