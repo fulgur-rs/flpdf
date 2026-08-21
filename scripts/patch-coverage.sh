@@ -81,7 +81,7 @@ if [[ -z "$LCOV" ]]; then
   #
   # We enable `qpdf-zlib-compat` because the byte-identical byte_gate tests are
   # gated on that feature; without it, most of the byte-parity plumbing (e.g.
-  # `overlay::byte_gate`, `overlay_annotations`) is exercised by nothing that
+  # `job::overlay::byte_gate`, `overlay_annotations`) is exercised by nothing that
   # runs under `cargo test`, and coverage under-reports catastrophically
   # (600+ false-positive uncovered lines on flpdf-9hc.34).
   #

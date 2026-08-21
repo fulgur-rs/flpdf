@@ -3128,8 +3128,8 @@ mod tests {
     /// `overlay_pipeline_repeated_placements_reuse_dr_rename_end_to_end`.
     #[test]
     fn overlay_pipeline_renames_colliding_dr_font_end_to_end() {
-        use crate::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
         use crate::page_range::PageRange;
+        use crate::{apply_overlay_specs, OverlayKind, OverlaySpec};
         use std::path::Path;
 
         fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
@@ -3208,8 +3208,8 @@ mod tests {
     /// rename-reuse branch in merge_resources_shallow are what enforce this.
     #[test]
     fn overlay_pipeline_repeated_placements_reuse_dr_rename_end_to_end() {
-        use crate::overlay::{apply_overlay_specs, OverlayKind, OverlaySpec};
         use crate::page_range::PageRange;
+        use crate::{apply_overlay_specs, OverlayKind, OverlaySpec};
         use std::path::Path;
 
         fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {

@@ -33,8 +33,8 @@
 //! `QPDFJob` orchestration layered on top of these library primitives — a
 //! distinct responsibility this function does not implement.
 
+use super::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
-use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::object_copy::copy_objects;
 use crate::object_handle::canonical_dictionary_key_from_legacy;
 use crate::page_closure::{extend_object_closure, extend_page_object_closure};

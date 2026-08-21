@@ -1,7 +1,7 @@
 //! qpdf correspondence: `QPDFJob::addAttachments`, `QPDFJob::doListAttachments`, and `QPDFJob::doShowAttachment` (`libqpdf/QPDFJob.cc:876-927,2046-2087`).
 
+use super::attachment_list::format_attachment_list_with_sink;
 use super::lifecycle::{JobExitCode, QPDFJob};
-use crate::attachment_list::format_attachment_list_with_sink;
 use crate::filespec_helper::{extract_attachment, FileSpec};
 use crate::qpdf_time::default_pdf_date;
 use crate::{Error, ObjectHandle, Pdf, Result};
@@ -319,8 +319,8 @@ impl QPDFJob {
 mod tests {
     use super::super::{JobExitCode, QPDFJob};
     use super::AttachmentAddOptions;
-    use crate::attachment_list::list_attachment_info;
     use crate::filespec_helper::extract_attachment;
+    use crate::job::attachment_list::list_attachment_info;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
     use crate::Object;

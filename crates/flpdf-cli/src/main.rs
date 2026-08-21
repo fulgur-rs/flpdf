@@ -11,6 +11,19 @@ use flpdf::job::{
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
+    collate,
+    objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
+    outline_dest_remap::remap_outline_and_dests,
+    page_combine::{CombinedPage, CombinedPlan},
+    page_rotate::apply_rotate_to_pages,
+    pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
+    should_remove_unreferenced_resources,
+    struct_tree_pg::drop_struct_elem_dangling_pg,
+    subset_prune::prune_after_subset,
+    thread_bead_p::drop_thread_bead_dangling_p,
+    InputSpec, PageRange, RotateSpec,
+};
+use flpdf::{
     filters, flatten_rotation_on_pages,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
@@ -24,19 +37,6 @@ use flpdf::{
     ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf,
     PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
-};
-use flpdf::{
-    objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
-    outline_dest_remap::remap_outline_and_dests,
-    page_collate::collate,
-    page_combine::{CombinedPage, CombinedPlan},
-    page_rotate::apply_rotate_to_pages,
-    pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
-    should_remove_unreferenced_resources,
-    struct_tree_pg::drop_struct_elem_dangling_pg,
-    subset_prune::prune_after_subset,
-    thread_bead_p::drop_thread_bead_dangling_p,
-    InputSpec, PageRange, RotateSpec,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};

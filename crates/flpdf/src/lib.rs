@@ -84,9 +84,7 @@
 #![deny(unsafe_code)]
 
 pub mod acroform_document_helper;
-pub mod acroform_field_prune;
 pub mod annotation_helper;
-pub mod attachment_list;
 pub(crate) mod bit_stream;
 pub(crate) mod bit_writer;
 pub mod cache;
@@ -120,13 +118,11 @@ pub(crate) mod optimization;
 pub mod outline_dest_remap;
 pub mod outline_document_helper;
 pub mod outline_object_helper;
-pub(crate) mod overlay;
 pub(crate) mod overlay_annotations;
 pub(crate) mod overlay_appearance_stream;
 pub mod page_annotation_enum;
 mod page_annotation_flatten;
 pub mod page_closure;
-pub mod page_collate;
 pub mod page_combine;
 pub mod page_document_helper;
 pub mod page_extract;
@@ -157,7 +153,6 @@ mod resource_finder;
 mod resource_replacer;
 pub mod resources;
 pub(crate) mod rewrite_renumber;
-pub mod rotate_spec;
 pub mod signatures;
 pub mod standard_font_metrics;
 pub(crate) mod stream_filter;
@@ -176,14 +171,7 @@ pub use logger::QPDFLogger;
 pub(crate) mod security;
 
 pub use acroform_document_helper::{AcroFormDocumentHelper, AcroFormFieldInfo};
-pub use acroform_field_prune::{
-    prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth,
-    DEFAULT_MAX_ACROFORM_DEPTH,
-};
 pub use annotation_helper::AnnotationObjectHelper;
-pub use attachment_list::{
-    format_attachment_list, format_attachment_list_with_sink, list_attachment_info, AttachmentInfo,
-};
 pub use cache::{CacheEntry, ObjectCache};
 pub use check::{
     check_pdf_with_limits, check_reader, check_reader_strict, check_reader_with_options,
@@ -210,7 +198,12 @@ pub use filespec_helper::{
     FileSpecBuilder,
 };
 pub use form_field_object_helper::FormFieldObjectHelper;
-pub use job::{merge_documents, MergeInput};
+pub use job::{
+    apply_overlay_specs, collate, format_attachment_list, format_attachment_list_with_sink,
+    list_attachment_info, merge_documents, overlay_verbose_report, prune_acroform_after_subset,
+    prune_acroform_after_subset_with_max_depth, AttachmentInfo, MergeInput, OverlayKind,
+    OverlaySpec, OverlayVerbosePage, OverlayVerboseSource, RotateSpec, DEFAULT_MAX_ACROFORM_DEPTH,
+};
 pub use matrix::{Matrix, Rectangle};
 pub use name_number_tree::{
     build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,
@@ -227,12 +220,7 @@ pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::OutlineDocumentHelper;
 pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
-pub use overlay::{
-    apply_overlay_specs, overlay_verbose_report, OverlayKind, OverlaySpec, OverlayVerbosePage,
-    OverlayVerboseSource,
-};
 pub use page_annotation_enum::{enumerate_page_annotations, EnumeratedAnnotation};
-pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::{PageDocumentHelper, PageInput};
 pub use page_extract::{extract_page, extract_pages};
@@ -257,7 +245,6 @@ pub use pipeline::{Pipeline, PipelineError, PipelineResult};
 pub use qdf_fix::fix_qdf;
 pub use reader::{EncryptionInfo, PdfOpenOptions, Permissions};
 pub use resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
-pub use rotate_spec::RotateSpec;
 pub use security::password::PasswordMode;
 pub use security::standard::ObjectKeyAlg;
 pub use signatures::{

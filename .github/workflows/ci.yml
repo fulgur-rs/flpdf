@@ -280,9 +280,9 @@ jobs:
           # and the multi-container OD ordering discriminator flpdf-699x).
           cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
           # Pins overlay/underlay output byte-identity vs committed qpdf goldens.
-          # These gates live in lib unit tests (overlay::byte_gate) behind the
+          # These gates live in lib unit tests (job::overlay::byte_gate) behind the
           # qpdf-zlib-compat cfg, so they must be run explicitly with --lib.
-          cargo test -p flpdf --features qpdf-zlib-compat --lib overlay::byte_gate
+          cargo test -p flpdf --features qpdf-zlib-compat --lib job::overlay::byte_gate
           # Pins the CLI binary's linearized output byte-identity vs qpdf goldens
           # end-to-end (argument parsing -> WriteOptions -> write path -> framing).
           # Gated behind qpdf-zlib-compat, so it is compiled out of the default
@@ -355,7 +355,7 @@ jobs:
       # patch-coverage gate's dirty-tree check.
       #
       # `--features qpdf-zlib-compat` mirrors scripts/patch-coverage.sh's fresh-
-      # mode default: the byte-identical `overlay::byte_gate` tests are gated on
+      # mode default: the byte-identical `job::overlay::byte_gate` tests are gated on
       # that feature, and without it coverage under-reports catastrophically
       # (600+ false-positive uncovered lines on flpdf-9hc.34). `--ignore-run-fail`
       # lets a single pre-existing baseline miss (flpdf-hdsz on

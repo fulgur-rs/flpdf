@@ -90,9 +90,9 @@ fn test_56_59_body<R: Read + Seek>(
     // (test_driver.cc:2095-2107) needs the page-to-Form-XObject conversion (mirrored by
     // `flpdf::page_form_xobject::get_form_xobject_for_page`, `page_form_xobject.rs:72`), the
     // inheritable-attribute lookup-with-create-if-missing used for `ph1.getAttribute("/Resources",
-    // true)`, and the content-fragment placement helper (mirrored by `flpdf::overlay::place_form_xobject`,
-    // `overlay.rs:141`). `get_form_xobject_for_page` is `pub(crate)` and `place_form_xobject` is not
-    // even `pub(crate)`-reachable outside `overlay.rs`; no `getAttribute`-with-create equivalent
+    // true)`, and the content-fragment placement helper (mirrored by `flpdf::job::overlay::place_form_xobject`,
+    // `job/overlay.rs:139`). `get_form_xobject_for_page` is `pub(crate)` and `place_form_xobject` is not
+    // even `pub(crate)`-reachable outside `job/overlay.rs`; no `getAttribute`-with-create equivalent
     // exists at any visibility. None of the three is exposed to this separate crate, so no
     // iteration of the loop can be attempted, and the `QPDFWriter` write of `a.pdf` at the end of
     // qpdf's `test_56_59` (test_driver.cc:2109-2112) — which depends entirely on the loop's page
