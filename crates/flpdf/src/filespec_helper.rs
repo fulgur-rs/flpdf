@@ -333,9 +333,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         if stream.is_null() {
             return Ok(None);
         }
+        let type_name = stream.type_name()?;
         Err(Error::System(format!(
             "operation for stream attempted on object of type {}",
-            stream.type_name()
+            type_name
         )))
     }
 

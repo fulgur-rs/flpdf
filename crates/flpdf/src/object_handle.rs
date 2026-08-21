@@ -2144,9 +2144,10 @@ impl ObjectHandle {
         } else {
             format!("{desc}: ")
         };
+        let type_name = self.type_name()?;
         self.warn_through_context(format!(
             "{prefix}operation for {expected_type} attempted on object of type {}: {warning}",
-            self.type_name()
+            type_name
         ))
     }
 
@@ -3617,11 +3618,11 @@ impl ObjectHandle {
     /// document-owned and `StreamCopier::copyStreamData` needs that document
     /// for the source-dispatch lifetime contract.
     pub fn copy_stream(&self) -> Result<ObjectHandle> {
-        self.try_dereference()?;
+        let type_name = self.type_name()?;
         let Some(source_dict) = self.as_stream_dict() else {
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
-                self.type_name()
+                type_name
             )));
         };
         let resolver = self.context().ok_or_else(|| {
@@ -3818,10 +3819,7 @@ impl ObjectHandle {
     ) -> Result<Vec<u8>> {
         let names = match resource_names {
             Some(names) => names.clone(),
-            None => {
-                self.try_dereference()?;
-                try_get_resource_names(self)?
-            }
+            None => try_get_resource_names(self)?,
         };
         let max_suffix = *min_suffix + names.len();
         while *min_suffix <= max_suffix {
@@ -3851,8 +3849,7 @@ impl ObjectHandle {
     /// holder are resolved through the owning document before inspection;
     /// programmatically constructed direct handles remain context-free.
     pub fn is_form_xobject(&self) -> Result<bool> {
-        self.try_dereference()?;
-        if self.type_code() != 10 {
+        if self.type_code()? != 10 {
             return Ok(false);
         }
         let Some(stream_dict) = self.as_stream_dict() else {
@@ -3870,8 +3867,7 @@ impl ObjectHandle {
     /// `exclude_imagemask` set, a boolean `/ImageMask true` excludes the
     /// stream; non-boolean or missing `/ImageMask` values do not.
     pub fn is_image(&self, exclude_imagemask: bool) -> Result<bool> {
-        self.try_dereference()?;
-        if self.type_code() != 10 {
+        if self.type_code()? != 10 {
             return Ok(false);
         }
         let Some(stream_dict) = self.as_stream_dict() else {
@@ -3918,11 +3914,11 @@ impl ObjectHandle {
     /// Returns [`Error::System`] when `new_contents` is not a stream, and
     /// propagates content normalization, ownership, or replacement failures.
     pub fn add_page_contents(&self, new_contents: ObjectHandle, first: bool) -> Result<()> {
-        new_contents.try_dereference()?;
-        if new_contents.type_code() != 10 {
+        if new_contents.type_code()? != 10 {
+            let type_name = new_contents.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
-                new_contents.type_name()
+                type_name
             )));
         }
 
@@ -4044,10 +4040,8 @@ impl ObjectHandle {
     /// handle has no owning document, and propagates resolution, ownership,
     /// stream allocation, or provider-registration failures.
     pub fn coalesce_content_streams(&self) -> Result<()> {
-        self.try_dereference()?;
         let old_contents = self.try_get_key(b"/Contents")?;
-        old_contents.try_dereference()?;
-        if old_contents.type_code() == 10 || old_contents.as_array().is_none() {
+        if old_contents.type_code()? == 10 || old_contents.as_array().is_none() {
             return Ok(());
         }
 
@@ -4242,7 +4236,6 @@ impl ObjectHandle {
     /// [`Self::get_page_contents`] prevents later entry points from
     /// reimplementing array/null handling.
     fn page_contents_with_description(&self) -> Result<(Vec<ObjectHandle>, String)> {
-        self.try_dereference()?;
         let description = format!("page object {}", object_generation_description(self));
         let contents = self.try_get_key(b"/Contents")?;
         contents.array_or_stream_to_stream_array(&description)
@@ -4261,8 +4254,7 @@ impl ObjectHandle {
         let mut result = Vec::new();
         if let Some(items) = self.as_array() {
             for (index, item) in items.into_iter().enumerate() {
-                item.try_dereference()?;
-                if item.type_code() == 10 {
+                if item.type_code()? == 10 {
                     result.push(item);
                 } else {
                     item.warn_through_context(format!(
@@ -4270,7 +4262,7 @@ impl ObjectHandle {
                     ))?;
                 }
             }
-        } else if self.type_code() == 10 {
+        } else if self.type_code()? == 10 {
             result.push(self.clone());
         } else if !self.is_null() {
             self.warn_through_context(format!(
@@ -4368,9 +4360,10 @@ impl ObjectHandle {
     ) -> Result<()> {
         self.try_dereference()?;
         if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+            let type_name = self.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
-                self.type_name()
+                type_name
             )));
         }
         self.set_content_normalization_applied(false);
@@ -4455,9 +4448,10 @@ impl ObjectHandle {
             _ => None,
         });
         let Some(previous) = previous else {
+            let type_name = self.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
-                self.type_name()
+                type_name
             )));
         };
         self.detach_child_from_state_owners(&previous);
@@ -4594,9 +4588,10 @@ impl ObjectHandle {
     pub fn add_token_filter(&self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
         self.try_dereference()?;
         if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+            let type_name = self.type_name()?;
             return Err(Error::System(format!(
                 "operation for stream attempted on object of type {}",
-                self.type_name()
+                type_name
             )));
         }
         let filters = self.0.borrow().stream_token_filters.clone();
@@ -5337,24 +5332,19 @@ impl ObjectHandle {
         })
     }
 
-    /// The qpdf-compatible numeric type code of this handle's current known
-    /// value: `include/qpdf/Constants.h:108-127`'s `qpdf_object_type_e`
-    /// ordinals. qpdf's own `getTypeCode()`/`getTypeName()`
+    /// Return the qpdf-compatible numeric type code after resolving this
+    /// handle's own indirect object: `include/qpdf/Constants.h:108-127`'s
+    /// `qpdf_object_type_e` ordinals. qpdf's own `getTypeCode()`/`getTypeName()`
     /// (`include/qpdf/QPDFObjectHandle.hh:311-316`,
-    /// `libqpdf/QPDFObjectHandle.cc:240-250`) call `dereference()`, which
-    /// unconditionally resolves the handle first
-    /// (`libqpdf/QPDFObjectHandle.cc:2376-2382`); this method never performs
-    /// that hidden resolution (design, `Pdf` section: no hidden I/O), so an
-    /// indirect handle's *reachable* resolution states surface as their own
-    /// qpdf ordinals instead: not-yet-resolved reports `13`
-    /// (`ot_unresolved`) and a destroyed (owning document dropped) handle
-    /// reports `14` (`ot_destroyed`) — both real `qpdf_object_type_e`
-    /// entries, not invented here. A reserved handle (see [`crate::Pdf::new_reserved`])
-    /// reports `1` (`ot_reserved`), qpdf's own ordinal for that state
-    /// (`include/qpdf/Constants.h:108-127`). `ot_uninitialized` (qpdf's one
-    /// remaining entry) is a construction-time-only state this port's
-    /// `ObjectHandle` never occupies, since every non-reserved handle is
-    /// fully constructed at birth.
+    /// `libqpdf/QPDFObjectHandle.cc:240-250`) call `dereference()` before
+    /// inspecting the value. The internal `try_dereference` helper mirrors that
+    /// handle-layer responsibility and propagates resolver failures through
+    /// [`crate::Result`].
+    ///
+    /// Reserved and destroyed handles are checked before resolution and retain
+    /// qpdf's `1` (`ot_reserved`) and `14` (`ot_destroyed`) ordinals. The
+    /// `ot_uninitialized` state is a construction-time-only qpdf state that
+    /// this port's `ObjectHandle` never occupies.
     ///
     /// A resolved indirect handle whose own value is itself a bare
     /// reference (mirroring [`crate::Object::Reference`]; see
@@ -5362,13 +5352,16 @@ impl ObjectHandle {
     /// redirect, also reports `13`. This looks like a
     /// contradiction with [`Self::is_resolved`] returning `true` for the
     /// same handle, but it is not: the *value* is known (it is a reference),
-    /// while the *referenced object's own type* is not known without
-    /// following the chain further, which this method never does — this
-    /// case is not chased to its terminal type the way it would be
-    /// elsewhere in this crate's own object-inspection code, and `13`
-    /// (`ot_unresolved`) is reported as a placeholder rather than the
-    /// terminal object's real ordinal.
-    pub fn type_code(&self) -> u8 {
+    /// while the *referenced object's own type* is not known without following
+    /// the chain further. `type_code`/`type_name` inspect only the handle's
+    /// own canonical slot; they do not follow a bare-reference value to the
+    /// object it points at.
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolver error when an unresolved indirect handle cannot be
+    /// resolved, such as when its owning document has been dropped.
+    pub fn type_code(&self) -> Result<u8> {
         {
             // `Destroyed` is a value state, independent of the indirect
             // metadata that disconnect clears. Bind the borrow to a local
@@ -5376,14 +5369,14 @@ impl ObjectHandle {
             let slot_ref = self.0.borrow();
             let state = slot_ref.state.borrow();
             match &*state {
-                ObjectState::Reserved => return 1,
-                ObjectState::Destroyed => return 14,
-                ObjectState::NotYetResolved if slot_ref.object_ref.is_some() => return 13,
+                ObjectState::Reserved => return Ok(1),
+                ObjectState::Destroyed => return Ok(14),
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
             }
         }
+        self.try_dereference()?;
         self.with_value(|value| {
-            match value.expect(
+            Ok(match value.expect(
                 "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
             ) {
                 ObjectValue::Null => 2,
@@ -5404,17 +5397,17 @@ impl ObjectHandle {
                 // for a test that exercises it via the same `set_resolved`
                 // call `Pdf::set_object` itself makes.
                 ObjectValue::Reference(_) => 13,
-            }
+            })
         })
     }
 
     /// The qpdf-compatible type name string for [`Self::type_code`]'s
     /// ordinal (`libqpdf/QPDFObjectHandle.cc:240-250`'s `getTypeName`, via
     /// each `QPDFValue` subclass's own registered name, e.g.
-    /// `libqpdf/QPDF_InlineImage.cc:6`). See [`Self::type_code`]'s own doc
-    /// for the states this port surfaces instead of qpdf's silent resolve.
-    pub fn type_name(&self) -> &'static str {
-        match self.type_code() {
+    /// `libqpdf/QPDF_InlineImage.cc:6`). Resolution errors from
+    /// [`Self::type_code`] are propagated unchanged.
+    pub fn type_name(&self) -> Result<&'static str> {
+        Ok(match self.type_code()? {
             1 => "reserved",
             2 => "null",
             3 => "boolean",
@@ -5432,7 +5425,7 @@ impl ObjectHandle {
             // produce, so this is exhaustive in practice, not a silent
             // catch-all for an unhandled ordinal.
             _ => "unresolved",
-        }
+        })
     }
 
     /// Write this handle through qpdf 11.9.0's `QPDFObjectHandle::writeJSON`
@@ -7838,12 +7831,15 @@ impl<'a> ObjectJsonWriter<'a> {
             return self.write_reference(object_ref);
         }
 
-        match handle.type_code() {
+        match handle
+            .type_code()
+            .map_err(|error| ObjectJsonError::Pdf(error.to_string()))?
+        {
             2 | 11 | 12 => self.write(b"null"),
             3 => self.write(
                 if handle
                     .as_boolean()
-                    .expect("type_code()==3 (boolean) => as_boolean")
+                    .expect("type_code()? == 3 (boolean) => as_boolean")
                 {
                     b"true"
                 } else {
@@ -7853,25 +7849,27 @@ impl<'a> ObjectJsonWriter<'a> {
             4 => {
                 let value = handle
                     .as_integer()
-                    .expect("type_code()==4 (integer) => as_integer");
+                    .expect("type_code()? == 4 (integer) => as_integer");
                 self.write(value.to_string().as_bytes())
             }
             5 => self.write_real(handle),
             6 => self.write_string(
                 &handle
                     .as_string()
-                    .expect("type_code()==6 (string) => as_string"),
+                    .expect("type_code()? == 6 (string) => as_string"),
                 json_version,
             ),
             7 => self.write_name_value(
-                &handle.as_name().expect("type_code()==7 (name) => as_name"),
+                &handle
+                    .as_name()
+                    .expect("type_code()? == 7 (name) => as_name"),
                 json_version,
             ),
             8 => {
                 self.write_start(b'[')?;
                 for child in handle
                     .as_array()
-                    .expect("type_code()==8 (array) => as_array")
+                    .expect("type_code()? == 8 (array) => as_array")
                 {
                     self.write_next()?;
                     self.write_handle(&child, json_version, false, depth + 1)?;
@@ -7882,7 +7880,7 @@ impl<'a> ObjectJsonWriter<'a> {
                 self.write_start(b'{')?;
                 for (key, child) in handle
                     .as_dictionary()
-                    .expect("type_code()==9 (dictionary) => as_dictionary")
+                    .expect("type_code()? == 9 (dictionary) => as_dictionary")
                 {
                     // QPDF_Dictionary::writeJSON calls isNull() before
                     // emitting a key. isNull() resolves an indirect child,
@@ -7912,7 +7910,7 @@ impl<'a> ObjectJsonWriter<'a> {
                 // QPDF_Stream::writeJSON writes only its dictionary. The
                 // outer stream wrapper belongs to QPDF_Stream::writeStreamJSON
                 // and the document JSON layer.
-                // cov:ignore-start: type_code()==10 guarantees that as_stream_dict returns Some
+                // cov:ignore-start: type_code()? == 10 guarantees that as_stream_dict returns Some
                 let dictionary = handle.as_stream_dict().ok_or_else(|| {
                     ObjectJsonError::Pdf("stream's dict handle is not a dictionary".to_string())
                 })?;
@@ -7935,7 +7933,9 @@ impl<'a> ObjectJsonWriter<'a> {
     }
 
     fn write_real(&mut self, handle: &ObjectHandle) -> std::result::Result<(), ObjectJsonError> {
-        let value = handle.as_real().expect("type_code()==5 (real) => as_real");
+        let value = handle
+            .as_real()
+            .expect("type_code()? == 5 (real) => as_real");
         if !value.is_finite() {
             return Err(ObjectJsonError::NonFiniteFloat);
         }
@@ -10819,7 +10819,7 @@ pub(crate) mod identity_tests {
 
         target.disconnect();
 
-        assert_eq!(target.type_code(), 14);
+        assert_eq!(target.type_code().expect("type code"), 14);
         assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
     }
 
@@ -11837,7 +11837,7 @@ mod uniform_identity_tests {
         assert!(alias.is_direct());
         assert_eq!(alias.object_ref(), None);
         assert!(!alias.is_null());
-        assert_eq!(alias.type_code(), 14);
+        assert_eq!(alias.type_code().expect("type code"), 14);
         assert_eq!(alias.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
@@ -11850,7 +11850,7 @@ mod uniform_identity_tests {
         handle.set_parsed_offset_if_unset(77);
         assert!(handle.is_indirect());
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(58, 0)));
-        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.type_code().expect("type code"), 14);
         assert_eq!(handle.get_parsed_offset(), 77);
 
         handle.disconnect();
@@ -11858,7 +11858,7 @@ mod uniform_identity_tests {
         assert!(handle.is_direct());
         assert_eq!(handle.object_ref(), None);
         assert!(!handle.is_null());
-        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.type_code().expect("type code"), 14);
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
@@ -12065,7 +12065,7 @@ mod object_value_tests {
                 .as_slice(),
             b"abc"
         );
-        assert_eq!(stream.type_code(), 10, "ot_stream");
+        assert_eq!(stream.type_code().expect("type code"), 10, "ot_stream");
     }
 
     #[test]
@@ -12606,7 +12606,10 @@ mod resolution_state_tests {
             null.as_dictionary().is_none()
         );
         assert_eq!(missing.as_stream_data(), null.as_stream_data());
-        assert_eq!(missing.type_code(), null.type_code());
+        assert_eq!(
+            missing.type_code().expect("missing type code"),
+            null.type_code().expect("null type code")
+        );
         assert_eq!(missing.unparse_resolved(), null.unparse_resolved());
         assert_eq!(missing.get_parsed_offset(), null.get_parsed_offset());
 
@@ -12670,7 +12673,7 @@ mod resolution_state_tests {
 
         assert!(handle.is_resolved());
         assert!(!handle.is_null());
-        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.type_code().expect("type code"), 14);
         assert_eq!(handle.as_integer(), None);
     }
 
@@ -13157,8 +13160,8 @@ mod type_code_tests {
             ),
         ];
         for (handle, code, name) in cases {
-            assert_eq!(handle.type_code(), *code, "{name}");
-            assert_eq!(handle.type_name(), *name);
+            assert_eq!(handle.type_code().expect("type code"), *code, "{name}");
+            assert_eq!(handle.type_name().expect("type name"), *name);
             assert!(!handle.is_reserved(), "ordinary {name} is not reserved");
         }
     }
@@ -13172,15 +13175,55 @@ mod type_code_tests {
             stream_provider: None,
             stream_length: 0,
         });
-        assert_eq!(stream.type_code(), 10);
-        assert_eq!(stream.type_name(), "stream");
+        assert_eq!(stream.type_code().expect("type code"), 10);
+        assert_eq!(stream.type_name().expect("type name"), "stream");
     }
 
     #[test]
-    fn not_yet_resolved_indirect_handle_reports_unresolved_without_resolving() {
-        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        assert_eq!(handle.type_code(), 13, "ot_unresolved");
-        assert_eq!(handle.type_name(), "unresolved");
+    fn type_code_resolves_an_unresolved_indirect_handle_before_classifying() {
+        let (handle, _resolver) = crate::object_handle::identity_tests::resolver_bearing_handle(
+            ObjectValue::Dictionary(std::collections::BTreeMap::new()),
+        );
+
+        assert!(!handle.is_resolved());
+        assert_eq!(
+            handle.type_code().expect("type code"),
+            9,
+            "qpdf ot_dictionary"
+        );
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn type_name_resolves_an_unresolved_indirect_handle_before_classifying() {
+        let (handle, _resolver) =
+            crate::object_handle::identity_tests::resolver_bearing_handle(ObjectValue::Integer(7));
+
+        assert_eq!(handle.type_name().expect("type name"), "integer");
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn type_code_and_type_name_propagate_resolver_errors() {
+        let (handle, _resolver) =
+            crate::object_handle::identity_tests::error_resolving_handle(ObjectRef::new(21, 0));
+        assert_eq!(
+            handle
+                .type_code()
+                .expect_err("type classification must be fallible")
+                .to_string(),
+            "resolver failed"
+        );
+
+        let (handle, _resolver) =
+            crate::object_handle::identity_tests::error_resolving_handle(ObjectRef::new(22, 0));
+        assert_eq!(
+            handle
+                .type_name()
+                .expect_err("type name must be fallible")
+                .to_string(),
+            "resolver failed"
+        );
         assert!(!handle.is_reserved());
     }
 
@@ -13189,8 +13232,8 @@ mod type_code_tests {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(1));
         handle.disconnect();
-        assert_eq!(handle.type_code(), 14, "ot_destroyed");
-        assert_eq!(handle.type_name(), "destroyed");
+        assert_eq!(handle.type_code().expect("type code"), 14, "ot_destroyed");
+        assert_eq!(handle.type_name().expect("type name"), "destroyed");
         assert!(!handle.is_reserved());
     }
 
@@ -13201,8 +13244,8 @@ mod type_code_tests {
         // documented is_null()==true contract.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_missing();
-        assert_eq!(handle.type_code(), 2, "ot_null");
-        assert_eq!(handle.type_name(), "null");
+        assert_eq!(handle.type_code().expect("type code"), 2, "ot_null");
+        assert_eq!(handle.type_name().expect("type name"), "null");
         assert!(!handle.is_reserved());
     }
 
@@ -13210,8 +13253,8 @@ mod type_code_tests {
     fn resolved_indirect_handle_reports_its_real_value_type() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
-        assert_eq!(handle.type_code(), 4, "ot_integer");
-        assert_eq!(handle.type_name(), "integer");
+        assert_eq!(handle.type_code().expect("type code"), 4, "ot_integer");
+        assert_eq!(handle.type_name().expect("type name"), "integer");
     }
 
     #[test]
@@ -13239,8 +13282,8 @@ mod type_code_tests {
         // state without pulling `Pdf` into this single-file slice.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Reference(ObjectRef::new(9, 0)));
-        assert_eq!(handle.type_code(), 13, "ot_unresolved");
-        assert_eq!(handle.type_name(), "unresolved");
+        assert_eq!(handle.type_code().expect("type code"), 13, "ot_unresolved");
+        assert_eq!(handle.type_name().expect("type name"), "unresolved");
         // The contradiction this method's own doc calls out: the value
         // itself is known (is_resolved() is true) even though its type
         // code reports the same ordinal as a handle whose value is not

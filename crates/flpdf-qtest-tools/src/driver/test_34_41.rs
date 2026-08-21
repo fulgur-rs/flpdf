@@ -611,12 +611,13 @@ impl<'a> flpdf::ObjectHandleParserCallbacks for ContentParserCallbacks<'a> {
             // below never executes for the `/Abort` token itself.
             return Ok(flpdf::ParseControl::Stop);
         }
+        let type_name = object.type_name()?;
         write!(
             self.stdout,
             "{}, offset={offset}, length={length}: ",
-            object.type_name()
+            type_name
         )?;
-        if object.type_code() == 12 {
+        if object.type_code()? == 12 {
             // ot_inlineimage
             let value = object.as_inline_image().unwrap_or_default();
             writeln!(self.stdout, "{}", hex_encode(&value))?;

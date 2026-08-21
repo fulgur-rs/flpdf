@@ -4846,7 +4846,11 @@ pub(crate) mod tests {
         drop(pdf);
 
         assert!(filter.is_resolved(), "disconnect leaves a terminal state");
-        assert_eq!(filter.type_code(), 14, "qpdf ot_destroyed");
+        assert_eq!(
+            filter.type_code().expect("type code"),
+            14,
+            "qpdf ot_destroyed"
+        );
         assert!(!filter.is_null());
         let error = decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None)
             .expect_err("a destroyed /Filter is not absent");

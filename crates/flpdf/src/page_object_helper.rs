@@ -1802,17 +1802,18 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let mut coords = [0.0f64; 4];
         for (index, item) in items.into_iter().take(4).enumerate() {
             self.pdf.resolve_object_handle(&item)?;
-            coords[index] = item
+            let Some(value) = item
                 .as_integer()
                 .map(|value| value as f64)
                 .or_else(|| item.as_real())
-                .ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "{} rectangle element {index} has type {} (expected number)",
-                        String::from_utf8_lossy(key),
-                        item.type_name()
-                    ))
-                })?;
+            else {
+                let type_name = item.type_name()?;
+                return Err(Error::Unsupported(format!(
+                    "{} rectangle element {index} has type {type_name} (expected number)",
+                    String::from_utf8_lossy(key),
+                )));
+            };
+            coords[index] = value;
         }
         Ok(Some(PageBox::new(
             coords[0], coords[1], coords[2], coords[3],

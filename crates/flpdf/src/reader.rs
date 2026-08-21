@@ -9387,8 +9387,8 @@ mod tests {
         assert!(first.is_reserved());
         assert!(first.is_resolved());
         assert!(!first.is_null());
-        assert_eq!(first.type_code(), 1, "qpdf ot_reserved");
-        assert_eq!(first.type_name(), "reserved");
+        assert_eq!(first.type_code().expect("type code"), 1, "qpdf ot_reserved");
+        assert_eq!(first.type_name().expect("type name"), "reserved");
         assert!(!first.is_same_object_as(&second));
         assert!(pdf.is_canonical_object_handle(&first));
         assert!(format!("{first:?}").contains("state: \"Reserved\""));
@@ -9410,8 +9410,12 @@ mod tests {
         };
 
         assert!(!reserved.is_reserved());
-        assert_eq!(reserved.type_code(), 14, "qpdf ot_destroyed");
-        assert_eq!(reserved.type_name(), "destroyed");
+        assert_eq!(
+            reserved.type_code().expect("type code"),
+            14,
+            "qpdf ot_destroyed"
+        );
+        assert_eq!(reserved.type_name().expect("type name"), "destroyed");
         assert!(!reserved.is_null());
     }
 
@@ -9437,7 +9441,7 @@ mod tests {
             copy.is_reserved(),
             "shallow_copy on Reserved must stay Reserved, not fall back to null"
         );
-        assert_eq!(copy.type_code(), 1, "qpdf ot_reserved");
+        assert_eq!(copy.type_code().expect("type code"), 1, "qpdf ot_reserved");
         assert!(
             copy.is_direct(),
             "a shallow copy has no object number of its own, matching every other value arm"
@@ -9976,7 +9980,7 @@ mod tests {
 
         assert!(stream.is_direct());
         assert_eq!(stream.object_ref(), None);
-        assert_eq!(stream.type_code(), 14);
+        assert_eq!(stream.type_code().expect("type code"), 14);
         assert_eq!(stream.get_parsed_offset(), NO_PARSED_OFFSET);
         assert_eq!(stream.as_stream_data(), None);
     }
@@ -10396,7 +10400,7 @@ mod tests {
         destroyed.disconnect();
         let target_ref = ObjectRef::new(99, 0);
         assert!(destroyed.is_direct());
-        assert_eq!(destroyed.type_code(), 14);
+        assert_eq!(destroyed.type_code().expect("type code"), 14);
         assert!(pdf.resolver.registered_handle(target_ref).is_none());
 
         let error = pdf
@@ -11616,7 +11620,7 @@ mod tests {
 
         assert_eq!(handle.as_reference(), Some(target_ref));
         assert_eq!(
-            handle.type_code(),
+            handle.type_code().expect("type code"),
             13,
             "ot_unresolved, unchanged by this method"
         );
@@ -11641,8 +11645,12 @@ mod tests {
             .expect("resolve redirect handle to its terminal value");
 
         assert_eq!(result.as_boolean(), Some(true));
-        assert_eq!(result.type_code(), 3, "ot_boolean, not 13/unresolved");
-        assert_eq!(result.type_name(), "boolean");
+        assert_eq!(
+            result.type_code().expect("type code"),
+            3,
+            "ot_boolean, not 13/unresolved"
+        );
+        assert_eq!(result.type_name().expect("type name"), "boolean");
         assert_eq!(
             result.object_ref(),
             Some(target_ref),

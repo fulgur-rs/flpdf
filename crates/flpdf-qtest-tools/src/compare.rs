@@ -53,7 +53,7 @@ where
 {
     let act = actual_pdf.resolve_object_handle_to_terminal(act)?;
     let exp = expected_pdf.resolve_object_handle_to_terminal(exp)?;
-    if act.type_code() != exp.type_code() {
+    if act.type_code()? != exp.type_code()? {
         return Ok(format!("{label}: different types"));
     }
     if act.as_stream_dict().is_some() {

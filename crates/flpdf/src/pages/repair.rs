@@ -205,10 +205,11 @@ fn repair_page_tree_handle<R: Read + Seek>(
     let Some(kid_count) = kids.try_array_len()? else {
         // QPDFObjectHandle::getArrayNItems warns and treats a non-array as
         // empty (`QPDFObjectHandle.cc:758-768`).
+        let type_name = kids.type_name()?;
         kids.warn_if_possible(
             format!(
                 "operation for array attempted on object of type {}: treating as empty",
-                kids.type_name()
+                type_name
             )
             .as_str(),
         )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle

@@ -54,8 +54,8 @@ fn resolved_key<R: Read + Seek>(
 /// `isBool() || isInteger() || isName() || isNull() || isReal() ||
 /// isString()`, i.e. ordinals `2..=7` in [`ObjectHandle::type_code`]'s own
 /// table (`null`, `boolean`, `integer`, `real`, `string`, `name`).
-fn is_scalar(handle: &ObjectHandle) -> bool {
-    matches!(handle.type_code(), 2..=7)
+fn is_scalar(handle: &ObjectHandle) -> flpdf::Result<bool> {
+    Ok(matches!(handle.type_code()?, 2..=7))
 }
 
 /// `QPDFObjectHandle::isDestroyed` (`libqpdf/QPDFObjectHandle.cc:333-336`):
@@ -63,8 +63,8 @@ fn is_scalar(handle: &ObjectHandle) -> bool {
 /// own doc documents ordinal `14` as this port's `Destroyed` state -- the
 /// value a resolved indirect handle is left with once its owning [`Pdf`] is
 /// dropped (`Pdf`'s own `Drop` impl, `pdf.rs:194-208`).
-fn is_destroyed(handle: &ObjectHandle) -> bool {
-    handle.type_code() == 14
+fn is_destroyed(handle: &ObjectHandle) -> flpdf::Result<bool> {
+    Ok(handle.type_code()? == 14)
 }
 
 /// `QPDFObjectHandle::replaceKeyAndGetNew`
@@ -420,7 +420,7 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     assert!(!resources.is_indirect());
 
     let contents = resolved_key(&mut qpdf, &page1, b"/Contents")?;
-    assert!(!is_scalar(&contents));
+    assert!(!is_scalar(&contents)?);
     let contents_dict = contents
         .as_stream_dict()
         .expect("minimal.pdf's page /Contents is a stream");
@@ -437,10 +437,10 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     // Objects that were originally indirect are destroyed; direct children
     // (`resources`, `contents_dict`) retain their old values instead
     // (test_driver.cc:3227-3235).
-    assert!(is_destroyed(&root));
-    assert!(!is_scalar(&root));
-    assert!(is_destroyed(&page1));
-    assert!(is_destroyed(&contents));
+    assert!(is_destroyed(&root)?);
+    assert!(!is_scalar(&root)?);
+    assert!(is_destroyed(&page1)?);
+    assert!(is_destroyed(&contents)?);
     assert!(resources.as_dictionary().is_some());
     assert!(contents_dict.as_dictionary().is_some());
 
@@ -555,15 +555,15 @@ pub(crate) fn run_test_95<R: Read + Seek>(
     let oh_a = ObjectHandle::array(vec![]);
     let oh_d = ObjectHandle::dictionary(vec![]);
 
-    assert!(is_scalar(&oh_b));
-    assert!(is_scalar(&oh_i));
-    assert!(is_scalar(&oh_r));
-    assert!(is_scalar(&oh_n));
-    assert!(is_scalar(&oh_s));
-    assert!(!is_scalar(&oh_o));
-    assert!(!is_scalar(&oh_ii));
-    assert!(!is_scalar(&oh_a));
-    assert!(!is_scalar(&oh_d));
+    assert!(is_scalar(&oh_b)?);
+    assert!(is_scalar(&oh_i)?);
+    assert!(is_scalar(&oh_r)?);
+    assert!(is_scalar(&oh_n)?);
+    assert!(is_scalar(&oh_s)?);
+    assert!(!is_scalar(&oh_o)?);
+    assert!(!is_scalar(&oh_ii)?);
+    assert!(!is_scalar(&oh_a)?);
+    assert!(!is_scalar(&oh_d)?);
     Ok(())
 }
 

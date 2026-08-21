@@ -76,8 +76,8 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     } else {
         ""
     };
-    let type_name = chased.type_name();
-    let type_code = chased.type_code();
+    let type_name = chased.type_name()?;
+    let type_code = chased.type_code()?;
     write!(stdout, "/QTest is {direct_prefix}direct and has type ")?;
     writeln!(stdout, "{type_name} ({type_code})")?;
 
@@ -177,7 +177,7 @@ fn write_object_details<R: Read + Seek>(
     chased: &ObjectHandle,
     terminal_ref: Option<ObjectRef>,
 ) -> flpdf::Result<()> {
-    match chased.type_code() {
+    match chased.type_code()? {
         2 => writeln!(stdout, "/QTest is null")?,
         3 => {
             let value = chased
