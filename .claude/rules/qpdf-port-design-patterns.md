@@ -283,8 +283,13 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `QPDFJob::parseRotationParameter`（`QPDFJob.cc:369`、private メソッド）
   に対応するが `parse_rotation_parameter` になっていない（`main.rs` から
   直接呼ばれる、対応する `QPDFJob` public メソッドの薄いラッパーが無い
-  ケース——8 の (D) 参照）。この 2 件が監査時点で見つかった未対応の乖離で、
-  この文書は「監査済みで全て一貫」とは主張しない。
+  ケース——8 の (D) 参照）。3 件目（PR #1015 Codex 再レビューで追加）は
+  `job/overlay.rs:178` の `apply_overlays_to_page_with_sources`
+  （同ファイル `:162` の doc comment 自身が `QPDFJob::doUnderOverlayForPage`
+  の移植と明記——1ページ分のcontentを組み立てる側で、`doX`→`x`規則に従えば
+  `under_overlay_for_page`相当になるはずだが独自命名になっている）。
+  この 3 件が監査時点で見つかった未対応の乖離で、この文書は
+  「監査済みで全て一貫」とは主張しない。
 - **戻り値の形が qpdf と違うために動詞ごと変えるのは許容される—ただし
   crate 内で一貫していること**。`doJSONPages`/`doJSONPageLabels`/
   `doJSONOutlines`/`doJSONAcroform`/`doJSONEncrypt`/`doJSONAttachments`
@@ -324,18 +329,24 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
 docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job/*.rs`
 全 17 ファイルの `pub fn`/`fn` 宣言（`rg -c '^\s*(pub )?fn '` で数えた
 関数シグネチャの総数）を対象にした命名監査では、この 2 件の doc 記載
-ミスと、前項で挙げた `apply_overlay_specs`/`RotateSpec::parse`
-（未リネームの既知の例外、いずれも `flpdf-ei0h` で追跡中）以外に
-high confidence の命名乖離は見つからなかった——`doX`→`x`、
-`handleX`→`handle_x` の変換は、その 2 件を除き一貫して正確に
-行われていた。
+ミスと、前項で挙げた `apply_overlay_specs`/`RotateSpec::parse`/
+`apply_overlays_to_page_with_sources`（未リネームの既知の例外、
+いずれも `flpdf-ei0h` で追跡中）以外に high confidence の命名乖離は
+見つからなかった——`doX`→`x`、`handleX`→`handle_x` の変換は、その
+3 件を除き一貫して正確に行われていた（この監査自体、複数ラウンドの
+Codex レビューを経てようやくこの状態に至ったものであり、更なる
+見落としが無いとは言い切れない）。
 
 ## 8. `pub` 境界も qpdf の public/private 境界に倣う
 
-**`pub`（クレート境界を超えて見える）ということは、対応する qpdf 側にも
-「本当に公開されている」ものが無ければならない。** qpdf の private メソッド
+**既定では、`pub`（クレート境界を超えて見える）は対応する qpdf 側にも
+「本当に公開されている」ものがある場合に限る。** qpdf の private メソッド
 内のインラインコードを切り出した flpdf 側の実装は、既定で `private`/
-`pub(crate)` に留める。
+`pub(crate)` に留める。ただしこれは無条件の invariant ではなく、
+後述の根拠 2（private な qpdf 対応物を `QPDFJob` public メソッド経由で
+公開する）・根拠 3（qpdf に対応物が無い flpdf 独自のライブラリ機能）という
+明示的な例外つきの既定値である——例えば `QPDFJob::check` は qpdf 側の
+`doCheck` が private でも根拠 2 により `pub` でよい。
 
 qpdf 自身の CLI 実行ファイル（`qpdf/qpdf.cc`、わずか 62 行）は
 `QPDFJob` の小さな public surface（`initializeFromArgv`/`run`/
@@ -371,18 +382,24 @@ orchestrate するだけで、CLI 側からは一切触れない。flpdf-cli も
   `main.rs` が直接 import していても debt ではない——`job.write_json()`/
   `job.check()` 等、根拠 2 で既に legitimate な `QPDFJob` public メソッドの
   シグネチャが要求しているだけ。
-- **re-export の付け替えでは可視性は狭められない**: ある項目が複数のパス
-  （例: `crate::job::X` と `crate::json_inspect::X`）から到達可能なとき、
-  片方のパスだけ閉じたくても、大元の宣言を `pub` から `pub(crate)` に
-  変えると、もう片方の `pub use crate::job::X` が
-  `error[E0364]: X is only public within the crate, and cannot be
-  re-exported outside` でコンパイル不能になる（`job/mod.rs` の
-  `pub use json_sections::{build_acroform_section, ...}` を
-  `pub(crate)` に変えて実測、2026-08-21）。Rust は `pub(crate)` な項目を
-  `pub use` で再エクスポートして可視性を引き上げることを許さない。
-  つまり「どの module が pub use するか」を動かすだけでは何も狭まらず、
-  生きた外部消費者（doctest・統合テスト・crate ルート re-export）が
-  1 つでも残っている限り、その項目は狭められない。
+- **大元の宣言だけを `pub(crate)` に変える単純な付け替えでは可視性は
+  狭められない（ただし再構築すれば片方だけ閉じることは可能——
+  PR #1015 Codex 再レビューで是正、過大な主張だった）**: ある項目が複数の
+  パス（例: `crate::job::X` と `crate::json_inspect::X`）から到達可能な
+  とき、大元の宣言を `pub` から `pub(crate)` に変えるだけでは、もう片方の
+  `pub use crate::job::X` が `error[E0364]: X is only public within the
+  crate, and cannot be re-exported outside` でコンパイル不能になる
+  （`job/mod.rs` の `pub use json_sections::{build_acroform_section, ...}`
+  を `pub(crate)` に変えて実測、2026-08-21）。**これが示すのは
+  「単純な付け替えでは失敗する」ことだけで、「絶対に片方だけ閉じられない」
+  ことではない**——例えば `json_sections`（現状 `job/mod.rs` の
+  `mod json_sections;` で private）自体を `pub(crate)` にし、
+  `json_inspect.rs` 側が `crate::job::json_sections::{...}` を直接
+  re-export するよう変え、`job/mod.rs` 側の `pub use` を削除すれば、
+  `crate::json_inspect::X` は残したまま `crate::job::X` だけを閉じられる。
+  ただしこれは「re-export 元の付け替え」ではなく module 構造そのものの
+  再編（どのモジュールを再輸出のsource of truthにするか）を要する、
+  というのが正確な言い方。
 - **QPDFJob.hh を読むときの罠**: `Config`/`PagesConfig`/`UOConfig` 等の
   argv パーサー用ネストクラスは、それぞれ自分の `private:` を持つ。
   ネストクラスの `};` で閉じた後、外側 `QPDFJob` 自身の直近の
@@ -411,9 +428,9 @@ crate ルート re-export と突き合わせたところ、5 群に分かれた
 （最初の版はここを 2 群に単純化して誤り、PR #1015 の Codex レビュー
 （複数ラウンド）で段階的に是正した）。
 
-**(A) 既に legitimate — ただし free 関数自体の根拠には要注意
-（PR #1015 Codex 再レビューで是正）**: `prune_acroform_after_subset`/
-`prune_acroform_after_subset_with_max_depth`/
+**(A) `QPDFJob` メソッドは legitimate、free 関数側は未検証の debt
+（PR #1015 Codex 再レビューで是正——見出しが本文の結論と矛盾していた）**:
+`prune_acroform_after_subset`/`prune_acroform_after_subset_with_max_depth`/
 `DEFAULT_MAX_ACROFORM_DEPTH`。flpdf-cli の `main.rs:4746` は
 `QPDFJob::prune_acroform_after_subset`（`job/page_specs.rs:546-551` で
 free 関数へ委譲する `QPDFJob` メソッド）を呼んでおり、これは根拠 2 を
@@ -483,11 +500,16 @@ public な対応物が無いことを確認済み）で、`prune_acroform_after_
 （`QPDFJob::parseNumrange` ではなく `QUtil::parse_numrange` を見る）が
 指す状況と一致するため、`PageRange::parse`（+`resolve`。2段階分割は
 flpdf 独自で qpdf 自体は1関数で行うが、分割自体は (B) の型で言う
-「入れ物」の違いに過ぎない）は根拠 1 で正当化される。加えて
-`page_combine.rs` の `InputSpec::range`/`InputSpec::new`/
-`CombinedPlan::build`/`PagePlan::build` という **job/ の外側にある**
-public library API の一部としても使われ、これらは実行可能な doc
-example を持ち `lib.rs:233` から再輸出されている——二重に legitimate。
+「入れ物」の違いに過ぎない）は根拠 1 で正当化される。`lib.rs:203` から
+crate ルートへ再輸出されており、実行可能な doc example を持つ点も
+根拠 1 の補強になる（PR #1011 で `job/page_combine.rs`/
+`job/page_plan.rs` が job/ 内へ移動済みであることを反映——移動前に
+「job/ の外側にある public library API」という別根拠として二重に
+legitimate と記載していたのは、この PR 自体の rebase 後の状態と
+食い違っていたため訂正した。`PageRange` が `InputSpec::range`/
+`InputSpec::new`/`CombinedPlan::build`/`PagePlan::build` という
+job/ 内の他モジュールからも使われている事実自体は変わらないが、
+それは根拠 1 とは別の追加根拠にはならない）。
 `RotateSpec` には `PageRange` のような library-API 側の依存は無く、
 `flpdf-hxmj`（single-source/multi-source `--pages` パイプライン統合）で
 CLI 経路を一本化すれば `pub(crate)` に落とせる見込み。
