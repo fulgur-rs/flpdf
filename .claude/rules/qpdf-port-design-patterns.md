@@ -341,9 +341,13 @@ docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job
 `apply_overlays_to_page_with_sources`/`PageRange::parse`
 （未リネームの既知の例外、いずれも `flpdf-ei0h` で追跡中）以外に
 high confidence の命名乖離は見つからなかった——`doX`→`x`、
-`handleX`→`handle_x`、`parseX`→`x`（型に紐づく `parse` メソッド）の
-変換は、その 4 件を除き一貫して正確に行われていた（この監査自体、
-複数ラウンドの Codex レビューを経てようやくこの状態に至ったものであり、
+`handleX`→`handle_x` の変換は、その 4 件を除き一貫して正確に
+行われていた（PR #1015 Codex 再レビューで訂正: 型に紐づく `parse`
+メソッドが qpdf 側のフルネームを落としてよいという主張は、
+`RotateSpec::parse`/`PageRange::parse` の 2 件を「未対応の乖離」として
+同時に挙げているのと矛盾するため削除した。この型スコープでの命名短縮を
+許容するかどうかは、まだこの文書で決着していない未決の設計判断であり、
+「機械的に正しい変換」として言い切ってはならない）。この監査自体、
 更なる見落としが無いとは言い切れない）。
 
 ## 8. `pub` 境界も qpdf の public/private 境界に倣う
