@@ -3921,28 +3921,19 @@ fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Over
             }
             continue;
         }
-        // qpdf requires the overlay/underlay file as a separate token (the file
-        // may be written `--file=FILE` INSIDE the group, but the flag itself is
-        // not an `=`-valued option). qpdf rejects `--overlay=FILE` with "overlay
-        // file not specified". The clap definitions keep `--overlay`/`--underlay`
-        // only for `--help`, and their parsed values are unused, so without this
-        // check an `--overlay=FILE` token would slip past clap and be a silent
-        // no-op. Reject the equals form here to match qpdf.
-        for prefix in ["--overlay=", "--underlay="] {
-            if arg.starts_with(prefix) {
-                let flag = prefix.trim_end_matches('=');
-                return Err(format!(
-                    "{flag}: the `{flag}=FILE` form is not supported; pass the file as a \
-                     separate token: `{flag} FILE … --`"
-                )
-                .into());
-            }
-        }
         let kind = match arg.as_str() {
             "--overlay" => Some(OverlayKind::Overlay),
             "--underlay" => Some(OverlayKind::Underlay),
             _ => None,
         };
+        let kind = kind.or_else(|| {
+            arg.strip_prefix("--overlay=")
+                .map(|_| OverlayKind::Overlay)
+                .or_else(|| {
+                    arg.strip_prefix("--underlay=")
+                        .map(|_| OverlayKind::Underlay)
+                })
+        });
         let Some(kind) = kind else {
             residual.push(arg);
             continue;
@@ -7611,23 +7602,39 @@ mod tests {
     }
 
     #[test]
-    fn extract_overlay_equals_form_rejected() {
-        // The `--overlay=FILE` attached-value form must stay rejected even
-        // after the segment parser was loosened to accept sub-options in any
-        // order; qpdf rejects the equals form (the flag itself is not an
-        // `=`-valued option, only its inner `--file=FILE` sub-option is).
-        let argv = strs(&["flpdf", "--overlay=src.pdf", "--"]);
+    fn extract_overlay_equals_form_without_positional_file_is_rejected() {
+        // qpdf discards the attached value on this bare option, so the segment
+        // still has no source file and is rejected.
+        let argv = strs(&["flpdf", "--overlay=discarded", "--"]);
         let err = extract_overlay_groups(argv).unwrap_err().to_string();
         assert!(err.contains("--overlay"), "got: {err}");
-        assert!(err.contains("not supported"), "got: {err}");
+        assert!(err.contains("no source file"), "got: {err}");
     }
 
     #[test]
-    fn extract_underlay_equals_form_rejected() {
-        let argv = strs(&["flpdf", "--underlay=src.pdf", "--"]);
+    fn extract_underlay_equals_form_without_positional_file_is_rejected() {
+        let argv = strs(&["flpdf", "--underlay=discarded", "--"]);
         let err = extract_overlay_groups(argv).unwrap_err().to_string();
         assert!(err.contains("--underlay"), "got: {err}");
-        assert!(err.contains("not supported"), "got: {err}");
+        assert!(err.contains("no source file"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_overlay_equals_form_discards_value_when_positional_source_follows() {
+        let argv = strs(&["flpdf", "--overlay=discarded", "src.pdf", "--"]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(residual, strs(&["flpdf"]));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file, "src.pdf");
+    }
+
+    #[test]
+    fn extract_underlay_equals_form_discards_value_when_positional_source_follows() {
+        let argv = strs(&["flpdf", "--underlay=discarded", "src.pdf", "--"]);
+        let (residual, specs) = extract_overlay_groups(argv).unwrap();
+        assert_eq!(residual, strs(&["flpdf"]));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].file, "src.pdf");
     }
 
     #[test]
