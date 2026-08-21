@@ -3,7 +3,9 @@
 //!
 //! qpdf exposes `--password-mode={auto,bytes,hex-bytes,unicode}` to control how
 //! a CLI-supplied password is interpreted before it is fed to key derivation.
-//! V=5 R=5/R=6 also requires SASLprep (RFC 4013) over the UTF-8 password bytes.
+//! qpdf 11.9.0 validates Unicode-mode input as UTF-8 and passes those bytes
+//! directly to its V=5 authentication code. Although the PDF specification
+//! describes SASLprep, qpdf's reader does not apply it.
 //! This module centralises that preprocessing so the security handler can stay
 //! ignorant of input encoding concerns.
 
@@ -22,20 +24,21 @@ pub enum PasswordMode {
     /// Decode the supplied bytes as a hex string before use.
     /// Useful for round-tripping non-printable passwords through shells.
     HexBytes,
-    /// Interpret the supplied bytes as a UTF-8 string and (for V=5) apply
-    /// SASLprep before V=5 key derivation. For V<5 this mode is currently
-    /// unsupported and surfaces an error.
+    /// Interpret the supplied bytes as UTF-8. For V<5 this mode is currently
+    /// unsupported and surfaces an error. For V>=5 the validated bytes are
+    /// passed through unchanged, matching qpdf 11.9.0.
     Unicode,
 }
 
 /// Normalize a CLI-supplied password byte string for a Standard handler of the
 /// given encryption revision.
 ///
-/// For V=5 R=5/R=6 the bytes are interpreted as UTF-8 and run through SASLprep.
-/// The Standard security handler applies qpdf's 127-byte V=5 truncation at its
-/// reader-side authentication boundary; this normalization helper does not
-/// apply that encryption-specific rule. Hex-bytes mode decodes the input
-/// first; bytes mode passes the input through unchanged.
+/// For V=5 R=5/R=6 the bytes are validated as UTF-8 and passed through
+/// unchanged, matching qpdf 11.9.0's reader-side behavior. The Standard
+/// security handler applies qpdf's 127-byte V=5 truncation at its reader-side
+/// authentication boundary; this normalization helper does not apply that
+/// encryption-specific rule. Hex-bytes mode decodes the input first; bytes
+/// mode passes the input through unchanged.
 pub(crate) fn normalize_password(raw: &[u8], mode: PasswordMode, revision: i64) -> Result<Vec<u8>> {
     let resolved = match mode {
         PasswordMode::Auto => {
@@ -81,13 +84,10 @@ fn unicode_password(raw: &[u8], revision: i64) -> Result<Vec<u8>> {
         }
         .into());
     }
-    let text = std::str::from_utf8(raw).map_err(|_| EncryptedError::Malformed {
+    std::str::from_utf8(raw).map_err(|_| EncryptedError::Malformed {
         reason: "--password-mode=unicode: password is not valid UTF-8".into(),
     })?;
-    let prepped = stringprep::saslprep(text).map_err(|err| EncryptedError::Malformed {
-        reason: format!("--password-mode=unicode: SASLprep rejected the password ({err})"),
-    })?;
-    Ok(prepped.into_owned().into_bytes())
+    Ok(raw.to_vec())
 }
 
 #[cfg(test)]
@@ -101,13 +101,27 @@ mod tests {
     }
 
     #[test]
-    fn auto_for_r5_runs_saslprep_on_ascii_passthrough() {
+    fn auto_for_r5_preserves_ascii_utf8_bytes() {
         let out = normalize_password(b"hello", PasswordMode::Auto, 6).unwrap();
         assert_eq!(out, b"hello");
     }
 
     #[test]
-    fn auto_for_r5_runs_saslprep_on_utf8() {
+    fn auto_for_r5_preserves_qpdf_password_bytes_without_saslprep() {
+        // qpdf 11.9.0's reader-side QPDF_encryption.cc:671-676 documents
+        // SASLprep as a specification requirement but passes the supplied
+        // UTF-8 bytes directly to truncate_password_V5. A no-break space is
+        // mapped to an ordinary space by SASLprep, so this distinguishes the
+        // qpdf path from the current flpdf normalization.
+        let raw = "a\u{00a0}b".as_bytes();
+
+        let out = normalize_password(raw, PasswordMode::Auto, 6).unwrap();
+
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn auto_for_r5_preserves_utf8_bytes() {
         // "café" — NFC, non-ASCII but no prohibited characters.
         let out = normalize_password("café".as_bytes(), PasswordMode::Auto, 6).unwrap();
         assert_eq!(out, "café".as_bytes());

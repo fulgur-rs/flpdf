@@ -95,8 +95,9 @@ flpdf rewrite --full-rewrite in.pdf out.pdf # decode + re-emit with FlateDecode
 ```
 
 Encrypted inputs are supported via `--password`, `--password-file`, and
-`--password-mode {auto,bytes,hex-bytes,unicode}` (the `unicode` mode applies
-SASLprep for V=5 R=5/R=6 handlers). RC4-backed handlers and revision 5
+`--password-mode {auto,bytes,hex-bytes,unicode}` (the `unicode` mode validates
+UTF-8 and preserves the supplied bytes for V=5 R=5/R=6 handlers, matching qpdf
+11.9.0). RC4-backed handlers and revision 5
 encryption are gated behind `--allow-weak-crypto`.
 
 `--static-id`, `--min-version`, `--force-version`, and the qpdf compatibility

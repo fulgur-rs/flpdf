@@ -33,18 +33,18 @@ fn explicit_unicode_mode_authenticates_composed_password() {
 }
 
 #[test]
-fn unicode_mode_normalizes_decomposed_password_to_composed() {
-    // "cafe" + COMBINING ACUTE ACCENT (U+0301) — SASLprep / NFC must fold
-    // this to the composed form the fixture was encrypted with.
+fn unicode_mode_preserves_decomposed_password_bytes() {
+    // qpdf 11.9.0 validates UTF-8 in Unicode mode but does not apply SASLprep
+    // or NFC normalization. The decomposed bytes therefore do not match the
+    // fixture encrypted with composed "café".
     check_cmd("v5-aes-256-r6-utf8.pdf", "cafe\u{301}", Some("unicode"))
         .assert()
-        .success();
+        .failure();
 }
 
 #[test]
 fn bytes_mode_does_not_normalize_decomposed_password() {
-    // Without SASLprep the decomposed UTF-8 bytes do not match the fixture's
-    // composed key, so authentication must fail.
+    // The raw decomposed UTF-8 bytes do not match the fixture's composed key.
     check_cmd("v5-aes-256-r6-utf8.pdf", "cafe\u{301}", Some("bytes"))
         .assert()
         .failure();
