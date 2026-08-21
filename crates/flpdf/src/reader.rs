@@ -3620,16 +3620,28 @@ impl<R: Read + Seek> Pdf<R> {
                 self.warn_unknown_crypt_filters(warn_unknown_string, false)?;
                 return Ok((object, false));
             } else if has_explicit_crypt_filter {
-                let mut encryption_guard = self.encryption.borrow_mut();
-                let encryption = encryption_guard
-                    .as_mut()
-                    .expect("encryption state remains present before stream pass");
-                warn_unknown_stream = apply_explicit_crypt_filters(
-                    object_ref,
-                    stream,
-                    encryption,
-                    recovered_stream_eol,
-                )?;
+                let explicit_result = {
+                    let mut encryption_guard = self.encryption.borrow_mut();
+                    let encryption = encryption_guard
+                        .as_mut()
+                        .expect("encryption state remains present before stream pass");
+                    apply_explicit_crypt_filters(
+                        object_ref,
+                        stream,
+                        encryption,
+                        recovered_stream_eol,
+                        &mut warn_unknown_stream,
+                    )
+                };
+                if let Err(error) = explicit_result {
+                    // qpdf's `decryptStream` warns from its method switch
+                    // (`libqpdf/QPDF_encryption.cc:1121-1133`) before it
+                    // derives the object key (`:1135`) or prepends the
+                    // decryption stage (`:1137-1149`), so a failure in either
+                    // of those later steps does not swallow the warning.
+                    self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream)?;
+                    return Err(error);
+                }
                 stream_payload_transformed = true;
             } else {
                 let mut encryption_guard = self.encryption.borrow_mut();
@@ -4227,27 +4239,32 @@ fn decrypt_stream_bytes(
     })
 }
 
-/// Returns whether the caller must emit the unknown-crypt-filter warning for
-/// streams: a `/Crypt` filter naming a method qpdf does not recognise still
-/// goes through `QPDF::decryptStream`'s switch, whose unknown arm warns and
-/// resets `cf_stream` (`libqpdf/QPDF_encryption.cc:1121-1133`).
+/// Sets `warn_unknown` when the caller must emit the unknown-crypt-filter
+/// warning for streams: a `/Crypt` filter naming a method qpdf does not
+/// recognise still goes through `QPDF::decryptStream`'s switch, whose unknown
+/// arm warns and resets `cf_stream` (`libqpdf/QPDF_encryption.cc:1121-1133`).
+///
+/// The flag is an out-parameter rather than part of the return value because
+/// qpdf raises that warning at `:1121-1133`, ahead of the key derivation at
+/// `:1135` and the pipeline construction at `:1137-1149`. Returning it would
+/// discard it whenever one of those later steps fails, which is the opposite
+/// of qpdf's ordering.
 fn apply_explicit_crypt_filters(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     encryption: &mut EncryptionState,
     recovered_stream_eol: Option<&[u8]>,
-) -> Result<bool> {
+    warn_unknown: &mut bool,
+) -> Result<()> {
     let filter = stream
         .dict
         .get("Filter")
         .cloned()
         .expect("caller checked for an explicit /Crypt filter");
-    let mut decode_params = stream.dict.get("DecodeParms").cloned();
+    let decode_params = stream.dict.get("DecodeParms").cloned();
     if let Some(filters) = filter.as_array() {
         crate::filters::validate_filter_chain_len(filters)?;
     }
-
-    let mut warn_unknown = false;
 
     // qpdf's QPDF::decryptStream prepends one decryption stage to the source
     // pipeline before QPDF_Stream applies any /Filter entry
@@ -4279,7 +4296,7 @@ fn apply_explicit_crypt_filters(
     // For an array, a malformed or missing local `/Name` leaves qpdf's
     // `method` at `e_unknown`, which falls back to the document `/StmF`.
     let (use_aes, warn) = encryption.stream_method(explicit_mode);
-    warn_unknown |= warn;
+    *warn_unknown |= warn;
 
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
@@ -4294,15 +4311,25 @@ fn apply_explicit_crypt_filters(
         decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
     }
 
+    remove_explicit_crypt_filter_with_values(stream, filter, decode_params);
+    Ok(())
+}
+
+fn remove_explicit_crypt_filter_with_values(
+    stream: &mut crate::Stream,
+    filter: Object,
+    decode_params: Option<Object>,
+) {
     if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
         stream.dict.remove("Filter");
         stream.dict.remove("DecodeParms");
-        return Ok(warn_unknown);
+        return;
     }
 
-    let mut filters = filter
-        .into_array()
-        .expect("explicit /Crypt filter is either a name or an array");
+    let Some(mut filters) = filter.into_array() else {
+        return; // cov:ignore: the qpdf explicit-crypt shape is a name or array; malformed shape is defensive
+    };
+    let mut decode_params = decode_params;
     let mut index = 0;
     while index < filters.len() {
         if matches!(&filters[index], Object::Name(name) if name.as_slice() == b"Crypt") {
@@ -4329,7 +4356,6 @@ fn apply_explicit_crypt_filters(
             }
         };
     }
-    Ok(warn_unknown)
 }
 
 fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
@@ -6345,6 +6371,73 @@ mod tests {
         Object::Dictionary(params)
     }
 
+    /// qpdf's `decryptStream` warns about an unrecognised crypt method at
+    /// `libqpdf/QPDF_encryption.cc:1121-1133`, before it derives the object key
+    /// at `:1135` and before it prepends the decryption stage at `:1137-1149`.
+    /// A failure in either later step therefore cannot suppress the warning.
+    ///
+    /// The failure here comes from an underivable AES object key: the state's
+    /// file key is five bytes, so `compute_data_key` yields neither an AES-128
+    /// nor an AES-256 key.
+    #[test]
+    fn explicit_crypt_filter_warning_survives_a_later_failure() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let mut encryption = explicit_rc4_encryption_state();
+        // An unrecognised /Name leaves qpdf's `method` at `e_unknown`, which is
+        // the arm that warns and resets `cf_stream` to AES.
+        encryption.cf_stream = EncryptionMode::Unknown;
+        *pdf.encryption.borrow_mut() = Some(encryption);
+
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        dict.insert("DecodeParms", crypt_params(b"NoSuchFilter"));
+
+        let error = pdf
+            .decrypt_resolved_object(
+                ObjectRef::new(4, 0),
+                Object::Stream(Stream::new(dict, vec![0u8; 48])),
+                None,
+            )
+            .expect_err("a five-byte file key cannot produce an AES object key");
+        assert!(matches!(error, Error::Encrypted(_)), "got {error:?}");
+
+        let warnings: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.contains("unknown encryption filter for streams")),
+            "the unknown-filter warning must outlive the later failure: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn decrypt_resolved_object_propagates_non_encrypted_explicit_filter_errors() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        *pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec()); 17]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"Identity"); 17]),
+        );
+        let error = pdf
+            .decrypt_resolved_object(
+                ObjectRef::new(4, 0),
+                Object::Stream(Stream::new(dict, b"identity".to_vec())),
+                None,
+            )
+            .expect_err("an overlong filter chain must remain a hard error");
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("filter chain")));
+    }
+
     fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {
         let mut dict = Dictionary::new();
         dict.insert(
@@ -6369,6 +6462,7 @@ mod tests {
             &mut stream,
             &mut encryption,
             Some(b"\n"),
+            &mut false,
         )
         .expect_err("17 explicit Crypt filters must exceed the shared decode cap");
 
@@ -6391,8 +6485,14 @@ mod tests {
         let mut encryption = explicit_rc4_encryption_state();
         let mut stream = explicit_identity_crypt_chain(16);
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
-            .expect("16 explicit Crypt filters are within the shared decode cap");
+        apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &mut encryption,
+            None,
+            &mut false,
+        )
+        .expect("16 explicit Crypt filters are within the shared decode cap");
 
         assert_eq!(stream.data, b"identity");
         assert_eq!(stream.dict.get("Filter"), None);
@@ -6419,9 +6519,15 @@ mod tests {
         );
         let mut stream = Stream::new(dict, b"ciphertext".to_vec());
 
-        let warn =
-            apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
-                .expect("a non-name /Crypt /Name is qpdf's Identity default, not an error");
+        let mut warn = false;
+        apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &mut encryption,
+            None,
+            &mut warn,
+        )
+        .expect("a non-name /Crypt /Name is qpdf's Identity default, not an error");
 
         assert!(!warn, "e_none does not warn; only e_unknown does");
         assert_eq!(stream.data, b"ciphertext");
@@ -6461,7 +6567,8 @@ mod tests {
         .expect("build AES ciphertext");
         let mut stream = Stream::new(dict, payload);
 
-        let warn = apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None)
+        let mut warn = false;
+        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None, &mut warn)
             .expect("unknown crypt filters decrypt as AES rather than failing");
 
         assert!(warn, "an unknown crypt filter must ask the caller to warn");
@@ -6489,8 +6596,14 @@ mod tests {
         dict.insert("DecodeParms", crypt_params(b"StdCF"));
         let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, plaintext, &encryption));
 
-        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, Some(b"\n"))
-            .expect("remove named Crypt");
+        apply_explicit_crypt_filters(
+            object_ref,
+            &mut stream,
+            &mut encryption,
+            Some(b"\n"),
+            &mut false,
+        )
+        .expect("remove named Crypt");
 
         assert_eq!(stream.data, plaintext);
         assert_eq!(stream.dict.get("Filter"), None);
@@ -6517,8 +6630,14 @@ mod tests {
         );
         let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &compressed, &encryption));
 
-        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, Some(b"\n"))
-            .expect("remove first Crypt");
+        apply_explicit_crypt_filters(
+            object_ref,
+            &mut stream,
+            &mut encryption,
+            Some(b"\n"),
+            &mut false,
+        )
+        .expect("remove first Crypt");
 
         assert_eq!(
             crate::filters::decode_stream_data(&stream.dict, &stream.data)
@@ -6555,7 +6674,7 @@ mod tests {
         );
         let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &encoded, &encryption));
 
-        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None)
+        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None, &mut false)
             .expect("remove Crypt without re-encoding the ASCIIHex prefix");
 
         assert_eq!(
@@ -6589,8 +6708,14 @@ mod tests {
         );
         let mut stream = Stream::new(dict, b"identity".to_vec());
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
-            .expect("remove singleton Crypt");
+        apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &mut encryption,
+            None,
+            &mut false,
+        )
+        .expect("remove singleton Crypt");
 
         assert_eq!(stream.data, b"identity");
         assert_eq!(stream.dict.get("Filter"), None);
@@ -6611,8 +6736,14 @@ mod tests {
         );
         let mut stream = Stream::new(dict, flate_encoded(plaintext));
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
-            .expect("remove Crypt without DecodeParms");
+        apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &mut encryption,
+            None,
+            &mut false,
+        )
+        .expect("remove Crypt without DecodeParms");
 
         assert_eq!(
             crate::filters::decode_stream_data(&stream.dict, &stream.data)
@@ -6637,8 +6768,14 @@ mod tests {
         dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
         let mut stream = Stream::new(dict, flate_encoded(plaintext));
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
-            .expect("remove Crypt with short DecodeParms");
+        apply_explicit_crypt_filters(
+            ObjectRef::new(4, 0),
+            &mut stream,
+            &mut encryption,
+            None,
+            &mut false,
+        )
+        .expect("remove Crypt with short DecodeParms");
 
         assert_eq!(
             crate::filters::decode_stream_data(&stream.dict, &stream.data)

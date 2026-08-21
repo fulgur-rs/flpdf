@@ -408,14 +408,4 @@ mod tests {
         let rebased = original.rebase_offset(100);
         assert!(matches!(rebased, Error::Unsupported(ref s) if s == "nope"));
     }
-
-    #[test]
-    fn primitive_error_padding_maps_to_encrypted_malformed() {
-        let e: Error = PrimitiveError::PaddingError.into();
-        assert!(
-            e.to_string()
-                .contains("malformed /Encrypt dictionary: primitive: invalid PKCS#7 padding"),
-            "unexpected display: {e}"
-        );
-    }
 }

@@ -156,6 +156,42 @@ impl<'a> PlAesPdf<'a> {
         Self::new(identifier, next, false, key)
     }
 
+    /// Decrypt a whole in-memory buffer through this stage and return the
+    /// plaintext.
+    ///
+    /// This is the shape `QPDF::decryptString` uses
+    /// (`libqpdf/QPDF_encryption.cc:1011-1027`): it hands `Pl_AES_PDF` the
+    /// entire stored string, leading initialization vector included, and reads
+    /// the result back out of a `Pl_Buffer`. The vector is *not* split off by
+    /// the caller — `flush` consumes the first input block as the vector
+    /// (`libqpdf/Pl_AES_PDF.cc:169-172`), which is also why an input of one
+    /// block or less yields no plaintext at all.
+    ///
+    /// Routing through the stage rather than a separate one-shot cipher is
+    /// what keeps qpdf's tolerance for malformed ciphertext: a tail shorter
+    /// than a block is zero-padded (`Pl_AES_PDF.cc:107-118`) and a trailer
+    /// that does not look like padding is left in place (`:183-196`), neither
+    /// of which is an error.
+    ///
+    /// # Errors
+    ///
+    /// Same key-length contract as [`Self::new_decrypt`].
+    pub(crate) fn decrypt_to_vec(
+        identifier: impl Into<String>,
+        data: &[u8],
+        key: &[u8],
+    ) -> PipelineResult<Vec<u8>> {
+        let mut sink = super::buffer::Buffer::new("AES decryption buffer", None);
+        {
+            // Spelled out rather than `Self::` so the stage borrows `sink` for
+            // this block alone instead of the impl's lifetime parameter.
+            let mut stage = PlAesPdf::new_decrypt(identifier, &mut sink, key)?;
+            stage.write(data)?;
+            stage.finish()?;
+        }
+        sink.take_buffer()
+    }
+
     /// An encrypting stage, mirroring `Pl_AES_PDF(identifier, next, true, key,
     /// key_bytes)`. Unless a vector is supplied or zeroed, a fresh random
     /// initialization vector is generated and written ahead of the ciphertext.
@@ -821,6 +857,131 @@ mod tests {
 
         assert!(
             error.to_string().contains("must be 16"),
+            "unexpected message: {error}"
+        );
+    }
+
+    // ── decrypt_to_vec: the one-shot shape QPDF::decryptString uses ─────────
+
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// NIST SP 800-38A section F.2.1 (CBC-AES128), with one block of PDF
+    /// padding appended so the stage strips it exactly as `flush` does
+    /// (`libqpdf/Pl_AES_PDF.cc:183-196`).
+    ///
+    /// Key 2b7e151628aed2a6abf7158809cf4f3c, IV 000102030405060708090a0b0c0d0e0f,
+    /// plaintext 6bc1bee22e409f96e93d7e117393172a, first ciphertext block
+    /// 7649abac8119b246cee98e9b12e9197d. The trailing padding block was
+    /// computed with the Python `cryptography` library, so nothing in the
+    /// vector comes from flpdf itself.
+    #[test]
+    fn decrypt_to_vec_matches_the_nist_aes128_cbc_vector() {
+        let key = from_hex("2b7e151628aed2a6abf7158809cf4f3c");
+        // The stage takes the leading block as the vector, so it is prepended
+        // to the ciphertext rather than passed separately.
+        let input = from_hex(
+            "000102030405060708090a0b0c0d0e0f\
+             7649abac8119b246cee98e9b12e9197d\
+             8964e0b149c10b7b682e6e39aaeb731c",
+        );
+
+        let plaintext = PlAesPdf::decrypt_to_vec("AES string decryption", &input, &key)
+            .expect("AES-128 key is a supported length");
+
+        assert_eq!(plaintext, from_hex("6bc1bee22e409f96e93d7e117393172a"));
+    }
+
+    /// NIST SP 800-38A section F.2.5 (CBC-AES256), same construction.
+    #[test]
+    fn decrypt_to_vec_matches_the_nist_aes256_cbc_vector() {
+        let key = from_hex(
+            "603deb1015ca71be2b73aef0857d7781\
+             1f352c073b6108d72d9810a30914dff4",
+        );
+        let input = from_hex(
+            "000102030405060708090a0b0c0d0e0f\
+             f58c4c04d6e5f1ba779eabfb5f7bfbd6\
+             485a5c81519cf378fa36d42b8547edc0",
+        );
+
+        let plaintext = PlAesPdf::decrypt_to_vec("AES string decryption", &input, &key)
+            .expect("AES-256 key is a supported length");
+
+        assert_eq!(plaintext, from_hex("6bc1bee22e409f96e93d7e117393172a"));
+    }
+
+    /// qpdf's `finish` zero-pads a ciphertext tail shorter than a block rather
+    /// than failing — "pad with zeroes and hope for the best"
+    /// (`libqpdf/Pl_AES_PDF.cc:107-118`). Here the payload after the vector is
+    /// 30 bytes, so the stage decrypts 32 and emits all of them.
+    ///
+    /// Expected plaintext computed with the Python `cryptography` library over
+    /// the zero-padded ciphertext, independently of this implementation.
+    #[test]
+    fn decrypt_to_vec_zero_pads_a_short_final_block_like_qpdf() {
+        let mut input = IV.to_vec();
+        input.extend(0x20u8..0x3e); // 30 bytes: not a whole number of blocks
+
+        let plaintext = PlAesPdf::decrypt_to_vec("AES string decryption", &input, &KEY128)
+            .expect("AES-128 key is a supported length");
+
+        assert_eq!(
+            plaintext,
+            from_hex("965d506c8efb62bdf82304a19615e54cf7cb11273e24d150cc5864434df9f4af"),
+            "a short tail is zero-padded, not rejected"
+        );
+    }
+
+    /// The padding strip is skipped, not failed, when the final byte does not
+    /// describe a run of equal bytes (`libqpdf/Pl_AES_PDF.cc:185-195`). This
+    /// payload decrypts to a block ending in 0x2c, whose preceding bytes
+    /// disagree, so all 32 bytes survive.
+    ///
+    /// Expected plaintext computed with the Python `cryptography` library.
+    #[test]
+    fn decrypt_to_vec_keeps_a_final_block_whose_trailer_is_not_padding() {
+        let mut input = IV.to_vec();
+        input.extend(0x40u8..0x60); // 32 bytes: two whole blocks
+
+        let plaintext = PlAesPdf::decrypt_to_vec("AES string decryption", &input, &KEY128)
+            .expect("AES-128 key is a supported length");
+
+        assert_eq!(
+            plaintext,
+            from_hex("313c1f855b4becb74548099f42378521afeba453bfea2ebf7237cdf47ffe442c"),
+            "an implausible padding byte leaves the block whole"
+        );
+    }
+
+    /// An input of one block or less is entirely consumed as the
+    /// initialization vector (`libqpdf/Pl_AES_PDF.cc:169-172`), leaving no
+    /// ciphertext to decrypt. A short one is zero-padded to a block first.
+    #[test]
+    fn decrypt_to_vec_yields_nothing_for_an_input_of_one_block_or_less() {
+        for len in [0usize, 1, 15, 16] {
+            let input = vec![0x5au8; len];
+            let plaintext = PlAesPdf::decrypt_to_vec("AES string decryption", &input, &KEY128)
+                .expect("AES-128 key is a supported length");
+            assert!(
+                plaintext.is_empty(),
+                "{len} bytes is at most the vector, so no plaintext follows"
+            );
+        }
+    }
+
+    /// The one-shot inherits `new_decrypt`'s key-length contract.
+    #[test]
+    fn decrypt_to_vec_rejects_an_unsupported_key_length() {
+        let error = PlAesPdf::decrypt_to_vec("AES string decryption", &[0u8; 32], &[0u8; 24])
+            .expect_err("24 bytes is not a supported AES key length");
+
+        assert!(
+            error.to_string().contains("16 or 32 bytes"),
             "unexpected message: {error}"
         );
     }

@@ -7092,6 +7092,12 @@ mod tests {
     // This catches a production regression where the resolver adapter accepts
     // a string cipher failure and returns ciphertext. Replacing the parser
     // callback's `?` with recovery makes this resolution succeed instead.
+    //
+    // The failure has to come from key derivation rather than from the
+    // ciphertext: `Pl_AES_PDF` never rejects a payload for its length or its
+    // padding (see the lenient-acceptance test below), so a short file key —
+    // which leaves `compute_data_key` returning something that is neither an
+    // AES-128 nor an AES-256 key — is what a string cipher failure looks like.
     #[test]
     fn canonical_resolver_propagates_string_decryption_errors() {
         let resolver = ResolverHandle::new_shared(
@@ -7104,13 +7110,57 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         );
-        *resolver.encryption_parameters().borrow_mut() = Some(aes128_encryption_state());
+        let mut state = aes128_encryption_state();
+        state.file_key.truncate(5);
+        *resolver.encryption_parameters().borrow_mut() = Some(state);
 
         let error = resolver
             .read_object_at_offset(0, ObjectRef::new(1, 0))
-            .expect_err("invalid AES string data must fail object parsing");
+            .expect_err("an underivable AES object key must fail object parsing");
 
         assert!(matches!(error, Error::Encrypted(_)), "got {error:?}");
+    }
+
+    /// qpdf's `decryptString` runs the stored bytes through `Pl_AES_PDF` into a
+    /// `Pl_Buffer` (`libqpdf/QPDF_encryption.cc:1013-1021`) and only converts a
+    /// `std::runtime_error` into a damaged-PDF error (`:1097-1100`). The stage
+    /// raises neither for a payload that is not a whole number of blocks nor
+    /// for one whose trailer is not valid padding: it zero-pads the tail
+    /// (`libqpdf/Pl_AES_PDF.cc:107-118`) and leaves an implausible trailer
+    /// alone (`:183-196`). So a malformed AES string resolves rather than
+    /// failing, and the leading block is consumed as the vector.
+    #[test]
+    fn canonical_resolver_accepts_malformed_aes_strings_like_qpdf() {
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(b"1 0 obj\n(bad AES ciphertext)\nendobj\n".to_vec()),
+            0,
+            BTreeMap::from([(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 })]),
+            false,
+            false, // already_reconstructed
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        *resolver.encryption_parameters().borrow_mut() = Some(aes128_encryption_state());
+
+        let (object, _) = resolver
+            .read_object_at_offset(0, ObjectRef::new(1, 0))
+            .expect("a malformed AES string is tolerated, not rejected");
+
+        // "bad AES ciphertext" is 18 bytes: the leading 16 are consumed as the
+        // vector and the remaining 2 are zero-padded up to a block, so one
+        // block of plaintext comes back. The bytes themselves vary with the
+        // fixture's randomly generated `/O`/`/U` (and therefore file key), so
+        // this cannot pin an exact length: `Pl_AES_PDF`'s lenient unpad also
+        // strips a trailing byte whenever it happens to look like valid
+        // PKCS#7 padding (most commonly a lone `0x01`, ~1/256 of random
+        // blocks), which this same tolerant behavior requires accepting, not
+        // rejecting. Assert only the tolerance property itself -- resolution
+        // succeeded and returned plaintext -- not a specific byte count.
+        assert!(
+            matches!(&object, ObjectValue::String(bytes) if !bytes.is_empty()),
+            "expected leniently decrypted plaintext, got {object:?}"
+        );
     }
 
     // This catches a production regression where canonical parsing omits the
