@@ -363,7 +363,7 @@ fn apply_overlays_to_page<R: Read + Seek>(
 }
 
 /// Pair selected destination pages with source pages, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` page-mapping loop (qpdf 11.9.0).
+/// `QPDFJob::handleUnderOverlay` page-mapping loop (qpdf 11.9.0).
 ///
 /// `from_pages`, `to_pages`, and `repeat_pages` are 1-based page numbers already
 /// resolved from the `--from`, `--to`, and `--repeat` page ranges. The `i`-th
@@ -398,7 +398,7 @@ fn map_overlay_pages(
 }
 
 /// Map a single overlay/underlay spec to its per-destination-page sources
-/// **without applying them**, mirroring qpdf's `QPDFJob::doUnderOverlay` source
+/// **without applying them**, mirroring qpdf's `QPDFJob::handleUnderOverlay` source
 /// preparation for one `--overlay`/`--underlay` group (qpdf 11.9.0).
 ///
 /// `from`, `to`, and `repeat` are the spec's page ranges. `from` (default all
@@ -542,7 +542,7 @@ pub(crate) fn resolve_spec_pairs(
 }
 
 /// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
+/// `QPDFJob::handleUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
 ///
 /// A thin wrapper over [`spec_page_sources`] + [`apply_overlay_specs`]'s
 /// aggregation: the spec's per-destination-page sources are mapped, grouped by
@@ -667,7 +667,7 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
 }
 
 /// Compose multiple overlay/underlay specs onto `dest`, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` handling of several `--overlay`/`--underlay` groups
+/// `QPDFJob::handleUnderOverlay` handling of several `--overlay`/`--underlay` groups
 /// (qpdf 11.9.0).
 ///
 /// Each [`OverlaySpec`] is mapped independently against `dest`: its `from`/`to`/
