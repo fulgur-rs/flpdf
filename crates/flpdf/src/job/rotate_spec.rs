@@ -35,7 +35,7 @@
 //! `--rotate` flags should collect them into a `Vec<RotateSpec>`; the specs are
 //! applied in order (responsibility of the CLI layer).
 
-use crate::page_range::PageRange;
+use super::page_range::PageRange;
 use crate::page_rotate::{RotateMode, RotateOp};
 use crate::{Error, Result};
 
@@ -206,8 +206,8 @@ impl RotateSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page_range::{Endpoint, PageRangeEntry};
     use crate::page_rotate::compose_rotate;
+    use crate::{Endpoint, PageRangeEntry};
 
     // -----------------------------------------------------------------------
     // Helpers

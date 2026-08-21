@@ -32,7 +32,7 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{page_combine::CombinedPlan, page_range::PageRange, Pdf};
+//! use flpdf::{CombinedPlan, PageRange, Pdf};
 //!
 //! let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
 //! let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
@@ -97,7 +97,7 @@ pub struct CombinedPage {
     /// page belongs to).
     pub source_index: usize,
     /// The selected page from that input.
-    pub page: crate::page_plan::SelectedPage,
+    pub page: super::page_plan::SelectedPage,
 }
 
 /// Concatenated page selection from multiple input documents.

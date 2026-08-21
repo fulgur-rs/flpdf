@@ -43,7 +43,8 @@
 //!   → A1,A2,B1,B2,C1,C2,A3,B3,B4,B5
 //! ```
 
-use crate::{page_combine::CombinedPage, CombinedPlan, Error, Result};
+use super::page_combine::{CombinedPage, CombinedPlan};
+use crate::{Error, Result};
 
 /// Reorder pages from a [`CombinedPlan`] using round-robin interleaving.
 ///
@@ -66,7 +67,7 @@ use crate::{page_combine::CombinedPage, CombinedPlan, Error, Result};
 /// # Example
 ///
 /// ```no_run
-/// use flpdf::{collate, page_combine::CombinedPlan, page_range::PageRange, Pdf};
+/// use flpdf::{collate, CombinedPlan, PageRange, Pdf};
 /// use std::io::{BufReader, Cursor};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,7 +95,7 @@ pub fn collate(plan: &CombinedPlan, n: usize) -> Result<Vec<CombinedPage>> {
     }
 
     // Build per-input cursor vectors: each entry is (source_index, pages_slice_index).
-    let inputs: Vec<(usize, &[crate::page_plan::SelectedPage])> = plan
+    let inputs: Vec<(usize, &[super::page_plan::SelectedPage])> = plan
         .per_input_plans()
         .iter()
         .enumerate()
@@ -147,10 +148,9 @@ pub fn collate(plan: &CombinedPlan, n: usize) -> Result<Vec<CombinedPage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page_combine::{CombinedPage, CombinedPlan};
-    use crate::page_plan::SelectedPage;
-    use crate::page_range::PageRange;
+    use crate::job::page_plan::SelectedPage;
     use crate::ObjectRef;
+    use crate::PageRange;
     use crate::Pdf;
     use std::io::Cursor;
 

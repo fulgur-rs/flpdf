@@ -27,10 +27,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+use super::page_range::PageRange;
 use crate::page_document_helper::PageDocumentHelper;
 use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
-use crate::page_range::PageRange;
 use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
@@ -363,7 +363,7 @@ fn apply_overlays_to_page<R: Read + Seek>(
 }
 
 /// Pair selected destination pages with source pages, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` page-mapping loop (qpdf 11.9.0).
+/// `QPDFJob::handleUnderOverlay` page-mapping loop (qpdf 11.9.0).
 ///
 /// `from_pages`, `to_pages`, and `repeat_pages` are 1-based page numbers already
 /// resolved from the `--from`, `--to`, and `--repeat` page ranges. The `i`-th
@@ -398,7 +398,7 @@ fn map_overlay_pages(
 }
 
 /// Map a single overlay/underlay spec to its per-destination-page sources
-/// **without applying them**, mirroring qpdf's `QPDFJob::doUnderOverlay` source
+/// **without applying them**, mirroring qpdf's `QPDFJob::handleUnderOverlay` source
 /// preparation for one `--overlay`/`--underlay` group (qpdf 11.9.0).
 ///
 /// `from`, `to`, and `repeat` are the spec's page ranges. `from` (default all
@@ -542,7 +542,7 @@ pub(crate) fn resolve_spec_pairs(
 }
 
 /// Apply a single overlay/underlay spec to `dest`, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
+/// `QPDFJob::handleUnderOverlay` for one `--overlay`/`--underlay` group (qpdf 11.9.0).
 ///
 /// A thin wrapper over [`spec_page_sources`] + [`apply_overlay_specs`]'s
 /// aggregation: the spec's per-destination-page sources are mapped, grouped by
@@ -667,7 +667,7 @@ fn apply_aggregated_sources<R: Read + Seek, RS: Read + Seek>(
 }
 
 /// Compose multiple overlay/underlay specs onto `dest`, mirroring qpdf's
-/// `QPDFJob::doUnderOverlay` handling of several `--overlay`/`--underlay` groups
+/// `QPDFJob::handleUnderOverlay` handling of several `--overlay`/`--underlay` groups
 /// (qpdf 11.9.0).
 ///
 /// Each [`OverlaySpec`] is mapped independently against `dest`: its `from`/`to`/
@@ -1127,8 +1127,8 @@ mod byte_gate {
         OverlaySource, OverlaySpec,
     };
     use crate::page_form_xobject::import_page_as_form_xobject;
-    use crate::page_range::PageRange;
     use crate::pages::page_refs;
+    use crate::PageRange;
     use crate::{Object, ObjectRef, Pdf, PdfWriter};
     use std::io::{Read, Seek};
     use std::path::Path;

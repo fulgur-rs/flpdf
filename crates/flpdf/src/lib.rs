@@ -123,14 +123,11 @@ pub(crate) mod overlay_appearance_stream;
 pub mod page_annotation_enum;
 mod page_annotation_flatten;
 pub mod page_closure;
-pub mod page_combine;
 pub mod page_document_helper;
 pub mod page_extract;
 pub(crate) mod page_form_xobject;
 pub mod page_label_document_helper;
 pub mod page_object_helper;
-pub mod page_plan;
-pub mod page_range;
 pub mod page_rotate;
 pub mod page_splice;
 pub mod pages;
@@ -201,8 +198,10 @@ pub use form_field_object_helper::FormFieldObjectHelper;
 pub use job::{
     apply_overlay_specs, collate, format_attachment_list, format_attachment_list_with_sink,
     list_attachment_info, merge_documents, overlay_verbose_report, prune_acroform_after_subset,
-    prune_acroform_after_subset_with_max_depth, AttachmentInfo, MergeInput, OverlayKind,
-    OverlaySpec, OverlayVerbosePage, OverlayVerboseSource, RotateSpec, DEFAULT_MAX_ACROFORM_DEPTH,
+    prune_acroform_after_subset_with_max_depth, AttachmentInfo, CombinedPage, CombinedPlan,
+    Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage,
+    OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, Parity, RotateSpec, SelectedPage,
+    DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use matrix::{Matrix, Rectangle};
 pub use name_number_tree::{
@@ -221,7 +220,6 @@ pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_wi
 pub use outline_document_helper::OutlineDocumentHelper;
 pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use page_annotation_enum::{enumerate_page_annotations, EnumeratedAnnotation};
-pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::{PageDocumentHelper, PageInput};
 pub use page_extract::{extract_page, extract_pages};
 pub use page_label_document_helper::{
@@ -229,8 +227,6 @@ pub use page_label_document_helper::{
     PageLabelDocumentHelper,
 };
 pub use page_object_helper::{PageBox, PageObjectHelper};
-pub use page_plan::{PagePlan, SelectedPage};
-pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_rotate::{
     apply_rotate_to_pages, compose_rotate, flatten_rotation_on_pages, resolve_inherited_rotate,
     resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
