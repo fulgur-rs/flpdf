@@ -6401,12 +6401,17 @@ mod tests {
             .expect_err("a five-byte file key cannot produce an AES object key");
         assert!(matches!(error, Error::Encrypted(_)), "got {error:?}");
 
+        let warnings: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
         assert!(
-            pdf.repair_diagnostics().entries().iter().any(|entry| entry
-                .message
-                .contains("unknown encryption filter for streams")),
-            "the unknown-filter warning must outlive the later failure: {:?}",
-            pdf.repair_diagnostics().entries()
+            warnings
+                .iter()
+                .any(|message| message.contains("unknown encryption filter for streams")),
+            "the unknown-filter warning must outlive the later failure: {warnings:?}"
         );
     }
 

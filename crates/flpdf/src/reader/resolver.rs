@@ -7147,15 +7147,14 @@ mod tests {
             .read_object_at_offset(0, ObjectRef::new(1, 0))
             .expect("a malformed AES string is tolerated, not rejected");
 
-        let ObjectValue::String(bytes) = object else {
-            panic!("expected a string, got {object:?}");
-        };
-        // "bad AES ciphertext" is 18 bytes: 16 are taken as the vector and the
-        // remaining 2 are zero-padded up to one block.
-        assert_eq!(
-            bytes.len(),
-            16,
-            "one block of plaintext survives the zero-padded tail"
+        // "bad AES ciphertext" is 18 bytes: the leading 16 are consumed as the
+        // vector and the remaining 2 are zero-padded up to a block, so exactly
+        // one block of plaintext comes back. The bytes themselves vary with the
+        // fixture's randomly generated `/O` and `/U`, so only the length —
+        // which is what distinguishes tolerance from rejection — is pinned.
+        assert!(
+            matches!(&object, ObjectValue::String(bytes) if bytes.len() == 16),
+            "expected one block of leniently decrypted plaintext, got {object:?}"
         );
     }
 
