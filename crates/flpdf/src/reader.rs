@@ -3746,7 +3746,13 @@ impl<R: Read + Seek> Pdf<R> {
         let Some(CacheEntry::Unresolved { offset }) = self.cache.entry(stream_ref).cloned() else {
             return Ok(false);
         };
-        let bytes = self.read_bounded_object_window(offset)?;
+        // qpdf's readObjectAtOffset does not use the next xref offset as a
+        // hard bound while recovering a malformed object. Probe the bounded
+        // window first, but retry this inspection through EOF when the window
+        // ends inside the object dictionary. Leave the fallback budget for
+        // object_stream_handle_with_legacy_fallback's actual parse; this probe
+        // must not consume the one retry that makes the stream usable.
+        let bytes = self.read_object_stream_framing_probe(offset)?;
         let pending = parse_file_object_syntax(&bytes)?;
         let PendingBody::Stream { dict, .. } = pending.body else {
             return Ok(false);
@@ -3755,6 +3761,18 @@ impl<R: Read + Seek> Pdf<R> {
             dict.get("Length"),
             Some(Object::Integer(value)) if *value >= 0
         ))
+    }
+
+    fn read_object_stream_framing_probe(&mut self, offset: u64) -> Result<Vec<u8>> {
+        let next = self.next_object_offset(offset);
+        let bytes = self.read_bounded_object_window(offset)?;
+        if next.is_some()
+            && self.resolution_fallbacks_remaining > 0
+            && parse_file_object_syntax(&bytes).is_err()
+        {
+            return self.resolver.read_window(offset, None);
+        }
+        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -8283,6 +8301,54 @@ mod tests {
             pdf.cache.entry(ObjectRef::new(4, 0)),
             Some(CacheEntry::Resolved(Object::Stream(_)))
         ));
+    }
+
+    #[test]
+    fn compressed_entry_retries_legacy_framing_probe_when_bounded_window_is_truncated() {
+        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
+        let mut body = "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n"
+            .to_owned()
+            .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let length_body = format!("6 0 obj\n{}\nendobj\n", payload.len()).into_bytes();
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                &body,
+                &length_body,
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .expect("object stream header") as u64;
+        let false_next_offset = bytes
+            .windows(b"/Length".len())
+            .position(|window| window == b"/Length")
+            .expect("object-stream dictionary key") as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("legacy-framing probe must retry against EOF");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1))
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1),
+            "the framing probe must not consume the actual object-read retry"
+        );
     }
 
     #[test]
