@@ -519,8 +519,19 @@ public な対応物が無いことを確認済み）で、`prune_acroform_after_
 関数として真に public）に委譲している。根拠 1 の例示そのもの
 （`QPDFJob::parseNumrange` ではなく `QUtil::parse_numrange` を見る）が
 指す状況と一致するため、`PageRange::parse`（+`resolve`。2段階分割は
-flpdf 独自で qpdf 自体は1関数で行うが、分割自体は (B) の型で言う
-「入れ物」の違いに過ぎない）は根拠 1 で正当化される。`lib.rs:203` から
+flpdf 独自で qpdf 自体は1関数で行う）は根拠 1 で正当化される——
+**ただしこの2段階分割自体は CLAUDE.md 分類 (B) の「入れ物の違い」には
+当たらない**（PR #1015 Codex 再レビューで訂正、誤った分類だった）。
+(B) 条件2は処理順序を変えないことを要求するが、`main.rs:3534`
+（`--pages` 引数の file-path/page-range 判別ヒューリスティック）は
+page count もファイルも開く前に `PageRange::parse(tok).is_ok()` だけを
+呼んでおり、qpdf の単発 `parse_numrange` 呼び出しには無い「page count
+未確定の時点での構文検証」という flpdf 独自の制御フローを実現している。
+これは根拠1（`pub`可視性の正当化）の妥当性自体は変えないが、
+「入れ物の違いに過ぎない」という記述は誤りだったため削除した。
+分割そのものが qpdf のアルゴリズム・処理順序からの実際の逸脱で
+あることは別途 `flpdf-ei0h` に記録する（CLAUDE.md 分類上は独立した
+逸脱として扱うべきで、まだ正式に分類・記録されていない）。`lib.rs:203` から
 crate ルートへ再輸出されており、実行可能な doc example を持つ点も
 根拠 1 の補強になる（PR #1011 で `job/page_combine.rs`/
 `job/page_plan.rs` が job/ 内へ移動済みであることを反映——移動前に
