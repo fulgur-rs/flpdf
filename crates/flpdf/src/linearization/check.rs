@@ -1787,7 +1787,17 @@ mod tests {
 
         let (end_before_space, end_after_space) = first_page_source_extent(&mut pdf)
             .expect("a missing source extent must not abort qpdf's part-6 envelope");
-        assert_eq!((end_before_space, end_after_space), (-1, -1));
+        // The injected object (50 0 obj) is the only part-6 member with no
+        // parse extent; `inherited_attrs.rs`'s push now writes back a
+        // /Pages node or leaf only when its own dictionary actually
+        // changes (`QPDF_optimization.cc:200,222-227` only calls
+        // `removeKey`/`replaceKey` on an actual pull-up), so every other
+        // part-6 object's real extent survives this walk and the max-fold
+        // still produces a genuine positive envelope -- proving the
+        // injected object was skipped in isolation rather than degrading
+        // the whole computation to the missing-extent sentinel.
+        assert_ne!((end_before_space, end_after_space), (-1, -1));
+        assert_eq!((end_before_space, end_after_space), (237, 238));
     }
 
     #[test]

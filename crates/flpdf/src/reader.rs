@@ -2275,6 +2275,7 @@ impl<R: Read + Seek> Pdf<R> {
             handle.set_resolved(value);
             handle.clear_description();
             handle.reset_parsed_offset();
+            handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
             self.legacy_materialized_memo.remove(&object_ref);
             self.legacy_materialized_replacement_refs
                 .remove(&object_ref);

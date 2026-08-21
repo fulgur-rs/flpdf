@@ -233,6 +233,7 @@ fn push_child_reference<R: Read + Seek>(
     let Object::Dictionary(mut leaf) = pdf.resolve(kid_ref)? else {
         return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     };
+    let mut changed = false;
     for (&key, values) in key_ancestors.iter() {
         let present = match leaf.get(key) {
             None | Some(Object::Null) => false,
@@ -245,10 +246,17 @@ fn push_child_reference<R: Read + Seek>(
         if !present {
             if let Some(value) = values.last() {
                 leaf.insert(key, value.clone());
+                changed = true;
             }
         }
     }
-    pdf.set_object(kid_ref, Object::Dictionary(leaf));
+    // qpdf calls `kid.replaceKey(key, ...)` (`QPDF_optimization.cc:222-227`)
+    // only for a key actually being added; an already-complete leaf is never
+    // touched. Mirror that by writing back only when a key was inserted,
+    // so an unchanged leaf's cached parse extent survives this pass.
+    if changed {
+        pdf.set_object(kid_ref, Object::Dictionary(leaf));
+    }
     Ok(())
 }
 
@@ -297,7 +305,14 @@ fn push_internal<R: Read + Seek>(
         .get("Kids")
         .and_then(Object::as_array)
         .map(<[Object]>::to_vec);
-    pdf.set_object(node_ref, Object::Dictionary(dict));
+    // qpdf calls `cur_pages.removeKey(key)` (`QPDF_optimization.cc:200`)
+    // only for an inheritable key actually being pulled up; a node with no
+    // inheritable attributes of its own is never written back. Mirror that
+    // by writing back only when an attribute was pulled from this node, so
+    // an unchanged /Pages node's cached parse extent survives this pass.
+    if !own_keys.is_empty() {
+        pdf.set_object(node_ref, Object::Dictionary(dict));
+    }
 
     if let Some(kids) = kids {
         for kid in kids {
