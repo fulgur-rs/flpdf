@@ -1053,6 +1053,42 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         self.copy_annotations_from_with_reserved_names(from_page, cm, source, &BTreeSet::new())
     }
 
+    /// Fix annotations after a foreign page has already been inserted into a
+    /// destination document, applying qpdf's replacement semantics.
+    ///
+    /// This is qpdf's `QPDFAcroFormDocumentHelper::fixCopiedAnnotations`
+    /// (`libqpdf/QPDFAcroFormDocumentHelper.cc:1017-1047`), not
+    /// `QPDFPageObjectHelper::copyAnnotations`: the page insertion has
+    /// already copied the source `/Annots`, so the transformed annotations
+    /// replace the destination array instead of being appended to it.
+    pub(crate) fn fix_copied_annotations_from<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        source: &mut Pdf<RS>,
+    ) -> Result<()> {
+        let destination = self.resolved_page_handle()?;
+        self.require_page_ref()?;
+        validate_foreign_page_handle(source, self.pdf, &from_page)?;
+        let old_annots = from_page.try_get_key(b"/Annots")?;
+        if old_annots.try_as_array()?.is_none() {
+            return Ok(());
+        }
+
+        let transformed = {
+            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+            let transformed =
+                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?;
+            acroform.add_and_rename_form_fields_with_reserved_names(
+                transformed.new_fields.clone(),
+                &BTreeSet::new(),
+            )?; // cov:ignore: malformed field-copy errors are covered by AcroForm transform tests.
+            transformed
+        };
+        destination.replace_key(b"/Annots", ObjectHandle::array(transformed.new_annotations))?;
+        self.pdf.mark_object_handle_dirty(&destination)?;
+        Ok(())
+    }
+
     /// Foreign-document annotation copy with qpdf's still-live primary
     /// field-name reservations applied to collision renaming.
     pub(crate) fn copy_annotations_from_with_reserved_names<RS: Read + Seek>(
