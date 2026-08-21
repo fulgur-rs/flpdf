@@ -1185,13 +1185,10 @@ fn delete_last_entry_through_two_hop_names() {
     );
 }
 
-// ── Site 1: remove_attachment clears a ref from a 2-hop /AF array ─────────────
+// ── Site 1: remove_attachment retains a 2-hop /AF array ──────────────────────
 //
-// `remove_ref_from_af_in_dict` resolves the catalog `/AF` value once. When /AF
-// is a 2-hop chain (`ref → ref → array`), a single-hop resolve sees a Reference
-// (not an array) and skips removal, leaving the removed filespec referenced.
-// Following the chain rewrites the terminal array. A second, unrelated ref is
-// kept in the array so it stays non-empty (carrier not orphaned/swept).
+// qpdf follows the name-tree removal with Filespec null replacement only; it
+// does not rewrite the /AF carrier or its array elements.
 
 /// Object layout:
 ///   1 0 R  Catalog  (/Names 2 0 R, /AF 6 0 R)
@@ -1233,7 +1230,7 @@ fn build_two_hop_af_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn remove_attachment_clears_ref_from_two_hop_af_array() {
+fn remove_attachment_preserves_two_hop_af_array_and_nulls_filespec() {
     use flpdf::{remove_attachment, Object};
 
     let mut pdf = open(build_two_hop_af_pdf());
@@ -1245,30 +1242,34 @@ fn remove_attachment_clears_ref_from_two_hop_af_array() {
     let removed = remove_attachment(&mut pdf, b"gone").expect("remove");
     assert!(removed, "existing attachment must report removed");
 
-    // The terminal /AF array (object 7) must no longer reference the removed
-    // filespec (4 0 R) but must still reference the unrelated kept ref (5 0 R).
+    // The terminal /AF array (object 7) retains both object references, while
+    // the removed Filespec object is replaced with null.
     let Object::Array(af) = pdf
         .resolve(ObjectRef::new(7, 0))
         .expect("terminal /AF array must still resolve (carrier not orphaned)")
     else {
         panic!("object 7 must be the terminal /AF array");
     };
-    assert!(
-        !af.iter()
-            .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(4, 0))),
-        "removed filespec ref must be absent from the terminal /AF array, got {af:?}"
-    );
+    assert!(af
+        .iter()
+        .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(4, 0))));
     assert!(
         af.iter()
             .any(|o| matches!(o, Object::Reference(r) if *r == ObjectRef::new(5, 0))),
         "unrelated kept ref must remain in the terminal /AF array, got {af:?}"
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(4, 0))
+            .expect("Filespec remains addressable"),
+        Object::Null,
+        "qpdf replaces the removed Filespec with null"
     );
 }
 
 // ── Site 1 boundary: indirect /AF whose terminal is not an array ──────────────
 //
 // When the catalog `/AF` value resolves (through the chain) to a non-array
-// object, `remove_ref_from_af_in_dict` must treat it as a no-op and return
+// object, the canonical helper must treat it as a no-op and return
 // cleanly rather than panicking — the removal still succeeds via the name tree.
 //
 // Object layout:
