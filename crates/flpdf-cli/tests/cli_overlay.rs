@@ -418,8 +418,8 @@ fn overlay_on_non_rewrite_subcommand_is_rejected() {
 
 #[test]
 fn overlay_equals_form_is_rejected() {
-    // qpdf rejects `--overlay=FILE` (the file must be a separate token). flpdf
-    // must too, so the equals form is never a silent no-op via clap.
+    // qpdf discards the value attached to its bare `--overlay` option. With no
+    // following positional source, both qpdf and flpdf reject the empty group.
     let one = fixture("one-page.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("o.pdf");
@@ -432,7 +432,7 @@ fn overlay_equals_form_is_rejected() {
         .arg(out.to_str().unwrap())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("is not supported"));
+        .stderr(predicate::str::contains("no source file"));
 }
 
 #[test]
