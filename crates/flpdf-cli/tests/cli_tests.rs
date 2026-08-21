@@ -739,6 +739,59 @@ fn preserve_unreferenced_retains_orphan_across_writer_cli_surfaces() {
 }
 
 #[test]
+fn preserve_pages_retains_qpdf_promoted_deselected_inheritable_object() {
+    let fixture = fixture_with_nested_pages();
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf-pages-preserve.qdf.pdf");
+    let flpdf_output = temp.path().join("flpdf-pages-preserve.qdf.pdf");
+
+    let qpdf_status = std::process::Command::new("qpdf")
+        .args([
+            "--qdf",
+            "--object-streams=disable",
+            "--preserve-unreferenced",
+            "--static-id",
+        ])
+        .arg(fixture.path())
+        .args(["--pages", fixture.path().to_str().unwrap(), "2", "--"])
+        .arg(&qpdf_output)
+        .status()
+        .expect("qpdf 11.9.0 must be available for this differential test");
+    assert!(qpdf_status.success(), "qpdf page-selection probe failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--qdf",
+            "--object-streams=disable",
+            "--preserve-unreferenced",
+        ])
+        .arg(fixture.path())
+        .args(["--pages", ".", "2", "--"])
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    // The input root carries a direct [0 0 595.28 841.89] /MediaBox while the
+    // selected page has its own /MediaBox. qpdf promotes the root value before
+    // flattening removes it; preserve-unreferenced then retains that orphan as
+    // a standalone array object.
+    let promoted_media_box = b"[\n  0\n  0\n  595.28\n  841.89\n]";
+    let qpdf_rendered = std::fs::read(&qpdf_output).unwrap();
+    let qpdf_has_promoted = contains(&qpdf_rendered, promoted_media_box);
+    assert!(
+        qpdf_has_promoted,
+        "qpdf 11.9.0 probe must retain the promoted orphan inheritable object"
+    );
+    assert_eq!(
+        contains(&std::fs::read(&flpdf_output).unwrap(), promoted_media_box),
+        qpdf_has_promoted,
+        "preserve page selection must retain qpdf's promoted orphan inheritable object"
+    );
+}
+
+#[test]
 fn preserve_unreferenced_remove_attachment_matches_qpdf() {
     let input = "../../tests/fixtures/compat/attachment-two-page.pdf";
     let temp = tempfile::tempdir().unwrap();

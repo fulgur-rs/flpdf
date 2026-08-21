@@ -236,6 +236,44 @@ fn collect_page_tree_nodes(
     Ok(())
 }
 
+/// Materialize direct non-scalar inheritable values on every `/Pages` node
+/// before the page-selection rebuild discards any branch.
+///
+/// qpdf's `pushInheritedAttributesToPageInternal` walks the complete tree
+/// before flattening (`QPDF_optimization.cc:159-239`). Its direct-array,
+/// dictionary, and stream promotion therefore also runs for a branch whose
+/// pages will not be selected; the later page-selection operation can discard
+/// that branch while `--preserve-unreferenced` still serializes the promoted
+/// object. Keep the existing promotion cache so a value later inherited by a
+/// selected leaf retains one canonical identity.
+fn promote_page_tree_inheritable_values<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    nodes: &[ObjectHandle],
+    promoted: &mut Vec<(ObjectHandle, ObjectHandle)>,
+) -> Result<()> {
+    let inheritable_keys = [
+        b"/CropBox".as_slice(),
+        b"/MediaBox".as_slice(),
+        b"/Resources".as_slice(),
+        b"/Rotate".as_slice(),
+    ];
+
+    for node in nodes {
+        for key in inheritable_keys {
+            if !node.try_has_key(key)? {
+                continue;
+            }
+            let value = node.try_get_key(key)?;
+            let promoted_value = promote_inherited_value(pdf, value.clone(), promoted)?;
+            if !promoted_value.is_same_object_as(&value) {
+                node.replace_key(key, promoted_value)?;
+                pdf.mark_object_handle_dirty(node)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn page_tree_root_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_root: PageTreeRoot,
@@ -389,6 +427,12 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         max_depth,
     )?; // cov:ignore: LLVM attributes this multiline canonical traversal terminator separately
 
+    // qpdf promotes direct non-scalar values on every original /Pages node
+    // before page selection discards an unselected branch. Keep these objects
+    // in the canonical registry so preserve-unreferenced can serialize them.
+    let mut promoted_inherited: Vec<(ObjectHandle, ObjectHandle)> = Vec::new();
+    promote_page_tree_inheritable_values(pdf, &page_tree_nodes, &mut promoted_inherited)?;
+
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
     // Any original leaf absent from ref_map is a removed page.
     let original_pages = prepared.pages;
@@ -398,7 +442,6 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     let mut pending_leaves: Vec<ObjectHandle> = Vec::with_capacity(selected.len());
     // Tracks whether a given source ref has already consumed its in-place slot.
     let mut materialized: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut promoted_inherited: Vec<(ObjectHandle, ObjectHandle)> = Vec::new();
 
     for &src in selected {
         let page = pdf.get_object_handle(src);
@@ -583,6 +626,61 @@ mod tests {
 
         let xref_start = out.len() as u64;
         let total = 10u32;
+        out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+        for i in 1..total {
+            out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    /// Build a two-branch page tree where the selected page is under branch B
+    /// and branch A carries a direct non-scalar inherited value. qpdf promotes
+    /// branch A's direct `/MediaBox` before page selection discards that branch,
+    /// so preserve-unreferenced output retains the promoted orphan object.
+    fn build_deselected_branch_pdf() -> Vec<u8> {
+        let parts: Vec<(u32, String)> = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into()),
+            (
+                3,
+                "<< /Type /Pages /Parent 2 0 R /Kids [5 0 R] /Count 1 \
+                 /MediaBox [0 0 200 300] >>"
+                    .into(),
+            ),
+            (
+                4,
+                "<< /Type /Pages /Parent 2 0 R /Kids [6 0 R] /Count 1 /Rotate 180 >>".into(),
+            ),
+            (5, "<< /Type /Page /Parent 3 0 R /Contents 7 0 R >>".into()),
+            (
+                6,
+                "<< /Type /Page /Parent 4 0 R /Contents 8 0 R /MediaBox [0 0 612 792] >>".into(),
+            ),
+        ];
+        let c1 = b"BT /F1 12 Tf 10 10 Td (Page1) Tj ET";
+        let c2 = b"BT /F1 12 Tf 10 10 Td (Page2) Tj ET";
+
+        let mut out: Vec<u8> = b"%PDF-1.5\n".to_vec();
+        let mut offs: BTreeMap<u32, u64> = BTreeMap::new();
+        for (n, s) in &parts {
+            offs.insert(*n, out.len() as u64);
+            out.extend_from_slice(format!("{n} 0 obj\n{s}\nendobj\n").as_bytes());
+        }
+        offs.insert(7, out.len() as u64);
+        out.extend_from_slice(format!("7 0 obj\n<< /Length {} >>\nstream\n", c1.len()).as_bytes());
+        out.extend_from_slice(c1);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+        offs.insert(8, out.len() as u64);
+        out.extend_from_slice(format!("8 0 obj\n<< /Length {} >>\nstream\n", c2.len()).as_bytes());
+        out.extend_from_slice(c2);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_start = out.len() as u64;
+        let total = 9u32;
         out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
         for i in 1..total {
             out.extend_from_slice(format!("{:010} 00000 n \n", offs[&i]).as_bytes());
@@ -882,6 +980,32 @@ mod tests {
             page.get("CropBox"),
             Some(&Object::Reference(ObjectRef::new(10, 0))),
             "the selected page must retain the root-inherited /CropBox handle"
+        );
+    }
+
+    #[test]
+    fn promotes_direct_inheritable_values_on_deselected_branches() {
+        let mut pdf = open(build_deselected_branch_pdf());
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(6, 0)])
+            .expect("page-tree rebuild must succeed");
+
+        let promoted = pdf
+            .get_all_object_handles()
+            .expect("canonical object enumeration must succeed")
+            .into_iter()
+            .filter_map(|handle| handle.as_array())
+            .any(|items| {
+                items.len() == 4
+                    && items
+                        .iter()
+                        .map(ObjectHandle::as_integer)
+                        .collect::<Vec<_>>()
+                        == vec![Some(0), Some(0), Some(200), Some(300)]
+            });
+        assert!(
+            promoted,
+            "qpdf promotes the deselected branch's direct /MediaBox before cleanup"
         );
     }
 
