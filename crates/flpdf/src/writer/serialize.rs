@@ -11,10 +11,10 @@ use super::{object_streams, CompressStreams, NewlineBeforeEndstream};
 ///
 /// where `<payload>` is the raw `stream.data` byte sequence and `<EOL>` is:
 ///
-/// - [`NewlineBeforeEndstream::Yes`]: always one `b'\n'`;
-/// - [`NewlineBeforeEndstream::No`]: one `b'\n'` unless the payload already
-///   ends with `\n`; and
-/// - [`NewlineBeforeEndstream::Never`]: no byte.
+/// - [`NewlineBeforeEndstream::Yes`]: always one `b'\n'`; and
+/// - [`NewlineBeforeEndstream::Never`]: no byte, except that QDF callers use
+///   qpdf's separate `qdf_mode && last_char != '\n'` rule in the internal
+///   framing helper.
 ///
 /// # `/Length` invariant
 ///
@@ -44,20 +44,39 @@ pub(crate) fn write_stream_with_id_writer(
 
 /// Emit stream framing after its dictionary has already been written.
 pub(crate) fn write_stream_payload(out: &mut Vec<u8>, data: &[u8], policy: NewlineBeforeEndstream) {
+    write_stream_payload_with_qdf(out, data, policy, false);
+}
+
+/// Emit stream framing with qpdf's QDF-specific conditional newline rule.
+pub(crate) fn write_stream_payload_with_qdf(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    policy: NewlineBeforeEndstream,
+    qdf_mode: bool,
+) {
     out.extend_from_slice(b"\nstream\n");
     out.extend_from_slice(data);
-    if framing_adds_newline(data, policy) {
+    if framing_adds_newline_with_qdf(data, policy, qdf_mode) {
         out.push(b'\n');
     }
     out.extend_from_slice(b"endstream");
 }
 
 /// Whether stream framing adds one LF before `endstream` for this payload.
+#[cfg(test)]
 pub(crate) fn framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) -> bool {
+    framing_adds_newline_with_qdf(data, policy, false)
+}
+
+/// Whether stream framing adds one LF, including qpdf's QDF-only rule.
+pub(crate) fn framing_adds_newline_with_qdf(
+    data: &[u8],
+    policy: NewlineBeforeEndstream,
+    qdf_mode: bool,
+) -> bool {
     match policy {
         NewlineBeforeEndstream::Yes => true,
-        NewlineBeforeEndstream::No => data.last() != Some(&b'\n'),
-        NewlineBeforeEndstream::Never => false,
+        NewlineBeforeEndstream::Never => qdf_mode && data.last() != Some(&b'\n'),
     }
 }
 
@@ -1303,7 +1322,7 @@ mod tests {
             &mut out,
             &body,
             CompressStreams::No,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
         )
         .unwrap();
         assert_eq!(
@@ -1314,19 +1333,38 @@ mod tests {
     }
 
     #[test]
-    fn framing_policy_matches_qpdf_last_lf_rule() {
-        assert!(framing_adds_newline(b"payload", NewlineBeforeEndstream::No));
+    fn framing_policy_matches_qpdf_boolean_and_qdf_rules() {
+        assert!(!framing_adds_newline(
+            b"payload",
+            NewlineBeforeEndstream::Never
+        ));
         assert!(!framing_adds_newline(
             b"payload\n",
-            NewlineBeforeEndstream::No
+            NewlineBeforeEndstream::Never
         ));
         assert!(framing_adds_newline(
             b"payload\n",
             NewlineBeforeEndstream::Yes
         ));
-        assert!(!framing_adds_newline(
+        assert!(framing_adds_newline_with_qdf(
             b"payload",
-            NewlineBeforeEndstream::Never
+            NewlineBeforeEndstream::Never,
+            true
+        ));
+        assert!(!framing_adds_newline_with_qdf(
+            b"payload\n",
+            NewlineBeforeEndstream::Never,
+            true
+        ));
+    }
+
+    #[test]
+    fn qpdf_newline_flag_adds_a_newline_even_for_eol_payloads() {
+        // qpdf's boolean setter is represented by `Yes`; the QDF conditional
+        // is represented separately rather than as a public middle state.
+        assert!(framing_adds_newline(
+            b"payload\n",
+            NewlineBeforeEndstream::Yes
         ));
     }
 
