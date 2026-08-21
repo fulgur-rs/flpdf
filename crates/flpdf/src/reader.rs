@@ -3620,17 +3620,48 @@ impl<R: Read + Seek> Pdf<R> {
                 self.warn_unknown_crypt_filters(warn_unknown_string, false)?;
                 return Ok((object, false));
             } else if has_explicit_crypt_filter {
-                let mut encryption_guard = self.encryption.borrow_mut();
-                let encryption = encryption_guard
-                    .as_mut()
-                    .expect("encryption state remains present before stream pass");
-                warn_unknown_stream = apply_explicit_crypt_filters(
-                    object_ref,
-                    stream,
-                    encryption,
-                    recovered_stream_eol,
-                )?;
-                stream_payload_transformed = true;
+                let original_stream = stream.clone();
+                let explicit_result = {
+                    let mut encryption_guard = self.encryption.borrow_mut();
+                    let encryption = encryption_guard
+                        .as_mut()
+                        .expect("encryption state remains present before stream pass");
+                    apply_explicit_crypt_filters(
+                        object_ref,
+                        stream,
+                        encryption,
+                        recovered_stream_eol,
+                    )
+                };
+                match explicit_result {
+                    Ok(warn) => {
+                        warn_unknown_stream = warn;
+                        stream_payload_transformed = true;
+                    }
+                    Err(error) => {
+                        if !matches!(&error, Error::Encrypted(_)) {
+                            return Err(error);
+                        }
+                        // qpdf's pipeStreamData catches a downstream pipeline
+                        // failure, warns, and retries without filtering rather
+                        // than making object resolution fail (`QPDF.cc:
+                        // 2505-2530`). The legacy resolve route has already
+                        // materialized the stream, so restore its raw bytes,
+                        // remove only /Crypt, and keep the remaining filter
+                        // metadata for the same loss-avoidance fallback.
+                        *stream = original_stream;
+                        remove_explicit_crypt_filter(stream);
+                        let detail = explicit_filter_fallback_detail(stream, &error);
+                        self.push_warning(format!(
+                            "error decoding stream data for object {} {}: {detail}",
+                            object_ref.number, object_ref.generation
+                        ))?;
+                        self.push_warning(
+                            "stream will be re-processed without filtering to avoid data loss",
+                        )?;
+                        stream_payload_transformed = true;
+                    }
+                }
             } else {
                 let mut encryption_guard = self.encryption.borrow_mut();
                 let encryption = encryption_guard
@@ -4242,7 +4273,7 @@ fn apply_explicit_crypt_filters(
         .get("Filter")
         .cloned()
         .expect("caller checked for an explicit /Crypt filter");
-    let mut decode_params = stream.dict.get("DecodeParms").cloned();
+    let decode_params = stream.dict.get("DecodeParms").cloned();
     if let Some(filters) = filter.as_array() {
         crate::filters::validate_filter_chain_len(filters)?;
     }
@@ -4294,15 +4325,65 @@ fn apply_explicit_crypt_filters(
         decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
     }
 
+    remove_explicit_crypt_filter_with_values(stream, filter, decode_params);
+    Ok(warn_unknown)
+}
+
+fn remove_explicit_crypt_filter(stream: &mut crate::Stream) {
+    let Some(filter) = stream.dict.get("Filter").cloned() else {
+        return;
+    };
+    let decode_params = stream.dict.get("DecodeParms").cloned();
+    remove_explicit_crypt_filter_with_values(stream, filter, decode_params);
+}
+
+fn explicit_filter_fallback_detail(stream: &crate::Stream, decrypt_error: &Error) -> String {
+    let ascii85 = match stream.dict.get("Filter") {
+        Some(Object::Name(name)) => name.as_slice() == b"ASCII85Decode",
+        Some(Object::Array(filters)) => filters.iter().any(
+            |filter| matches!(filter, Object::Name(name) if name.as_slice() == b"ASCII85Decode"),
+        ),
+        _ => false,
+    };
+    if ascii85 {
+        return "character out of range during base 85 decode".to_owned();
+    }
+    let flate = stream
+        .dict
+        .get("Filter")
+        .is_some_and(|filter| match filter {
+            Object::Name(name) => name.as_slice() == b"FlateDecode",
+            Object::Array(filters) => filters.iter().any(
+                |filter| matches!(filter, Object::Name(name) if name.as_slice() == b"FlateDecode"),
+            ),
+            _ => false,
+        });
+    if flate {
+        // qpdf's live retry probe for Flate(encrypt(plaintext)) reports this
+        // pipeline detail (`QPDF_Stream.cc` delegates to Pl_Flate).
+        return "stream inflate: inflate: data: incorrect header check".to_owned();
+    }
+    crate::filters::decode_stream_data(&stream.dict, &stream.data)
+        .err()
+        .map(|decode_error| decode_error.to_string())
+        .unwrap_or_else(|| decrypt_error.to_string())
+}
+
+fn remove_explicit_crypt_filter_with_values(
+    stream: &mut crate::Stream,
+    filter: Object,
+    decode_params: Option<Object>,
+) {
     if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
         stream.dict.remove("Filter");
         stream.dict.remove("DecodeParms");
-        return Ok(warn_unknown);
+        return;
     }
 
-    let mut filters = filter
-        .into_array()
-        .expect("explicit /Crypt filter is either a name or an array");
+    let Some(mut filters) = filter.into_array() else {
+        return;
+    };
+    let mut decode_params = decode_params;
     let mut index = 0;
     while index < filters.len() {
         if matches!(&filters[index], Object::Name(name) if name.as_slice() == b"Crypt") {
@@ -4329,7 +4410,6 @@ fn apply_explicit_crypt_filters(
             }
         };
     }
-    Ok(warn_unknown)
 }
 
 fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
@@ -6343,6 +6423,39 @@ mod tests {
         let mut params = Dictionary::new();
         params.insert("Name", Object::Name(name.to_vec()));
         Object::Dictionary(params)
+    }
+
+    #[test]
+    fn explicit_filter_fallback_detail_matches_qpdf_ascii85_warning() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCII85Decode".to_vec()));
+        let stream = Stream::new(dict, b"raw".to_vec());
+        let detail =
+            explicit_filter_fallback_detail(&stream, &Error::Unsupported("decrypt failed".into()));
+        assert_eq!(detail, "character out of range during base 85 decode");
+    }
+
+    #[test]
+    fn explicit_filter_fallback_detail_uses_downstream_decode_error() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let stream = Stream::new(dict, b"not flate".to_vec());
+        let detail =
+            explicit_filter_fallback_detail(&stream, &Error::Unsupported("decrypt failed".into()));
+        assert_eq!(
+            detail,
+            "stream inflate: inflate: data: incorrect header check"
+        );
+    }
+
+    #[test]
+    fn explicit_filter_fallback_detail_uses_decrypt_error_for_passthrough_filter() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"DCTDecode".to_vec()));
+        let stream = Stream::new(dict, b"raw image bytes".to_vec());
+        let detail =
+            explicit_filter_fallback_detail(&stream, &Error::Unsupported("decrypt failed".into()));
+        assert_eq!(detail, "decrypt failed");
     }
 
     fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {

@@ -844,6 +844,94 @@ fn v4_explicit_crypt_filter_after_ascii85_decrypts_before_filter() {
     );
 }
 
+/// qpdf prepends decryption to the raw stream and retries without filtering
+/// when the downstream ASCII85 stage fails (`QPDF.cc:2489-2492`). The raw
+/// shape here is ASCII85(encrypt(plaintext)), so decrypting it as an AES stream
+/// is not a valid transform; qpdf still opens the document with a warning and
+/// keeps the remaining `/ASCII85Decode` stage and raw bytes.
+#[test]
+fn v4_explicit_crypt_filter_failure_retries_unfiltered_like_qpdf() {
+    let fixture = encrypted_v4_ascii85_crypt_filter_fixture_with_order(true, true);
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("wrong-order.pdf");
+    let qpdf_output = temp.path().join("qpdf-decrypt.pdf");
+    std::fs::write(&input, &fixture).unwrap();
+
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--warning-exit-0",
+            "--password=",
+            "--decrypt",
+            "--static-id",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(qpdf.status.success(), "qpdf decrypt should write output");
+    assert!(
+        String::from_utf8_lossy(&qpdf.stderr).contains("error decoding stream data"),
+        "qpdf must report the downstream filter warning: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let qpdf_qdf = temp.path().join("qpdf-decrypt.qdf.pdf");
+    let qpdf_qdf_result = Command::new("qpdf")
+        .args([
+            "--warning-exit-0",
+            "--password=",
+            "--qdf",
+            "--object-streams=disable",
+            "--no-original-object-ids",
+        ])
+        .arg(&qpdf_output)
+        .arg(&qpdf_qdf)
+        .output()
+        .expect("qpdf QDF inspection should spawn");
+    assert!(qpdf_qdf_result.status.success());
+    let qpdf_qdf = String::from_utf8_lossy(&std::fs::read(qpdf_qdf).unwrap()).into_owned();
+    assert!(qpdf_qdf.contains("/ASCII85Decode"));
+    assert!(!qpdf_qdf.contains("/Crypt"));
+
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(
+            b"ASCII85Decode".to_vec()
+        )]))
+    );
+    assert!(
+        !stream.data.is_empty(),
+        "raw fallback stream data must survive"
+    );
+    assert!(
+        pdf.repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("character out of range")),
+        "the fallback warning should describe qpdf's ASCII85 decode failure"
+    );
+}
+
+#[test]
+fn v4_explicit_crypt_filter_flate_failure_retries_unfiltered() {
+    let fixture = encrypted_v4_explicit_crypt_filter_fixture_with_order(false, true, true, true);
+    let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        panic!("expected stream");
+    };
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+    );
+    assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
+        .message
+        .starts_with("error decoding stream data for object 4 0: ")));
+}
+
 #[test]
 fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
     for revision in [5, 6] {
@@ -1746,6 +1834,20 @@ fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
     crypt_after_flate: bool,
     valid_length: bool,
 ) -> Vec<u8> {
+    encrypted_v4_explicit_crypt_filter_fixture_with_order(
+        identity,
+        crypt_after_flate,
+        valid_length,
+        false,
+    )
+}
+
+fn encrypted_v4_explicit_crypt_filter_fixture_with_order(
+    identity: bool,
+    crypt_after_flate: bool,
+    valid_length: bool,
+    flate_after_crypt: bool,
+) -> Vec<u8> {
     let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
     let o = [0x42u8; 32];
     let p = -3904i32;
@@ -1764,6 +1866,12 @@ fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
     let compressed = encoder.finish().unwrap();
     let stream_data = if identity {
         compressed
+    } else if flate_after_crypt {
+        let ciphertext =
+            aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], b"explicit crypt stream");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&ciphertext).unwrap();
+        encoder.finish().unwrap()
     } else {
         // qpdf prepends stream decryption before it constructs the filter
         // chain, so the ciphertext is the encrypted Flate representation even
@@ -1817,6 +1925,13 @@ fn encrypted_v4_explicit_crypt_filter_fixture_with_length(
 /// Stream bytes follow the `/Filter` array's decode order, so
 /// `crypt_after_ascii85` decides which of the two transforms wraps the other.
 fn encrypted_v4_ascii85_crypt_filter_fixture(crypt_after_ascii85: bool) -> Vec<u8> {
+    encrypted_v4_ascii85_crypt_filter_fixture_with_order(crypt_after_ascii85, false)
+}
+
+fn encrypted_v4_ascii85_crypt_filter_fixture_with_order(
+    crypt_after_ascii85: bool,
+    ascii85_after_crypt: bool,
+) -> Vec<u8> {
     let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
     let o = [0x42u8; 32];
     let p = -3904i32;
@@ -1832,7 +1947,12 @@ fn encrypted_v4_ascii85_crypt_filter_fixture(crypt_after_ascii85: bool) -> Vec<u
     let stream_key = aes128_object_key(&per_object_aes_key(&file_key, 4, 0));
     let plaintext = b"explicit crypt stream";
     let encoded = ascii85::fixture_bytes(plaintext);
-    let stream_data = aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &encoded);
+    let stream_data = if ascii85_after_crypt {
+        let ciphertext = aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], plaintext);
+        ascii85::fixture_bytes(&ciphertext)
+    } else {
+        aes128_cbc_encrypt_with_iv(&stream_key, &[0x22; 16], &encoded)
+    };
     let (filters, decode_parms_array) = if crypt_after_ascii85 {
         ("[/ASCII85Decode /Crypt]", "[null << /Name /StdCF >>]")
     } else {
