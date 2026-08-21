@@ -234,18 +234,28 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   落としても支配的慣行と矛盾しない（C-GETTER 通りで正しい）。
   **副作用/計算を伴う getter で prefix を落としているものは、支配的慣行との
   真の食い違いとして扱う** — `form_field_object_helper.rs` の
-  `flags`/`partial_name`/`value`（いずれも `&mut self -> Result<...>` で
-  inheritable attribute 解決を伴い、qpdf の
-  `getFlags`/`getPartialName`/`getValue` を直接写している）が該当し、
-  `get_flags`/`get_partial_name`/`get_value` へ寄せる余地がある。
+  `flags`/`value`（いずれも `&mut self -> Result<...>` で
+  `resolve_inherited_integer`/`resolve_inherited_handle` を介した inheritable
+  attribute 解決を伴い、qpdf の `getFlags`/`getValue` を直接写している）が
+  該当し、`get_flags`/`get_value` へ寄せる余地がある。同じファイルの
+  `partial_name()` は見た目が似ていても中身が違う——`string_key(self.field
+  .clone(), b"T")` を 1 回呼ぶだけの直接 lookup で、親を辿る解決を伴わない
+  （qpdf の `getPartialName` も `/T` 単体を返すのみ）。このため
+  `partial_name` は本項の「計算を伴う getter」の実例には含めない。
   `filespec_helper.rs` の `size()`/`get_size()`・`creation_date()`/
   `get_creation_date()` のような prefix なし/ありの併存は、見かけは同じでも
-  中身が違う **意図した 2 層**（`size()` は `/Params /Size` の生の
-  `Option<i64>`、`get_size()` はそれを負値/欠損を 0 にする qpdf の既定値
-  ロジックまで含めて写した `usize`）なので、これは食い違いではなく
-  むしろ良い実例——prefix の有無が「qpdf の `getX()` の既定値処理まで
-  含めて再現しているか」の目印になっている。新規コードで似た二層構造を
-  作るときはこの区別を踏襲する。
+  中身が違う——`size()` は `/Params /Size` の生の `Option<i64>`、
+  `get_size()` はそれを負値/欠損を 0 にする qpdf の既定値ロジックまで含めて
+  写した `usize`。qpdf 側で `getSize()` に対応するのは `get_size()` のみで、
+  raw 版 `size()` 自身に写す元の qpdf 識別子は無い。この既存ペアを読むときは
+  prefix の有無が「qpdf の `getX()` の既定値処理まで含めて再現しているか」の
+  目印になる、という点だけを覚えておけば足り、**新規コードで qpdf の `getX()`
+  に既定値/フォールバック処理があるからといって、この raw+`get_` の 2 層
+  構造を新たに作ってよいという前例にはしない**——raw 側は本節後述の
+  「qpdf 側に個別の識別子が無い」場合の独自命名の一種であり、正当化には
+  そちらの基準（インライン抽出物の切り出し等、実際に独立した意味を持つ
+  こと）を満たす必要がある。単に `get_x()` の下請けとして値を先取りする
+  だけの raw アクセサを量産する理由にはしない。
   新規コードは、計算を伴う getter では `get_` を保持する側に合わせ、
   `form_field_object_helper.rs` のような drop 済み箇所は見つけ次第 issue化の
   対象とする（このルール自体を根拠に一括リネームを今すぐ強制はしない —
@@ -257,6 +267,14 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `doListAttachments`→`list_attachments`、`doSplitPages`→`split_pages`。
   `handleX()` は `handle` 自体に「入力を受けて処理を実行する」という
   意味があるので落とさない: `handlePageSpecs`→`handle_page_specs`。
+  **既知の未解消の例外**: `job/overlay.rs` の `apply_overlay_specs` は
+  `QPDFJob::handleUnderOverlay`（`QPDFJob.cc:1937`、`--overlay`/
+  `--underlay` の適用全体を担う private メソッドで、qpdf 側に個別識別子が
+  無いケースにも該当しない）に対応するが、`handle_under_overlay` に
+  なっていない。監査時点で見つかった唯一の未対応の乖離で、
+  リネームの影響範囲（呼び出し箇所・テスト関数名 40 箇所超）が大きいため
+  `flpdf-ei0h` として別途追跡し、この文書は「監査済みで全て一貫」とは
+  主張しない。
 - **戻り値の形が qpdf と違うために動詞ごと変えるのは許容される—ただし
   crate 内で一貫していること**。`doJSONPages`/`doJSONPageLabels`/
   `doJSONOutlines`/`doJSONAcroform`/`doJSONEncrypt`/`doJSONAttachments`
@@ -329,6 +347,28 @@ orchestrate するだけで、CLI 側からは一切触れない。flpdf-cli も
      等。qpdf に単体の embeddable 対応物が無くても、flpdf が単体の
      Rust PDF ライブラリとして提供すると決めた機能は該当）。
   上記のどれにも当たらないなら `pub(crate)` 以下に落とす。
+- **支援型（第 4 の根拠）**: 上記いずれかで legitimate な `pub` メソッドの
+  引数/戻り値型に使われている型は、それ自体は qpdf に対応物が無くても
+  pub でよい——Rust は private-in-public を禁止するため、public な
+  メソッドのシグネチャに現れる型は最低でもメソッドと同じ可視性が要る。
+  `AttachmentAddOptions`/`AttachmentCopyOptions`/`CheckError`/
+  `JsonJobError`/`JsonJobOptions`/`JsonJobOutput`/`JsonStreamData`/
+  `UsageError`/`PageSpecInput`/`SplitPageOptions` はこのカテゴリで、
+  `main.rs` が直接 import していても debt ではない——`job.write_json()`/
+  `job.check()` 等、根拠 2 で既に legitimate な `QPDFJob` public メソッドの
+  シグネチャが要求しているだけ。
+- **re-export の付け替えでは可視性は狭められない**: ある項目が複数のパス
+  （例: `crate::job::X` と `crate::json_inspect::X`）から到達可能なとき、
+  片方のパスだけ閉じたくても、大元の宣言を `pub` から `pub(crate)` に
+  変えると、もう片方の `pub use crate::job::X` が
+  `error[E0364]: X is only public within the crate, and cannot be
+  re-exported outside` でコンパイル不能になる（`job/mod.rs` の
+  `pub use json_sections::{build_acroform_section, ...}` を
+  `pub(crate)` に変えて実測、2026-08-21）。Rust は `pub(crate)` な項目を
+  `pub use` で再エクスポートして可視性を引き上げることを許さない。
+  つまり「どの module が pub use するか」を動かすだけでは何も狭まらず、
+  生きた外部消費者（doctest・統合テスト・crate ルート re-export）が
+  1 つでも残っている限り、その項目は狭められない。
 - **QPDFJob.hh を読むときの罠**: `Config`/`PagesConfig`/`UOConfig` 等の
   argv パーサー用ネストクラスは、それぞれ自分の `private:` を持つ。
   ネストクラスの `};` で閉じた後、外側 `QPDFJob` 自身の直近の
@@ -351,33 +391,79 @@ orchestrate するだけで、CLI 側からは一切触れない。flpdf-cli も
 
 ### 該当例
 
-`job/mod.rs` の `pub use` 一覧を flpdf-cli の実利用箇所と突き合わせたところ
-2 群に分かれた。(1) `list_attachment_info`/`format_attachment_list`/
-`format_attachment_list_with_sink`/`AttachmentInfo`、および
+`job/mod.rs` の `pub use` 一覧を flpdf-cli・doctest・統合テスト
+（`tests/*.rs`、別 crate 扱いで `pub` しか見えない）・`lib.rs` の
+crate ルート re-export と突き合わせたところ、4 群に分かれた
+（最初の版はここを 2 群に単純化して誤り、PR #1015 の Codex レビューで
+是正した）。
+
+**(A) 既に legitimate — 変更不要**: `prune_acroform_after_subset`/
+`prune_acroform_after_subset_with_max_depth`/
+`DEFAULT_MAX_ACROFORM_DEPTH`。flpdf-cli の `main.rs:4746` は
+`QPDFJob::prune_acroform_after_subset`（`job/page_specs.rs:569-573` で
+free 関数へ委譲する `QPDFJob` メソッド）を呼んでおり、free 関数自体を
+直接は呼ばない——根拠 2（`QPDFJob` public メソッド経由）を満たす。
+加えて `tests/page_extract_thread_bead_p_tests.rs:113` が free 関数を
+直接呼ぶ統合テストで、これは根拠 3（`lib.rs:200-206` が
+`prune_acroform_after_subset` を crate ルートに flat re-export 済み）
+にも当たる。二重に legitimate であり、後述 (D) の debt グループとは
+無関係。
+
+**(B) 既に legitimate — job/ 内部の話ではない**: `format_attachment_list`/
+`format_attachment_list_with_sink`/`list_attachment_info`/
+`AttachmentInfo`。flpdf-cli からは `job.list_attachments()` という
+`QPDFJob` public メソッド経由でしか呼ばれないが、これは根拠として
+不要——`lib.rs:200-206` が 4 つとも crate ルートへ flat re-export
+しており（`merge_documents`/`collate` 等と同じ並び）、根拠 3 の
+「flpdf 独自のライブラリ機能」に該当する。`format_attachment_list` は
+`attachment_list.rs` 自身の `no_run` doctest、`list_attachment_info` は
+`tests/helper_api_tests.rs:506` の統合テストが個別に直接使っており、
+`AttachmentInfo` は `list_attachment_info` の戻り値型
+（`Vec<AttachmentInfo>`）である以上 private-in-public により最低でも
+同じ可視性が要る。**`format_attachment_list_with_sink` 単体は
+attachment_list.rs 内部からしか直接は呼ばれていない**が、`lib.rs`
+top-level re-export に同列で並んでいる以上、他 3 つと切り離して
+`pub(crate)` にはできない（切り離すこと自体が「flpdf 独自ライブラリ
+機能の API 縮小」という独立した product 判断になる）。
+
+**(C) `pub` のまま — 狭めるには API 縮小そのものが要る**:
 `build_pages_section`/`build_outlines_section`/`build_pagelabels_section`/
-`build_acroform_section`/`build_encrypt_section`/`build_attachments_section`/
-`write_qpdf_json_v2_selected_objects_with_options`/
-`write_qpdf_json_v2_selected_objects_to_output_with_options` は、flpdf-cli
-からは `job.list_attachments()`/`job.write_json()` という `QPDFJob` の
-public メソッド経由でしか呼ばれておらず（`--list-attachments` は
-`run_list_attachments`→`job.list_attachments(&mut pdf, verbose)`）、これら
-自身の名前を直接参照しているのは `job/attachments.rs`/`job/json_sections.rs`
-自身の実装と、`json_inspect.rs` の `#[cfg(test)] mod tests`（972 行目以降）
-の JSON 出力形状テストだけだった——flpdf 自身の production コードからも
-呼ばれていない。qpdf の `doListAttachments`/`doJSON` が private のまま
-`run()` 越しにしか呼ばれないのと同じ形が既に実現できているので、
-`pub(crate)` に落として問題ない。(2) 一方 `prune_acroform_after_subset`・
-`RotateSpec`（`RotateSpec::parse`）・`PageRange`（`PageRange::parse`）は
-flpdf-cli の `main.rs` から直接呼ばれており、対応する qpdf 側は
-`handlePageSpecs` 内のインラインコード／`parseRotationParameter`／
-`QPDFJob::parseNumrange` という private メソッドのみ（`PageRange` の
-根底にある `QUtil::parse_numrange` は public だが、flpdf の 2 段階
-parse/resolve 構造そのものへの対応物ではない）。これは qpdf の CLI が
-`QPDFJob` の private 実装に触れない構造と食い違っており、
-`QPDFJob` 側に `handle_page_specs` 相当の public メソッドへ経路を
-一本化しない限り `pub(crate)` に落とせない——`flpdf-hxmj`
-（single-source と multi-source の `--pages` パイプライン統合）が
-この食い違いの解消先として既に追跡されている。
+`build_acroform_section`/`build_encrypt_section`/
+`build_attachments_section`/`write_qpdf_json_v2_selected_objects_with_options`/
+`write_qpdf_json_v2_selected_objects_to_output_with_options`。
+flpdf-cli からは (B) と同様 `job.write_json()` 経由でしか呼ばれないが、
+`json_inspect.rs:31-40` がこれら 8 個を `crate::job::{...}` から
+`pub use` で crate ルート近くへ再輸出しており（同ファイル自身のコメントが
+「staged migration の間、historical な public path を残す」と明言）、
+`tests/document_json_tests.rs:9-13` が実際に
+`flpdf::json_inspect::write_qpdf_json_v2_selected_objects_with_options`
+を統合テストから直接使っている。前掲の re-export ルールの通り、
+`job/mod.rs` 側だけ `pub(crate)` に変えると `json_inspect.rs` の
+`pub use` が `E0364` でコンパイル不能になることを実測済み——re-export の
+付け替えでは対策できない。狭めるには `json_inspect.rs` の compatibility
+re-export 自体を撤去し、`document_json_tests.rs` を
+`QPDFJob::write_json()` 経由の書き方へ書き換える、という
+staged-migration の完了そのものが要る。これは可視性の issue ではなく
+API 移行の issue なので、`flpdf-7bkv`（旧 `flpdf-wy3k` は前提の誤りにより
+close 済み）として追跡する。
+
+**(D) 未解消の debt**: `RotateSpec`（`RotateSpec::parse`）・
+`PageRange`（`PageRange::parse`）。`main.rs` から直接呼ばれており、
+対応する qpdf 側は `parseRotationParameter`／`QPDFJob::parseNumrange`
+という private メソッドのみで、`prune_acroform_after_subset`（(A)）と
+違って `QPDFJob` 側に対応する public メソッドの薄いラッパーが無い——
+真の意味で qpdf の CLI 構造と食い違っている。ただし `PageRange` は
+`RotateSpec` と同列には扱えない: `page_combine.rs` の
+`InputSpec::range`/`InputSpec::new`/`CombinedPlan::build`/
+`PagePlan::build` という **job/ の外側にある** public library API の
+一部としても使われ、これらは実行可能な doc example を持ち
+`lib.rs:233` から再輸出されている。つまり `flpdf-hxmj`
+（single-source/multi-source `--pages` パイプライン統合）で CLI 側の
+経路を一本化できても、`PageRange` 自体を `pub(crate)` に落とせるとは
+限らない——job/ 外の public API 依存を別途どうするか（型を分離するか、
+その依存ごと debt として受け入れるか）を `flpdf-hxmj` の issue 本文に
+明記する。`RotateSpec` にはこの library-API 側の依存は無く、CLI 経路の
+一本化だけで `pub(crate)` に落とせる見込み。
 
 ---
 
