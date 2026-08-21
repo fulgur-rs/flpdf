@@ -36,7 +36,7 @@
 
 use super::QPDFJob;
 use crate::{
-    Error, Matrix, PageDocumentHelper, PageInput, PageObjectHelper, Pdf, PdfWriter, Result,
+    Error, PageDocumentHelper, PageInput, PageObjectHelper, Pdf, PdfWriter, Result,
     WriterConfiguration,
 };
 use std::path::{Path, PathBuf};
@@ -117,6 +117,9 @@ impl QPDFJob {
         // cov:ignore-end
         let has_page_labels = source.page_labels().has_page_labels()?;
         let has_acro_form = source.acroform().has_acro_form()?;
+        let source_version =
+            crate::parse_pdf_version(source.version()).map(|version| version.get_version().0);
+        let source_extension_level = source.adobe_extension_level().unwrap_or(0);
         let mut written = Vec::new();
 
         for chunk_start in (0..page_count).step_by(options.chunk_size) {
@@ -164,11 +167,8 @@ impl QPDFJob {
                 // field-tree copy and annotation transform.
                 if has_acro_form {
                     let source_page = source.get_object_handle(page_ref);
-                    PageObjectHelper::new(new_page, &mut output).copy_annotations_from(
-                        source_page,
-                        Matrix::default(),
-                        source,
-                    )?; // cov:ignore: malformed foreign annotation errors are covered by the canonical PageObjectHelper tests
+                    PageObjectHelper::new(new_page, &mut output)
+                        .fix_copied_annotations_from(source_page, source)?; // cov:ignore: malformed foreign annotation errors are covered by the canonical PageObjectHelper tests
                 }
             }
 
@@ -205,6 +205,9 @@ impl QPDFJob {
 
             let mut writer = PdfWriter::new(&mut output);
             options.writer_configuration.apply_to(&mut writer);
+            if let Some(version) = source_version.as_deref() {
+                writer.set_minimum_pdf_version(version, source_extension_level);
+            }
             if options.deterministic_id {
                 writer.set_deterministic_id(true);
             }
@@ -612,6 +615,22 @@ mod tests {
             .expect("catalog is a dictionary")
     }
 
+    fn first_page_annotation_count(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> usize {
+        let page_ref = page_refs(pdf)
+            .expect("page references resolve")
+            .into_iter()
+            .next()
+            .expect("fixture has a page");
+        let Object::Dictionary(page) = pdf.resolve(page_ref).expect("page resolves") else {
+            panic!("page is not a dictionary"); // cov:ignore: fixture pages are dictionaries
+        };
+        match page.get("Annots") {
+            Some(Object::Array(annots)) => annots.len(),
+            None => 0,
+            Some(other) => panic!("/Annots is not an array: {other:?}"), // cov:ignore: fixture /Annots is an array
+        }
+    }
+
     #[test]
     fn split_page_options_builder_keeps_qpdf_job_inputs() {
         let options = SplitPageOptions::new(2, "out-%d.pdf")
@@ -744,9 +763,31 @@ mod tests {
 
         let mut first = Pdf::open_mem_owned(std::fs::read(&written[0]).unwrap()).unwrap();
         let mut second = Pdf::open_mem_owned(std::fs::read(&written[1]).unwrap()).unwrap();
+        let mut third = Pdf::open_mem_owned(std::fs::read(&written[2]).unwrap()).unwrap();
         assert!(!first.acroform().has_acro_form().unwrap());
         assert!(second.acroform().has_acro_form().unwrap());
         assert_eq!(second.acroform().fields().unwrap().len(), 1);
+        assert_eq!(first_page_annotation_count(&mut first), 0);
+        assert_eq!(first_page_annotation_count(&mut second), 1);
+        assert_eq!(first_page_annotation_count(&mut third), 1);
+    }
+
+    #[test]
+    fn split_pages_preserves_source_pdf_version_on_each_chunk() {
+        let mut source = open_fixture("objstm-lin-acroform-widget-page1-page2.pdf");
+        assert_eq!(source.version(), "1.5");
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let options = SplitPageOptions::new(1, temp.path().join("out.pdf"));
+        let mut job = super::super::QPDFJob::new();
+
+        let written = job
+            .split_pages(&mut source, options)
+            .expect("split job should succeed");
+
+        for path in written {
+            let bytes = std::fs::read(path).expect("chunk should be readable");
+            assert!(bytes.starts_with(b"%PDF-1.5\n"));
+        }
     }
 
     #[test]
