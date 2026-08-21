@@ -851,6 +851,10 @@ fn v4_explicit_crypt_filter_after_ascii85_decrypts_before_filter() {
 /// keeps the remaining `/ASCII85Decode` stage and raw bytes.
 #[test]
 fn v4_explicit_crypt_filter_failure_retries_unfiltered_like_qpdf() {
+    if !qpdf_available() {
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
     let fixture = encrypted_v4_ascii85_crypt_filter_fixture_with_order(true, true);
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("wrong-order.pdf");
@@ -960,6 +964,10 @@ fn qpdf_retained_raw_stream(pdf_path: &std::path::Path, filter_name: &str) -> Ve
 /// bytes and the remaining `/FlateDecode` stage.
 #[test]
 fn v4_explicit_crypt_filter_flate_failure_retries_unfiltered() {
+    if !qpdf_available() {
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
     let fixture = encrypted_v4_explicit_crypt_filter_fixture_with_order(false, true, true, true);
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("flate-wrong-order.pdf");
@@ -2839,6 +2847,21 @@ fn assert_qpdf_object_contains(fixture: &[u8], object_number: u32, expected: &st
         output.contains(expected),
         "qpdf --show-object={object_number} output {output:?} must contain {expected:?}"
     );
+}
+
+/// Whether qpdf 11.9.0 is on `PATH`, for tests that spawn it as a live
+/// differential oracle rather than hand-authoring the expected bytes.
+fn qpdf_available() -> bool {
+    Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == "qpdf version 11.9.0")
+        })
 }
 
 fn qpdf_show_object(fixture: &[u8], object_number: u32) -> Option<String> {
