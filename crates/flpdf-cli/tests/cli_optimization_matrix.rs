@@ -1038,23 +1038,32 @@ fn newline_before_endstream_n_matches_qpdf_boolean_flag() {
         "newline-before-endstream=n: no stream objects found in output"
     );
 
+    // `n` now maps to the identical `NewlineBeforeEndstream::Yes` code path
+    // as `y`, so every real `endstream` must be preceded by `\n` — the same
+    // universal check the `y`-test above uses.
+    let mut violations = 0usize;
+    for &start in &endstream_offsets {
+        if start == 0 || output_bytes[start - 1] != b'\n' {
+            violations += 1;
+            eprintln!(
+                "newline-before-endstream=n violation at offset {start}: \
+                 preceding byte is 0x{:02x}",
+                output_bytes[start - 1]
+            );
+        }
+    }
+
+    assert_eq!(
+        violations, 0,
+        "newline-before-endstream=n: {violations} `endstream` keyword(s) not preceded by \\n"
+    );
+
     // At least one real `endstream` must show the double-newline shape from an
-    // EOL-terminated payload plus qpdf's unconditional framing LF.
-    //
-    // The loop only counts positions where both bytes before `endstream` are
-    // LF, proving the payload's own LF and the framing LF are both present.
+    // EOL-terminated payload plus qpdf's unconditional framing LF, proving the
+    // flag is unconditional rather than "insert only if missing".
     let mut found_double_newline = false;
     for &start in &endstream_offsets {
         if start >= 2 && output_bytes[start - 1] == b'\n' && output_bytes[start - 2] == b'\n' {
-            // qpdf's boolean flag adds the framing LF after the payload's LF.
-            assert_eq!(
-                output_bytes[start - 2],
-                b'\n',
-                "newline-before-endstream=n: double \\n before `endstream` at offset {start}; \
-                 qpdf's boolean flag inserts a framing newline after the payload's trailing \\n.\n\
-                 bytes[-4..0]: {:?}",
-                &output_bytes[start.saturating_sub(4)..start]
-            );
             found_double_newline = true;
         }
     }
