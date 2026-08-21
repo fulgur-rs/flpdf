@@ -288,8 +288,16 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   （同ファイル `:162` の doc comment 自身が `QPDFJob::doUnderOverlayForPage`
   の移植と明記——1ページ分のcontentを組み立てる側で、`doX`→`x`規則に従えば
   `under_overlay_for_page`相当になるはずだが独自命名になっている）。
-  この 3 件が監査時点で見つかった未対応の乖離で、この文書は
-  「監査済みで全て一貫」とは主張しない。
+  4 件目（PR #1015 Codex 再レビューでさらに追加）は `job/page_range.rs`
+  の `PageRange::parse`（8 の (D) で `QUtil::parse_numrange` への
+  対応を確認済み）で、`RotateSpec::parse` と同じ形の乖離
+  （`parse_numrange` を反映していない）。qpdf の1関数呼び出しを
+  `parse`（文字列→中間表現、page count 不要）と `resolve`
+  （中間表現+page count→解決済み index 列）の2段階に分割している点は
+  命名とは別の設計判断で、page count が未確定な時点（CLI引数の妥当性
+  検証等）でも`parse`だけ先に走らせられる利点があるが、それ自体は
+  `parse`という名前の正当化にはならない。この 4 件が監査時点で見つかった
+  未対応の乖離で、この文書は「監査済みで全て一貫」とは主張しない。
 - **戻り値の形が qpdf と違うために動詞ごと変えるのは許容される—ただし
   crate 内で一貫していること**。`doJSONPages`/`doJSONPageLabels`/
   `doJSONOutlines`/`doJSONAcroform`/`doJSONEncrypt`/`doJSONAttachments`
@@ -330,12 +338,13 @@ docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job
 全 17 ファイルの `pub fn`/`fn` 宣言（`rg -c '^\s*(pub )?fn '` で数えた
 関数シグネチャの総数）を対象にした命名監査では、この 2 件の doc 記載
 ミスと、前項で挙げた `apply_overlay_specs`/`RotateSpec::parse`/
-`apply_overlays_to_page_with_sources`（未リネームの既知の例外、
-いずれも `flpdf-ei0h` で追跡中）以外に high confidence の命名乖離は
-見つからなかった——`doX`→`x`、`handleX`→`handle_x` の変換は、その
-3 件を除き一貫して正確に行われていた（この監査自体、複数ラウンドの
-Codex レビューを経てようやくこの状態に至ったものであり、更なる
-見落としが無いとは言い切れない）。
+`apply_overlays_to_page_with_sources`/`PageRange::parse`
+（未リネームの既知の例外、いずれも `flpdf-ei0h` で追跡中）以外に
+high confidence の命名乖離は見つからなかった——`doX`→`x`、
+`handleX`→`handle_x`、`parseX`→`x`（型に紐づく `parse` メソッド）の
+変換は、その 4 件を除き一貫して正確に行われていた（この監査自体、
+複数ラウンドの Codex レビューを経てようやくこの状態に至ったものであり、
+更なる見落としが無いとは言い切れない）。
 
 ## 8. `pub` 境界も qpdf の public/private 境界に倣う
 
@@ -431,7 +440,8 @@ crate ルート re-export と突き合わせたところ、5 群に分かれた
 **(A) `QPDFJob` メソッドは legitimate、free 関数側は未検証の debt
 （PR #1015 Codex 再レビューで是正——見出しが本文の結論と矛盾していた）**:
 `prune_acroform_after_subset`/`prune_acroform_after_subset_with_max_depth`/
-`DEFAULT_MAX_ACROFORM_DEPTH`。flpdf-cli の `main.rs:4746` は
+`DEFAULT_MAX_ACROFORM_DEPTH`/`write_json`（`job/json.rs:257`）。
+flpdf-cli の `main.rs:4753` は
 `QPDFJob::prune_acroform_after_subset`（`job/page_specs.rs:546-551` で
 free 関数へ委譲する `QPDFJob` メソッド）を呼んでおり、これは根拠 2 を
 満たす——**ただし根拠 2 が正当化するのはこの `QPDFJob` メソッドの
@@ -444,9 +454,13 @@ pub-nessであって、free 関数自身の pub-ness ではない**。free 関�
 している点は事実だが、根拠 3（「crate ルートの doc（lib.rs 冒頭）に
 明記されている」）が要求する opening `//!` doc への明記は無い
 （`merge_documents`/`extract_pages` は `lib.rs:63-72` に明記されている
-のと対照的）。3 根拠のいずれも厳密には満たさない **未検証の debt** として
-`flpdf-xsq1` で追跡し、`pub(crate)` へ狭めるか opening doc に明記するかの
-設計判断を別途行う。
+のと対照的）。`write_json` も同型（PR #1015 Codex 再レビューで追加、
+監査対象から漏れていた）: 唯一の呼び出し元は `job/lifecycle.rs:269`の
+`QPDFJob::write_json`メソッドのみで、しかも `lib.rs` からの
+crate ルート再輸出すら無い（根拠3の一部さえ満たさない、
+`prune_acroform_after_subset`よりさらに弱いケース）。3 根拠のいずれも
+厳密には満たさない **未検証の debt** として`flpdf-xsq1` で追跡し、
+`pub(crate)` へ狭めるか opening doc に明記するかの設計判断を別途行う。
 
 **(B) 未検証の debt（PR #1015 Codex 再レビューで訂正）**:
 `format_attachment_list`/`format_attachment_list_with_sink`/
@@ -477,9 +491,15 @@ flpdf-cli からは (B) と同様 `job.write_json()` 経由でしか呼ばれな
 `flpdf::json_inspect::write_qpdf_json_v2_selected_objects_with_options`
 を統合テストから直接使っている。前掲の re-export ルールの通り、
 `job/mod.rs` 側だけ `pub(crate)` に変えると `json_inspect.rs` の
-`pub use` が `E0364` でコンパイル不能になることを実測済み——re-export の
-付け替えでは対策できない。狭めるには `json_inspect.rs` の compatibility
-re-export 自体を撤去し、`document_json_tests.rs` を
+`pub use` が `E0364` でコンパイル不能になることを実測済み——単純な
+付け替えでは対策できない（PR #1015 Codex 再レビューで訂正:
+前掲のルール改訂で示した「`json_sections` 自体を `pub(crate)` にし
+`json_inspect.rs` が直接 re-export する」という module 再編オプションは
+ここにも技術的には適用できるが、`json_inspect.rs` 自身のコメントが
+「staged migration の間、historical な public path を残す」ことを
+明言している以上、この API 自体を最終的に消す方針が既に決まっており、
+module 再編で永続化する意味が無い）。狭めるには `json_inspect.rs` の
+compatibility re-export 自体を撤去し、`document_json_tests.rs` を
 `QPDFJob::write_json()` 経由の書き方へ書き換える、という
 staged-migration の完了そのものが要る。これは可視性の issue ではなく
 API 移行の issue なので、`flpdf-7bkv`（旧 `flpdf-wy3k` は前提の誤りにより
@@ -515,15 +535,19 @@ job/ 内の他モジュールからも使われている事実自体は変わら
 CLI 経路を一本化すれば `pub(crate)` に落とせる見込み。
 
 **(E) 未検証の debt（PR #1015 Codex 再レビューで追加、スコープ外だった）**:
-`overlay_verbose_report`/`apply_overlay_specs`。`main.rs:3398-3414,
-4816-4832` が `QPDFJob` の public メソッドを経由せず `flpdf::` crate
-ルートから直接呼んでおり、根拠 1〜3 のいずれにも該当しない。この
-`(A)`〜`(D)` の監査は `job/mod.rs` の `pub use` 一覧を起点にしたもので、
-`main.rs` が job/ の型・関数を直接 import している箇所を全数走査した
-ものではなかった（**この文書は監査の網羅性を主張しない**——`job/mod.rs`
-起点で見つかった範囲の記録である）。`apply_overlay_specs` は既に
-`flpdf-ei0h`（命名）で追跡中のため、可視性側も同じ `flpdf-xsq1` に
-まとめて記録する。
+`overlay_verbose_report`/`apply_overlay_specs`/`collate`（`job/mod.rs:58`、
+`page_collate.rs` から再輸出）。`main.rs:3398-3414,4816-4832` の
+overlay 2 つに加え、`collate` も `main.rs:4391,4653` から `QPDFJob` の
+public メソッドを経由せず `flpdf::` crate ルートから直接呼ばれており、
+根拠 1〜3 のいずれにも該当しない。この `(A)`〜`(D)` の監査は
+`job/mod.rs` の `pub use` 一覧を起点にしたもので、`main.rs` が job/ の
+型・関数を直接 import している箇所を全数走査したものではなかった
+（**この文書は監査の網羅性を主張しない**——`job/mod.rs` 起点で
+見つかった範囲の記録である。実際、この一文自体も複数ラウンドの
+Codex レビューを経て書き足した項目が追加され続けている）。
+`apply_overlay_specs` は既に `flpdf-ei0h`（命名）で追跡中のため、
+可視性側も `overlay_verbose_report`/`collate` と合わせて同じ
+`flpdf-xsq1` に記録する。
 
 ---
 
