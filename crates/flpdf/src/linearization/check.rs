@@ -375,9 +375,13 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
         object.try_dereference()?;
         let (end_before_space, end_after_space) = object.end_offsets();
         if end_before_space < 0 || end_after_space < 0 {
-            return Err(crate::Error::Unsupported(format!(
-                "linearization part-6 object {object_ref:?} has no source extent"
-            )));
+            // qpdf's `checkLinearizationInternal` initializes both `/E`
+            // envelope values to -1 and applies `std::max` to every part-6
+            // object (`QPDF_linearization.cc:507-521`). A programmatic
+            // `QPDF::replaceObject` therefore contributes no source extent;
+            // it does not make the whole check fail. Keep the same sentinel
+            // semantics after `Pdf::set_object` clears its cache extent.
+            continue;
         }
         max_end_before_space = max_end_before_space.max(end_before_space);
         max_end_after_space = max_end_after_space.max(end_after_space);
@@ -642,17 +646,21 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
         fail!("/E ({e_val}) must be less than file length ({file_len})");
     }
     let (min_e, max_e) = first_page_source_extent(pdf).map_err(LinearizationCheckError::from)?;
-    // cov:ignore-start: source extents are rejected as negative in the canonical
-    // object walk before this conversion; parsed PDF integers are i64-backed.
-    let min_e = u64::try_from(min_e).map_err(|_| LinearizationCheckError::InvalidParam {
-        message: format!("computed part-6 end offset {min_e} is negative"),
-    })?;
-    let max_e = u64::try_from(max_e).map_err(|_| LinearizationCheckError::InvalidParam {
-        message: format!("computed part-6 end offset {max_e} is negative"),
-    })?;
-    // cov:ignore-end
-    if e_val < min_e || e_val > max_e {
-        fail!("/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})");
+    // qpdf leaves the envelope at (-1, -1) when part-6 objects have no source
+    // extents (`QPDF_linearization.cc:507-521`). In that case its `/E` check
+    // emits a warning rather than turning the missing metadata into a fatal
+    // parse error; this checker has no logger at this boundary, so it skips
+    // only the extent-range comparison and retains all structural checks.
+    if min_e >= 0 && max_e >= 0 {
+        let min_e = u64::try_from(min_e).map_err(|_| LinearizationCheckError::InvalidParam {
+            message: format!("computed part-6 end offset {min_e} is negative"),
+        })?;
+        let max_e = u64::try_from(max_e).map_err(|_| LinearizationCheckError::InvalidParam {
+            message: format!("computed part-6 end offset {max_e} is negative"),
+        })?;
+        if e_val < min_e || e_val > max_e {
+            fail!("/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1759,15 +1767,15 @@ mod tests {
     }
 
     #[test]
-    fn extent_walk_rejects_a_missing_object_source_extent() {
+    fn extent_walk_ignores_a_missing_object_source_extent_like_qpdf() {
         let bytes = source_extent_graph_fixture();
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open extent graph");
         // Materialize a fresh object with no physical source extent and route
         // it into part 6 through /Outlines (the fixture already carries
-        // /PageMode /UseOutlines). This mirrors how qpdf's own optimize() can
-        // hand calculateLinearizationData an object with no parsed byte
-        // position at all — e.g. a non-indirect /Outlines dictionary qpdf
-        // forces indirect before classification (`QPDF_optimization.cc:67-76`).
+        // /PageMode /UseOutlines). qpdf's own optimize() can hand
+        // calculateLinearizationData an object with no parsed byte position
+        // at all — e.g. a non-indirect /Outlines dictionary qpdf forces
+        // indirect before classification (`QPDF_optimization.cc:67-76`).
         let injected_ref = ObjectRef::new(50, 0);
         pdf.set_object(
             injected_ref,
@@ -1781,11 +1789,9 @@ mod tests {
         root.insert("Outlines", crate::Object::Reference(injected_ref));
         pdf.set_object(root_ref, crate::Object::Dictionary(root));
 
-        let error = first_page_source_extent(&mut pdf)
-            .expect_err("materialized object has no source extent");
-        assert!(
-            matches!(error, crate::Error::Unsupported(message) if message.contains("no source extent"))
-        );
+        let (end_before_space, end_after_space) = first_page_source_extent(&mut pdf)
+            .expect("a missing source extent must not abort qpdf's part-6 envelope");
+        assert_eq!((end_before_space, end_after_space), (-1, -1));
     }
 
     #[test]
