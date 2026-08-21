@@ -6640,7 +6640,7 @@ fn run_copy_attachments_from(
     src.root_handle()
         .map_err(|error| error_with_file(&args.file, actionable_password_error(error)))?;
 
-    let count = job.copy_attachments(
+    job.copy_attachments(
         &mut pdf,
         &mut src,
         &AttachmentCopyOptions {
@@ -6649,7 +6649,6 @@ fn run_copy_attachments_from(
             verbose,
         },
     )?;
-    eprintln!("copied {count} attachment(s)");
 
     let writer_options = WriterOptions {
         deterministic_id,

@@ -7046,7 +7046,7 @@ fn copy_attachments_from_copies_all_entries() {
 
     // Copy attachments from the source into a fresh target.
     let output = temp.path().join("out.pdf");
-    Command::cargo_bin("flpdf")
+    let copy = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
             input.path().to_str().unwrap(),
@@ -7055,9 +7055,14 @@ fn copy_attachments_from_copies_all_entries() {
             "--",
             output.to_str().unwrap(),
         ])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("copied 2 attachment(s)"));
+        .output()
+        .unwrap();
+    assert!(copy.status.success(), "copy failed: {copy:?}");
+    assert!(
+        copy.stderr.is_empty(),
+        "qpdf-compatible copy must not emit a summary on stderr: {}",
+        String::from_utf8_lossy(&copy.stderr)
+    );
 
     Command::cargo_bin("flpdf")
         .unwrap()

@@ -194,17 +194,12 @@ impl QPDFJob {
     /// from a repaired open) are folded into this job's own warning state,
     /// matching qpdf's `other->anyWarnings()` check (`QPDFJob.cc:2116-2118`).
     ///
-    /// Returns the number of attachments actually copied (excluding
-    /// duplicate-key skips). `QPDFJob::copyAttachments` itself returns
-    /// nothing; the count is a flpdf-only addition kept for the CLI's
-    /// `copied N attachment(s)` diagnostic, which predates this method and
-    /// has no qpdf equivalent (`docs/qpdf-correspondence.md`).
     pub fn copy_attachments<R1, R2>(
         &mut self,
         target: &mut Pdf<R1>,
         source: &mut Pdf<R2>,
         options: &AttachmentCopyOptions,
-    ) -> Result<usize>
+    ) -> Result<()>
     where
         R1: Read + Seek + 'static,
         R2: Read + Seek + 'static,
@@ -224,7 +219,6 @@ impl QPDFJob {
 
         let other_attachments = source.embedded_files().get_embedded_files()?;
         let mut duplicates: Vec<String> = Vec::new();
-        let mut copied_count = 0usize;
         for (key, filespec) in other_attachments {
             let mut new_key = options.prefix.clone();
             new_key.extend_from_slice(&key);
@@ -246,7 +240,6 @@ impl QPDFJob {
             target
                 .embedded_files()
                 .replace_embedded_file(&new_key, copied)?;
-            copied_count += 1;
 
             if options.verbose {
                 let mut message = Vec::new();
@@ -262,7 +255,7 @@ impl QPDFJob {
         self.record_document_warnings(source);
 
         if duplicates.is_empty() {
-            return Ok(copied_count);
+            return Ok(());
         }
 
         Err(Error::System(format!(
@@ -1101,14 +1094,12 @@ mod tests {
             )
             .expect("open target fixture");
 
-        let count = job
-            .copy_attachments(
-                &mut target,
-                &mut source,
-                &copy_options(std::path::PathBuf::from("donor.pdf"), b"src-", true),
-            )
-            .expect("copy attachments");
-        assert_eq!(count, 1, "the fixture donor carries exactly one attachment");
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from("donor.pdf"), b"src-", true),
+        )
+        .expect("copy attachments");
 
         let root_ref = target.root_ref().expect("catalog root");
         let Object::Dictionary(root) = target.resolve(root_ref).expect("resolve catalog") else {
@@ -1197,14 +1188,12 @@ mod tests {
             )
             .expect("open target fixture");
 
-        let count = job
-            .copy_attachments(
-                &mut target,
-                &mut source,
-                &copy_options(std::path::PathBuf::from("donor.pdf"), b"", false),
-            )
-            .expect("empty source copies nothing but still succeeds");
-        assert_eq!(count, 0, "an empty source has nothing to copy");
+        job.copy_attachments(
+            &mut target,
+            &mut source,
+            &copy_options(std::path::PathBuf::from("donor.pdf"), b"", false),
+        )
+        .expect("empty source copies nothing but still succeeds");
 
         let root_ref = target.root_ref().expect("catalog root");
         let Object::Dictionary(root) = target.resolve(root_ref).expect("resolve catalog") else {
