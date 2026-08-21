@@ -3652,13 +3652,7 @@ impl<R: Read + Seek> Pdf<R> {
                         *stream = original_stream;
                         remove_explicit_crypt_filter(stream);
                         let detail = explicit_filter_fallback_detail(stream, &error);
-                        self.push_warning(format!(
-                            "error decoding stream data for object {} {}: {detail}",
-                            object_ref.number, object_ref.generation
-                        ))?; // cov:ignore: LLVM attributes the successful warning-sink continuation to the format call
-                        self.push_warning(
-                            "stream will be re-processed without filtering to avoid data loss",
-                        )?; // cov:ignore: LLVM attributes the successful warning-sink continuation to the string call
+                        self.push_explicit_filter_fallback_warnings(object_ref, &detail)?;
                         stream_payload_transformed = true;
                     }
                 }
@@ -3687,6 +3681,19 @@ impl<R: Read + Seek> Pdf<R> {
         }
         self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream)?;
         Ok((object, stream_payload_transformed))
+    }
+
+    fn push_explicit_filter_fallback_warnings(
+        &mut self,
+        object_ref: ObjectRef,
+        detail: &str,
+    ) -> Result<()> {
+        self.push_warning(format!(
+            "error decoding stream data for object {} {}: {detail}",
+            object_ref.number, object_ref.generation
+        ))?;
+        self.push_warning("stream will be re-processed without filtering to avoid data loss")?;
+        Ok(())
     }
 
     /// Recover an object-stream container that exists only in the legacy
