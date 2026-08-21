@@ -28,11 +28,14 @@
 //! disregard the hint stream itself, so any raw offset `>= H_offset` has
 //! `H_length` added before display (qpdf's `adjusted_offset`).
 
-use super::check::{check_linearization, load_hint_stream, LinearizationCheckError};
+use super::check::{
+    check_linearization_parameters, check_linearization_warnings, load_hint_stream,
+    LinearizationCheckError, LinearizationParameterCheck,
+};
 use crate::bit_stream::{BitStream, BitStreamError};
 #[cfg(test)]
 use crate::ObjectRef;
-use crate::{ObjectHandle, PageDocumentHelper, Pdf};
+use crate::{ObjectHandle, Pdf};
 use std::fmt;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -55,6 +58,15 @@ pub enum ShowLinearizationError {
     Malformed { message: String },
     /// An I/O or parse error occurred while reading the file.
     Io(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Successful `--show-linearization` output plus qpdf soft-check warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowLinearizationOutput {
+    /// The qpdf-compatible dump written to stdout.
+    pub dump: String,
+    /// Ordered warning messages emitted by qpdf's linearization checker.
+    pub warnings: Vec<String>,
 }
 
 impl fmt::Display for ShowLinearizationError {
@@ -632,6 +644,37 @@ fn read_lin_parameters(dict: &ObjectHandle, file_size: u64) -> ShowResult<LinPar
     })
 }
 
+/// Format a qpdf `damagedPDF` warning raised while loading linearization data.
+fn linearization_parameter_warning(
+    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    display_name: &str,
+    message: &str,
+) -> ShowResult<String> {
+    for object in ["linearization dictionary", "linearization hint table"] {
+        let prefix = format!("{object}: ");
+        if let Some(detail) = message.strip_prefix(&prefix) {
+            let offset = if object == "linearization dictionary" {
+                let candidate = pdf
+                    .linearization_candidate_ref()
+                    .map_err(ShowLinearizationError::from)?;
+                candidate
+                    .map(|object_ref| pdf.get_object_handle(object_ref).get_parsed_offset())
+                    .filter(|offset| *offset >= 0)
+                    .map(|offset| offset as u64)
+                    .unwrap_or_else(|| pdf.source_last_offset())
+            } else {
+                pdf.source_last_offset()
+            };
+            return Ok(format!(
+                "{display_name} ({object}, offset {offset}): {detail}"
+            ));
+        }
+    }
+    // The checker supplies only the two qpdf damagedPDF categories above;
+    // keep a stable fallback for future diagnostics.
+    Ok(format!("{display_name}: {message}")) // cov:ignore: unreachable fallback for unknown qpdf category
+}
+
 /// Extract the Shared Object (`/S`) and optional Outline (`/O`) section offsets
 /// from the **hint stream** dictionary (not the parameter dict).
 ///
@@ -677,7 +720,7 @@ fn show_with_pdf(
     pdf: &mut Pdf<Cursor<Vec<u8>>>,
     file_bytes: &[u8],
     display_name: &str,
-) -> ShowResult<String> {
+) -> ShowResult<ShowLinearizationOutput> {
     let file_size = file_bytes.len() as u64;
 
     // 1. Locate the linearization parameter dictionary (first physical object)
@@ -686,7 +729,12 @@ fn show_with_pdf(
     //    integer) `/L` must equal the file length.  When the file is not
     //    linearized, qpdf's `--show-linearization` prints "<name> is not
     //    linearized" to stdout and exits 0 — we return that line as Ok.
-    let not_linearized = || Ok(format!("{display_name} is not linearized\n"));
+    let not_linearized = || {
+        Ok(ShowLinearizationOutput {
+            dump: format!("{display_name} is not linearized\n"),
+            warnings: Vec::new(),
+        })
+    };
 
     if !pdf.is_linearized().map_err(ShowLinearizationError::from)? {
         return not_linearized();
@@ -706,59 +754,39 @@ fn show_with_pdf(
         return not_linearized();
     }
 
-    // 2. Param-dict values (qpdf's LinParameters).
-    let params = read_lin_parameters(&param_dict, file_size)?;
-
-    // qpdf's --show-linearization walks getAllPages() in
-    // checkLinearizationInternal; mirror that walk here, both for fidelity and
-    // to bound the per-page allocation in read_h_page_offset. A well-formed
-    // linearized file has /N equal to its page count, so this never rejects
-    // valid input; a malformed /N (up to u32::MAX) is reported as malformed
-    // rather than driving a multi-gigabyte pre-allocation (OOM DoS).
-    let page_count = PageDocumentHelper::new(pdf).get_all_pages()?.len();
-    if params.npages as usize != page_count {
-        // cov:ignore-start: /N disagreeing with the page tree — never emitted by
-        // flpdf's writer; this bounds read_h_page_offset against a malformed /N.
-        return Err(malformed!(
-            "/N ({}) does not match the document page count ({page_count})",
-            params.npages
-        ));
-        // cov:ignore-end
-    }
-
     // qpdf's `showLinearizationData` calls `checkLinearizationInternal`
-    // (`QPDF_linearization.cc:838-843`) but never branches on its boolean
-    // result: a failed structural/hint-table check only accumulates a
-    // `linearizationWarning` (logged via `QPDF::warn`, `:63-67`), which does
-    // NOT throw — `dumpLinearizationDataInternal` still runs right after
-    // (`:838-847`). Only a genuine parse failure thrown by
-    // `readLinearizationData`/`readHintStream` (`:159-322` — wrong-typed
-    // param-dict keys, a malformed `/H` array, or an unreadable/out-of-bounds
-    // hint stream) stops the dump. This function's own `read_lin_parameters`
-    // (above) and `load_hint_stream` (below) already replicate those
-    // `readLinearizationData`/`readHintStream` failures independently, so a
-    // malformed-but-still-decodable file — e.g. `/O`, `/E`, or `/T` not
-    // matching the actual page/extent/xref layout — must still produce the
-    // (partial) table dump rather than aborting here.
-    //
-    // Call `check_linearization` for its qpdf-parity diagnostic value, but
-    // only propagate a genuine I/O failure: its `InvalidParam` mismatches are
-    // qpdf's non-fatal warnings (or, for a still-undecodable hint stream, are
-    // independently re-raised as hard failures by this function's own reads
-    // below), and `NotLinearized` cannot occur here since `is_linearized`
-    // already passed above.
-    //
-    // Deviation: qpdf's soft-check path also emits a `WARNING: ...` line to
-    // stderr and drives the CLI exit code to EXIT_WARNING (3) instead of 0
-    // (`linearizationWarning`, `QPDF_linearization.cc:61-67`; the
-    // `getWarnings()`-driven exit code, `QPDFJob.cc:1689-1691`). Neither the
-    // warning text nor the exit code is reproduced here — tracked separately
-    // (flpdf-pky8) rather than folded into this fix.
-    if let Err(LinearizationCheckError::Io(error)) = check_linearization(pdf, file_bytes) {
-        // public show entry points use Cursor<Vec<u8>>; the canonical
-        // resolver catches parse/unsupported failures and this in-memory
-        // source cannot produce a read I/O error.
-        return Err(ShowLinearizationError::Io(error)); // cov:ignore: see comment above
+    // (`QPDF_linearization.cc:838-843`) and always dumps after the check. The
+    // canonical warning route now preserves the same ordered soft messages;
+    // the CLI owns their logger emission and exit-3 completion.
+    let mut warnings = match check_linearization_parameters(pdf)? {
+        LinearizationParameterCheck::Clean => Vec::new(),
+        LinearizationParameterCheck::Warning(message) => vec![message.to_owned()],
+        LinearizationParameterCheck::Error(message) => {
+            return Ok(ShowLinearizationOutput {
+                dump: String::new(),
+                warnings: vec![linearization_parameter_warning(pdf, display_name, message)?],
+            });
+        }
+    };
+
+    // 2. Param-dict values (qpdf's LinParameters). The parameter preflight
+    // above reproduces readLinearizationData's warning-only type/page-count
+    // failures before this decoder needs the values for the dump.
+    let params = read_lin_parameters(&param_dict, file_size)?;
+    match check_linearization_warnings(pdf, file_bytes, true) {
+        Ok(messages) => warnings.extend(messages),
+        // cov:ignore-start: a Cursor<Vec<u8>> cannot produce a source I/O error;
+        // retain the defensive mapping for the generic checker contract.
+        Err(LinearizationCheckError::Io(error)) => {
+            return Err(ShowLinearizationError::Io(error)); // cov:ignore: in-memory source failures are defensive
+        }
+        // cov:ignore-end
+        Err(LinearizationCheckError::InvalidParam { .. })
+        | Err(LinearizationCheckError::NotLinearized) => {
+            // read_lin_parameters/load_hint_stream below own the hard parse
+            // failures for this show route; preserve their qpdf-shaped error
+            // text rather than duplicating a second validator here.
+        }
     }
 
     // 3. Locate, resolve, and decompress the hint stream object at /H[0].
@@ -840,13 +868,16 @@ fn show_with_pdf(
         None => None,
     };
 
-    Ok(format_dump(
-        display_name,
-        &params,
-        &page_offset,
-        &shared_object,
-        outline.as_ref(),
-    ))
+    Ok(ShowLinearizationOutput {
+        dump: format_dump(
+            display_name,
+            &params,
+            &page_offset,
+            &shared_object,
+            outline.as_ref(),
+        ),
+        warnings,
+    })
 }
 
 /// Assemble the complete dump string (qpdf's `dumpLinearizationDataInternal`).
@@ -976,6 +1007,14 @@ pub fn show_linearization_bytes(
     file_bytes: &[u8],
     display_name: &str,
 ) -> std::result::Result<String, ShowLinearizationError> {
+    show_linearization_bytes_with_warnings(file_bytes, display_name).map(|result| result.dump)
+}
+
+/// Decode linearization data and retain qpdf's ordered soft-check warnings.
+pub fn show_linearization_bytes_with_warnings(
+    file_bytes: &[u8],
+    display_name: &str,
+) -> std::result::Result<ShowLinearizationOutput, ShowLinearizationError> {
     let mut pdf = Pdf::open(Cursor::new(file_bytes.to_vec()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
     show_with_pdf(&mut pdf, file_bytes, display_name)
@@ -996,6 +1035,14 @@ pub fn show_linearization_bytes(
 pub fn show_linearization_path(
     path: &std::path::Path,
 ) -> std::result::Result<String, ShowLinearizationError> {
+    show_linearization_path_with_warnings(path).map(|result| result.dump)
+}
+
+/// Decode linearization data at `path` and retain qpdf's ordered soft-check
+/// warnings alongside the dump.
+pub fn show_linearization_path_with_warnings(
+    path: &std::path::Path,
+) -> std::result::Result<ShowLinearizationOutput, ShowLinearizationError> {
     let file_bytes = std::fs::read(path)?;
     let mut pdf = Pdf::open(Cursor::new(file_bytes.clone()))
         .map_err(|e| ShowLinearizationError::Io(Box::new(e)))?;
@@ -2102,15 +2149,18 @@ mod tests {
 
     #[test]
     fn missing_required_key_is_malformed() {
-        // Rename /N to /Z so the required /N lookup fails → Malformed.
+        // Rename /N to /Z so qpdf's readLinearizationData warning path is
+        // exercised: --show-linearization emits no dump and exits 3.
         let mut bytes = linearized_bytes();
         let pos = bytes.windows(3).position(|w| w == b"/N ").expect("/N");
         bytes[pos + 1] = b'Z';
-        let result = show_linearization_bytes(&bytes, "noN.pdf");
-        assert!(matches!(
-            result,
-            Err(ShowLinearizationError::Malformed { .. })
-        ));
+        let result = show_linearization_bytes_with_warnings(&bytes, "noN.pdf")
+            .expect("missing /N is a qpdf warning");
+        assert!(result.dump.is_empty());
+        assert_eq!(
+            result.warnings,
+            ["noN.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type".to_owned()]
+        );
     }
 
     #[test]

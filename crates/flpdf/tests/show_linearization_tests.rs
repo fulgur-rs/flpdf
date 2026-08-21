@@ -17,7 +17,7 @@
 //! values are identical regardless of which deflate backend flpdf links — the
 //! `qpdf-zlib-compat` gate only matters for flpdf's *encoder*, not this reader.
 
-use flpdf::linearization::show_linearization_bytes;
+use flpdf::linearization::{show_linearization_bytes, show_linearization_bytes_with_warnings};
 use std::path::{Path, PathBuf};
 
 /// Path to a committed qpdf golden linearized PDF.
@@ -75,6 +75,34 @@ fn non_linearized_reports_is_not_linearized() {
     let bytes = std::fs::read(&path).expect("read one-page fixture");
     let out = show_linearization_bytes(&bytes, "one-page.pdf").expect("not-linearized is Ok");
     assert_eq!(out, "one-page.pdf is not linearized\n");
+}
+
+#[test]
+fn soft_linearization_warnings_are_returned_without_dropping_the_dump() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/linearized-one-page.pdf");
+    let mut bytes = std::fs::read(fixture).expect("read linearized fixture");
+    for (needle, replacement) in [
+        (b"/O 6".as_slice(), b"/O 7".as_slice()),
+        (b"/T 1523".as_slice(), b"/T 1522".as_slice()),
+    ] {
+        let start = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("linearization parameter");
+        bytes[start..start + needle.len()].copy_from_slice(replacement);
+    }
+
+    let result = show_linearization_bytes_with_warnings(&bytes, "mismatch.pdf")
+        .expect("soft mismatches should still produce a dump");
+    assert!(result.dump.contains("linearization data:"));
+    assert_eq!(
+        result.warnings,
+        [
+            "first page object (/O) mismatch".to_owned(),
+            "space before first xref item (/T) mismatch (computed = 1524; file = 1522".to_owned(),
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------

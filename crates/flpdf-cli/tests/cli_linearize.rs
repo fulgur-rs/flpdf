@@ -262,6 +262,57 @@ fn show_linearization_dumps_structure() {
         .stdout(predicate::str::contains("Shared Objects Hint Table"));
 }
 
+#[test]
+fn show_linearization_soft_warnings_exit_3_after_dump() {
+    let outdir = tempfile::tempdir().unwrap();
+    let input = outdir.path().join("o-and-t-mismatch.pdf");
+    let mut bytes = linearized_fixture_bytes();
+    replace_linearization_parameter(&mut bytes, b"/O", b"7");
+    replace_linearization_parameter(&mut bytes, b"/T", b"1522");
+    std::fs::write(&input, bytes).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-linearization", input.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(3)
+        .stdout(predicate::str::contains("linearization data:"))
+        .stderr(predicate::str::contains("first page object (/O) mismatch"))
+        .stderr(predicate::str::contains(
+            "space before first xref item (/T) mismatch",
+        ))
+        .stderr(predicate::str::contains(
+            "qpdf: operation succeeded with warnings",
+        ));
+}
+
+#[test]
+fn show_linearization_parameter_warning_exits_3_without_dump() {
+    let outdir = tempfile::tempdir().unwrap();
+    let input = outdir.path().join("n-mismatch.pdf");
+    let mut bytes = linearized_fixture_bytes();
+    replace_linearization_parameter(&mut bytes, b"/N", b"2");
+    std::fs::write(&input, bytes).unwrap();
+
+    let input_name = input.to_string_lossy();
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-linearization", input.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(3)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {input_name}: {input_name} (linearization hint table, offset 908): /N does not match number of pages"
+        )))
+        .stderr(predicate::str::contains(
+            "qpdf: operation succeeded with warnings",
+        ));
+}
+
 // ---------------------------------------------------------------------------
 // 3c. show-linearization on a NON-linearized PDF: like qpdf, print
 //     "<name> is not linearized" to stdout and exit 0 (not an error).
