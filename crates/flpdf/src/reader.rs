@@ -11,9 +11,7 @@ use crate::encrypt_setup::CopyEncryptionSource;
 use crate::error::EncryptedError;
 #[cfg(test)]
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::ObjectValue;
-#[cfg(test)]
-use crate::object_handle::NO_PARSED_OFFSET;
+use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -1284,6 +1282,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // data, not something parsed from a source position; any
                 // previously recorded offset no longer describes it.
                 handle.reset_parsed_offset();
+                handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
             }
             Err(_) => {
                 // Programmatic depth is unbounded above, so this fallback is
@@ -12708,9 +12707,14 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         handle.try_dereference().expect("resolve");
         let source_description = handle.description();
+        let source_end_offsets = handle.end_offsets();
         assert!(
             source_description.contains("offset"),
             "the fixture must establish a source description before replacement"
+        );
+        assert!(
+            source_end_offsets.0 >= 0 && source_end_offsets.1 >= 0,
+            "the fixture must establish source extents before replacement"
         );
 
         let mut replacement = Object::Null;
@@ -12723,6 +12727,11 @@ mod tests {
             handle.description(),
             "object 1 0",
             "a canonical replacement must discard the source provenance"
+        );
+        assert_eq!(
+            handle.end_offsets(),
+            (NO_PARSED_OFFSET, NO_PARSED_OFFSET),
+            "a canonical replacement must discard the source extents"
         );
         handle
             .object_warning("failed replacement warning")
