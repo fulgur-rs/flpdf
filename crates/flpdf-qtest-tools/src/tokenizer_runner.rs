@@ -565,6 +565,15 @@ mod tests {
     use super::*;
     use flpdf::{Object, ObjectHandle, ObjectRef};
 
+    #[test]
+    fn object_stream_pipeline_collects_bytes_and_has_qpdf_identifier() {
+        let mut pipeline = ObjectStreamPipeline::default();
+        assert_eq!(pipeline.identifier(), "object stream data");
+        pipeline.write(b"raw").expect("pipeline write");
+        pipeline.finish().expect("pipeline finish");
+        assert_eq!(pipeline.bytes, b"raw");
+    }
+
     fn open_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let bytes: &[u8] = b"%PDF-1.4\n\
             1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
