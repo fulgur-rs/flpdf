@@ -4700,7 +4700,7 @@ impl ObjectHandle {
             false,
             false,
         )?; // cov:ignore: multiline call terminator has no executable coverage region
-        if !stream_data_succeeded {
+        if !stream_data_succeeded || !filtering_attempted {
             return Err(Error::Unsupported(
                 "error getting decoded stream data".to_owned(),
             ));
@@ -16372,6 +16372,31 @@ mod mutation_tests {
             Error::Unsupported(message) if message == "error getting decoded stream data"
         ));
         assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
+    fn get_stream_data_rejects_filters_gated_by_the_requested_decode_level() {
+        for (filter, decode_level) in [
+            (b"DCTDecode".as_slice(), DecodeLevel::Generalized),
+            (b"RunLengthDecode".as_slice(), DecodeLevel::Generalized),
+        ] {
+            let stream = ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(filter.to_vec()),
+                )]),
+                Rc::new(b"raw filtered bytes".to_vec()),
+            );
+
+            let error = stream
+                .get_stream_data(decode_level)
+                .expect_err("gated raw bytes must not be labeled as decoded");
+
+            assert!(matches!(
+                error,
+                Error::Unsupported(message) if message == "error getting decoded stream data"
+            ));
+        }
     }
 
     #[test]
