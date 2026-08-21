@@ -271,10 +271,14 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `QPDFJob::handleUnderOverlay`（`QPDFJob.cc:1937`、`--overlay`/
   `--underlay` の適用全体を担う private メソッドで、qpdf 側に個別識別子が
   無いケースにも該当しない）に対応するが、`handle_under_overlay` に
-  なっていない。監査時点で見つかった唯一の未対応の乖離で、
-  リネームの影響範囲（呼び出し箇所・テスト関数名 40 箇所超）が大きいため
-  `flpdf-ei0h` として別途追跡し、この文書は「監査済みで全て一貫」とは
-  主張しない。
+  なっていない。リネームの影響範囲（呼び出し箇所・テスト関数名 40 箇所超）
+  が大きいため `flpdf-ei0h` として別途追跡する。同様に
+  `job/rotate_spec.rs` の `RotateSpec::parse` は qpdf の
+  `QPDFJob::parseRotationParameter`（`QPDFJob.cc:369`、private メソッド）
+  に対応するが `parse_rotation_parameter` になっていない（`main.rs` から
+  直接呼ばれる、対応する `QPDFJob` public メソッドの薄いラッパーが無い
+  ケース——8 の (D) 参照）。この 2 件が監査時点で見つかった未対応の乖離で、
+  この文書は「監査済みで全て一貫」とは主張しない。
 - **戻り値の形が qpdf と違うために動詞ごと変えるのは許容される—ただし
   crate 内で一貫していること**。`doJSONPages`/`doJSONPageLabels`/
   `doJSONOutlines`/`doJSONAcroform`/`doJSONEncrypt`/`doJSONAttachments`
@@ -314,10 +318,11 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
 docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job/*.rs`
 全 17 ファイルの `pub fn`/`fn` 宣言（`rg -c '^\s*(pub )?fn '` で数えた
 関数シグネチャの総数）を対象にした命名監査では、この 2 件の doc 記載
-ミスと、前項で挙げた `apply_overlay_specs`（未リネームの既知の例外、
-`flpdf-ei0h` で追跡中）以外に high confidence の命名乖離は見つからな
-かった——`doX`→`x`、`handleX`→`handle_x` の変換は、その 1 件を除き
-一貫して正確に行われていた。
+ミスと、前項で挙げた `apply_overlay_specs`/`RotateSpec::parse`
+（未リネームの既知の例外、いずれも `flpdf-ei0h` で追跡中）以外に
+high confidence の命名乖離は見つからなかった——`doX`→`x`、
+`handleX`→`handle_x` の変換は、その 2 件を除き一貫して正確に
+行われていた。
 
 ## 8. `pub` 境界も qpdf の public/private 境界に倣う
 
@@ -400,34 +405,43 @@ crate ルート re-export と突き合わせたところ、4 群に分かれた
 （最初の版はここを 2 群に単純化して誤り、PR #1015 の Codex レビューで
 是正した）。
 
-**(A) 既に legitimate — 変更不要**: `prune_acroform_after_subset`/
+**(A) 既に legitimate — ただし free 関数自体の根拠には要注意
+（PR #1015 Codex 再レビューで是正）**: `prune_acroform_after_subset`/
 `prune_acroform_after_subset_with_max_depth`/
 `DEFAULT_MAX_ACROFORM_DEPTH`。flpdf-cli の `main.rs:4746` は
-`QPDFJob::prune_acroform_after_subset`（`job/page_specs.rs:569-573` で
-free 関数へ委譲する `QPDFJob` メソッド）を呼んでおり、free 関数自体を
-直接は呼ばない——根拠 2（`QPDFJob` public メソッド経由）を満たす。
-加えて `tests/page_extract_thread_bead_p_tests.rs:113` が free 関数を
-直接呼ぶ統合テストで、これは根拠 3（`lib.rs:200-206` が
-`prune_acroform_after_subset` を crate ルートに flat re-export 済み）
-にも当たる。二重に legitimate であり、後述 (D) の debt グループとは
-無関係。
+`QPDFJob::prune_acroform_after_subset`（`job/page_specs.rs:546-551` で
+free 関数へ委譲する `QPDFJob` メソッド）を呼んでおり、これは根拠 2 を
+満たす——**ただし根拠 2 が正当化するのはこの `QPDFJob` メソッドの
+pub-nessであって、free 関数自身の pub-ness ではない**。free 関数
+`acroform_field_prune::prune_acroform_after_subset` 自体の呼び出し元は
+`job/page_specs.rs:550` の `super::` 修飾された同一 crate 内呼び出し
+1 箇所のみで、`pub(crate)` でも当該呼び出しはそのままコンパイルできる。
+`tests/page_extract_thread_bead_p_tests.rs:113` が free 関数を直接呼ぶ
+統合テストである点、`lib.rs:200-206` が crate ルートへ flat re-export
+している点は事実だが、根拠 3（「crate ルートの doc（lib.rs 冒頭）に
+明記されている」）が要求する opening `//!` doc への明記は無い
+（`merge_documents`/`extract_pages` は `lib.rs:63-72` に明記されている
+のと対照的）。3 根拠のいずれも厳密には満たさない **未検証の debt** として
+`flpdf-xsq1` で追跡し、`pub(crate)` へ狭めるか opening doc に明記するかの
+設計判断を別途行う。
 
-**(B) 既に legitimate — job/ 内部の話ではない**: `format_attachment_list`/
-`format_attachment_list_with_sink`/`list_attachment_info`/
-`AttachmentInfo`。flpdf-cli からは `job.list_attachments()` という
-`QPDFJob` public メソッド経由でしか呼ばれないが、これは根拠として
-不要——`lib.rs:200-206` が 4 つとも crate ルートへ flat re-export
-しており（`merge_documents`/`collate` 等と同じ並び）、根拠 3 の
-「flpdf 独自のライブラリ機能」に該当する。`format_attachment_list` は
+**(B) 既に legitimate — job/ 内部の話ではない（ただし1件は要 debt 化、
+PR #1015 Codex 再レビューで是正）**: `format_attachment_list`/
+`list_attachment_info`/`AttachmentInfo` の 3 つ。flpdf-cli からは
+`job.list_attachments()` という `QPDFJob` public メソッド経由でしか
+呼ばれないが、これは根拠として不要——`format_attachment_list` は
 `attachment_list.rs` 自身の `no_run` doctest、`list_attachment_info` は
 `tests/helper_api_tests.rs:506` の統合テストが個別に直接使っており、
 `AttachmentInfo` は `list_attachment_info` の戻り値型
 （`Vec<AttachmentInfo>`）である以上 private-in-public により最低でも
-同じ可視性が要る。**`format_attachment_list_with_sink` 単体は
-attachment_list.rs 内部からしか直接は呼ばれていない**が、`lib.rs`
-top-level re-export に同列で並んでいる以上、他 3 つと切り離して
-`pub(crate)` にはできない（切り離すこと自体が「flpdf 独自ライブラリ
-機能の API 縮小」という独立した product 判断になる）。
+同じ可視性が要る。**`format_attachment_list_with_sink` はこの3つとは
+別**: `attachment_list.rs` 内部からしか直接は呼ばれておらず、
+外部呼び出し元も opening doc への明記も無い。`lib.rs:199` で他の
+3つと同じ `pub use` 行に並んでいることは、単独の根拠にはならない
+（根拠が共有されるのは同一の re-export 行に並んでいるからではなく、
+各シンボル自身が独立に 3 根拠のどれかを満たすからでなければならない）。
+`format_attachment_list_with_sink` も `flpdf-xsq1` で debt として
+追跡する。
 
 **(C) `pub` のまま — 狭めるには API 縮小そのものが要る**:
 `build_pages_section`/`build_outlines_section`/`build_pagelabels_section`/
