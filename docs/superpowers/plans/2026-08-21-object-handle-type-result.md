@@ -153,7 +153,23 @@ fn type_code_propagates_a_resolver_error() {
 Add the corresponding `type_name` assertion using a fresh error-resolving
 handle and `expect_err("type name must be fallible")`.
 
-- [ ] **Step 5: Run the focused object-handle tests**
+- [ ] **Step 5: Update the existing type-mapping tests in the same module**
+
+Change every existing assertion in `type_code_tests` to unwrap the new
+fallible result while preserving its expected ordinal and name. For example:
+
+```rust
+assert_eq!(handle.type_code().expect("type code"), 13, "ot_unresolved");
+assert_eq!(handle.type_name().expect("type name"), "unresolved");
+```
+
+Reserved, Destroyed, Missing, already-resolved, and `ObjectValue::Reference`
+cases keep their existing expected values. The resolver-less
+`not_yet_resolved_indirect_handle_reports_unresolved_without_resolving` test
+must become the explicit error-propagation case from Step 4 because qpdf-style
+classification now attempts resolution.
+
+- [ ] **Step 6: Run the focused object-handle tests**
 
 Run:
 
@@ -161,9 +177,8 @@ Run:
 cargo test -p flpdf type_code_tests
 ```
 
-Expected: the new resolution and error-propagation tests pass after the
-accessors are changed; existing type mapping tests will remain compile errors
-until the consumer migration in Task 3 is applied.
+Expected: all tests in `type_code_tests` pass; unrelated consumers may still
+fail to compile until the migration in Task 3 is applied.
 
 ### Task 3: Propagate `Result` through every consumer and existing test
 
@@ -310,5 +325,4 @@ git push -u origin feature/flpdf-25kg-8-type-result
 Do not close `flpdf-25kg.8` until the branch/PR lifecycle explicitly confirms
 the implementation is complete; preserve the dependency edge blocking
 `flpdf-25kg.9`.
-
 
