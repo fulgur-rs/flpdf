@@ -542,7 +542,7 @@ impl DocumentResolver for BootstrapHandleDocument {
                 ),
                 None,
             );
-            handle.set_missing();
+            handle.set_resolved(ObjectValue::Null);
             return Ok(());
         }
 
@@ -590,7 +590,7 @@ impl DocumentResolver for BootstrapHandleDocument {
                     _ => None, // cov:ignore: byte-backed bootstrap object reads surface parse errors
                 };
                 self.push_warning(error.to_string(), offset);
-                handle.set_missing();
+                handle.set_resolved(ObjectValue::Null);
             }
         }
         Ok(())

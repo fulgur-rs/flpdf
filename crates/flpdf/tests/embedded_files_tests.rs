@@ -1902,10 +1902,14 @@ fn helper_reads_repairs_direct_kid() {
 }
 
 #[test]
-fn helper_persists_direct_kid_repair_before_begin_error() {
+fn helper_persists_direct_kid_repair_before_empty_result() {
     let mut pdf = open(build_direct_kid_with_broken_names_reference_pdf());
 
-    assert!(pdf.embedded_files().get_embedded_files().is_err());
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_files()
+        .expect("qpdf resolves the malformed child to a null tree node")
+        .is_empty());
 
     let names = embedded_names_dict(&mut pdf);
     let root = names
@@ -1917,10 +1921,14 @@ fn helper_persists_direct_kid_repair_before_begin_error() {
 }
 
 #[test]
-fn helper_persists_direct_kid_repair_before_next_error() {
+fn helper_persists_direct_kid_repair_before_valid_result_after_first_entry() {
     let mut pdf = open(build_direct_kid_with_broken_names_reference_after_first_entry_pdf());
 
-    assert!(pdf.embedded_files().get_embedded_files().is_err());
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_files()
+        .expect("qpdf skips the malformed second child")
+        .contains_key(b"valid".as_slice()));
 
     let names = embedded_names_dict(&mut pdf);
     let root = names
@@ -1929,32 +1937,18 @@ fn helper_persists_direct_kid_repair_before_next_error() {
         .expect("direct root");
     let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
     assert!(matches!(kids.first(), Some(Object::Reference(_))));
-    assert!(matches!(kids.get(1), Some(Object::Reference(_))));
+    assert!(matches!(kids.get(1), Some(Object::Dictionary(_))));
 }
 
 #[test]
-fn helper_lookup_persists_direct_kid_repair_before_find_error() {
-    let mut pdf = open(build_direct_kid_with_broken_names_reference_pdf());
-
-    assert!(pdf.embedded_files().get_embedded_file(b"missing").is_err());
-
-    let names = embedded_names_dict(&mut pdf);
-    let root = names
-        .get("EmbeddedFiles")
-        .and_then(Object::as_dict)
-        .expect("direct root");
-    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
-    assert!(matches!(kids.first(), Some(Object::Reference(_))));
-}
-
-#[test]
-fn helper_remove_persists_direct_kid_repair_before_find_error() {
+fn helper_lookup_persists_direct_kid_repair_before_find_none() {
     let mut pdf = open(build_direct_kid_with_broken_names_reference_pdf());
 
     assert!(pdf
         .embedded_files()
-        .remove_embedded_file(b"missing")
-        .is_err());
+        .get_embedded_file(b"missing")
+        .expect("qpdf resolves the malformed child to a null tree node")
+        .is_none());
 
     let names = embedded_names_dict(&mut pdf);
     let root = names
@@ -1966,13 +1960,31 @@ fn helper_remove_persists_direct_kid_repair_before_find_error() {
 }
 
 #[test]
-fn helper_remove_persists_indirect_root_repair_before_find_error() {
+fn helper_remove_persists_direct_kid_repair_before_find_false() {
+    let mut pdf = open(build_direct_kid_with_broken_names_reference_pdf());
+
+    assert!(!pdf
+        .embedded_files()
+        .remove_embedded_file(b"missing")
+        .expect("qpdf resolves the malformed child to a null tree node"));
+
+    let names = embedded_names_dict(&mut pdf);
+    let root = names
+        .get("EmbeddedFiles")
+        .and_then(Object::as_dict)
+        .expect("direct root");
+    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
+    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+}
+
+#[test]
+fn helper_remove_persists_indirect_root_repair_before_find_false() {
     let mut pdf = open(build_indirect_root_with_broken_names_reference_pdf());
 
-    assert!(pdf
+    assert!(!pdf
         .embedded_files()
         .remove_embedded_file(b"missing")
-        .is_err());
+        .expect("qpdf resolves the malformed child to a null tree node"));
 
     let root = pdf
         .resolve(ObjectRef::new(3, 0))

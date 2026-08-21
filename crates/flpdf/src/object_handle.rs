@@ -692,7 +692,6 @@ impl std::fmt::Debug for ObjectHandle {
             ObjectState::Resolved(ObjectValue::Reserved) => "Reserved",
             ObjectState::Resolved(ObjectValue::Destroyed) => "Destroyed",
             ObjectState::Resolved(_) => "Resolved(..)",
-            ObjectState::Missing => "Missing",
         };
         let label = if slot.object_ref.is_some() {
             "ObjectHandle::Indirect"
@@ -746,7 +745,6 @@ fn expand_description_template(
             ObjectValue::Array(_) => 1,
             _ => 0,
         },
-        _ => 0,
     };
     let offset = if parsed_offset >= 0 {
         (parsed_offset + shift).to_string()
@@ -1077,13 +1075,11 @@ struct ContainmentOwner {
 /// The resolution state of an object handle's uniform backing slot.
 ///
 /// qpdf stores unresolved, reserved, destroyed, and ordinary values in the
-/// same `QPDFValue` hierarchy. `Missing` remains a temporary flpdf resolver
-/// bookkeeping state until `flpdf-25kg.11` removes it in the next cutover
-/// slice.
+/// same `QPDFValue` hierarchy. Resolution failures are represented by the
+/// ordinary `ObjectValue::Null`, matching qpdf's `updateCache` fallback.
 #[derive(Debug)]
 pub(crate) enum ObjectState {
     Resolved(ObjectValue),
-    Missing,
 }
 
 impl ObjectHandle {
@@ -1432,7 +1428,6 @@ impl ObjectHandle {
     fn state_children(state: &ObjectState) -> Vec<ObjectHandle> {
         match state {
             ObjectState::Resolved(value) => Self::direct_children(value),
-            ObjectState::Missing => Vec::new(),
         }
     }
 
@@ -1621,7 +1616,6 @@ impl ObjectHandle {
             let state = slot.state.borrow();
             match &*state {
                 ObjectState::Resolved(value) => Self::direct_children(value),
-                ObjectState::Missing => Vec::new(),
             }
         };
         let mut visited = BTreeSet::new();
@@ -1706,9 +1700,6 @@ impl ObjectHandle {
                     return None;
                 }
                 ObjectState::Resolved(value) => Self::direct_children(value),
-                ObjectState::Missing => {
-                    return None; // cov:ignore: Missing handles retain an indirect object reference and return above
-                }
             }
         };
         for child in children {
@@ -1718,7 +1709,6 @@ impl ObjectHandle {
         let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
         match state {
             ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
-            ObjectState::Missing => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
         }
     }
 
@@ -1779,7 +1769,6 @@ impl ObjectHandle {
                 },
                 other => other.clone(),
             })),
-            ObjectState::Missing => Ok(None), // cov:ignore: Missing handles retain an indirect object reference and return above
         }
     }
 
@@ -1809,9 +1798,22 @@ impl ObjectHandle {
 
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
     /// a direct handle, which has no resolution state to update.
+    ///
+    /// qpdf's null cache update carries `-1` source positions. Reset the
+    /// provenance before a parser can install a real offset for a parsed
+    /// literal null (`libqpdf/QPDF.cc:1706-1749,1843-1858`).
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if self.is_indirect() {
-            self.replace_shared_state(ObjectState::Resolved(canonicalize_object_value(value)));
+            let value = canonicalize_object_value(value);
+            let is_null = matches!(value, ObjectValue::Null);
+            self.replace_shared_state(ObjectState::Resolved(value));
+            if is_null {
+                let mut slot = self.0.borrow_mut();
+                slot.parsed_offset = NO_PARSED_OFFSET;
+                slot.end_before_space = NO_PARSED_OFFSET;
+                slot.end_after_space = NO_PARSED_OFFSET;
+                slot.description = None;
+            }
         }
     }
 
@@ -1892,33 +1894,6 @@ impl ObjectHandle {
         true
     }
 
-    /// Mark this indirect handle as resolved-to-null because its reference is
-    /// absent from — or broken in — the source cross-reference table (see
-    /// [`ObjectState`]). A no-op for a direct handle, which has no
-    /// resolution state to update.
-    ///
-    /// Also resets the parsed offset to the no-offset sentinel: "An absent,
-    /// freed, dangling, cyclic, or otherwise unresolvable indirect object
-    /// retains its indirect identity but resolves to null with parsed offset
-    /// `-1`" (design, Parsed-Offset Contract). Without this, a handle that
-    /// was previously resolved (e.g. natively parsed with a real offset)
-    /// and later marked missing — [`crate::Pdf::delete_object`] on an
-    /// already-resolved handle — would keep reporting its former body's
-    /// source position even though the value now reads as null.
-    /// The parsed description is discarded with the same transition, so an
-    /// outstanding handle cannot keep attributing warnings to the deleted
-    /// value's source location.
-    pub(crate) fn set_missing(&self) {
-        if self.is_indirect() {
-            self.replace_detached_state(ObjectState::Missing);
-            let mut slot = self.0.borrow_mut();
-            slot.parsed_offset = NO_PARSED_OFFSET;
-            slot.end_before_space = NO_PARSED_OFFSET;
-            slot.end_after_space = NO_PARSED_OFFSET;
-            slot.description = None;
-        }
-    }
-
     /// Sever this indirect handle's resolved value, dropping any `ObjectHandle`
     /// children it holds. A no-op for a direct handle.
     ///
@@ -1934,16 +1909,16 @@ impl ObjectHandle {
     /// disconnects every cached indirect object, including unresolved entries,
     /// and replaces only non-null values with `QPDF_Destroyed()`, specifically
     /// to break cycles like this one
-    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Literal null and missing values stay
-    /// null. The reader's `Pdf::drop` calls this for every entry in its handle
+    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Literal null values stay null. The
+    /// reader's `Pdf::drop` calls this for every entry in its handle
     /// registry — the sole owner of the canonical `Rc`s — before the registry
     /// itself is dropped, so no lingering cycle keeps a document's object
     /// graph (and any reachable stream buffers) alive past the `Pdf` that
     /// produced it.
     ///
     /// Resets the parsed offset to the no-offset sentinel only when the value
-    /// is destroyed. Surviving null and missing values retain their existing
-    /// parsed-offset provenance.
+    /// is destroyed. Surviving null values retain their existing parsed-offset
+    /// provenance.
     pub(crate) fn disconnect(&self) {
         let should_destroy = {
             let slot = self.0.borrow();
@@ -1951,10 +1926,7 @@ impl ObjectHandle {
                 return;
             }
             let state = slot.state.borrow();
-            !matches!(
-                &*state,
-                ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
-            )
+            !matches!(&*state, ObjectState::Resolved(ObjectValue::Null))
         };
         if should_destroy {
             self.replace_detached_state(ObjectState::Resolved(ObjectValue::Destroyed));
@@ -2817,26 +2789,13 @@ impl ObjectHandle {
     /// whose value has not yet been resolved returns `false` — this method
     /// never performs resolution itself, so an unresolved handle is not
     /// assumed to be null. Once resolved, this reflects the real value:
-    /// `true` both for a genuinely parsed `null` object and for a reference
-    /// that turned out to be missing from the source. A handle disconnected
-    /// when its owning document is dropped is `Destroyed`, not null.
+    /// `true` for both a genuinely parsed `null` object and a reference that
+    /// qpdf resolved to its null fallback. A handle disconnected when its
+    /// owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
         let state = self.0.borrow().state.clone();
-        let is_null = matches!(
-            &*state.borrow(),
-            ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
-        );
+        let is_null = matches!(&*state.borrow(), ObjectState::Resolved(ObjectValue::Null));
         is_null
-    }
-
-    /// True if this indirect handle resolved as a missing or malformed source
-    /// object rather than as a parsed literal null. The distinction is kept
-    /// private to the canonical reader/consumer boundary because both states
-    /// intentionally present as null through the public qpdf-compatible view.
-    pub(crate) fn is_missing(&self) -> bool {
-        let state = self.0.borrow().state.clone();
-        let is_missing = matches!(&*state.borrow(), ObjectState::Missing);
-        is_missing
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -2931,7 +2890,7 @@ impl ObjectHandle {
     /// key, while an indirect
     /// null or dangling indirect reference is retained as the dictionary
     /// value. A no-op on a
-    /// non-dictionary handle or an unresolved/missing/destroyed indirect
+    /// non-dictionary handle or an unresolved/destroyed indirect
     /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
     /// than panicking. Also a no-op if `value` is a direct handle sharing
     /// `self`'s value state — inserting it into the dictionary would
@@ -3424,7 +3383,6 @@ impl ObjectHandle {
             }
             let children = match &*state.borrow() {
                 ObjectState::Resolved(value) => Self::direct_children(value),
-                ObjectState::Missing => Vec::new(), // cov:ignore: Missing handles are indirect and filtered before this walk
             };
             pending.extend(children.into_iter().filter(|child| child.is_direct()));
         }
@@ -3518,7 +3476,6 @@ impl ObjectHandle {
                 drop(slot);
                 let children = match &*state.borrow() {
                     ObjectState::Resolved(value) => Self::direct_children(value),
-                    ObjectState::Missing => Vec::new(), // cov:ignore: Missing handles are indirect and skipped by this walk
                 };
                 children
             };
@@ -3569,7 +3526,7 @@ impl ObjectHandle {
     /// live value every other clone of this handle also observes — mirrors
     /// `QPDFObjectHandle::removeKey` (`libqpdf/QPDFObjectHandle.cc:1226-1234`).
     /// A no-op if `key` is absent, this handle is not a dictionary, or the
-    /// indirect handle is unresolved/missing/destroyed. `key` must be qpdf's
+    /// indirect handle is unresolved/destroyed. `key` must be qpdf's
     /// decoded, canonical dictionary key including its leading `/`; this API
     /// does not normalize slashless input. Never performs resolution itself.
     ///
@@ -3599,7 +3556,7 @@ impl ObjectHandle {
     /// resolving/duplicating through indirection, not a single-level-only
     /// copy. A scalar value is cloned outright. Always returns a direct
     /// handle regardless of whether `self` is indirect. Never performs
-    /// resolution itself: shallow-copying an unresolved/missing/destroyed
+    /// resolution itself: shallow-copying an unresolved/destroyed
     /// indirect handle produces a direct null handle, matching every other
     /// accessor's "no hidden I/O" rule.
     ///
@@ -5398,9 +5355,7 @@ impl ObjectHandle {
         self.try_dereference()?;
         self.with_value(|value| {
             Ok(value
-                .expect(
-                    "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
-                )
+                .expect("every reachable state here (direct or indirect Resolved) carries a value")
                 .type_code())
         })
     }
@@ -5414,9 +5369,7 @@ impl ObjectHandle {
         self.try_dereference()?;
         self.with_value(|value| {
             Ok(value
-                .expect(
-                    "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
-                )
+                .expect("every reachable state here (direct or indirect Resolved) carries a value")
                 .type_name())
         })
     }
@@ -5475,26 +5428,22 @@ impl ObjectHandle {
 
     // `try_dereference` owns the explicit resolution boundary. Once the
     // handle is resolved, including to qpdf's internal Unresolved/Reserved/
-    // Destroyed value, this helper exposes the actual ObjectValue. Missing
-    // remains the only state presented as a synthetic null here.
+    // Destroyed value, this helper exposes the actual ObjectValue.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
         let state = state.borrow();
         match &*state {
             ObjectState::Resolved(value) => f(Some(value)),
-            ObjectState::Missing => f(Some(&ObjectValue::Null)),
         }
     }
 
-    // Mutable twin of `with_value`: Missing has no live ObjectValue payload;
-    // every resolved qpdf value, including the internal sentinels, is a real
-    // mutable value-layer slot.
+    // Mutable twin of `with_value`: every resolved qpdf value, including the
+    // internal sentinels, is a real mutable value-layer slot.
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
         let mut state = state.borrow_mut();
         match &mut *state {
             ObjectState::Resolved(value) => f(Some(value)),
-            ObjectState::Missing => f(None), // cov:ignore: Missing handles are never mutable direct slots
         }
     }
 
@@ -6443,7 +6392,7 @@ fn unparse_object_walk_with_ref_map(
             }
             None => {
                 // cov:ignore-start: successful dereference exposes Null for
-                // missing states or errors while unresolved.
+                // the null fallback or errors while unresolved.
                 out.extend_from_slice(b"null");
                 Ok(None)
                 // cov:ignore-end
@@ -7504,7 +7453,7 @@ where
             }
             None => {
                 // cov:ignore-start: successful dereference exposes Null for
-                // missing states or errors while unresolved.
+                // the null fallback or errors while unresolved.
                 out.extend_from_slice(b"null");
                 Ok(None)
                 // cov:ignore-end
@@ -7651,7 +7600,7 @@ where
             }
             None => {
                 // cov:ignore-start: successful dereference exposes Null for
-                // missing states or errors while unresolved.
+                // the null fallback or errors while unresolved.
                 out.extend_from_slice(b"null");
                 Ok(None)
                 // cov:ignore-end
@@ -10519,7 +10468,7 @@ pub(crate) mod identity_tests {
             _object_ref: ObjectRef,
             handle: &ObjectHandle,
         ) -> crate::Result<()> {
-            handle.set_missing();
+            handle.set_resolved(ObjectValue::Null);
             Ok(())
         }
     }
@@ -11804,7 +11753,7 @@ mod uniform_identity_tests {
     }
 
     #[test]
-    fn disconnect_preserves_literal_null_and_missing_as_null() {
+    fn disconnect_preserves_literal_null_and_resolved_null_as_null() {
         let resolver = resolver();
         let literal_null = ObjectHandle::null();
         literal_null.set_parsed_offset_if_unset(55);
@@ -11814,13 +11763,13 @@ mod uniform_identity_tests {
         assert!(literal_null.is_null());
         assert_eq!(literal_null.get_parsed_offset(), 55);
 
-        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(51, 0), -1);
-        missing.set_missing();
-        missing.promote_to_indirect(ObjectRef::new(53, 0), 93, Rc::downgrade(&resolver));
-        missing.disconnect();
-        assert!(missing.is_direct());
-        assert!(missing.is_null());
-        assert_eq!(missing.get_parsed_offset(), NO_PARSED_OFFSET);
+        let resolved_null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(51, 0), -1);
+        resolved_null.set_resolved(ObjectValue::Null);
+        resolved_null.promote_to_indirect(ObjectRef::new(53, 0), 93, Rc::downgrade(&resolver));
+        resolved_null.disconnect();
+        assert!(resolved_null.is_direct());
+        assert!(resolved_null.is_null());
+        assert_eq!(resolved_null.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
     #[test]
@@ -12559,65 +12508,37 @@ mod resolution_state_tests {
     }
 
     #[test]
-    fn set_missing_marks_the_handle_resolved_to_null() {
-        // `Missing` (dangling/broken reference) must present the same
-        // observable value as a genuinely parsed `null` object — but see
-        // `set_resolved_with_a_null_value_is_indistinguishable_from_the_outside`
-        // for proof the two routes are not literally the same variant.
+    fn resolving_to_qpdf_null_resets_the_cached_source_offset() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_missing();
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.set_parsed_offset_if_unset(100);
+
+        handle.set_resolved(ObjectValue::Null);
+
+        assert!(handle.is_null());
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn set_resolved_null_marks_the_handle_resolved_to_null() {
+        // A dangling or broken reference uses the same observable null value
+        // as a genuinely parsed literal null.
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Null);
         assert!(handle.is_resolved());
         assert!(handle.is_null());
         assert_eq!(handle.as_integer(), None);
     }
 
-    /// The two null routes are distinct [`ObjectState`] variants that no
-    /// public observation can tell apart.
-    ///
-    /// Named by `set_missing_marks_the_handle_resolved_to_null`'s comment,
-    /// which cited it before it existed. Both halves matter and neither
-    /// implies the other: the *indistinguishable* half is what lets
-    /// `reader/resolver.rs` pick `set_missing` for qpdf's loop branch, where
-    /// qpdf caches a live `QPDF_Null` (`libqpdf/QPDF.cc:1711`); the *distinct
-    /// variant* half is what makes `with_value_mut` behave differently between
-    /// them, which nothing can observe today only because every caller matches
-    /// on a container variant `Null` is not.
+    /// A null-resolved indirect handle has the same value-layer state as a
+    /// parsed literal null; there is no separate qpdf missing sentinel.
     #[test]
-    fn set_resolved_with_a_null_value_is_indistinguishable_from_the_outside() {
-        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        missing.set_missing();
+    fn set_resolved_with_a_null_value_uses_the_null_value_layer() {
         let null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         null.set_resolved(ObjectValue::Null);
 
-        for observation in [
-            ObjectHandle::is_resolved,
-            ObjectHandle::is_null,
-            ObjectHandle::is_indirect,
-            ObjectHandle::is_direct,
-        ] {
-            assert_eq!(observation(&missing), observation(&null));
-        }
-        assert_eq!(missing.as_integer(), null.as_integer());
-        assert_eq!(missing.as_array().is_none(), null.as_array().is_none());
-        assert_eq!(
-            missing.as_dictionary().is_none(),
-            null.as_dictionary().is_none()
-        );
-        assert_eq!(missing.as_stream_data(), null.as_stream_data());
-        assert_eq!(
-            missing.type_code().expect("missing type code"),
-            null.type_code().expect("null type code")
-        );
-        assert_eq!(missing.unparse_resolved(), null.unparse_resolved());
-        assert_eq!(missing.get_parsed_offset(), null.get_parsed_offset());
-
-        // Asserted with `matches!` rather than by mapping the state to a name:
-        // a mapping needs arms for the two variants neither handle can be in,
-        // and an arm nothing reaches is an uncovered line.
-        assert!(
-            matches!(&*missing.0.borrow().state.borrow(), ObjectState::Missing),
-            "`set_missing` must leave the slot in the `Missing` variant"
-        );
+        assert!(null.is_resolved());
+        assert!(null.is_null());
         let state = null.0.borrow().state.clone();
         assert!(
             matches!(&*state.borrow(), ObjectState::Resolved(ObjectValue::Null)),
@@ -12626,7 +12547,7 @@ mod resolution_state_tests {
     }
 
     #[test]
-    fn set_missing_resets_a_previously_recorded_parsed_offset() {
+    fn set_resolved_null_resets_a_previously_recorded_parsed_offset() {
         // Design's Parsed-Offset Contract: "An absent, freed, dangling,
         // cyclic, or otherwise unresolvable indirect object ... resolves to
         // null with parsed offset -1." A handle that was already resolved
@@ -12638,19 +12559,19 @@ mod resolution_state_tests {
         handle.set_parsed_offset_if_unset(100);
         assert_eq!(handle.get_parsed_offset(), 100);
 
-        handle.set_missing();
+        handle.set_resolved(ObjectValue::Null);
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
         assert!(handle.is_null());
     }
 
     #[test]
-    fn set_resolved_and_set_missing_are_a_no_op_on_a_direct_handle() {
-        // Direct handles have no resolution state; calling either setter must
-        // not panic and must leave the original value untouched.
+    fn set_resolved_is_a_no_op_on_a_direct_handle() {
+        // Direct handles have no resolution state; calling the setter must not
+        // panic and must leave the original value untouched.
         let handle = ObjectHandle::integer(42);
         handle.set_resolved(ObjectValue::Integer(99));
-        handle.set_missing();
+        handle.set_resolved(ObjectValue::Null);
         assert_eq!(handle.as_integer(), Some(42));
     }
 
@@ -12677,7 +12598,7 @@ mod resolution_state_tests {
 
     #[test]
     fn disconnect_resets_a_previously_recorded_parsed_offset() {
-        // Mirrors `set_missing_resets_a_previously_recorded_parsed_offset`
+        // Mirrors `set_resolved_null_resets_a_previously_recorded_parsed_offset`
         // for the same Parsed-Offset Contract clause: a handle a caller
         // keeps alive past its owning `Pdf`'s drop must not keep reporting
         // its former body's source position once it reads as null.
@@ -12789,9 +12710,9 @@ mod resolution_state_tests {
         let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         assert!(format!("{unresolved:?}").contains("Unresolved"));
 
-        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
-        missing.set_missing();
-        assert!(format!("{missing:?}").contains("Missing"));
+        let null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
+        null.set_resolved(ObjectValue::Null);
+        assert!(format!("{null:?}").contains("Resolved(..)"));
 
         let destroyed = ObjectHandle::new_indirect_unresolved(ObjectRef::new(3, 0), 0);
         destroyed.set_resolved(ObjectValue::Integer(1));
@@ -13350,12 +13271,12 @@ mod type_code_tests {
     }
 
     #[test]
-    fn missing_indirect_handle_reports_null_not_a_distinct_missing_code() {
+    fn null_resolved_indirect_handle_reports_null_not_a_distinct_missing_code() {
         // qpdf has no separate "missing" ot_* code — a dangling/broken
-        // reference presents as ot_null, matching set_missing's own
+        // reference presents as ot_null, matching the qpdf null fallback's
         // documented is_null()==true contract.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        handle.set_missing();
+        handle.set_resolved(ObjectValue::Null);
         assert_eq!(handle.type_code().expect("type code"), 2, "ot_null");
         assert_eq!(handle.type_name().expect("type name"), "null");
         assert!(!handle.is_reserved());
@@ -13614,7 +13535,7 @@ mod unparse_tests {
         // child's value is already known (is_resolved()), never by forcing
         // new resolution (see the "keeps a not-yet-resolved" test below).
         let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        missing.set_missing();
+        missing.set_resolved(ObjectValue::Null);
         let dict = ObjectHandle::dictionary(vec![
             (b"A".to_vec(), missing),
             (b"B".to_vec(), ObjectHandle::integer(1)),
@@ -15071,7 +14992,7 @@ mod unparse_object_tests {
         assert_eq!(redirect_out, b"null");
 
         let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(92, 0), 0);
-        missing.set_missing();
+        missing.set_resolved(ObjectValue::Null);
         redirect_out.clear();
         missing
             .unparse_object_with_ref_map_and_removed_with_string_writer(
@@ -17309,7 +17230,7 @@ mod mutation_tests {
     #[test]
     fn replace_key_preserves_a_dangling_indirect_reference_and_its_identity() {
         let dangling = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
-        dangling.set_missing();
+        dangling.set_resolved(ObjectValue::Null);
         let dict = ObjectHandle::dictionary(vec![]);
 
         dict.replace_key(b"/Dangling", dangling.clone()).unwrap();
@@ -18228,7 +18149,7 @@ mod mutation_tests {
         assert!(replaced.containing_object_refs().is_empty());
         assert_eq!(missing.containing_object_refs(), vec![owner_ref]);
 
-        owner.set_missing();
+        owner.set_resolved(ObjectValue::Null);
         assert!(missing.containing_object_refs().is_empty());
 
         let disconnected = ObjectHandle::dictionary(vec![]);
