@@ -32,7 +32,7 @@ pub(crate) fn run_test_80<R: Read + Seek>(
     // whole-document overlay/underlay operation, not the standalone
     // "transform this page's annotations with an arbitrary matrix, then copy
     // them onto a page in a different document" sequence this test performs
-    // directly. `PdfWriter` (writer/pdf_writer.rs) already supports QDF
+    // directly. `PdfWriter` (writer.rs) already supports QDF
     // mode, static IDs, and file output, but there is nothing correct to
     // feed it here: writing the *un*transformed documents would not be
     // qpdf's actual output, so no output files are produced.
