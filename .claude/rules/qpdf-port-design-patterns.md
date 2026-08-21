@@ -312,9 +312,12 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
 4 箇所とも前者の責務を指していたため `handleUnderOverlay` に修正した。
 どちらも「qpdf 風の識別子をパターンマッチで作文し、実在確認しないまま
 docs に書いた」という同一の失敗パターン。`crates/flpdf/src/job/*.rs`
-全 17 ファイル・228 関数を対象にした命名監査では、この 2 件の doc
-記載ミス以外に high confidence の命名乖離は見つからなかった——
-`doX`→`x`、`handleX`→`handle_x` の変換自体は一貫して正確に行われていた。
+全 17 ファイルの `pub fn`/`fn` 宣言（`rg -c '^\s*(pub )?fn '` で数えた
+関数シグネチャの総数）を対象にした命名監査では、この 2 件の doc 記載
+ミスと、前項で挙げた `apply_overlay_specs`（未リネームの既知の例外、
+`flpdf-ei0h` で追跡中）以外に high confidence の命名乖離は見つからな
+かった——`doX`→`x`、`handleX`→`handle_x` の変換は、その 1 件を除き
+一貫して正確に行われていた。
 
 ## 8. `pub` 境界も qpdf の public/private 境界に倣う
 
