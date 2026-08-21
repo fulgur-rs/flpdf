@@ -5443,17 +5443,22 @@ fn qpdf_selector_integer(value: &str) -> CliResult<i32> {
         return Ok(0);
     }
     let prefix = &value[..digits_end];
-    let parsed = prefix
-        .parse::<i128>()
-        .map_err(|_| format!("overflow/underflow converting {original} to 64-bit integer"))?;
+    let parsed = prefix.parse::<i128>().map_err(|_| {
+        UsageError::new(format!(
+            "overflow/underflow converting {original} to 64-bit integer"
+        ))
+    })?;
     if !(i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&parsed) {
-        return Err(format!("overflow/underflow converting {original} to 64-bit integer").into());
+        return Err(UsageError::new(format!(
+            "overflow/underflow converting {original} to 64-bit integer"
+        ))
+        .into());
     }
     let parsed = parsed as i64;
     Ok(i32::try_from(parsed).map_err(|_| {
-        format!(
+        UsageError::new(format!(
             "integer out of range converting {parsed} from a 8-byte signed type to a 4-byte signed type"
-        )
+        ))
     })?)
 }
 
@@ -5466,8 +5471,11 @@ fn run_show_object(
     raw_stream_data: bool,
     filtered_stream_data: bool,
 ) -> CliResult<()> {
-    let input = input.ok_or("missing input file")?;
+    // qpdf's Config::showObject callback parses the selector during argv
+    // parsing, before QPDFJob::run() ever opens the input file, so a usage
+    // error in the selector must surface even when no input file is given.
     let selector = parse_show_object_selector(selector)?;
+    let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let object = match selector {
         ShowObjectSelector::Trailer => pdf.trailer_handle(),
@@ -8132,17 +8140,44 @@ mod tests {
 
     #[test]
     fn show_object_selector_integer_errors_match_qpdf() {
+        let overflow = qpdf_selector_integer("9223372036854775808").expect_err("i64 overflow");
         assert_eq!(
-            qpdf_selector_integer("9223372036854775808")
-                .expect_err("i64 overflow")
-                .to_string(),
+            overflow.to_string(),
             "overflow/underflow converting 9223372036854775808 to 64-bit integer"
         );
+        assert!(
+            overflow.downcast_ref::<UsageError>().is_some(),
+            "qpdf reports this as a QPDFUsage-class error (thrown from argv parsing, \
+             before the input file is opened), so it must route through \
+             flpdf-cli's usage_exit path rather than the generic error path"
+        );
+
+        let narrowing = qpdf_selector_integer("2147483648").expect_err("i32 narrowing overflow");
         assert_eq!(
-            qpdf_selector_integer("2147483648")
-                .expect_err("i32 narrowing overflow")
-                .to_string(),
+            narrowing.to_string(),
             "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        );
+        assert!(narrowing.downcast_ref::<UsageError>().is_some());
+    }
+
+    #[test]
+    fn show_object_selector_parses_before_checking_for_an_input_file() {
+        // qpdf's Config::showObject parses the selector during argv parsing,
+        // before QPDFJob::run() ever opens an input file, so a usage error in
+        // the selector must surface even when no input file was given.
+        let error = run_show_object(
+            None,
+            false,
+            &PasswordArgs::default(),
+            "2147483648",
+            false,
+            false,
+        )
+        .expect_err("overflow selector with no input file");
+        assert!(
+            error.downcast_ref::<UsageError>().is_some(),
+            "got {error} instead of a UsageError -- the missing-input-file check must not \
+             run before selector parsing"
         );
     }
 }

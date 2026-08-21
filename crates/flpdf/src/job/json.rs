@@ -221,11 +221,21 @@ pub enum JsonJobOutput<'a> {
     },
 }
 
-/// Invalid combination of command-level JSON output options.
+/// A qpdf `QPDFUsage`-class error: an invalid command-line argument or
+/// combination of options, reported before any file is touched.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct UsageError {
     message: String,
+}
+
+impl UsageError {
+    /// Construct a usage error with the given message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 /// Failure while resolving command-level JSON options or writing JSON output.
