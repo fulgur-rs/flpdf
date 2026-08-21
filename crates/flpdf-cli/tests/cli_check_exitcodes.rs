@@ -467,7 +467,7 @@ fn check_linearized_n_mismatch_uses_qpdf_warning() {
         String::from_utf8(output.stderr).unwrap(),
         format!(
             "WARNING: {path}: error encountered while checking linearization data: \
-             linearization hint table: /N does not match number of pages\n\
+             {path} (linearization hint table, offset 908): /N does not match number of pages\n\
              flpdf: operation succeeded with warnings\n"
         )
     );
@@ -499,7 +499,7 @@ fn check_linearized_p_wrong_type_uses_qpdf_warning() {
         String::from_utf8(output.stderr).unwrap(),
         format!(
             "WARNING: {path}: error encountered while checking linearization data: \
-             linearization dictionary: some keys in linearization dictionary are of the wrong type\n\
+             {path} (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type\n\
              flpdf: operation succeeded with warnings\n"
         )
     );
