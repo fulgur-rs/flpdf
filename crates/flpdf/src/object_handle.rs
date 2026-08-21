@@ -121,11 +121,13 @@ use std::rc::{Rc, Weak};
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
 type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
 
-/// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
-pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
+/// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`, for the
+/// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
+pub const STREAM_ENCODE_COMPRESS: u32 = 1;
 
-/// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
-pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
+/// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`, for the
+/// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
+pub const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
 const STREAM_DATA_PROVIDER_DEFAULT_ERROR: &str =
     "you must override provideStreamData -- see QPDFObjectHandle.hh";
@@ -4627,7 +4629,8 @@ impl ObjectHandle {
     /// writer retry a failed filtering decision with raw bytes
     /// (`libqpdf/QPDFWriter.cc:1239-1314`).
     ///
-    /// `encode_flags` uses qpdf's `qpdf_ef_compress` and
+    /// `encode_flags` is a bitwise OR of [`STREAM_ENCODE_COMPRESS`] and
+    /// [`STREAM_ENCODE_NORMALIZE`], qpdf's `qpdf_ef_compress` and
     /// `qpdf_ef_normalize` bits. The output stages are built first, then
     /// the stream filters are added in reverse `/Filter` order. The source
     /// is finally dispatched through the completed chain without a legacy

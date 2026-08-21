@@ -286,25 +286,42 @@ fn process(
         if !resolve_objstm_type(&mut pdf, &stream_dict) {
             continue;
         }
-        // qpdf's test_tokenizer uses the public pipeStreamData overload so an
-        // unfilterable object stream can still be tokenized from raw bytes
-        // after its warning. Do not use getStreamData here: qpdf deliberately
-        // rejects raw pass-through from that decoded-data API. Keep the
-        // canonical handle and avoid Pdf::resolve_borrowed so a stream-length
-        // recovery emits only one warning sequence.
+        // qpdf's real test_tokenizer.cc:211 calls getStreamData
+        // (qpdf_dl_specialized), which throws when filtering wasn't
+        // attempted (`libqpdf/QPDF_Stream.cc:345-359`) -- an unfilterable
+        // object stream aborts that tool's single top-level try/catch
+        // rather than tokenizing raw bytes. This tool instead uses the
+        // lower-level pipeStreamData overload directly and continues
+        // tokenizing the remaining object streams after reporting one
+        // unfilterable stream: an flpdf-only choice with no qpdf
+        // counterpart, not yet reconciled with qpdf's actual
+        // abort-on-first-failure behavior. Keep the canonical handle and
+        // avoid Pdf::resolve_borrowed so a stream-length recovery emits
+        // only one warning sequence.
         let mut sink = ObjectStreamPipeline::default();
         let mut filtering_attempted = false;
-        if !stream_handle
-            .pipe_stream_data(
-                &mut sink,
-                &mut filtering_attempted,
-                0,
-                DecodeLevel::Specialized,
-                false,
-                false,
-            )
-            .map_err(|e| e.to_string())?
-        {
+        let piped = stream_handle.pipe_stream_data(
+            &mut sink,
+            &mut filtering_attempted,
+            0,
+            DecodeLevel::Specialized,
+            false,
+            false,
+        );
+        let filtered = match piped {
+            Ok(filtered) => filtered,
+            Err(e) => {
+                let _ = emit_new_diagnostics(
+                    &pdf,
+                    &mut diagnostics_written,
+                    &filename_diagnostic,
+                    stdout,
+                    stderr,
+                );
+                return Err(e.to_string());
+            }
+        };
+        if !filtered {
             let _ = emit_new_diagnostics(
                 &pdf,
                 &mut diagnostics_written,
