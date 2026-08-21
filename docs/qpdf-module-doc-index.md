@@ -33,7 +33,10 @@
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command and JSON section orchestration |
 | `crates/flpdf/src/job/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/job/page_collate.rs` | correspondence | QPDFJob.cc handlePageSpecs collate ordering split into a page-operation module |
+| `crates/flpdf/src/job/page_combine.rs` | correspondence | QPDFJob.cc handlePageSpecs multi-input combination split into a page-operation module |
 | `crates/flpdf/src/job/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
+| `crates/flpdf/src/job/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |
+| `crates/flpdf/src/job/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
 | `crates/flpdf/src/job/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
@@ -80,14 +83,11 @@
 | `crates/flpdf/src/page_annotation_enum.rs` | correspondence | QPDFPageObjectHelper.cc annotation enumeration |
 | `crates/flpdf/src/page_annotation_flatten.rs` | correspondence | QPDFPageObjectHelper.cc annotation flattening split from the page helper |
 | `crates/flpdf/src/page_closure.rs` | correspondence | QPDF.cc copyForeignObject graph closure split from object copying |
-| `crates/flpdf/src/page_combine.rs` | correspondence | QPDFJob.cc handlePageSpecs multi-input combination split into a page-operation module |
 | `crates/flpdf/src/page_document_helper.rs` | correspondence | QPDFPageDocumentHelper.cc responsibilities split with page extraction |
 | `crates/flpdf/src/page_extract.rs` | correspondence | QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only |
 | `crates/flpdf/src/page_form_xobject.rs` | correspondence | QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper |
 | `crates/flpdf/src/page_label_document_helper.rs` | correspondence | \`QPDFPageLabelDocumentHelper.cc\` canonical page-label access and reconstruction |
 | `crates/flpdf/src/page_object_helper.rs` | correspondence | QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules |
-| `crates/flpdf/src/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |
-| `crates/flpdf/src/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/page_rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/page_splice.rs` | correspondence | \`QPDFPageDocumentHelper.cc:37-52\` delegates page insertion/removal to the page-tree owner |
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |

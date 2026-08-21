@@ -27,10 +27,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+use super::page_range::PageRange;
 use crate::page_document_helper::PageDocumentHelper;
 use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
-use crate::page_range::PageRange;
 use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
@@ -1127,8 +1127,8 @@ mod byte_gate {
         OverlaySource, OverlaySpec,
     };
     use crate::page_form_xobject::import_page_as_form_xobject;
-    use crate::page_range::PageRange;
     use crate::pages::page_refs;
+    use crate::PageRange;
     use crate::{Object, ObjectRef, Pdf, PdfWriter};
     use std::io::{Read, Seek};
     use std::path::Path;

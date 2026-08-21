@@ -2,8 +2,8 @@
 //! Page-tree rebuild after extraction / merge / rotate.
 //!
 //! Given an open [`Pdf`] and an ordered list of selected leaf `/Page`
-//! `ObjectRef`s (the output of [`crate::page_plan::PagePlan`] /
-//! [`crate::page_combine::CombinedPlan`] for a **single** document), this
+//! `ObjectRef`s (the output of [`crate::PagePlan`] /
+//! [`crate::CombinedPlan`] for a **single** document), this
 //! module rebuilds the document's `/Pages` tree so that:
 //!
 //! - The root `/Pages` node's `/Kids` enumerates exactly the selected pages,
@@ -58,7 +58,7 @@
 //! # Scope (single document only)
 //!
 //! This layer operates on **one** [`Pdf`]. Rebuilding across multiple input
-//! documents ([`crate::page_combine::CombinedPlan`] with >1 input) additionally
+//! documents ([`crate::CombinedPlan`] with >1 input) additionally
 //! requires cross-document object copying (renumbering, encryption-boundary
 //! handling, name-conflict resolution) and is a separate future layer. The
 //! single-input CLI wiring, outline/dest remap, and AcroForm
@@ -355,8 +355,8 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
 /// Rebuild the document's `/Pages` tree from `selected` leaf page refs.
 ///
 /// `selected` is the ordered list of source `/Page` `ObjectRef`s (from
-/// [`crate::page_plan::PagePlan::pages`] / a single-input
-/// [`crate::page_combine::CombinedPlan`]). Duplicate refs are permitted and
+/// [`crate::PagePlan::pages`] / a single-input
+/// [`crate::CombinedPlan`]). Duplicate refs are permitted and
 /// produce duplicate output pages, matching qpdf.
 ///
 /// On success the in-memory document is mutated so that its root `/Pages`
@@ -366,8 +366,8 @@ fn remove_inheritable_keys_from_page_tree<R: Read + Seek>(
 /// result with [`crate::PdfWriter`].
 ///
 /// The `selected` refs it consumes are produced by
-/// [`PagePlan`](crate::page_plan::PagePlan) (single document) or a single-input
-/// [`CombinedPlan`](crate::page_combine::CombinedPlan). For an end-to-end
+/// [`PagePlan`](crate::PagePlan) (single document) or a single-input
+/// [`CombinedPlan`](crate::CombinedPlan). For an end-to-end
 /// extraction walkthrough see the runnable `examples/extract_pages.rs`.
 ///
 /// # Errors

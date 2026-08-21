@@ -9,8 +9,8 @@
 use super::page_merge::{
     merge_documents_with_resource_mode, source_top_level_field_names, MergeInput,
 };
+use super::page_plan::PagePlan;
 use crate::page_label_document_helper::LabelRange;
-use crate::page_plan::PagePlan;
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::resources::RemoveUnreferencedResources;
 use crate::{

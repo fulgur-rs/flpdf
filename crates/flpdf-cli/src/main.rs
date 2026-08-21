@@ -14,14 +14,13 @@ use flpdf::{
     collate,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
     outline_dest_remap::remap_outline_and_dests,
-    page_combine::{CombinedPage, CombinedPlan},
     page_rotate::apply_rotate_to_pages,
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
     subset_prune::prune_after_subset,
     thread_bead_p::drop_thread_bead_dangling_p,
-    InputSpec, PageRange, RotateSpec,
+    CombinedPage, CombinedPlan, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
     filters, flatten_rotation_on_pages,
@@ -4563,7 +4562,7 @@ fn run_page_extraction_from_multiple_sources(
         .map(|(index, &page_ref)| {
             Ok(CombinedPage {
                 source_index: 0,
-                page: flpdf::page_plan::SelectedPage {
+                page: flpdf::SelectedPage {
                     index_1based: u32::try_from(index + 1)
                         .map_err(|_| "--pages: too many output pages")?,
                     page_ref,

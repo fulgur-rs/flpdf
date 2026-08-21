@@ -19,7 +19,10 @@ mod json_sections;
 mod lifecycle;
 mod overlay;
 mod page_collate;
+mod page_combine;
 mod page_merge;
+mod page_plan;
+mod page_range;
 mod page_specs;
 mod page_split;
 mod rotate_spec;
@@ -53,7 +56,10 @@ pub use overlay::{
     OverlayVerboseSource,
 };
 pub use page_collate::collate;
+pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_merge::{merge_documents, MergeInput};
+pub use page_plan::{PagePlan, SelectedPage};
+pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_specs::PageSpecInput;
 pub use page_split::SplitPageOptions;
 pub use rotate_spec::RotateSpec;

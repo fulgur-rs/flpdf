@@ -14,7 +14,7 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{page_plan::PagePlan, page_range::PageRange, Pdf};
+//! use flpdf::{PagePlan, PageRange, Pdf};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
 //! let range = PageRange::parse("1,3,5")?;
