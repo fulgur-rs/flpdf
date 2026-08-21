@@ -252,10 +252,20 @@ fn push_child_reference<R: Read + Seek>(
     }
     // qpdf calls `kid.replaceKey(key, ...)` (`QPDF_optimization.cc:222-227`)
     // only for a key actually being added; an already-complete leaf is never
-    // touched. Mirror that by writing back only when a key was inserted,
-    // so an unchanged leaf's cached parse extent survives this pass.
+    // touched, and `replaceKey` itself never calls `updateCache`
+    // (`QPDFObjectHandle.cc:1199-1209` delegates straight to the
+    // dictionary's own key mutation), so even a leaf that *does* inherit a
+    // key keeps its recorded source extent in qpdf. `Pdf::set_object` has no
+    // equivalent surgical per-key primitive here (it always clears the
+    // extent, matching qpdf's whole-object `replaceObject`/`updateCache`,
+    // `QPDF.cc:1985-1993`); preserve the extent explicitly across the
+    // otherwise-equivalent whole-dictionary write-back this module uses.
     if changed {
+        let handle = pdf.get_object_handle(kid_ref);
+        let extents = handle.end_offsets();
         pdf.set_object(kid_ref, Object::Dictionary(leaf));
+        pdf.get_object_handle(kid_ref)
+            .set_end_offsets(extents.0, extents.1);
     }
     Ok(())
 }
@@ -307,11 +317,22 @@ fn push_internal<R: Read + Seek>(
         .map(<[Object]>::to_vec);
     // qpdf calls `cur_pages.removeKey(key)` (`QPDF_optimization.cc:200`)
     // only for an inheritable key actually being pulled up; a node with no
-    // inheritable attributes of its own is never written back. Mirror that
-    // by writing back only when an attribute was pulled from this node, so
-    // an unchanged /Pages node's cached parse extent survives this pass.
+    // inheritable attributes of its own is never written back, and
+    // `removeKey` itself never calls `updateCache`
+    // (`QPDFObjectHandle.cc:1227-1236` delegates straight to the
+    // dictionary's own key mutation), so even a node that *does* have an
+    // attribute pulled up keeps its recorded source extent in qpdf.
+    // `Pdf::set_object` has no equivalent surgical per-key primitive here
+    // (it always clears the extent, matching qpdf's whole-object
+    // `replaceObject`/`updateCache`, `QPDF.cc:1985-1993`); preserve the
+    // extent explicitly across the otherwise-equivalent whole-dictionary
+    // write-back this module uses.
     if !own_keys.is_empty() {
+        let handle = pdf.get_object_handle(node_ref);
+        let extents = handle.end_offsets();
         pdf.set_object(node_ref, Object::Dictionary(dict));
+        pdf.get_object_handle(node_ref)
+            .set_end_offsets(extents.0, extents.1);
     }
 
     if let Some(kids) = kids {
@@ -418,6 +439,43 @@ mod tests {
 
         assert!(error.to_string().contains("inheritable attribute"));
         assert_eq!(pdf.resolve(root).unwrap(), before);
+    }
+
+    #[test]
+    fn pushing_an_inherited_key_onto_a_leaf_preserves_its_source_extent() {
+        // The fixture's page 3 lacks /Rotate, so it actually inherits
+        // /Rotate 90 from its /Pages parent -- exercising
+        // `push_child_reference`'s `changed` branch, not the unchanged-leaf
+        // skip. qpdf's `kid.replaceKey` never clears the leaf's recorded
+        // source extent for this same mutation; the leaf's extent here must
+        // match.
+        let mut pdf = Pdf::open_mem_owned(pdf_with_inherited_scalar_rotate()).unwrap();
+        let leaf_ref = ObjectRef::new(3, 0);
+        pdf.get_object_handle(leaf_ref).try_dereference().unwrap();
+        let before = pdf.get_object_handle(leaf_ref).end_offsets();
+        assert_ne!(
+            before,
+            (-1, -1),
+            "fixture leaf must have a real parse extent"
+        );
+
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+        push(&mut pdf, &prepared, true, false).unwrap();
+
+        assert!(
+            matches!(
+                pdf.resolve(leaf_ref).unwrap(),
+                Object::Dictionary(ref page) if page.get("Rotate") == Some(&Object::Integer(90))
+            ),
+            "leaf must have actually inherited /Rotate"
+        );
+        assert_eq!(
+            pdf.get_object_handle(leaf_ref).end_offsets(),
+            before,
+            "inheriting a key must not clear the leaf's source extent"
+        );
     }
 
     #[test]
