@@ -3618,7 +3618,6 @@ impl ObjectHandle {
     /// document-owned and `StreamCopier::copyStreamData` needs that document
     /// for the source-dispatch lifetime contract.
     pub fn copy_stream(&self) -> Result<ObjectHandle> {
-        self.try_dereference()?;
         let type_name = self.type_name()?;
         let Some(source_dict) = self.as_stream_dict() else {
             return Err(Error::System(format!(
@@ -3820,10 +3819,7 @@ impl ObjectHandle {
     ) -> Result<Vec<u8>> {
         let names = match resource_names {
             Some(names) => names.clone(),
-            None => {
-                self.try_dereference()?;
-                try_get_resource_names(self)?
-            }
+            None => try_get_resource_names(self)?,
         };
         let max_suffix = *min_suffix + names.len();
         while *min_suffix <= max_suffix {
@@ -3853,7 +3849,6 @@ impl ObjectHandle {
     /// holder are resolved through the owning document before inspection;
     /// programmatically constructed direct handles remain context-free.
     pub fn is_form_xobject(&self) -> Result<bool> {
-        self.try_dereference()?;
         if self.type_code()? != 10 {
             return Ok(false);
         }
@@ -3872,7 +3867,6 @@ impl ObjectHandle {
     /// `exclude_imagemask` set, a boolean `/ImageMask true` excludes the
     /// stream; non-boolean or missing `/ImageMask` values do not.
     pub fn is_image(&self, exclude_imagemask: bool) -> Result<bool> {
-        self.try_dereference()?;
         if self.type_code()? != 10 {
             return Ok(false);
         }
@@ -3920,7 +3914,6 @@ impl ObjectHandle {
     /// Returns [`Error::System`] when `new_contents` is not a stream, and
     /// propagates content normalization, ownership, or replacement failures.
     pub fn add_page_contents(&self, new_contents: ObjectHandle, first: bool) -> Result<()> {
-        new_contents.try_dereference()?;
         if new_contents.type_code()? != 10 {
             let type_name = new_contents.type_name()?;
             return Err(Error::System(format!(
@@ -4047,9 +4040,7 @@ impl ObjectHandle {
     /// handle has no owning document, and propagates resolution, ownership,
     /// stream allocation, or provider-registration failures.
     pub fn coalesce_content_streams(&self) -> Result<()> {
-        self.try_dereference()?;
         let old_contents = self.try_get_key(b"/Contents")?;
-        old_contents.try_dereference()?;
         if old_contents.type_code()? == 10 || old_contents.as_array().is_none() {
             return Ok(());
         }
@@ -4245,7 +4236,6 @@ impl ObjectHandle {
     /// [`Self::get_page_contents`] prevents later entry points from
     /// reimplementing array/null handling.
     fn page_contents_with_description(&self) -> Result<(Vec<ObjectHandle>, String)> {
-        self.try_dereference()?;
         let description = format!("page object {}", object_generation_description(self));
         let contents = self.try_get_key(b"/Contents")?;
         contents.array_or_stream_to_stream_array(&description)
@@ -4264,7 +4254,6 @@ impl ObjectHandle {
         let mut result = Vec::new();
         if let Some(items) = self.as_array() {
             for (index, item) in items.into_iter().enumerate() {
-                item.try_dereference()?;
                 if item.type_code()? == 10 {
                     result.push(item);
                 } else {
