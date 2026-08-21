@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use flpdf::{
     DecodeLevel, Dictionary, Error, Object, ObjectHandle, PageDocumentHelper, Pdf, PdfWriter,
-    Pipeline, StreamDataMode, StreamDataProvider,
+    Pipeline, PipelineResult, StreamDataMode, StreamDataProvider,
 };
 
 use crate::output::write_bytes;
@@ -255,14 +255,42 @@ pub(crate) fn run_test_5<R: Read + Seek>(
     Ok(())
 }
 
+/// A `Pl_Buffer`-shaped [`Pipeline`] accumulator, for `run_test_6`'s direct
+/// [`ObjectHandle::pipe_stream_data`] call below.
+#[derive(Default)]
+struct ByteSink {
+    bytes: Vec<u8>,
+}
+
+impl Pipeline for ByteSink {
+    fn identifier(&self) -> &str {
+        "test 6 metadata stream"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
 /// qpdf source: `qpdf/test_driver.cc:422-439` (`test_6`).
 ///
 /// `metadata.pipeStreamData(&bufpl, 0, qpdf_dl_none)` decrypts (decode level
-/// and decryption are independent in qpdf) but applies no content filter;
-/// [`DecodeLevel::None`] on [`ObjectHandle::get_stream_data`] is the same
-/// operation. `get_raw_stream_data` would be the *wrong* substitution here
-/// since it skips decryption, inverting this test's cleartext-vs-encrypted
-/// detection on an encrypted-metadata fixture.
+/// and decryption are independent in qpdf) but requests no content filter,
+/// so `filtering_attempted` is unconditionally false and the overall-success
+/// return is discarded (`test_driver.cc:431` reads neither). This is the
+/// direct [`ObjectHandle::pipe_stream_data`] call, not
+/// [`ObjectHandle::get_stream_data`]: `get_stream_data` mirrors qpdf's
+/// `getStreamData`, which throws when `filtering_attempted` is false
+/// (`libqpdf/QPDF_Stream.cc:345-359`) -- a call shape qpdf's own test suite
+/// never uses with [`DecodeLevel::None`] for exactly that reason.
+/// `get_raw_stream_data` would be the *wrong* substitution here since it
+/// skips decryption, inverting this test's cleartext-vs-encrypted detection
+/// on an encrypted-metadata fixture.
 pub(crate) fn run_test_6<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     _filename: &[u8],
@@ -280,7 +308,17 @@ pub(crate) fn run_test_6<R: Read + Seek>(
             "test 6 run on file with no metadata".to_string(),
         ));
     }
-    let data = metadata.get_stream_data(DecodeLevel::None)?;
+    let mut sink = ByteSink::default();
+    let mut filtering_attempted = false;
+    metadata.pipe_stream_data(
+        &mut sink,
+        &mut filtering_attempted,
+        0,
+        DecodeLevel::None,
+        false,
+        false,
+    )?;
+    let data = sink.bytes;
     let cleartext = data.starts_with(b"<?xpacket");
     writeln!(
         stdout,

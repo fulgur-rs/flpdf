@@ -121,11 +121,13 @@ use std::rc::{Rc, Weak};
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
 type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
 
-/// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
-pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
+/// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`, for the
+/// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
+pub const STREAM_ENCODE_COMPRESS: u32 = 1;
 
-/// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
-pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
+/// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`, for the
+/// `encode_flags` argument of [`ObjectHandle::pipe_stream_data`].
+pub const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
 const STREAM_DATA_PROVIDER_DEFAULT_ERROR: &str =
     "you must override provideStreamData -- see QPDFObjectHandle.hh";
@@ -4627,14 +4629,14 @@ impl ObjectHandle {
     /// writer retry a failed filtering decision with raw bytes
     /// (`libqpdf/QPDFWriter.cc:1239-1314`).
     ///
-    /// `encode_flags` uses [`STREAM_ENCODE_COMPRESS`] and
-    /// [`STREAM_ENCODE_NORMALIZE`]. The output stages are built first, then
+    /// `encode_flags` is a bitwise OR of [`STREAM_ENCODE_COMPRESS`] and
+    /// [`STREAM_ENCODE_NORMALIZE`], qpdf's `qpdf_ef_compress` and
+    /// `qpdf_ef_normalize` bits. The output stages are built first, then
     /// the stream filters are added in reverse `/Filter` order. The source
     /// is finally dispatched through the completed chain without a legacy
     /// `Object` materialization.
-    #[allow(dead_code)] // writer/inspection consumers are not on the canonical resolver route yet.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pipe_stream_data(
+    pub fn pipe_stream_data(
         &self,
         pipeline: &mut dyn Pipeline,
         filtering_attempted: &mut bool,
@@ -4700,7 +4702,7 @@ impl ObjectHandle {
             false,
             false,
         )?; // cov:ignore: multiline call terminator has no executable coverage region
-        if !stream_data_succeeded {
+        if !stream_data_succeeded || !filtering_attempted {
             return Err(Error::Unsupported(
                 "error getting decoded stream data".to_owned(),
             ));
@@ -16372,6 +16374,31 @@ mod mutation_tests {
             Error::Unsupported(message) if message == "error getting decoded stream data"
         ));
         assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
+    fn get_stream_data_rejects_filters_gated_by_the_requested_decode_level() {
+        for (filter, decode_level) in [
+            (b"DCTDecode".as_slice(), DecodeLevel::Generalized),
+            (b"RunLengthDecode".as_slice(), DecodeLevel::Generalized),
+        ] {
+            let stream = ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(filter.to_vec()),
+                )]),
+                Rc::new(b"raw filtered bytes".to_vec()),
+            );
+
+            let error = stream
+                .get_stream_data(decode_level)
+                .expect_err("gated raw bytes must not be labeled as decoded");
+
+            assert!(matches!(
+                error,
+                Error::Unsupported(message) if message == "error getting decoded stream data"
+            ));
+        }
     }
 
     #[test]

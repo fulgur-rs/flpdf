@@ -7,7 +7,8 @@ use std::path::Path;
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult,
+    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Pipeline, PipelineResult,
+    Result as FlpdfResult,
 };
 
 use crate::common::test_driver_program_name_bytes;
@@ -15,6 +16,26 @@ use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning
 
 pub enum RunOutcome {
     Exit(u8),
+}
+
+#[derive(Default)]
+struct ObjectStreamPipeline {
+    bytes: Vec<u8>,
+}
+
+impl Pipeline for ObjectStreamPipeline {
+    fn identifier(&self) -> &str {
+        "object stream data"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 pub fn run(
@@ -265,13 +286,30 @@ fn process(
         if !resolve_objstm_type(&mut pdf, &stream_dict) {
             continue;
         }
-        // qpdf's test_tokenizer calls getStreamData on the same canonical
-        // object it just inspected. Do not cross back through
-        // Pdf::resolve_borrowed here: a stream-length recovery on the
-        // ObjStm container would otherwise run a second time through the
-        // legacy source/xref route and emit a second warning sequence.
-        let decoded = match stream_handle.get_stream_data(DecodeLevel::Specialized) {
-            Ok(decoded) => decoded,
+        // qpdf's real test_tokenizer.cc:211 calls getStreamData
+        // (qpdf_dl_specialized), which throws when filtering wasn't
+        // attempted (`libqpdf/QPDF_Stream.cc:345-359`) -- an unfilterable
+        // object stream aborts that tool's single top-level try/catch
+        // rather than tokenizing raw bytes. This tool instead uses the
+        // lower-level pipeStreamData overload directly and continues
+        // tokenizing the remaining object streams after reporting one
+        // unfilterable stream: an flpdf-only choice with no qpdf
+        // counterpart, not yet reconciled with qpdf's actual
+        // abort-on-first-failure behavior. Keep the canonical handle and
+        // avoid Pdf::resolve_borrowed so a stream-length recovery emits
+        // only one warning sequence.
+        let mut sink = ObjectStreamPipeline::default();
+        let mut filtering_attempted = false;
+        let piped = stream_handle.pipe_stream_data(
+            &mut sink,
+            &mut filtering_attempted,
+            0,
+            DecodeLevel::Specialized,
+            false,
+            false,
+        );
+        let filtered = match piped {
+            Ok(filtered) => filtered,
             Err(e) => {
                 let _ = emit_new_diagnostics(
                     &pdf,
@@ -283,6 +321,17 @@ fn process(
                 return Err(e.to_string());
             }
         };
+        if !filtered {
+            let _ = emit_new_diagnostics(
+                &pdf,
+                &mut diagnostics_written,
+                &filename_diagnostic,
+                stdout,
+                stderr,
+            );
+            return Err("error getting decoded stream data".to_owned());
+        }
+        let decoded = sink.bytes;
         let _ = emit_new_diagnostics(
             &pdf,
             &mut diagnostics_written,
@@ -292,7 +341,7 @@ fn process(
         );
         let label = format!("OBJECT STREAM {}", obj_ref.number);
         dump_tokens(
-            decoded.as_ref(),
+            &decoded,
             &label,
             max_len,
             include_ignorable,
@@ -532,6 +581,15 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use flpdf::{Object, ObjectHandle, ObjectRef};
+
+    #[test]
+    fn object_stream_pipeline_collects_bytes_and_has_qpdf_identifier() {
+        let mut pipeline = ObjectStreamPipeline::default();
+        assert_eq!(pipeline.identifier(), "object stream data");
+        pipeline.write(b"raw").expect("pipeline write");
+        pipeline.finish().expect("pipeline finish");
+        assert_eq!(pipeline.bytes, b"raw");
+    }
 
     fn open_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let bytes: &[u8] = b"%PDF-1.4\n\
