@@ -688,11 +688,11 @@ impl std::fmt::Debug for ObjectHandle {
         let slot = self.0.borrow();
         let state = slot.state.borrow();
         let state: &str = match &*state {
-            ObjectState::NotYetResolved => "NotYetResolved",
+            ObjectState::Resolved(ObjectValue::Unresolved) => "Unresolved",
+            ObjectState::Resolved(ObjectValue::Reserved) => "Reserved",
+            ObjectState::Resolved(ObjectValue::Destroyed) => "Destroyed",
             ObjectState::Resolved(_) => "Resolved(..)",
             ObjectState::Missing => "Missing",
-            ObjectState::Reserved => "Reserved",
-            ObjectState::Destroyed => "Destroyed",
         };
         let label = if slot.object_ref.is_some() {
             "ObjectHandle::Indirect"
@@ -859,6 +859,13 @@ impl ObjectSlot {
 #[derive(Debug, Clone)]
 pub(crate) enum ObjectValue {
     Null,
+    /// qpdf's lazy cache sentinel (`QPDF_Unresolved`), whose object identity
+    /// and resolver context remain on the surrounding [`ObjectSlot`].
+    Unresolved,
+    /// qpdf's document-allocation sentinel (`QPDF_Reserved`).
+    Reserved,
+    /// qpdf's post-document-lifetime sentinel (`QPDF_Destroyed`).
+    Destroyed,
     Boolean(bool),
     Integer(i64),
     Real(f64),
@@ -961,6 +968,9 @@ impl ObjectValue {
     pub(crate) fn type_code(&self) -> u8 {
         match self {
             Self::Null => 2,
+            Self::Unresolved => 13,
+            Self::Reserved => 1,
+            Self::Destroyed => 14,
             Self::Boolean(_) => 3,
             Self::Integer(_) => 4,
             Self::Real(_) | Self::RealLiteral { .. } => 5,
@@ -983,6 +993,9 @@ impl ObjectValue {
     pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Null => "null",
+            Self::Unresolved => "unresolved",
+            Self::Reserved => "reserved",
+            Self::Destroyed => "destroyed",
             Self::Boolean(_) => "boolean",
             Self::Integer(_) => "integer",
             Self::Real(_) | Self::RealLiteral { .. } => "real",
@@ -1063,31 +1076,14 @@ struct ContainmentOwner {
 
 /// The resolution state of an object handle's uniform backing slot.
 ///
-/// `Missing` and `Resolved(ObjectValue::Null)` are kept as distinct variants
-/// even though both currently present the same externally-observable value
-/// (`is_null() == true`): the former is a reference absent from — or broken
-/// in — the source cross-reference table (`Pdf::resolve_object_handle`'s
-/// fallback arm), the latter is a genuinely parsed literal `null` object.
-/// Collapsing them into one variant would lose that distinction the moment a
-/// later task needs it (e.g. to tell a dangling reference apart from a real
-/// null value for diagnostics).
+/// qpdf stores unresolved, reserved, destroyed, and ordinary values in the
+/// same `QPDFValue` hierarchy. `Missing` remains a temporary flpdf resolver
+/// bookkeeping state until `flpdf-25kg.11` removes it in the next cutover
+/// slice.
 #[derive(Debug)]
 pub(crate) enum ObjectState {
-    NotYetResolved,
     Resolved(ObjectValue),
     Missing,
-    /// qpdf's internal construction sentinel (`ot_reserved`). It is an
-    /// indirect, document-owned slot with no serializable `ObjectValue` and
-    /// must be replaced before the document is written
-    /// (`libqpdf/QPDF_Reserved.cc:1-27`).
-    Reserved,
-    /// The owning document has been dropped and this slot's value has been
-    /// severed (see [`ObjectHandle::disconnect`]). Distinct from `Missing`
-    /// (a reference absent from the source) so a future diagnostic can still
-    /// tell the two apart. It is also distinct from null: [`ObjectHandle::is_null`]
-    /// reports `false`, while value accessors without an error channel retain
-    /// their null fallback.
-    Destroyed,
 }
 
 impl ObjectHandle {
@@ -1120,9 +1116,9 @@ impl ObjectHandle {
 
     /// True if this handle is qpdf's internal reserved construction sentinel.
     ///
-    /// The sentinel is represented as an `ObjectState` rather than an
-    /// `ObjectValue`, carrying no PDF value that can be resolved or
-    /// serialized (`include/qpdf/Constants.h:108-127`,
+    /// The sentinel is represented as an `ObjectValue`, while the surrounding
+    /// slot retains its indirect identity and resolver metadata
+    /// (`include/qpdf/Constants.h:108-127`,
     /// `libqpdf/QPDF_Reserved.cc:1-27`). [`crate::Pdf::new_reserved`]'s own
     /// sentinel always has an indirect identity and document owner, but
     /// [`Self::shallow_copy`] on a reserved handle mirrors
@@ -1131,7 +1127,10 @@ impl ObjectHandle {
     /// identity is this sentinel's common case, not a universal one.
     pub fn is_reserved(&self) -> bool {
         let state = self.0.borrow().state.clone();
-        let reserved = matches!(&*state.borrow(), ObjectState::Reserved);
+        let reserved = matches!(
+            &*state.borrow(),
+            ObjectState::Resolved(ObjectValue::Reserved)
+        );
         reserved
     }
 
@@ -1236,7 +1235,7 @@ impl ObjectHandle {
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::Reserved)),
+            state: Rc::new(RefCell::new(ObjectState::Resolved(ObjectValue::Reserved))),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
             active_pdf_unique_id: Some(pdf_unique_id),
@@ -1267,7 +1266,7 @@ impl ObjectHandle {
     /// from.
     fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::Reserved)),
+            state: Rc::new(RefCell::new(ObjectState::Resolved(ObjectValue::Reserved))),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
             active_pdf_unique_id: None,
@@ -1323,7 +1322,7 @@ impl ObjectHandle {
     ) -> Self {
         let _ = offset;
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::NotYetResolved)),
+            state: Rc::new(RefCell::new(ObjectState::Resolved(ObjectValue::Unresolved))),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
             active_pdf_unique_id: pdf_unique_id,
@@ -1433,10 +1432,7 @@ impl ObjectHandle {
     fn state_children(state: &ObjectState) -> Vec<ObjectHandle> {
         match state {
             ObjectState::Resolved(value) => Self::direct_children(value),
-            ObjectState::NotYetResolved
-            | ObjectState::Missing
-            | ObjectState::Reserved
-            | ObjectState::Destroyed => Vec::new(),
+            ObjectState::Missing => Vec::new(),
         }
     }
 
@@ -1625,10 +1621,7 @@ impl ObjectHandle {
             let state = slot.state.borrow();
             match &*state {
                 ObjectState::Resolved(value) => Self::direct_children(value),
-                ObjectState::NotYetResolved
-                | ObjectState::Missing
-                | ObjectState::Reserved
-                | ObjectState::Destroyed => Vec::new(),
+                ObjectState::Missing => Vec::new(),
             }
         };
         let mut visited = BTreeSet::new();
@@ -1704,11 +1697,18 @@ impl ObjectHandle {
             let slot = self.0.borrow();
             let state = slot.state.borrow();
             match &*state {
+                ObjectState::Resolved(
+                    value @ (ObjectValue::Unresolved
+                    | ObjectValue::Reserved
+                    | ObjectValue::Destroyed),
+                ) => {
+                    let _ = value;
+                    return None;
+                }
                 ObjectState::Resolved(value) => Self::direct_children(value),
-                ObjectState::NotYetResolved
-                | ObjectState::Missing
-                | ObjectState::Reserved
-                | ObjectState::Destroyed => return None,
+                ObjectState::Missing => {
+                    return None; // cov:ignore: Missing handles retain an indirect object reference and return above
+                }
             }
         };
         for child in children {
@@ -1718,10 +1718,7 @@ impl ObjectHandle {
         let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
         match state {
             ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
-            ObjectState::NotYetResolved
-            | ObjectState::Missing
-            | ObjectState::Reserved
-            | ObjectState::Destroyed => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
+            ObjectState::Missing => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
         }
     }
 
@@ -1755,21 +1752,10 @@ impl ObjectHandle {
     /// dictionary being privatized itself holds a *direct* stream, the same
     /// case `QPDF_Dictionary::copy` throws on.
     ///
-    /// Also returns [`Error::Unsupported`] for a *direct* reserved handle
-    /// (only constructible via [`Self::shallow_copy`] on a reserved handle,
-    /// `QPDF_Reserved::copy`, `libqpdf/QPDF_Reserved.cc:14-19`, which never
-    /// throws). The early `object_ref.is_some()` check above already
-    /// confirms directness before this state match runs, so a reserved
-    /// value here cannot honestly join the arm below that means "already
-    /// indirect" for the caller — but this crate's [`ObjectValue`] also has
-    /// no reserved variant to clone into `Some`, since qpdf represents
-    /// `QPDF_Reserved` as its own `QPDFValue` subclass rather than a
-    /// data-carrying value. None of qpdf's own `QPDF::makeIndirectObject`
-    /// call sites (`QPDF_pages.cc`, `NNTree.cc`,
-    /// `QPDFAcroFormDocumentHelper.cc`, …) ever pass a reserved handle, so
-    /// there is no qpdf throw text to mirror for a successful promotion
-    /// here; this is rejected explicitly instead of silently misreporting
-    /// the already-indirect case.
+    /// Also returns [`Error::Unsupported`] for a *direct* reserved handle.
+    /// This legacy promotion helper is intentionally narrower than qpdf's
+    /// `replaceObject`/`shallowCopy` value layer; the canonical promotion
+    /// primitive is [`Self::promote_to_indirect`].
     pub(crate) fn direct_value_clone(&self) -> Result<Option<ObjectValue>> {
         let slot = self.0.borrow();
         if slot.object_ref.is_some() {
@@ -1778,6 +1764,8 @@ impl ObjectHandle {
         let state = slot.state.borrow();
         match &*state {
             ObjectState::Resolved(value) => Ok(Some(match value {
+                ObjectValue::Reserved => return Err(reserved_clone_error()),
+                ObjectValue::Unresolved | ObjectValue::Destroyed => return Ok(None),
                 ObjectValue::Stream {
                     stream_dict,
                     stream_data,
@@ -1791,8 +1779,7 @@ impl ObjectHandle {
                 },
                 other => other.clone(),
             })),
-            ObjectState::Reserved => Err(reserved_clone_error()),
-            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => Ok(None),
+            ObjectState::Missing => Ok(None), // cov:ignore: Missing handles retain an indirect object reference and return above
         }
     }
 
@@ -1970,7 +1957,7 @@ impl ObjectHandle {
             )
         };
         if should_destroy {
-            self.replace_detached_state(ObjectState::Destroyed);
+            self.replace_detached_state(ObjectState::Resolved(ObjectValue::Destroyed));
         }
         let mut slot = self.0.borrow_mut();
         slot.object_ref = None;
@@ -1999,7 +1986,10 @@ impl ObjectHandle {
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
         let state = self.0.borrow().state.clone();
-        let resolved = !matches!(*state.borrow(), ObjectState::NotYetResolved);
+        let resolved = !matches!(
+            &*state.borrow(),
+            ObjectState::Resolved(ObjectValue::Unresolved)
+        );
         resolved
     }
 
@@ -2015,7 +2005,7 @@ impl ObjectHandle {
                 return Ok(());
             };
             let state = slot.state.borrow();
-            if !matches!(&*state, ObjectState::NotYetResolved) {
+            if !matches!(&*state, ObjectState::Resolved(ObjectValue::Unresolved)) {
                 return Ok(());
             }
             (object_ref, slot.resolver.clone())
@@ -3295,7 +3285,7 @@ impl ObjectHandle {
         let item_is_destroyed = {
             let slot = item.0.borrow();
             let state = slot.state.borrow();
-            let destroyed = matches!(&*state, ObjectState::Destroyed);
+            let destroyed = matches!(&*state, ObjectState::Resolved(ObjectValue::Destroyed));
             destroyed
         };
         if item_is_destroyed {
@@ -3434,10 +3424,7 @@ impl ObjectHandle {
             }
             let children = match &*state.borrow() {
                 ObjectState::Resolved(value) => Self::direct_children(value),
-                ObjectState::NotYetResolved
-                | ObjectState::Missing
-                | ObjectState::Reserved
-                | ObjectState::Destroyed => Vec::new(),
+                ObjectState::Missing => Vec::new(), // cov:ignore: Missing handles are indirect and filtered before this walk
             };
             pending.extend(children.into_iter().filter(|child| child.is_direct()));
         }
@@ -3531,10 +3518,7 @@ impl ObjectHandle {
                 drop(slot);
                 let children = match &*state.borrow() {
                     ObjectState::Resolved(value) => Self::direct_children(value),
-                    ObjectState::NotYetResolved
-                    | ObjectState::Missing
-                    | ObjectState::Reserved
-                    | ObjectState::Destroyed => Vec::new(),
+                    ObjectState::Missing => Vec::new(), // cov:ignore: Missing handles are indirect and skipped by this walk
                 };
                 children
             };
@@ -5411,18 +5395,6 @@ impl ObjectHandle {
     /// Returns the resolver error when an unresolved indirect handle cannot be
     /// resolved, such as when its owning document has been dropped.
     pub fn type_code(&self) -> Result<u8> {
-        {
-            // `Destroyed` is a value state, independent of the indirect
-            // metadata that disconnect clears. Bind the borrow to a local
-            // and release it before `with_value` below takes its own borrow.
-            let slot_ref = self.0.borrow();
-            let state = slot_ref.state.borrow();
-            match &*state {
-                ObjectState::Reserved => return Ok(1),
-                ObjectState::Destroyed => return Ok(14),
-                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
-            }
-        }
         self.try_dereference()?;
         self.with_value(|value| {
             Ok(value
@@ -5439,18 +5411,6 @@ impl ObjectHandle {
     /// which reads the value-layer `type_name` field. Resolution errors are
     /// propagated unchanged.
     pub fn type_name(&self) -> Result<&'static str> {
-        {
-            // Reserved and destroyed are handle states rather than
-            // ObjectValue payloads, so retain their qpdf sentinel names at
-            // this layer.
-            let slot_ref = self.0.borrow();
-            let state = slot_ref.state.borrow();
-            match &*state {
-                ObjectState::Reserved => return Ok("reserved"),
-                ObjectState::Destroyed => return Ok("destroyed"),
-                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
-            }
-        }
         self.try_dereference()?;
         self.with_value(|value| {
             Ok(value
@@ -5513,38 +5473,28 @@ impl ObjectHandle {
         crate::json::Json::parse(&bytes).map_err(|error| ObjectJsonError::Json(error.to_string()))
     }
 
-    // `None` for an indirect handle that has not yet been resolved — value
-    // access on an unresolved handle must not perform hidden I/O (design,
-    // `Pdf` section). A resolved indirect handle exposes its real value.
-    // Missing and Destroyed retain the null fallback for value accessors that
-    // use this helper; state-aware accessors such as `is_null` inspect their
-    // slot directly instead.
+    // `try_dereference` owns the explicit resolution boundary. Once the
+    // handle is resolved, including to qpdf's internal Unresolved/Reserved/
+    // Destroyed value, this helper exposes the actual ObjectValue. Missing
+    // remains the only state presented as a synthetic null here.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
         let state = state.borrow();
         match &*state {
-            ObjectState::NotYetResolved => f(None),
             ObjectState::Resolved(value) => f(Some(value)),
-            ObjectState::Missing | ObjectState::Destroyed => f(Some(&ObjectValue::Null)),
-            ObjectState::Reserved => f(None),
+            ObjectState::Missing => f(Some(&ObjectValue::Null)),
         }
     }
 
-    // Mutable twin of `with_value` above: `None` for an indirect handle not
-    // yet resolved (mutation on an unresolved handle must not perform
-    // hidden I/O, same rule as every read accessor), and for
-    // `Missing`/`Destroyed` (there is no live `ObjectValue::Null` slot to
-    // hand out a `&mut` into — those states only *present* as null, they do
-    // not store one).
+    // Mutable twin of `with_value`: Missing has no live ObjectValue payload;
+    // every resolved qpdf value, including the internal sentinels, is a real
+    // mutable value-layer slot.
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
         let mut state = state.borrow_mut();
         match &mut *state {
             ObjectState::Resolved(value) => f(Some(value)),
-            ObjectState::NotYetResolved
-            | ObjectState::Missing
-            | ObjectState::Reserved
-            | ObjectState::Destroyed => f(None),
+            ObjectState::Missing => f(None), // cov:ignore: Missing handles are never mutable direct slots
         }
     }
 
@@ -5636,7 +5586,7 @@ impl ObjectHandle {
     /// This port diverges from qpdf's own `unparseResolved()` in three
     /// internal resolution states that qpdf itself does not reach the same
     /// way:
-    /// - **Not yet resolved**: qpdf silently dereferences (resolves) an
+    /// - **Unresolved**: qpdf silently dereferences (resolves) an
     ///   unresolved indirect handle before unparsing it; this method does
     ///   not perform that hidden I/O, matching every other accessor in this
     ///   file (see e.g. [`Self::as_integer`]'s own doc) — no accessor here
@@ -5654,7 +5604,7 @@ impl ObjectHandle {
     ///   (`libqpdf/QPDF_Reserved.cc:22-26`) throws `std::logic_error` the
     ///   same way `QPDF_Destroyed::unparse()` does, for the same reason —
     ///   this method has no exception channel to mirror that with and falls
-    ///   back to `null` here too. Unlike Destroyed/Not-yet-resolved, the
+    ///   back to `null` here too. Unlike Destroyed/Unresolved, the
     ///   writer-facing top-level entry points ([`Self::materialize`],
     ///   `unparse_object_walk` and its QDF/ref-map siblings,
     ///   `unparse_stream_body` and its siblings, `unparse_trailer`) do
@@ -5931,22 +5881,11 @@ impl ObjectHandle {
 // public `ObjectHandle::array`/`dictionary` factories (which impose no depth
 // bound themselves) can reach the cap at all.
 //
-// Checks `is_reserved()` on `handle` before ever touching `with_value`,
-// mirroring `unparse_object_walk`/`unparse_object_walk_with_ref_map`/
-// `unparse_object_walk_qdf`'s own entry check: `QPDF_Reserved::unparse()`
-// (`libqpdf/QPDF_Reserved.cc:22-26`) throws for *any* dereferenced reserved
-// value, direct or indirect, not only `ObjectHandle::materialize`'s own
-// top-level `self`. Without this, `with_value`'s `Reserved => None` arm
-// below was indistinguishable from `NotYetResolved`'s identical `None` --
-// correct for the latter (no hidden I/O), wrong for the former (the value
-// is already fully known: there isn't one). A *direct* reserved handle
-// reached as an array/dictionary child -- only reachable since
-// `ObjectHandle::shallow_copy` started returning `ObjectHandle::
-// new_reserved_direct()` -- used to materialize to `Object::Null` silently
-// through this gap (flpdf-25kg.3.16.1.2). An *indirect* reserved child never
-// reaches this function at all: `materialize_child`'s own `object_ref()`
-// check intercepts it first and writes `Object::Reference`, so this check
-// changes nothing for the case flpdf-25kg.3.16.1.1 already covers.
+// Checks `is_reserved()` on `handle` before ever walking its children,
+// mirroring the writer entrypoints' qpdf error boundary. The value-layer
+// Unresolved/Reserved/Destroyed arms below also return their qpdf logic
+// errors when a direct value reaches this materializer; an indirect child is
+// still emitted as a reference by `materialize_child` without dereferencing.
 fn materialize_bounded(handle: &ObjectHandle, depth: usize) -> Result<Object> {
     if depth > crate::parser::MAX_PARSE_DEPTH {
         return Ok(Object::Null);
@@ -5984,6 +5923,9 @@ fn materialize_bounded(handle: &ObjectHandle, depth: usize) -> Result<Object> {
 fn materialize_value(value: &ObjectValue, depth: usize) -> Result<Object> {
     Ok(match value {
         ObjectValue::Null => Object::Null,
+        ObjectValue::Unresolved => return Err(unresolved_unparse_error()),
+        ObjectValue::Reserved => return Err(reserved_unparse_error()),
+        ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
         ObjectValue::Boolean(b) => Object::Boolean(*b),
         ObjectValue::Integer(n) => Object::Integer(*n),
         ObjectValue::Real(r) => Object::Real(*r),
@@ -6100,6 +6042,7 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
                     .clone(),
             ))
         }
+        ObjectValue::Unresolved | ObjectValue::Reserved | ObjectValue::Destroyed => Object::Null,
         // No other variant nests a dictionary, so the omission rule cannot
         // apply anywhere beneath it; delegate to the ordinary materializer.
         // Every remaining variant is a scalar with no further recursion, so
@@ -6145,6 +6088,22 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
 
 fn reserved_unparse_error() -> Error {
     Error::System("QPDFObjectHandle: attempting to unparse a reserved object".to_owned())
+}
+
+fn unresolved_unparse_error() -> Error {
+    Error::Internal("attempted to unparse an unresolved QPDFObjectHandle".to_owned())
+}
+
+fn destroyed_unparse_error() -> Error {
+    Error::Internal("attempted to unparse a QPDFObjectHandle from a destroyed QPDF".to_owned())
+}
+
+fn unresolved_copy_error() -> Error {
+    Error::Internal("attempted to shallow copy an unresolved QPDFObjectHandle".to_owned())
+}
+
+fn destroyed_copy_error() -> Error {
+    Error::Internal("attempted to shallow copy QPDFObjectHandle from destroyed QPDF".to_owned())
 }
 
 // Unlike `reserved_unparse_error` above, no qpdf throw text exists to mirror
@@ -6325,6 +6284,9 @@ fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
 fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
     match value {
         ObjectValue::Null => out.extend_from_slice(b"null"),
+        ObjectValue::Unresolved => return Err(unresolved_unparse_error()),
+        ObjectValue::Reserved => return Err(reserved_unparse_error()),
+        ObjectValue::Destroyed => return Err(destroyed_unparse_error()),
         ObjectValue::Boolean(v) => out.extend_from_slice(if *v { b"true" } else { b"false" }),
         ObjectValue::Integer(v) => out.extend_from_slice(v.to_string().as_bytes()),
         ObjectValue::Real(v) => out.extend_from_slice(v.to_string().as_bytes()),
@@ -6908,6 +6870,9 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
         // `unparse_object_value` itself already gets from having no
         // catch-all arm at all.
         ObjectValue::Null
+        | ObjectValue::Unresolved
+        | ObjectValue::Reserved
+        | ObjectValue::Destroyed
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
         | ObjectValue::Real(_)
@@ -10022,6 +9987,9 @@ fn write_id_style_value_handle_with_ref_map(
 // cloned as-is with no further recursion.
 fn shallow_copy_value(value: &ObjectValue) -> Result<ObjectValue> {
     Ok(match value {
+        ObjectValue::Unresolved => return Err(unresolved_copy_error()),
+        ObjectValue::Reserved => ObjectValue::Reserved,
+        ObjectValue::Destroyed => return Err(destroyed_copy_error()),
         ObjectValue::Array(items) => ObjectValue::Array(
             items
                 .iter()
@@ -10726,7 +10694,7 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
-    fn canonical_payload_sharing_rejects_invalid_sources_without_mutating() {
+    fn canonical_payload_sharing_rejects_invalid_sources_and_shares_internal_values() {
         let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), -1);
         let direct = ObjectHandle::integer(1);
         direct
@@ -10750,14 +10718,11 @@ pub(crate) mod identity_tests {
             Rc::downgrade(&destroyed_resolver),
         );
         destroyed.disconnect();
-        let error = target
+        target
             .share_value_state_with(&destroyed)
-            .expect_err("a destroyed direct payload is not initialized");
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: replacement ObjectHandle is not initialized"
-        );
-        assert!(!target.is_resolved());
+            .expect("qpdf QPDFObject::assign accepts a destroyed value payload");
+        assert!(target.is_resolved());
+        assert_eq!(target.type_code().expect("destroyed type code"), 14);
     }
 
     #[test]
@@ -12821,8 +12786,8 @@ mod resolution_state_tests {
 
     #[test]
     fn debug_format_summarizes_every_indirect_resolution_state() {
-        let not_yet_resolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
-        assert!(format!("{not_yet_resolved:?}").contains("NotYetResolved"));
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        assert!(format!("{unresolved:?}").contains("Unresolved"));
 
         let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(2, 0), 0);
         missing.set_missing();
@@ -12832,6 +12797,59 @@ mod resolution_state_tests {
         destroyed.set_resolved(ObjectValue::Integer(1));
         destroyed.disconnect();
         assert!(format!("{destroyed:?}").contains("Destroyed"));
+    }
+}
+
+#[cfg(test)]
+mod internal_state_value_tests {
+    use super::*;
+
+    #[test]
+    fn internal_qpdf_values_use_their_value_layer_error_contracts() {
+        for (value, expected) in [
+            (
+                ObjectValue::Unresolved,
+                "attempted to unparse an unresolved QPDFObjectHandle",
+            ),
+            (
+                ObjectValue::Reserved,
+                "QPDFObjectHandle: attempting to unparse a reserved object",
+            ),
+            (
+                ObjectValue::Destroyed,
+                "attempted to unparse a QPDFObjectHandle from a destroyed QPDF",
+            ),
+        ] {
+            let materialize_error = materialize_value(&value, 0)
+                .expect_err("internal qpdf values cannot materialize as PDF values");
+            assert!(
+                materialize_error.to_string().contains(expected),
+                "unexpected materialize error: {materialize_error:?}"
+            );
+
+            let mut out = Vec::new();
+            let unparse_error = unparse_object_value(&value, &mut out)
+                .expect_err("internal qpdf values cannot unparse as PDF values");
+            assert!(
+                unparse_error.to_string().contains(expected),
+                "unexpected unparse error: {unparse_error:?}"
+            );
+        }
+
+        let reserved_copy = shallow_copy_value(&ObjectValue::Reserved).expect("reserved copies");
+        assert!(matches!(reserved_copy, ObjectValue::Reserved));
+
+        let unresolved_copy = shallow_copy_value(&ObjectValue::Unresolved)
+            .expect_err("unresolved copy is a qpdf logic error");
+        assert!(unresolved_copy
+            .to_string()
+            .contains("attempted to shallow copy an unresolved QPDFObjectHandle"));
+
+        let destroyed_copy = shallow_copy_value(&ObjectValue::Destroyed)
+            .expect_err("destroyed copy is a qpdf logic error");
+        assert!(destroyed_copy
+            .to_string()
+            .contains("attempted to shallow copy QPDFObjectHandle from destroyed QPDF"));
     }
 }
 
@@ -12964,17 +12982,16 @@ mod materialize_tests {
     }
 
     #[test]
-    fn an_unresolved_indirect_handle_materializes_to_null_without_performing_resolution() {
-        // `Pdf::resolve_borrowed` always resolves before materializing, but
-        // `materialize` itself must not assume that precondition holds --
-        // a caller that skips resolution sees `Object::Null`, not a panic.
+    fn an_unresolved_indirect_handle_materialization_reports_qpdf_error() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        assert_eq!(
-            handle
-                .materialize()
-                .expect("unresolved handle materializes"),
-            Object::Null
-        );
+        let error = handle
+            .materialize()
+            .expect_err("QPDF_Unresolved::unparse is a logic error");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "attempted to unparse an unresolved QPDFObjectHandle"
+        ));
     }
 
     #[test]
@@ -13166,6 +13183,20 @@ mod is_resolved_visibility_tests {
 #[cfg(test)]
 mod type_code_tests {
     use super::*;
+
+    #[test]
+    fn object_values_report_qpdf_internal_state_types() {
+        let cases = [
+            (ObjectValue::Unresolved, 13, "unresolved"),
+            (ObjectValue::Reserved, 1, "reserved"),
+            (ObjectValue::Destroyed, 14, "destroyed"),
+        ];
+
+        for (value, code, name) in cases {
+            assert_eq!(value.type_code(), code, "{name}");
+            assert_eq!(value.type_name(), name);
+        }
+    }
 
     #[test]
     fn object_values_report_qpdf_type_codes_and_names() {
@@ -18961,11 +18992,16 @@ mod mutation_tests {
     }
 
     #[test]
-    fn shallow_copy_of_an_unresolved_indirect_handle_is_a_direct_null() {
+    fn shallow_copy_of_an_unresolved_indirect_handle_reports_qpdf_error() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        let copy = indirect.shallow_copy().expect("unresolved copy");
-        assert!(copy.is_direct());
-        assert!(copy.is_null());
+        let error = indirect
+            .shallow_copy()
+            .expect_err("QPDF_Unresolved::copy is a logic error");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "attempted to shallow copy an unresolved QPDFObjectHandle"
+        ));
     }
 
     #[test]
