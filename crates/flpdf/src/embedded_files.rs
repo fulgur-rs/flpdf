@@ -11,8 +11,8 @@
 //!
 //! # Writer
 //!
-//! [`insert_embedded_file`] and [`delete_embedded_file`] mutate the existing
-//! tree through [`crate::NameTree`]. Unaffected nodes and the existing root
+//! [`insert_embedded_file`] and [`delete_embedded_file`] delegate to the live
+//! ObjectHandle name-tree helper. Unaffected nodes and the existing root
 //! reference are retained; splits and `/Limits` repairs follow qpdf's NNTree
 //! behavior.
 //!
@@ -50,7 +50,7 @@
 //! # Value types
 //!
 //! Each name-tree value should be an indirect reference to a `/Filespec`
-//! dictionary.  Values that are not [`Object::Reference`] are skipped with a
+//! dictionary.  Values that are not [`crate::Object::Reference`] are skipped with a
 //! diagnostic comment in source but no error; direct-dict filespecs embedded
 //! directly in name arrays are exceedingly rare in practice and out of scope for
 //! this read-only enumerator.
@@ -79,8 +79,8 @@
 
 use crate::nntree::HandleNameTree;
 #[cfg(test)]
-use crate::Dictionary;
-use crate::{Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Object};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
@@ -277,32 +277,41 @@ impl<R: Read + Seek> Pdf<R> {
 
 // ── remove_attachment ─────────────────────────────────────────────────────────
 
-/// Remove an attachment by name-tree key, then garbage-collect via a
-/// mark-and-sweep from `/Root` (the qpdf rewrite model).
+/// Remove an attachment by name-tree key and garbage-collect unreachable
+/// payload objects.
 ///
 /// # Behaviour
 ///
 /// 1. Looks up `key` in the catalog's `/Names /EmbeddedFiles` name tree.
 ///    Returns `Ok(false)` — without error — if the key is absent.
-/// 2. Calls [`delete_embedded_file`] to remove the name-tree entry (rebuilds
-///    the tree; superseded leaf/intermediate nodes become orphans).
-/// 3. Clears references to the filespec from the `/AF` array in the document
-///    catalog and in every page dictionary.  If a `/AF` array becomes empty
-///    the `/AF` key itself is deleted; a shared indirect `/AF` array object
-///    is patched in place, never deleted here (see
-///    `remove_ref_from_af_in_dict`).
-/// 4. **Mark-and-sweep GC** (`crate::subset_prune::sweep_unreachable_objects`):
+/// 2. Calls [`EmbeddedFileDocumentHelper::remove_embedded_file`], which
+///    removes the name-tree entry and **unconditionally** replaces an
+///    indirect Filespec with null, matching qpdf's `removeEmbeddedFile`
+///    contract — regardless of any other live reference to that same object
+///    (an `/AF` entry, a `/Dests` / `/JavaScript` name tree, another
+///    Filespec). Associated-files (`/AF`) arrays are not modified, so an
+///    `/AF` entry that pointed at the removed Filespec now points at null.
+/// 3. **Mark-and-sweep GC** (`crate::subset_prune::sweep_unreachable_objects`):
 ///    every indirect object no longer reachable from `/Root` or the trailer
-///    is physically deleted. This drops the removed `/Filespec`, *all* its
-///    `/EF` streams (including a filespec carrying distinct streams under
-///    several `/EF` keys), any sub-objects reachable only through it, and the
-///    orphan ghost name-tree nodes left by the rebuild — in one pass, with no
-///    per-feature reachability heuristics.
+///    is physically deleted. This always drops the Filespec's original
+///    content — its `/EF` streams (including a filespec carrying distinct
+///    streams under several `/EF` keys) and any sub-objects reachable only
+///    through it become unreachable the instant step 2 nulls the Filespec,
+///    so the sweep removes them regardless of what else is live. The null
+///    object *slot* the Filespec occupied is a separate question: it
+///    survives the sweep, still emitted as `null`, if something else (most
+///    commonly `/AF`) still holds an indirect reference to that object
+///    number; otherwise the slot itself is swept away too. The sweep also
+///    drops the orphan ghost name-tree nodes left by the rebuild — all in
+///    one pass, with no per-feature reachability heuristics.
 ///
-/// The conservative-share semantics are automatic: an `/EmbeddedFile` stream
-/// still reachable from another live object (e.g. shared between two
-/// filespecs, or a filespec still referenced by a live `/Dests` /
-/// `/JavaScript` name tree) stays reachable and therefore survives the sweep.
+/// The conservative-share semantics only protect content that was never
+/// routed through the removed Filespec in the first place: an `/EmbeddedFile`
+/// stream shared by a *different*, still-live Filespec object stays
+/// reachable through that other Filespec and survives. A `/Dests` /
+/// `/JavaScript` name tree entry that points at the *same* Filespec object
+/// being removed does **not** preserve it — step 2 nulls that object
+/// unconditionally, so the other name tree ends up pointing at null too.
 ///
 /// # Blast radius
 ///
@@ -315,49 +324,20 @@ impl<R: Read + Seek> Pdf<R> {
 /// # Limitation
 ///
 /// When the name-tree value is a *direct* `/Filespec` dictionary (not an
-/// indirect reference) there is no `ObjectRef` to clear from `/AF`; the
-/// name-tree entry is removed and the sweep still runs. This case is
-/// exceedingly rare in practice (ISO 32000-2 §7.11 expects indirect refs)
-/// and is handled gracefully — no panic, no spurious error.
+/// indirect reference), qpdf has no object slot to replace; the name-tree
+/// entry is removed and the sweep still runs.
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`] or [`delete_embedded_file`].
+/// Propagates any error from the canonical embedded-files helper or the sweep.
 pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
-    // ── Step 1: locate the entry ──────────────────────────────────────────────
-    let entries = collect_embedded_file_pairs_raw(pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)?;
-    let target_value = match entries.iter().find(|(k, _)| k.as_slice() == key) {
-        Some((_, v)) => v.clone(),
-        None => return Ok(false),
-    };
-
-    // The filespec ref is only needed to clear it from `/AF` (so that path
-    // stops keeping it reachable). Direct-dict filespecs have no ref.
-    let filespec_ref_opt: Option<ObjectRef> = match &target_value {
-        Object::Reference(r) => Some(*r),
-        _ => None,
-    };
-
-    // ── Step 2: clear /AF references on catalog and all pages ─────────────────
-    // Do this while the name-tree value still carries its indirect identity;
-    // qpdf's canonical replacement turns the removed filespec into null, so
-    // waiting until after removal would lose the identity needed to filter
-    // existing `/AF` arrays.
-    if let Some(fs_ref) = filespec_ref_opt {
-        clear_af_reference(pdf, fs_ref)?;
+    let removed = pdf.embedded_files().remove_embedded_file(key)?;
+    if !removed {
+        return Ok(false);
     }
 
-    // ── Step 3: detach the name-tree entry ───────────────────────────────────
-    delete_embedded_file(pdf, key)?;
-
-    // ── Step 4: mark-and-sweep GC (qpdf model) ────────────────────────────────
-    // Once the entry is detached and `/AF` cleared, the removed filespec, its
-    // `/EF` stream(s), any objects reachable only through it, and the orphan
-    // ghost name-tree nodes left by the rebuild are all unreachable from
-    // `/Root`/trailer and are physically dropped here. A filespec/stream still
-    // reachable from another live object (shared stream, live `/Dests`, …)
-    // stays reachable and therefore survives — conservative semantics for
-    // free, no ad-hoc exclusion heuristics.
+    // The null Filespec remains reachable through any existing `/AF` array,
+    // while its embedded streams and name-tree ghosts become unreachable.
     crate::subset_prune::sweep_unreachable_objects(pdf)?;
 
     Ok(true)
@@ -398,103 +378,6 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
         }
     }
     Ok(None)
-}
-
-/// Remove all occurrences of `target_ref` from `/AF` arrays on the catalog and
-/// every page dictionary.  After removal, if a `/AF` array becomes empty, the
-/// `/AF` key is deleted from that dictionary.
-fn clear_af_reference<R: Read + Seek>(pdf: &mut Pdf<R>, target_ref: ObjectRef) -> Result<()> {
-    // ── Catalog /AF ───────────────────────────────────────────────────────────
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-    remove_ref_from_af_in_dict(pdf, catalog_ref, target_ref)?;
-
-    // ── Page /AF ──────────────────────────────────────────────────────────────
-    // Collect page refs first; page_refs performs I/O so we cannot interleave
-    // it with set_object mutations.
-    let page_refs = match crate::pages::page_refs(pdf) {
-        Ok(v) => v,
-        Err(_) => return Ok(()), // Best-effort: skip if tree is broken.
-    };
-    for page_ref in page_refs {
-        remove_ref_from_af_in_dict(pdf, page_ref, target_ref)?;
-    }
-    Ok(())
-}
-
-/// Remove `target_ref` from the `/AF` array of the dictionary at `dict_ref`.
-///
-/// `/AF` may be a *direct* array or an *indirect reference* to an array
-/// object.  In the indirect case the referenced array object — not just the
-/// parent dictionary — must be updated, otherwise it lingers in
-/// [`Pdf::live_object_refs`] still holding a stale reference to `target_ref`,
-/// which would block the conservative GC in [`remove_attachment`] and leave
-/// the removed attachment's data as unreachable objects (roborev #948).
-///
-/// Behaviour:
-/// - direct array → filter in place; if it becomes empty the `/AF` key is
-///   removed from the parent;
-/// - indirect array → the *referenced* array object is rewritten with the
-///   filtered contents; if it becomes empty the `/AF` key is removed from the
-///   parent.  The array object itself is **never** `delete_object`-ed: the
-///   same indirect array may be shared by the catalog and one or more page
-///   dictionaries, and [`clear_af_reference`] invokes this helper once per
-///   parent — deleting it on the first parent would dangle the rest (roborev
-///   #951).  Filtering its contents already removes the stale reference that
-///   would otherwise block conservative GC (the original #948 motivation), so
-///   the deletion was unnecessary.  An emptied, now-unreferenced array object
-///   is harmless dead weight, exactly like the name-tree ghosts the existing
-///   GC already tolerates.
-///
-/// If `/AF` is absent or contains no reference to `target_ref`, this is a
-/// no-op.
-fn remove_ref_from_af_in_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict_ref: ObjectRef,
-    target_ref: ObjectRef,
-) -> Result<()> {
-    let dict = pdf.get_object_handle(dict_ref);
-    pdf.resolve_object_handle(&dict)?;
-    if dict.try_as_dictionary()?.is_none() {
-        return Ok(());
-    }
-
-    // `/AF` may be a direct array or an indirect reference to an array. The
-    // terminal handle is the live array object that qpdf mutates in place.
-    let af_value = dict.try_get_key(b"/AF")?;
-    let terminal = pdf.resolve_object_handle_to_terminal(&af_value)?;
-    let Some(af_array) = terminal.try_as_array()? else {
-        return Ok(());
-    };
-
-    // Early no-op: if `target_ref` is not actually present, do NOT mutate the
-    // parent dict or delete the indirect array object — an unrelated empty (or
-    // target-absent) indirect /AF array may be shared and must be left intact
-    // (roborev #950-2).
-    if !af_array
-        .iter()
-        .any(|o| o.object_ref().or_else(|| o.as_reference()) == Some(target_ref))
-    {
-        return Ok(());
-    }
-
-    let filtered: Vec<ObjectHandle> = af_array
-        .into_iter()
-        .filter(|o| o.object_ref().or_else(|| o.as_reference()) != Some(target_ref))
-        .collect();
-    let is_empty = filtered.is_empty();
-    terminal.set_array_items(filtered)?;
-    pdf.mark_object_handle_dirty(&terminal)?;
-
-    if is_empty {
-        // Drop the now-empty `/AF` key from this parent; a shared indirect
-        // array object remains intact for any other parent that references it.
-        dict.remove_key(b"/AF");
-        pdf.mark_object_handle_dirty(&dict)?;
-    }
-    Ok(())
 }
 
 // ── Writer constants ──────────────────────────────────────────────────────────
@@ -573,7 +456,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
 ///
 /// The public reader [`list_embedded_files`] intentionally filters to indirect
 /// references, while mutation and copying preserve direct-dict entries.
-// qpdf-deviation: the raw Object projection remains only for the attachment cleanup cutover and is removed by flpdf-egzr.3.2.8.
+#[cfg(test)]
 pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
@@ -591,6 +474,7 @@ pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
 /// attachment cleanup route until `flpdf-egzr.3.2.8`. Indirect values remain
 /// references without resolving their bodies; direct values are materialized
 /// in place, matching the old `NameTree::as_map` projection.
+#[cfg(test)]
 fn raw_object_from_handle(handle: &ObjectHandle) -> Result<Object> {
     if let Some(object_ref) = handle.object_ref() {
         Ok(Object::Reference(object_ref))
@@ -632,13 +516,9 @@ pub fn insert_embedded_file<R: Read + Seek>(
 ///
 /// # Errors
 ///
-/// Propagates any error from [`Pdf::resolve`].
-// qpdf-deviation: this legacy wrapper detaches a name-tree entry without nulling a shared filespec; qpdf nulling belongs to EmbeddedFileDocumentHelper::remove_embedded_file and this route is removed by flpdf-egzr.3.2.8.
+/// Propagates any error from the canonical embedded-files helper.
 pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<bool> {
-    let Some(mut tree) = embedded_files_tree_with_options(pdf, true, None)? else {
-        return Ok(false);
-    };
-    Ok(tree.remove(pdf, key)?.is_some())
+    pdf.embedded_files().remove_embedded_file(key)
 }
 
 // ── Tests for remove_attachment ───────────────────────────────────────────────
@@ -809,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_attachment_updates_retained_af_array_handle() {
+    fn remove_attachment_preserves_retained_af_array_handle_and_nulls_filespec() {
         let mut pdf = open_minimal();
         let filespec_ref = FileSpecBuilder::new("retained-af.txt", b"payload")
             .build(&mut pdf)
@@ -852,8 +732,14 @@ mod tests {
 
         assert_eq!(
             retained_af.as_array().expect("retained AF array").len(),
-            0,
-            "the retained AF handle must observe qpdf-shaped in-place filtering"
+            1,
+            "qpdf keeps the retained AF array element"
+        );
+        assert_eq!(
+            pdf.resolve(filespec_ref)
+                .expect("Filespec remains addressable"),
+            Object::Null,
+            "qpdf replaces the removed Filespec with null"
         );
     }
 
@@ -1263,15 +1149,10 @@ mod tests {
         );
     }
 
-    // ── Test: indirect /AF array no longer blocks GC of the filespec ─────────
+    // ── Test: indirect /AF array retains the null Filespec reference ─────────
     //
-    // Regression for roborev #948 (semantics updated by flpdf-eg3): when /AF
-    // is an *indirect* array reference whose only referrer is the catalog,
-    // removing the attachment clears the catalog /AF key, leaving the array
-    // object unreachable — the mark-and-sweep then drops the array, the
-    // filespec, and the stream together (no orphan left behind; qpdf model).
-    // The shared-indirect-/AF case (catalog + page) is covered separately by
-    // `remove_attachment_shared_indirect_af_across_catalog_and_page_not_dangled`.
+    // qpdf keeps an indirect /AF array and its reference to the nulled
+    // Filespec, while the embedded stream becomes unreachable and is swept.
     #[test]
     fn remove_attachment_with_indirect_af_array_gcs_filespec_and_stream() {
         let mut pdf = open_minimal();
@@ -1307,40 +1188,41 @@ mod tests {
 
         let live = pdf.live_object_refs();
         assert!(
-            !live.contains(&fs_ref),
-            "filespec must be GC-deleted even when only an indirect /AF array referenced it"
+            live.contains(&fs_ref),
+            "null Filespec must remain reachable through the indirect /AF array"
         );
         assert!(
             !live.contains(&stream_ref),
             "embedded stream must be GC-deleted alongside the filespec"
         );
-        // The indirect /AF array was reachable ONLY via the catalog /AF key;
-        // once that key is cleared the array is unreachable and the
-        // mark-and-sweep drops it too (no orphan left behind — qpdf model).
         assert!(
-            !live.contains(&af_array_ref),
-            "indirect /AF array reachable only via the cleared catalog /AF must be swept"
+            live.contains(&af_array_ref),
+            "qpdf keeps the indirect /AF array referenced by the catalog"
         );
 
-        // Catalog /AF must be gone (its only entry was the removed filespec).
+        // Catalog /AF and its null Filespec reference remain.
         let Object::Dictionary(catalog2) = pdf
             .resolve_borrowed(catalog_ref)
             .expect("resolve catalog after")
         else {
             panic!("expected catalog dict");
         };
-        assert!(
-            catalog2.get("AF").is_none(),
-            "catalog /AF must be removed once empty"
+        assert_eq!(
+            catalog2.get("AF"),
+            Some(&Object::Reference(af_array_ref)),
+            "catalog /AF must remain in place"
+        );
+        assert_eq!(
+            pdf.resolve(fs_ref).expect("Filespec remains addressable"),
+            Object::Null,
+            "Filespec must be nulled, not removed"
         );
     }
 
-    // ── Test: indirect /AF shared by catalog + page is not dangled ───────────
+    // ── Test: indirect /AF shared by catalog + page retains null Filespec ────
     //
-    // Regression for roborev #951: the same indirect /AF array object was
-    // `delete_object`-ed by the first parent (catalog) while a later parent
-    // (page) still referenced it → dangling ref / resolve failure.  The array
-    // must survive (emptied) and stay resolvable for every parent.
+    // The same indirect /AF array object is referenced by both catalog and
+    // page. qpdf keeps both parent references and the null Filespec element.
     #[test]
     fn remove_attachment_shared_indirect_af_across_catalog_and_page_not_dangled() {
         let mut pdf = open_minimal();
@@ -1385,51 +1267,49 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"sh.txt").expect("remove");
         assert!(removed);
 
-        // The shared array object must still resolve for every parent (not
-        // deleted on the first), and be emptied of the removed filespec.
+        // The shared array object must still resolve for every parent and keep
+        // the removed Filespec reference.
         let Object::Array(af_after) = pdf
             .resolve_borrowed(af_array_ref)
             .expect("shared indirect /AF array must still resolve (not deleted)")
         else {
             panic!("expected /AF array object");
         };
-        assert!(
-            af_after.is_empty(),
-            "shared /AF array must be emptied of the removed filespec"
+        assert_eq!(
+            af_after.as_slice(),
+            [Object::Reference(fs_ref)],
+            "shared /AF array must retain the nulled Filespec reference"
         );
 
-        // The filespec is still GC-deleted (array no longer references it).
+        // The null Filespec remains reachable through the shared array.
         let live = pdf.live_object_refs();
         assert!(
-            !live.contains(&fs_ref),
-            "filespec must be GC-deleted once the shared /AF array no longer references it"
+            live.contains(&fs_ref),
+            "null Filespec must remain reachable through the shared /AF array"
         );
 
-        // Catalog /AF dropped (emptied); page /AF may remain but, if present,
-        // must point at the still-resolvable array (no dangling ref).
+        // Page /AF must still point at the surviving shared array.
         let Object::Dictionary(page_after) =
             pdf.resolve_borrowed(page_ref).expect("resolve page after")
         else {
             panic!("expected page dict");
         };
-        if let Some(r) = page_after.get("AF").and_then(Object::as_ref_id) {
-            assert_eq!(
-                r, af_array_ref,
-                "page /AF must still point at the surviving shared array"
-            );
-            assert!(
-                pdf.resolve_borrowed(r).is_ok(),
-                "page /AF reference must resolve (not dangling)"
-            );
-        }
+        assert_eq!(
+            page_after.get("AF").and_then(Object::as_ref_id),
+            Some(af_array_ref),
+            "page /AF must still point at the surviving shared array"
+        );
+        assert_eq!(
+            pdf.resolve(fs_ref).expect("Filespec remains addressable"),
+            Object::Null,
+            "Filespec must be nulled, not removed"
+        );
     }
 
-    // ── Test: filespec referenced by another live name tree is preserved ─────
+    // ── Test: another live name tree retains the null Filespec reference ────
     //
-    // Regression for roborev #947: the GC ghost-exclusion heuristic used to
-    // skip *every* type-less /Names|/Kids dictionary, so a live `/Dests` (or
-    // /JavaScript / custom) name tree referencing the same filespec was also
-    // excluded — letting `remove_attachment` delete a still-referenced object.
+    // qpdf replaces the Filespec object with null even when a live /Dests
+    // name tree still retains its object reference.
     #[test]
     fn remove_attachment_preserves_filespec_referenced_by_other_name_tree() {
         let mut pdf = open_minimal();
@@ -1471,15 +1351,20 @@ mod tests {
         catalog.insert("Dests", Object::Reference(dests_leaf_ref));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
-        // Remove the embedded-files attachment.  The filespec is still
-        // referenced by the /Dests name tree → conservative GC must keep it.
+        // Remove the embedded-files attachment. qpdf nulls the Filespec
+        // object even when another name tree still references its object ref.
         let removed = remove_attachment(&mut pdf, b"shared.txt").expect("remove");
         assert!(removed, "existing key must report removed");
 
         let live = pdf.live_object_refs();
         assert!(
             live.contains(&fs_ref),
-            "filespec referenced by another live name tree (/Dests) must NOT be GC-deleted"
+            "the null Filespec ref remains reachable through /Dests"
+        );
+        assert_eq!(
+            pdf.resolve(fs_ref).expect("Filespec remains addressable"),
+            Object::Null,
+            "qpdf replaces the shared Filespec with null"
         );
 
         // The /Dests reference itself must remain intact.
@@ -1494,12 +1379,11 @@ mod tests {
             "/Dests leaf must still reference the filespec"
         );
 
-        // Symmetric inverse (roborev #949): the preserved filespec still
-        // references its embedded stream via `/EF`, so the stream must also
-        // survive — otherwise the kept filespec would dangle.
+        // The Filespec is null, so its embedded stream is no longer reachable
+        // through that object and is swept.
         assert!(
-            live.contains(&stream_ref),
-            "embedded stream of a preserved filespec must NOT be GC-deleted"
+            !live.contains(&stream_ref),
+            "embedded stream must be GC-deleted after the Filespec is nulled"
         );
     }
 
@@ -1759,7 +1643,7 @@ mod tests {
     // ── Test: /AF on catalog and page is cleared after remove ─────────────────
 
     #[test]
-    fn remove_attachment_clears_af_on_catalog_and_page() {
+    fn remove_attachment_preserves_af_and_nulls_filespec_on_catalog_and_page() {
         let mut pdf = open_minimal();
 
         // Build a filespec manually so we control the ref.
@@ -1800,7 +1684,8 @@ mod tests {
         let removed = remove_attachment(&mut pdf, b"af-test.txt").expect("remove");
         assert!(removed);
 
-        // /AF on catalog must be gone.
+        // qpdf leaves the associated-files reference in place; the Filespec
+        // object itself is replaced with null by removeEmbeddedFile.
         let Some(catalog2) = pdf
             .resolve_borrowed(catalog_ref)
             .expect("resolve catalog after")
@@ -1808,12 +1693,20 @@ mod tests {
         else {
             panic!("expected catalog dict");
         };
-        assert!(
-            catalog2.get("AF").is_none(),
-            "catalog /AF must be removed after attachment removal"
+        assert_eq!(
+            catalog2.get("AF"),
+            Some(&Object::Array(vec![Object::Reference(fs_ref)])),
+            "qpdf keeps catalog /AF pointing at the nulled Filespec"
         );
 
-        // /AF on page must be gone.
+        assert_eq!(
+            pdf.resolve(fs_ref)
+                .expect("Filespec must remain addressable"),
+            Object::Null,
+            "qpdf replaces the removed Filespec with null"
+        );
+
+        // The page's /AF reference is retained too.
         let Some(page_dict2) = pdf
             .resolve_borrowed(page_ref)
             .expect("resolve page after")
@@ -1821,9 +1714,10 @@ mod tests {
         else {
             panic!("expected page dict");
         };
-        assert!(
-            page_dict2.get("AF").is_none(),
-            "page /AF must be removed after attachment removal"
+        assert_eq!(
+            page_dict2.get("AF"),
+            Some(&Object::Array(vec![Object::Reference(fs_ref)])),
+            "qpdf keeps page /AF pointing at the nulled Filespec"
         );
     }
 
