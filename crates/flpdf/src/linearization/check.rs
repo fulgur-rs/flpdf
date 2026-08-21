@@ -652,12 +652,8 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     // parse error; this checker has no logger at this boundary, so it skips
     // only the extent-range comparison and retains all structural checks.
     if min_e >= 0 && max_e >= 0 {
-        let min_e = u64::try_from(min_e).map_err(|_| LinearizationCheckError::InvalidParam {
-            message: format!("computed part-6 end offset {min_e} is negative"),
-        })?;
-        let max_e = u64::try_from(max_e).map_err(|_| LinearizationCheckError::InvalidParam {
-            message: format!("computed part-6 end offset {max_e} is negative"),
-        })?;
+        let min_e = min_e as u64;
+        let max_e = max_e as u64;
         if e_val < min_e || e_val > max_e {
             fail!("/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})");
         }
