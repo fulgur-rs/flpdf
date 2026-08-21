@@ -256,12 +256,12 @@ fn as_u64(obj: &ObjectHandle, key: &str) -> std::result::Result<u64, Linearizati
         .map_err(LinearizationCheckError::from)?;
     match obj.as_integer() {
         Some(n) if n >= 0 => Ok(n as u64),
-        _ => Err(LinearizationCheckError::InvalidParam {
-            message: format!(
-                "/{key} is not a non-negative integer (got {})",
-                obj.type_name()
-            ),
-        }),
+        _ => {
+            let type_name = obj.type_name().map_err(LinearizationCheckError::from)?;
+            Err(LinearizationCheckError::InvalidParam {
+                message: format!("/{key} is not a non-negative integer (got {type_name})"),
+            })
+        }
     }
 }
 

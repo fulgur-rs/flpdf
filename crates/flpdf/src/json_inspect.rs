@@ -3885,7 +3885,7 @@ mod tests {
         // same ObjectValue::Reference payload verbatim
         // (shallow_copy_value's catch-all `other => other.clone()` arm). This
         // handle's object_ref() is None (it is direct), so only the
-        // as_reference() check catches it before the type_code() match.
+        // as_reference() check catches it before the type-code dispatch.
         use crate::ObjectRef;
         let mut pdf = empty_pdf();
         let holder = ObjectRef::new(2, 0);
@@ -5767,7 +5767,7 @@ mod tests {
             "qpdf reads the historical xref stream into obj_cache while loading /Prev"
         );
         assert_eq!(
-            handle.type_code(),
+            handle.type_code().expect("type code"),
             10,
             "historical object must remain a stream"
         );

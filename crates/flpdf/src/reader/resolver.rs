@@ -878,12 +878,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<()> {
         source.try_dereference()?;
         destination.try_dereference()?;
-        let destination_dict = destination.as_stream_dict().ok_or_else(|| {
-            Error::System(format!(
-                "operation for stream attempted on object of type {}",
-                destination.type_name()
-            ))
-        })?;
+        let destination_type_name = destination.type_name()?;
+        let Some(destination_dict) = destination.as_stream_dict() else {
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {destination_type_name}"
+            )));
+        };
 
         let filter = Some(stream_copy_dictionary_value(&destination_dict, b"/Filter")?);
         let decode_parms = stream_copy_dictionary_value(&destination_dict, b"/DecodeParms")?;
@@ -895,12 +895,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .unwrap_or(false);
 
         if source_data.is_none() && source_immediate_copy {
-            let source_dict = source.as_stream_dict().ok_or_else(|| {
-                Error::System(format!(
-                    "operation for stream attempted on object of type {}",
-                    source.type_name()
-                ))
-            })?;
+            let source_type_name = source.type_name()?;
+            let Some(source_dict) = source.as_stream_dict() else {
+                return Err(Error::System(format!(
+                    "operation for stream attempted on object of type {source_type_name}"
+                )));
+            };
             let raw_data = source.get_raw_stream_data()?;
             source.replace_stream_data(
                 raw_data,
@@ -7419,7 +7419,11 @@ mod tests {
         handle
             .try_dereference()
             .expect("a destroyed slot is terminal, not an error");
-        assert_eq!(handle.type_code(), 14, "qpdf ot_destroyed");
+        assert_eq!(
+            handle.type_code().expect("type code"),
+            14,
+            "qpdf ot_destroyed"
+        );
         assert!(!handle.is_null());
     }
 

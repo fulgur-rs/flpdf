@@ -259,7 +259,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     // dereferences `handle`'s own indirect identity (one hop), so a
     // resolved value that is itself a bare reference needs this second,
     // explicit chase or the entry both serializes the wrong value and
-    // (for a redirect-to-stream) is misrouted below, since `type_code()`
+    // (for a redirect-to-stream) is misrouted below, since `type_code()?`
     // on the un-chased holder reports 13 (unresolved/reference), never 10.
     // qpdf-deviation: chases a Pdf::set_object bare-reference redirect, a
     // shape with no qpdf counterpart (QPDF::replaceObject rejects indirect
@@ -267,7 +267,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     let handle = pdf
         .resolve_object_handle_to_terminal(handle)
         .map_err(ConvertError::from)?;
-    if handle.type_code() == 10 {
+    if handle.type_code().map_err(ConvertError::from)? == 10 {
         // The former split consumer resolved and converted the complete
         // stream value before it wrote the object key. Keep that established
         // failure prefix while routing the conversion itself through the
@@ -320,7 +320,7 @@ fn write_file_mode_object_entry<R: Read + Seek>(
     let handle = pdf
         .resolve_object_handle_to_terminal(handle)
         .map_err(ConvertError::from)?;
-    if handle.type_code() == 10 {
+    if handle.type_code().map_err(ConvertError::from)? == 10 {
         Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
         let mut object_first = true;
         Json::write_dictionary_open(out, &mut object_first, 3)?;
@@ -763,7 +763,7 @@ mod tests {
              literal reference, got {text}"
         );
     }
-    /// Guards the fix's new gate (`terminal.type_code() == 10`, checked
+    /// Guards the fix's new gate (`terminal.type_code()? == 10`, checked
     /// after the canonical chase, but the stream branch body still reads
     /// the *legacy* representation via `qpdf_resolve_top_level_object`)
     /// against the two representations disagreeing about redirect-to-stream
@@ -805,7 +805,7 @@ mod tests {
             .resolve_object_handle_to_terminal(&handle)
             .expect("terminal chase must not error even when the lift failed");
         assert_eq!(
-            terminal.type_code(),
+            terminal.type_code().expect("type code"),
             2,
             "an un-lifted target must not report as a stream to the new gate"
         );

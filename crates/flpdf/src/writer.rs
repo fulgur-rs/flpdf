@@ -8608,7 +8608,8 @@ mod tests {
             catalog
                 .try_get_key(b"/Metadata")
                 .expect("Metadata lookup must succeed")
-                .type_name(),
+                .type_name()
+                .expect("type name"),
             "stream"
         );
     }

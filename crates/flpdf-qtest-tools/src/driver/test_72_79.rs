@@ -110,12 +110,13 @@ impl<'a> ObjectHandleParserCallbacks for DriverParserCallbacks<'a> {
             writeln!(self.stdout, "test suite: terminating parsing")?;
             return Ok(ParseControl::Stop);
         }
+        let type_name = object.type_name()?;
         write!(
             self.stdout,
             "{}, offset={offset}, length={length}: ",
-            object.type_name()
+            type_name
         )?;
-        if object.type_code() == 12 {
+        if object.type_code()? == 12 {
             // ot_inlineimage
             let value = object.as_inline_image().unwrap_or_default();
             writeln!(self.stdout, "{}", hex_encode(&value))?;

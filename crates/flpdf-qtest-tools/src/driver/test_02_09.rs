@@ -275,7 +275,7 @@ pub(crate) fn run_test_6<R: Read + Seek>(
     let root = dict_key(pdf, &trailer, b"/Root")?;
     let metadata = dict_key(pdf, &root, b"/Metadata")?;
     resolve_handle(pdf, &metadata)?;
-    if metadata.type_code() != 10 {
+    if metadata.type_code()? != 10 {
         return Err(Error::Internal(
             "test 6 run on file with no metadata".to_string(),
         ));
@@ -314,7 +314,7 @@ pub(crate) fn run_test_7<R: Read + Seek>(
     let root = dict_key(pdf, &trailer, b"/Root")?;
     let qstream = dict_key(pdf, &root, b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
-    if qstream.type_code() != 10 {
+    if qstream.type_code()? != 10 {
         return Err(Error::Internal(
             "test 7 run on file with no QStream".to_string(),
         ));
@@ -390,7 +390,7 @@ pub(crate) fn run_test_8<R: Read + Seek>(
     let root = dict_key(pdf, &trailer, b"/Root")?;
     let qstream = dict_key(pdf, &root, b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
-    if qstream.type_code() != 10 {
+    if qstream.type_code()? != 10 {
         return Err(Error::Internal(
             "test 7 run on file with no QStream".to_string(),
         ));

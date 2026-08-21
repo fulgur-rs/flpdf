@@ -253,17 +253,18 @@ struct ParsedObject {
     description: String,
 }
 
-fn object_description(object: &ObjectHandle) -> String {
+fn object_description(object: &ObjectHandle) -> std::result::Result<String, Error> {
     let offset = object.get_parsed_offset();
     let location = if let Some(ObjectRef { number, generation }) = object.object_ref() {
         format!("indirect {number}/{generation}")
     } else {
         "direct".to_owned()
     };
-    format!(
+    let type_name = object.type_name()?;
+    Ok(format!(
         "offset = {offset} (0x{offset:x}), {location}, {}",
-        object.type_name()
-    )
+        type_name
+    ))
 }
 
 fn metadata_object_ref(object: &ObjectHandle) -> std::result::Result<ObjectRef, Error> {
@@ -272,27 +273,32 @@ fn metadata_object_ref(object: &ObjectHandle) -> std::result::Result<ObjectRef, 
         .ok_or_else(|| Error::Internal("get_all_objects returned a direct object".to_owned()))
 }
 
-fn walk(object: &ObjectHandle, group: u32, groups: &mut BTreeMap<u32, Vec<ParsedObject>>) {
+fn walk(
+    object: &ObjectHandle,
+    group: u32,
+    groups: &mut BTreeMap<u32, Vec<ParsedObject>>,
+) -> std::result::Result<(), Error> {
     groups.entry(group).or_default().push(ParsedObject {
         offset: object.get_parsed_offset(),
-        description: object_description(object),
+        description: object_description(object)?,
     });
 
     if let Some(items) = object.as_array() {
         for item in items {
             if !item.is_indirect() {
-                walk(&item, group, groups);
+                walk(&item, group, groups)?;
             }
         }
     } else if let Some(entries) = object.as_dictionary() {
         for item in entries.into_values() {
             if !item.is_indirect() && !item.is_null() {
-                walk(&item, group, groups);
+                walk(&item, group, groups)?;
             }
         }
     } else if let Some(dictionary) = object.as_stream_dict() {
-        walk(&dictionary, group, groups);
+        walk(&dictionary, group, groups)?;
     }
+    Ok(())
 }
 
 fn stream_group(
@@ -343,7 +349,7 @@ pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Ve
         for object in objects {
             let object_ref = metadata_object_ref(&object)?;
             let group = stream_group(object_ref, xref.get(&object_ref).copied())?;
-            walk(&object, group, &mut groups);
+            walk(&object, group, &mut groups)?;
         }
 
         let mut output = render_parsed_groups(&mut groups);
@@ -549,7 +555,7 @@ mod tests {
             (b"/Value".to_vec(), ObjectHandle::integer(7)),
         ]);
         let mut groups = BTreeMap::new();
-        walk(&object, 0, &mut groups);
+        walk(&object, 0, &mut groups).expect("direct metadata walk succeeds");
 
         let descriptions: Vec<_> = groups[&0]
             .iter()
