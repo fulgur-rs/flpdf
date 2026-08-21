@@ -859,10 +859,9 @@ fn attachment_insert_embedded_file_matches_manual_name_tree() {
 
 /// Catalog with a direct inline `/AcroForm` that carries a document-level `/DA`
 /// and two text fields. F1 (4 0 R) has its OWN `/DA`, distinct byte-for-byte
-/// from the AcroForm-level `/DA`; F2 (5 0 R) has NO direct `/DA`. So
-/// `fix_appearance_inheritance` copies the AcroForm `/DA` onto F2 only, and
-/// leaves F1's own `/DA` intact — exercising both the copy and the
-/// preservation prong.
+/// from the AcroForm-level `/DA`; F2 (5 0 R) has NO direct `/DA`. This lets the
+/// field-info reader exercise qpdf-style lazy inheritance without materializing
+/// a direct `/DA` on F2.
 fn acroform_inheritance_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -883,43 +882,22 @@ fn acroform_inheritance_pdf() -> Vec<u8> {
     )
 }
 
-/// AcroForm `fix_appearance_inheritance` parity (byte-identity).
-///
-/// `fix_appearance_inheritance` reads `/AcroForm/DA` and copies it onto every
-/// field-tree node that lacks a direct `/DA`, while leaving fields that already
-/// carry their own `/DA` untouched (with no font renames in play, the existing
-/// `/DA` is rewritten to itself, so no write occurs). The AcroForm dictionary
-/// itself is never rewritten. In `acroform_inheritance_pdf`, F1 (4 0 R) keeps
-/// its own `/DA` and F2 (5 0 R) gains the AcroForm `/DA`. The manual path reads
-/// the AcroForm `/DA` value verbatim and inserts it into F2 only, leaving F1
-/// alone ⇒ byte-identity. Sourcing the DA from the parsed AcroForm (rather than
-/// a literal) guarantees a byte-match regardless of the parser's string
-/// representation, and the single `.clone()` on a `&Dictionary` value is the
-/// unavoidable, appropriate case.
+/// AcroForm inherited `/DA` parity: qpdf reads the effective value through the
+/// field tree and does not stamp same-document field dictionaries.
 #[test]
-fn acroform_fix_appearance_inheritance_matches_manual_da_copy() {
+fn acroform_inherited_da_is_read_without_materializing_fields() {
     use flpdf::{Object, ObjectRef};
-    let f2_ref = ObjectRef::new(5, 0); // the `city` field, which lacks a direct /DA
-    roundtrip_eq(
-        acroform_inheritance_pdf,
-        |pdf| {
-            pdf.acroform().fix_appearance_inheritance().unwrap();
-        },
-        |pdf| {
-            // Read the AcroForm-level /DA verbatim via independent raw ops.
-            let root = pdf.root_ref().unwrap();
-            let acroform_da = {
-                let cat = pdf.resolve(root).unwrap();
-                let acroform = cat.as_dict().unwrap().get("AcroForm").unwrap();
-                // /AcroForm is a direct inline dictionary here.
-                acroform.as_dict().unwrap().get("DA").unwrap().clone()
-            };
-            // Copy it onto F2 only; F1 is deliberately left untouched.
-            let mut f2 = pdf.resolve(f2_ref).unwrap().into_dict().unwrap();
-            f2.insert("DA", acroform_da);
-            pdf.set_object(f2_ref, Object::Dictionary(f2));
-        },
+    let mut pdf = flpdf::Pdf::open_mem_owned(acroform_inheritance_pdf()).unwrap();
+
+    let fields = pdf.acroform().field_infos().unwrap();
+    assert_eq!(fields[1].object_ref, ObjectRef::new(5, 0));
+    assert_eq!(
+        fields[1].default_appearance,
+        Some(Object::String(b"/Helv 12 Tf 0 g".to_vec()))
     );
+
+    let field = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
+    assert!(field.as_dict().unwrap().get("DA").is_none());
 }
 
 /// Attachment `delete_embedded_file` parity (byte-identity).
