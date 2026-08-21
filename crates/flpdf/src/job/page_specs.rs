@@ -570,7 +570,7 @@ impl super::QPDFJob {
         pdf: &mut Pdf<R>,
         result: &RebuildResult,
     ) -> Result<()> {
-        crate::acroform_field_prune::prune_acroform_after_subset(pdf, result)
+        super::acroform_field_prune::prune_acroform_after_subset(pdf, result)
     }
 
     /// Execute qpdf's page-specification and multi-source copy operation.

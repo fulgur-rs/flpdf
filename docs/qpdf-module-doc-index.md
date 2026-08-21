@@ -5,9 +5,7 @@
 | flpdf module | classification | qpdf correspondence |
 |---|---|---|
 | `crates/flpdf/src/acroform_document_helper.rs` | correspondence | QPDFAcroFormDocumentHelper.cc responsibilities shared with overlay and signature modules |
-| `crates/flpdf/src/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
 | `crates/flpdf/src/annotation_helper.rs` | correspondence | \`QPDFAnnotationObjectHelper.cc\` |
-| `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/bit_stream.rs` | correspondence | BitStream.cc and bits_functions.hh MSB-first bit reading with Rust error values |
 | `crates/flpdf/src/bit_writer.rs` | correspondence | BitWriter.cc and bits_functions.hh MSB-first bit packing into a Pipeline stage |
 | `crates/flpdf/src/cache.rs` | correspondence | QPDF.cc xref-backed object cache represented as a standalone Rust module |
@@ -25,15 +23,20 @@
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
+| `crates/flpdf/src/job/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
+| `crates/flpdf/src/job/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
 | `crates/flpdf/src/job/attachments.rs` | correspondence | \`QPDFJob::addAttachments\`, \`QPDFJob::doListAttachments\`, and \`QPDFJob::doShowAttachment\` (\`libqpdf/QPDFJob.cc:876-927,2046-2087\`) |
 | `crates/flpdf/src/job/check.rs` | correspondence | \`QPDFJob::doCheck\` and \`QPDFJob::doInspection\` (\`libqpdf/QPDFJob.cc:745-803,1646-1693\`) |
 | `crates/flpdf/src/job/json.rs` | correspondence | \`QPDFJob.cc:1545-1640\` (\`doJSON\` fixed section order) and \`QPDFJob.cc:3094-3115\` (\`writeJSON\` output/stream-prefix selection) |
 | `crates/flpdf/src/job/json_sections.rs` | correspondence | \`QPDFJob::doJSONPages\`, \`doJSONPageLabels\`, \`doJSONOutlines\`, \`doJSONAcroform\`, \`doJSONAttachments\`, and \`doJSONEncrypt\` section builders |
 | `crates/flpdf/src/job/lifecycle.rs` | correspondence | \`QPDFJob\` shared state and completion boundary |
 | `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command and JSON section orchestration |
+| `crates/flpdf/src/job/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
+| `crates/flpdf/src/job/page_collate.rs` | correspondence | QPDFJob.cc handlePageSpecs collate ordering split into a page-operation module |
 | `crates/flpdf/src/job/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
+| `crates/flpdf/src/job/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/input.rs` | correspondence | \`QPDF_json.cc\` JSONReactor state machine, validators, deferred stream providers, and \`makeObject\` value construction |
@@ -72,13 +75,11 @@
 | `crates/flpdf/src/outline_dest_remap.rs` | correspondence | QPDFJob.cc page selection and QPDFWriter.cc null visibility specialized for surviving destinations |
 | `crates/flpdf/src/outline_document_helper.rs` | correspondence | QPDFOutlineDocumentHelper.cc — construction, \`hasOutlines\`, and \`resolveNamedDest\`; \`QPDFOutlineObjectHelper.cc\` accessors live in outline_object_helper.rs |
 | `crates/flpdf/src/outline_object_helper.rs` | correspondence | QPDFOutlineObjectHelper.cc getTitle/getCount/getDest/getDestPage, split from the document helper's QPDFOutlineDocumentHelper.cc responsibilities |
-| `crates/flpdf/src/overlay.rs` | correspondence | QPDFPageObjectHelper.cc placement and QPDFJob.cc overlay orchestration responsibilities |
 | `crates/flpdf/src/overlay_annotations.rs` | correspondence | QPDFPageObjectHelper.cc, QPDFAcroFormDocumentHelper.cc, ResourceFinder.cc, and QPDFObjectHandle.cc overlay responsibilities |
 | `crates/flpdf/src/overlay_appearance_stream.rs` | correspondence | QPDFAcroFormDocumentHelper.cc adjustAppearanceStream consuming resource_replacer.rs |
 | `crates/flpdf/src/page_annotation_enum.rs` | correspondence | QPDFPageObjectHelper.cc annotation enumeration |
 | `crates/flpdf/src/page_annotation_flatten.rs` | correspondence | QPDFPageObjectHelper.cc annotation flattening split from the page helper |
 | `crates/flpdf/src/page_closure.rs` | correspondence | QPDF.cc copyForeignObject graph closure split from object copying |
-| `crates/flpdf/src/page_collate.rs` | correspondence | QPDFJob.cc handlePageSpecs collate ordering split into a page-operation module |
 | `crates/flpdf/src/page_combine.rs` | correspondence | QPDFJob.cc handlePageSpecs multi-input combination split into a page-operation module |
 | `crates/flpdf/src/page_document_helper.rs` | correspondence | QPDFPageDocumentHelper.cc responsibilities split with page extraction |
 | `crates/flpdf/src/page_extract.rs` | correspondence | QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only |
@@ -133,7 +134,6 @@
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
 | `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
-| `crates/flpdf/src/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
 | `crates/flpdf/src/security/mod.rs` | correspondence | QPDF_encryption.cc responsibilities split across the Rust security module tree |
 | `crates/flpdf/src/security/password.rs` | correspondence | QPDF_encryption.cc password normalization |
 | `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf AES and MD5 native implementations |

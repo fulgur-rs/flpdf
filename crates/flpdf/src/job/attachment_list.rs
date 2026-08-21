@@ -43,10 +43,10 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::{BufReader, Write};
-//! use flpdf::{attachment_list, Pdf};
+//! use flpdf::{format_attachment_list, Pdf};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("with-attachments.pdf")?))?;
-//! match attachment_list::format_attachment_list(&mut pdf, false)? {
+//! match format_attachment_list(&mut pdf, false)? {
 //!     Some(listing) => std::io::stdout().write_all(&listing)?,
 //!     None => println!("with-attachments.pdf has no embedded files"),
 //! }

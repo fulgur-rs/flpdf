@@ -66,7 +66,7 @@ use crate::{page_combine::CombinedPage, CombinedPlan, Error, Result};
 /// # Example
 ///
 /// ```no_run
-/// use flpdf::{page_combine::CombinedPlan, page_collate::collate, page_range::PageRange, Pdf};
+/// use flpdf::{collate, page_combine::CombinedPlan, page_range::PageRange, Pdf};
 /// use std::io::{BufReader, Cursor};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
