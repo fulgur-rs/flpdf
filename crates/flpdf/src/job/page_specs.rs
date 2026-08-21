@@ -7,7 +7,8 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use super::page_merge::{
-    merge_documents_with_resource_mode, source_top_level_field_names, MergeInput,
+    merge_documents_with_resource_mode, merge_documents_with_resource_mode_and_preserve_primary,
+    source_top_level_field_names, MergeInput,
 };
 use crate::page_label_document_helper::LabelRange;
 use crate::page_plan::PagePlan;
@@ -371,6 +372,26 @@ pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
     collate: Option<usize>,
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    handle_page_specs_with_resource_mode_and_preserve_unreferenced(
+        job,
+        sources,
+        specs,
+        collate,
+        resource_mode,
+        false,
+    )
+}
+
+/// Resolve qpdf page specifications with the writer-level preservation policy
+/// available to the multi-source merge boundary.
+pub fn handle_page_specs_with_resource_mode_and_preserve_unreferenced<R: Read + Seek + 'static>(
+    job: &mut super::QPDFJob,
+    sources: &mut [Pdf<R>],
+    specs: &[PageSpecInput],
+    collate: Option<usize>,
+    resource_mode: RemoveUnreferencedResources,
+    preserve_unreferenced: bool,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if sources.is_empty() {
         return Err(Error::Unsupported(
             "--pages: a primary source document is required".into(),
@@ -497,7 +518,15 @@ pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
             pages: pages.clone(),
         })
         .collect();
-    let mut merged = merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?;
+    let mut merged = if preserve_unreferenced {
+        merge_documents_with_resource_mode_and_preserve_primary(
+            &mut merge_inputs,
+            resource_mode,
+            true,
+        )? // cov:ignore: LLVM attributes the successful multiline preservation call continuation to the call setup
+    } else {
+        merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?
+    };
     drop(merge_inputs);
 
     // merge_documents emits source-group order. Rebuild the target tree with
@@ -593,6 +622,28 @@ impl super::QPDFJob {
         resource_mode: RemoveUnreferencedResources,
     ) -> Result<Pdf<Cursor<Vec<u8>>>> {
         handle_page_specs_with_resource_mode(self, sources, specs, collate, resource_mode)
+    }
+
+    /// Execute qpdf page specifications while preserving primary-source
+    /// objects that are not reachable from its trailer roots.
+    pub fn handle_page_specs_with_resource_mode_and_preserve_unreferenced<
+        R: Read + Seek + 'static,
+    >(
+        &mut self,
+        sources: &mut [Pdf<R>],
+        specs: &[PageSpecInput],
+        collate: Option<usize>,
+        resource_mode: RemoveUnreferencedResources,
+        preserve_unreferenced: bool,
+    ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+        handle_page_specs_with_resource_mode_and_preserve_unreferenced(
+            self,
+            sources,
+            specs,
+            collate,
+            resource_mode,
+            preserve_unreferenced,
+        )
     }
 }
 

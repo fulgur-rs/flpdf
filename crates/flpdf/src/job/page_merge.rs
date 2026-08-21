@@ -1061,6 +1061,24 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    merge_documents_with_resource_mode_and_preserve_primary(inputs, resource_mode, false)
+}
+
+/// Merge selected pages while optionally retaining primary-source objects that
+/// are not reachable from its trailer roots.
+///
+/// qpdf keeps the primary QPDF in place while `QPDFJob::handlePageSpecs`
+/// copies foreign pages (`libqpdf/QPDFJob.cc:2360-2632`). When the writer's
+/// `preserve_unreferenced_objects` option is enabled, those primary objects
+/// remain available to `QPDFWriter::enqueueObjectsStandard` (`QPDFWriter.cc:
+/// 2907-2913`). The fresh merge target normally has no way to see them, so the
+/// job-level page-spec route adds the primary's unreachable live references to
+/// the same copy closure as its selected pages.
+pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    resource_mode: RemoveUnreferencedResources,
+    preserve_primary_unreferenced: bool,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
             "merge requires at least one input".to_string(),
@@ -1250,6 +1268,17 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
             closure.extend(primary_acroform.closure_seed.iter().copied());
         }
 
+        if is_primary && preserve_primary_unreferenced {
+            let reachable = crate::rewrite_renumber::reachable_object_set(input.source, false)?;
+            closure.extend(
+                input
+                    .source
+                    .live_object_refs()
+                    .into_iter()
+                    .filter(|object_ref| !reachable.contains(object_ref)),
+            );
+        }
+
         // qpdf `--pages` null-out parity is page-tree driven: after every closure
         // root has been folded, the selected page set determines which copied
         // source pages are retained. No destination/action subtype analysis is
@@ -1400,8 +1429,13 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
     }
 
     // Drop the copied ancestor /Pages node(s) and any objects only they
-    // referenced before handing the graph to the canonical writer.
-    sweep_unreachable_objects(&mut target)?;
+    // referenced before handing the graph to the canonical writer. When the
+    // qpdf job requests preservation, the writer owns this reachability
+    // decision and must see the primary orphan closure (`QPDFWriter.cc:
+    // 2907-2913`), so do not sweep it away here.
+    if !preserve_primary_unreferenced {
+        sweep_unreachable_objects(&mut target)?;
+    }
 
     Ok(target)
 }

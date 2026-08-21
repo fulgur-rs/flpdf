@@ -4543,11 +4543,12 @@ fn run_page_extraction_from_multiple_sources(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     let source_warnings = job.has_warnings();
-    let mut merged = job.handle_page_specs_with_resource_mode(
+    let mut merged = job.handle_page_specs_with_resource_mode_and_preserve_unreferenced(
         &mut sources,
         &specs,
         collate,
         remove_unref.into(),
+        options.preserve_unreferenced_objects,
     )?;
     let source_warnings = source_warnings || job.has_warnings();
 
