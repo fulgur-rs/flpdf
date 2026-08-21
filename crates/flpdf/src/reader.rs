@@ -3655,10 +3655,10 @@ impl<R: Read + Seek> Pdf<R> {
                         self.push_warning(format!(
                             "error decoding stream data for object {} {}: {detail}",
                             object_ref.number, object_ref.generation
-                        ))?;
+                        ))?; // cov:ignore: LLVM attributes the successful warning-sink continuation to the format call
                         self.push_warning(
                             "stream will be re-processed without filtering to avoid data loss",
-                        )?;
+                        )?; // cov:ignore: LLVM attributes the successful warning-sink continuation to the string call
                         stream_payload_transformed = true;
                     }
                 }
@@ -4331,7 +4331,7 @@ fn apply_explicit_crypt_filters(
 
 fn remove_explicit_crypt_filter(stream: &mut crate::Stream) {
     let Some(filter) = stream.dict.get("Filter").cloned() else {
-        return;
+        return; // cov:ignore: explicit-crypt callers always provide /Filter; this is a defensive helper guard
     };
     let decode_params = stream.dict.get("DecodeParms").cloned();
     remove_explicit_crypt_filter_with_values(stream, filter, decode_params);
@@ -4381,7 +4381,7 @@ fn remove_explicit_crypt_filter_with_values(
     }
 
     let Some(mut filters) = filter.into_array() else {
-        return;
+        return; // cov:ignore: the qpdf explicit-crypt shape is a name or array; malformed shape is defensive
     };
     let mut decode_params = decode_params;
     let mut index = 0;
@@ -6456,6 +6456,45 @@ mod tests {
         let detail =
             explicit_filter_fallback_detail(&stream, &Error::Unsupported("decrypt failed".into()));
         assert_ne!(detail, "decrypt failed");
+    }
+
+    #[test]
+    fn explicit_filter_helpers_handle_malformed_filter_shapes() {
+        let mut no_filter = Stream::new(Dictionary::new(), Vec::new());
+        remove_explicit_crypt_filter(&mut no_filter);
+
+        let mut malformed_dict = Dictionary::new();
+        malformed_dict.insert("Filter", Object::Integer(1));
+        let mut malformed = Stream::new(malformed_dict, b"raw".to_vec());
+        let detail = explicit_filter_fallback_detail(
+            &malformed,
+            &Error::Unsupported("decrypt failed".into()),
+        );
+        assert!(detail.contains("filter") || detail.contains("decrypt"));
+        remove_explicit_crypt_filter(&mut malformed);
+    }
+
+    #[test]
+    fn decrypt_resolved_object_propagates_non_encrypted_explicit_filter_errors() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        *pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![Object::Name(b"Crypt".to_vec()); 17]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![crypt_params(b"Identity"); 17]),
+        );
+        let error = pdf
+            .decrypt_resolved_object(
+                ObjectRef::new(4, 0),
+                Object::Stream(Stream::new(dict, b"identity".to_vec())),
+                None,
+            )
+            .expect_err("an overlong filter chain must remain a hard error");
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("filter chain")));
     }
 
     fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {
