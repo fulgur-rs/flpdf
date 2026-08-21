@@ -212,7 +212,7 @@ Entry points through which untrusted bytes reach flpdf:
 | Lazy object loading | `Pdf::resolve` / `resolve_borrowed` (xref offsets, object syntax, object streams) |
 | Stream decoding | filter pipeline in `filters.rs`: Flate, LZW, ASCII85, ASCIIHex, RunLength (+ pass-through DCT/JBIG2/JPX/CCITT) |
 | Decryption | standard security handler (`security/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); qpdf-compatible UTF-8 validation/raw password bytes and the reader-side V5 prefix boundary (qpdf does not apply SASLprep) |
-| Validation | `check_reader`, `check_reader_strict`, `check_reader_with_options`, `check_reader_with_options_and_limits` |
+| Validation | `job::QPDFJob::check` and the CLI `--check` route |
 | Writing (reads everything it writes) | `PdfWriter`, QDF repair, linearization |
 | Signature inspection | `signatures.rs` (`/ByteRange`, signature dictionaries, certificates) |
 | CLI (drives all of the above on argv-named files) | `flpdf-cli`: `check`, `rewrite`, `qdf`, `qdf-fix`, `linearize`, `dump-object`, `show-stream`, `pages`/`--pages`, `--split-pages`, attachment options, encryption options, JSON output |

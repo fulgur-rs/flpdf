@@ -1,8 +1,8 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    check_reader, filters, load_xref_and_trailer, parse_object, CompressStreams, Dictionary,
-    Object, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, XrefForm,
+    filters, load_xref_and_trailer, parse_object, CompressStreams, Dictionary, Object, ObjectRef,
+    ObjectStreamMode, Pdf, PdfOpenOptions, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -13,8 +13,8 @@ use std::io::{BufReader, Cursor};
 mod ascii85;
 mod common;
 use common::{
-    write_default, write_qdf_output, write_with_settings, write_with_settings_and_mapping,
-    WriterTestSettings,
+    check_output, write_default, write_qdf_output, write_with_settings,
+    write_with_settings_and_mapping, WriterTestSettings,
 };
 
 #[test]
@@ -24,7 +24,7 @@ fn rewrites_minimal_pdf_to_valid_pdf() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -63,7 +63,7 @@ fn plain_full_rewrite_does_not_emit_object_0_as_body() {
     );
 
     // And the result must remain a valid PDF.
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -163,7 +163,7 @@ fn plain_full_rewrite_does_not_emit_deleted_object_as_body() {
         "the non-deleted reachable leaf must still be emitted"
     );
 
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -932,7 +932,7 @@ fn rewrites_pdf_with_real_numbers() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -978,7 +978,7 @@ fn rewrites_pdf_with_real_number_fixture() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -998,7 +998,7 @@ fn rewrites_linearized_input_to_fresh_valid_pdf() {
     assert!(!output_text.contains(" /Linearized "));
     assert!(output_text.contains("1 0 obj"));
 
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -1025,7 +1025,7 @@ fn rewrites_repaired_pdf_in_best_effort_mode() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output)).unwrap();
+    let report = check_output(Cursor::new(output)).unwrap();
     assert!(
         report.valid,
         "diagnostics: {:?}",
@@ -1342,7 +1342,7 @@ fn write_qdf_traverses_direct_catalog_pages_root() {
             .any(|w| w == b"%% Page 1\n"),
         "direct-root page must still receive its QDF page marker"
     );
-    let report = check_reader(Cursor::new(output)).expect("QDF output must be readable");
+    let report = check_output(Cursor::new(output)).expect("QDF output must be readable");
     assert!(
         report.valid,
         "direct-root QDF output must pass flpdf check: {:?}",
@@ -1386,7 +1386,7 @@ fn write_qdf_promotes_a_direct_kids_leaf_before_numbering() {
             .any(|w| w == b"%% Page 1\n"),
         "the promoted leaf must still receive its QDF page marker"
     );
-    let report = check_reader(Cursor::new(output)).expect("QDF output must be readable");
+    let report = check_output(Cursor::new(output)).expect("QDF output must be readable");
     assert!(
         report.valid,
         "direct-Kids-leaf QDF output must pass flpdf check: {:?}",
@@ -2378,7 +2378,7 @@ fn pdf_writer_minimal_pdf_is_valid() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite output should be valid; diagnostics: {:?}",
@@ -2446,7 +2446,7 @@ fn pdf_writer_decodes_and_reencodes_multi_filter_stream() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite of multi-filter PDF should be valid; diagnostics: {:?}",
@@ -2501,7 +2501,7 @@ fn pdf_writer_rewrites_fixture_to_valid_pdf() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite of fixture should be valid; diagnostics: {:?}",
@@ -2575,7 +2575,7 @@ fn pdf_writer_rewrites_xref_stream_input_to_valid_pdf() {
     let mut output = Vec::new();
     write_default(&mut pdf, &mut output).unwrap();
 
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite of xref-stream input should be valid; diagnostics: {:?}",
@@ -2630,7 +2630,7 @@ fn pdf_writer_xref_stream_input_downgrades_under_force_version() {
         !String::from_utf8_lossy(&output).contains("/Type /XRef"),
         "inherited xref stream must be downgraded to a classic xref table under force<1.5"
     );
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "downgraded output must be a valid PDF; diagnostics: {:?}",
@@ -2696,7 +2696,7 @@ fn pdf_writer_xref_stream_compress_yes_produces_valid_flate_xref() {
     write_with_settings(&mut pdf, &mut output, &settings).unwrap();
 
     // The output must parse back cleanly (FlateDecode xref stream is valid).
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite output from filtered xref-stream input should be valid; diagnostics: {:?}",
@@ -2748,7 +2748,7 @@ fn pdf_writer_xref_stream_compress_no_strips_all_filter_keys() {
     write_with_settings(&mut pdf, &mut output, &settings).unwrap();
 
     // The output must parse back cleanly.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "CompressStreams::No full-rewrite should produce a valid PDF; diagnostics: {:?}",

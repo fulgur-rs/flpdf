@@ -133,8 +133,8 @@ The crate is organized as a few small layers:
 - `pages`, `outline_object_helper` — read-only traversal helpers that mirror
   `qpdf --show-pages` and `--json-key=outlines`.
 - `write_pdf` / `write_qdf` — incremental rewrite and qdf-style flat dump.
-- `check_reader` — diagnostics gathered during parsing/repair, returning a
-  `CheckReport` of `Diagnostic`s.
+- `job::QPDFJob::check` — qpdf-compatible document validation and warning
+  completion for CLI and library job consumers.
 
 Errors flow through the unified `Error` enum and the crate-level `Result`
 alias. See the rustdoc on `crates/flpdf/src/lib.rs` for the full API.

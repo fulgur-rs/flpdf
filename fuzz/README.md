@@ -12,7 +12,7 @@ it.
 ## Targets
 
 - **`roundtrip`** — whole-document harness mirroring qpdf's `qpdf_fuzzer`:
-  `check_reader` (repair-enabled open + validate), then `Pdf::open_mem` →
+  `QPDFJob::check` (repair-enabled open + validate), then `Pdf::open_mem` →
   `PdfWriter` (one fresh full rewrite).
   libFuzzer lends its input only for the duration of the closure, and `Pdf<R>`
   requires `R: 'static`, so the target copies the input into one `Arc<[u8]>`

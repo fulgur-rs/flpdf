@@ -11,8 +11,8 @@
 //!   `--json-key=outlines` provide.
 //! - [`PdfWriter`] configures the one fresh full-rewrite output with qpdf-shaped
 //!   settings.
-//! - [`check_reader`] reports diagnostics gathered during parsing/repair, returning a
-//!   [`CheckReport`] of [`Diagnostic`]s.
+//! - [`job::QPDFJob::check`] owns the qpdf-compatible document-check lifecycle and
+//!   warning/exit-status boundary.
 //!
 //! # End-to-end example
 //!
@@ -88,7 +88,6 @@ pub mod annotation_helper;
 pub(crate) mod bit_stream;
 pub(crate) mod bit_writer;
 pub mod cache;
-pub mod check;
 pub mod content_normalizer;
 pub mod content_stream;
 pub mod default_appearance;
@@ -170,10 +169,6 @@ pub(crate) mod security;
 pub use acroform_document_helper::{AcroFormDocumentHelper, AcroFormFieldInfo};
 pub use annotation_helper::AnnotationObjectHelper;
 pub use cache::{CacheEntry, ObjectCache};
-pub use check::{
-    check_pdf_with_limits, check_reader, check_reader_strict, check_reader_with_options,
-    check_reader_with_options_and_limits, CheckReport, CheckSummary,
-};
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;
 pub use content_stream::{

@@ -35,6 +35,8 @@ pub use attachment_list::{
     format_attachment_list, format_attachment_list_with_sink, list_attachment_info, AttachmentInfo,
 };
 pub use attachments::{AttachmentAddOptions, AttachmentCopyOptions};
+#[cfg(test)]
+pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
 pub use json::{
     write_json, write_qpdf_json_v2_selected_objects_to_output_with_options,

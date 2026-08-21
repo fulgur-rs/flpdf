@@ -276,7 +276,7 @@ fn walk_refs(obj: &Object, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::check::check_reader;
+    use crate::job::check_bytes_for_test;
     use crate::object::MAX_INLINE_DEPTH;
     use crate::pages::page_refs;
     use crate::pages::tree_rebuild::rebuild_page_tree;
@@ -619,12 +619,7 @@ mod tests {
 
         // Output must still be valid.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
-        let report = check_reader(Cursor::new(out)).unwrap();
-        assert!(
-            report.valid,
-            "pruned PDF must be valid: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     /// Yes mode: same expectation as Auto for this case (each page has its own
@@ -700,12 +695,7 @@ mod tests {
 
         // Output should be valid.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
-        let report = check_reader(Cursor::new(out)).unwrap();
-        assert!(
-            report.valid,
-            "PDF with both pages should be valid after prune: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     /// Extract page 1 from shared-resources PDF.
@@ -775,12 +765,7 @@ mod tests {
 
         // Valid output.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
-        let report = check_reader(Cursor::new(out)).unwrap();
-        assert!(
-            report.valid,
-            "pruned PDF must be valid: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     #[test]
@@ -969,12 +954,7 @@ mod tests {
 
         // Output must still be valid.
         let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
-        let report = check_reader(Cursor::new(out)).unwrap();
-        assert!(
-            report.valid,
-            "pruned PDF with /Info must be valid: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     /// Round-trip: prune + serialize + reopen and check page refs.

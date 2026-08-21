@@ -567,7 +567,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::check::check_reader;
+    use crate::job::check_bytes_for_test;
     use crate::pages::page_refs;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
@@ -1205,12 +1205,7 @@ mod tests {
         }
 
         // Belt-and-suspenders: the crate's own validity check is clean.
-        let report = check_reader(Cursor::new(out)).expect("check should run");
-        assert!(
-            report.valid,
-            "rebuilt subset PDF should pass check_reader: {:?}",
-            report.diagnostics
-        );
+        check_bytes_for_test(out).expect("canonical qpdf check should run");
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //! outcome for malformed input and are intentionally ignored.
 
 use libfuzzer_sys::fuzz_target;
+use flpdf::job::QPDFJob;
+use flpdf::PdfOpenOptions;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -20,10 +22,20 @@ fuzz_target!(|data: &[u8]| {
     // the hot loop instead of three.
     let shared: Arc<[u8]> = Arc::from(data);
 
-    // Repair-enabled open + validation path. `check_reader` opens internally,
-    // runs the recovery heuristics, and reports diagnostics rather than
-    // panicking, so it exercises the recovery branches the strict open skips.
-    let _ = flpdf::check_reader(Cursor::new(Arc::clone(&shared)));
+    // Repair-enabled open + validation path. QPDFJob opens with recovery and
+    // runs the canonical qpdf document-check consumer, exercising the
+    // recovery branches the strict open skips.
+    let mut job = QPDFJob::new();
+    if let Ok(mut pdf) = job.open(
+        Cursor::new(Arc::clone(&shared)),
+        "fuzz-regression.pdf",
+        PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        let _ = job.check(&mut pdf);
+    }
 
     // Strict open + qpdf-shaped writer round-trip. Writing mutates the handle's
     // object/xref state, so it gets a freshly parsed handle rather than reusing

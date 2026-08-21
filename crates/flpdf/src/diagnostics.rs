@@ -1,12 +1,12 @@
 //! qpdf correspondence: QPDFLogger.cc diagnostic routing represented as Rust values.
-//! Diagnostic primitives shared by the parser, writer, and `check` module.
+//! Diagnostic primitives shared by the parser, writer, and job check module.
 //!
 //! The [`Diagnostics::push_encrypted`] helper maps an [`crate::error::EncryptedError`]
 //! to a structured [`Diagnostic`] with a `[<code>]` prefix in the message.
 
 /// Severity of a [`Diagnostic`].
 ///
-/// Only `Error` flips [`crate::CheckReport::valid`] to `false`.
+/// Job check errors are reported through [`crate::job::CheckError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     Warning,

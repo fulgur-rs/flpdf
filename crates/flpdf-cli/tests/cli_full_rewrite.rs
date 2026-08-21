@@ -113,7 +113,7 @@ fn rewrite_produces_output() {
 
 #[test]
 fn rewrite_output_is_valid_pdf() {
-    use flpdf::{check_reader, Pdf};
+    use flpdf::Pdf;
     use std::io::Cursor;
 
     let temp = tempfile::tempdir().unwrap();
@@ -129,12 +129,11 @@ fn rewrite_output_is_valid_pdf() {
     .success();
 
     let bytes = std::fs::read(&output).unwrap();
-    let report = check_reader(Cursor::new(bytes.clone())).unwrap();
-    assert!(
-        report.valid,
-        "full-rewrite CLI output should be valid; diagnostics: {:?}",
-        report.diagnostics.entries()
-    );
+    let mut check = Command::cargo_bin("flpdf").unwrap();
+    check
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
 
     // Trailer must not have /Prev.
     let pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();

@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use flpdf::job::{CheckError, QPDFJob};
 use flpdf::ObjectRef;
 use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
@@ -12,6 +13,44 @@ use flpdf::{
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
+
+/// Result shape used by integration tests that only need to assert that the
+/// canonical qpdf job check accepted an emitted PDF.
+#[derive(Debug)]
+pub struct CheckTestResult {
+    pub valid: bool,
+    pub diagnostics: flpdf::Diagnostics,
+}
+
+/// Run the canonical qpdf-shaped document check for integration-test output.
+pub fn check_output<R: Read + Seek + 'static>(
+    source: R,
+) -> std::result::Result<CheckTestResult, CheckError> {
+    let mut job = QPDFJob::new();
+    let mut pdf = job
+        .open(
+            source,
+            "test.pdf",
+            flpdf::PdfOpenOptions {
+                repair: true,
+                ..flpdf::PdfOpenOptions::default()
+            },
+        )
+        .map_err(CheckError::Operation)?;
+    let result = job.check(&mut pdf);
+    let diagnostics = pdf.repair_diagnostics();
+    match result {
+        Ok(_) => Ok(CheckTestResult {
+            valid: true,
+            diagnostics,
+        }),
+        Err(CheckError::ErrorsDetected) => Ok(CheckTestResult {
+            valid: false,
+            diagnostics,
+        }),
+        Err(error) => Err(error),
+    }
+}
 
 /// Test-only settings used while the integration corpus migrates to the
 /// public qpdf-shaped writer. This deliberately has no PDF route selector:

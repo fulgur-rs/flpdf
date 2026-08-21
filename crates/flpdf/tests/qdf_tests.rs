@@ -22,8 +22,7 @@
 //!   (n) qdf=false: no "%% Original object ID:" lines regardless of flag.
 
 use flpdf::{
-    check_reader, filters, CompressStreams, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf,
-    Stream,
+    filters, CompressStreams, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, Stream,
 };
 use std::io::Cursor;
 
@@ -399,7 +398,7 @@ fn qdf_of_qdf_reuses_length_holders_and_is_byte_stable() {
     let mut pass1 = Vec::new();
     write_with_settings(&mut pdf, &mut pass1, &opts).unwrap();
     assert!(
-        check_reader(Cursor::new(pass1.clone())).is_ok(),
+        check_output(Cursor::new(pass1.clone())).is_ok(),
         "pass 1 qdf output must be structurally valid"
     );
 
@@ -613,7 +612,7 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Output must be a structurally valid PDF.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf ObjStm-decompose output must be valid; diagnostics: {:?}",
@@ -755,7 +754,7 @@ fn qdf_overrides_generate_mode_no_objstm() {
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Output must be valid.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf+Generate output must be valid; diagnostics: {:?}",
@@ -851,7 +850,7 @@ fn qdf_original_object_id_comments_emitted_when_flag_false() {
     check_pair(2, 4, 0); // Pages (emission 4; holder occupies emission 3)
 
     // The output must still be a valid PDF (xref offsets point at "N G obj").
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "QDF output with original-object-id comments must be valid; diagnostics: {:?}",
@@ -968,7 +967,7 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
     );
 
     // Output must be structurally valid.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf xref-stream→table output must be valid; diagnostics: {:?}",
@@ -1085,7 +1084,7 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
     }
 
     // Output must be valid.
-    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf+Generate xref-table output must be valid; diagnostics: {:?}",
@@ -1471,7 +1470,7 @@ fn qdf_output_is_idempotent() {
     let twice = qdf_rewrite(&once);
 
     // The double-pass output must be a structurally valid PDF.
-    let report = check_reader(Cursor::new(twice.clone())).unwrap();
+    let report = check_output(Cursor::new(twice.clone())).unwrap();
     assert!(
         report.valid,
         "qdf-of-qdf output must be valid; diagnostics: {:?}",
@@ -1651,4 +1650,4 @@ fn non_qdf_output_keeps_compact_dict_form() {
 
 mod common;
 #[allow(unused_imports)]
-use common::{write_default, write_with_settings, WriterTestSettings};
+use common::{check_output, write_default, write_with_settings, WriterTestSettings};
