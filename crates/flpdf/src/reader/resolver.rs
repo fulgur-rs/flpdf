@@ -7148,13 +7148,18 @@ mod tests {
             .expect("a malformed AES string is tolerated, not rejected");
 
         // "bad AES ciphertext" is 18 bytes: the leading 16 are consumed as the
-        // vector and the remaining 2 are zero-padded up to a block, so exactly
-        // one block of plaintext comes back. The bytes themselves vary with the
-        // fixture's randomly generated `/O` and `/U`, so only the length —
-        // which is what distinguishes tolerance from rejection — is pinned.
+        // vector and the remaining 2 are zero-padded up to a block, so one
+        // block of plaintext comes back. The bytes themselves vary with the
+        // fixture's randomly generated `/O`/`/U` (and therefore file key), so
+        // this cannot pin an exact length: `Pl_AES_PDF`'s lenient unpad also
+        // strips a trailing byte whenever it happens to look like valid
+        // PKCS#7 padding (most commonly a lone `0x01`, ~1/256 of random
+        // blocks), which this same tolerant behavior requires accepting, not
+        // rejecting. Assert only the tolerance property itself -- resolution
+        // succeeded and returned plaintext -- not a specific byte count.
         assert!(
-            matches!(&object, ObjectValue::String(bytes) if bytes.len() == 16),
-            "expected one block of leniently decrypted plaintext, got {object:?}"
+            matches!(&object, ObjectValue::String(bytes) if !bytes.is_empty()),
+            "expected leniently decrypted plaintext, got {object:?}"
         );
     }
 
