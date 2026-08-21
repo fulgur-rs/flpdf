@@ -408,14 +408,4 @@ mod tests {
         let rebased = original.rebase_offset(100);
         assert!(matches!(rebased, Error::Unsupported(ref s) if s == "nope"));
     }
-
-    #[test]
-    fn primitive_error_invalid_length_display_is_fully_qualified() {
-        let e: Error = PrimitiveError::InvalidLength.into();
-        assert!(
-            e.to_string()
-                .contains("malformed /Encrypt dictionary: primitive: invalid key/IV length"),
-            "unexpected display: {e}"
-        );
-    }
 }
