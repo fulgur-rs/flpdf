@@ -893,6 +893,13 @@ fn v4_explicit_crypt_filter_failure_retries_unfiltered_like_qpdf() {
     assert!(qpdf_qdf.contains("/ASCII85Decode"));
     assert!(!qpdf_qdf.contains("/Crypt"));
 
+    // qpdf's own retained bytes, read straight back out of the file it just
+    // wrote. This is the oracle: `Pl_AES_PDF` zero-pads the 46-byte tail that
+    // follows the vector (`libqpdf/Pl_AES_PDF.cc:107-118`) and leaves a
+    // trailer that is not valid padding in place (`:183-196`), so decryption
+    // yields 48 bytes rather than failing.
+    let qpdf_retained = qpdf_retained_raw_stream(&qpdf_output, "/ASCII85Decode");
+
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
     let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
@@ -903,22 +910,76 @@ fn v4_explicit_crypt_filter_failure_retries_unfiltered_like_qpdf() {
             b"ASCII85Decode".to_vec()
         )]))
     );
-    assert!(
-        !stream.data.is_empty(),
-        "raw fallback stream data must survive"
+    // qpdf keeps the `/Crypt` slot's companion entry as a null placeholder:
+    // `<< /DecodeParms [ null ] ... >>`.
+    assert_eq!(
+        stream.dict.get("DecodeParms"),
+        Some(&Object::Array(vec![Object::Null]))
     );
-    assert!(
-        pdf.repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|entry| entry.message.contains("character out of range")),
-        "the fallback warning should describe qpdf's ASCII85 decode failure"
+    assert_eq!(
+        stream.data, qpdf_retained,
+        "retained stream bytes must match qpdf's byte for byte"
     );
 }
 
+/// The raw (still-encoded) bytes qpdf retained for the stream carrying
+/// `filter_name` in `pdf_path`. qpdf renumbers objects when it writes, so the
+/// stream is located by its dictionary rather than by an assumed number.
+fn qpdf_retained_raw_stream(pdf_path: &std::path::Path, filter_name: &str) -> Vec<u8> {
+    for object_number in 1..=10u32 {
+        let shown = Command::new("qpdf")
+            .arg("--warning-exit-0")
+            .arg(format!("--show-object={object_number}"))
+            .arg(pdf_path)
+            .output()
+            .expect("qpdf --show-object should spawn");
+        if !shown.status.success() || !String::from_utf8_lossy(&shown.stdout).contains(filter_name)
+        {
+            continue;
+        }
+        let raw = Command::new("qpdf")
+            .arg("--warning-exit-0")
+            .arg(format!("--show-object={object_number}"))
+            .arg("--raw-stream-data")
+            .arg(pdf_path)
+            .output()
+            .expect("qpdf --raw-stream-data should spawn");
+        assert!(
+            raw.status.success(),
+            "qpdf --raw-stream-data failed: {}",
+            String::from_utf8_lossy(&raw.stderr)
+        );
+        return raw.stdout;
+    }
+    panic!("qpdf output has no stream carrying {filter_name}");
+}
+
+/// The same shape as the ASCII85 case with `/FlateDecode` in the filter slot:
+/// the raw bytes are Flate(encrypt(plaintext)), so decrypting them as an AES
+/// stream cannot produce valid Flate input. qpdf still keeps the decrypted
+/// bytes and the remaining `/FlateDecode` stage.
 #[test]
 fn v4_explicit_crypt_filter_flate_failure_retries_unfiltered() {
     let fixture = encrypted_v4_explicit_crypt_filter_fixture_with_order(false, true, true, true);
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("flate-wrong-order.pdf");
+    let qpdf_output = temp.path().join("qpdf-decrypt.pdf");
+    std::fs::write(&input, &fixture).unwrap();
+
+    let qpdf = Command::new("qpdf")
+        .args([
+            "--warning-exit-0",
+            "--password=",
+            "--decrypt",
+            "--static-id",
+        ])
+        .arg(&input)
+        .arg(&qpdf_output)
+        .output()
+        .expect("qpdf should spawn");
+    assert!(qpdf.status.success(), "qpdf decrypt should write output");
+    let qpdf_retained = qpdf_retained_raw_stream(&qpdf_output, "/FlateDecode");
+
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
     let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
@@ -927,9 +988,14 @@ fn v4_explicit_crypt_filter_flate_failure_retries_unfiltered() {
         stream.dict.get("Filter"),
         Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
     );
-    assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
-        .message
-        .starts_with("error decoding stream data for object 4 0: ")));
+    assert_eq!(
+        stream.dict.get("DecodeParms"),
+        Some(&Object::Array(vec![Object::Null]))
+    );
+    assert_eq!(
+        stream.data, qpdf_retained,
+        "retained stream bytes must match qpdf's byte for byte"
+    );
 }
 
 #[test]

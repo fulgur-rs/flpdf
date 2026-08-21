@@ -410,11 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn primitive_error_padding_maps_to_encrypted_malformed() {
-        let e: Error = PrimitiveError::PaddingError.into();
+    fn primitive_error_invalid_length_display_is_fully_qualified() {
+        let e: Error = PrimitiveError::InvalidLength.into();
         assert!(
             e.to_string()
-                .contains("malformed /Encrypt dictionary: primitive: invalid PKCS#7 padding"),
+                .contains("malformed /Encrypt dictionary: primitive: invalid key/IV length"),
             "unexpected display: {e}"
         );
     }

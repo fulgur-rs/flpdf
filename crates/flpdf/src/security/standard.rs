@@ -43,6 +43,7 @@
 #![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
+use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::sha2::PlSha2;
 use crate::pipeline::Pipeline;
 use crate::security::primitives::md5;
@@ -1603,39 +1604,19 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
             cipher.process_in_place(bytes);
             Ok(())
         }
+        // qpdf has exactly one AES implementation, `Pl_AES_PDF`, and reaches it
+        // for strings at `libqpdf/QPDF_encryption.cc:1014` and for streams at
+        // `:1139`. Both hand it the whole stored payload and let the stage take
+        // the leading block as the initialization vector, so the IV is not
+        // split off here and a payload of one block or less simply yields no
+        // plaintext. Keeping this on the stage rather than a one-shot cipher is
+        // what preserves qpdf's tolerance for a short or unpadded tail.
         StringCipher::Aes128 { key } => {
-            if bytes.len() <= 16 {
-                // qpdf's Pl_AES_PDF zero-pads a short final input block,
-                // consumes it as the IV, and emits no plaintext block.
-                bytes.clear();
-                return Ok(());
-            }
-            let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
-                return Err(EncryptedError::Malformed {
-                    reason: "AES string is missing its 16-byte IV".into(),
-                }
-                .into());
-            };
-            let mut decrypted = ciphertext.to_vec();
-            crate::security::primitives::aes128_cbc_decrypt(key, iv, &mut decrypted)?;
-            *bytes = decrypted;
+            *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
             Ok(())
         }
         StringCipher::Aes256 { key } => {
-            if bytes.len() <= 16 {
-                // Keep AES-256 aligned with qpdf's shared AES pipeline.
-                bytes.clear();
-                return Ok(());
-            }
-            let Some((iv, ciphertext)) = bytes.split_first_chunk::<16>() else {
-                return Err(EncryptedError::Malformed {
-                    reason: "AES string is missing its 16-byte IV".into(),
-                }
-                .into());
-            };
-            let mut decrypted = ciphertext.to_vec();
-            crate::security::primitives::aes256_cbc_decrypt(key, iv, &mut decrypted)?;
-            *bytes = decrypted;
+            *bytes = PlAesPdf::decrypt_to_vec("AES string decryption", bytes, key)?;
             Ok(())
         }
     }
