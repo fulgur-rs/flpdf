@@ -128,7 +128,10 @@ fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfi
         configuration.set_content_normalization(options.content_normalization);
     }
     configuration.set_preserve_unreferenced_objects(options.preserve_unreferenced_objects);
-    configuration.set_newline_before_endstream_mode(options.newline_before_endstream);
+    configuration.set_newline_before_endstream(matches!(
+        options.newline_before_endstream,
+        NewlineBeforeEndstream::Yes
+    ));
     configuration.set_static_id(options.static_id);
     configuration.set_deterministic_id(options.deterministic_id);
     configuration.set_static_aes_iv(options.static_aes_iv);
@@ -1243,10 +1246,9 @@ struct RewriteCommand {
     /// `never` (default): never insert a newline, so exactly `/Length` bytes sit
     /// between `stream` and `endstream`. Reproduces qpdf's default output and is
     /// required for byte-identical qpdf-equivalent rewrites.
-    /// `y`: always write exactly one `\n` before `endstream`, matching
-    /// ISO 32000-1 §7.3.8.1 and qpdf run with `--newline-before-endstream`.
-    /// `n`: omit the extra newline when the stream payload already ends with `\n`
-    /// or `\r` (a flpdf-specific middle ground; matches neither of qpdf's modes).
+    /// `y` and `n`: enable qpdf's boolean option and always write exactly one
+    /// `\n` before `endstream`. qpdf 11.9.0 accepts both value spellings as
+    /// the presence of the flag.
     ///
     /// Only affects the full-rewrite path.
     #[arg(long = "newline-before-endstream", value_enum,
@@ -1473,9 +1475,8 @@ fn normalize_content_enabled(setting: Option<CliYesNo>, qdf: bool) -> bool {
 
 /// `--newline-before-endstream=y|n|never` (qpdf default: never).
 ///
-/// Adds a third `never` variant on top of `y|n` so the CLI can request qpdf's
-/// default framing (no newline between the stream payload and `endstream`),
-/// which is required for byte-identical qpdf-equivalent output.
+/// `never` requests qpdf's default framing (no newline between the stream
+/// payload and `endstream`); `y` and `n` both enable qpdf's boolean option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliNewlineBeforeEndstream {
     #[clap(name = "y")]
@@ -2403,7 +2404,10 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 },
                 newline_before_endstream: match cmd.newline_before_endstream {
                     CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
-                    CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::No,
+                    // qpdf treats `--newline-before-endstream=<value>` as the
+                    // presence of its boolean option, so `=n` has the same
+                    // output as `=y` in the 11.9.0 CLI.
+                    CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::Yes,
                     CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
                 },
                 // --stream-data overrides --compress-streams when set.

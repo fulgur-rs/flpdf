@@ -987,46 +987,43 @@ fn newline_before_endstream_y_always_inserts_newline() {
 }
 
 // ---------------------------------------------------------------------------
-// Cell 5b: newline-before-endstream=n
+// Cell 5b: newline-before-endstream=n (qpdf boolean alias)
 //
-// With `n`, flpdf omits the extra newline when the payload already ends with
-// `\n` or `\r`; it still inserts one `\n` for ISO 32000-1 parseability when
-// the payload is NOT EOL-terminated.
+// qpdf 11.9.0 treats the value form `--newline-before-endstream=n` as the
+// presence of its boolean option, so it inserts an unconditional framing LF,
+// including when the payload already ends with LF.
 //
 // To make this test discriminating — i.e., able to detect a regression where
-// `n` behaves identically to `y` — we use `--compress-streams=n` so that the
+// `n` is incorrectly treated as qpdf's default — we use
+// `--stream-data=uncompress` so that the
 // content-stream payload is written as raw decoded bytes.  The decoded payload
 // for `one-page.pdf` ends with `\n` (the last line of the content stream),
 // which means:
 //
-//   flag=n: no extra `\n` is inserted → byte before `endstream` is the
-//           payload's own trailing `\n` and the byte before THAT is the
-//           last non-newline content byte (NOT another `\n`).
-//   flag=y: exactly one extra `\n` is inserted unconditionally → byte before
-//           `endstream` is the inserted `\n` and the byte before THAT is the
-//           payload's own `\n` (two consecutive `\n` bytes).
+//   flag=n/y: exactly one extra `\n` is inserted unconditionally → byte before
+//             `endstream` is the inserted `\n` and the byte before THAT is
+//             the payload's own `\n` (two consecutive `\n` bytes).
 //
 // Assertions:
 //   (n-test) at least one `endstream` is found.
-//   (n-test) for every `endstream` preceded by `\n`, the byte two positions
-//            before `endstream` is NOT `\n` (no double-newline → extra `\n`
-//            was not inserted for a payload that already ends with `\n`).
+//   (n-test) at least one EOL-terminated payload has two consecutive `\n`
+//            bytes before `endstream`, proving the option is unconditional.
 //   (y-contrast, in the y-test above) every `endstream` is preceded by `\n`.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn newline_before_endstream_n_omits_extra_newline_for_eol_terminated_payload() {
+fn newline_before_endstream_n_matches_qpdf_boolean_flag() {
     let tmp = tempdir().unwrap();
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("newline-n.pdf");
 
-    // Use --compress-streams=n so the payload is written as raw decoded bytes.
-    // The decoded content stream for one-page.pdf ends with b'\n', so flag=n
-    // must NOT insert an additional newline before endstream.
+    // Use --stream-data=uncompress so the payload is written as raw decoded bytes.
+    // The decoded content stream for one-page.pdf ends with b'\n', so qpdf's
+    // boolean flag must insert an additional newline before endstream.
     run_rewrite(
         &input,
         &output,
-        &["--newline-before-endstream=n", "--compress-streams=n"],
+        &["--newline-before-endstream=n", "--stream-data=uncompress"],
     );
 
     let output_bytes = std::fs::read(&output).unwrap();
@@ -1041,37 +1038,33 @@ fn newline_before_endstream_n_omits_extra_newline_for_eol_terminated_payload() {
         "newline-before-endstream=n: no stream objects found in output"
     );
 
-    // For every real `endstream` position, verify that an extra newline was NOT
-    // inserted when the payload already ends with `\n`.
+    // At least one real `endstream` must show the double-newline shape from an
+    // EOL-terminated payload plus qpdf's unconditional framing LF.
     //
-    // Concretely: if byte[idx-1] == '\n' (the payload's own trailing newline),
-    // then byte[idx-2] must NOT be '\n' (no double-newline injected by flag=n).
-    // If byte[idx-1] != '\n' (payload did not end with EOL), the check is not
-    // applicable for the "omit" direction (an extra '\n' is correctly inserted
-    // for parseability in that case).
-    let mut found_eol_terminated = false;
+    // The loop only counts positions where both bytes before `endstream` are
+    // LF, proving the payload's own LF and the framing LF are both present.
+    let mut found_double_newline = false;
     for &start in &endstream_offsets {
-        if start >= 2 && output_bytes[start - 1] == b'\n' {
-            // The payload ends with '\n'.  With flag=n, no extra '\n' is added,
-            // so byte[start-2] must NOT be '\n'.
-            assert_ne!(
+        if start >= 2 && output_bytes[start - 1] == b'\n' && output_bytes[start - 2] == b'\n' {
+            // qpdf's boolean flag adds the framing LF after the payload's LF.
+            assert_eq!(
                 output_bytes[start - 2],
                 b'\n',
                 "newline-before-endstream=n: double \\n before `endstream` at offset {start}; \
-                 flag=n must not insert an extra newline when the payload already ends with \\n.\n\
+                 qpdf's boolean flag inserts a framing newline after the payload's trailing \\n.\n\
                  bytes[-4..0]: {:?}",
                 &output_bytes[start.saturating_sub(4)..start]
             );
-            found_eol_terminated = true;
+            found_double_newline = true;
         }
     }
 
-    // Sanity-check: the fixture must have produced at least one stream whose
-    // payload ends with '\n' (so the above assertion was actually exercised).
+    // Sanity-check: the fixture must have produced at least one EOL-terminated
+    // stream (so the unconditional qpdf flag is actually exercised).
     assert!(
-        found_eol_terminated,
+        found_double_newline,
         "newline-before-endstream=n: no `endstream` was preceded by '\\n' in the output; \
-         the fixture may no longer produce an EOL-terminated payload with --compress-streams=n"
+         no double LF was observed with --stream-data=uncompress"
     );
 
     if !skip_if_qpdf_missing() {

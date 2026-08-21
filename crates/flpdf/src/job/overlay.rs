@@ -1171,10 +1171,9 @@ mod byte_gate {
     }
 
     /// Write `dest` through the `flpdf rewrite --static-id --qdf --no-original-object-ids`
-    /// recipe. QDF uses the caller's `newline_before_endstream` policy but
-    /// promotes only `Never` to `No` internally (so `endstream` stays
-    /// line-anchored) — we leave `newline_before_endstream` at its default
-    /// (`Never`) and rely on that promotion.
+    /// recipe. QDF applies qpdf's conditional `last_char != '\n'` framing rule
+    /// so `endstream` stays line-anchored — we leave
+    /// `newline_before_endstream` at its default (`Never`).
     fn write_qdf_nooid<R: Read + Seek + 'static>(dest: &mut Pdf<R>) -> Vec<u8> {
         write_qpdf(dest, |writer| {
             writer.set_static_id(true);

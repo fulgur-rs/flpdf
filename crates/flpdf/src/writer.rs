@@ -13,8 +13,6 @@ pub(crate) mod plain;
 pub(crate) mod serialize;
 mod settings;
 pub use object_streams::ObjectStreamMode;
-#[cfg(test)]
-use serialize::framing_adds_newline as stream_framing_adds_newline;
 use serialize::write_stream_payload;
 pub use serialize::write_stream_to_buf;
 #[cfg(test)]
@@ -188,11 +186,6 @@ impl WriterConfiguration {
         } else {
             NewlineBeforeEndstream::Never
         };
-    }
-
-    /// Set the full three-state endstream framing policy used by flpdf's CLI.
-    pub fn set_newline_before_endstream_mode(&mut self, value: NewlineBeforeEndstream) {
-        self.settings.newline_before_endstream = value;
     }
 
     /// Set qpdf's minimum output PDF version and extension level.
@@ -423,13 +416,6 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         } else {
             NewlineBeforeEndstream::Never
         };
-    }
-
-    /// Set qpdf's three-state endstream framing policy used by the CLI and
-    /// byte-parity tests. `Never` is qpdf's default; `No` adds a newline only
-    /// when the payload does not already end in one.
-    pub fn set_newline_before_endstream_mode(&mut self, value: NewlineBeforeEndstream) {
-        self.settings.newline_before_endstream = value;
     }
 
     pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
@@ -821,7 +807,6 @@ mod lifecycle_tests {
         configuration.set_preserve_unreferenced_objects(true);
         configuration.set_newline_before_endstream(false);
         configuration.set_newline_before_endstream(true);
-        configuration.set_newline_before_endstream_mode(NewlineBeforeEndstream::No);
         configuration.set_minimum_pdf_version("1.4", 2);
         configuration.force_pdf_version("1.7", 3);
         configuration.set_extra_header_text("% split configuration");
@@ -854,7 +839,7 @@ mod lifecycle_tests {
         assert!(writer.settings.preserve_unreferenced_objects);
         assert_eq!(
             writer.settings.newline_before_endstream,
-            NewlineBeforeEndstream::No
+            NewlineBeforeEndstream::Yes
         );
         assert_eq!(
             writer.settings.minimum_pdf_version,
@@ -1031,9 +1016,6 @@ pub(crate) fn effective_stream_policy(options: &WriterOptions) -> Option<Compres
 /// - [`Yes`](Self::Yes) — always write exactly one `b'\n'`, satisfying the ISO
 ///   32000-1 §7.3.8.1 recommendation and easing hand-editing. Equivalent to
 ///   qpdf run **with** `--newline-before-endstream`.
-/// - [`No`](Self::No) — write a single `b'\n'` only when the payload does not
-///   already end with `\n`/`\r`; if it does, `endstream` is adjacent. This is a
-///   flpdf-specific middle ground and matches neither of qpdf's two modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum NewlineBeforeEndstream {
@@ -1043,14 +1025,6 @@ pub enum NewlineBeforeEndstream {
     /// Satisfies ISO 32000-1 §7.3.8.1 and matches qpdf run with
     /// `--newline-before-endstream`.
     Yes,
-    /// Write a single `b'\n'` before `endstream` only when the payload does not
-    /// already end with `\n`; otherwise `endstream` is adjacent. Payloads
-    /// ending with bare `\r` or `\r\n` still receive an added `\n`.
-    ///
-    /// Matches qpdf's `(last_char != '\n')` check in QPDFWriter.cc:1560,
-    /// which is what QDF form falls back to when the caller does not set
-    /// [`NewlineBeforeEndstream::Yes`] explicitly.
-    No,
     /// Never insert a newline: the raw payload is written verbatim and
     /// `endstream` follows immediately, so exactly `/Length` bytes sit between
     /// `stream` and `endstream` (the **flpdf default**).
@@ -1367,10 +1341,8 @@ pub(crate) struct WriterOptions {
     /// qpdf's default output and required for byte-identical qpdf-equivalent
     /// rewrites. [`NewlineBeforeEndstream::Yes`] always writes exactly one
     /// `b'\n'` before `endstream`, matching qpdf run with
-    /// `--newline-before-endstream`. [`NewlineBeforeEndstream::No`] omits the
-    /// extra newline only when the stream payload already ends with exactly
-    /// `\n` (matches qpdf's `(last_char != '\n')` check; bare `\r` or `\r\n`
-    /// endings still receive an added `\n`).
+    /// `--newline-before-endstream`. QDF applies qpdf's separate conditional
+    /// rule: it adds a newline only when the payload's last byte is not `\n`.
     ///
     /// The `/Length` value in the stream dictionary is **not** affected by this
     /// setting — it always reflects the raw payload byte count only.
@@ -3155,13 +3127,36 @@ pub(crate) fn write_stream_payload_with_pipeline(
     encrypt_stream: bool,
     explicit_iv: Option<[u8; 16]>,
 ) -> Result<bool> {
+    write_stream_payload_with_pipeline_qdf(
+        out,
+        data,
+        policy,
+        false,
+        object_ref,
+        ctx,
+        encrypt_stream,
+        explicit_iv,
+    )
+}
+
+/// Write an encrypted stream payload with qpdf's QDF-specific framing rule.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_stream_payload_with_pipeline_qdf(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    policy: NewlineBeforeEndstream,
+    qdf_mode: bool,
+    object_ref: ObjectRef,
+    ctx: &EncryptionContext,
+    encrypt_stream: bool,
+    explicit_iv: Option<[u8; 16]>,
+) -> Result<bool> {
     out.extend_from_slice(b"\nstream\n");
     let last_byte =
         pipe_writer_stream_payload(out, data, object_ref, ctx, encrypt_stream, explicit_iv)?;
     let add_newline = match policy {
         NewlineBeforeEndstream::Yes => true,
-        NewlineBeforeEndstream::No => last_byte != b'\n',
-        NewlineBeforeEndstream::Never => false,
+        NewlineBeforeEndstream::Never => qdf_mode && last_byte != b'\n',
     };
     if add_newline {
         out.push(b'\n');
@@ -3443,30 +3438,6 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
         let was_dirty = pdf.is_dirty(r);
         pdf.resolve(r).ok().map(|catalog| (r, catalog, was_dirty))
     });
-
-    // QDF form (`qpdf --qdf`) is designed for human editing and requires a
-    // line-anchored `endstream`, so the caller's `Never` policy — which
-    // would place `endstream` immediately after the raw payload byte —
-    // is incompatible with QDF. Promote `Never` to `No` here (qpdf's `No`
-    // still emits a newline unless the payload's last byte is exactly
-    // `\n`). Explicit `Yes` and `No` pass through unchanged so callers can
-    // request the exact qpdf semantics via WriterOptions or the CLI
-    // `--newline-before-endstream` flag.
-    //
-    // Mirrors qpdf QPDFWriter.cc:1560:
-    //     `if (newline_before_endstream || (qdf_mode && last_char != '\n'))`
-    // i.e. Yes → always add; QDF + non-'\n' end → add.
-    let effective;
-    let options =
-        if options.qdf && options.newline_before_endstream == NewlineBeforeEndstream::Never {
-            effective = WriterOptions {
-                newline_before_endstream: NewlineBeforeEndstream::No,
-                ..options.clone()
-            };
-            &effective
-        } else {
-            options
-        };
 
     // qpdf's full-rewrite writer resolves source streams with its default
     // stream-framing recovery enabled. Keep that recovery scoped to the
@@ -4551,22 +4522,28 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             }
 
             let added_newline = if let Some(ctx) = stream_encryption {
-                write_stream_payload_with_pipeline(
+                write_stream_payload_with_pipeline_qdf(
                     &mut bytes,
                     &stream_data,
                     options.newline_before_endstream,
+                    options.qdf,
                     emit_ref,
                     ctx,
                     encrypt_stream,
                     None,
                 )? // cov:ignore: encrypted stream payload route; LLVM maps the call continuation here
             } else {
-                serialize::write_stream_payload(
+                serialize::write_stream_payload_with_qdf(
                     &mut bytes,
                     &stream_data,
                     options.newline_before_endstream,
+                    options.qdf,
                 );
-                serialize::framing_adds_newline(&stream_data, options.newline_before_endstream)
+                serialize::framing_adds_newline_with_qdf(
+                    &stream_data,
+                    options.newline_before_endstream,
+                    options.qdf,
+                )
             };
             if let Some(holder_ref) = holder_ref {
                 qdf_holder_to_emit = Some((
@@ -5380,10 +5357,11 @@ fn write_stream_to_buf_qdf(
         } else {
             dict.write_pdf_stream_qdf(buf, 0);
         }
-        let add_newline = write_stream_payload_with_pipeline(
+        let add_newline = write_stream_payload_with_pipeline_qdf(
             buf,
             &stream.data,
             policy,
+            true,
             emitted_ref,
             ctx,
             encrypt_stream_strings,
@@ -5398,12 +5376,20 @@ fn write_stream_to_buf_qdf(
             &stream.dict,
             encrypted_strings::StreamDictOptions::new(true, false, true),
         )?; // cov:ignore: the dictionary-only route executes; this call continuation has no counter.
-        write_stream_payload(buf, &stream.data, policy);
-        Ok(stream_framing_adds_newline(&stream.data, policy))
+        serialize::write_stream_payload_with_qdf(buf, &stream.data, policy, true);
+        Ok(serialize::framing_adds_newline_with_qdf(
+            &stream.data,
+            policy,
+            true,
+        ))
     } else {
         stream.dict.write_pdf_stream_qdf(buf, 0);
-        write_stream_payload(buf, &stream.data, policy);
-        Ok(stream_framing_adds_newline(&stream.data, policy))
+        serialize::write_stream_payload_with_qdf(buf, &stream.data, policy, true);
+        Ok(serialize::framing_adds_newline_with_qdf(
+            &stream.data,
+            policy,
+            true,
+        ))
     }
 }
 
@@ -5499,16 +5485,16 @@ mod tests {
     }
 
     #[test]
-    fn pdf_writer_lifecycle_accepts_three_state_newline_mode() {
+    fn pdf_writer_lifecycle_accepts_qpdf_boolean_newline_mode() {
         let mut pdf = crate::Pdf::empty().expect("empty PDF");
         let mut writer = PdfWriter::new(&mut pdf);
 
-        writer.set_newline_before_endstream_mode(NewlineBeforeEndstream::No);
+        writer.set_newline_before_endstream(false);
         assert_eq!(
             writer.settings.newline_before_endstream,
-            NewlineBeforeEndstream::No
+            NewlineBeforeEndstream::Never
         );
-        writer.set_newline_before_endstream_mode(NewlineBeforeEndstream::Yes);
+        writer.set_newline_before_endstream(true);
         assert_eq!(
             writer.settings.newline_before_endstream,
             NewlineBeforeEndstream::Yes
@@ -7920,7 +7906,7 @@ mod tests {
         write_stream_to_buf_qdf(
             &mut out,
             &stream,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
             None,
             emitted_ref,
             Some(&context),
@@ -7934,7 +7920,7 @@ mod tests {
         write_stream_to_buf_qdf(
             &mut out,
             &stream,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
             Some(&mut emitter),
             emitted_ref,
             Some(&context),
@@ -7948,7 +7934,7 @@ mod tests {
         write_stream_to_buf_qdf(
             &mut out,
             &stream,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
             Some(&mut emitter),
             emitted_ref,
             None,
@@ -7961,7 +7947,7 @@ mod tests {
         write_stream_to_buf_qdf(
             &mut out,
             &stream,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
             None,
             emitted_ref,
             None,

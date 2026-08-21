@@ -1864,17 +1864,23 @@ fn append_hint_stream_object(
         // writes the payload through the encryption pipeline exactly once.
         // Pass 2 receives this complete framed object unchanged, so the
         // explicit IV preserves the same ciphertext across both passes.
-        crate::writer::write_stream_payload_with_pipeline(
+        crate::writer::write_stream_payload_with_pipeline_qdf(
             bytes,
             payload,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
+            true,
             new_ref,
             ctx,
             true,
             Some(hint_stream_aes_iv),
         )?;
     } else {
-        crate::writer::serialize::write_stream_payload(bytes, payload, NewlineBeforeEndstream::No);
+        crate::writer::serialize::write_stream_payload_with_qdf(
+            bytes,
+            payload,
+            NewlineBeforeEndstream::Never,
+            true,
+        );
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -9406,10 +9412,11 @@ mod tests {
         // must embed, without routing the test through the legacy buffer
         // replacement helper.
         let mut expected_object = Vec::new();
-        crate::writer::write_stream_payload_with_pipeline(
+        crate::writer::write_stream_payload_with_pipeline_qdf(
             &mut expected_object,
             &payload,
-            NewlineBeforeEndstream::No,
+            NewlineBeforeEndstream::Never,
+            true,
             object_ref,
             &ctx,
             true,
@@ -9562,10 +9569,11 @@ mod tests {
         // wrong reason would be worse than no test).
         let payload_len_from = |ctx: &EncryptionContext, iv: [u8; 16]| -> usize {
             let mut object = Vec::new();
-            crate::writer::write_stream_payload_with_pipeline(
+            crate::writer::write_stream_payload_with_pipeline_qdf(
                 &mut object,
                 &payload,
-                NewlineBeforeEndstream::No,
+                NewlineBeforeEndstream::Never,
+                true,
                 object_ref,
                 ctx,
                 true,
