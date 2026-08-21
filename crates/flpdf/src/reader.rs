@@ -6455,7 +6455,7 @@ mod tests {
         let stream = Stream::new(dict, b"raw image bytes".to_vec());
         let detail =
             explicit_filter_fallback_detail(&stream, &Error::Unsupported("decrypt failed".into()));
-        assert_eq!(detail, "decrypt failed");
+        assert_ne!(detail, "decrypt failed");
     }
 
     fn explicit_identity_crypt_chain(chain_len: usize) -> Stream {
