@@ -3,8 +3,9 @@
 //!
 //! [`AcroFormDocumentHelper`] wraps a `&mut Pdf<R>` and exposes document-level
 //! operations for interactive form fields. It builds on
-//! [`crate::FormFieldObjectHelper`] for inherited value lookup and on
-//! [`crate::copy_objects`] for cross-document field copying.
+//! [`crate::FormFieldObjectHelper`] for inherited value lookup. qpdf's
+//! page-based AcroForm copy responsibilities use the canonical annotation
+//! transform path in this module and its job consumers.
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object::MAX_INLINE_DEPTH;
@@ -14,14 +15,11 @@ use crate::pdf_string::utf8_value;
 use crate::ref_chain::resolve_ref_chain;
 use crate::resource_replacer::{replace_resource_names, ResourceRenames};
 use crate::{
-    copy_objects, Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
+    Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
-
-type AcroFormInheritedEntries = Vec<(Vec<u8>, Object)>;
-type FieldCopySet = BTreeSet<ObjectRef>;
 
 fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field: ObjectHandle) {
     let annotation_identity = annotation.identity_key();
@@ -1655,133 +1653,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(())
     }
 
-    /// Copy `/AcroForm/DA` onto fields that do not carry a direct `/DA`.
-    ///
-    /// Existing field-level `/DA` values are preserved.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
-    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
-    ///   dictionary, or when the field-tree depth limit is exceeded. A direct
-    ///   non-dictionary `/AcroForm` value is ignored, not rejected.
-    /// - Any error from [`Pdf::resolve`].
-    pub fn fix_appearance_inheritance(&mut self) -> Result<()> {
-        let Some(acroform) = self.acroform_dict()? else {
-            return Ok(());
-        };
-        let Some(da) = acroform.get("DA").cloned() else {
-            return Ok(());
-        };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.get("Fields").cloned())? else {
-            return Ok(());
-        };
-
-        let mut seen = BTreeSet::new();
-        for item in fields {
-            if let Object::Reference(field_ref) = item {
-                self.fix_field_appearance_inheritance(
-                    field_ref,
-                    &da,
-                    &BTreeMap::new(),
-                    &mut seen,
-                    0,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Copy all top-level fields from `source` and append them to this document.
-    ///
-    /// Returns the copied top-level field refs in the target document.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Missing`] when the target document has no `/Root`.
-    /// - [`Error::Unsupported`] when the catalog or a field-tree node is not a
-    ///   dictionary, when an indirect `/AcroForm` reference does not resolve to a
-    ///   dictionary, when a depth limit (field-tree or reference-chain) is
-    ///   exceeded, or when the target object-number space is exhausted. A direct
-    ///   non-dictionary `/AcroForm` value is ignored, not rejected.
-    /// - Any error propagated from [`copy_objects`] (for example a failed
-    ///   [`Pdf::resolve`] on `source`).
-    pub fn copy_fields_from<RS: Read + Seek>(
-        &mut self,
-        source: &mut Pdf<RS>,
-    ) -> Result<Vec<ObjectRef>> {
-        let (top_fields, inherited_entries, copy_set) = source_field_copy_set(source)?;
-        if top_fields.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let map = copy_objects(source, self.pdf, &copy_set)?;
-        let copied_top: Vec<ObjectRef> = top_fields
-            .iter()
-            .filter_map(|field_ref| map.get(field_ref).copied())
-            .collect();
-
-        let acroform_ref = self.ensure_acroform_ref()?;
-        let mut acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
-        let mut fields =
-            resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.unwrap_or_default();
-        fields.extend(copied_top.iter().copied().map(Object::Reference));
-        acroform.insert("Fields", Object::Array(fields));
-
-        let mut source_da = None;
-        let mut source_dr = None;
-        for (key, value) in inherited_entries {
-            let mapped = remap_refs_in_object(value, &map);
-            match key.as_slice() {
-                b"DA" => {
-                    source_da = Some(mapped);
-                }
-                b"DR" => {
-                    source_dr = Some(mapped);
-                }
-                _ => {}
-            }
-        }
-        materialize_acroform_dr(&mut acroform, self.pdf)?;
-        let font_renames = match source_dr {
-            Some(dr) => {
-                let dr = resolve_dictionary_object(self.pdf, dr)?;
-                let dr = materialize_resource_categories_in_object(self.pdf, dr)?;
-                merge_acroform_dr(&mut acroform, dr)
-            }
-            None => BTreeMap::new(),
-        };
-        let source_da = source_da.map(|da| rewrite_da_resource_names(da, &font_renames));
-        if let Some(da) = source_da.clone() {
-            if acroform.get("DA").is_none() {
-                acroform.insert("DA", da);
-            }
-        }
-        self.pdf
-            .set_object(acroform_ref, Object::Dictionary(acroform));
-
-        if let Some(da) = source_da {
-            let mut seen = BTreeSet::new();
-            for copied_ref in &copied_top {
-                self.fix_field_appearance_inheritance(
-                    *copied_ref,
-                    &da,
-                    &font_renames,
-                    &mut seen,
-                    0,
-                )?;
-            }
-        } else if !font_renames.is_empty() {
-            let mut seen = BTreeSet::new();
-            for copied_ref in &copied_top {
-                self.rewrite_field_da_resource_names(*copied_ref, &font_renames, &mut seen, 0)?;
-            }
-        }
-
-        self.invalidate_cache();
-        Ok(copied_top)
-    }
-
     fn acroform_ref(&mut self) -> Result<Option<ObjectRef>> {
         let Some(root_ref) = self.pdf.root_ref() else {
             return Ok(None);
@@ -1952,96 +1823,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         for kid in kids {
             if let Object::Reference(kid_ref) = kid {
                 self.walk_field_info_tree(kid_ref, current.clone(), seen, out, depth + 1)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn fix_field_appearance_inheritance(
-        &mut self,
-        field_ref: ObjectRef,
-        inherited_da: &Object,
-        font_renames: &BTreeMap<Vec<u8>, Vec<u8>>,
-        seen: &mut BTreeSet<ObjectRef>,
-        depth: usize,
-    ) -> Result<()> {
-        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
-            )));
-        }
-        if !seen.insert(field_ref) {
-            return Ok(());
-        }
-
-        let mut field = self.resolve_field_dict(field_ref)?;
-        let current_da = match field.get("DA").cloned() {
-            Some(da) => {
-                let rewritten = rewrite_da_resource_names(da, font_renames);
-                if field.get("DA") != Some(&rewritten) {
-                    field.insert("DA", rewritten.clone());
-                    self.pdf
-                        .set_object(field_ref, Object::Dictionary(field.clone()));
-                }
-                rewritten
-            }
-            None => {
-                field.insert("DA", inherited_da.clone());
-                self.pdf
-                    .set_object(field_ref, Object::Dictionary(field.clone()));
-                inherited_da.clone()
-            }
-        };
-
-        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
-            return Ok(());
-        };
-        for kid in kids {
-            if let Object::Reference(kid_ref) = kid {
-                self.fix_field_appearance_inheritance(
-                    kid_ref,
-                    &current_da,
-                    font_renames,
-                    seen,
-                    depth + 1,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn rewrite_field_da_resource_names(
-        &mut self,
-        field_ref: ObjectRef,
-        font_renames: &BTreeMap<Vec<u8>, Vec<u8>>,
-        seen: &mut BTreeSet<ObjectRef>,
-        depth: usize,
-    ) -> Result<()> {
-        if depth > DEFAULT_MAX_ACROFORM_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "AcroForm field tree depth exceeds maximum of {DEFAULT_MAX_ACROFORM_DEPTH}"
-            )));
-        }
-        if !seen.insert(field_ref) {
-            return Ok(());
-        }
-
-        let mut field = self.resolve_field_dict(field_ref)?;
-        if let Some(da) = field.get("DA").cloned() {
-            let rewritten = rewrite_da_resource_names(da, font_renames);
-            if field.get("DA") != Some(&rewritten) {
-                field.insert("DA", rewritten);
-                self.pdf
-                    .set_object(field_ref, Object::Dictionary(field.clone()));
-            }
-        }
-
-        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
-            return Ok(());
-        };
-        for kid in kids {
-            if let Object::Reference(kid_ref) = kid {
-                self.rewrite_field_da_resource_names(kid_ref, font_renames, seen, depth + 1)?;
             }
         }
         Ok(())
@@ -2357,31 +2138,6 @@ fn qpdf_real(v: f64) -> ObjectHandle {
     ObjectHandle::real(rounded)
 }
 
-fn source_field_copy_set<RS: Read + Seek>(
-    source: &mut Pdf<RS>,
-) -> Result<(Vec<ObjectRef>, AcroFormInheritedEntries, FieldCopySet)> {
-    let mut helper = AcroFormDocumentHelper::new(source);
-    let top_fields = helper.top_level_fields()?;
-    let inherited_entries = helper.acroform_inherited_entries()?;
-    let mut copy_set = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    for field_ref in &top_fields {
-        // Field-tree walk: skip a widget's /P (its page back-pointer) so the
-        // closure never pulls the page and its sibling tree into the copy set.
-        collect_reachable_refs(helper.pdf, *field_ref, &mut copy_set, &mut seen, 0, true)?;
-    }
-    for (_, value) in &inherited_entries {
-        // /DR and /DA are resource subtrees, not field-tree nodes: a resource may
-        // be legitimately named /P (e.g. a /DA-referenced font), so collect /P
-        // here rather than dropping it as a field-tree back-pointer. A well-formed
-        // resource dict holds no field-tree back-pointers; the `seen` set and the
-        // depth cap still bound traversal against cycles and long reference chains
-        // (DoS) on hostile input.
-        collect_refs_in_object(helper.pdf, value, &mut copy_set, &mut seen, 0, 0, false)?;
-    }
-    Ok((top_fields, inherited_entries, copy_set))
-}
-
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     pub(crate) fn top_level_fields(&mut self) -> Result<Vec<ObjectRef>> {
         let Some(acroform) = self.acroform_dict()? else {
@@ -2588,28 +2344,6 @@ fn resolve_array_value<R: Read + Seek>(
     }
 }
 
-fn resolve_dictionary_object<R: Read + Seek>(pdf: &mut Pdf<R>, obj: Object) -> Result<Object> {
-    match obj {
-        Object::Reference(object_ref) => match pdf.resolve_borrowed(object_ref)? {
-            Object::Dictionary(dict) => Ok(Object::Dictionary(dict.clone())),
-            _ => Ok(Object::Reference(object_ref)),
-        },
-        other => Ok(other),
-    }
-}
-
-fn materialize_acroform_dr<R: Read + Seek>(
-    acroform: &mut Dictionary,
-    pdf: &mut Pdf<R>,
-) -> Result<()> {
-    let Some(dr) = acroform.get("DR").cloned() else {
-        return Ok(());
-    };
-    let dr = resolve_dictionary_object(pdf, dr)?;
-    acroform.insert("DR", materialize_resource_categories_in_object(pdf, dr)?);
-    Ok(())
-}
-
 pub(crate) fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
     match obj {
         Object::Reference(object_ref) => map
@@ -2648,145 +2382,6 @@ fn remap_refs_in_dict(dict: Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) ->
     out
 }
 
-fn merge_acroform_dr(acroform: &mut Dictionary, source_dr: Object) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    match acroform.remove("DR") {
-        None | Some(Object::Null) => {
-            acroform.insert("DR", source_dr);
-            BTreeMap::new()
-        }
-        Some(Object::Dictionary(target_dr)) => {
-            if let Object::Dictionary(source_dr) = source_dr {
-                let (merged, renames) = merge_resource_dicts(target_dr, source_dr);
-                acroform.insert("DR", Object::Dictionary(merged));
-                renames
-            } else {
-                acroform.insert("DR", Object::Dictionary(target_dr));
-                BTreeMap::new()
-            }
-        }
-        Some(existing) => {
-            acroform.insert("DR", existing);
-            BTreeMap::new()
-        }
-    }
-}
-
-fn materialize_resource_categories_in_object<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dr: Object,
-) -> Result<Object> {
-    match dr {
-        Object::Dictionary(mut dict) => {
-            materialize_resource_categories(&mut dict, pdf)?;
-            Ok(Object::Dictionary(dict))
-        }
-        other => Ok(other),
-    }
-}
-
-fn materialize_resource_categories<R: Read + Seek>(
-    dr: &mut Dictionary,
-    pdf: &mut Pdf<R>,
-) -> Result<()> {
-    let categories: Vec<Vec<u8>> = dr.iter().map(|(key, _)| key.to_vec()).collect();
-    for category in categories {
-        let Some(value) = dr.get(&category).cloned() else {
-            continue;
-        };
-        dr.insert(&category, resolve_dictionary_object(pdf, value)?);
-    }
-    Ok(())
-}
-
-fn merge_resource_dicts(
-    mut target: Dictionary,
-    source: Dictionary,
-) -> (Dictionary, BTreeMap<Vec<u8>, Vec<u8>>) {
-    let mut font_renames = BTreeMap::new();
-    for (category, source_value) in source.iter() {
-        match (target.remove(category), source_value) {
-            (None, _) => target.insert(category, source_value.clone()),
-            (Some(Object::Dictionary(target_category)), Object::Dictionary(source_category)) => {
-                let (merged, renames) =
-                    merge_resource_category(target_category, source_category, category == b"Font");
-                if category == b"Font" {
-                    font_renames.extend(renames);
-                }
-                target.insert(category, Object::Dictionary(merged));
-            }
-            (Some(existing), _) => target.insert(category, existing),
-        }
-    }
-    (target, font_renames)
-}
-
-fn merge_resource_category(
-    mut target: Dictionary,
-    source: &Dictionary,
-    rename_conflicts: bool,
-) -> (Dictionary, BTreeMap<Vec<u8>, Vec<u8>>) {
-    let mut renames = BTreeMap::new();
-    for (name, value) in source.iter() {
-        match target.get(name) {
-            None => target.insert(name, value.clone()),
-            Some(existing) if existing == value => {}
-            Some(_) if rename_conflicts => {
-                let renamed = unique_resource_name(name, &target);
-                target.insert(&renamed, value.clone());
-                renames.insert(name.to_vec(), renamed);
-            }
-            Some(_) => {}
-        }
-    }
-    (target, renames)
-}
-
-fn unique_resource_name(base: &[u8], existing: &Dictionary) -> Vec<u8> {
-    let mut candidate = [base, b"_flpdf"].concat();
-    let mut suffix = 2u32;
-    while existing.get(&candidate).is_some() {
-        candidate = [base, b"_flpdf", suffix.to_string().as_bytes()].concat();
-        suffix += 1;
-    }
-    candidate
-}
-
-fn rewrite_da_resource_names(da: Object, renames: &BTreeMap<Vec<u8>, Vec<u8>>) -> Object {
-    if renames.is_empty() {
-        return da;
-    }
-    match da {
-        Object::String(bytes) => Object::String(rewrite_pdf_name_tokens(&bytes, renames)),
-        other => other,
-    }
-}
-
-fn rewrite_pdf_name_tokens(bytes: &[u8], renames: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'/' {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-
-        let start = i + 1;
-        let mut end = start;
-        while end < bytes.len() && !is_pdf_name_delimiter(bytes[end]) {
-            end += 1;
-        }
-        out.push(b'/');
-        if let Some(renamed) = renames.get(&bytes[start..end]) {
-            out.extend_from_slice(renamed);
-        } else {
-            out.extend_from_slice(&bytes[start..end]);
-        }
-        i = end;
-    }
-    out
-}
-
 fn resource_renames_from_conflicts(conflicts: &ResourceConflicts) -> ResourceRenames {
     conflicts
         .iter()
@@ -2809,14 +2404,6 @@ fn resource_renames_from_conflicts(conflicts: &ResourceConflicts) -> ResourceRen
 
 fn without_pdf_name_slash(value: &[u8]) -> Vec<u8> {
     value.strip_prefix(b"/").unwrap_or(value).to_vec()
-}
-
-fn is_pdf_name_delimiter(byte: u8) -> bool {
-    byte.is_ascii_whitespace()
-        || matches!(
-            byte,
-            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-        )
 }
 
 #[cfg(test)]
@@ -2932,110 +2519,6 @@ mod tests {
         let obj = Object::Dictionary(dict(&[("S", stream), ("N", Object::Integer(1))]));
         collect_refs_in_object(&mut pdf, &obj, &mut out, &mut seen, 0, 0, true).unwrap();
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn merge_acroform_dr_keeps_existing_when_source_is_not_a_dictionary() {
-        let target_dr = Object::Dictionary(dict(&[(
-            "Font",
-            Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
-        )]));
-        let mut acroform = dict(&[("DR", target_dr.clone())]);
-
-        let renames = merge_acroform_dr(&mut acroform, Object::Name(b"Bad".to_vec()));
-
-        assert!(renames.is_empty());
-        assert_eq!(acroform.get("DR"), Some(&target_dr));
-    }
-
-    #[test]
-    fn merge_acroform_dr_preserves_non_dictionary_target() {
-        let existing = Object::Name(b"Bad".to_vec());
-        let mut acroform = dict(&[("DR", existing.clone())]);
-        let source_dr = Object::Dictionary(dict(&[(
-            "Font",
-            Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
-        )]));
-
-        let renames = merge_acroform_dr(&mut acroform, source_dr);
-
-        assert!(renames.is_empty());
-        assert_eq!(acroform.get("DR"), Some(&existing));
-    }
-
-    #[test]
-    fn merge_acroform_dr_inserts_source_when_target_is_missing_or_null() {
-        for initial in [None, Some(Object::Null)] {
-            let mut acroform = Dictionary::new();
-            if let Some(value) = initial {
-                acroform.insert("DR", value);
-            }
-            let source_dr = Object::Dictionary(dict(&[(
-                "Font",
-                Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
-            )]));
-
-            let renames = merge_acroform_dr(&mut acroform, source_dr.clone());
-
-            assert!(renames.is_empty());
-            assert_eq!(acroform.get("DR"), Some(&source_dr));
-        }
-    }
-
-    #[test]
-    fn merge_resource_dicts_keeps_target_non_dictionary_categories() {
-        let target = dict(&[("Font", Object::Name(b"Existing".to_vec()))]);
-        let source = dict(&[(
-            "Font",
-            Object::Dictionary(dict(&[("Helv", Object::Integer(1))])),
-        )]);
-
-        let (merged, renames) = merge_resource_dicts(target, source);
-
-        assert!(renames.is_empty());
-        assert_eq!(
-            merged.get("Font"),
-            Some(&Object::Name(b"Existing".to_vec()))
-        );
-    }
-
-    #[test]
-    fn merge_resource_category_skips_non_font_conflicts() {
-        let target = dict(&[("Img", Object::Integer(1))]);
-        let source = dict(&[("Img", Object::Integer(2))]);
-
-        let (merged, renames) = merge_resource_category(target, &source, false);
-
-        assert!(renames.is_empty());
-        assert_eq!(merged.get("Img"), Some(&Object::Integer(1)));
-    }
-
-    #[test]
-    fn unique_resource_name_uses_numeric_suffix_after_first_conflict() {
-        let existing = dict(&[
-            ("Helv_flpdf", Object::Integer(1)),
-            ("Helv_flpdf2", Object::Integer(2)),
-        ]);
-
-        assert_eq!(unique_resource_name(b"Helv", &existing), b"Helv_flpdf3");
-    }
-
-    #[test]
-    fn rewrite_da_resource_names_handles_non_strings_and_unmapped_names() {
-        let mut renames = BTreeMap::new();
-        renames.insert(b"Helv".to_vec(), b"Helv_flpdf".to_vec());
-
-        assert_eq!(
-            rewrite_da_resource_names(Object::Name(b"DA".to_vec()), &renames),
-            Object::Name(b"DA".to_vec())
-        );
-        assert_eq!(
-            rewrite_da_resource_names(
-                Object::String(b"/Other 9 Tf /Helv2 10 Tf".to_vec()),
-                &renames
-            ),
-            Object::String(b"/Other 9 Tf /Helv2 10 Tf".to_vec())
-        );
     }
 
     #[test]
