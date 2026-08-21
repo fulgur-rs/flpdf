@@ -595,6 +595,30 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     target: &mut Pdf<RT>,
     refs: &BTreeSet<ObjectRef>,
 ) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
+    copy_objects_with_seed(source, target, refs, &BTreeMap::new())
+}
+
+/// Like [`copy_objects`], but `seed` pre-populates the renumbering map with
+/// source refs that must remap to an *existing* target object rather than a
+/// freshly copied one.
+///
+/// A seeded ref in `refs` is neither given a new target number nor copied
+/// (the loops below skip it): its entry in `seed` is the only mapping used,
+/// so an edge from another copied object that points at it resolves to the
+/// target's own existing object instead of becoming `Object::Null`
+/// (unseeded, unmapped refs) or a redundant duplicate (seeded but still
+/// copied). Used by the multi-source `--pages --preserve-unreferenced`
+/// merge (`job/page_merge.rs`) to let a preserved primary orphan's reference
+/// to the primary's original Catalog/Pages root resolve to the merge
+/// target's own Catalog/Pages root, matching qpdf's in-place primary
+/// mutation (`QPDFJob.cc:2481-2489`) where that reference was never
+/// severed in the first place.
+pub(crate) fn copy_objects_with_seed<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    refs: &BTreeSet<ObjectRef>,
+    seed: &BTreeMap<ObjectRef, ObjectRef>,
+) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
     // Next free target object number: one past the current maximum.
     let base = target
         .object_refs()
@@ -604,23 +628,33 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
         .unwrap_or(0)
         + 1;
 
-    // Pre-allocate a fresh target number for every ref in the set, iterating in
-    // sorted order (BTreeSet) for deterministic output.  Building the complete
-    // map before rewriting is what makes cycles safe.  Allocation is bounded by
-    // the `u32` object-number space; exhaustion is an error rather than a
-    // silent wraparound.
-    let mut map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
-    for (offset, &src_ref) in refs.iter().enumerate() {
+    // Pre-allocate a fresh target number for every non-seeded ref in the
+    // set, iterating in sorted order (BTreeSet) for deterministic output.
+    // Building the complete map before rewriting is what makes cycles safe.
+    // Allocation is bounded by the `u32` object-number space; exhaustion is
+    // an error rather than a silent wraparound.
+    let mut map: BTreeMap<ObjectRef, ObjectRef> = seed.clone();
+    let mut offset = 0usize;
+    for &src_ref in refs {
+        if map.contains_key(&src_ref) {
+            continue;
+        }
         map.insert(
             src_ref,
             ObjectRef::new(alloc_target_number(base, offset)?, 0),
         );
+        offset += 1;
     }
 
-    // Resolve each source object, rewrite its references in place, and store it.
-    // `resolve` already returns an owned `Object`, so rewriting in place avoids
-    // a second deep clone of (potentially large) stream payloads.
+    // Resolve each non-seeded source object, rewrite its references in
+    // place, and store it. `resolve` already returns an owned `Object`, so
+    // rewriting in place avoids a second deep clone of (potentially large)
+    // stream payloads. A seeded ref is not re-copied: the target already
+    // owns the object it maps to.
     for &src_ref in refs {
+        if seed.contains_key(&src_ref) {
+            continue;
+        }
         let mut obj = source.resolve(src_ref)?;
         rewrite_refs(&mut obj, 0, &map)?;
         target.set_object(map[&src_ref], obj);

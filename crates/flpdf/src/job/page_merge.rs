@@ -35,7 +35,7 @@
 
 use super::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
-use crate::object_copy::copy_objects;
+use crate::object_copy::copy_objects_with_seed;
 use crate::object_handle::canonical_dictionary_key_from_legacy;
 use crate::page_closure::{extend_object_closure, extend_page_object_closure};
 use crate::page_extract::{
@@ -46,7 +46,7 @@ use crate::pages::page_refs;
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
 use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
-use crate::subset_prune::sweep_unreachable_objects;
+use crate::subset_prune::sweep_unreachable_objects_except;
 use crate::{
     Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf,
     Result,
@@ -962,7 +962,7 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// clone of its first copy, matching [`extract_pages`](crate::extract_pages).
 ///
 /// Each source is left unmodified. Each input is copied with
-/// [`copy_objects`]; the result mirrors
+/// [`copy_objects`](crate::object_copy::copy_objects); the result mirrors
 /// [`extract_pages`](crate::extract_pages) for a single input. Write the result
 /// with [`crate::PdfWriter`] to produce one fresh qpdf-style output.
 ///
@@ -1061,6 +1061,24 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
     resource_mode: RemoveUnreferencedResources,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    merge_documents_with_resource_mode_and_preserve_primary(inputs, resource_mode, false)
+}
+
+/// Merge selected pages while optionally retaining primary-source objects that
+/// are not reachable from its trailer roots.
+///
+/// qpdf keeps the primary QPDF in place while `QPDFJob::handlePageSpecs`
+/// copies foreign pages (`libqpdf/QPDFJob.cc:2360-2632`). When the writer's
+/// `preserve_unreferenced_objects` option is enabled, those primary objects
+/// remain available to `QPDFWriter::enqueueObjectsStandard` (`QPDFWriter.cc:
+/// 2907-2913`). The fresh merge target normally has no way to see them, so the
+/// job-level page-spec route adds the primary's unreachable live references to
+/// the same copy closure as its selected pages.
+pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    resource_mode: RemoveUnreferencedResources,
+    preserve_primary_unreferenced: bool,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if inputs.is_empty() {
         return Err(Error::Unsupported(
             "merge requires at least one input".to_string(),
@@ -1096,6 +1114,10 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
     let mut kept_fields: Vec<KeptField> = Vec::new();
     let mut primary_acroform = PrimaryAcroForm::default();
     let mut primary_map: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+    // Target-side refs of the primary's preserved-orphan closure
+    // (`--preserve-unreferenced`), protected from the final sweep below.
+    // Empty, and therefore a no-op, when preservation is disabled.
+    let mut preserved_target_refs: BTreeSet<ObjectRef> = BTreeSet::new();
 
     // /PageLabels merge state (qpdf `handlePageSpecs` parity). Unlike outlines
     // and named destinations, which are inherited from the primary input
@@ -1250,10 +1272,101 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
             closure.extend(primary_acroform.closure_seed.iter().copied());
         }
 
+        // qpdf keeps the primary `QPDF` in place through `handlePageSpecs`
+        // (`QPDFJob.cc:2481-2489`): every original page is `removePage`'d
+        // first (leaving its object graph untouched), selected pages are
+        // re-added, and each unreused original page is then
+        // `replaceObject`'d to a bare `null` -- nulling only the page dict,
+        // never its children. Nothing else in the primary's object cache is
+        // ever removed. `QPDFWriter::enqueueObjectsStandard`
+        // (`QPDFWriter.cc:2907-2913`) then enqueues literally every entry in
+        // `getAllObjects()` when the option is set -- no reachability
+        // computation, no subtraction. Fold in the primary's *entire* live
+        // object universe unconditionally to match: `closure` already
+        // dedupes (`BTreeSet`), so re-adding objects already selected via
+        // `page_closure`/`doc_level` is a no-op, and a deselected page's
+        // dict now reaches `closure` too, which is what lets
+        // `null_copied_removed_pages` below null it out (matching
+        // `replaceObject`) instead of silently dropping it and everything
+        // reachable only through it.
+        // A preserved orphan may reference the primary's own structural
+        // roots (Catalog, `/Pages`) directly -- e.g. a bookmark-like helper
+        // dict pointing back at the document root. qpdf never severs that
+        // edge: the primary's Catalog/`/Pages` objects are mutated in place
+        // and stay exactly what they always were. Since `target` instead
+        // builds a FRESH Catalog/`/Pages` pair (`Pdf::empty`) and copies
+        // everything else, seed the copy map so those two source refs
+        // resolve to the target's existing equivalents instead of being
+        // duplicated as new, dead-weight copies or dropped to `Object::Null`
+        // (unmapped refs) by `rewrite_refs`.
+        let mut copy_seed: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
+        let primary_live = if is_primary && preserve_primary_unreferenced {
+            // Exclude `/Type /ObjStm` container refs: an object-stream
+            // container is a writer-owned compression artifact, not
+            // semantic content. qpdf's writer independently decides
+            // container membership for whatever gets enqueued
+            // (`QPDFWriter::enqueueObject` redirects a compressible member
+            // to its container rather than writing the member directly,
+            // `QPDFWriter.cc:1093-1103`) and regenerates each container's
+            // bytes fresh from that current membership
+            // (`getCompressibleObjGens`, `QPDFWriter.cc:1955-2003`) --- it
+            // never writes a source container's raw bytes verbatim. Each
+            // compressed member's own ref still resolves to its correct
+            // logical value via `source.resolve()` regardless of
+            // compression, so excluding only the container here does not
+            // lose any member; flpdf's own writer
+            // (`writer/object_streams.rs`) already owns (re)compressing the
+            // copied members into fresh containers. Without this exclusion,
+            // the container's raw stream would be copied as an ordinary
+            // object, duplicating its still-live members' content in a
+            // second, dangling copy that nothing in the output references.
+            let mut primary_live = Vec::new();
+            for object_ref in input.source.live_object_refs() {
+                if input
+                    .source
+                    .get_object_handle(object_ref)
+                    .try_is_stream_of_type(b"ObjStm", b"")?
+                {
+                    continue;
+                }
+                primary_live.push(object_ref);
+            }
+            closure.extend(primary_live.iter().copied());
+            // `page_refs(input.source)` above already succeeded for this same
+            // primary in this same loop iteration (nothing between the two
+            // calls mutates `input.source`'s catalog/`/Pages`), which
+            // requires `/Root` to resolve to a dictionary and its `/Pages`
+            // entry to be an indirect reference (`PageWalk::with_max_depth`,
+            // `pages.rs:826-833`). Both `expect`s below encode that already-
+            // proven invariant rather than re-deriving a fallback path qpdf
+            // has no counterpart for.
+            let primary_catalog_ref = input
+                .source
+                .root_ref()
+                .expect("page_refs above already required a resolvable /Root");
+            let target_catalog_ref = target
+                .root_ref()
+                .expect("Pdf::empty always populates a root catalog");
+            copy_seed.insert(primary_catalog_ref, target_catalog_ref);
+            let primary_pages_ref = input
+                .source
+                .resolve(primary_catalog_ref)?
+                .as_dict()
+                .and_then(|dict| dict.get_ref("Pages"))
+                .expect("page_refs above already required an indirect primary /Pages");
+            copy_seed.insert(primary_pages_ref, pages_root_ref);
+            primary_live
+        } else {
+            Vec::new()
+        };
+
         // qpdf `--pages` null-out parity is page-tree driven: after every closure
         // root has been folded, the selected page set determines which copied
-        // source pages are retained. No destination/action subtype analysis is
-        // needed, and pages outside the closure are never copied as placeholders.
+        // source pages are retained. Without `--preserve-unreferenced`, pages
+        // outside the closure are never copied as placeholders; with it, a
+        // deselected primary page dict is now folded into `closure` above so
+        // it IS copied, and the null-out below turns that copy into the same
+        // bare `null` qpdf's `replaceObject` produces.
         // Renumbering-disjointness invariant: copy_objects allocates fresh
         // target object numbers starting one past the current maximum, so the
         // refs it returns never collide with objects already surviving in the
@@ -1261,12 +1374,22 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
         // This is the structural guard that makes a shared-destination
         // double-remap unreachable; capture the surviving set BEFORE copying.
         let surviving_before: BTreeSet<ObjectRef> = target.object_refs().into_iter().collect();
-        let map = copy_objects(input.source, &mut target, &closure)?;
+        let map = copy_objects_with_seed(input.source, &mut target, &closure, &copy_seed)?;
         debug_assert!(
-            map.values().all(|new| !surviving_before.contains(new)),
-            "copy_objects must allocate refs disjoint from surviving target refs \
+            map.values()
+                .all(|new| !surviving_before.contains(new) || copy_seed.values().any(|s| s == new)),
+            "copy_objects_with_seed must allocate fresh refs disjoint from surviving target refs, \
+             except for explicitly seeded target refs \
              (renumbering-disjointness invariant; guards against shared-destination double-remap)"
         );
+
+        // Track the primary's preserved-orphan closure by its TARGET-side
+        // refs so the final sweep (below) can protect exactly this set —
+        // and nothing else — from the reachability GC it still runs for
+        // incidental merge artifacts (qpdf's writer preserves unreferenced
+        // objects only when explicitly asked; it does not disable
+        // reachability pruning for everything else).
+        preserved_target_refs.extend(primary_live.iter().filter_map(|r| map.get(r).copied()));
 
         null_copied_removed_pages(&mut target, &all, &seen, &map);
 
@@ -1400,8 +1523,14 @@ pub(crate) fn merge_documents_with_resource_mode<R: Read + Seek>(
     }
 
     // Drop the copied ancestor /Pages node(s) and any objects only they
-    // referenced before handing the graph to the canonical writer.
-    sweep_unreachable_objects(&mut target)?;
+    // referenced before handing the graph to the canonical writer. Run this
+    // sweep unconditionally — qpdf's writer only skips reachability pruning
+    // for objects the caller explicitly asked to preserve
+    // (`QPDFWriter.cc:2907-2913`), not for the rest of the graph — and
+    // protect exactly `preserved_target_refs` (empty, so a no-op, when
+    // preservation is disabled) so the primary's preserved-orphan closure
+    // survives while incidental merge artifacts still do not.
+    sweep_unreachable_objects_except(&mut target, &preserved_target_refs)?;
 
     Ok(target)
 }

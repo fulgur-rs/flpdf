@@ -7,7 +7,8 @@
 //! documents stay alive for the whole operation, matching qpdf's page heap.
 
 use super::page_merge::{
-    merge_documents_with_resource_mode, source_top_level_field_names, MergeInput,
+    merge_documents_with_resource_mode, merge_documents_with_resource_mode_and_preserve_primary,
+    source_top_level_field_names, MergeInput,
 };
 use crate::page_label_document_helper::LabelRange;
 use crate::page_plan::PagePlan;
@@ -44,6 +45,13 @@ impl PageSpecInput {
             range,
         }
     }
+}
+
+fn merge_preserving_primary<R: Read + Seek>(
+    inputs: &mut [MergeInput<'_, R>],
+    resource_mode: RemoveUnreferencedResources,
+) -> Result<Pdf<Cursor<Vec<u8>>>> {
+    merge_documents_with_resource_mode_and_preserve_primary(inputs, resource_mode, true)
 }
 
 /// A selected page represented by its source and its occurrence within the
@@ -324,52 +332,17 @@ fn merge_job_label_ranges(ranges: Vec<JobLabelEntry>) -> Vec<JobLabelEntry> {
     out
 }
 
-/// Resolve and execute qpdf's page-specification operation.
-///
-/// This is the Rust boundary corresponding to
-/// `QPDFJob::handlePageSpecs` (`libqpdf/QPDFJob.cc:2360-2632`). The low-level
-/// page tree and foreign-object responsibilities remain in
-/// [`crate::job::merge_documents`] and its page helpers. The job layer owns:
-///
-/// - per-spec range resolution and source-index validation;
-/// - qpdf's round-robin `--collate` order across specifications;
-/// - retaining the source documents while copied objects are materialized;
-/// - rebuilding the merged page tree in the final spec order; and
-/// - reconstructing `/PageLabels` in that same final order.
-///
-/// The caller supplies source documents in qpdf order, with the primary at
-/// index zero. `sources` must remain mutable because page-tree repair and
-/// inherited-attribute materialization are part of the qpdf copy operation.
-///
-/// `collate` is `None` for the ordinary concatenation order and `Some(n)` for
-/// qpdf's `--collate=n`; zero is rejected before any document is mutated.
-pub fn handle_page_specs<R: Read + Seek + 'static>(
-    job: &mut super::QPDFJob,
-    sources: &mut [Pdf<R>],
-    specs: &[PageSpecInput],
-    collate: Option<usize>,
-) -> Result<Pdf<Cursor<Vec<u8>>>> {
-    handle_page_specs_with_resource_mode(
-        job,
-        sources,
-        specs,
-        collate,
-        RemoveUnreferencedResources::Auto,
-    )
-}
-
-/// Resolve and execute qpdf's page-specification operation with an explicit
-/// page-resource mode.
-///
-/// qpdf's default is `auto`; the mode is a job-level policy and is therefore
-/// threaded into the bounded merge consumer rather than changing the generic
-/// [`crate::merge_documents`] library primitive.
-pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
+/// Crate-internal implementation of [`super::QPDFJob::handle_page_specs`];
+/// see that method for the parameter contract. Kept as a free function,
+/// rather than inlined into the method, so tests can drive it directly
+/// without spinning up a whole `QPDFJob`.
+fn handle_page_specs<R: Read + Seek + 'static>(
     job: &mut super::QPDFJob,
     sources: &mut [Pdf<R>],
     specs: &[PageSpecInput],
     collate: Option<usize>,
     resource_mode: RemoveUnreferencedResources,
+    preserve_unreferenced: bool,
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if sources.is_empty() {
         return Err(Error::Unsupported(
@@ -497,7 +470,11 @@ pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
             pages: pages.clone(),
         })
         .collect();
-    let mut merged = merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?;
+    let mut merged = if preserve_unreferenced {
+        merge_preserving_primary(&mut merge_inputs, resource_mode)?
+    } else {
+        merge_documents_with_resource_mode(&mut merge_inputs, resource_mode)?
+    };
     drop(merge_inputs);
 
     // merge_documents emits source-group order. Rebuild the target tree with
@@ -573,26 +550,51 @@ impl super::QPDFJob {
         super::acroform_field_prune::prune_acroform_after_subset(pdf, result)
     }
 
-    /// Execute qpdf's page-specification and multi-source copy operation.
+    /// Resolve and execute qpdf's page-specification operation
+    /// (`QPDFJob::handlePageSpecs`, `libqpdf/QPDFJob.cc:2360-2632`). The
+    /// low-level page tree and foreign-object responsibilities remain in
+    /// [`crate::job::merge_documents`] and its page helpers. This method
+    /// owns:
+    ///
+    /// - per-spec range resolution and source-index validation;
+    /// - qpdf's round-robin `--collate` order across specifications;
+    /// - retaining the source documents while copied objects are
+    ///   materialized;
+    /// - rebuilding the merged page tree in the final spec order; and
+    /// - reconstructing `/PageLabels` in that same final order.
+    ///
+    /// `sources` supplies source documents in qpdf order, with the primary
+    /// at index zero, and must remain mutable because page-tree repair and
+    /// inherited-attribute materialization are part of the qpdf copy
+    /// operation. `collate` is `None` for the ordinary concatenation order
+    /// and `Some(n)` for qpdf's `--collate=n`; zero is rejected before any
+    /// document is mutated. `resource_mode` is qpdf's
+    /// `--remove-unreferenced-resources={auto,yes,no}` job-level policy
+    /// (qpdf's default is `auto`). `preserve_unreferenced` is qpdf's
+    /// `--preserve-unreferenced` writer policy (`QPDFWriter.cc:2907-2913`),
+    /// applied to the primary input's own otherwise-unreachable objects.
+    /// Both settings live on `QPDFJob`'s member variables in qpdf
+    /// (`m->remove_unreferenced_page_resources`,
+    /// `m->preserve_unreferenced_objects`); qpdf has exactly one
+    /// `handlePageSpecs`, so this stays the single Rust entry point rather
+    /// than growing a family of same-named overloads with one more
+    /// parameter each.
     pub fn handle_page_specs<R: Read + Seek + 'static>(
         &mut self,
         sources: &mut [Pdf<R>],
         specs: &[PageSpecInput],
         collate: Option<usize>,
-    ) -> Result<Pdf<Cursor<Vec<u8>>>> {
-        handle_page_specs(self, sources, specs, collate)
-    }
-
-    /// Execute qpdf's page-specification operation with an explicit resource
-    /// pruning mode.
-    pub fn handle_page_specs_with_resource_mode<R: Read + Seek + 'static>(
-        &mut self,
-        sources: &mut [Pdf<R>],
-        specs: &[PageSpecInput],
-        collate: Option<usize>,
         resource_mode: RemoveUnreferencedResources,
+        preserve_unreferenced: bool,
     ) -> Result<Pdf<Cursor<Vec<u8>>>> {
-        handle_page_specs_with_resource_mode(self, sources, specs, collate, resource_mode)
+        handle_page_specs(
+            self,
+            sources,
+            specs,
+            collate,
+            resource_mode,
+            preserve_unreferenced,
+        )
     }
 }
 
@@ -787,8 +789,15 @@ mod tests {
         let mut sources = vec![inherited_resources_pdf()];
         let specs = [PageSpecInput::new(0, PageRange::parse("1,1").unwrap())];
 
-        let mut merged = handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None)
-            .expect("merge inherited-resources page");
+        let mut merged = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("merge inherited-resources page");
         let page_refs = crate::pages::page_refs(&mut merged).expect("read merged page tree");
         assert_eq!(page_refs.len(), 2);
         for page_ref in page_refs {
@@ -823,8 +832,15 @@ mod tests {
             PageSpecInput::new(1, PageRange::parse("1").unwrap()),
         ];
 
-        let mut merged = handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None)
-            .expect("merge across a fields-less-AcroForm primary and a secondary source");
+        let mut merged = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("merge across a fields-less-AcroForm primary and a secondary source");
         let root_ref = merged.root_ref().expect("merged root");
         let root = merged
             .resolve(root_ref)
@@ -857,8 +873,15 @@ mod tests {
             PageSpecInput::new(1, PageRange::parse("1").unwrap()),
         ];
 
-        let mut merged = handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None)
-            .expect("merge with the only AcroForm field on an unselected page");
+        let mut merged = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .expect("merge with the only AcroForm field on an unselected page");
         let root_ref = merged.root_ref().expect("merged root");
         let root = merged
             .resolve(root_ref)
@@ -907,27 +930,73 @@ mod tests {
     fn handle_page_specs_rejects_invalid_job_inputs_and_selections() {
         let mut no_sources: Vec<Pdf<Cursor<Vec<u8>>>> = Vec::new();
         let spec = [PageSpecInput::new(0, PageRange::parse("1").unwrap())];
-        assert!(handle_page_specs(&mut QPDFJob::new(), &mut no_sources, &spec, None).is_err());
+        assert!(handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut no_sources,
+            &spec,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .is_err());
 
         let mut sources = vec![three_page_pdf()];
-        assert!(handle_page_specs(&mut QPDFJob::new(), &mut sources, &[], None,).is_err());
+        assert!(handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &[],
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .is_err());
 
         let mut sources = vec![three_page_pdf()];
-        assert!(handle_page_specs(&mut QPDFJob::new(), &mut sources, &spec, Some(0),).is_err());
+        assert!(handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &spec,
+            Some(0),
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .is_err());
 
         let mut sources = vec![three_page_pdf()];
         let missing = [PageSpecInput::new(1, PageRange::parse("1").unwrap())];
-        assert!(handle_page_specs(&mut QPDFJob::new(), &mut sources, &missing, None,).is_err());
+        assert!(handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &missing,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .is_err());
 
         let mut sources = vec![three_page_pdf()];
         let out_of_range = [PageSpecInput::new(0, PageRange::parse("99").unwrap())];
-        assert!(
-            handle_page_specs(&mut QPDFJob::new(), &mut sources, &out_of_range, None,).is_err()
-        );
+        assert!(handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &out_of_range,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .is_err());
 
         let mut sources = vec![three_page_pdf()];
         let empty = [PageSpecInput::new(0, PageRange::empty())];
-        assert!(handle_page_specs(&mut QPDFJob::new(), &mut sources, &empty, None,).is_err());
+        assert!(handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &empty,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .is_err());
     }
 
     #[test]
@@ -937,8 +1006,15 @@ mod tests {
             PageSpecInput::new(1, PageRange::parse("1").unwrap()),
             PageSpecInput::new(0, PageRange::parse("1").unwrap()),
         ];
-        let mut reversed_output =
-            handle_page_specs(&mut QPDFJob::new(), &mut sources, &reversed, None).unwrap();
+        let mut reversed_output = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &reversed,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(selected_page_count(&mut reversed_output), 2);
 
         let mut sources = vec![three_page_pdf(), three_page_pdf()];
@@ -946,8 +1022,15 @@ mod tests {
             PageSpecInput::new(0, PageRange::parse("1-2").unwrap()),
             PageSpecInput::new(1, PageRange::parse("1-2").unwrap()),
         ];
-        let mut collated_output =
-            handle_page_specs(&mut QPDFJob::new(), &mut sources, &collated, Some(1)).unwrap();
+        let mut collated_output = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &collated,
+            Some(1),
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .unwrap();
         assert_eq!(selected_page_count(&mut collated_output), 4);
     }
 
@@ -955,8 +1038,15 @@ mod tests {
     fn handle_page_specs_reconstructs_qpdf_page_labels_with_empty_prefix() {
         let mut sources = vec![labelled_pdf()];
         let specs = [PageSpecInput::new(0, PageRange::parse("1-2").unwrap())];
-        let mut output =
-            handle_page_specs(&mut QPDFJob::new(), &mut sources, &specs, None).unwrap();
+        let mut output = handle_page_specs(
+            &mut QPDFJob::new(),
+            &mut sources,
+            &specs,
+            None,
+            RemoveUnreferencedResources::Auto,
+            false,
+        )
+        .unwrap();
 
         let catalog_ref = output.root_ref().unwrap();
         let catalog = output
