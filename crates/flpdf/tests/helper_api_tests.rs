@@ -382,7 +382,7 @@ fn outline_helper_walk_yields_preorder_titles_with_depth() {
     let tree = helper.get_tree().unwrap();
     let seen: Vec<(String, usize)> = tree
         .preorder()
-        .map(|(depth, _id, item)| (item.title(&mut helper).unwrap(), depth))
+        .map(|(depth, _id, item)| (item.get_title(&mut helper).unwrap(), depth))
         .collect();
 
     assert_eq!(

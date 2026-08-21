@@ -31,7 +31,7 @@ fn outline_tree_returns_titles_in_pre_order() {
     let (depth, id, item) = tree.preorder().next().unwrap();
     assert_eq!(tree.roots().len(), 1);
     assert_eq!(depth, 1);
-    assert_eq!(item.title(&mut helper).unwrap(), "Chapter One");
+    assert_eq!(item.get_title(&mut helper).unwrap(), "Chapter One");
     assert_eq!(item.source_ref, Some(ObjectRef::new(10, 0)));
     assert!(tree
         .get(id)
@@ -58,7 +58,7 @@ fn outline_tree_resolves_indirect_title() {
     let tree = helper.get_tree().unwrap();
     let item = &tree[tree.roots()[0]];
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(item.title(&mut helper).unwrap(), "Chapter One");
+    assert_eq!(item.get_title(&mut helper).unwrap(), "Chapter One");
     assert_eq!(item.source_ref, Some(ObjectRef::new(4, 0)));
 }
 
@@ -70,7 +70,7 @@ fn outline_tree_decodes_utf16be_title_like_qpdf() {
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "日");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "日");
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn outline_tree_uses_empty_title_when_title_absent() {
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn outline_tree_uses_empty_title_for_non_string_value() {
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();
     assert_eq!(tree.roots().len(), 1);
-    assert_eq!(tree[tree.roots()[0]].title(&mut helper).unwrap(), "");
+    assert_eq!(tree[tree.roots()[0]].get_title(&mut helper).unwrap(), "");
 }
 
 /// Build a minimal PDF whose catalog points at an `/Outlines` tree with a single

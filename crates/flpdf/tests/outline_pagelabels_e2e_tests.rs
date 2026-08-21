@@ -160,8 +160,8 @@ fn deep_outline_round_trip_through_write_pdf() {
     let mut id = tree.roots()[0];
     loop {
         let item = &tree[id];
-        assert_eq!(item.title(&mut helper).unwrap(), format!("L{depth}"));
-        let dest_page = item.dest_page(&mut helper).unwrap();
+        assert_eq!(item.get_title(&mut helper).unwrap(), format!("L{depth}"));
+        let dest_page = item.get_dest_page(&mut helper).unwrap();
         assert_eq!(
             dest_page
                 .object_ref()
@@ -518,7 +518,7 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let mut id = roots[0];
     loop {
         let item = &tree[id];
-        assert_eq!(item.title(&mut helper).unwrap(), format!("Deep{depth}"));
+        assert_eq!(item.get_title(&mut helper).unwrap(), format!("Deep{depth}"));
         match item.kids.first() {
             Some(&child) => {
                 id = child;
@@ -532,7 +532,7 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     // Fetch the `/SE` item's title live while `helper` still borrows
     // `reopened`, then drop `helper` so the raw-dictionary checks below can
     // borrow `reopened` mutably again.
-    let se_title = tree[roots[6]].title(&mut helper).unwrap();
+    let se_title = tree[roots[6]].get_title(&mut helper).unwrap();
     drop(helper);
 
     // -- All five raw action dictionaries preserved, in sibling order --

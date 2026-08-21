@@ -430,15 +430,15 @@ fn outline_item_to_json<R: Read + Seek>(
     helper: &mut crate::OutlineDocumentHelper<'_, R>,
 ) -> Result<Json, ConvertError> {
     let item = &tree[id];
-    let dest = pdf_dest_to_json(&item.dest(helper)?)?;
+    let dest = pdf_dest_to_json(&item.get_dest(helper)?)?;
     let destpageposfrom1 = item
-        .dest_page(helper)?
+        .get_dest_page(helper)?
         .object_ref()
         .and_then(|reference| page_numbers.get(&reference).copied())
         .map(Json::make_int)
         .unwrap_or_else(Json::make_null);
-    let count = item.count(helper)?;
-    let title = item.title(helper)?;
+    let count = item.get_count(helper)?;
+    let title = item.get_title(helper)?;
     let mut kids = Vec::with_capacity(item.kids.len());
     for kid in item.kids.iter().copied() {
         kids.push(outline_item_to_json(tree, kid, page_numbers, helper)?);

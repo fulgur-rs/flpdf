@@ -697,10 +697,10 @@ pub(crate) fn run_test_49<R: Read + Seek>(
     //
     // `OutlineTree::get_outlines_for_page` is qpdf's
     // `QPDFOutlineDocumentHelper::getOutlinesForPage`
-    // (`outline_object_helper.rs:159-178`'s own doc cites the qpdf source), and
-    // `OutlineItem::title`/`::dest` are the decoded `/Title` and resolved
-    // destination `getTitle()`/`getDest()` produce, recomputed live on every
-    // call like qpdf's own accessors.
+    // (`outline_object_helper.rs:266-285`'s own doc cites the qpdf source), and
+    // `OutlineItem::get_title`/`::get_dest` are the decoded `/Title` and
+    // resolved destination `getTitle()`/`getDest()` produce, recomputed live
+    // on every call like qpdf's own accessors.
     //
     // qpdf constructs `QPDFOutlineDocumentHelper odh(pdf)` -- which walks the
     // top-level `/Outlines` `/First`/`/Next` chain in its constructor
@@ -722,8 +722,8 @@ pub(crate) fn run_test_49<R: Read + Seek>(
     for (pageno, page_ref) in pages.into_iter().enumerate() {
         let mut lines: Vec<(String, Vec<u8>)> = Vec::new();
         for (_, item) in tree.get_outlines_for_page(&mut helper, Some(page_ref))? {
-            let title = item.title(&mut helper)?;
-            let dest = item.dest(&mut helper)?.unparse_resolved();
+            let title = item.get_title(&mut helper)?;
+            let dest = item.get_dest(&mut helper)?.unparse_resolved();
             lines.push((title, dest));
         }
         for (title, dest) in lines {

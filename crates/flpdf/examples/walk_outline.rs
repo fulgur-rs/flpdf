@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tree = helper.get_tree()?;
     let mut visited = 0;
     for (depth, _id, item) in tree.preorder() {
-        let title = item.title(&mut helper)?;
+        let title = item.get_title(&mut helper)?;
         println!("{}{}", "  ".repeat(depth - 1), title);
         visited += 1;
     }

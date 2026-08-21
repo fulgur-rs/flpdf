@@ -194,7 +194,7 @@ fn canonical_name_tree_probe_matches_qpdf_warning_context() {
     let tree = helper.get_tree().expect("get_tree never touches /Dest");
     let item = tree[tree.roots()[0]].clone();
     let error = item
-        .dest(&mut helper)
+        .get_dest(&mut helper)
         .expect_err("malformed name tree must fail through the same consumer as qpdf");
     assert!(
         error
