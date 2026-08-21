@@ -78,7 +78,7 @@ use crate::pages::{
     resolve_inherited_handle_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -128,10 +128,14 @@ pub struct RebuildResult {
 /// and streams before attaching them to leaves, while scalar values are copied
 /// directly. The shared direct-handle cache keeps several selected leaves from
 /// minting separate objects for one ancestor value.
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+)]
 fn promote_inherited_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: ObjectHandle,
-    promoted: &mut Vec<(ObjectHandle, ObjectHandle)>,
+    promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<ObjectHandle> {
     value.try_dereference()?;
     let non_scalar = value.as_array().is_some()
@@ -140,14 +144,12 @@ fn promote_inherited_value<R: Read + Seek>(
     if !value.is_direct() || !non_scalar {
         return Ok(value);
     }
-    if let Some((_, indirect)) = promoted
-        .iter()
-        .find(|(source, _)| source.is_same_object_as(&value))
-    {
+    let identity = value.identity_key();
+    if let Some(indirect) = promoted.get(&identity) {
         return Ok(indirect.clone());
     }
     let indirect = pdf.make_indirect_object_handle(value.clone())?;
-    promoted.push((value, indirect.clone()));
+    promoted.insert(identity, indirect.clone());
     Ok(indirect)
 }
 
@@ -171,13 +173,17 @@ fn install_inherited_value<R: Read + Seek>(
 /// Resolve and prepare an inherited value only when the page has no visible
 /// own value. A leaf-owned non-scalar must not be promoted merely because the
 /// canonical walk returns that same leaf handle.
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+)]
 fn resolve_inherited_for_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     page: &ObjectHandle,
     key: &[u8],
     max_depth: usize,
-    promoted: &mut Vec<(ObjectHandle, ObjectHandle)>,
+    promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<Option<ObjectHandle>> {
     let value = resolve_inherited_handle_with_max_depth(pdf, page_ref, key, max_depth)?;
     if page.try_has_key(key)? {
@@ -246,10 +252,14 @@ fn collect_page_tree_nodes(
 /// that branch while `--preserve-unreferenced` still serializes the promoted
 /// object. Keep the existing promotion cache so a value later inherited by a
 /// selected leaf retains one canonical identity.
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+)]
 fn promote_page_tree_inheritable_values<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     nodes: &[ObjectHandle],
-    promoted: &mut Vec<(ObjectHandle, ObjectHandle)>,
+    promoted: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
 ) -> Result<()> {
     let inheritable_keys = [
         b"/CropBox".as_slice(),
@@ -400,6 +410,10 @@ pub fn rebuild_page_tree<R: Read + Seek>(
 /// - Any error propagated from the canonical `ObjectHandle` resolver or
 ///   mutation surface while resolving the catalog, leaves, or inherited
 ///   attributes.
+#[allow(
+    clippy::mutable_key_type,
+    reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+)]
 pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     selected: &[ObjectRef],
@@ -430,7 +444,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // qpdf promotes direct non-scalar values on every original /Pages node
     // before page selection discards an unselected branch. Keep these objects
     // in the canonical registry so preserve-unreferenced can serialize them.
-    let mut promoted_inherited: Vec<(ObjectHandle, ObjectHandle)> = Vec::new();
+    let mut promoted_inherited: HashMap<ObjectHandleIdentity, ObjectHandle> = HashMap::new();
     promote_page_tree_inheritable_values(pdf, &page_tree_nodes, &mut promoted_inherited)?;
 
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
@@ -1375,10 +1389,30 @@ mod tests {
             ObjectHandle::dictionary(Vec::new()),
             Rc::new(b"stream".to_vec()),
         );
-        let promoted = promote_inherited_value(&mut pdf, stream, &mut Vec::new())
+        let promoted = promote_inherited_value(&mut pdf, stream, &mut HashMap::new())
             .expect("direct stream promotion must succeed");
 
         assert!(promoted.is_indirect());
         assert!(promoted.as_stream_dict().is_some());
+    }
+
+    #[test]
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "ObjectHandleIdentity intentionally keys the canonical live allocation"
+    )]
+    fn promote_inherited_value_reuses_a_same_identity_promotion_from_a_map() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let value = ObjectHandle::dictionary(vec![(b"Marker".to_vec(), ObjectHandle::integer(7))]);
+        let mut promoted = std::collections::HashMap::new();
+
+        let first = promote_inherited_value(&mut pdf, value.clone(), &mut promoted)
+            .expect("first promotion must succeed");
+        let second = promote_inherited_value(&mut pdf, value, &mut promoted)
+            .expect("same-identity promotion must reuse the cached object");
+
+        assert!(first.is_indirect());
+        assert!(first.is_same_object_as(&second));
+        assert_eq!(promoted.len(), 1);
     }
 }
