@@ -511,8 +511,8 @@ logger consumer に移行済みである。
 
 - `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
   unfilterable stream を同じ marker へ変換しない
-- native `rewrite --static-id` warning、`--remove-restrictions` intent diagnostic、
-  `copy-attachments-from` count: flpdf-only surface
+- native `rewrite --static-id` warning、`--remove-restrictions` intent diagnostic:
+  flpdf-only surface
 - clap 前後の immediate option-validation diagnostics: production `QPDFJob` aggregation
   (`flpdf-25kg.5.2`) より前の CLI shell responsibility。最終 dispatch error と usage result
   は logger 済みだが、この validation 群は同 downstream cutover まで direct stderr を維持する
