@@ -136,7 +136,7 @@
 | `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/security/mod.rs` | correspondence | QPDF_encryption.cc responsibilities split across the Rust security module tree |
 | `crates/flpdf/src/security/password.rs` | correspondence | QPDF_encryption.cc password normalization |
-| `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf AES and MD5 native implementations |
+| `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf's single-block AES and MD5 native implementations |
 | `crates/flpdf/src/security/rc4.rs` | mirror | libqpdf/RC4.cc, libqpdf/RC4_native.cc |
 | `crates/flpdf/src/security/standard.rs` | correspondence | QPDF_encryption.cc Standard security handler algorithms split from writer setup |
 | `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
