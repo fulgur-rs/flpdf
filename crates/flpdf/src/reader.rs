@@ -1520,7 +1520,7 @@ impl<R: Read + Seek> Pdf<R> {
         // reference from a live object's own content) before any handle for
         // it has ever been created via `Pdf::get_object_handle`. If the two
         // lines below ran only past the early return, that combination
-        // (cache already `Missing`, handle still `NotYetResolved`) would
+        // (cache already `Missing`, handle still `Unresolved`) would
         // leave stale compatibility data behind.
         self.legacy_materialized_memo.remove(&object_ref);
         self.legacy_materialized_replacement_refs
@@ -2049,10 +2049,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// (only reachable via [`ObjectHandle::shallow_copy`] on a reserved
     /// handle). Such a handle is not indirect, so this crate cannot
     /// honestly answer the "already indirect?" question with `false`
-    /// either: none of qpdf's own `QPDF::makeIndirectObject` call sites
-    /// ever pass it a reserved value, so qpdf establishes no oracle for
-    /// what a successful promotion should produce, and this crate's value
-    /// representation has no reserved variant to install here regardless.
+    /// either: this legacy allocator intentionally rejects reserved values;
+    /// canonical qpdf-shaped promotion belongs to
+    /// `ObjectHandle::promote_to_indirect`.
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         let Some(value) = handle.direct_value_clone()? else {
             return Err(Error::Unsupported(
@@ -2455,7 +2454,7 @@ impl<R: Read + Seek> Pdf<R> {
         // fixDanglingReferences. Resolve the registered seeds after the xref
         // pass so a trailer-only reference with no row becomes an explicit
         // missing/null cache entry rather than escaping enumeration as
-        // NotYetResolved.
+        // Unresolved.
         for object_ref in trailer_refs {
             self.get_object_handle(object_ref).try_dereference()?;
         }
@@ -2702,7 +2701,7 @@ impl<R: Read + Seek> Pdf<R> {
                 //
                 // `hop` is always Resolved or Missing here, so it presents a
                 // value exactly as a copy of it would: the one state that
-                // would differ, `NotYetResolved`, needs `resolve_object_handle`
+                // would differ, `Unresolved`, needs `resolve_object_handle`
                 // to have hit a `CacheEntry::Reserved` entry, and that guard
                 // exists only while `resolve_pending_stream_length` is on the
                 // stack (it is the sole `set_reserved` caller and clears the
@@ -4053,6 +4052,9 @@ fn object_value_contains_string(value: &ObjectValue) -> Result<bool> {
             handles_contain_string(entries.values(), 1)
         }
         ObjectValue::Null
+        | ObjectValue::Unresolved
+        | ObjectValue::Reserved
+        | ObjectValue::Destroyed
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
         | ObjectValue::Real(_)
@@ -4135,6 +4137,9 @@ fn decrypt_strings_in_object_value(
             decrypt_stream_dict_strings_in_place(stream_dict, cipher, 1)
         }
         ObjectValue::Null
+        | ObjectValue::Unresolved
+        | ObjectValue::Reserved
+        | ObjectValue::Destroyed
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
         | ObjectValue::Real(_)
@@ -7041,16 +7046,9 @@ mod tests {
         // `slot.object_ref.is_some()` had already confirmed was direct just
         // a few lines above.
         //
-        // qpdf's own `QPDF::makeIndirectObject` never receives a reserved
-        // value from any of its own call sites (`QPDF_pages.cc`,
-        // `NNTree.cc`, `QPDFAcroFormDocumentHelper.cc`, etc. always pass a
-        // dictionary, page, or resource dictionary), so there is no qpdf
-        // throw text to mirror for a *successful* promotion here, and this
-        // crate's `ObjectValue` has no reserved variant this clone-based
-        // allocator could install via `set_resolved` either way. This is
-        // rejected explicitly instead, the same way a direct reserved child
-        // is rejected during materialize rather than silently substituted
-        // with something else (flpdf-25kg.3.16.1.2, commit 60a63829).
+        // This legacy clone-based allocator is intentionally narrow; canonical
+        // reserved values remain in ObjectValue for qpdf-shaped promotion and
+        // replacement primitives.
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
         let direct_copy = reserved
@@ -9456,14 +9454,13 @@ mod tests {
     fn a_direct_reserved_child_materialize_rejects_like_a_top_level_reserved_handle() {
         // `ObjectHandle::shallow_copy` on a reserved handle produces a
         // *direct* reserved sentinel (see the previous test) -- a shape
-        // `ObjectState::Reserved` could not take before that fix landed.
+        // the reserved value now lives directly in ObjectValue.
         // Nesting that direct copy as an array element and materializing
         // the array previously substituted `Object::Null` for it silently:
         // `materialize_child`'s direct branch (`handle.object_ref()` is
         // `None` for a direct handle) falls through to
-        // `materialize_bounded`, which read `with_value`'s
-        // `Reserved => None` arm as "value not yet known" instead of
-        // "value never exists". qpdf's own `QPDF_Reserved::unparse()`
+        // `materialize_bounded`, which now dispatches the ObjectValue
+        // sentinel to qpdf's own `QPDF_Reserved::unparse()`
         // (`libqpdf/QPDF_Reserved.cc:22-26`) throws once the reserved
         // object is the value actually being dereferenced -- which a
         // *direct* child always is, since `QPDFWriter::unparseChild`
@@ -9697,7 +9694,7 @@ mod tests {
         // `reserved_objects_are_rejected_by_object_writer_entrypoints`), it
         // has no exception channel to mirror qpdf's `QPDF_Reserved::unparse()`
         // throw (`libqpdf/QPDF_Reserved.cc:22-26`) with, so it falls back to
-        // `null` the same way it already does for `NotYetResolved`/
+        // `null` the same way it already does for `Unresolved`/
         // `Destroyed` (see `unparse_resolved`'s own doc for all three).
         let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
@@ -10370,7 +10367,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_object_handle_rejects_direct_reserved_without_registering_target() {
+    fn replace_object_handle_accepts_a_direct_reserved_value() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
         let replacement = reserved.shallow_copy().expect("reserved copy");
@@ -10379,22 +10376,18 @@ mod tests {
         assert!(replacement.is_reserved());
         assert!(pdf.resolver.registered_handle(target_ref).is_none());
 
-        let error = pdf
+        let target = pdf
             .replace_object_handle(target_ref, replacement)
-            .expect_err("reserved replacement is outside flpdf's resolved-only contract");
+            .expect("qpdf replaceObject accepts an initialized direct reserved value");
 
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: replacement ObjectHandle is not initialized"
-        );
-        assert!(
-            pdf.resolver.registered_handle(target_ref).is_none(),
-            "a rejected source-state preflight must not register an absent target"
-        );
+        assert!(target.is_reserved());
+        assert_eq!(target.object_ref(), Some(target_ref));
+        assert!(pdf.resolver.registered_handle(target_ref).is_some());
+        assert!(pdf.is_dirty(target_ref));
     }
 
     #[test]
-    fn replace_object_handle_rejects_same_pdf_destroyed_source_without_registering_target() {
+    fn replace_object_handle_accepts_a_destroyed_value() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let destroyed = pdf.new_reserved().expect("reserved object");
         destroyed.disconnect();
@@ -10403,18 +10396,14 @@ mod tests {
         assert_eq!(destroyed.type_code().expect("type code"), 14);
         assert!(pdf.resolver.registered_handle(target_ref).is_none());
 
-        let error = pdf
+        let target = pdf
             .replace_object_handle(target_ref, destroyed)
-            .expect_err("destroyed replacement is outside flpdf's resolved-only contract");
+            .expect("qpdf replaceObject accepts an initialized destroyed value");
 
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: replacement ObjectHandle is not initialized"
-        );
-        assert!(
-            pdf.resolver.registered_handle(target_ref).is_none(),
-            "a rejected source-state preflight must not register an absent target"
-        );
+        assert_eq!(target.type_code().expect("type code"), 14);
+        assert_eq!(target.object_ref(), Some(target_ref));
+        assert!(pdf.resolver.registered_handle(target_ref).is_some());
+        assert!(pdf.is_dirty(target_ref));
     }
 
     #[test]
