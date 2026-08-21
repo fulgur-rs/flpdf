@@ -763,23 +763,16 @@ mod tests {
              literal reference, got {text}"
         );
     }
-    /// Guards the fix's new gate (`terminal.type_code()? == 10`, checked
-    /// after the canonical chase, but the stream branch body still reads
-    /// the *legacy* representation via `qpdf_resolve_top_level_object`)
-    /// against the two representations disagreeing about redirect-to-stream
-    /// status. `Pdf::set_object`'s bounded lift
-    /// (`Pdf::lift_for_set_object`, `reader.rs`) can fail for a value nested
-    /// past `MAX_INLINE_DEPTH`, in which case it leaves the *canonical*
-    /// handle graph untouched while the *legacy* cache still receives the
-    /// full value (`reader.rs`'s `set_object` doc: "store `object` directly
-    /// as the bridge's authoritative materialized value instead"). This
-    /// constructs exactly that split — target's dict entry nested
-    /// `MAX_INLINE_DEPTH + 5` deep — and confirms the canonical terminal
-    /// chase reports `null` (not `10`/stream) for the un-lifted target, so
-    /// the new gate correctly stays out of the stream branch instead of
-    /// entering it and hitting the legacy/canonical mismatch error.
+    /// Guards the canonical replacement boundary against the two
+    /// representations disagreeing about redirect-to-stream status.
+    /// `QPDF::replaceObject` accepts a programmatically constructed direct
+    /// stream without applying the parser's input-depth limit
+    /// (`libqpdf/QPDF.cc:1980-1993`). `Pdf::set_object` must therefore keep a
+    /// target whose dictionary is nested `MAX_INLINE_DEPTH + 5` deep on the
+    /// canonical handle graph, so the terminal chase and JSON stream branch
+    /// observe the same value.
     #[test]
-    fn redirect_to_a_stream_whose_lift_failed_falls_through_to_null_not_an_error() {
+    fn redirect_to_a_deep_stream_stays_canonical_and_writes_json() {
         let mut pdf = load_one_page_pdf();
         let target_ref = ObjectRef::new(50, 0);
 
@@ -803,11 +796,11 @@ mod tests {
 
         let terminal = pdf
             .resolve_object_handle_to_terminal(&handle)
-            .expect("terminal chase must not error even when the lift failed");
+            .expect("terminal chase must preserve the canonical stream");
         assert_eq!(
             terminal.type_code().expect("type code"),
-            2,
-            "an un-lifted target must not report as a stream to the new gate"
+            10,
+            "a deep programmatic replacement must remain a canonical stream"
         );
 
         let mut bytes = Vec::new();
@@ -822,12 +815,12 @@ mod tests {
                 &mut out,
                 &mut objects_first,
             )
-            .expect("a lift failure must not surface as a canonical/legacy mismatch error");
+            .expect("a canonical deep stream replacement must serialize without a mismatch");
         }
         let text = String::from_utf8(bytes).expect("json output must be utf8");
         assert!(
-            text.contains("\"value\": null"),
-            "expected the fallback null value, got {text}"
+            text.contains("\"stream\""),
+            "expected the canonical stream wrapper, got {text}"
         );
     }
 

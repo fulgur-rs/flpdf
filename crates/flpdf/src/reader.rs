@@ -11,9 +11,7 @@ use crate::encrypt_setup::CopyEncryptionSource;
 use crate::error::EncryptedError;
 #[cfg(test)]
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::ObjectValue;
-#[cfg(test)]
-use crate::object_handle::NO_PARSED_OFFSET;
+use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -480,6 +478,13 @@ const READER_STACK_RED_ZONE: usize = 128 * 1024;
 // stacker switches to it before the caller's bounded stack can exhaust on any
 // supported platform.
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
+// `QPDF::replaceObject` accepts any initialized direct object and does not
+// impose the parser's input-depth bound on programmatically constructed
+// replacements (`libqpdf/QPDF.cc:1980-1993`; `include/qpdf/QPDF.hh:380-388`).
+// Keep the stack-growth guard in the lift walk, but do not reject a valid
+// caller-owned Object tree merely because it is deeper than parsed input.
+const PROGRAMMATIC_LIFT_MAX_DEPTH: usize = usize::MAX;
 
 impl<R: Read + Seek> Pdf<R> {
     /// Return this document's current shared logger.
@@ -1277,23 +1282,16 @@ impl<R: Read + Seek> Pdf<R> {
                 // data, not something parsed from a source position; any
                 // previously recorded offset no longer describes it.
                 handle.reset_parsed_offset();
+                handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
             }
             Err(_) => {
-                // `lift`'s bounded-depth guard (mirroring every other
-                // post-parse structural walker over an `Object` tree in
-                // this crate) cannot represent an excessively deep `object`
-                // as an `ObjectHandle` tree. `set_object` is infallible, so
-                // store `object` directly as the bridge's authoritative
-                // materialized value instead: `resolve`/`resolve_borrowed`
-                // must still hand back exactly what the caller set, so a
-                // later structural walker (e.g. `optimization.rs`'s own
-                // inline-depth guard) is what rejects the excess depth, not
-                // `set_object` itself. This is the one authoritative value
-                // the caller just supplied, not the "stale value" the
-                // invalidate-not-reinsert rule above guards against —
-                // `Pdf::resolve_borrowed`'s memo check always prefers it
-                // over whatever the (in this case untouched) handle graph
-                // holds.
+                // Programmatic depth is unbounded above, so this fallback is
+                // only for an Object variant that has no canonical
+                // ObjectValue representation (currently a content-stream
+                // token nested in a stream dictionary). `set_object` is
+                // infallible; preserve the exact caller value for the legacy
+                // raw-object boundary while keeping valid replacements on the
+                // canonical handle graph.
                 self.legacy_materialized_memo
                     .insert(object_ref, object.clone());
                 self.legacy_materialized_replacement_refs.insert(object_ref);
@@ -1309,10 +1307,10 @@ impl<R: Read + Seek> Pdf<R> {
     // This is intentionally broader than the ordinary legacy bounded lift:
     // qpdf's `replaceObject` accepts the already-constructed operator and
     // inline-image values (`QPDFObjectHandle.cc:1933-1941`) and does not apply
-    // the raw bridge's `MAX_INLINE_DEPTH` policy to programmatic values. Keep
-    // the canonical replacement on the handle graph through the parser's
-    // actual nesting boundary; only values beyond that boundary retain the
-    // legacy compatibility fallback.
+    // the raw bridge's parser-depth policy to programmatic values. Keep the
+    // canonical replacement on the handle graph for the entire caller-owned
+    // Object tree; the lift itself remains stack-safe through
+    // `stacker::maybe_grow`.
     //
     // Identical to the ordinary bounded lift except when `object` is a stream and
     // `existing_handle`'s current (pre-overwrite) value is also a stream:
@@ -1335,14 +1333,14 @@ impl<R: Read + Seek> Pdf<R> {
                 return self.lift_stream_with_existing_dictionary(
                     stream,
                     existing_dict,
-                    crate::object::MAX_INLINE_DEPTH,
+                    PROGRAMMATIC_LIFT_MAX_DEPTH,
                     false,
                 );
             }
             let stream_dict = self.lift_dictionary_bounded_with_options(
                 &stream.dict,
                 0,
-                crate::object::MAX_INLINE_DEPTH,
+                PROGRAMMATIC_LIFT_MAX_DEPTH,
                 false,
             )?;
             return Ok(ObjectValue::Stream {
@@ -1354,7 +1352,7 @@ impl<R: Read + Seek> Pdf<R> {
                 stream_provider: None,
             });
         }
-        self.lift_bounded_with_content_tokens(object, 0, crate::parser::MAX_PARSE_DEPTH)
+        self.lift_bounded_with_content_tokens(object, 0, PROGRAMMATIC_LIFT_MAX_DEPTH)
     }
 
     fn lift_stream_with_existing_dictionary(
@@ -2235,10 +2233,11 @@ impl<R: Read + Seek> Pdf<R> {
             let Some(replacement) = self.legacy_materialized_memo.remove(&object_ref) else {
                 continue;
             };
-            // `set_object` falls back only after the canonical replacement
-            // boundary's MAX_PARSE_DEPTH limit, while a value that already
-            // parsed successfully can be rebuilt at that same bound so
-            // enumeration cannot return the stale source handle.
+            // `set_object` reaches this legacy path only when the supplied
+            // value has no canonical ObjectValue representation. Reconcile
+            // that narrow compatibility value with the existing bounded
+            // materialization walk; valid programmatic depth replacements
+            // never enter this path.
             // Content-stream tokens are valid `ObjectValue` leaves even
             // though the generic legacy lift rejects them outside a content
             // stream; preserve them at every nesting level rather than
@@ -2276,6 +2275,7 @@ impl<R: Read + Seek> Pdf<R> {
             handle.set_resolved(value);
             handle.clear_description();
             handle.reset_parsed_offset();
+            handle.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
             self.legacy_materialized_memo.remove(&object_ref);
             self.legacy_materialized_replacement_refs
                 .remove(&object_ref);
@@ -10701,7 +10701,7 @@ mod tests {
     }
 
     #[test]
-    fn get_all_objects_reconciles_a_deep_memo_backed_replacement() {
+    fn get_all_objects_enumerates_a_deep_canonical_replacement() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(3, 0);
         let mut replacement = Object::Integer(7);
@@ -10716,7 +10716,7 @@ mod tests {
 
         let found = pdf
             .get_all_objects()
-            .expect("enumerate memo-backed replacement")
+            .expect("enumerate canonical replacement")
             .into_iter()
             .find(|candidate| candidate.object_ref() == Some(object_ref))
             .expect("replacement object remains enumerated");
@@ -10729,7 +10729,7 @@ mod tests {
     }
 
     #[test]
-    fn get_all_objects_reuses_stream_dictionary_for_deep_memo_replacement() {
+    fn get_all_objects_reuses_stream_dictionary_for_deep_replacement() {
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
             ObjectRef::new(1, 0),
@@ -10770,7 +10770,7 @@ mod tests {
             .expect("replacement stream dictionary");
         assert!(
             current_dict.is_same_object_as(&original_dict),
-            "memo reconciliation must reuse the existing stream dictionary handle"
+            "canonical replacement must reuse the existing stream dictionary handle"
         );
         assert_eq!(
             current_dict.get_parsed_offset(),
@@ -10787,7 +10787,7 @@ mod tests {
     }
 
     #[test]
-    fn get_all_objects_rejects_an_overdeep_stream_dictionary_memo() {
+    fn get_all_objects_accepts_an_overdeep_stream_dictionary_replacement() {
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
             ObjectRef::new(1, 0),
@@ -10811,12 +10811,25 @@ mod tests {
             Object::Stream(Stream::new(replacement_dict, b"new data".to_vec())),
         );
 
-        let error = pdf
+        let found = pdf
             .get_all_objects()
-            .expect_err("an over-deep stream dictionary must fail during reconciliation");
-        assert!(error
-            .to_string()
-            .contains("object handle lift: inline object nesting exceeds maximum"));
+            .expect("an over-deep programmatic stream dictionary is a valid replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement stream remains enumerated");
+        assert!(
+            found
+                .as_stream_dict()
+                .expect("replacement stream dictionary")
+                .as_dictionary()
+                .expect("replacement dictionary entries")
+                .contains_key(b"/TooDeep".as_slice()),
+            "the canonical stream dictionary must retain an over-deep replacement"
+        );
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "an over-deep programmatic stream replacement must not use the legacy memo"
+        );
     }
 
     #[test]
@@ -12685,7 +12698,7 @@ mod tests {
     }
 
     #[test]
-    fn set_object_keeps_the_source_description_when_handle_lift_fails() {
+    fn set_object_replacement_over_parser_depth_discards_source_description() {
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
             ObjectRef::new(1, 0),
@@ -12695,9 +12708,14 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         handle.try_dereference().expect("resolve");
         let source_description = handle.description();
+        let source_end_offsets = handle.end_offsets();
         assert!(
             source_description.contains("offset"),
             "the fixture must establish a source description before replacement"
+        );
+        assert!(
+            source_end_offsets.0 >= 0 && source_end_offsets.1 >= 0,
+            "the fixture must establish source extents before replacement"
         );
 
         let mut replacement = Object::Null;
@@ -12708,19 +12726,69 @@ mod tests {
 
         assert_eq!(
             handle.description(),
-            source_description,
-            "a failed handle lift must leave the canonical value and provenance untouched"
+            "object 1 0",
+            "a canonical replacement must discard the source provenance"
+        );
+        assert_eq!(
+            handle.end_offsets(),
+            (NO_PARSED_OFFSET, NO_PARSED_OFFSET),
+            "a canonical replacement must discard the source extents"
         );
         handle
             .object_warning("failed replacement warning")
-            .expect("unchanged handle warning should keep its source description");
+            .expect("replacement handle warning should use its canonical description");
         assert_eq!(
             pdf.repair_diagnostics()
                 .entries()
                 .last()
-                .expect("failed replacement warning is recorded")
+                .expect("replacement warning is recorded")
                 .message,
-            format!("{source_description}: failed replacement warning")
+            "object 1 0: failed replacement warning"
+        );
+    }
+
+    #[test]
+    fn set_object_replacement_over_parser_depth_updates_canonical_handle() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve source object");
+
+        let mut replacement = Object::Integer(7);
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement);
+
+        assert!(
+            handle.as_array().is_some(),
+            "qpdf-style replacement must update the canonical handle even when the legacy Object tree is deeply nested"
+        );
+        let mut current = handle.clone();
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            current = current
+                .as_array()
+                .expect("every replacement level must remain canonical")
+                .into_iter()
+                .next()
+                .expect("every replacement array must retain its child");
+        }
+        assert_eq!(
+            current.as_integer(),
+            Some(7),
+            "the canonical replacement must retain the terminal value past the parser depth"
+        );
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical replacement must not fall back to a legacy materialized memo"
+        );
+        assert!(
+            pdf.legacy_materialized_replacement_refs.is_empty(),
+            "canonical replacement must not leave a deferred legacy replacement marker"
         );
     }
 
