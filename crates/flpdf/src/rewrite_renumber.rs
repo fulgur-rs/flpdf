@@ -73,8 +73,8 @@ impl NewNumberLookup for HashMap<ObjectRef, ObjectRef> {
 /// orphan stream merely typed `/ObjStm` remains a preserve-unreferenced object.
 fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<ObjectRef> {
     pdf.source_xref_entries()
-        .into_iter()
-        .filter_map(|(_, entry)| match entry {
+        .into_values()
+        .filter_map(|entry| match entry {
             XrefEntry::Compressed { stream, .. } => Some(ObjectRef::new(stream, 0)),
             XrefEntry::Free { .. } | XrefEntry::Uncompressed { .. } => None,
         })
