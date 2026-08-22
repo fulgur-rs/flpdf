@@ -164,6 +164,7 @@ impl LabelRange {
     /// operation; use [`Self::to_dict`] for a directly authored range (qpdf's
     /// `--set-page-labels` shape), where the default `/St 1` is omitted for
     /// brevity.
+    #[cfg(test)]
     pub(crate) fn to_reconstructed_dict(&self) -> Dictionary {
         let mut d = self.to_dict();
         d.insert("St", Object::Integer(self.start));
@@ -398,6 +399,18 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 .expect("new direct page-label dictionary is unowned");
         }
         result
+    }
+
+    fn reconstructed_label_handle(
+        range: &LabelRange,
+        prefix_present: bool,
+    ) -> Result<ObjectHandle> {
+        let result = Self::page_label_dict(range.style, range.start, &range.prefix);
+        if prefix_present && range.prefix.is_empty() {
+            result.replace_key(b"/P", ObjectHandle::string(Vec::new()))?;
+        }
+        result.replace_key(b"/St", ObjectHandle::integer(range.start))?;
+        Ok(result)
     }
 
     /// All label ranges as `(first_page_index, LabelRange)`, ascending by index.
@@ -743,19 +756,20 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(());
         };
-        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference()?;
+        if catalog.try_as_dictionary()?.is_none() {
             return Ok(());
-        };
+        }
         let mut nums = Vec::with_capacity(entries.len() * 2);
         for (idx, range) in entries {
-            nums.push(Object::Integer(*idx));
-            nums.push(Object::Dictionary(range.to_reconstructed_dict()));
+            nums.push(ObjectHandle::integer(*idx));
+            nums.push(Self::reconstructed_label_handle(range, false)?);
         }
-        let mut page_labels = Dictionary::new();
-        page_labels.insert("Nums", Object::Array(nums));
-        catalog.insert("PageLabels", Object::Dictionary(page_labels));
-        self.pdf
-            .set_object(catalog_ref, Object::Dictionary(catalog));
+        let page_labels =
+            ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
+        catalog.replace_key(b"/PageLabels", page_labels)?;
+        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
 
@@ -770,23 +784,20 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(());
         };
-        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference()?;
+        if catalog.try_as_dictionary()?.is_none() {
             return Ok(());
-        };
+        }
         let mut nums = Vec::with_capacity(entries.len() * 2);
         for (idx, range, prefix_present) in entries {
-            nums.push(Object::Integer(*idx));
-            let mut dict = range.to_reconstructed_dict();
-            if *prefix_present && range.prefix.is_empty() {
-                dict.insert("P", Object::String(Vec::new()));
-            }
-            nums.push(Object::Dictionary(dict));
+            nums.push(ObjectHandle::integer(*idx));
+            nums.push(Self::reconstructed_label_handle(range, *prefix_present)?);
         }
-        let mut page_labels = Dictionary::new();
-        page_labels.insert("Nums", Object::Array(nums));
-        catalog.insert("PageLabels", Object::Dictionary(page_labels));
-        self.pdf
-            .set_object(catalog_ref, Object::Dictionary(catalog));
+        let page_labels =
+            ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(nums))]);
+        catalog.replace_key(b"/PageLabels", page_labels)?;
+        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
 
@@ -2262,6 +2273,44 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].0, 0);
         assert_eq!(ranges[1].0, 3);
+    }
+
+    #[test]
+    fn write_reconstructed_labels_preserves_catalog_source_metadata() {
+        let mut pdf = bare_one_page_pdf();
+        let catalog_ref = pdf.root_ref().expect("catalog ref");
+        let catalog = pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference().expect("resolve catalog");
+        let source_description = catalog.description();
+        let source_end_offsets = catalog.end_offsets();
+        assert!(
+            source_end_offsets.0 >= 0 && source_end_offsets.1 >= 0,
+            "fixture must establish catalog source extents"
+        );
+
+        pdf.page_labels()
+            .write_reconstructed_labels(&[(0, none_range(1))])
+            .expect("canonical label write");
+
+        assert_eq!(
+            catalog.description(),
+            source_description,
+            "replaceKey must preserve the catalog object description"
+        );
+        assert_eq!(
+            catalog.end_offsets(),
+            source_end_offsets,
+            "replaceKey must preserve the catalog source extents"
+        );
+        assert!(
+            catalog
+                .try_get_key(b"/PageLabels")
+                .expect("PageLabels key")
+                .try_as_dictionary()
+                .expect("PageLabels dictionary")
+                .is_some(),
+            "the live catalog handle must observe the replacement"
+        );
     }
 
     #[test]
