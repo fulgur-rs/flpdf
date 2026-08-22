@@ -136,6 +136,7 @@ pub mod pipeline;
 pub mod qdf_fix;
 pub(crate) mod qpdf_null;
 mod qpdf_time;
+pub mod qutil;
 pub mod reader;
 #[cfg(not(feature = "qtest-driver"))]
 pub(crate) mod ref_chain;
