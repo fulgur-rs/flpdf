@@ -1236,6 +1236,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
 
     let mut registration = XrefRegistration::default();
     let mut initial_parse_diagnostics = Diagnostics::default();
+    let mut observed_first_xref_item_offset = None;
     let mut loaded = match parse_xref_from_start(
         bytes,
         xref_pos,
@@ -1245,6 +1246,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         &mut registration,
         Some(&mut initial_parse_diagnostics),
         XrefReadContextSpec::ActiveSection,
+        Some(&mut observed_first_xref_item_offset),
     ) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
@@ -1268,6 +1270,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 None,
                 options,
                 initial_diagnostics,
+                observed_first_xref_item_offset,
             )?;
             recovered.header_offset = header_offset;
             return Ok(recovered);
@@ -1277,7 +1280,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
     let mut previous_parse_diagnostics = Diagnostics::default();
-    if let Err(error) = merge_previous_xref_sections(
+    if let Err(error) = merge_previous_xref_sections_with_observer(
         bytes,
         &version,
         &mut loaded,
@@ -1285,6 +1288,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         &mut registration,
         Some(&mut previous_parse_diagnostics),
         XrefReadContextSpec::ActiveSection,
+        Some(&mut observed_first_xref_item_offset),
     ) {
         if allow_repair {
             let deleted_objects = std::mem::take(&mut registration.deleted_objects);
@@ -1297,6 +1301,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 Some(&loaded.loaded.trailer),
                 options,
                 previous_parse_diagnostics,
+                observed_first_xref_item_offset,
             )?;
             let mut recovered = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
             recovered.header_offset = header_offset;
@@ -1345,6 +1350,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             Some(&loaded.loaded.trailer),
             options,
             diagnostics,
+            None,
         )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
         let deleted_objects = std::mem::take(&mut registration.deleted_objects);
         let mut recovered = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
@@ -1417,14 +1423,19 @@ fn parse_xref_from_start(
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
+    first_xref_item_offset_sink: Option<&mut Option<u64>>,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
-        let (entries, trailer, trailer_diagnostics, first_xref_item_offset) =
-            parse_xref_table(&mut cursor, bytes, error_diagnostics_sink.as_deref_mut())?;
+        let (entries, trailer, trailer_diagnostics, first_xref_item_offset) = parse_xref_table(
+            &mut cursor,
+            bytes,
+            error_diagnostics_sink.as_deref_mut(),
+            first_xref_item_offset_sink,
+        )?;
         let mut deferred_free = Vec::new();
         for entry in entries {
             match entry {
@@ -1652,8 +1663,31 @@ fn merge_previous_xref_sections(
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    error_diagnostics_sink: Option<&mut Diagnostics>,
+    context_spec: XrefReadContextSpec<'_>,
+) -> Result<()> {
+    merge_previous_xref_sections_with_observer(
+        bytes,
+        version,
+        loaded,
+        options,
+        registration,
+        error_diagnostics_sink,
+        context_spec,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_previous_xref_sections_with_observer(
+    bytes: &[u8],
+    version: &str,
+    loaded: &mut LoadedXrefState,
+    options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
+    mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let chain_bootstrap_cache = match context_spec {
@@ -1711,6 +1745,7 @@ fn merge_previous_xref_sections(
             registration,
             error_diagnostics_sink.as_deref_mut(),
             section_context_spec,
+            first_xref_item_offset_sink.as_deref_mut(),
         )?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -1806,6 +1841,7 @@ fn append_xref_size_warning_for(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_xref_from_linear_scan(
     bytes: &[u8],
     version: String,
@@ -1814,7 +1850,14 @@ fn recover_xref_from_linear_scan(
     fallback_trailer: Option<&Dictionary>,
     options: XrefLoadOptions,
     mut repair_diagnostics: Diagnostics,
+    observed_first_xref_item_offset: Option<u64>,
 ) -> Result<LoadedXrefState> {
+    // qpdf mutates `m->first_xref_item_offset` while reading object 0's row,
+    // before a later row can throw, and `reconstruct_xref` preserves that
+    // member across the exception (`QPDF.cc:846-869, 626-708`). Rust's
+    // `Result::Err` cannot carry the successful prefix, so the xref reader
+    // supplies this explicit side channel instead of recovering through a
+    // sentinel value.
     push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
 
     let recovered = recover_xref_entries(bytes, fallback_trailer.is_none())
@@ -1874,6 +1917,8 @@ fn recover_xref_from_linear_scan(
                 },
             }
         };
+    let recovered_first_xref_item_offset =
+        observed_first_xref_item_offset.unwrap_or(recovered_first_xref_item_offset);
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
@@ -2123,6 +2168,7 @@ fn recover_trailer_from_xref_stream_candidate(
             line_scan_entries: entries,
             bootstrap_cache: &candidate.bootstrap_cache,
         },
+        None,
     ) {
         Ok(reentry) => reentry,
         Err(_) => {
@@ -2616,6 +2662,7 @@ fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
     error_diagnostics_sink: Option<&mut Diagnostics>,
+    mut first_xref_item_offset_sink: Option<&mut Option<u64>>,
 ) -> Result<(Vec<ParsedXrefEntry>, Dictionary, Vec<Diagnostic>, u64)> {
     let mut entries = Vec::new();
     let mut first_xref_item_offset = 0;
@@ -2630,6 +2677,9 @@ fn parse_xref_table(
         if first == 0 && count > 0 {
             cursor.skip_ws();
             first_xref_item_offset = cursor.pos as u64;
+            if let Some(sink) = first_xref_item_offset_sink.as_deref_mut() {
+                *sink = Some(first_xref_item_offset);
+            }
         }
         for index in 0..count {
             cursor.skip_ws();
@@ -7838,6 +7888,7 @@ mod tests {
             None,
             options,
             Diagnostics::default(),
+            None,
         )
         .expect("candidate recovery must consume its local tombstone before returning");
         assert!(!recovered.loaded.entries.contains_key(&ObjectRef::new(5, 0)));
@@ -7982,7 +8033,7 @@ mod tests {
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Foo 1 /Foo 2 >>\n";
         let mut cursor = ByteCursor::new(bytes, 4);
         let (entries, trailer, diagnostics, first_xref_item_offset) =
-            parse_xref_table(&mut cursor, bytes, None).expect("valid classic xref section");
+            parse_xref_table(&mut cursor, bytes, None, None).expect("valid classic xref section");
         assert_eq!(entries.len(), 1);
         assert_eq!(first_xref_item_offset, 9);
         assert_eq!(
@@ -8020,7 +8071,7 @@ mod tests {
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Foo 1 /Foo 2";
         let mut cursor = ByteCursor::new(bytes, 4);
         let mut sink = Diagnostics::default();
-        let result = parse_xref_table(&mut cursor, bytes, Some(&mut sink));
+        let result = parse_xref_table(&mut cursor, bytes, Some(&mut sink), None);
         assert!(result.is_err(), "truncated trailer dictionary must fail");
 
         let dict_open_end = bytes
@@ -8047,7 +8098,7 @@ mod tests {
         // parse failure -- only the diagnostic-forwarding step is skipped.
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Foo 1 /Foo 2";
         let mut cursor = ByteCursor::new(bytes, 4);
-        let result = parse_xref_table(&mut cursor, bytes, None);
+        let result = parse_xref_table(&mut cursor, bytes, None, None);
         assert!(result.is_err(), "truncated trailer dictionary must fail");
     }
 
@@ -8061,7 +8112,7 @@ mod tests {
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n[ 1 0 << /x 1 /x 2 >> ]";
         let mut cursor = ByteCursor::new(bytes, 4);
         let mut sink = Diagnostics::default();
-        let result = parse_xref_table(&mut cursor, bytes, Some(&mut sink));
+        let result = parse_xref_table(&mut cursor, bytes, Some(&mut sink), None);
         assert!(
             result.is_err(),
             "a non-dictionary trailer candidate must be rejected"
@@ -8088,7 +8139,7 @@ mod tests {
     fn parse_xref_table_fails_without_a_sink_when_the_trailer_is_not_a_dictionary() {
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n[ 1 0 << /x 1 /x 2 >> ]";
         let mut cursor = ByteCursor::new(bytes, 4);
-        let result = parse_xref_table(&mut cursor, bytes, None);
+        let result = parse_xref_table(&mut cursor, bytes, None, None);
         assert!(
             result.is_err(),
             "a non-dictionary trailer candidate must be rejected"
