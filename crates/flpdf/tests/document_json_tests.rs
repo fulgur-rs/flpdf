@@ -61,7 +61,7 @@ fn flpdf_qpdf_key_only_json(name: &str) -> Vec<u8> {
         objects: &[],
     };
     QPDFJob::new()
-        .write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut bytes), false)
+        .write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut bytes))
         .expect("qpdf JSON must be written");
     bytes
 }

@@ -251,7 +251,7 @@ fn write_outlines_json(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
     let mut job = QPDFJob::new();
     job.set_suppress_warnings(true);
     let mut output = Vec::new();
-    job.write_json(pdf, options, JsonJobOutput::Stdout(&mut output), false)
+    job.write_json(pdf, options, JsonJobOutput::Stdout(&mut output))
         .expect("outline JSON should be written");
 }
 

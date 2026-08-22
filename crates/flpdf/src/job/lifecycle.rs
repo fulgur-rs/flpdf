@@ -254,17 +254,19 @@ impl QPDFJob {
     ///
     /// JSON construction and stream side-file handling remain owned by the
     /// existing serializer; this method owns only the qpdf `writeQPDF`
-    /// lifecycle boundary (`QPDFJob.cc:484-563`).
+    /// lifecycle boundary (`QPDFJob.cc:484-563`). The warning-summary
+    /// destination is derived from [`JsonJobOutput`] itself, so callers cannot
+    /// provide a destination and an inconsistent `creates_output` flag.
     pub fn write_json<R>(
         &mut self,
         pdf: &mut Pdf<R>,
         options: JsonJobOptions<'_>,
         output: JsonJobOutput<'_>,
-        creates_output: bool,
     ) -> std::result::Result<JobExitCode, JsonJobError>
     where
         R: Read + Seek,
     {
+        let creates_output = matches!(&output, JsonJobOutput::File { .. });
         pdf.set_logger(self.logger.clone());
         write_json(pdf, options, output)?;
         self.record_document_warnings(pdf);
