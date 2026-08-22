@@ -12,6 +12,14 @@
 //! byte-boundary regression coverage. Production object and stream values
 //! route through [`ObjectHandle`] and [`crate::document_json`].
 
+#[cfg(test)]
+use crate::job::{
+    build_attachments_section, build_encrypt_section, build_outlines_section,
+    build_pagelabels_section, build_pages_section, cf_method_string, checksum_to_hex,
+    collect_content_refs, collect_image_refs, parse_pdf_date,
+    write_qpdf_json_v2_selected_objects_to_output_with_options,
+    write_qpdf_json_v2_selected_objects_with_options,
+};
 use crate::json::Json;
 #[cfg(test)]
 use crate::object::Dictionary;
@@ -27,21 +35,6 @@ use std::io::{Read, Seek, Write};
 pub(crate) use crate::pdf_string::decode_pdf_text_string;
 #[cfg(test)]
 pub(crate) use crate::pdf_string::lossy_utf16_to_utf8;
-
-// Compatibility re-exports: the qpdf JSON v2 section builders and command
-// writer now live under `job/`, but their historical public paths remain
-// available to library and test callers while the staged migration proceeds.
-pub(crate) use crate::job::checksum_to_hex;
-pub use crate::job::{
-    build_acroform_section, build_attachments_section, build_encrypt_section,
-    build_outlines_section, build_pagelabels_section, build_pages_section,
-    write_qpdf_json_v2_selected_objects_to_output_with_options,
-    write_qpdf_json_v2_selected_objects_with_options,
-};
-#[cfg(test)]
-pub(crate) use crate::job::{
-    cf_method_string, collect_content_refs, collect_image_refs, parse_pdf_date,
-};
 
 /// The qpdf JSON version these builders emit.
 ///

@@ -7,10 +7,8 @@
 //! command output is a usable oracle for the library call.
 
 use flpdf::document_json::write_json;
-use flpdf::json_inspect::{
-    write_qpdf_json_v2_selected_objects_with_options, DecodeLevel, JsonKey, JsonOutputError,
-    StreamDataMode,
-};
+use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
+use flpdf::json_inspect::{DecodeLevel, JsonKey, JsonOutputError, StreamDataMode};
 use flpdf::pipeline::PlString;
 use flpdf::Pdf;
 use std::fs::File;
@@ -54,18 +52,17 @@ fn flpdf_complete_json(name: &str) -> Vec<u8> {
 fn flpdf_qpdf_key_only_json(name: &str) -> Vec<u8> {
     let mut pdf = open_fixture(name);
     let mut bytes = Vec::new();
-    {
-        let mut out = PlString::new("json output", None, &mut bytes);
-        write_qpdf_json_v2_selected_objects_with_options(
-            &mut pdf,
-            DecodeLevel::Generalized,
-            &StreamDataMode::None,
-            &[JsonKey::Qpdf],
-            &[],
-            &mut out,
-        )
+    let keys = [JsonKey::Qpdf];
+    let options = JsonJobOptions {
+        decode_level: DecodeLevel::Generalized,
+        stream_data: JsonStreamData::None,
+        stream_prefix: None,
+        keys: &keys,
+        objects: &[],
+    };
+    QPDFJob::new()
+        .write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut bytes), false)
         .expect("qpdf JSON must be written");
-    }
     bytes
 }
 

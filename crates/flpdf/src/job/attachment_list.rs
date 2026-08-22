@@ -53,9 +53,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use super::checksum_to_hex;
 use crate::embedded_files::list_embedded_files;
 use crate::filespec_helper::{EmbeddedFileStream, FileSpec};
-use crate::json_inspect::checksum_to_hex;
 use crate::object_handle::ObjectHandle;
 use crate::{ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
