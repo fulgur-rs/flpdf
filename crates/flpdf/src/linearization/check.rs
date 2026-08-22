@@ -725,13 +725,8 @@ fn check_hint_tables<R: Read + Seek>(
     }
 
     let mut shared_idx_to_obj = BTreeMap::new();
-    let first_page =
-        pages
-            .first()
-            .copied()
-            .ok_or_else(|| LinearizationCheckError::InvalidParam {
-                message: "cannot validate hint tables for a document with no pages".to_owned(),
-            })?;
+    // `compute_hint_data` above rejects an empty page list before this point.
+    let first_page = pages[0];
 
     if shared_hints.nshared_total < shared_hints.nshared_first_page {
         hint_warning(
@@ -796,6 +791,10 @@ fn check_hint_tables<R: Read + Seek>(
                     message: format!("shared object {index} object count overflows"),
                 }
             })?;
+            let nobjects_u32 =
+                u32::try_from(nobjects).map_err(|_| LinearizationCheckError::InvalidParam {
+                    message: format!("shared object {index} object count does not fit in u32"),
+                })?;
             let computed_length = length_next_n(
                 pdf,
                 &xref,
@@ -816,15 +815,11 @@ fn check_hint_tables<R: Read + Seek>(
                 )?;
             }
             shared_idx_to_obj.insert(index as u64, current_object);
-            current_object = current_object
-                .checked_add(u32::try_from(nobjects).map_err(|_| {
-                    LinearizationCheckError::InvalidParam {
-                        message: format!("shared object {index} object count does not fit in u32"),
-                    }
-                })?)
-                .ok_or_else(|| LinearizationCheckError::InvalidParam {
+            current_object = current_object.checked_add(nobjects_u32).ok_or_else(|| {
+                LinearizationCheckError::InvalidParam {
                     message: format!("shared object {index} sequence overflows u32"),
-                })?;
+                }
+            })?;
         }
     }
 
@@ -2280,6 +2275,235 @@ mod tests {
     }
 
     #[test]
+    fn hint_table_warning_route_accumulates_qpdf_soft_diagnostics() {
+        let bytes = linearized_fixture_bytes();
+        let (mut pdf, pages, h_offset, h_length, mut page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        page_hints.first_page_offset = 0;
+        page_hints.min_nobjects += 1;
+        page_hints.min_page_length += 1;
+        page_hints.entries[0].nshared_objects = 1;
+        page_hints.entries[0].shared_identifiers = vec![0];
+        page_hints.entries[0].shared_numerators = vec![0];
+        shared_hints.min_group_length += 1;
+
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .expect("qpdf hint mismatches are soft warnings");
+        assert!(warnings
+            .iter()
+            .any(|message| message == "first page object offset mismatch"));
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("object count mismatch for page 0:")));
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("page length mismatch for page 0:")));
+        assert!(warnings
+            .iter()
+            .any(|message| message == "page 0 has shared identifier entries"));
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("shared object 0 length mismatch:")));
+        assert!(warnings.iter().any(|message| message
+            .starts_with("page 0: shared object 6: in hint table but not computed list")));
+    }
+
+    #[test]
+    fn hint_table_warning_route_checks_part8_offsets_and_lengths() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../tests/golden/references/objstm-lin-otherpage-shared-docother/linearize-objstm.pdf",
+            ),
+        )
+        .expect("part-8 linearized fixture");
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.first_shared_obj = shared_hints.first_shared_obj.wrapping_add(1);
+        shared_hints.first_shared_offset = shared_hints.first_shared_offset.wrapping_add(1);
+        shared_hints.min_group_length = shared_hints.min_group_length.wrapping_add(1);
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .expect("qpdf part-8 mismatches are soft warnings");
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("first shared object number mismatch:")));
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("first shared object offset mismatch:")));
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("shared object 2 length mismatch:")));
+    }
+
+    #[test]
+    fn hint_table_validator_covers_defensive_and_outline_warning_paths() {
+        let malformed = map_show_error(ShowLinearizationError::Malformed {
+            message: "bad hint bits".to_owned(),
+        });
+        assert!(matches!(
+            malformed,
+            LinearizationCheckError::InvalidParam { message } if message == "bad hint bits"
+        ));
+        let io = map_show_error(ShowLinearizationError::Io(Box::new(std::io::Error::other(
+            "hint read failed",
+        ))));
+        assert!(matches!(io, LinearizationCheckError::Io(_)));
+
+        let mut xref = BTreeMap::new();
+        xref.insert(
+            ObjectRef::new(1, 0),
+            XrefEntry::Compressed {
+                stream: 2,
+                index: 0,
+            },
+        );
+        xref.insert(ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 7 });
+        let mut seen = BTreeSet::new();
+        assert_eq!(
+            linearization_offset(&xref, ObjectRef::new(1, 0), &mut seen).unwrap(),
+            7
+        );
+        let mut cycle = BTreeMap::new();
+        cycle.insert(
+            ObjectRef::new(3, 0),
+            XrefEntry::Compressed {
+                stream: 3,
+                index: 0,
+            },
+        );
+        assert!(linearization_offset(&cycle, ObjectRef::new(3, 0), &mut BTreeSet::new()).is_err());
+        assert!(linearization_offset(
+            &BTreeMap::from([(ObjectRef::new(4, 0), XrefEntry::Free { next: 0 })]),
+            ObjectRef::new(4, 0),
+            &mut BTreeSet::new()
+        )
+        .is_err());
+        assert!(
+            linearization_offset(&BTreeMap::new(), ObjectRef::new(5, 0), &mut BTreeSet::new())
+                .is_err()
+        );
+
+        let mut pdf = Pdf::open_mem_owned(tiny_pdf_bytes()).expect("tiny PDF");
+        let mut warnings = Vec::new();
+        assert_eq!(
+            length_next_n(&mut pdf, &BTreeMap::new(), 1, 1, true, &mut warnings,).unwrap(),
+            0
+        );
+        assert!(warnings
+            .iter()
+            .any(|message| message == "no xref table entry for 1 0"));
+        assert!(length_next_n(
+            &mut pdf,
+            &BTreeMap::new(),
+            1,
+            1_000_001,
+            true,
+            &mut warnings,
+        )
+        .is_err());
+
+        let no_extent = ObjectRef::new(50, 0);
+        pdf.set_object(no_extent, crate::Object::Integer(1));
+        assert!(length_next_n(
+            &mut pdf,
+            &BTreeMap::from([(no_extent, XrefEntry::Uncompressed { offset: 0 })]),
+            no_extent.number,
+            1,
+            true,
+            &mut warnings,
+        )
+        .is_err());
+        assert!(compute_hint_data(&mut pdf, &[]).is_err());
+
+        let mut rootless = tiny_pdf_bytes();
+        let root_marker = b"/Root 1 0 R";
+        let root_start = rootless
+            .windows(root_marker.len())
+            .position(|window| window == root_marker)
+            .expect("trailer root");
+        rootless[root_start..root_start + root_marker.len()].fill(b' ');
+        let mut rootless = Pdf::open_mem_owned(rootless).expect("rootless PDF");
+        assert!(root_outlines_ref(&mut rootless).unwrap().is_none());
+        assert!(!outlines_in_first_page(&mut rootless).unwrap());
+
+        let outline_bytes =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../tests/golden/references/objstm-lin-outlines-80-80/linearize-classic.pdf",
+            ))
+            .expect("outline fixture");
+        let (mut pdf, pages, h_offset, h_length, page_hints, shared_hints, mut outline_hints) =
+            decode_hint_tables_for_test(&outline_bytes);
+        let outline_hints = outline_hints.as_mut().expect("outline hints");
+        outline_hints.first_object = outline_hints.first_object.wrapping_add(1);
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: Some(outline_hints),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .expect("outline first-object mismatch is a soft warning");
+        assert!(warnings
+            .iter()
+            .any(|message| message == "incorrect first object number in outline hints table."));
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, shared_hints, mut outline_hints) =
+            decode_hint_tables_for_test(&outline_bytes);
+        let outline_hints = outline_hints.as_mut().expect("outline hints");
+        outline_hints.nobjects = 0;
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: Some(outline_hints),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .expect("outline count mismatch is a soft warning");
+        assert!(warnings
+            .iter()
+            .any(|message| message == "incorrect object count in outline hint table"));
+    }
+
+    #[test]
     fn check_linearization_rejects_a_page_offset_hint_tampered_in_the_stream() {
         use flate2::read::ZlibDecoder;
         use flate2::write::ZlibEncoder;
@@ -2299,15 +2523,12 @@ mod tests {
                 .windows(b"endstream".len())
                 .position(|window| window == b"endstream")
                 .expect("hint stream terminator");
-        let framing_len = if bytes[stream_end.saturating_sub(2)..stream_end] == *b"\r\n" {
-            2
-        } else if bytes[stream_end.saturating_sub(1)..stream_end] == *b"\n"
-            || bytes[stream_end.saturating_sub(1)..stream_end] == *b"\r"
-        {
-            1
-        } else {
-            0
-        };
+        assert_eq!(
+            bytes[stream_end - 1],
+            b'\n',
+            "the committed fixture uses a newline before endstream"
+        );
+        let framing_len = 1;
         let compressed_end = stream_end - framing_len;
         let compressed = bytes[stream_start..compressed_end].to_vec();
         let framing = bytes[compressed_end..stream_end].to_vec();
