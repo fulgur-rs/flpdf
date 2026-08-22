@@ -2221,27 +2221,15 @@ mod tests {
     }
 
     #[test]
-    fn t_backscan_failure_is_a_warning_with_dump_intact() {
-        // flpdf's /T backscan (check.rs:710-726, marked as a qpdf deviation) has
-        // no qpdf throw counterpart -- qpdf's own /T check
-        // (QPDF_linearization.cc:452-470) is a soft warning inside
-        // checkLinearizationInternal, which never throws. A /T value that
-        // cannot be backscanned to an `xref` keyword must therefore still
-        // produce a normal dump, with the backscan failure appended as a
-        // warning rather than replacing the dump with nothing (the way a
-        // genuine readLinearizationData throw does).
-        //
-        // /T = 0 is used here only to force flpdf's own backscan into its
-        // hard-failure arm (too close to EOF to contain the `xref`
-        // keyword) -- it does not reproduce what qpdf itself does with
-        // /T = 0. Verified against `/usr/bin/qpdf` 11.9.0: qpdf's own /T
-        // check reads `xref_zero_offset` directly and compares cursor
-        // positions, so /T = 0 there produces a different soft warning
-        // ("space before first xref item (/T) mismatch") and still dumps
-        // -- the same "warning, dump intact" shape this test asserts, via
-        // a different flpdf code path (`show_continues_past_a_qpdf_soft_check_mismatch`
-        // and the CLI's `show_linearization_soft_warnings_exit_3_after_dump`
-        // exercise that qpdf-matching path instead).
+    fn t_position_mismatch_is_a_warning_with_dump_intact() {
+        // qpdf's own /T check (QPDF_linearization.cc:452-470) is a soft
+        // warning inside checkLinearizationInternal, which never throws: it
+        // only seeks to /T, skips whitespace, and compares the resulting
+        // position against the xref parser's first_xref_item_offset
+        // (QPDF.cc:845-869,1110-1120). A /T value that does not match that
+        // position must therefore still produce a normal dump, with the
+        // mismatch appended as a warning rather than replacing the dump with
+        // nothing (the way a genuine readLinearizationData throw does).
         let mut bytes = linearized_bytes();
         let pos = bytes.windows(3).position(|w| w == b"/T ").expect("/T");
         let dstart = pos + 3;
@@ -2254,12 +2242,13 @@ mod tests {
         bytes[dstart..dend].copy_from_slice(&vec![b'0'; width]); // /T = 0
 
         let result = show_linearization_bytes_with_warnings(&bytes, "badT.pdf")
-            .expect("a /T backscan failure is a warning, not a hard error");
+            .expect("a /T position mismatch is a warning, not a hard error");
         assert!(result.dump.starts_with("badT.pdf: linearization data:\n\n"));
         assert!(result.dump.contains("\nPage Offsets Hint Table\n\n"));
         assert_eq!(result.warnings.len(), 1);
         assert!(
-            result.warnings[0].contains("/T (0)"),
+            result.warnings[0].contains("space before first xref item (/T) mismatch")
+                && result.warnings[0].contains("file = 0"),
             "unexpected warning: {:?}",
             result.warnings
         );
