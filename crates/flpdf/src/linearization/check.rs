@@ -2089,6 +2089,22 @@ mod tests {
     }
 
     #[test]
+    fn warning_check_treats_a_t_offset_beyond_eof_as_a_position_warning() {
+        let mut bytes = linearized_fixture_bytes();
+        replace_parameter_number(&mut bytes, b"/T ", 9999);
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("linearized fixture should open");
+
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect("qpdf does not structurally parse a /T neighborhood");
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.starts_with("space before first xref item (/T) mismatch")),
+            "the out-of-range /T must remain a position warning: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn xref_parser_records_qpdf_first_xref_item_offset() {
         let bytes = linearized_fixture_bytes();
         let pdf = Pdf::open_mem_owned(bytes).expect("linearized fixture should open");
