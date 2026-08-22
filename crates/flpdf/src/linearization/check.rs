@@ -2501,6 +2501,208 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|message| message == "incorrect object count in outline hint table"));
+
+        let bytes = linearized_fixture_bytes();
+        let (mut pdf, pages, h_offset, h_length, mut page_hints, shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        page_hints.entries.clear();
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.nshared_first_page = shared_hints.nshared_total + 1;
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .expect("ntotal < nfirst_page is a soft warning");
+        assert!(warnings
+            .iter()
+            .any(|message| message == "shared object hint table: ntotal < nfirst_page"));
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.nshared_total += 1;
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.entries[0].nobjects_minus_one = u64::MAX;
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.entries[0].nobjects_minus_one = u32::MAX as u64;
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.nshared_first_page = 0;
+        shared_hints.nshared_total = 1;
+        shared_hints.first_shared_obj = u32::MAX as u64;
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, mut page_hints, shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        page_hints.entries[0].delta_nobjects = u64::MAX;
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, mut page_hints, shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        page_hints.min_nobjects = u32::MAX;
+        page_hints.entries[0].delta_nobjects = 1;
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, mut page_hints, shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        page_hints.entries[0].nshared_objects = 1;
+        page_hints.entries[0].shared_identifiers = vec![u64::MAX];
+        page_hints.entries[0].shared_numerators = vec![0];
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, shared_hints, mut outline_hints) =
+            decode_hint_tables_for_test(&outline_bytes);
+        let outline_hints = outline_hints.as_mut().expect("outline hints");
+        outline_hints.group_length = outline_hints.group_length.wrapping_add(1);
+        let mut warnings = Vec::new();
+        check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: Some(outline_hints),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .expect("outline length mismatch is a soft warning");
+        assert!(warnings.iter().any(|message| message
+            == "incorrect length in outlines table: hint table = 6265; computed = 6264"));
     }
 
     #[test]
