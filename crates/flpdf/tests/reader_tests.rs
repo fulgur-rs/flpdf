@@ -59,29 +59,23 @@ fn open_with_options_rejects_wrong_password() {
 }
 
 #[test]
-fn open_rejects_rc4_encryption_by_default() {
-    let err = match Pdf::open_with_options(
+fn open_accepts_rc4_encryption_by_default() {
+    let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v1-rc4-40-r2.pdf")),
         PdfOpenOptions {
             password: b"user-v1".to_vec(),
             ..PdfOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("RC4 encryption should be rejected by default"),
-        Err(err) => err,
-    };
+    )
+    .expect("qpdf accepts authenticated RC4 reads without a write opt-in");
 
-    assert!(matches!(
-        err,
-        Error::Encrypted(EncryptedError::WeakCryptoNotAllowed)
-    ));
+    assert!(pdf.uses_weak_crypto());
 }
 
 #[test]
 fn open_with_options_accepts_owner_password() {
     let bytes = committed_encrypted_fixture("v1-rc4-40-r2.pdf");
     let options = PdfOpenOptions {
-        allow_weak_crypto: true,
         password: b"owner-v1".to_vec(),
         ..PdfOpenOptions::default()
     };
@@ -281,49 +275,38 @@ fn resolve_borrowed_returns_null_for_compressed_entry_with_mismatched_parent_ref
 }
 
 #[test]
-fn open_with_options_rejects_r5_by_default() {
-    let err = match Pdf::open_with_options(
+fn open_with_options_accepts_r5_by_default() {
+    let pdf = Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
         PdfOpenOptions {
             password: b"userpass".to_vec(),
             ..PdfOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("deprecated R=5 encryption should be rejected by default"),
-        Err(err) => err,
-    };
+    )
+    .expect("qpdf accepts authenticated R=5 reads without a write opt-in");
 
-    assert!(matches!(
-        err,
-        Error::Encrypted(EncryptedError::WeakCryptoNotAllowed)
-    ));
+    assert!(pdf.uses_weak_crypto());
 }
 
 #[test]
-fn open_rejects_v4_rc4_crypt_filters_by_default() {
-    let err = match Pdf::open_with_options(
+fn open_accepts_v4_rc4_crypt_filters_by_default() {
+    let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v4-rc4-128-r4.pdf")),
         PdfOpenOptions {
             password: b"user-v4-rc4".to_vec(),
             ..PdfOpenOptions::default()
         },
-    ) {
-        Ok(_) => panic!("V=4 /CFM /V2 encryption should be rejected by default"),
-        Err(err) => err,
-    };
+    )
+    .expect("qpdf accepts authenticated V=4 RC4 reads without a write opt-in");
 
-    assert!(matches!(
-        err,
-        Error::Encrypted(EncryptedError::WeakCryptoNotAllowed)
-    ));
+    assert!(pdf.uses_weak_crypto());
 }
 
 #[test]
-fn open_with_options_accepts_v4_rc4_crypt_filters_with_weak_crypto_opt_in() {
+fn open_with_options_accepts_v4_rc4_crypt_filters() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v4-rc4-128-r4.pdf")),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"user-v4-rc4".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -334,11 +317,10 @@ fn open_with_options_accepts_v4_rc4_crypt_filters_with_weak_crypto_opt_in() {
 }
 
 #[test]
-fn open_with_options_marks_rc4_opt_in_as_weak_crypto() {
+fn open_with_options_marks_rc4_as_weak_crypto() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v1-rc4-40-r2.pdf")),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"user-v1".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -349,7 +331,7 @@ fn open_with_options_marks_rc4_opt_in_as_weak_crypto() {
 }
 
 #[test]
-fn open_with_options_accepts_r5_with_weak_crypto_opt_in_and_r6_by_default() {
+fn open_with_options_accepts_r5_and_r6_by_default() {
     for (revision, password) in [
         (5, b"userpass".as_slice()),
         (5, b"ownerpass"),
@@ -357,7 +339,6 @@ fn open_with_options_accepts_r5_with_weak_crypto_opt_in_and_r6_by_default() {
         (6, b"ownerpass"),
     ] {
         let options = PdfOpenOptions {
-            allow_weak_crypto: revision == 5,
             password: password.to_vec(),
             ..PdfOpenOptions::default()
         };
@@ -375,10 +356,8 @@ fn open_with_options_accepts_r5_with_weak_crypto_opt_in_and_r6_by_default() {
 // ---------------------------------------------------------------------------
 // flpdf-9hc.3.21: authentication error parity for V=5 (and the V<5/V=4 path).
 //
-// Error-variant firing order in reader.rs `authenticate_if_encrypted`:
+// Error behavior in reader.rs `authenticate_if_encrypted`:
 //   - Password authentication runs FIRST. Both user+owner failing => BadPassword.
-//   - The weak-crypto gate (WeakCryptoNotAllowed) is applied only AFTER a
-//     password authenticates.
 //   - On the V=5 R=5/R=6 auth path, a wrong-length /U or /O entry maps to
 //     BadPassword (not Malformed), matching qpdf's "invalid password".
 //
@@ -388,9 +367,8 @@ fn open_with_options_accepts_r5_with_weak_crypto_opt_in_and_r6_by_default() {
 // together with the four regression fences (a)-(d).
 // ---------------------------------------------------------------------------
 
-/// scenario 7: an RC4 (V=1/R=2, weak) file opened with the WRONG password and
-/// WITHOUT --allow-weak-crypto must report BadPassword, not
-/// WeakCryptoNotAllowed. qpdf reports "invalid password" here.
+/// scenario 7: an RC4 (V=1/R=2, weak) file opened with the WRONG password
+/// must report BadPassword. qpdf reports "invalid password" here.
 #[test]
 fn scenario7_rc4_wrong_password_without_weak_opt_in_is_bad_password() {
     let err = match Pdf::open_with_options(
@@ -406,7 +384,7 @@ fn scenario7_rc4_wrong_password_without_weak_opt_in_is_bad_password() {
 
     assert!(
         matches!(err, Error::Encrypted(EncryptedError::BadPassword)),
-        "expected BadPassword (password checked before weak-crypto gate), got {err:?}"
+        "expected BadPassword from authentication, got {err:?}"
     );
 }
 
@@ -419,7 +397,6 @@ fn scenario8_v5_short_u_entry_is_bad_password() {
     let err = match Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"userpass".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -442,7 +419,6 @@ fn fence_v5_short_ue_entry_stays_malformed() {
     let err = match Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"userpass".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -457,41 +433,18 @@ fn fence_v5_short_ue_entry_stays_malformed() {
     );
 }
 
-/// Regression fence (a): a CORRECT password against a weak (RC4) file WITHOUT
-/// --allow-weak-crypto must still return WeakCryptoNotAllowed. Only the
-/// ordering relative to BadPassword changed, not this behaviour.
+/// A correct password against a weak (RC4) file is accepted without a
+/// write-only weak-crypto opt-in, matching qpdf.
 #[test]
-fn fence_a_correct_password_weak_not_allowed_still_weak_crypto() {
-    let err = match Pdf::open_with_options(
-        std::io::Cursor::new(committed_encrypted_fixture("v1-rc4-40-r2.pdf")),
-        PdfOpenOptions {
-            password: b"user-v1".to_vec(),
-            ..PdfOpenOptions::default()
-        },
-    ) {
-        Ok(_) => panic!("RC4 must be rejected without --allow-weak-crypto"),
-        Err(err) => err,
-    };
-
-    assert!(
-        matches!(err, Error::Encrypted(EncryptedError::WeakCryptoNotAllowed)),
-        "correct password + weak + not allowed must stay WeakCryptoNotAllowed, got {err:?}"
-    );
-}
-
-/// Regression fence (b): a CORRECT password against a weak (RC4) file WITH
-/// --allow-weak-crypto must still open.
-#[test]
-fn fence_b_correct_password_weak_allowed_still_opens() {
+fn fence_a_correct_password_weak_opens_without_write_opt_in() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v1-rc4-40-r2.pdf")),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"user-v1".to_vec(),
             ..PdfOpenOptions::default()
         },
     )
-    .expect("correct password + weak + --allow-weak-crypto must open");
+    .expect("correct password + weak encryption must open");
 
     assert!(pdf.uses_weak_crypto());
 }
@@ -503,7 +456,6 @@ fn fence_c_v5_wellformed_wrong_password_is_bad_password() {
     let err = match Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"definitely-wrong".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -622,7 +574,6 @@ fn resolve_decrypts_encrypted_strings_after_authentication() {
     let mut pdf = Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"user-pw".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -663,7 +614,6 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
     let mut pdf = Pdf::open_with_options(
         std::io::Cursor::new(bytes),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"user-pw".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -1012,7 +962,6 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
         let mut pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_r5_or_r6_identity_cf_minimal_pdf(revision)),
             PdfOpenOptions {
-                allow_weak_crypto: revision == 5,
                 password: b"userpass".to_vec(),
                 ..PdfOpenOptions::default()
             },
@@ -1051,9 +1000,7 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
 /// 0
 /// ```
 ///
-/// flpdf used to reject the same document with `UnsupportedHandler`. Only
-/// `/R 5`'s pre-existing weak-crypto gate still refuses it by default, which
-/// is why the option is set here; that gate is unrelated to the crypt filter.
+/// flpdf used to reject the same document with `UnsupportedHandler`.
 #[test]
 fn r5_and_r6_accept_an_rc4_crypt_filter_method() {
     for revision in [5, 6] {
@@ -1061,7 +1008,6 @@ fn r5_and_r6_accept_an_rc4_crypt_filter_method() {
             std::io::Cursor::new(encrypted_r5_or_r6_unsupported_cf_minimal_pdf(revision)),
             PdfOpenOptions {
                 password: b"userpass".to_vec(),
-                allow_weak_crypto: true,
                 ..PdfOpenOptions::default()
             },
         )
@@ -1260,7 +1206,6 @@ fn r5_and_r6_reject_malformed_encrypt_metadata() {
                 &[],
             )),
             PdfOpenOptions {
-                allow_weak_crypto: revision == 5,
                 password: b"userpass".to_vec(),
                 ..PdfOpenOptions::default()
             },
@@ -1301,7 +1246,6 @@ fn password_matched_flags_v1_r2_user_password() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v1-rc4-40-r2.pdf")),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"user-v1".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -1324,7 +1268,6 @@ fn password_matched_flags_v1_r2_owner_password() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(committed_encrypted_fixture("v1-rc4-40-r2.pdf")),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"owner-v1".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -1387,7 +1330,6 @@ fn password_matched_flags_v5_r5_user_password() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"userpass".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -1410,7 +1352,6 @@ fn password_matched_flags_v5_r5_owner_password() {
     let pdf = Pdf::open_with_options(
         std::io::Cursor::new(encrypted_r5_or_r6_minimal_pdf(5)),
         PdfOpenOptions {
-            allow_weak_crypto: true,
             password: b"ownerpass".to_vec(),
             ..PdfOpenOptions::default()
         },
@@ -2403,7 +2344,6 @@ fn pre_v4_documents_still_decrypt_their_streams_with_rc4() {
         let mut pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_legacy_rc4_stream_fixture(version)),
             PdfOpenOptions {
-                allow_weak_crypto: true,
                 ..PdfOpenOptions::default()
             },
         )
@@ -2431,7 +2371,6 @@ fn pre_v4_documents_report_no_crypt_filter_methods() {
         let mut pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_legacy_rc4_stream_fixture(version)),
             PdfOpenOptions {
-                allow_weak_crypto: true,
                 ..PdfOpenOptions::default()
             },
         )

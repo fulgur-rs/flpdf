@@ -7967,13 +7967,11 @@ mod tests {
     /// FileKeyAes256` code path with R=6 (only the password-hash algorithm
     /// and the `/R` value differ — see `build_v5_r5_encrypt_dict`'s doc), so
     /// this is not a redundant re-run of the R=6 case: it is R=5's own
-    /// weak-crypto reader gate (`revision == 5`,
-    /// `PdfOpenOptions::allow_weak_crypto`) that needs its own coverage,
-    /// mirroring `crate::writer::tests::v5_r5_encrypt_round_trips_string_and_stream_via_reader`.
-    /// `check_linearization_bytes` opens with the reader's default options
-    /// (weak crypto disallowed), so the linearization-checker step here opens
-    /// its own `Pdf` with `allow_weak_crypto: true` and calls
-    /// `check_linearization` directly instead.
+    /// deprecated encryption revision that needs its own coverage, mirroring
+    /// `crate::writer::tests::v5_r5_encrypt_round_trips_string_and_stream_via_reader`.
+    /// `check_linearization_bytes` opens with the reader's default options,
+    /// which accept weak encrypted inputs just like qpdf, and calls
+    /// `check_linearization` directly instead of reopening through a CLI job.
     #[test]
     fn linearize_with_v5_r5_aes256_encrypts_and_round_trips() {
         let content_marker: &[u8] = b"BT /F1 12 Tf (flpdf v5r5 linearize content marker) Tj ET\n";
@@ -8050,11 +8048,10 @@ mod tests {
         let mut checker_pdf = Pdf::open_with_options(
             Cursor::new(out.clone()),
             crate::PdfOpenOptions {
-                allow_weak_crypto: true,
                 ..crate::PdfOpenOptions::default()
             },
         )
-        .expect("re-open with the empty user password + allow_weak_crypto for the checker");
+        .expect("re-open with the empty user password for the checker");
         crate::linearization::check_linearization(&mut checker_pdf, &out)
             .expect("V=5 R=5 encrypted linearized output must pass the linearization checker");
 
@@ -8063,7 +8060,6 @@ mod tests {
                 Cursor::new(out.clone()),
                 crate::PdfOpenOptions {
                     password: pw.to_vec(),
-                    allow_weak_crypto: true,
                     ..crate::PdfOpenOptions::default()
                 },
             )

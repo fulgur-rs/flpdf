@@ -1,7 +1,6 @@
-//! qpdf 11.9.0 password-recovery parity tests, except one gate-pinning
-//! test noted inline where it appears.
+//! qpdf 11.9.0 password-recovery parity tests.
 
-use flpdf::{EncryptMethod, EncryptParams, EncryptedError, Pdf, PdfOpenOptions, PdfWriter};
+use flpdf::{EncryptMethod, EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
 use std::io::Cursor;
 
 fn minimal_fixture() -> Vec<u8> {
@@ -68,17 +67,23 @@ fn reader_recovers_mac_roman_password_from_utf8_input() {
     }
 }
 
-// NOT a qpdf-parity assertion, unlike the rest of this file: live qpdf
-// 11.9.0 opens this same RC4 file with the correct password and no
-// --allow-weak-crypto (its allow_weak_crypto concept lives only on the
-// QPDFJob write path, QPDFJob.cc:2725-2763; the QPDF read/authenticate
-// path has no such gate at all). flpdf's library-level
-// WeakCryptoNotAllowed on read is an flpdf-only gate whose qpdf basis is
-// under review (flpdf-zzdz). This test pins flpdf's current behavior so a
-// change to that gate is a deliberate, visible diff here -- it does not
-// assert that behavior is qpdf-correct.
 #[test]
-fn reader_stops_recovery_at_flpdfs_own_weak_crypto_gate_pending_flpdf_zzdz() {
+fn reader_accepts_rc4_with_correct_password_without_write_opt_in() {
+    let encrypted = v3_rc4_encrypted_with_raw_password(b"password");
+    let pdf = Pdf::open_with_options(
+        Cursor::new(encrypted),
+        PdfOpenOptions {
+            password: b"password".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("qpdf accepts an authenticated RC4 read without its write-only opt-in");
+
+    assert!(pdf.uses_weak_crypto());
+}
+
+#[test]
+fn reader_recovery_accepts_rc4_without_write_opt_in() {
     let encrypted = v3_rc4_encrypted_with_raw_password(b"caf\xe9");
     let result = Pdf::open_with_options(
         Cursor::new(encrypted),
@@ -88,10 +93,6 @@ fn reader_stops_recovery_at_flpdfs_own_weak_crypto_gate_pending_flpdf_zzdz() {
         },
     );
 
-    assert!(matches!(
-        result,
-        Err(flpdf::Error::Encrypted(
-            EncryptedError::WeakCryptoNotAllowed
-        ))
-    ));
+    let pdf = result.expect("qpdf accepts authenticated RC4 reads without its write opt-in");
+    assert!(pdf.uses_weak_crypto());
 }

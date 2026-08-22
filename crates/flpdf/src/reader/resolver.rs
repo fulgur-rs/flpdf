@@ -5171,7 +5171,6 @@ mod tests {
             fixture,
             crate::PdfOpenOptions {
                 password: b"user-v2".to_vec(),
-                allow_weak_crypto: true,
                 ..crate::PdfOpenOptions::default()
             },
         )
@@ -6672,7 +6671,6 @@ mod tests {
             .expect("encrypted fixture missing: tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
         let options = crate::PdfOpenOptions {
             password: b"user-v2".to_vec(),
-            allow_weak_crypto: true,
             ..crate::PdfOpenOptions::default()
         };
         let pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open RC4 fixture");
@@ -6913,7 +6911,7 @@ mod tests {
             // cov:ignore-end
         }
 
-        for (name, encrypt, allow_weak_crypto) in [
+        for (name, encrypt) in [
             (
                 "rc4-v2",
                 crate::encrypt_setup::EncryptParams::rc4(
@@ -6921,17 +6919,14 @@ mod tests {
                     b"user-pw",
                     b"owner-pw",
                 ),
-                true,
             ),
             (
                 "aes128-v4",
                 crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
-                false,
             ),
             (
                 "aes256-v5",
                 crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw", b"owner-pw"),
-                false,
             ),
         ] {
             let (encrypted, plaintext) = encrypted_stream_fixture(encrypt);
@@ -6960,7 +6955,6 @@ mod tests {
                 Cursor::new(encrypted),
                 crate::PdfOpenOptions {
                     password: b"user-pw".to_vec(),
-                    allow_weak_crypto,
                     ..crate::PdfOpenOptions::default()
                 },
             )
@@ -6995,7 +6989,6 @@ mod tests {
 
     fn canonical_info_dictionary(
         bytes: Vec<u8>,
-        allow_weak_crypto: bool,
     ) -> (
         ObjectRef,
         std::collections::BTreeMap<Vec<u8>, crate::ObjectHandle>,
@@ -7004,7 +6997,6 @@ mod tests {
             Cursor::new(bytes),
             crate::PdfOpenOptions {
                 password: b"user-pw".to_vec(),
-                allow_weak_crypto,
                 ..crate::PdfOpenOptions::default()
             },
         )
@@ -7273,29 +7265,19 @@ mod tests {
         }
         // cov:ignore-end
 
-        for (name, encrypt, allow_weak_crypto) in [
+        for (name, encrypt) in [
             (
                 "rc4",
                 EncryptParams::rc4(EncryptMethod::V2Rc4128, b"user-pw", b"owner-pw"),
-                true,
             ),
-            (
-                "aes128",
-                EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
-                false,
-            ),
-            (
-                "aes256",
-                EncryptParams::v5_r6(b"user-pw", b"owner-pw"),
-                false,
-            ),
+            ("aes128", EncryptParams::v4_aes128(b"user-pw", b"owner-pw")),
+            ("aes256", EncryptParams::v5_r6(b"user-pw", b"owner-pw")),
         ] {
             let encrypted = encrypted_info_fixture(
                 b"<< /Title (TopSecretTitle) /Metadata << /Label (NestedSecret) >> >>",
                 encrypt,
             );
-            let (info_ref, values) =
-                canonical_info_dictionary(encrypted.clone(), allow_weak_crypto);
+            let (info_ref, values) = canonical_info_dictionary(encrypted.clone());
             assert_eq!(
                 values
                     .get(b"/Title".as_slice())
@@ -7345,7 +7327,7 @@ mod tests {
             b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents (SignatureCipher) /Reason (ReasonPlain) >>",
             crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
-        let (info_ref, values) = canonical_info_dictionary(encrypted.clone(), false);
+        let (info_ref, values) = canonical_info_dictionary(encrypted.clone());
         assert_eq!(
             values
                 .get(b"/Reason".as_slice())
@@ -7369,7 +7351,7 @@ mod tests {
             b"<< /Type /Sig /Contents (SignatureCipher) >>",
             crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
-        let (_, values) = canonical_info_dictionary(no_byte_range, false);
+        let (_, values) = canonical_info_dictionary(no_byte_range);
         assert_eq!(
             values
                 .get(b"/Contents".as_slice())

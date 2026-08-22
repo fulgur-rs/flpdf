@@ -7425,10 +7425,7 @@ mod tests {
         );
     }
 
-    fn fixed_v5_encrypted_output(
-        params: crate::encrypt_setup::EncryptParams,
-        allow_weak_crypto: bool,
-    ) -> Vec<u8> {
+    fn fixed_v5_encrypted_output(params: crate::encrypt_setup::EncryptParams) -> Vec<u8> {
         use crate::PdfOpenOptions;
         use std::io::Cursor;
 
@@ -7451,7 +7448,6 @@ mod tests {
             Cursor::new(out.clone()),
             PdfOpenOptions {
                 password: b"user-pw".to_vec(),
-                allow_weak_crypto,
                 ..PdfOpenOptions::default()
             },
         )
@@ -7464,14 +7460,14 @@ mod tests {
 
     #[test]
     fn v5_r6_fixed_randomness_is_byte_stable() {
-        let first = fixed_v5_encrypted_output(
-            crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw".to_vec(), b"owner-pw".to_vec()),
-            false,
-        );
-        let second = fixed_v5_encrypted_output(
-            crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw".to_vec(), b"owner-pw".to_vec()),
-            false,
-        );
+        let first = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r6(
+            b"user-pw".to_vec(),
+            b"owner-pw".to_vec(),
+        ));
+        let second = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r6(
+            b"user-pw".to_vec(),
+            b"owner-pw".to_vec(),
+        ));
         assert_eq!(
             first, second,
             "fixed V=5 R=6 input must produce stable bytes"
@@ -7480,14 +7476,14 @@ mod tests {
 
     #[test]
     fn v5_r5_fixed_randomness_is_byte_stable() {
-        let first = fixed_v5_encrypted_output(
-            crate::encrypt_setup::EncryptParams::v5_r5(b"user-pw".to_vec(), b"owner-pw".to_vec()),
-            true,
-        );
-        let second = fixed_v5_encrypted_output(
-            crate::encrypt_setup::EncryptParams::v5_r5(b"user-pw".to_vec(), b"owner-pw".to_vec()),
-            true,
-        );
+        let first = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r5(
+            b"user-pw".to_vec(),
+            b"owner-pw".to_vec(),
+        ));
+        let second = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r5(
+            b"user-pw".to_vec(),
+            b"owner-pw".to_vec(),
+        ));
         assert_eq!(
             first, second,
             "fixed V=5 R=5 input must produce stable bytes"
@@ -7575,9 +7571,8 @@ mod tests {
                 Cursor::new(out.clone()),
                 PdfOpenOptions {
                     password: pw.to_vec(),
-                    // R=5 is flagged as weak crypto by the reader (deprecated
-                    // pre-ISO revision); allow it explicitly in this writer test.
-                    allow_weak_crypto: true,
+                    // R=5 is deprecated pre-ISO encryption; the reader accepts
+                    // it like qpdf without a write-side opt-in.
                     ..PdfOpenOptions::default()
                 },
             )
@@ -8011,7 +8006,6 @@ mod tests {
                     Cursor::new(out.clone()),
                     PdfOpenOptions {
                         password: pw.to_vec(),
-                        allow_weak_crypto: true,
                         ..PdfOpenOptions::default()
                     },
                 )

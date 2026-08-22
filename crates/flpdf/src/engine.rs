@@ -87,9 +87,9 @@ impl<R: Read + Seek> Pdf<R> {
     ///   that cannot be authenticated or processed: a wrong password
     ///   ([`EncryptedError::BadPassword`]), an unsupported filter or revision
     ///   ([`EncryptedError::UnsupportedHandler`]), a structurally invalid
-    ///   `/Encrypt` dictionary ([`EncryptedError::Malformed`]), or an RC4 / R=5
-    ///   document opened without `options.allow_weak_crypto`
-    ///   ([`EncryptedError::WeakCryptoNotAllowed`]).
+    ///   `/Encrypt` dictionary ([`EncryptedError::Malformed`]). Weak
+    ///   encryption is readable; qpdf's `--allow-weak-crypto` is a write-only
+    ///   policy.
     pub fn open_with_options(reader: R, options: PdfOpenOptions) -> Result<Self> {
         Self::open_with_repair_mode(reader, options)
     }

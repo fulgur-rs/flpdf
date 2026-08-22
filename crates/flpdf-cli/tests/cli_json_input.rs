@@ -673,13 +673,11 @@ const RC4_ENCRYPTED_PDF: &str = "../../tests/fixtures/encrypted/v1-rc4-40-r2.pdf
 const RC4_USER_PASSWORD: &str = "user-v1";
 const NOOP_UPDATE_JSON: &str = r#"{"qpdf":[{"jsonversion":2,"calledgetallpages":true,"pushedinheritedpageresources":false},{}]}"#;
 
-/// `run_check` forces `PdfOpenOptions::allow_weak_crypto = true` because
-/// qpdf treats `--check` as a read-only inspection (like `--show-encryption`):
-/// an RC4/R=5 file opened with the correct password checks cleanly without
-/// `--allow-weak-crypto` (verified qpdf 11.9.0). `--update-from-json --check`
-/// previously went through the generic (write-path) `open_job_pdf` branch,
-/// which used the normal, non-forced gate, so a file that passes plain
-/// `--check` failed once `--update-from-json` was added.
+/// qpdf treats `--check` as a read-only inspection (like
+/// `--show-encryption`): an RC4/R=5 file opened with the correct password
+/// checks cleanly without `--allow-weak-crypto` (verified qpdf 11.9.0).
+/// `--update-from-json --check` also uses this same warning-aggregation path
+/// rather than the ordinary inspection route.
 #[test]
 fn update_from_json_check_inspects_rc4_encrypted_input_by_default() {
     let temp = tempfile::tempdir().unwrap();

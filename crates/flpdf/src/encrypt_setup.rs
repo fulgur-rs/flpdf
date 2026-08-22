@@ -170,8 +170,7 @@ impl EncryptParams {
     /// True when this method writes deprecated revision-5 (V=5 R=5,
     /// pre-ISO 32000-2) AES-256 output. R=5 was dropped from the published
     /// standard in favour of R=6, so the CLI gates *creating* R=5 files
-    /// behind `--allow-weak-crypto`, mirroring the reader, which rejects R=5
-    /// input unless the same opt-in is given.
+    /// behind `--allow-weak-crypto`; existing R=5 input remains readable.
     ///
     /// This is disjoint from [`is_weak_rc4`](Self::is_weak_rc4): R=5 still
     /// uses AES-256, not RC4. Both classify methods the CLI refuses to write

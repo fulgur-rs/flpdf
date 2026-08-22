@@ -186,11 +186,6 @@ pub enum EncryptedError {
         /// Human-readable description of what is missing or invalid.
         reason: String,
     },
-
-    /// The document is encrypted with RC4, which is a weak cipher. The caller
-    /// must pass `--allow-weak-crypto` to permit processing.
-    #[error("encryption uses weak crypto (RC4); pass --allow-weak-crypto to permit")]
-    WeakCryptoNotAllowed,
 }
 
 /// Bridge from the low-level `PrimitiveError` to [`Error::Encrypted`].
@@ -214,7 +209,6 @@ impl EncryptedError {
             Self::BadPassword => "encrypted.bad-password",
             Self::UnsupportedHandler { .. } => "encrypted.unsupported-handler",
             Self::Malformed { .. } => "encrypted.malformed",
-            Self::WeakCryptoNotAllowed => "encrypted.weak-crypto-not-allowed",
         }
     }
 }
@@ -332,15 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_error_display_weak_crypto() {
-        let e = EncryptedError::WeakCryptoNotAllowed;
-        assert_eq!(
-            e.to_string(),
-            "encryption uses weak crypto (RC4); pass --allow-weak-crypto to permit"
-        );
-    }
-
-    #[test]
     fn error_encrypted_wraps_subkind() {
         let e: Error = EncryptedError::BadPassword.into();
         assert_eq!(e.to_string(), "encrypted PDF: incorrect password");
@@ -365,10 +350,6 @@ mod tests {
             }
             .code(),
             "encrypted.malformed"
-        );
-        assert_eq!(
-            EncryptedError::WeakCryptoNotAllowed.code(),
-            "encrypted.weak-crypto-not-allowed"
         );
     }
 

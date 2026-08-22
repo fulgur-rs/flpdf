@@ -44,9 +44,6 @@ pub fn compare_files(
 ) -> flpdf::Result<Option<String>> {
     let open_options = || PdfOpenOptions {
         password: password.to_vec(),
-        // qpdf's processFile accepts RC4-backed handlers by default. Mirror
-        // that so encrypted fixtures don't require a feature flag.
-        allow_weak_crypto: true,
         ..PdfOpenOptions::default()
     };
     // `open_mem_owned_with_options` takes an owned `Vec<u8>`; the `.to_vec()`

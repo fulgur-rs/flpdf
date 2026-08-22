@@ -1528,7 +1528,8 @@ struct PasswordArgs {
     /// `unicode` pass them through unchanged. Mirrors qpdf's flag.
     #[arg(long = "password-mode", value_enum, default_value_t = CliPasswordMode::Auto)]
     password_mode: CliPasswordMode,
-    /// Permit deprecated RC4-backed handlers and revision 5 encryption.
+    /// Permit creating deprecated RC4-backed handlers and revision 5
+    /// encryption. Reading existing weakly encrypted PDFs does not require it.
     #[arg(long = "allow-weak-crypto")]
     allow_weak_crypto: bool,
     /// Interpret --password as the precomputed file encryption key in hex,
@@ -2204,10 +2205,9 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
 
     let mut options = pdf_open_options(cli.repair, &cli.password)?;
     if cli.check {
-        // `--check` is a read-only inspection: qpdf forces weak-crypto
-        // authentication open and re-emits collected diagnostics once in its
-        // check report rather than delivering them during input creation.
-        options.allow_weak_crypto = true;
+        // `--check` is a read-only inspection and re-emits collected
+        // diagnostics once in its check report rather than delivering them
+        // during input creation.
         options.suppress_warnings = true;
     }
     let mut pdf = match job.open(BufReader::new(file), input.display().to_string(), options) {
@@ -2217,12 +2217,6 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
             return Err(error_with_file(input, actionable_password_error(error)));
         }
     };
-    if pdf.uses_weak_crypto() && !cli.check {
-        logger_warn(format!(
-            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
-            input.display()
-        ))?;
-    }
     apply_json_update_with_job(&mut job, &mut pdf, cli.update_from_json.as_deref())?;
     run_job_inspection_on_pdf(cli, &mut job, &mut pdf)
 }
@@ -2595,13 +2589,6 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     let mut options = pdf_open_options(repair, password)?;
-    // qpdf treats `--check` as a read-only inspection, like `--show-encryption`,
-    // `--requires-password`, and `--is-encrypted`: an RC4 / R=5 (weak-crypto)
-    // file opened with the correct password is checked without
-    // `--allow-weak-crypto` and exits 0 with no weak-crypto warning (verified
-    // qpdf 11.9.0). Force the gate open here. Authentication still runs first,
-    // so a wrong password fails exactly as before.
-    options.allow_weak_crypto = true;
     // The job emits the collected diagnostics once, after the qpdf check
     // banner, and owns the shared warning completion boundary.
     options.suppress_warnings = true;
@@ -2788,7 +2775,7 @@ fn build_copy_encryption_source(
 ///
 /// RC4 outputs (40-bit, or 128-bit without AES) are weak and require
 /// `allow_weak_crypto` (the top-level `--allow-weak-crypto` flag), mirroring
-/// qpdf's checkConfiguration.
+/// qpdf's write-side checkConfiguration.
 ///
 /// Permission sub-flags (`--print`, `--modify`, `--extract`, `--annotate`,
 /// `--form`, `--assemble`, `--accessibility`) use the R>=3 grammar and are
@@ -3002,11 +2989,7 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
 
     // RC4 outputs are weak; qpdf refuses to write them without
     // --allow-weak-crypto, so apply the same gate here. Deprecated R=5
-    // (AES-256) output is also gated: unlike qpdf — which gates only RC4 and
-    // happily writes R=5 — flpdf rejects reading R=5 input without
-    // --allow-weak-crypto, so it refuses to *create* R=5 without the same
-    // opt-in to keep the read and write paths symmetric (see the threat model,
-    // §4 weak-crypto write gate).
+    // (AES-256) output is also gated by flpdf's explicit write policy.
     let guard_weak = |params: EncryptParams| -> CliResult<EncryptParams> {
         if !allow_weak_crypto {
             if params.is_weak_rc4() {
@@ -4197,17 +4180,13 @@ fn build_overlay_specs(
         let path = PathBuf::from(&spec.file);
         let file = File::open(&path).map_err(|error| error_with_file(&path, error.into()))?;
         // Overlay sources are read-only; qpdf accepts weak-crypto opens
-        // unconditionally (the flag only gates weak-crypto WRITES). Match
-        // qpdf and unblock RC4 overlays — same pattern `run_check` uses
-        // for its inspection open (search for `options.allow_weak_crypto`
-        // in `run_check`).
+        // unconditionally because its flag only gates writes.
         let mut options = PdfOpenOptions {
             // qpdf's recovery permission is enabled on the document by
             // default; the absence of `--repair` must not turn it off (see
             // `pdf_open_options`'s identical treatment for the primary
             // document).
             repair: repair || PdfOpenOptions::default().repair,
-            allow_weak_crypto: true,
             password: spec
                 .password
                 .as_ref()
@@ -5731,17 +5710,6 @@ where
         .open(BufReader::new(file), input.display().to_string(), options)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
 
-    // Keep the ordinary inspection weak-crypto advisory in the job-owned
-    // logger, matching the previous `open_pdf` route without making it a
-    // warning-exit condition.
-    if pdf.uses_weak_crypto() {
-        let warning = format!(
-            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
-            input.display()
-        );
-        job.logger().warn(warning)?;
-    }
-
     let logger = job.logger();
     let status = job.inspect(&mut pdf, |pdf| inspection(pdf, &logger))?;
     finish_job_exit_status(status)
@@ -5858,16 +5826,9 @@ enum EncryptionProbe {
 /// error. This mirrors qpdf's ability to answer these queries for
 /// password-protected files without the password.
 ///
-/// The probe forces `allow_weak_crypto = true`: qpdf applies its weak-crypto
-/// refusal to write/transform operations, NOT to these read-only inspections
-/// (verified against qpdf — a correct password on an RC4/R=5 file yields
-/// `--requires-password` exit 3, identical to a strong file). Because the
-/// library applies the weak-crypto gate only AFTER authentication, leaving the
-/// gate enabled would surface `WeakCryptoNotAllowed` for a correctly
-/// authenticated file and mis-report it as "a different password is required".
-/// Disabling the gate here keeps the answer a pure password
-/// question: authentication still runs first, so a wrong password yields
-/// `BadPassword` exactly as before.
+/// qpdf applies its weak-crypto refusal to write/transform operations, not to
+/// these read-only inspections. Authentication still runs first, so a wrong
+/// password yields `BadPassword` exactly as before.
 fn probe_encryption(
     input: &PathBuf,
     repair: bool,
@@ -5875,7 +5836,6 @@ fn probe_encryption(
 ) -> CliResult<EncryptionProbe> {
     let file = File::open(input)?;
     let mut options = pdf_open_options(repair, password)?;
-    options.allow_weak_crypto = true;
     configure_document_logger(&mut options, input);
     match Pdf::open_with_options(BufReader::new(file), options) {
         Ok(mut pdf) => {
@@ -6157,8 +6117,8 @@ fn apply_json_update_with_job<R: Read + Seek + 'static>(
 /// Open the main qpdf job input and apply `--update-from-json` at the same
 /// point qpdf's `QPDFJob::createQPDF` does: immediately after input creation,
 /// before page specifications, rotations, overlays, or serialization.
-/// `check_inspection` applies `run_check`'s forced weak-crypto-open and
-/// warning-aggregation policy (see [`open_pdf_for_check_inspection`]) to the
+/// `check_inspection` applies `run_check`'s warning-aggregation policy (see
+/// [`open_pdf_for_check_inspection`]) to the
 /// non-`--json-input` (`--update-from-json` only) branch. It has no effect
 /// on the `--json-input` branch: [`Pdf::create_from_json`] always seeds from
 /// the fixed, never-encrypted rootless bootstrap document, so this policy
@@ -6198,7 +6158,7 @@ fn open_pdf(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, false, false)
+    open_pdf_impl(input, repair, password, false)
 }
 
 fn open_pdf_from_file(
@@ -6207,33 +6167,29 @@ fn open_pdf_from_file(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_file_impl(input, file, repair, password, false, false)
+    open_pdf_file_impl(input, file, repair, password, false)
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,
 /// `show-encryption-key`).
 ///
-/// Like [`open_pdf`] but forces the weak-crypto gate open, so an RC4 / R=5 file
-/// authenticated with the CORRECT password is inspectable without
-/// `--allow-weak-crypto`. qpdf treats these as read-only inspections rather than
-/// a write policy: it derives and prints the key / encryption block for a weak
-/// file with the correct password and emits no weak-crypto warning (verified
-/// qpdf 11.9.0). This mirrors the `requires-password` / `is-encrypted` alignment
-/// (flpdf-63g); authentication still runs first, so a wrong password fails
-/// exactly as before.
+/// qpdf treats these as read-only inspections rather than a write policy: it
+/// derives and prints the key / encryption block for a weak file with the
+/// correct password and emits no weak-crypto warning (verified qpdf 11.9.0).
+/// Authentication still runs first, so a wrong password fails exactly as
+/// before.
 fn open_pdf_for_inspection(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, true, false)
+    open_pdf_impl(input, repair, password, false)
 }
 
 /// Open for `--update-from-json --check`'s generic job-inspection route.
 ///
-/// Mirrors `run_check`'s own two-part inspection policy exactly (forced
-/// weak-crypto gate, same reasoning as [`open_pdf_for_inspection`]; plus
-/// `suppress_warnings` so open/update-time repair diagnostics are collected
+/// Mirrors `run_check`'s own inspection policy, plus `suppress_warnings` so
+/// open/update-time repair diagnostics are collected
 /// rather than delivered live, since the qpdf-shaped job check re-emits the
 /// same diagnostics from the document after its check banner -- without
 /// this, a `--repair`-triggered warning prints twice). `--show-npages`/
@@ -6245,25 +6201,17 @@ fn open_pdf_for_check_inspection(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, true, true)
+    open_pdf_impl(input, repair, password, true)
 }
 
 fn open_pdf_impl(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
-    force_allow_weak_crypto: bool,
     suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
-    open_pdf_file_impl(
-        input,
-        file,
-        repair,
-        password,
-        force_allow_weak_crypto,
-        suppress_warnings,
-    )
+    open_pdf_file_impl(input, file, repair, password, suppress_warnings)
 }
 
 fn open_pdf_file_impl(
@@ -6271,13 +6219,9 @@ fn open_pdf_file_impl(
     file: File,
     repair: bool,
     password: &PasswordArgs,
-    force_allow_weak_crypto: bool,
     suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let mut options = pdf_open_options(repair, password)?;
-    if force_allow_weak_crypto {
-        options.allow_weak_crypto = true;
-    }
     if suppress_warnings {
         options.suppress_warnings = true;
     }
@@ -6287,22 +6231,10 @@ fn open_pdf_file_impl(
     let pdf = job
         .open(BufReader::new(file), input.display().to_string(), options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-    // Skip the weak-crypto warning on the forced (inspection) path: the user
-    // supplied no `--allow-weak-crypto` flag to acknowledge, and qpdf emits no
-    // such warning for `--show-encryption[-key]`. On the normal path a weak
-    // file only opens when the user did pass the flag, so the warning is apt.
-    if pdf.uses_weak_crypto() && !force_allow_weak_crypto {
-        logger_warn(format!(
-            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
-            input.display()
-        ))?; // cov:ignore: exercised by weak-crypto subprocess integration tests
-    }
-
     Ok(pdf)
 }
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
-    let allow_weak_crypto = password.allow_weak_crypto;
     let password_is_hex_key = password.password_is_hex_key;
     let suppress_password_recovery = password.suppress_password_recovery;
     let password_mode = password.password_mode.into();
@@ -6328,7 +6260,6 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         password,
         password_mode,
         suppress_password_recovery,
-        allow_weak_crypto,
         password_is_hex_key,
         ..PdfOpenOptions::default()
     })
@@ -6754,13 +6685,6 @@ fn run_add_attachment(
 
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
-    if pdf.uses_weak_crypto() {
-        job.logger().warn(format!(
-            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
-            input.display()
-        ))?;
-    }
-
     job.add_attachments(&mut pdf, &attachment_options)?;
 
     let options = WriterOptions {
@@ -6893,13 +6817,6 @@ fn run_copy_attachments_from(
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
 
     let mut standard_output = prepare_pdf_standard_output(&output)?;
-
-    if pdf.uses_weak_crypto() {
-        job.logger().warn(format!(
-            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
-            input.display()
-        ))?;
-    }
 
     // Open the source with its own password (independent of the target's).
     // qpdf's recovery permission is enabled on the document by default; the
