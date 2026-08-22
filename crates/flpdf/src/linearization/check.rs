@@ -3479,6 +3479,23 @@ mod tests {
     }
 
     #[test]
+    fn first_xref_item_offset_survives_initial_xref_reconstruction() {
+        // Keep xref object 0's row intact, but make object 1's fixed-width row
+        // invalid. qpdf records the first row's offset before parsing object 1
+        // and retains it when read_xref falls back to reconstruct_xref
+        // (QPDF.cc:846-869, 626-708), so the later /T check has no false
+        // mismatch warning.
+        let mut bytes = linearized_fixture_bytes();
+        bytes[1544..1554].copy_from_slice(b"XXXXXXXXXX");
+
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            result.is_ok(),
+            "xref recovery lost qpdf's first row offset: {result:?}"
+        );
+    }
+
+    #[test]
     fn check_rejects_a_classic_t_value_that_is_not_the_pre_entry_whitespace() {
         let mut bytes = linearized_fixture_bytes();
         let xref_offset = bytes
