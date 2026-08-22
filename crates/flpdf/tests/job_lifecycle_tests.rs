@@ -283,12 +283,80 @@ fn json_create_update_and_write_share_one_job_lifecycle() {
                 objects: &[],
             },
             JsonJobOutput::Stdout(&mut output),
-            false,
         )
         .expect("JSON output");
 
     assert_eq!(status, JobExitCode::Success);
     assert!(String::from_utf8_lossy(&output).contains("\"jsonversion\": 2"));
+}
+
+#[test]
+fn json_write_derives_file_completion_suffix_from_output_destination() {
+    let (logger, state) = logger_with_warning_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.record_warnings();
+    let mut pdf = job
+        .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+        .expect("complete JSON input");
+    let mut output = Vec::new();
+    let filename = Path::new("output.json");
+
+    let status = job
+        .write_json(
+            &mut pdf,
+            JsonJobOptions {
+                decode_level: DecodeLevel::None,
+                stream_data: JsonStreamData::None,
+                stream_prefix: None,
+                keys: &[],
+                objects: &[],
+            },
+            JsonJobOutput::File {
+                filename,
+                writer: &mut output,
+            },
+        )
+        .expect("JSON output");
+
+    assert_eq!(status, JobExitCode::Warning);
+    assert_eq!(
+        state.lock().unwrap().bytes,
+        b"qpdf: operation succeeded with warnings; resulting file may have some problems\n"
+    );
+}
+
+#[test]
+fn json_write_reports_completion_sink_errors() {
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingSink)));
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.record_warnings();
+    let mut pdf = job
+        .create_from_json(Cursor::new(COMPLETE_JSON), "input.json")
+        .expect("complete JSON input");
+    let mut output = Vec::new();
+
+    let error = job
+        .write_json(
+            &mut pdf,
+            JsonJobOptions {
+                decode_level: DecodeLevel::None,
+                stream_data: JsonStreamData::None,
+                stream_prefix: None,
+                keys: &[],
+                objects: &[],
+            },
+            JsonJobOutput::Stdout(&mut output),
+        )
+        .expect_err("completion warning sink failure must be reported");
+
+    assert!(matches!(
+        error,
+        flpdf::job::JsonJobError::Completion(Error::System(message))
+            if message == "warning sink failed"
+    ));
 }
 
 #[test]
@@ -330,7 +398,6 @@ fn json_write_failure_does_not_emit_completion_summary() {
                 objects: &[],
             },
             JsonJobOutput::Stdout(&mut output),
-            false,
         )
         .expect_err("serializer failure must abort before completion");
 
@@ -377,7 +444,6 @@ fn json_job_output_matches_qpdf_11_9_json_input_route() {
             objects: &[],
         },
         JsonJobOutput::Stdout(&mut actual),
-        false,
     )
     .expect("JSON output");
 

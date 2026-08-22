@@ -2276,7 +2276,6 @@ fn run_json_document<R: Read + Seek>(
                 filename: path,
                 writer: &mut file,
             },
-            true,
         )
     } else {
         let options = JsonJobOptions {
@@ -2295,7 +2294,6 @@ fn run_json_document<R: Read + Seek>(
                     .as_mut()
                     .expect("stdout writer prepared for JSON stdout"),
             ),
-            false,
         )
     };
     match json_result {
