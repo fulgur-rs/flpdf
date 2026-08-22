@@ -126,7 +126,7 @@ fn ordinary_show_npages_completes_repair_warnings_with_status_three() {
 }
 
 #[test]
-fn ordinary_show_npages_preserves_weak_crypto_advisory() {
+fn ordinary_show_npages_matches_qpdf_without_weak_crypto_advisory() {
     if skip_if_qpdf_missing() {
         return;
     }
@@ -158,8 +158,5 @@ fn ordinary_show_npages_preserves_weak_crypto_advisory() {
         normalize_newlines(&flpdf.stdout),
         normalize_newlines(&qpdf.stdout)
     );
-    assert!(
-        String::from_utf8_lossy(&flpdf.stderr).contains("encrypted PDF uses weak crypto"),
-        "ordinary inspection must retain the existing weak-crypto advisory"
-    );
+    assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("encrypted PDF uses weak crypto"));
 }

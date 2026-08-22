@@ -58,7 +58,6 @@ fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
         file,
         PdfOpenOptions {
             repair: true,
-            allow_weak_crypto: true,
             suppress_warnings: true,
             description: path.display().to_string(),
             ..PdfOpenOptions::default()

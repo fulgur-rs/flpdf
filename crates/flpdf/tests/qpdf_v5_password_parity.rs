@@ -122,12 +122,11 @@ fn assert_qpdf_rejects(path: &Path, password: &[u8]) {
     );
 }
 
-fn assert_flpdf_accepts(bytes: &[u8], password: &[u8], r5: bool) {
+fn assert_flpdf_accepts(bytes: &[u8], password: &[u8]) {
     Pdf::open_with_options(
         Cursor::new(bytes.to_vec()),
         PdfOpenOptions {
             password: password.to_vec(),
-            allow_weak_crypto: r5,
             ..PdfOpenOptions::default()
         },
     )
@@ -166,7 +165,7 @@ fn v5_password_truncation_matches_qpdf_reader_writer_split() {
             &flpdf_encrypted(&input, &prefix, r5),
         );
         assert_qpdf_accepts(&flpdf_127_path, &longer);
-        assert_flpdf_accepts(&fs::read(&flpdf_127_path).unwrap(), &longer, r5);
+        assert_flpdf_accepts(&fs::read(&flpdf_127_path).unwrap(), &longer);
 
         let flpdf_128_path = write_bytes(
             directory.path(),
@@ -186,7 +185,7 @@ fn v5_password_truncation_matches_qpdf_reader_writer_split() {
             "qpdf-r6-127.pdf"
         });
         write_qpdf_encrypted(&input_path, &qpdf_127_path, &prefix, r5);
-        assert_flpdf_accepts(&fs::read(&qpdf_127_path).unwrap(), &longer, r5);
+        assert_flpdf_accepts(&fs::read(&qpdf_127_path).unwrap(), &longer);
     }
 }
 

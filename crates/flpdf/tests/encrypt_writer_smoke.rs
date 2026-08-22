@@ -752,7 +752,6 @@ fn rc4_128_printable_ciphertext_uses_literal_string_syntax() {
         Cursor::new(bytes),
         PdfOpenOptions {
             password: Vec::new(),
-            allow_weak_crypto: true,
             ..PdfOpenOptions::default()
         },
     )

@@ -101,19 +101,6 @@ mod tests {
     }
 
     #[test]
-    fn push_encrypted_weak_crypto_round_trip() {
-        let mut diags = Diagnostics::default();
-        let e = EncryptedError::WeakCryptoNotAllowed;
-        diags.push_encrypted(&e);
-
-        let entries = diags.entries();
-        assert_eq!(entries[0].severity, Severity::Error);
-        assert!(entries[0]
-            .message
-            .starts_with("[encrypted.weak-crypto-not-allowed]"));
-    }
-
-    #[test]
     fn push_encrypted_malformed_round_trip() {
         let mut diags = Diagnostics::default();
         let e = EncryptedError::Malformed {

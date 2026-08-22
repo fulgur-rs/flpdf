@@ -29,10 +29,8 @@ const V5_R6_HEX_KEY: &str = "fc459408a5282b7c59daa5162f860e82315679cc04942ef5799
 const R4_EMPTY_PW: &str = "../../tests/fixtures/compat/encrypted-r4-three-page.pdf";
 const R4_HEX_KEY: &str = "43ca065209d492256d845f57f8b95da2";
 
-/// RC4 fixture (weak crypto). Exercises the hex-key path against the
-/// weak-crypto gate: the gate is honored on processing/write paths (`rewrite`),
-/// but NOT on the read-only `--check` inspection, which opens weak files like
-/// qpdf (a raw key does not change either behavior).
+/// RC4 fixture (weak crypto). The read-side hex-key path accepts it without a
+/// writer-only weak-crypto opt-in, just like qpdf.
 const V2_RC4: &str = "../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf";
 
 fn flpdf() -> Command {
@@ -250,14 +248,10 @@ fn hex_key_uppercase_and_whitespace_tolerant() {
 }
 
 #[test]
-fn hex_key_rewrite_weak_crypto_gate_still_honored() {
-    // A raw key does NOT bypass the weak-crypto gate on processing/write paths.
-    // An RC4 file opened with a hex key and no --allow-weak-crypto must still be
-    // rejected with WeakCryptoNotAllowed. `rewrite` routes through the gated
-    // `open_pdf`; `check` no longer does (it now treats weak files as a
-    // read-only inspection — see `hex_key_check_weak_rc4_inspectable_exit_0`).
-    // The exact key value is irrelevant: the gate fires after the key is
-    // accepted, before decryption, so any well-formed hex triggers it.
+fn hex_key_rewrite_weak_crypto_is_not_gated_by_reader() {
+    // The read side accepts weak encryption without the writer-only opt-in.
+    // This fixture has no page content, so a well-formed raw key is sufficient
+    // to exercise the open/rewrite boundary without requiring object decrypt.
     let out = tempfile::NamedTempFile::new().unwrap();
     let assert = flpdf()
         .args([
@@ -268,11 +262,11 @@ fn hex_key_rewrite_weak_crypto_gate_still_honored() {
             out.path().to_str().unwrap(),
         ])
         .assert()
-        .failure();
+        .success();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(
-        stderr.contains("weak crypto"),
-        "RC4 file with a hex key on a write path must still hit the weak-crypto gate, got: {stderr}"
+        !stderr.contains("weak crypto"),
+        "RC4 file with a hex key must not hit the read-side weak-crypto gate, got: {stderr}"
     );
 }
 

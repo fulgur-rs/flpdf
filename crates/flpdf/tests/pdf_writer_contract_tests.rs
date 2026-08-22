@@ -1770,37 +1770,21 @@ fn pdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::R
 fn pdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let cases = [
-        ("v1-rc4-40-r2.pdf", b"user-v1".as_slice(), true, "none"),
-        ("v2-rc4-128-r3.pdf", b"user-v2".as_slice(), true, "none"),
-        (
-            "v4-rc4-128-r4.pdf",
-            b"user-v4-rc4".as_slice(),
-            true,
-            "AESv2",
-        ),
-        (
-            "v4-aes-128-r4.pdf",
-            b"user-v4-aes".as_slice(),
-            false,
-            "AESv2",
-        ),
-        ("v5-aes-256-r5.pdf", b"user-v5-r5".as_slice(), true, "AESv3"),
-        (
-            "v5-aes-256-r6.pdf",
-            b"user-v5-r6".as_slice(),
-            false,
-            "AESv3",
-        ),
+        ("v1-rc4-40-r2.pdf", b"user-v1".as_slice(), "none"),
+        ("v2-rc4-128-r3.pdf", b"user-v2".as_slice(), "none"),
+        ("v4-rc4-128-r4.pdf", b"user-v4-rc4".as_slice(), "AESv2"),
+        ("v4-aes-128-r4.pdf", b"user-v4-aes".as_slice(), "AESv2"),
+        ("v5-aes-256-r5.pdf", b"user-v5-r5".as_slice(), "AESv3"),
+        ("v5-aes-256-r6.pdf", b"user-v5-r6".as_slice(), "AESv3"),
     ];
 
-    for (fixture, password, allow_weak_crypto, expected_method) in cases {
+    for (fixture, password, expected_method) in cases {
         let mut source = Pdf::open_with_options(
             BufReader::new(File::open(format!(
                 "../../tests/fixtures/encrypted/{fixture}"
             ))?),
             PdfOpenOptions {
                 password: password.to_vec(),
-                allow_weak_crypto,
                 ..PdfOpenOptions::default()
             },
         )?;
@@ -1817,7 +1801,6 @@ fn pdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()>
             Cursor::new(output.clone()),
             PdfOpenOptions {
                 password: password.to_vec(),
-                allow_weak_crypto,
                 ..PdfOpenOptions::default()
             },
         )?;
