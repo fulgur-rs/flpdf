@@ -100,7 +100,7 @@ impl LabelRange {
     }
 
     /// Decode a live qpdf-shaped label dictionary without materializing it as
-    /// a legacy [`Object`]. Unknown `/S` names remain unknown to the raw
+    /// a legacy [`crate::Object`]. Unknown `/S` names remain unknown to the raw
     /// handle, while this typed compatibility view retains the historical
     /// `LabelStyle::None` mapping.
     fn from_handle<R: Read + Seek>(
