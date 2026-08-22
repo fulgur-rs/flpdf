@@ -242,7 +242,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let mut changed = remove_security_restrictions(pdf)?;
 
-    let form_fields = crate::AcroFormDocumentHelper::new(pdf).form_field_handles()?;
+    let form_fields = crate::AcroFormDocumentHelper::new(pdf)?.form_field_handles()?;
 
     let mut to_remove = BTreeSet::new();
     for (field_ref, field) in form_fields {
@@ -288,7 +288,7 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
         }
     }
 
-    if crate::AcroFormDocumentHelper::new(pdf).remove_form_fields(&to_remove)? {
+    if crate::AcroFormDocumentHelper::new(pdf)?.remove_form_fields(&to_remove)? {
         changed = true;
     }
 

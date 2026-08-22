@@ -229,7 +229,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     // uses one qpdf-shaped analysis cache. The handles are collected before
     // the field and annotation accessors borrow the Pdf again below.
     let (has_acroform, need_appearances, widgets) = {
-        let mut acroform = crate::AcroFormDocumentHelper::new(pdf);
+        let mut acroform = crate::AcroFormDocumentHelper::new(pdf)?;
         let has_acroform = acroform.has_acro_form()?;
         let need_appearances = acroform.get_need_appearances()?;
         let mut widgets = Vec::new();

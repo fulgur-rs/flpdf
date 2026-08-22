@@ -512,7 +512,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn set_need_appearances(&mut self) -> Result<()> {
-        crate::AcroFormDocumentHelper::new(self.pdf).set_need_appearances(true)
+        crate::AcroFormDocumentHelper::new(self.pdf)?.set_need_appearances(true)
     }
 
     fn set_checkbox_value(&mut self, checked: bool) -> Result<()> {

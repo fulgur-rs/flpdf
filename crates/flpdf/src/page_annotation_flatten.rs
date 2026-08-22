@@ -825,7 +825,7 @@ fn resolve_matched_category_handles<R: Read + Seek>(
 fn acroform_annotation_identities<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> Result<HashSet<ObjectHandleIdentity>> {
-    let mut helper = AcroFormDocumentHelper::new(pdf);
+    let mut helper = AcroFormDocumentHelper::new(pdf)?;
     let identities: HashSet<_> = helper
         .canonical_annotation_to_field_handles()?
         .into_iter()

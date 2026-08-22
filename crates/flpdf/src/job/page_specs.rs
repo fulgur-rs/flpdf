@@ -68,7 +68,7 @@ fn collect_primary_fields(
 ) -> Result<Vec<ObjectHandle>> {
     let mut field_refs = BTreeSet::new();
     {
-        let mut acroform = AcroFormDocumentHelper::new(merged);
+        let mut acroform = AcroFormDocumentHelper::new(merged)?;
         for &page_ref in pages {
             let widgets = acroform.get_widget_annotations_for_page(page_ref)?;
             for widget in widgets {
@@ -80,7 +80,7 @@ fn collect_primary_fields(
         }
     }
     let primary_order = {
-        let mut acroform = AcroFormDocumentHelper::new(merged);
+        let mut acroform = AcroFormDocumentHelper::new(merged)?;
         acroform.top_level_fields()?
     };
     Ok(primary_order
@@ -205,7 +205,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
     // the foreign resource/field route.
     let source_has_acroform: Vec<bool> = sources
         .iter_mut()
-        .map(|source| source.acroform().has_acro_form())
+        .map(|source| source.acroform()?.has_acro_form())
         .collect::<Result<_>>()?;
 
     // qpdf's foreign ObjCopier has already mapped each source page to the first
@@ -247,7 +247,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
     // the primary is also referenced as a later page-spec source -- so this
     // reads the pre-merge value.
     let had_fields_array = match sources.first_mut() {
-        Some(primary) => primary.acroform().has_fields_array()?,
+        Some(primary) => primary.acroform()?.has_fields_array()?,
         None => false,
     };
     let primary_fields = collect_primary_fields(merged, &primary_first_pages)?;

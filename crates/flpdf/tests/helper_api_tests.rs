@@ -308,7 +308,7 @@ fn acroform_helper_field_infos_match_manual_and_resolve_indirect_value() {
         vec![flpdf::ObjectRef::new(4, 0), flpdf::ObjectRef::new(5, 0)]
     );
 
-    let infos = pdf.acroform().field_infos().unwrap();
+    let infos = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(infos.len(), 2);
 
     // Helper-reported refs cross-check the manual extraction.
@@ -634,6 +634,7 @@ fn acroform_set_field_value_matches_manual_v_insert() {
         acroform_smoke_pdf,
         |pdf| {
             pdf.acroform()
+                .unwrap()
                 .set_field_value(f1_ref, ObjectHandle::string(b"Bob".to_vec()))
                 .unwrap();
         },
@@ -662,7 +663,10 @@ fn acroform_set_default_appearance_matches_manual_promote_and_insert() {
     roundtrip_eq(
         acroform_smoke_pdf,
         |pdf| {
-            pdf.acroform().set_default_appearance(da.to_vec()).unwrap();
+            pdf.acroform()
+                .unwrap()
+                .set_default_appearance(da.to_vec())
+                .unwrap();
         },
         |pdf| {
             // Reproduce the inline -> indirect promotion the helper performs.
@@ -770,7 +774,7 @@ fn acroform_inherited_da_is_read_without_materializing_fields() {
     use flpdf::{Object, ObjectRef};
     let mut pdf = flpdf::Pdf::open_mem_owned(acroform_inheritance_pdf()).unwrap();
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(fields[1].object_ref, ObjectRef::new(5, 0));
     assert_eq!(
         fields[1].default_appearance,

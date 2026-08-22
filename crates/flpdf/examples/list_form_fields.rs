@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `field_infos` reconstructs each field's dotted full name and resolves
     // inherited `/FT` / `/V` (following indirect references when present).
-    let infos = pdf.acroform().field_infos()?;
+    let infos = pdf.acroform()?.field_infos()?;
     for info in &infos {
         let ft = info
             .field_type

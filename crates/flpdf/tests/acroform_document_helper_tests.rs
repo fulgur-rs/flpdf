@@ -243,7 +243,7 @@ fn fields_walks_acroform_field_tree() {
     let bytes = form_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let fields = pdf.acroform().fields().unwrap();
+    let fields = pdf.acroform().unwrap().fields().unwrap();
 
     assert_eq!(fields, vec![ObjectRef::new(5, 0), ObjectRef::new(6, 0)]);
 }
@@ -275,7 +275,7 @@ fn fields_follows_holder_chain_carrier() {
         ObjectRef::new(6, 0),
         Object::Reference(ObjectRef::new(7, 0)),
     );
-    let fields = pdf.acroform().fields().unwrap();
+    let fields = pdf.acroform().unwrap().fields().unwrap();
     assert_eq!(fields, vec![ObjectRef::new(4, 0)]);
 }
 
@@ -284,7 +284,7 @@ fn field_infos_materialize_inherited_values_and_full_names() {
     let bytes = inherited_field_info_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
 
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].object_ref, ObjectRef::new(5, 0));
@@ -329,7 +329,7 @@ fn field_infos_skip_pure_widget_kids_but_keep_merged_widget_fields() {
     let bytes = field_info_widget_kids_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
 
     assert_eq!(
         fields
@@ -354,7 +354,7 @@ fn field_infos_decode_utf16be_field_name_paths() {
     let bytes = unicode_field_names_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
 
     assert_eq!(fields[0].partial_name, Some(vec![0xFE, 0xFF, 0x89, 0xAA]));
     assert_eq!(fields[0].full_name, "親");
@@ -367,7 +367,7 @@ fn field_infos_materialize_indirect_inherited_values() {
     let bytes = indirect_field_info_values_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
 
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].partial_name, Some(b"parent".to_vec()));
@@ -410,11 +410,11 @@ fn field_infos_materialize_indirect_inherited_values() {
 fn missing_or_malformed_acroform_shapes_are_noops() {
     let empty_bytes = empty_pdf();
     let mut empty = Pdf::open_mem_owned(empty_bytes).unwrap();
-    assert!(empty.acroform().fields().unwrap().is_empty());
+    assert!(empty.acroform().unwrap().fields().unwrap().is_empty());
 
     let malformed_bytes = malformed_acroform_pdf();
     let mut malformed = Pdf::open_mem_owned(malformed_bytes).unwrap();
-    assert!(malformed.acroform().fields().unwrap().is_empty());
+    assert!(malformed.acroform().unwrap().fields().unwrap().is_empty());
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn malformed_fields_are_ignored_for_listing() {
     let bytes = malformed_fields_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    assert!(pdf.acroform().fields().unwrap().is_empty());
+    assert!(pdf.acroform().unwrap().fields().unwrap().is_empty());
 }
 
 #[test]
@@ -430,7 +430,10 @@ fn missing_default_appearance_is_noop_but_fields_still_walk() {
     let bytes = no_default_appearance_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    assert_eq!(pdf.acroform().fields().unwrap(), vec![ObjectRef::new(5, 0)]);
+    assert_eq!(
+        pdf.acroform().unwrap().fields().unwrap(),
+        vec![ObjectRef::new(5, 0)]
+    );
 
     let field = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
     let Object::Dictionary(field_dict) = field else {
@@ -445,7 +448,7 @@ fn indirect_malformed_fields_are_ignored() {
         let bytes = indirect_malformed_fields_pdf(fields);
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-        assert!(pdf.acroform().fields().unwrap().is_empty());
+        assert!(pdf.acroform().unwrap().fields().unwrap().is_empty());
     }
 }
 
@@ -455,7 +458,7 @@ fn field_value_get_set_uses_live_document() {
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     {
-        let mut acroform = AcroFormDocumentHelper::new(&mut pdf);
+        let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         assert_eq!(
             acroform
                 .field_value(ObjectRef::new(6, 0))
@@ -471,7 +474,7 @@ fn field_value_get_set_uses_live_document() {
             .unwrap();
     }
 
-    let mut acroform = pdf.acroform();
+    let mut acroform = pdf.acroform().unwrap();
     assert_eq!(
         acroform
             .field_value(ObjectRef::new(6, 0))
@@ -487,7 +490,10 @@ fn default_appearance_materializes_direct_catalog_acroform() {
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
     let da = b"/Helv 12 Tf 0 g".to_vec();
 
-    pdf.acroform().set_default_appearance(da.clone()).unwrap();
+    pdf.acroform()
+        .unwrap()
+        .set_default_appearance(da.clone())
+        .unwrap();
 
     let catalog = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
     let Object::Dictionary(catalog_dict) = catalog else {
@@ -513,7 +519,10 @@ fn default_appearance_is_read_as_inherited_without_materializing_fields() {
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
     let da = b"/F1 9 Tf 0 0 1 rg".to_vec();
 
-    pdf.acroform().set_default_appearance(da.clone()).unwrap();
+    pdf.acroform()
+        .unwrap()
+        .set_default_appearance(da.clone())
+        .unwrap();
 
     let acroform = pdf.resolve(ObjectRef::new(4, 0)).unwrap();
     let Object::Dictionary(acroform_dict) = acroform else {
@@ -521,7 +530,7 @@ fn default_appearance_is_read_as_inherited_without_materializing_fields() {
     };
     assert_eq!(acroform_dict.get("DA"), Some(&Object::String(da.clone())));
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(fields[1].object_ref, ObjectRef::new(6, 0));
     assert_eq!(fields[1].default_appearance, Some(Object::String(da)));
 
@@ -540,7 +549,7 @@ fn parent_field_appearance_is_read_as_inherited_without_materialization() {
     let bytes = parent_da_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let fields = pdf.acroform().field_infos().unwrap();
+    let fields = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(fields[1].object_ref, ObjectRef::new(6, 0));
     assert_eq!(
         fields[1].default_appearance,
@@ -583,7 +592,7 @@ fn fields_errors_when_field_tree_depth_limit_is_exceeded() {
     let bytes = build_pdf(&borrowed, 1);
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    let err = pdf.acroform().fields().unwrap_err();
+    let err = pdf.acroform().unwrap().fields().unwrap_err();
 
     assert!(
         matches!(err, flpdf::Error::Unsupported(_)),
@@ -614,9 +623,13 @@ fn need_appearances_reads_boolean_values_and_ignores_other_types() {
 
     let mut true_pdf = Pdf::open_mem_owned(true_pdf).unwrap();
     let mut false_pdf = Pdf::open_mem_owned(false_pdf).unwrap();
-    assert!(true_pdf.acroform().has_acro_form().unwrap());
-    assert!(true_pdf.acroform().get_need_appearances().unwrap());
-    assert!(!false_pdf.acroform().get_need_appearances().unwrap());
+    assert!(true_pdf.acroform().unwrap().has_acro_form().unwrap());
+    assert!(true_pdf.acroform().unwrap().get_need_appearances().unwrap());
+    assert!(!false_pdf
+        .acroform()
+        .unwrap()
+        .get_need_appearances()
+        .unwrap());
 }
 
 #[test]
@@ -624,8 +637,8 @@ fn has_acro_form_reports_present_non_dictionary_entries() {
     let mut malformed = Pdf::open_mem_owned(malformed_acroform_pdf()).unwrap();
     let mut absent = Pdf::open_mem_owned(empty_pdf()).unwrap();
 
-    assert!(malformed.acroform().has_acro_form().unwrap());
-    assert!(!absent.acroform().has_acro_form().unwrap());
+    assert!(malformed.acroform().unwrap().has_acro_form().unwrap());
+    assert!(!absent.acroform().unwrap().has_acro_form().unwrap());
 }
 
 #[test]
@@ -641,16 +654,16 @@ fn set_need_appearances_replaces_true_and_removes_false() {
     );
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    pdf.acroform().set_need_appearances(true).unwrap();
-    assert!(pdf.acroform().get_need_appearances().unwrap());
+    pdf.acroform().unwrap().set_need_appearances(true).unwrap();
+    assert!(pdf.acroform().unwrap().get_need_appearances().unwrap());
 
-    pdf.acroform().set_need_appearances(false).unwrap();
-    assert!(!pdf.acroform().get_need_appearances().unwrap());
+    pdf.acroform().unwrap().set_need_appearances(false).unwrap();
+    assert!(!pdf.acroform().unwrap().get_need_appearances().unwrap());
     let acroform = pdf.resolve(ObjectRef::new(4, 0)).unwrap();
     assert_eq!(acroform.as_dict().unwrap().get("NeedAppearances"), None);
 
     // qpdf's removeKey is also a no-op when the key is already absent.
-    pdf.acroform().set_need_appearances(false).unwrap();
+    pdf.acroform().unwrap().set_need_appearances(false).unwrap();
 }
 
 #[test]
@@ -678,9 +691,12 @@ fn generate_appearances_if_needed_updates_widgets_and_clears_marker() {
     );
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    pdf.acroform().generate_appearances_if_needed().unwrap();
+    pdf.acroform()
+        .unwrap()
+        .generate_appearances_if_needed()
+        .unwrap();
 
-    assert!(!pdf.acroform().get_need_appearances().unwrap());
+    assert!(!pdf.acroform().unwrap().get_need_appearances().unwrap());
     let widget = pdf.resolve(ObjectRef::new(6, 0)).unwrap();
     let normal = widget
         .as_dict()
@@ -712,9 +728,12 @@ fn generate_appearances_if_needed_synchronizes_checkbox_value() {
     );
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    pdf.acroform().generate_appearances_if_needed().unwrap();
+    pdf.acroform()
+        .unwrap()
+        .generate_appearances_if_needed()
+        .unwrap();
 
-    assert!(!pdf.acroform().get_need_appearances().unwrap());
+    assert!(!pdf.acroform().unwrap().get_need_appearances().unwrap());
     let widget = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
     let widget = widget.as_dict().unwrap();
     assert!(matches!(widget.get("V"), Some(Object::Name(name)) if name == b"Yes"));
@@ -741,7 +760,10 @@ fn generate_appearances_if_needed_handles_a_direct_orphan_widget() {
     );
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
-    pdf.acroform().generate_appearances_if_needed().unwrap();
+    pdf.acroform()
+        .unwrap()
+        .generate_appearances_if_needed()
+        .unwrap();
 
     let widget = {
         let mut page = flpdf::PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
