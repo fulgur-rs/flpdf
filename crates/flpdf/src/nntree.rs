@@ -24,6 +24,7 @@
 use crate::object_handle::{canonical_dictionary_key, ObjectHandleIdentity};
 use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
@@ -821,11 +822,66 @@ pub struct NumberTree {
 pub(crate) struct HandleNumberTree {
     root: ObjectHandle,
     max_depth: usize,
+    inner: RefCell<Option<NNTree<NumberKey>>>,
 }
 
 impl HandleNumberTree {
     pub(crate) fn new(root: ObjectHandle, max_depth: usize) -> Self {
-        Self { root, max_depth }
+        Self {
+            root,
+            max_depth,
+            inner: RefCell::new(None),
+        }
+    }
+
+    /// Create an empty indirect number tree with a live canonical root.
+    pub(crate) fn new_empty<R: Read + Seek>(pdf: &mut Pdf<R>, max_depth: usize) -> Result<Self> {
+        let root = ObjectHandle::dictionary(vec![(
+            canonical_dictionary_key(NumberKey::ITEMS_KEY.as_bytes()),
+            ObjectHandle::array(Vec::new()),
+        )]);
+        let root = pdf.make_indirect_from_object_handle(root)?;
+        Ok(Self::new(root, max_depth))
+    }
+
+    fn with_inner<R: Read + Seek, T>(
+        &self,
+        pdf: &mut Pdf<R>,
+        f: impl FnOnce(&mut NNTree<NumberKey>, &mut Pdf<R>) -> Result<T>,
+    ) -> Result<T> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.is_none() {
+            let mut tree = NNTree::from_handle(self.root.clone(), pdf.unique_id(), true);
+            tree.max_depth = Some(self.max_depth);
+            *inner = Some(tree);
+        }
+        f(inner.as_mut().expect("number-tree engine initialized"), pdf)
+    }
+
+    /// Return the live canonical root after any repairs or mutations.
+    pub(crate) fn root_handle<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<ObjectHandle> {
+        self.with_inner(pdf, |inner, pdf| inner.ensure_canonical_root(pdf))
+    }
+
+    /// Insert or replace a live `/Nums` value without materializing it.
+    pub(crate) fn insert<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+        value: ObjectHandle,
+    ) -> Result<()> {
+        self.with_inner(pdf, |inner, pdf| {
+            inner.insert_handle(pdf, key, value).map(|_| ())
+        })
+    }
+
+    /// Remove a live `/Nums` value while retaining its object identity.
+    pub(crate) fn remove<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+    ) -> Result<Option<ObjectHandle>> {
+        self.with_inner(pdf, |inner, pdf| inner.remove_handle(pdf, &key))
     }
 
     /// Return sorted explicit `/Nums` entries, preserving each value handle.
@@ -3499,9 +3555,10 @@ mod tests {
     #[test]
     fn handle_number_tree_mutation_preserves_live_handle_identity() {
         let mut pdf = empty_pdf();
-        let mut tree =
+        let tree =
             HandleNumberTree::new_empty(&mut pdf, crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH)
                 .expect("empty canonical number tree");
+        assert!(tree.root_handle(&mut pdf).unwrap().is_indirect());
         let value = pdf
             .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
                 b"S".to_vec(),
@@ -3528,7 +3585,10 @@ mod tests {
             .expect("find replacement")
             .expect("replacement exists")
             .0;
-        assert_eq!(replaced.try_get_key(b"/S").unwrap().as_name(), Some(b"R"));
+        assert_eq!(
+            replaced.try_get_key(b"/S").unwrap().as_name(),
+            Some(b"R".to_vec())
+        );
 
         let removed = tree
             .remove(&mut pdf, 0)
