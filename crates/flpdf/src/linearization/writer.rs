@@ -2304,6 +2304,9 @@ fn do_write_pass<R: Read + Seek>(
     // XObject before the OD ObjStm at a lower object number (e.g. obj 7 before obj
     // 8 ObjStm); --object-streams=disable places the whole AcroForm subtree here.
     for original_ref in &plan.part4_open_document_plain {
+        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
+            continue;
+        }
         // cov:ignore-start: unreachable invariant — renumber.rs step-6b inserts
         // every part4_open_document_plain ref, so new_for_original is always Some.
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
@@ -5798,12 +5801,14 @@ mod tests {
         let mut pdf =
             Pdf::open(Cursor::new(catalog_backref_pdf_bytes())).expect("backref PDF must parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        // Precondition: the `/X` back-reference puts the catalog (obj 1) into the
-        // single page's PRIVATE first-page set (part2) — the case the part2 loop
-        // skip guards against double-emitting.
         assert!(
-            plan.part2_objects.contains(&ObjectRef::new(1, 0)),
-            "test precondition: the catalog must land in part2 (page-0 private)"
+            !plan.part2_objects.contains(&ObjectRef::new(1, 0)),
+            "qpdf's is_root precedence must keep the catalog out of part2"
+        );
+        assert!(
+            plan.part4_open_document_plain
+                .contains(&ObjectRef::new(1, 0)),
+            "the qpdf root must remain in the first half before /O"
         );
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 =
@@ -6026,15 +6031,18 @@ mod tests {
     }
 
     #[test]
-    fn shared_catalog_in_part3_emitted_once() {
+    fn shared_catalog_remains_qpdf_part4_and_is_emitted_once() {
         let mut pdf = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
             .expect("two-page backref PDF must parse");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        // Precondition: a catalog reachable from BOTH pages is shared, so it
-        // lands in part3 (first-page shared) — exercising the part3 loop skip.
         assert!(
-            plan.part3_objects.contains(&ObjectRef::new(1, 0)),
-            "test precondition: the shared catalog must land in part3"
+            !plan.part3_objects.contains(&ObjectRef::new(1, 0)),
+            "qpdf's is_root precedence must keep the catalog out of part3"
+        );
+        assert!(
+            plan.part4_open_document_plain
+                .contains(&ObjectRef::new(1, 0)),
+            "the qpdf root must remain in the first half before /O"
         );
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
@@ -6053,6 +6061,40 @@ mod tests {
             "shared catalog must be emitted exactly once, found {count}"
         );
         Pdf::open(Cursor::new(doc.bytes)).expect("output must be parseable");
+    }
+
+    #[test]
+    fn two_page_shared_resource_output_has_no_qpdf_object_count_warning() {
+        let mut pdf = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
+            .expect("two-page shared-resource PDF must parse");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut pdf2 = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
+            .expect("two-page shared-resource PDF must parse");
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
+            .expect("write_linearized");
+        doc.back_patch().expect("back_patch");
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("shared-resource.pdf");
+        std::fs::write(&path, doc.bytes).expect("write linearized output");
+        let output = std::process::Command::new("qpdf")
+            .args(["--check-linearization", path.to_str().expect("UTF-8 path")])
+            .output()
+            .expect("qpdf 11.9.0 must be available for this oracle test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "qpdf --check-linearization failed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("object count mismatch for page 0"),
+            "qpdf reported a shared-resource hint mismatch:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("in hint table but not computed list"),
+            "qpdf reported a phantom shared-resource hint entry:\n{stderr}"
+        );
     }
 
     // -------------------------------------------------------------------

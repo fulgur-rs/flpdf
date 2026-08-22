@@ -1012,12 +1012,15 @@ fn acroform_widget_peeled_to_open_document_in_disable_mode() {
     }
 
     // qpdf part4 = [lc_root] ++ lc_open_document (ascending source number).
-    // open_document_set here = {AcroForm dict (src 5), widgets (src 6..10)}; the
-    // Catalog (src 1) is placed separately via the renumber root_ref promote, so
-    // part4_open_document_plain is exactly [5, 6, 7, 8, 9, 10] in source order.
+    // The plan keeps the root in the same first-half routing vector so the
+    // renumber map can assign its promoted slot; the writer emits that Catalog
+    // once at the physical start of the first half and skips it in this loop.
+    // Thus the vector is [Catalog (src 1), AcroForm dict (src 5), widgets
+    // (src 6..10)] in qpdf source order.
     assert_eq!(
         plan.part4_open_document_plain,
-        (5u32..=10)
+        std::iter::once(1u32)
+            .chain(5u32..=10)
             .map(|n| ObjectRef {
                 number: n,
                 generation: 0,

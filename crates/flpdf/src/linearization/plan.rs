@@ -1058,6 +1058,9 @@ impl LinearizationPlan {
         let first_page_users = optimization
             .objects_for(&crate::optimization::ObjectUser::Page(0))
             .clone();
+        let root_objects = optimization
+            .objects_for(&crate::optimization::ObjectUser::Root)
+            .clone();
         let mut open_document_objects = optimization.objects_for_trailer_key(b"Encrypt");
         for key in OPEN_DOCUMENT_CATALOG_KEYS {
             open_document_objects.extend(optimization.objects_for_root_key(key));
@@ -1179,7 +1182,10 @@ impl LinearizationPlan {
             // outline extraction in Step 8 can place it. Verified against qpdf
             // 11.9.0: outlines-shared-page-80-80's /Extra-referenced font is the
             // last second-half object, not a first-page-shared object (flpdf-q2zw).
-            if all_outline_refs.contains(obj_ref) || open_document_objects.contains(obj_ref) {
+            if root_objects.contains(obj_ref)
+                || all_outline_refs.contains(obj_ref)
+                || open_document_objects.contains(obj_ref)
+            {
                 continue;
             }
             if Some(*obj_ref) == first_page_ref {
@@ -1403,17 +1409,18 @@ impl LinearizationPlan {
             // every mode, so they ARE present in part4_provisional and must not be
             // treated as first-page here — they flow to the OD routing below. A
             // genuine first-page object reaching this point is skipped defensively.
-            let in_first_page = first_page_set.contains(&r) && !open_document_objects.contains(&r);
+            let in_first_page = first_page_set.contains(&r)
+                && !root_objects.contains(&r)
+                && !open_document_objects.contains(&r);
             if in_first_page {
                 // Should have been in Part 2 or Part 3 — skip (defensive).
                 continue;
             }
-            // Route open-document objects to part4 (first half, before /O) in
-            // EVERY mode — qpdf's part4 = [lc_root] ++ lc_open_document. Outline
-            // objects (which qpdf orders above in_open_document) were already
-            // routed above, so anything reaching here that is in open_document_objects
-            // is a genuine lc_open_document object.
-            if open_document_objects.contains(&r) {
+            // Route the qpdf root and open-document objects to part4 (first
+            // half, before /O) in EVERY mode — qpdf's part4 is
+            // [lc_root] ++ lc_open_document. Outline objects (which qpdf
+            // orders above in_open_document) were already routed above.
+            if root_objects.contains(&r) || open_document_objects.contains(&r) {
                 if let Some(ctx) = elig_ctx.as_ref() {
                     // generate mode: an OD object eligible for ObjStm packing goes
                     // to part4_rest (the batch planner packs it into the
