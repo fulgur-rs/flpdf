@@ -3705,6 +3705,27 @@ impl<R: Read + Seek> Pdf<R> {
                 if parsed.object_ref != stream_ref {
                     return Ok(None);
                 }
+                // A false next-object offset can end the bounded window
+                // right after the object-stream dictionary's closing `>>`
+                // but before the `stream` keyword, so the parse above
+                // succeeds as a bare direct object (not an error) instead of
+                // failing -- read_object_at_with_policy's own retry-on-error
+                // path never triggers for that shape. qpdf's
+                // readObjectAtOffset recovery has no bounded/unbounded split
+                // at all (`QPDF.cc:1330-1402`); reproduce its effective
+                // behavior by retrying through EOF once more when the parse
+                // succeeded but did not actually yield a stream.
+                if !matches!(parsed.object, Object::Stream(_))
+                    && self.resolution_fallbacks_remaining > 0
+                {
+                    self.resolution_fallbacks_remaining -= 1;
+                    let full_bytes = self.resolver.read_window(offset, None)?;
+                    let retried =
+                        self.parse_and_finish_file_object(stream_ref, &full_bytes, offset, policy)?;
+                    if retried.object_ref == stream_ref {
+                        parsed = retried;
+                    }
+                }
                 let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
                 let recovered_eol_bytes =
                     recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
@@ -3766,10 +3787,17 @@ impl<R: Read + Seek> Pdf<R> {
     fn read_object_stream_framing_probe(&mut self, offset: u64) -> Result<Vec<u8>> {
         let next = self.next_object_offset(offset);
         let bytes = self.read_bounded_object_window(offset)?;
-        if next.is_some()
-            && self.resolution_fallbacks_remaining > 0
-            && parse_file_object_syntax(&bytes).is_err()
-        {
+        // A false next-object offset can land after the complete object
+        // dictionary but before the `stream` keyword, so the bounded parse
+        // succeeds as `PendingBody::Direct` (a bare dictionary) instead of
+        // failing outright. That is just as truncated as a parse error for
+        // an object stream, whose body must be `PendingBody::Stream` -- treat
+        // it the same way and retry through EOF.
+        let needs_retry = match parse_file_object_syntax(&bytes) {
+            Err(_) => true,
+            Ok(pending) => matches!(pending.body, PendingBody::Direct { .. }),
+        };
+        if next.is_some() && self.resolution_fallbacks_remaining > 0 && needs_retry {
             return self.resolver.read_window(offset, None);
         }
         Ok(bytes)
@@ -8343,6 +8371,67 @@ mod tests {
         assert_eq!(
             object.as_dict().and_then(|dict| dict.get("Value")),
             Some(&Object::Integer(1))
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1),
+            "the framing probe must not consume the actual object-read retry"
+        );
+    }
+
+    #[test]
+    fn compressed_entry_retries_legacy_framing_probe_when_bounded_window_stops_before_stream_keyword(
+    ) {
+        // A false next-object offset can land after the complete object
+        // dictionary (past the closing `>>`) but before the `stream`
+        // keyword. The bounded parse then succeeds as a bare dictionary
+        // (`PendingBody::Direct`) instead of failing outright, which must
+        // still be treated as truncated framing and retried through EOF --
+        // otherwise object_stream_needs_legacy_framing wrongly concludes no
+        // legacy framing is needed for an object stream whose /Length is an
+        // indirect reference, and the compressed member resolves to null.
+        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
+        let mut body = "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n"
+            .to_owned()
+            .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let length_body = format!("6 0 obj\n{}\nendobj\n", payload.len()).into_bytes();
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                &body,
+                &length_body,
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .expect("object stream header") as u64;
+        // Land the false next-object offset right after the dictionary's
+        // closing `>>` and its trailing newline, but before `stream`.
+        let false_next_offset = bytes
+            .windows(b">>\nstream\n".len())
+            .position(|window| window == b">>\nstream\n")
+            .expect("object-stream dictionary close") as u64
+            + b">>\n".len() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("legacy-framing probe must retry through EOF past a bare-dictionary parse");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1)),
+            "the compressed member must be recovered, not resolve to null"
         );
         assert_eq!(
             pdf.resolution_fallbacks_remaining,
