@@ -874,7 +874,7 @@ fn check_hint_tables<R: Read + Seek>(
             hint_count as u64,
             collect_soft_warnings,
             warnings,
-        )?;
+        )?; // cov:ignore: llvm maps this length-call cleanup to the following page-length comparison
         let hint_length =
             i128::from(page_hints.min_page_length) + i128::from(entry.delta_page_length);
         if computed_length != hint_length {
