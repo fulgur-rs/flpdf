@@ -217,7 +217,7 @@ reader.rs に残す）とは移動の種類が異なる。本設計もこれに�
 `Pdf` を除去（`EncryptionInfo`/`PdfOpenOptions`/`Permissions` は
 reader.rs に残ったまま）。
 
-**`encryption/standard.rs`/`encrypt_setup.rs`/`permissions.rs`/
+**`encryption.rs`/`encryption/{state,standard,permissions}.rs`/
 `object_copy.rs` も同じ解決法をそのまま使える**: `is_encrypted`
 （`self.encryption.borrow()`。フィールド定義は `pdf.rs:154`、メソッド本体は
 `reader.rs:558-560`）や `take_foreign_object_map`（`self.foreign_object_maps`。
@@ -479,8 +479,8 @@ reader.rs に残ったまま）。
   `encrypt_dictionary`, `encryption_ref`, `uses_weak_crypto`,
   `encryption_info`, `permissions`, `user_password_matched`,
   `owner_password_matched`, `encryption_file_key`）は `QPDF_encryption.cc`
-  の既存受け皿（`encryption/standard.rs` / `encrypt_setup.rs` /
-  `permissions.rs`）へ移す。reader.rs 側の実装は重複であり、削除対象。
+  の既存受け皿（`encryption.rs` / `encryption/{state,standard,
+  permissions}.rs`）へ移す。reader.rs 側の実装は重複であり、削除対象。
   **この10個の公開メソッドだけでは実装が終わらない**: `authenticate_if_
   encrypted`（`reader.rs:782-`）は reader.rs 内で private 定義されている
   `EncryptionState`(`reader.rs:54-`)/`EncryptionMode`(`reader.rs:327-`)/
