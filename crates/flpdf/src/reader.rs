@@ -3705,6 +3705,27 @@ impl<R: Read + Seek> Pdf<R> {
                 if parsed.object_ref != stream_ref {
                     return Ok(None);
                 }
+                // A false next-object offset can end the bounded window
+                // right after the object-stream dictionary's closing `>>`
+                // but before the `stream` keyword, so the parse above
+                // succeeds as a bare direct object (not an error) instead of
+                // failing -- read_object_at_with_policy's own retry-on-error
+                // path never triggers for that shape. qpdf's
+                // readObjectAtOffset recovery has no bounded/unbounded split
+                // at all (`QPDF.cc:1330-1402`); reproduce its effective
+                // behavior by retrying through EOF once more when the parse
+                // succeeded but did not actually yield a stream.
+                if !matches!(parsed.object, Object::Stream(_))
+                    && self.resolution_fallbacks_remaining > 0
+                {
+                    self.resolution_fallbacks_remaining -= 1;
+                    let full_bytes = self.resolver.read_window(offset, None)?;
+                    let retried =
+                        self.parse_and_finish_file_object(stream_ref, &full_bytes, offset, policy)?;
+                    if retried.object_ref == stream_ref {
+                        parsed = retried;
+                    }
+                }
                 let recovered_eol = parsed.remove_included_recovery_eol_for_decryption();
                 let recovered_eol_bytes =
                     recovered_eol.map(crate::parser::RecoveredStreamEol::as_bytes);
@@ -3746,7 +3767,19 @@ impl<R: Read + Seek> Pdf<R> {
         let Some(CacheEntry::Unresolved { offset }) = self.cache.entry(stream_ref).cloned() else {
             return Ok(false);
         };
-        let bytes = self.read_bounded_object_window(offset)?;
+        // qpdf's readObjectAtOffset does not use the next xref offset as a
+        // hard bound while recovering a malformed object. Probe the bounded
+        // window first, but retry this inspection through EOF when the window
+        // ends inside the object dictionary. This probe charges its own EOF
+        // retry against `resolution_fallbacks_remaining`, independent of
+        // object_stream_handle_with_legacy_fallback's actual parse retry
+        // (`Self::resolution_fallbacks_remaining`'s doc): without its own
+        // charge, a crafted xref where every compressed member's container
+        // still parses as a bare dictionary at this bounded window would
+        // re-run this full-file probe once per member with no cap, since
+        // `self.cache` only starts reflecting a resolved container after a
+        // member successfully resolves through it.
+        let bytes = self.read_object_stream_framing_probe(offset)?;
         let pending = parse_file_object_syntax(&bytes)?;
         let PendingBody::Stream { dict, .. } = pending.body else {
             return Ok(false);
@@ -3755,6 +3788,26 @@ impl<R: Read + Seek> Pdf<R> {
             dict.get("Length"),
             Some(Object::Integer(value)) if *value >= 0
         ))
+    }
+
+    fn read_object_stream_framing_probe(&mut self, offset: u64) -> Result<Vec<u8>> {
+        let next = self.next_object_offset(offset);
+        let bytes = self.read_bounded_object_window(offset)?;
+        // A false next-object offset can land after the complete object
+        // dictionary but before the `stream` keyword, so the bounded parse
+        // succeeds as `PendingBody::Direct` (a bare dictionary) instead of
+        // failing outright. That is just as truncated as a parse error for
+        // an object stream, whose body must be `PendingBody::Stream` -- treat
+        // it the same way and retry through EOF.
+        let needs_retry = match parse_file_object_syntax(&bytes) {
+            Err(_) => true,
+            Ok(pending) => matches!(pending.body, PendingBody::Direct { .. }),
+        };
+        if next.is_some() && self.resolution_fallbacks_remaining > 0 && needs_retry {
+            self.resolution_fallbacks_remaining -= 1;
+            return self.resolver.read_window(offset, None);
+        }
+        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -8283,6 +8336,207 @@ mod tests {
             pdf.cache.entry(ObjectRef::new(4, 0)),
             Some(CacheEntry::Resolved(Object::Stream(_)))
         ));
+    }
+
+    #[test]
+    fn compressed_entry_retries_legacy_framing_probe_when_bounded_window_is_truncated() {
+        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
+        let mut body = "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n"
+            .to_owned()
+            .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let length_body = format!("6 0 obj\n{}\nendobj\n", payload.len()).into_bytes();
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                &body,
+                &length_body,
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .expect("object stream header") as u64;
+        let false_next_offset = bytes
+            .windows(b"/Length".len())
+            .position(|window| window == b"/Length")
+            .expect("object-stream dictionary key") as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("legacy-framing probe must retry against EOF");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1))
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(2),
+            "the framing probe and the actual object-read retry each charge \
+             their own EOF read against the same offset"
+        );
+    }
+
+    #[test]
+    fn compressed_entry_retries_legacy_framing_probe_when_bounded_window_stops_before_stream_keyword(
+    ) {
+        // A false next-object offset can land after the complete object
+        // dictionary (past the closing `>>`) but before the `stream`
+        // keyword. The bounded parse then succeeds as a bare dictionary
+        // (`PendingBody::Direct`) instead of failing outright, which must
+        // still be treated as truncated framing and retried through EOF --
+        // otherwise object_stream_needs_legacy_framing wrongly concludes no
+        // legacy framing is needed for an object stream whose /Length is an
+        // indirect reference, and the compressed member resolves to null.
+        let payload = b"7 0 << /Value 1 >>\n9 0 obj\nnull\nendobj\n";
+        let mut body = "4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 6 0 R >>\nstream\n"
+            .to_owned()
+            .into_bytes();
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let length_body = format!("6 0 obj\n{}\nendobj\n", payload.len()).into_bytes();
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                &body,
+                &length_body,
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .expect("object stream header") as u64;
+        // Land the false next-object offset right after the dictionary's
+        // closing `>>` and its trailing newline, but before `stream`.
+        let false_next_offset = bytes
+            .windows(b">>\nstream\n".len())
+            .position(|window| window == b">>\nstream\n")
+            .expect("object-stream dictionary close") as u64
+            + b">>\n".len() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        let object = pdf
+            .resolve_qpdf_json_object(ObjectRef::new(7, 0))
+            .expect("legacy-framing probe must retry through EOF past a bare-dictionary parse");
+        assert_eq!(
+            object.as_dict().and_then(|dict| dict.get("Value")),
+            Some(&Object::Integer(1)),
+            "the compressed member must be recovered, not resolve to null"
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(2),
+            "the framing probe and the actual object-read retry each charge \
+             their own EOF read against the same offset"
+        );
+    }
+
+    #[test]
+    fn legacy_framing_probe_stays_within_the_fallback_budget_across_many_members() {
+        // A crafted xref can mark many compressed members as belonging to
+        // an object number that is not actually an object-stream container
+        // at all -- an ordinary dictionary with no `stream` body, which the
+        // canonical resolver happily resolves as a plain (non-stream)
+        // handle. `object_stream_handle_with_legacy_fallback`'s early
+        // return (`!prefer_legacy_framing && canonical_error.is_none() &&
+        // !stream_handle.is_missing()`) then hands that non-stream handle
+        // straight back without ever reaching the `Unresolved` match arm,
+        // so `self.cache` for this ref stays `Unresolved` forever and
+        // `resolve_compressed_entry`'s `as_stream_dict().is_none()` guard
+        // rejects every member. Each member's resolution therefore
+        // re-enters `object_stream_needs_legacy_framing` and re-probes the
+        // same offset, with no other retry machinery along the way to
+        // charge the budget. Without the probe charging its own EOF
+        // retry, this would repeat an unbounded full-file read once per
+        // member; with the charge, the shared budget caps the total number
+        // of full-file reads regardless of how many members reference it.
+        let body = "4 0 obj\n<< /Foo /Bar >>\nendobj\n".to_owned().into_bytes();
+        // Object 4 must be a real xref entry (not merely seeded into the
+        // legacy cache) so the canonical resolver actually resolves it as a
+        // plain, non-missing dictionary handle instead of reporting it
+        // missing outright -- that is what routes
+        // object_stream_handle_with_legacy_fallback through its early
+        // return instead of the `Unresolved` match arm, which has its own,
+        // separately budget-charged EOF retry that would otherwise mask
+        // the probe's own charge.
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                b"2 0 obj\nnull\nendobj\n",
+                b"3 0 obj\nnull\nendobj\n",
+                &body,
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let objstm_offset = bytes
+            .windows(b"4 0 obj".len())
+            .position(|window| window == b"4 0 obj")
+            .expect("object stream header") as u64;
+        // Land the false next-object offset right after the dictionary's
+        // closing `>>` and its trailing newline, same as the
+        // stops-before-stream-keyword case above -- except here there is no
+        // `stream` keyword anywhere in the file, so retrying through EOF
+        // still yields a bare dictionary, not a stream. Search only from
+        // objstm_offset onward: the catalog body earlier in the file also
+        // ends in `>>\nendobj\n` and would otherwise match first.
+        let false_next_offset = objstm_offset
+            + bytes[objstm_offset as usize..]
+                .windows(b">>\nendobj\n".len())
+                .position(|window| window == b">>\nendobj\n")
+                .expect("object-stream dictionary close") as u64
+            + b">>\n".len() as u64;
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open ObjStm legacy-framing fixture");
+        pdf.cache
+            .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
+        for (member, index) in [(7, 0), (8, 1), (9, 2)] {
+            pdf.cache
+                .set_compressed(ObjectRef::new(member, 0), 4, index);
+        }
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        pdf.resolution_fallbacks_remaining = 2;
+
+        for member in [7, 8, 9] {
+            assert_eq!(
+                pdf.resolve_qpdf_json_object(ObjectRef::new(member, 0))
+                    .expect(
+                        "a container that is not a stream resolves its member to null, not Err"
+                    ),
+                Object::Null,
+                "member {member} must not recover from a container that never has a stream body"
+            );
+        }
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining, 0,
+            "the shared fallback budget caps total full-file reads across all members \
+             instead of granting each member its own unbounded probe"
+        );
+        assert!(
+            matches!(
+                pdf.cache.entry(ObjectRef::new(4, 0)),
+                Some(CacheEntry::Unresolved { offset }) if *offset == objstm_offset
+            ),
+            "the container never resolves, so later members keep re-probing until the budget caps them"
+        );
     }
 
     #[test]
