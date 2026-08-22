@@ -368,10 +368,6 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     }
 }
 
-// ── Encoding helpers ──────────────────────────────────────────────────────────
-
-/// Encode a Unicode filename as a UTF-16BE string with BOM.
-///
 // ── FileSpecBuilder ───────────────────────────────────────────────────────────
 
 /// Optional date fields for a `/Params` sub-dictionary.
