@@ -10,7 +10,7 @@
 //! post-open resolver owned by `flpdf-25kg.3.5`.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::{DocumentResolver, ObjectValue};
+use crate::object_handle::{canonical_dictionary_key_from_legacy, DocumentResolver, ObjectValue};
 use crate::parser::{
     parse_qpdf_file_object, parse_qpdf_file_object_handle_with_diagnostics, HandleResolver, Parser,
     ParserDiagnostic,
@@ -40,9 +40,26 @@ pub struct LoadedXref {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct BootstrapCache {
-    objects: BTreeMap<ObjectRef, Object>,
+struct BootstrapHandleState {
+    handles: BTreeMap<ObjectRef, ObjectHandle>,
+    resolving: BTreeSet<ObjectRef>,
     resolved_object_streams: BTreeSet<u32>,
+    diagnostics: Diagnostics,
+    reconstruction_trigger: Option<(u64, String)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BootstrapCache {
+    /// Legacy raw materializations retained for bootstrap consumers that still
+    /// require `Object` values. The handle state below is the canonical
+    /// cross-context resolution/cache boundary.
+    objects: BTreeMap<ObjectRef, Object>,
+    /// qpdf's one-operation cache and resolution state. Keeping this state
+    /// apart from the owner document avoids making each context a new resolver
+    /// identity while retaining the document strongly below.
+    handle_state: Rc<RefCell<BootstrapHandleState>>,
+    handle_document: Option<Rc<BootstrapHandleDocument>>,
+    handle_document_owners: Vec<Rc<BootstrapHandleDocument>>,
 }
 
 type SharedBootstrapCache = Rc<RefCell<BootstrapCache>>;
@@ -236,44 +253,57 @@ impl XrefEntryLookup<'_> {
 /// The short-lived document context used while qpdf is reading an xref
 /// stream. It exists before the post-open `ResolverCore`, but it still gives
 /// every parsed direct child the same weak `DocumentResolver` and gives every
-/// `N G R` the same canonical handle slot.
+/// `N G R` the same canonical handle slot. The owner and its mutable state are
+/// shared through [`BootstrapCache`] for one xref-loading operation, matching
+/// qpdf's document-level cache rather than one context's local parse lifetime.
 struct BootstrapHandleDocument {
     bytes: Rc<[u8]>,
-    entry_lookup: BTreeMap<ObjectRef, XrefEntry>,
+    entry_lookup: RefCell<BTreeMap<ObjectRef, XrefEntry>>,
     options: XrefLoadOptions,
-    cache: RefCell<BTreeMap<ObjectRef, ObjectHandle>>,
-    resolving: RefCell<BTreeSet<ObjectRef>>,
-    resolved_object_streams: RefCell<BTreeSet<u32>>,
-    diagnostics: RefCell<Diagnostics>,
-    reconstruction_trigger: RefCell<Option<(u64, String)>>,
+    state: Rc<RefCell<BootstrapHandleState>>,
     resolver: RefCell<Option<Weak<dyn DocumentResolver>>>,
 }
 
 impl std::fmt::Debug for BootstrapHandleDocument {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BootstrapHandleDocument")
-            .field("cache_len", &self.cache.borrow().len())
-            .field("resolving", &self.resolving.borrow())
+            .field("cache_len", &self.state.borrow().handles.len())
+            .field("resolving", &self.state.borrow().resolving)
             .finish()
     }
 }
 
 impl BootstrapHandleDocument {
+    #[cfg(test)]
     fn new(bytes: &[u8], entry_lookup: XrefEntryLookup<'_>, options: XrefLoadOptions) -> Rc<Self> {
+        Self::new_with_state(
+            bytes,
+            entry_lookup,
+            options,
+            Rc::new(RefCell::new(BootstrapHandleState::default())),
+        )
+    }
+
+    fn new_with_state(
+        bytes: &[u8],
+        entry_lookup: XrefEntryLookup<'_>,
+        options: XrefLoadOptions,
+        state: Rc<RefCell<BootstrapHandleState>>,
+    ) -> Rc<Self> {
         let document = Rc::new(Self {
             bytes: Rc::from(bytes),
-            entry_lookup: entry_lookup.owned_entries(),
+            entry_lookup: RefCell::new(entry_lookup.owned_entries()),
             options,
-            cache: RefCell::new(BTreeMap::new()),
-            resolving: RefCell::new(BTreeSet::new()),
-            resolved_object_streams: RefCell::new(BTreeSet::new()),
-            diagnostics: RefCell::new(Diagnostics::default()),
-            reconstruction_trigger: RefCell::new(None),
+            state,
             resolver: RefCell::new(None),
         });
         let resolver: Rc<dyn DocumentResolver> = document.clone();
         *document.resolver.borrow_mut() = Some(Rc::downgrade(&resolver));
         document
+    }
+
+    fn refresh_entry_lookup(&self, entry_lookup: XrefEntryLookup<'_>) {
+        *self.entry_lookup.borrow_mut() = entry_lookup.owned_entries();
     }
 
     fn resolver_weak(&self) -> Weak<dyn DocumentResolver> {
@@ -284,23 +314,97 @@ impl BootstrapHandleDocument {
     }
 
     fn handle_for_reference(&self, object_ref: ObjectRef) -> ObjectHandle {
-        if let Some(handle) = self.cache.borrow().get(&object_ref).cloned() {
+        if let Some(handle) = self.state.borrow().handles.get(&object_ref).cloned() {
             return handle;
         }
         let handle = ObjectHandle::new_indirect_with_resolver(object_ref, self.resolver_weak());
-        self.cache.borrow_mut().insert(object_ref, handle.clone());
+        self.state
+            .borrow_mut()
+            .handles
+            .insert(object_ref, handle.clone());
         handle
     }
 
+    fn seed_object(&self, object_ref: ObjectRef, object: &Object) -> Result<()> {
+        let handle = self.handle_for_reference(object_ref);
+        if handle.is_resolved() {
+            return Ok(());
+        }
+        let value = self.object_value_from_raw(object)?;
+        handle.set_resolved(value);
+        Ok(())
+    }
+
+    fn object_handle_from_raw(&self, object: &Object) -> Result<ObjectHandle> {
+        if let Object::Reference(object_ref) = object {
+            return Ok(self.handle_for_reference(*object_ref));
+        }
+        let value = self.object_value_from_raw(object)?;
+        Ok(ObjectHandle::from_parsed_value_with_resolver(
+            value,
+            self.resolver_weak(),
+        ))
+    }
+
+    fn object_value_from_raw(&self, object: &Object) -> Result<ObjectValue> {
+        Ok(match object {
+            Object::Null => ObjectValue::Null,
+            Object::Boolean(value) => ObjectValue::Boolean(*value),
+            Object::Integer(value) => ObjectValue::Integer(*value),
+            Object::Real(value) => ObjectValue::Real(*value),
+            Object::RealLiteral { value, literal } => ObjectValue::RealLiteral {
+                value: *value,
+                literal: literal.clone(),
+            },
+            Object::Name(value) => ObjectValue::Name(value.clone()),
+            Object::String(value) => ObjectValue::String(value.clone()),
+            Object::Operator(value) => ObjectValue::Operator(value.clone()),
+            Object::InlineImage(value) => ObjectValue::InlineImage(value.clone()),
+            Object::Array(values) => ObjectValue::Array(
+                values
+                    .iter()
+                    .map(|value| self.object_handle_from_raw(value))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            Object::Dictionary(dictionary) => ObjectValue::Dictionary(
+                dictionary
+                    .iter()
+                    .map(|(key, value)| {
+                        Ok((
+                            canonical_dictionary_key_from_legacy(key),
+                            self.object_handle_from_raw(value)?,
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            ),
+            Object::Stream(stream) => ObjectValue::Stream {
+                stream_dict: ObjectHandle::from_parsed_value_with_resolver(
+                    self.object_value_from_raw(&Object::Dictionary(stream.dict.clone()))?,
+                    self.resolver_weak(),
+                ),
+                stream_data: Some(Rc::new(stream.data.clone())),
+                stream_provider: None,
+                stream_length: stream.data.len(),
+            },
+            Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
+        })
+    }
+
     fn push_warning(&self, message: impl Into<String>, offset: Option<u64>) {
-        self.diagnostics
+        self.state
             .borrow_mut()
+            .diagnostics
             .push(Diagnostic::warning(message, offset));
     }
 
+    fn push_diagnostic(&self, diagnostic: Diagnostic) {
+        self.state.borrow_mut().diagnostics.push(diagnostic);
+    }
+
     fn take_reconstruction_trigger(&self) -> Option<Error> {
-        self.reconstruction_trigger
+        self.state
             .borrow_mut()
+            .reconstruction_trigger
             .take()
             .map(|(offset, message)| Error::parse(offset as usize, message))
     }
@@ -365,7 +469,8 @@ impl BootstrapHandleDocument {
                 object_ref.number, object_ref.generation
             );
             if self.options.allow_repair || policy == RecoveryPolicy::Bounded {
-                let mut trigger = self.reconstruction_trigger.borrow_mut();
+                let mut state = self.state.borrow_mut();
+                let trigger = &mut state.reconstruction_trigger;
                 if trigger.is_none() {
                     *trigger = Some((offset, message.clone()));
                 }
@@ -387,6 +492,14 @@ impl BootstrapHandleDocument {
         let mut completed = self
             .read_file_object(input, offset, policy, XrefObjectDescription::Ordinary)
             .map_err(|error| error.rebase_offset(start))?;
+        for diagnostic in &completed.diagnostics {
+            self.push_diagnostic(xref_file_object_diagnostic(
+                XrefObjectDescription::Ordinary,
+                completed.object_ref,
+                offset,
+                diagnostic.clone(),
+            ));
+        }
         let parsed_offset = completed.object.get_parsed_offset();
         let _ = completed.remove_included_recovery_eol_for_decryption();
         // cov:ignore-start: the handle parser guarantees an exclusively owned direct top-level value
@@ -402,8 +515,9 @@ impl BootstrapHandleDocument {
 
     fn resolve_objects_in_stream(&self, stream_number: u32) -> Result<()> {
         if !self
-            .resolved_object_streams
+            .state
             .borrow_mut()
+            .resolved_object_streams
             .insert(stream_number)
         {
             return Ok(());
@@ -447,7 +561,7 @@ impl BootstrapHandleDocument {
         for (object_number, object_offset) in members {
             let object_ref = ObjectRef::new(object_number, 0);
             if !matches!(
-                self.entry_lookup.get(&object_ref).copied(),
+                self.entry_lookup.borrow().get(&object_ref).copied(),
                 Some(XrefEntry::Compressed { stream, .. }) if stream == stream_number
             ) {
                 continue;
@@ -537,7 +651,7 @@ impl DocumentResolver for BootstrapHandleDocument {
         if handle.is_resolved() {
             return Ok(());
         }
-        if !self.resolving.borrow_mut().insert(object_ref) {
+        if !self.state.borrow_mut().resolving.insert(object_ref) {
             self.push_warning(
                 format!(
                     "loop detected resolving object {} {}",
@@ -549,7 +663,7 @@ impl DocumentResolver for BootstrapHandleDocument {
             return Ok(());
         }
 
-        let result = match self.entry_lookup.get(&object_ref).copied() {
+        let result = match self.entry_lookup.borrow().get(&object_ref).copied() {
             Some(XrefEntry::Uncompressed { offset }) if offset != 0 => {
                 self.read_uncompressed_object(object_ref, offset)
             }
@@ -570,7 +684,7 @@ impl DocumentResolver for BootstrapHandleDocument {
                 match self.resolve_objects_in_stream(stream) {
                     Ok(()) => {
                         if handle.is_resolved() {
-                            self.resolving.borrow_mut().remove(&object_ref);
+                            self.state.borrow_mut().resolving.remove(&object_ref);
                             return Ok(());
                         }
                         Ok((ObjectValue::Null, -1))
@@ -580,7 +694,7 @@ impl DocumentResolver for BootstrapHandleDocument {
             }
             Some(XrefEntry::Free { .. }) | None => Ok((ObjectValue::Null, -1)),
         };
-        self.resolving.borrow_mut().remove(&object_ref);
+        self.state.borrow_mut().resolving.remove(&object_ref);
 
         match result {
             Ok((value, parsed_offset)) => {
@@ -616,10 +730,28 @@ impl XrefObjectCache {
     }
 
     fn get(&self, object_ref: &ObjectRef) -> Option<Object> {
+        let handle = self
+            .shared
+            .borrow()
+            .handle_state
+            .borrow()
+            .handles
+            .get(object_ref)
+            .cloned();
+        if let Some(object) = handle
+            .filter(|handle| handle.is_resolved())
+            .and_then(|handle| handle.materialize().ok())
+        {
+            return Some(object);
+        }
         if let Some(value) = self.overlay.get(object_ref) {
             return Some(value.clone());
         }
-        self.shared.borrow().objects.get(object_ref).cloned()
+        let shared = self.shared.borrow();
+        if let Some(value) = shared.objects.get(object_ref) {
+            return Some(value.clone());
+        }
+        None
     }
 
     fn insert(&mut self, object_ref: ObjectRef, object: Object) {
@@ -628,6 +760,8 @@ impl XrefObjectCache {
 
     fn mark_object_stream_resolved(&mut self, stream_number: u32) -> bool {
         self.shared
+            .borrow_mut()
+            .handle_state
             .borrow_mut()
             .resolved_object_streams
             .insert(stream_number)
@@ -643,17 +777,46 @@ impl XrefObjectCache {
             .extend(std::mem::take(&mut self.overlay));
     }
 
+    fn visible_objects(&self) -> BTreeMap<ObjectRef, Object> {
+        let mut objects = self.shared.borrow().objects.clone();
+        objects.extend(self.overlay.clone());
+        objects
+    }
+
     fn shared(&self) -> SharedBootstrapCache {
         Rc::clone(&self.shared)
+    }
+
+    fn handle_document(
+        &self,
+        bytes: &[u8],
+        entry_lookup: XrefEntryLookup<'_>,
+        options: XrefLoadOptions,
+    ) -> Rc<BootstrapHandleDocument> {
+        let mut shared = self.shared.borrow_mut();
+        if let Some(document) = shared.handle_document.as_ref() {
+            document.refresh_entry_lookup(entry_lookup);
+            return Rc::clone(document);
+        }
+        let document = BootstrapHandleDocument::new_with_state(
+            bytes,
+            entry_lookup,
+            options,
+            Rc::clone(&shared.handle_state),
+        );
+        shared.handle_document = Some(Rc::clone(&document));
+        document
     }
 }
 
 /// A qpdf-shaped, read-time resolver for xref bootstrap objects.
 ///
 /// The context borrows the currently visible xref entries through an explicit
-/// lookup view and owns only its cache overlay/recursion guard. It never
-/// delegates to `Pdf::resolve` or the later canonical resolver, and it never
-/// uses an absent optional entry table to distinguish bootstrap phases.
+/// lookup view and owns only its raw cache overlay/recursion guard; handle
+/// identity, handle recursion, and handle diagnostics live in the shared
+/// bootstrap state. It never delegates to `Pdf::resolve` or the later
+/// canonical resolver, and it never uses an absent optional entry table to
+/// distinguish bootstrap phases.
 struct XrefReadContext<'bytes, 'entries> {
     bytes: &'bytes [u8],
     entry_lookup: XrefEntryLookup<'entries>,
@@ -663,9 +826,10 @@ struct XrefReadContext<'bytes, 'entries> {
     diagnostics: Diagnostics,
     handle_diagnostics_len: usize,
     reconstruction_trigger: Option<(u64, String)>,
-    /// Built lazily: constructing a [`BootstrapHandleDocument`] copies the
+    /// Built lazily: the first handle-native use for a shared cache copies the
     /// whole input into a fresh `Rc<[u8]>` (needed so `ObjectHandle`'s
-    /// `'static` resolver can outlive this context). Most contexts -- e.g.
+    /// `'static` resolver can outlive this context), and later contexts reuse
+    /// that owner and state. Most contexts -- e.g.
     /// every `/Prev` hop whose value is the ordinary direct integer, per ISO
     /// 32000-2 7.5.8.4 -- never touch handle-native resolution at all, so
     /// deferring construction until [`Self::handle_document`] is actually
@@ -709,6 +873,13 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                 Rc::clone(bootstrap_cache),
             ),
         };
+        let handle_diagnostics_len = bootstrap_cache
+            .borrow()
+            .handle_state
+            .borrow()
+            .diagnostics
+            .entries()
+            .len();
         Self {
             bytes,
             entry_lookup,
@@ -716,7 +887,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
             cache: XrefObjectCache::new(bootstrap_cache),
             resolving: BTreeSet::new(),
             diagnostics: Diagnostics::default(),
-            handle_diagnostics_len: 0,
+            handle_diagnostics_len,
             reconstruction_trigger: None,
             handle_document: OnceCell::new(),
         }
@@ -732,7 +903,16 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         let entry_lookup = self.entry_lookup;
         let options = self.options;
         self.handle_document
-            .get_or_init(|| BootstrapHandleDocument::new(bytes, entry_lookup, options))
+            .get_or_init(|| self.cache.handle_document(bytes, entry_lookup, options))
+    }
+
+    fn sync_handle_cache_from_raw(&self) -> Result<()> {
+        let objects = self.cache.visible_objects();
+        let document = self.handle_document();
+        for (object_ref, object) in objects {
+            document.seed_object(object_ref, &object)?;
+        }
+        Ok(())
     }
 
     fn object_policy(&self) -> RecoveryPolicy {
@@ -776,6 +956,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         policy: RecoveryPolicy,
         description: XrefObjectDescription,
     ) -> Result<HandleFileObjectRead> {
+        self.sync_handle_cache_from_raw()?;
         let result =
             self.handle_document()
                 .read_file_object(input, absolute_offset, policy, description);
@@ -790,15 +971,16 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         let Some(handle_document) = self.handle_document.get() else {
             return;
         };
-        let handle_diagnostics = handle_document.diagnostics.borrow();
-        for diagnostic in handle_diagnostics
+        let state = handle_document.state.borrow();
+        for diagnostic in state
+            .diagnostics
             .entries()
             .iter()
             .skip(self.handle_diagnostics_len)
         {
             self.diagnostics.push(diagnostic.clone());
         }
-        self.handle_diagnostics_len = handle_diagnostics.entries().len();
+        self.handle_diagnostics_len = state.diagnostics.entries().len();
     }
 
     fn read_file_object_for_reference(
@@ -892,6 +1074,8 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         if !self.cache.mark_object_stream_resolved(stream_number) {
             return Ok(());
         }
+
+        self.sync_handle_cache_from_raw()?;
 
         let stream_handle = self
             .handle_document()
@@ -1493,6 +1677,34 @@ fn parse_xref_from_start(
     )
 }
 
+fn merge_bootstrap_handle_state_prefer_source(
+    destination: &Rc<RefCell<BootstrapHandleState>>,
+    source: &Rc<RefCell<BootstrapHandleState>>,
+) {
+    if Rc::ptr_eq(destination, source) {
+        return;
+    }
+    let destination = destination.borrow();
+    let mut source = source.borrow_mut();
+    let mut handles = destination.handles.clone();
+    handles.extend(source.handles.clone());
+    source.handles = handles;
+    source
+        .resolving
+        .extend(destination.resolving.iter().copied());
+    source
+        .resolved_object_streams
+        .extend(destination.resolved_object_streams.iter().copied());
+    let mut diagnostics = destination.diagnostics.clone();
+    for diagnostic in source.diagnostics.entries() {
+        diagnostics.push(diagnostic.clone());
+    }
+    source.diagnostics = diagnostics;
+    if source.reconstruction_trigger.is_none() {
+        source.reconstruction_trigger = destination.reconstruction_trigger.clone();
+    }
+}
+
 fn merge_bootstrap_cache_prefer_source(
     destination: &SharedBootstrapCache,
     source: &SharedBootstrapCache,
@@ -1509,8 +1721,22 @@ fn merge_bootstrap_cache_prefer_source(
             .map(|(object_ref, object)| (*object_ref, object.clone())),
     );
     destination
-        .resolved_object_streams
-        .extend(source.resolved_object_streams.iter().copied());
+        .handle_document_owners
+        .extend(source.handle_document_owners.iter().cloned());
+    if let Some(source_document) = source.handle_document.as_ref() {
+        if let Some(destination_document) = destination.handle_document.clone() {
+            if !Rc::ptr_eq(&destination_document, source_document) {
+                destination
+                    .handle_document_owners
+                    .push(destination_document);
+            }
+        }
+        merge_bootstrap_handle_state_prefer_source(&destination.handle_state, &source.handle_state);
+        destination.handle_state = Rc::clone(&source.handle_state);
+        destination.handle_document = Some(Rc::clone(source_document));
+    } else {
+        merge_bootstrap_handle_state_prefer_source(&destination.handle_state, &source.handle_state);
+    }
 }
 
 /// Read the optional hybrid-reference stream named by a classic trailer's
@@ -3534,8 +3760,9 @@ mod tests {
             .resolve_indirect(ObjectRef::new(1, 0), &offset_zero)
             .expect("already-resolved handle through the resolver boundary");
         assert!(document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("offset 0")));
@@ -3563,8 +3790,9 @@ mod tests {
         let mismatched = document.handle_for_reference(ObjectRef::new(2, 0));
         assert_eq!(mismatched.try_as_integer().unwrap(), Some(42));
         assert!(document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("expected 2 0 obj")));
@@ -3589,8 +3817,9 @@ mod tests {
             .try_dereference()
             .expect("object ID zero is handled as a warning");
         assert!(reference_document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("object with ID 0")));
@@ -3644,8 +3873,9 @@ mod tests {
         );
         assert!(handle.is_null());
 
-        let diagnostics = document.diagnostics.borrow();
+        let diagnostics = document.state.borrow();
         let message = diagnostics
+            .diagnostics
             .entries()
             .iter()
             .find(|diagnostic| diagnostic.message.contains("expected endstream"))
@@ -3725,8 +3955,9 @@ mod tests {
             Some(b"Decoded".to_vec())
         );
         assert!(object_stream_document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("duplicated key /Value")));
@@ -3765,8 +3996,9 @@ mod tests {
             .try_dereference()
             .expect("wrong object-stream type remains readable");
         assert!(wrong_type_document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("wrong type")));
@@ -3916,8 +4148,9 @@ mod tests {
             .expect("malformed member parse error resolves to null with a warning");
         assert!(malformed_member.is_null());
         assert!(malformed_member_document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("integer out of range")));
@@ -4021,15 +4254,20 @@ mod tests {
             .expect("a malformed object-stream /N degrades to a warning and a null value, not Err");
         assert!(handle.is_null());
         assert!(document
-            .diagnostics
+            .state
             .borrow()
+            .diagnostics
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("/N is not an integer")));
         // The recursion guard must not leak on this path: `resolve_indirect`
         // must remove `object_ref` from `resolving` even when
         // `resolve_objects_in_stream` returns `Err`.
-        assert!(!document.resolving.borrow().contains(&ObjectRef::new(2, 0)));
+        assert!(!document
+            .state
+            .borrow()
+            .resolving
+            .contains(&ObjectRef::new(2, 0)));
     }
 
     #[test]
@@ -4391,6 +4629,78 @@ mod tests {
             cache.borrow().objects.get(&object_ref),
             Some(&Object::Integer(7))
         );
+    }
+
+    #[test]
+    fn shared_bootstrap_cache_reuses_handle_identity_and_forwards_diagnostics() {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let object_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"3 0 obj\n4\n");
+        let object_ref = ObjectRef::new(3, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            object_ref,
+            XrefEntry::Uncompressed {
+                offset: object_offset,
+            },
+        );
+        let shared_cache = empty_bootstrap_cache();
+
+        let first_handle = {
+            let mut context = XrefReadContext::new(
+                &bytes,
+                XrefReadContextSpec::ActiveSectionWithCache {
+                    bootstrap_cache: &shared_cache,
+                },
+                &registration,
+                XrefLoadOptions::default(),
+            );
+            let handle = context
+                .handle_for_reference(object_ref)
+                .expect("test context exposes bootstrap handles");
+            handle
+                .try_dereference()
+                .expect("malformed direct object degrades to a warning");
+            context.sync_handle_diagnostics();
+            assert_eq!(
+                context
+                    .diagnostics
+                    .entries()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+                    .count(),
+                1,
+                "handle-native object diagnostics must reach the owning context"
+            );
+            handle
+        };
+
+        let second_handle = {
+            let mut context = XrefReadContext::new(
+                &bytes,
+                XrefReadContextSpec::ActiveSectionWithCache {
+                    bootstrap_cache: &shared_cache,
+                },
+                &registration,
+                XrefLoadOptions::default(),
+            );
+            let handle = context
+                .handle_for_reference(object_ref)
+                .expect("test context exposes bootstrap handles");
+            handle
+                .try_dereference()
+                .expect("the shared resolved handle must remain dereferenceable");
+            context.sync_handle_diagnostics();
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("expected endobj")));
+            handle
+        };
+
+        assert!(first_handle.is_same_object_as(&second_handle));
+        assert_eq!(second_handle.try_as_integer().unwrap(), Some(4));
     }
 
     #[test]
@@ -6612,8 +6922,9 @@ mod tests {
         context.reconstruction_trigger = Some((5, "expected 5 0 obj".to_string()));
         context
             .handle_document()
-            .reconstruction_trigger
-            .replace(Some((9, "expected 9 0 obj".to_string())));
+            .state
+            .borrow_mut()
+            .reconstruction_trigger = Some((9, "expected 9 0 obj".to_string()));
 
         let trigger = context
             .take_reconstruction_trigger()
@@ -6628,8 +6939,9 @@ mod tests {
         assert!(context.reconstruction_trigger.is_none());
         assert!(context
             .handle_document()
-            .reconstruction_trigger
+            .state
             .borrow()
+            .reconstruction_trigger
             .is_none());
     }
 
