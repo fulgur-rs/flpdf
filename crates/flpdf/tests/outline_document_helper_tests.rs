@@ -1,5 +1,7 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
+use flpdf::job::{JsonJobOptions, JsonJobOutput, JsonStreamData, QPDFJob};
+use flpdf::json_inspect::{DecodeLevel, JsonKey};
 use flpdf::{Dictionary, Error, Object, ObjectHandle, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -235,6 +237,22 @@ fn warning_messages(pdf: &Pdf<Cursor<Vec<u8>>>) -> Vec<String> {
         .iter()
         .map(|diagnostic| diagnostic.message.clone())
         .collect()
+}
+
+fn write_outlines_json(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+    let keys = [JsonKey::Outlines];
+    let options = JsonJobOptions {
+        decode_level: DecodeLevel::Generalized,
+        stream_data: JsonStreamData::None,
+        stream_prefix: None,
+        keys: &keys,
+        objects: &[],
+    };
+    let mut job = QPDFJob::new();
+    job.set_suppress_warnings(true);
+    let mut output = Vec::new();
+    job.write_json(pdf, options, JsonJobOutput::Stdout(&mut output), false)
+        .expect("outline JSON should be written");
 }
 
 fn direct_dests_root(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Dictionary {
@@ -725,7 +743,7 @@ fn outline_json_warning_order_matches_qpdf_add_outlines_to_json() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    flpdf::job::build_outlines_section(&mut pdf).expect("outline JSON should degrade to defaults");
+    write_outlines_json(&mut pdf);
 
     let kinds = warning_messages(&pdf)
         .into_iter()
@@ -760,7 +778,7 @@ fn nested_outline_json_warning_order_keeps_kids_after_parent_fields() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    flpdf::job::build_outlines_section(&mut pdf).expect("nested outline JSON should succeed");
+    write_outlines_json(&mut pdf);
 
     let kinds = warning_messages(&pdf)
         .into_iter()

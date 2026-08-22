@@ -39,12 +39,18 @@ pub use attachments::{AttachmentAddOptions, AttachmentCopyOptions};
 pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
 pub use json::{
-    write_json, write_qpdf_json_v2_selected_objects_to_output_with_options,
-    write_qpdf_json_v2_selected_objects_with_options, JsonJobError, JsonJobOptions, JsonJobOutput,
-    JsonStreamData, UsageError,
+    write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
+};
+// Keep the internal aliases available to the json_inspect unit tests without
+// exposing the staged implementation through the public job API.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use json::{
+    write_qpdf_json_v2_selected_objects_to_output_with_options,
+    write_qpdf_json_v2_selected_objects_with_options,
 };
 pub(crate) use json_sections::checksum_to_hex;
-pub use json_sections::{
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use json_sections::{
     build_acroform_section, build_attachments_section, build_encrypt_section,
     build_outlines_section, build_pagelabels_section, build_pages_section,
 };
