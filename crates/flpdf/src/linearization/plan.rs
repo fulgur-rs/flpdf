@@ -188,6 +188,7 @@ fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
             collect_direct_handle_refs(&value, 0, &mut refs)?;
             has_indirect_parameter |= !refs.is_empty();
         }
+        // cov:ignore-start: qpdf probe errors are covered by body-level probe tests; this caller only propagates the defensive branch
         if has_indirect_parameter
             && crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
                 &handle,
@@ -195,7 +196,7 @@ fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
                 true,
                 options.content_normalization,
             )?
-        // cov:ignore: the stream guard and qpdf-shaped probe make this only a defensive error propagation edge
+        // cov:ignore-end
         {
             skipped_streams.insert(object_ref);
         }
