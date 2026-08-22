@@ -151,3 +151,49 @@ pub(crate) fn crypt_filter_method(encrypt: &Dictionary) -> Option<String> {
     };
     Some(String::from_utf8_lossy(cfm).to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypt_filter_method_reports_each_qpdf_shape() {
+        assert_eq!(crypt_filter_method(&Dictionary::new()), None);
+
+        let mut not_a_cf_dictionary = Dictionary::new();
+        not_a_cf_dictionary.insert("CF", Object::Name(b"StdCF".to_vec()));
+        assert_eq!(crypt_filter_method(&not_a_cf_dictionary), None);
+
+        let mut no_std_cf = Dictionary::new();
+        no_std_cf.insert("CF", Object::Dictionary(Dictionary::new()));
+        assert_eq!(crypt_filter_method(&no_std_cf), None);
+
+        let mut std_cf_not_a_dictionary = Dictionary::new();
+        let mut cf = Dictionary::new();
+        cf.insert("StdCF", Object::Name(b"not-a-dict".to_vec()));
+        std_cf_not_a_dictionary.insert("CF", Object::Dictionary(cf));
+        assert_eq!(crypt_filter_method(&std_cf_not_a_dictionary), None);
+
+        let mut missing_cfm = Dictionary::new();
+        let mut cf = Dictionary::new();
+        cf.insert("StdCF", Object::Dictionary(Dictionary::new()));
+        missing_cfm.insert("CF", Object::Dictionary(cf));
+        assert_eq!(crypt_filter_method(&missing_cfm), None);
+
+        let mut wrong_cfm_type = Dictionary::new();
+        let mut std_cf = Dictionary::new();
+        std_cf.insert("CFM", Object::Integer(4));
+        let mut cf = Dictionary::new();
+        cf.insert("StdCF", Object::Dictionary(std_cf));
+        wrong_cfm_type.insert("CF", Object::Dictionary(cf));
+        assert_eq!(crypt_filter_method(&wrong_cfm_type), None);
+
+        let mut valid = Dictionary::new();
+        let mut std_cf = Dictionary::new();
+        std_cf.insert("CFM", Object::Name(b"AESV2".to_vec()));
+        let mut cf = Dictionary::new();
+        cf.insert("StdCF", Object::Dictionary(std_cf));
+        valid.insert("CF", Object::Dictionary(cf));
+        assert_eq!(crypt_filter_method(&valid), Some("AESV2".to_owned()));
+    }
+}

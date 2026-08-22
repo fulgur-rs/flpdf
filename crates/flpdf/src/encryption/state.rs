@@ -631,3 +631,172 @@ pub(crate) fn first_file_id(trailer: &Dictionary) -> Result<&[u8]> {
         .into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_dictionary() -> Dictionary {
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("Filter", Object::Name(b"Standard".to_vec()));
+        encrypt.insert("V", Object::Integer(2));
+        encrypt.insert("R", Object::Integer(3));
+        encrypt.insert("P", Object::Integer(-4));
+        encrypt.insert("U", Object::String(vec![0; 32]));
+        encrypt.insert("O", Object::String(vec![0; 32]));
+        encrypt
+    }
+
+    fn legacy_trailer() -> Dictionary {
+        let mut trailer = Dictionary::new();
+        trailer.insert("ID", Object::Array(vec![Object::String(vec![1, 2, 3])]));
+        trailer
+    }
+
+    #[test]
+    fn dictionary_validation_reports_qpdf_error_shapes() {
+        let mut unsupported = legacy_dictionary();
+        unsupported.insert("Filter", Object::Name(b"Other".to_vec()));
+        assert!(standard_handler_inputs(&unsupported, &legacy_trailer()).is_err());
+
+        let mut wrong_length = legacy_dictionary();
+        wrong_length.insert("Length", Object::Name(b"bad".to_vec()));
+        assert!(standard_handler_inputs(&wrong_length, &legacy_trailer()).is_err());
+
+        let mut unsupported_v5 = legacy_dictionary();
+        unsupported_v5.insert("V", Object::Integer(4));
+        unsupported_v5.insert("R", Object::Integer(4));
+        assert!(standard_handler_r5_inputs(&unsupported_v5).is_err());
+
+        let mut bad_permissions = legacy_dictionary();
+        bad_permissions.insert("P", Object::Integer(i64::MAX));
+        assert!(standard_handler_inputs(&bad_permissions, &legacy_trailer()).is_err());
+
+        let mut missing = Dictionary::new();
+        assert!(required_integer(&missing, "V").is_err());
+        missing.insert("V", Object::Name(b"not-an-integer".to_vec()));
+        assert!(required_integer(&missing, "V").is_err());
+
+        assert!(required_name(&Dictionary::new(), "Filter").is_err());
+        let mut wrong_name = Dictionary::new();
+        wrong_name.insert("Filter", Object::Integer(1));
+        assert!(required_name(&wrong_name, "Filter").is_err());
+        wrong_name.insert("Filter", Object::Name(vec![0xff]));
+        assert!(required_name(&wrong_name, "Filter").is_err());
+
+        let mut wrong_32 = Dictionary::new();
+        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        wrong_32.insert("U", Object::Integer(1));
+        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        wrong_32.insert("U", Object::String(vec![0; 31]));
+        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+
+        let mut wrong_48 = Dictionary::new();
+        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        wrong_48.insert("U", Object::Integer(1));
+        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        wrong_48.insert("U", Object::String(vec![0; 47]));
+        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+
+        assert!(first_file_id(&Dictionary::new()).is_err());
+        let mut id = Dictionary::new();
+        id.insert("ID", Object::Name(b"not-an-array".to_vec()));
+        assert!(first_file_id(&id).is_err());
+        id.insert("ID", Object::Array(Vec::new()));
+        assert!(first_file_id(&id).is_err());
+        id.insert("ID", Object::Array(vec![Object::Integer(1)]));
+        assert!(first_file_id(&id).is_err());
+
+        assert!(encrypt_metadata_flag(&Dictionary::new()).unwrap());
+        let mut metadata = Dictionary::new();
+        metadata.insert("EncryptMetadata", Object::Integer(1));
+        assert!(encrypt_metadata_flag(&metadata).is_err());
+        metadata.insert("EncryptMetadata", Object::Boolean(false));
+        assert!(!encrypt_metadata_flag(&metadata).unwrap());
+    }
+
+    fn encrypted_perms(p: i32, encrypt_metadata: bool, edit: impl FnOnce(&mut [u8; 16])) -> Object {
+        let file_key = [0x42; 32];
+        let mut block = crate::encryption::standard::compute_perms_blob(
+            p,
+            encrypt_metadata,
+            &[1, 2, 3, 4],
+            &file_key,
+        );
+        crate::encryption::primitives::aes256_ecb_decrypt_block(&file_key, &mut block);
+        edit(&mut block);
+        crate::encryption::primitives::aes256_ecb_encrypt_block(&file_key, &mut block);
+        Object::String(block.to_vec())
+    }
+
+    fn perms_warning(
+        perms: Object,
+        file_key: &[u8],
+        expected: i32,
+        metadata: bool,
+    ) -> Option<String> {
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("Perms", perms);
+        r6_perms_warning(&encrypt, file_key, Permissions::new(expected), metadata).unwrap()
+    }
+
+    #[test]
+    fn perms_validation_covers_qpdf_warning_order() {
+        let key = [0x42; 32];
+        assert_eq!(
+            r6_perms_warning(&Dictionary::new(), &key, Permissions::new(-4), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            perms_warning(Object::Integer(1), &key, -4, true).as_deref(),
+            Some("R=6 /Perms entry is not a string")
+        );
+        assert_eq!(
+            perms_warning(Object::String(vec![0; 15]), &key, -4, true).as_deref(),
+            Some("R=6 /Perms entry is not 16 bytes")
+        );
+        assert_eq!(
+            perms_warning(Object::String(vec![0; 16]), &[0; 31], -4, true).as_deref(),
+            Some("R=6 /Perms cannot be verified with non-256-bit file key")
+        );
+        assert_eq!(
+            perms_warning(
+                encrypted_perms(-4, true, |block| block[8] = b'X'),
+                &key,
+                -4,
+                true
+            )
+            .as_deref(),
+            Some("R=6 /Perms encrypted-metadata flag is not T or F")
+        );
+        assert!(perms_warning(encrypted_perms(-4, true, |_| {}), &key, -3, true).is_some());
+        assert_eq!(
+            perms_warning(
+                encrypted_perms(-4, true, |block| block[4] = 0),
+                &key,
+                -4,
+                true
+            )
+            .as_deref(),
+            Some("R=6 /Perms reserved bytes are invalid")
+        );
+        assert_eq!(
+            perms_warning(encrypted_perms(-4, false, |_| {}), &key, -4, true).as_deref(),
+            Some("R=6 /Perms encrypted-metadata flag does not match /EncryptMetadata")
+        );
+        assert_eq!(
+            perms_warning(
+                encrypted_perms(-4, true, |block| block[9] = b'X'),
+                &key,
+                -4,
+                true
+            )
+            .as_deref(),
+            Some("R=6 /Perms magic bytes are not 'adb'")
+        );
+        assert_eq!(
+            perms_warning(encrypted_perms(-4, true, |_| {}), &key, -4, true),
+            None
+        );
+    }
+}
