@@ -107,7 +107,14 @@ impl EncryptionState {
         self.encryption_v < 4 || !matches!(method, EncryptionMode::Identity)
     }
 
-    /// qpdf `QPDF::compute_data_key` (`QPDF_encryption.cc:325-357`).
+    /// qpdf `QPDF::compute_data_key` (`QPDF_encryption.cc:325-357`),
+    /// Algorithm 3.1 from the PDF 1.7 Reference Manual.
+    ///
+    /// Not the same function as [`super::keys::per_object_key`], which
+    /// truncates to `min(file_key.len() + 5, 16)` and so drops the four salt
+    /// bytes from the length qpdf takes the minimum against. The two agree for
+    /// every `/V` and `/R` pair the standard handler actually admits, because
+    /// AES requires a 128-bit key and `min(21, 16) == min(25, 16)`.
     pub(crate) fn compute_data_key(&self, og: ObjectRef, use_aes: bool) -> Vec<u8> {
         let mut result = self.file_key.clone();
         if self.encryption_v >= 5 {
@@ -266,16 +273,48 @@ pub(crate) fn authenticate(
 
     let (file_key, encrypt_metadata, weak_crypto, user_password_matched, owner_password_matched) =
         if password_is_hex_key {
+            // qpdf `--password-is-hex-key`: the value passed via --password is
+            // the precomputed file encryption key as hex, NOT a user/owner
+            // password. We skip ALL password→key derivation (Algorithm 2 /
+            // 2.A / 2.B / 6 / 7) and the layer-2 user/owner attempt +
+            // bad-password ordering block entirely. This is a SEPARATE
+            // sibling branch: the `else` below preserves layer-2's password
+            // authentication logic (flpdf-9hc.3.21).
+            //
+            // revision / crypt_filters / encrypt_ref / permissions and the
+            // crypt-filter methods are already determined above and do NOT
+            // depend on the password. /EncryptMetadata is likewise
+            // password-independent; compute it with the SAME revision-aware
+            // split layer-2 uses.
             let file_key = decode_hex_file_key(raw_password)?;
             let (encrypt_metadata, weak_crypto) = if matches!(revision, 5 | 6) {
                 let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
+                // Same weak-crypto classification as layer-2's R5/R6 branch.
                 (encrypt_metadata, revision == 5 || rc4_in_use())
             } else {
                 let inputs = standard_handler_inputs(encrypt, trailer)?;
                 (inputs.encrypt_metadata, rc4_in_use())
             };
+            // A raw key bypasses authentication, so neither the user nor the
+            // owner password was matched. qpdf likewise reports no password
+            // match for `--password-is-hex-key`; report both as false.
             (file_key, encrypt_metadata, weak_crypto, false, false)
         } else if matches!(revision, 5 | 6) {
+            // Authentication error behavior must match qpdf (see
+            // flpdf-9hc.3.21):
+            //
+            //   1. Password authentication runs FIRST.  If neither the user nor
+            //      the owner password authenticates, return `BadPassword`.
+            //   2. A wrong-length `/U` or `/O` entry on this authentication
+            //      path is reported as `BadPassword` (an unusable credential
+            //      entry is indistinguishable from a wrong password to a
+            //      caller), not `Malformed`.  This is scoped to the auth path
+            //      via `standard_handler_r5_inputs` (its only caller); all
+            //      other `Malformed` reclassification is intentionally NOT done
+            //      (e.g. `/UE`/`/OE` length errors stay `Malformed`).
+            //
+            // Keep this authentication ordering identical in the `else`
+            // (V<5 / V=4) branch below.
             let inputs =
                 standard_handler_r5_inputs(encrypt).map_err(map_uo_length_to_bad_password)?;
             let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
@@ -308,6 +347,8 @@ pub(crate) fn authenticate(
             let inputs = standard_handler_inputs(encrypt, trailer)?;
             let encrypt_metadata = inputs.encrypt_metadata;
             let weak_crypto = rc4_in_use();
+            // Password authentication runs before any state is committed, so
+            // both failing attempts return `BadPassword`.
             let v4_path = inputs.v == 4 && inputs.r == 4;
             let user_attempt = if v4_path {
                 check_user_password_v4(&password, &inputs)
@@ -426,6 +467,16 @@ fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5I
     })
 }
 
+/// Scoped to the V=5 R=5/R=6 authentication path (the sole caller of
+/// `standard_handler_r5_inputs`): a `/U` or `/O` entry that is not exactly
+/// 48 bytes is an unusable credential entry that is indistinguishable, from a
+/// caller's perspective, from supplying the wrong password — qpdf reports
+/// "invalid password" here, so we map to `BadPassword` for parity.
+///
+/// Only the `/U` / `/O` *length* error is remapped. `/UE` / `/OE` length
+/// errors, missing entries, and non-string entries stay `Malformed`: those are
+/// genuine structural defects, not credential mismatches. No broader
+/// `Malformed` reclassification is performed.
 fn map_uo_length_to_bad_password(err: crate::Error) -> crate::Error {
     match &err {
         crate::Error::Encrypted(crate::error::EncryptedError::Malformed { reason })

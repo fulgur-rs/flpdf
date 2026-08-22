@@ -83,7 +83,7 @@ itself.
 
 | qpdf ファイル | flpdf 受け皿 |
 |---|---|
-| `QPDF_encryption.cc` | `encryption/standard.rs` + `writer.rs` の encryption context + `encrypt_setup.rs` + `permissions.rs` + `encryption/password.rs` |
+| `QPDF_encryption.cc` | `encryption.rs` + `encryption/{state,standard,crypt_filters,keys,permissions,password,primitives,rc4}.rs` + `writer.rs` の encryption context |
 | `QPDF_json.cc` | `document_json.rs`（出力側） + `json/document.rs`（入力境界） |
 | `QPDF_linearization.cc` | `linearization/` |
 | `QPDF_optimization.cc` | `optimization.rs` |
