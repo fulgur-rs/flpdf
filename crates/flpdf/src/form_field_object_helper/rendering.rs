@@ -3181,10 +3181,10 @@ mod tests {
                 .expect("canonical Tx generation")
                 .expect("Tx field is handled");
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve appearance") else {
-            panic!("appearance must be a stream");
+            panic!("appearance must be a stream"); // cov:ignore: canonical fixture always installs a Form stream
         };
         let Object::Dictionary(resources) = stream.dict.get("Resources").expect("resources") else {
-            panic!("resources must be a dictionary");
+            panic!("resources must be a dictionary"); // cov:ignore: canonical fixture always installs a resource dictionary
         };
         assert!(
             resources.get("Font").is_none(),
@@ -3204,19 +3204,120 @@ mod tests {
                 .expect("canonical Tx generation")
                 .expect("Tx field is handled");
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve appearance") else {
-            panic!("appearance must be a stream");
+            panic!("appearance must be a stream"); // cov:ignore: canonical fixture always installs a Form stream
         };
         let Object::Dictionary(resources) = stream.dict.get("Resources").expect("resources") else {
-            panic!("resources must be a dictionary");
+            panic!("resources must be a dictionary"); // cov:ignore: canonical fixture always installs a resource dictionary
         };
         let Object::Dictionary(fonts) = resources.get("Font").expect("font resources") else {
-            panic!("font resources must be a dictionary");
+            panic!("font resources must be a dictionary"); // cov:ignore: canonical fixture always installs a font dictionary
         };
         assert_eq!(
             fonts.get("F1"),
             Some(&Object::Reference(ObjectRef::new(5, 0))),
             "qpdf reuses the /DR font object instead of synthesizing a duplicate"
         );
+    }
+
+    fn pdf_with_objects(objects: &[String]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+        }
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    fn existing_ap_with_dr_font_pdf(resources_indirect: bool) -> Vec<u8> {
+        let resources = if resources_indirect { "7 0 R" } else { "<<>>" };
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR << /Font << /F1 6 0 R >> >> /DA (/F1 12 Tf 0 g) >> >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) /Rect [10 10 200 30] /AP << /N 5 0 R >> >>".to_string(),
+            format!("<< /Type /XObject /Subtype /Form /BBox [0 0 190 20] /Resources {resources} /Length 4 >>\nstream\nq Q\nendstream"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+        ];
+        if resources_indirect {
+            objects.push("<<>>".to_string());
+        }
+        pdf_with_objects(&objects)
+    }
+
+    #[test]
+    fn canonical_tx_adds_a_dr_font_to_direct_and_indirect_existing_resources() {
+        for resources_indirect in [false, true] {
+            let mut pdf = Pdf::open(Cursor::new(existing_ap_with_dr_font_pdf(
+                resources_indirect,
+            )))
+            .expect("parse existing AP");
+            let reference =
+                render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                    .expect("generate")
+                    .expect("Tx handled");
+            assert_eq!(reference, ObjectRef::new(5, 0));
+            let stream = pdf.get_object_handle(reference);
+            pdf.resolve_object_handle(&stream).expect("resolve stream");
+            let resources = stream
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .get_key(b"/Resources");
+            pdf.resolve_object_handle(&resources)
+                .expect("resolve resources");
+            let fonts = resources.get_key(b"/Font");
+            pdf.resolve_object_handle(&fonts).expect("resolve fonts");
+            assert_eq!(
+                fonts.get_key(b"/F1").object_ref(),
+                Some(ObjectRef::new(6, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_tx_uses_a_local_winansi_appearance_font() {
+        let raw = build_ch_pdf_with_extras(
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) /DA (/F1 12 Tf 0 g) /Rect [10 10 200 30] /AP << /N 5 0 R >> >>",
+            &[
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 190 20] /Resources << /Font << /F1 6 0 R >> >> /Length 4 >>\nstream\nq Q\nendstream",
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+            ],
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse local AP resource");
+        let reference =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("generate")
+                .expect("Tx handled");
+        assert_eq!(reference, ObjectRef::new(5, 0));
+    }
+
+    #[test]
+    fn canonical_choice_uses_the_same_resource_lookup_boundary() {
+        let raw = build_ch_pdf_obj4(
+            "<< /Type /Annot /Subtype /Widget /FT /Ch /V (Beta) /Opt [(Alpha) (Beta)] /DA (/Helv 10 Tf 0 g) /Rect [10 10 200 30] >>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        assert!(render_choice_field_canonical(
+            &mut pdf,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("generate choice")
+        .is_some());
     }
 
     fn replace_bytes_once(input: &mut Vec<u8>, from: &[u8], to: &[u8]) {
