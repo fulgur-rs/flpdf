@@ -63,6 +63,13 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
             continue;
         }
         pdf.resolve_object_handle(&value)?;
+        if value.as_dictionary().is_none() {
+            // qpdf only shallow-copies and mutates a category when
+            // `dict.isDictionary()` (`QPDFPageObjectHelper.cc:576-585`); a
+            // malformed category is left as its original (possibly indirect)
+            // value, never replaced or removed.
+            continue;
+        }
         let dictionary = if value.is_indirect() {
             let copy = value.shallow_copy()?;
             resources.replace_key(category, copy.clone())?;
@@ -70,12 +77,6 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
         } else {
             value
         };
-        if dictionary.as_dictionary().is_none() {
-            if category == b"/XObject" {
-                resources.remove_key(category);
-            }
-            continue;
-        }
         let names = finder.names();
         let remove = dictionary
             .as_dictionary()
@@ -158,6 +159,11 @@ fn prune_canonical_resource_target<R: Read + Seek>(
             continue;
         }
         pdf.resolve_object_handle(&value)?;
+        if value.as_dictionary().is_none() {
+            // qpdf leaves a malformed /Font or /XObject category untouched;
+            // see the matching comment in remove_unreferenced_resources_on_page.
+            continue;
+        }
         let dictionary = if value.is_indirect() {
             let copy = value.shallow_copy()?;
             resources.replace_key(category, copy.clone())?;
@@ -165,12 +171,6 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         } else {
             value
         };
-        if dictionary.as_dictionary().is_none() {
-            if category == b"/XObject" {
-                resources.remove_key(category);
-            }
-            continue;
-        }
         let live_keys = dictionary.try_get_keys()?;
         known_names.extend(
             live_keys
@@ -430,9 +430,8 @@ fn prune_font_and_xobject_dictionaries<R: Read + Seek>(
         let Some(mut dictionary) =
             resolve_resource_reference(pdf, &value)?.and_then(|(object, _)| object.into_dict())
         else {
-            if category == b"XObject" {
-                resources.remove(category);
-            }
+            // qpdf leaves a malformed /Font or /XObject category untouched;
+            // see the matching comment in remove_unreferenced_resources_on_page.
             continue;
         };
         let names = used.get(category).cloned().unwrap_or_default();
@@ -1189,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_declared_xobject_is_skipped_like_qpdf() {
+    fn malformed_declared_xobject_does_not_abort_pruning_like_qpdf() {
         let bytes = remove_xref_for_recovery_probe(build_page_with_resources_carrier_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
                /Resources << /XObject << /Fm 4 0 R >> >> >>",
@@ -1213,14 +1212,22 @@ mod tests {
             .get("XObject")
             .and_then(Object::as_dict)
             .expect("XObject category should remain a dictionary");
+        // The page has no /Contents, so ResourceFinder records no used names;
+        // "Fm" is removed by ordinary unreferenced-name pruning
+        // (`QPDFPageObjectHelper.cc:596-604`), not because its target (object
+        // 4, malformed) fails to resolve. `resolve_resource_reference` only
+        // has to keep pruning from aborting when it walks that target during
+        // the Form pre-pass; qpdf itself never dereferences a declared
+        // XObject's target here (removal is name-based).
         assert!(
             xobjects.get("Fm").is_none(),
-            "qpdf drops a malformed declared XObject during pruning"
+            "an unreferenced declared XObject name is pruned regardless of \
+             whether its target resolves"
         );
     }
 
     #[test]
-    fn malformed_xobject_category_is_skipped_like_qpdf() {
+    fn malformed_xobject_category_is_left_unchanged_like_qpdf() {
         let bytes = build_page_with_resources_carrier_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
                /Resources << /XObject 4 0 R >> >>",
@@ -1231,18 +1238,34 @@ mod tests {
         remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
             .expect("malformed XObject category must be skipped, not abort pruning");
 
-        let mut page_helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-        let resources = page_helper
-            .get_resources(false)
-            .expect("page resources should remain available");
-        assert!(
-            resources.get_key(b"/XObject").is_null(),
-            "qpdf drops a malformed XObject category during pruning"
+        // qpdf's `removeUnreferencedResourcesHelper` (`QPDFPageObjectHelper.cc:576-585`)
+        // only shallow-copies and prunes a category when `dict.isDictionary()`;
+        // a malformed category is never passed to `removeKey`, so its
+        // original indirect reference survives untouched in the written
+        // dictionary. Verified live against qpdf 11.9.0
+        // (`--remove-unreferenced-resources=yes --pages . 1 --` on a minimal
+        // fixture leaves a non-dictionary `/XObject` value in place). Read
+        // through the materialized `Object` (rather than an `ObjectHandle`
+        // dereference, which collapses an unresolvable indirect target to
+        // null) to check the value actually stored at the key.
+        let page = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .expect("page should resolve")
+            .into_dict()
+            .expect("page should remain a dictionary");
+        let resources = page
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("page resources should remain a dictionary");
+        assert_eq!(
+            resources.get("XObject"),
+            Some(&Object::Reference(ObjectRef::new(4, 0))),
+            "qpdf leaves a malformed XObject category in place during pruning"
         );
     }
 
     #[test]
-    fn direct_non_dictionary_xobject_category_is_removed_like_qpdf() {
+    fn direct_non_dictionary_xobject_category_is_preserved_like_qpdf() {
         let bytes = build_page_with_resources_carrier_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
                /Resources << /XObject 42 >> >>",
@@ -1257,11 +1280,11 @@ mod tests {
         let resources = page_helper
             .get_resources(false)
             .expect("page resources should remain available");
-        assert!(resources.get_key(b"/XObject").is_null());
+        assert_eq!(resources.get_key(b"/XObject").as_integer(), Some(42));
     }
 
     #[test]
-    fn form_resource_pruning_removes_non_dictionary_xobject_category() {
+    fn form_resource_pruning_preserves_non_dictionary_xobject_category() {
         let mut pdf = Pdf::empty().expect("empty PDF should be constructible");
         let mut resources = Dictionary::new();
         resources.insert("XObject", Object::Integer(42));
@@ -1269,7 +1292,7 @@ mod tests {
         prune_font_and_xobject_dictionaries(&mut pdf, &mut resources, &BTreeMap::new())
             .expect("malformed resource categories should be recoverable");
 
-        assert!(resources.get("XObject").is_none());
+        assert_eq!(resources.get("XObject"), Some(&Object::Integer(42)));
     }
 
     // ISO 32000-1 §8.6.8: only /DeviceGray, /DeviceRGB, /DeviceCMYK, /Pattern
