@@ -1301,7 +1301,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// Remove an object's source-xref row while retaining an outstanding
     /// canonical handle's indirect identity for the legacy `delete_object`
-    /// contract. The qpdf-facing object snapshot filters the retained missing
+    /// contract. The qpdf-facing object snapshot filters the retained null
     /// slot through `qpdf_removed_refs`; that Pdf-facing snapshot concern is
     /// separate from both qpdf's local xref-registration suppression
     /// (`QPDF.cc:1187-1210`) and `removeObject` cache mutation
@@ -1316,7 +1316,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.object_cache.get(&object_ref).cloned()
         };
         if let Some(handle) = cached {
-            handle.set_missing();
+            handle.set_resolved(ObjectValue::Null);
         }
         Ok(())
     }
@@ -2001,7 +2001,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
 
             if malformed {
-                member_handle.set_missing();
+                member_handle.set_resolved(ObjectValue::Null);
             } else {
                 member_handle.set_resolved(value);
                 member_handle.set_parsed_offset_if_unset(parsed_offset);
@@ -2037,7 +2037,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         match self.resolve_object_stream_with_failure_kind(stream_number) {
             Ok(()) => {
                 if !handle.is_resolved() {
-                    handle.set_missing();
+                    handle.set_resolved(ObjectValue::Null);
                 }
             }
             Err(ObjectStreamResolutionError::WarningDelivery(error)) => return Err(error),
@@ -2049,7 +2049,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }) => {
                 self.push_object_stream_warning(stream_number, object_ref, offset, message)?;
                 if !handle.is_resolved() {
-                    handle.set_missing();
+                    handle.set_resolved(ObjectValue::Null);
                 }
             }
             Err(ObjectStreamResolutionError::Operation(error))
@@ -2060,7 +2060,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // cache the requested object as null (`QPDF.cc:1724-1750`).
                 self.push_caught_resolution_warning(error)?;
                 if !handle.is_resolved() {
-                    handle.set_missing();
+                    handle.set_resolved(ObjectValue::Null);
                 }
             }
             Err(ObjectStreamResolutionError::Operation(error)) => return Err(error),
@@ -2105,9 +2105,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let handle = self.get_object_handle(object_ref);
         if malformed && matches!(&value, ObjectValue::Null) {
             // The qpdf parser recovers a damaged scalar/container close as a
-            // visible null, but the tree consumer still needs to distinguish
-            // that source damage from a literal null object.
-            handle.set_missing();
+            // visible null. Source damage remains observable through the
+            // diagnostics; the value itself follows qpdf's null fallback.
+            handle.set_resolved(ObjectValue::Null);
             return;
         }
         handle.set_resolved(value);
@@ -3895,44 +3895,26 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// `"belongs to a dropped PDF"` when it cannot upgrade its `Weak`, which
     /// is a different failure from this one.
     ///
-    /// # The loop branch
+    /// # The null fallback
     ///
-    /// qpdf's loop branch (`libqpdf/QPDF.cc:1706-1712`) does three things:
-    /// warns `damagedPDF("", "loop detected resolving object " +
-    /// og.unparse(' '))`, calls `updateCache(og, QPDF_Null::create(), -1, -1)`,
-    /// and returns without throwing. All three are ported; the notes below are
-    /// on *how*, and on the one qpdf side effect that stays out.
-    ///
-    /// *Null at offset -1* is [`ObjectHandle::set_missing`], not
-    /// `set_resolved(ObjectValue::Null)`. qpdf draws no distinction to port
-    /// here — a loop and an object absent from the xref table both end at the
-    /// same `updateCache(og, QPDF_Null::create(), -1, -1)` call (`:1711` and
-    /// `:1748`) — so the loop takes whichever route flpdf's absent-reference
-    /// case already takes, which is `set_missing` (`reader.rs`'s
-    /// `resolve_object_handle`). It is also the one that clears the parsed
-    /// offset, matching qpdf's `-1` argument; `set_resolved` leaves any
-    /// recorded offset in place. The design's Parsed-Offset Contract names
-    /// "cyclic" in the set `set_missing`'s own doc quotes.
-    ///
-    /// The two routes really are different internal states, so the choice was
-    /// checked rather than assumed: `IndirectState::Missing` presents as null
-    /// through `with_value` but hands out no `&mut` through `with_value_mut`,
-    /// where `Resolved(ObjectValue::Null)` hands out one. Nothing can observe
-    /// that today — all six `with_value_mut` callers (`replace_key`,
-    /// `remove_key`, `replace_array_item`, `replace_array_items`,
-    /// `replace_stream_data`, `append_array_item`) match on a container
-    /// variant that `Null` is not, so both routes are the same no-op. Whoever
-    /// gives a null value a mutable meaning should re-check this against qpdf,
-    /// where the loop's cache entry is a live `QPDF_Null` in `m->obj_cache`.
+    /// qpdf's loop and catch branches (`libqpdf/QPDF.cc:1706-1749`) warn,
+    /// call `updateCache(og, QPDF_Null::create(), -1, -1)`, and return without
+    /// throwing. The canonical handle route uses
+    /// `set_resolved(ObjectValue::Null)`, which updates the shared value and
+    /// clears its source provenance before any parsed literal-null offset is
+    /// installed. There is deliberately no value-layer distinction between a
+    /// dangling reference, a resolution loop, damaged input, and a literal
+    /// null; xref/cache metadata remains the source-of-truth for whether a
+    /// reference existed (`QPDF::Members::xref_table`, `QPDF.cc:1716-1748`).
     ///
     /// *The canonical cache* needs no separate write. The `handle` this was
     /// called with is already the [`ResolverCore::object_cache`] entry for
     /// `object_ref` — [`ObjectHandle::try_dereference`] can only reach here
     /// through a handle carrying this resolver's `Weak`, and
     /// [`Self::get_object_handle`] is the only thing that mints one — so
-    /// `set_missing` writes straight through the cached slot, which is what
-    /// qpdf's `updateCache` achieves with `cache.object->assign(...)`
-    /// (`libqpdf/QPDF.cc:1849-1853`).
+    /// `set_resolved(ObjectValue::Null)` writes straight through the cached
+    /// slot, which is what qpdf's `updateCache` achieves with
+    /// `cache.object->assign(...)` (`libqpdf/QPDF.cc:1849-1853`).
     ///
     /// qpdf's other `updateCache` branch, the insert, is unreachable from
     /// `QPDF::resolve`: `QPDF::getObject` has already put a `QPDF_Unresolved`
@@ -4059,7 +4041,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // flpdf's structural equivalent; I/O, encryption,
                 // and diagnostic-channel failures remain caller errors.
                 self.push_caught_resolution_warning(error)?;
-                handle.set_missing();
+                handle.set_resolved(ObjectValue::Null);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -4082,7 +4064,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "loop detected resolving object {} {}",
                 object_ref.number, object_ref.generation
             ))?;
-            handle.set_missing();
+            handle.set_resolved(ObjectValue::Null);
             return Ok(());
         };
         let entry = self.xref_entry(object_ref);
@@ -4092,7 +4074,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "object {}/{} has unexpected xref entry type",
                 object_ref.number, object_ref.generation
             ))?;
-            handle.set_missing();
+            handle.set_resolved(ObjectValue::Null);
             return Ok(());
         }
 
@@ -4106,7 +4088,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // into a resolution-time xref-recovery trigger.
                 if offset == 0 {
                     self.push_warning_at(0, "object has offset 0")?;
-                    handle.set_missing();
+                    handle.set_resolved(ObjectValue::Null);
                     return Ok(());
                 }
                 let attempt_recovery = self.attempt_recovery();
@@ -4123,7 +4105,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                             // qpdf's common resolve tail sees the
                             // requested slot still unresolved after
                             // caching the header's actual generation.
-                            handle.set_missing();
+                            handle.set_resolved(ObjectValue::Null);
                         }
                         Ok(())
                     }
@@ -4134,7 +4116,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                 let parsed_ref = parsed.object_ref;
                                 self.cache_parsed_object(parsed);
                                 if parsed_ref != object_ref {
-                                    handle.set_missing(); // cov:ignore: reconstructed xref keys the exact parsed object reference
+                                    handle.set_resolved(ObjectValue::Null); // cov:ignore: reconstructed xref keys the exact parsed object reference
                                 }
                                 Ok(())
                             }
@@ -4144,7 +4126,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                             object_ref.number, object_ref.generation
                                         );
                                 self.push_warning(warning)?;
-                                handle.set_missing();
+                                handle.set_resolved(ObjectValue::Null);
                                 Ok(())
                             }
                             // cov:ignore-start: resolution-time reconstruct_xref records only type-1 entries; type-2 retry handoff belongs to xref-stream recovery before resolution
@@ -4174,13 +4156,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 self.resolve_object_stream_or_null(stream, handle)
             }
             Some(XrefEntry::Free { .. }) => {
-                handle.set_missing();
+                handle.set_resolved(ObjectValue::Null);
                 Ok(())
             }
             None => {
                 // qpdf QPDF::resolve fallback (QPDF.cc:1745-1748):
                 // Absent entries resolve to null without invoking reconstruction.
-                handle.set_missing();
+                handle.set_resolved(ObjectValue::Null);
                 Ok(())
             }
         };
@@ -7496,10 +7478,9 @@ mod tests {
     /// 2. the handle reads as null and its parsed offset has been *cleared*,
     ///    qpdf's `updateCache(og, QPDF_Null::create(), -1, -1)` (`:1711`),
     ///    which writes `-1` over whatever the cache entry held. The offset is
-    ///    pre-set below only so that assertion can tell the two null routes
-    ///    apart: a freshly vended handle already reports `NO_PARSED_OFFSET`,
-    ///    so `set_resolved(ObjectValue::Null)` — which leaves the offset
-    ///    untouched — would otherwise satisfy it by accident;
+    ///    pre-set below so the assertion proves that the null cache update
+    ///    clears an existing source offset rather than merely observing the
+    ///    freshly vended `NO_PARSED_OFFSET` sentinel;
     /// 3. the mark is *still* held after the inner call returns. qpdf reaches
     ///    its `return` at `:1712` before constructing `ResolveRecorder rr` at
     ///    `:1714`, so the inner call never owns a recorder and never erases
@@ -9377,7 +9358,7 @@ mod tests {
     /// **The only fixture where the nested resolution re-enters on the *same*
     /// handle**, which is what makes it more than a restatement of the
     /// sibling-`/Length` seam test above.
-    /// [`crate::ObjectHandle::set_missing`] takes `borrow_mut()` on the very
+    /// [`crate::ObjectHandle::set_resolved`] takes `borrow_mut()` on the very
     /// slot the outer frame is part-way through resolving — a second
     /// `RefCell`, distinct from [`super::ResolverCore`]'s. That much is
     /// latent rather than load-bearing, and the reason is checkable rather

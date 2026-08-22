@@ -4236,8 +4236,8 @@ pub(crate) mod tests {
         // `filter_obj.isNull()` (`libqpdf/QPDF_Stream.cc:391`) dereferences, so
         // a dangling `/Filter` reference reads as "no filters" rather than as
         // a bad filter type. That is the shape a broken reference takes once
-        // `flpdf-25kg.3.5` wires the resolver: `set_missing` resolves the slot
-        // to null (pinned by `set_missing_marks_the_handle_resolved_to_null`,
+        // `flpdf-25kg.3.5` wires the resolver: `set_resolved(Null)` resolves the slot
+        // to null (pinned by `set_resolved_with_a_null_value_uses_the_null_value_layer`,
         // `object_handle.rs`).
         let (filter, _resolver) = resolver_bearing_handle(ObjectValue::Null);
 
@@ -4295,10 +4295,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn handle_reader_omits_direct_indirect_and_missing_null_valued_keys() {
+    fn handle_reader_omits_direct_and_indirect_null_valued_keys() {
         let (indirect_null, _resolver) = resolver_bearing_handle(ObjectValue::Null);
         let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(21, 0), -1);
-        missing.set_missing();
+        missing.set_resolved(ObjectValue::Null);
         let parms = ObjectHandle::dictionary(vec![
             (b"Columns".to_vec(), ObjectHandle::integer(4)),
             (b"Predictor".to_vec(), ObjectHandle::null()),

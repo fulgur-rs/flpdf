@@ -1504,7 +1504,7 @@ impl<R: Read + Seek> Pdf<R> {
         // qpdf erases the source xref row and canonical object-cache entry
         // while nullifying every outstanding handle (`QPDF.cc:1996-2004`).
         // Keep the indirect identity for this legacy public API, but remove
-        // the source row and mark the retained handle missing. The qpdf-facing
+        // the source row and resolve the retained handle to null. The qpdf-facing
         // object snapshot filters this compatibility slot below.
         self.promote_resolved_object_stream_members(object_ref)
             .expect("a parsed ObjStm member must be representable as an ObjectHandle");
@@ -1524,7 +1524,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.legacy_materialized_replacement_refs
             .remove(&object_ref);
         self.handle_mutated_object_refs.remove(&object_ref);
-        self.get_object_handle(object_ref).set_missing();
+        self.get_object_handle(object_ref)
+            .set_resolved(ObjectValue::Null);
 
         if matches!(
             self.cache.entry(object_ref),
@@ -1636,7 +1637,7 @@ impl<R: Read + Seek> Pdf<R> {
             .filter_map(|handle| {
                 let object_ref = handle.object_ref()?;
                 let cache_entry = self.cache.entry(object_ref);
-                if handle.is_missing() || matches!(cache_entry, Some(CacheEntry::Missing)) {
+                if matches!(cache_entry, Some(CacheEntry::Missing)) {
                     return None;
                 }
                 if live_only && self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
@@ -2340,7 +2341,9 @@ impl<R: Read + Seek> Pdf<R> {
                 continue;
             }
             let handle = self.get_object_handle(object_ref);
-            if !handle.is_resolved() || handle.is_missing() {
+            if !handle.is_resolved()
+                || matches!(self.cache.entry(object_ref), Some(CacheEntry::Missing))
+            {
                 // `parsed_xref_streams` is owned here, but every value is an
                 // xref-stream object read by `read_xrefStream`, so the
                 // `Object::Stream` arm is the one that always applies in
@@ -2508,7 +2511,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// # Errors
     ///
     /// I/O, parse, filter, or decryption failures propagate. Free, absent, or
-    /// overridden references resolve to the canonical null/missing state.
+    /// overridden references resolve to the canonical null fallback.
     pub fn resolve_object_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
         // ObjectHandle resolution is qpdf's canonical cache operation. The
         // resolver owns the source xref table, live parser, stream pipeline,
@@ -2666,7 +2669,7 @@ impl<R: Read + Seek> Pdf<R> {
     ) -> Result<(ObjectHandle, Option<ObjectRef>)> {
         self.resolve_object_handle(handle)?;
         let Some(mut current_ref) = handle.as_reference() else {
-            // already terminal (the common case) — or unresolved/missing;
+            // already terminal (the common case) — or unresolved/null;
             // `handle.object_ref()` is already the correct terminal ref,
             // `None` for an originally-direct handle.
             return Ok((handle.clone(), handle.object_ref()));
@@ -2699,7 +2702,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // simply redoes the chase rather than being stuck observing
                 // a stale result.
                 //
-                // `hop` is always Resolved or Missing here, so it presents a
+                // `hop` is always a resolved value here, so it presents a
                 // value exactly as a copy of it would: the one state that
                 // would differ, `Unresolved`, needs `resolve_object_handle`
                 // to have hit a `CacheEntry::Reserved` entry, and that guard
@@ -2992,7 +2995,7 @@ impl<R: Read + Seek> Pdf<R> {
                     .get(&object_ref)
                     .expect("inserted materialized ObjectHandle value"));
             }
-            return Ok(&NULL_OBJECT); // cov:ignore: a successful canonical resolve always leaves a missing handle resolved
+            return Ok(&NULL_OBJECT); // cov:ignore: a successful canonical resolve always leaves a null handle resolved
         }
 
         // qpdf has one object cache. A canonical producer may have resolved a
@@ -3268,14 +3271,10 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.set_reserved(expected_ref);
         let length_handle = self.get_object_handle(holder);
         let resolved_object = if length_handle.is_resolved() {
-            if length_handle.is_missing() {
-                Ok(None)
-            } else {
-                match length_handle.try_as_integer()? {
-                    Some(value) => Ok(Some(ResolvedStreamLength::Integer(value))),
-                    None if length_handle.is_null() => Ok(None),
-                    None => Ok(Some(ResolvedStreamLength::Invalid)),
-                }
+            match length_handle.try_as_integer()? {
+                Some(value) => Ok(Some(ResolvedStreamLength::Integer(value))),
+                None if length_handle.is_null() => Ok(None),
+                None => Ok(Some(ResolvedStreamLength::Invalid)),
             }
         } else {
             // Stream framing is qpdf's readObjectAtOffset recovery boundary
@@ -3685,7 +3684,10 @@ impl<R: Read + Seek> Pdf<R> {
         } else {
             self.resolve_object_handle(&stream_handle).err()
         };
-        if !prefer_legacy_framing && canonical_error.is_none() && !stream_handle.is_missing() {
+        if !prefer_legacy_framing
+            && canonical_error.is_none()
+            && stream_handle.as_stream_dict().is_some()
+        {
             return Ok(Some(stream_handle));
         }
 
@@ -7029,10 +7031,10 @@ mod tests {
     }
 
     #[test]
-    fn dropping_pdf_preserves_a_surviving_missing_handle() {
+    fn dropping_pdf_preserves_a_surviving_null_resolved_handle() {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(91, 0));
-        handle.set_missing();
+        handle.set_resolved(ObjectValue::Null);
         assert!(handle.is_indirect());
         assert!(handle.is_null());
 
@@ -11346,7 +11348,8 @@ mod tests {
 
         let missing_ref = ObjectRef::new(102, 0);
         let missing = pdf.get_object_handle(missing_ref);
-        missing.set_missing();
+        missing.set_resolved(ObjectValue::Null);
+        pdf.cache.set_missing(missing_ref);
         pdf.install_test_parsed_xref_stream_handle(missing_ref, historical)
             .expect("restore missing historical entry");
 
@@ -11499,12 +11502,10 @@ mod tests {
     fn live_object_refs_excludes_deleted_canonical_registry_slots() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let deleted_ref = ObjectRef::new(99, 0);
-        let handle = pdf.get_object_handle(deleted_ref);
-        assert!(!handle.is_missing());
-
         // Keep the canonical handle registered while presenting the legacy
         // cache state that live enumeration must filter out. `delete_object`
-        // also marks the handle missing, which exercises a different guard.
+        // also marks the cache entry deleted, which exercises the same
+        // qpdf-facing source-xref guard.
         pdf.cache.set_deleted(deleted_ref);
 
         assert!(pdf.object_refs().contains(&deleted_ref));

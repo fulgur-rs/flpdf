@@ -264,20 +264,6 @@ fn resolved_array<R: Read + Seek>(
     }))
 }
 
-fn reject_missing_array_source(
-    node: &NodeHandle,
-    key: &str,
-    source: Option<&ObjectHandle>,
-) -> Result<()> {
-    if source.is_some_and(ObjectHandle::is_missing) {
-        return Err(structural_error(
-            node.diagnostic_ref(),
-            format!("/{key} is not an array"),
-        ));
-    }
-    Ok(())
-}
-
 fn resolved_key<K: TreeKey, R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: &ObjectHandle,
@@ -348,11 +334,9 @@ impl LiveDictionary {
     fn get(&self, key: &str) -> Option<ObjectHandle> {
         let key = self.actual_key(key);
         let value = self.handle.try_get_key(&key).ok();
-        // Keep a resolved-missing child in the tree walk. `resolved_array`
-        // uses that state to emit qpdf's structural `/Names` or `/Kids`
-        // error; filtering it as ordinary null would incorrectly turn a
-        // malformed indirect child into an empty node.
-        value.filter(|value| !value.is_null() || value.is_missing())
+        // qpdf dereferences the value before its array/type checks, so a
+        // dangling reference has the same null outcome as a literal null.
+        value.filter(|value| !value.is_null())
     }
 
     fn insert(&self, key: &str, value: ObjectHandle) -> Result<()> {
@@ -370,9 +354,7 @@ impl LiveDictionary {
         self.handle
             .try_get_key(&key)
             .ok()
-            // See `get`: a missing child is still a structural key for the
-            // next qpdf-shaped validation step.
-            .is_some_and(|value| !value.is_null() || value.is_missing())
+            .is_some_and(|value| !value.is_null())
     }
 
     fn mark_dirty<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
@@ -2342,10 +2324,8 @@ impl<K: TreeKey> NNTree<K> {
                 .map_err(|_| structural_error(node.diagnostic_ref(), "bad node during find"))?;
             let items_source = dictionary.get(K::ITEMS_KEY);
             let items = resolved_array(pdf, items_source.as_ref())?;
-            reject_missing_array_source(&node, K::ITEMS_KEY, items_source.as_ref())?;
             let kids_source = dictionary.get("Kids");
             let kids = resolved_array(pdf, kids_source.as_ref())?;
-            reject_missing_array_source(&node, "Kids", kids_source.as_ref())?;
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
                 let index = binary_search(
@@ -2558,10 +2538,8 @@ impl<K: TreeKey> NNTree<K> {
             };
             let items_source = dictionary.get(K::ITEMS_KEY);
             let items = resolved_array(pdf, items_source.as_ref())?;
-            reject_missing_array_source(&node, K::ITEMS_KEY, items_source.as_ref())?;
             let kids_source = dictionary.get("Kids");
             let kids = resolved_array(pdf, kids_source.as_ref())?;
-            reject_missing_array_source(&node, "Kids", kids_source.as_ref())?;
 
             if let Some(items) = items.as_ref().filter(|items| !items.values.is_empty()) {
                 let item_number = if first {
@@ -3235,6 +3213,7 @@ fn build_number_leaf(entries: &[(i64, Object)]) -> Dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_handle::ObjectValue;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
     use crate::{Dictionary, ObjectRef, Pdf};
@@ -4204,7 +4183,10 @@ mod tests {
         let mut pdf_with_missing_max = empty_pdf();
         let missing_max =
             pdf_with_missing_max.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
-        missing_max.set_missing();
+        missing_max.set_resolved(ObjectValue::Null);
+        pdf_with_missing_max
+            .cache
+            .set_missing(ObjectRef::new(i32::MAX as u32, 0));
         assert!(!pdf_with_missing_max
             .object_refs()
             .contains(&ObjectRef::new(i32::MAX as u32, 0)));
@@ -4879,6 +4861,40 @@ mod tests {
             error.to_string(),
             "parse error at byte 0: Name/Number tree node (object 80): invalid kid at index 1"
         );
+    }
+
+    #[test]
+    fn dangling_names_key_follows_qpdf_null_tree_node_path() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert("Names", Object::Reference(ObjectRef::new(99, 0)));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+
+        let cursor = tree
+            .begin(&mut pdf)
+            .expect("a dangling /Names value resolves as qpdf null");
+
+        assert!(!cursor.positioned());
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
+            .message
+            .contains("name/number tree node has neither non-empty /Names nor /Kids")));
+    }
+
+    #[test]
+    fn dangling_kids_key_follows_qpdf_null_tree_node_path() {
+        let mut pdf = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Reference(ObjectRef::new(99, 0)));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+
+        let cursor = tree
+            .begin(&mut pdf)
+            .expect("a dangling /Kids value resolves as qpdf null");
+
+        assert!(!cursor.positioned());
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
+            .message
+            .contains("name/number tree node has neither non-empty /Names nor /Kids")));
     }
 
     #[test]
