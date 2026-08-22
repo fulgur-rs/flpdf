@@ -45,7 +45,7 @@ handler, not `reader.rs`:
 1. `r5_salted_hash` and `r6_password_hash` become raw hash primitives. They
    consume every byte supplied by their caller.
 2. The four V=5 authentication entry points in
-   `crates/flpdf/src/security/standard.rs` truncate their password argument to
+   `crates/flpdf/src/encryption/standard.rs` truncate their password argument to
    127 bytes before calling the decrypt/validation helpers:
    `check_user_password_r5`, `check_owner_password_r5`,
    `check_user_password_r6`, and `check_owner_password_r6`.

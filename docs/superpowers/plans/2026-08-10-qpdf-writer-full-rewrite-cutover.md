@@ -125,7 +125,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
 - Modify `crates/flpdf/src/writer/plain/mod.rs`, `crates/flpdf/src/writer/plain/plan.rs`, `crates/flpdf/src/writer/plain/body.rs`, and `crates/flpdf/src/writer/plain/xref.rs`.
 - Modify `crates/flpdf/src/writer/object_streams.rs`, `crates/flpdf/src/writer/serialize.rs`, `crates/flpdf/src/writer/encrypted_strings.rs`, and `crates/flpdf/src/writer/encryption_state.rs`.
 - Modify `crates/flpdf/src/filters.rs` and `crates/flpdf/src/content_normalizer.rs` only where the new decode-level and content-normalization controls need the existing qpdf filter/normalizer primitives.
-- Modify `crates/flpdf/src/encrypt_setup.rs` documentation and source-encryption construction helpers.
+- Modify `crates/flpdf/src/encryption.rs` documentation and source-encryption construction helpers.
 
 **Steps:**
 

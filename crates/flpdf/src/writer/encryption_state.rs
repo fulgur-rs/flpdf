@@ -1,6 +1,6 @@
 //! qpdf correspondence: QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state.
 
-use crate::security::primitives::md5;
+use crate::encryption::primitives::md5;
 
 /// qpdf's `QPDF::compute_data_key` for writer object emission.
 ///

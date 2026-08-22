@@ -15,7 +15,15 @@
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads. The input-side \`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` boundary lives in the private JSON document module (the output and input paths remain separate qpdf responsibilities) |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | \`EmbeddedFileDocumentHelper\` implements QPDFEmbeddedFileDocumentHelper.hh's public API (hasEmbeddedFiles, getEmbeddedFiles, getEmbeddedFile, replaceEmbeddedFile, removeEmbeddedFile) |
-| `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
+| `crates/flpdf/src/encryption.rs` | correspondence | \`QPDF_encryption.cc\` encryption facade and domain configuration |
+| `crates/flpdf/src/encryption/crypt_filters.rs` | correspondence | \`QPDF_encryption.cc:700-716,860-904\` crypt-filter interpretation and \`/CF\` table construction |
+| `crates/flpdf/src/encryption/keys.rs` | correspondence | \`QPDF_encryption.cc\` file/object-key ownership |
+| `crates/flpdf/src/encryption/password.rs` | correspondence | QPDF_encryption.cc password normalization |
+| `crates/flpdf/src/encryption/permissions.rs` | correspondence | \`QPDF_encryption.cc\` permission projection and \`/P\` encoding |
+| `crates/flpdf/src/encryption/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf's single-block AES and MD5 native implementations |
+| `crates/flpdf/src/encryption/rc4.rs` | mirror | libqpdf/RC4.cc, libqpdf/RC4_native.cc |
+| `crates/flpdf/src/encryption/standard.rs` | correspondence | QPDF_encryption.cc Standard security handler algorithms split from writer setup |
+| `crates/flpdf/src/encryption/state.rs` | correspondence | \`QPDF.hh:899-923\` and \`QPDF_encryption.cc:700-1205\` encryption state, crypt-filter dispatch, object-key cache, and inspection projection |
 | `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\`, \`processFile()\`, and \`processMemoryFile()\`) and their shared construction orchestration |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
 | `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
@@ -94,7 +102,6 @@
 | `crates/flpdf/src/pdf.rs` | correspondence | QPDF's central document container, direct document-state accessors, and teardown (\`include/qpdf/QPDF.hh:1438-1518\`; \`libqpdf/QPDF.cc:215-232,2323-2358,2647-2651\`) |
 | `crates/flpdf/src/pdf_string.rs` | correspondence | \`libqpdf/QPDF_String.cc\` PDF string semantics |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
-| `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
 | `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
 | `crates/flpdf/src/pipeline/aes.rs` | correspondence | Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time |
 | `crates/flpdf/src/pipeline/ascii85_decoder.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
@@ -131,11 +138,6 @@
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
 | `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
-| `crates/flpdf/src/security/mod.rs` | correspondence | QPDF_encryption.cc responsibilities split across the Rust security module tree |
-| `crates/flpdf/src/security/password.rs` | correspondence | QPDF_encryption.cc password normalization |
-| `crates/flpdf/src/security/primitives.rs` | correspondence | Rust crypto-crate substitution for qpdf's single-block AES and MD5 native implementations |
-| `crates/flpdf/src/security/rc4.rs` | mirror | libqpdf/RC4.cc, libqpdf/RC4_native.cc |
-| `crates/flpdf/src/security/standard.rs` | correspondence | QPDF_encryption.cc Standard security handler algorithms split from writer setup |
 | `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
 | `crates/flpdf/src/standard_font_metrics.rs` | correspondence | flpdf-only Standard 14 font metrics with no qpdf library component |
 | `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from either Object-shaped or ObjectHandle-shaped /Filter and /DecodeParms values |

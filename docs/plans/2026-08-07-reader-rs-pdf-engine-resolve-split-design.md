@@ -83,7 +83,7 @@ itself.
 
 | qpdf ファイル | flpdf 受け皿 |
 |---|---|
-| `QPDF_encryption.cc` | `security/standard.rs` + `writer.rs` の encryption context + `encrypt_setup.rs` + `permissions.rs` + `security/password.rs` |
+| `QPDF_encryption.cc` | `encryption/standard.rs` + `writer.rs` の encryption context + `encrypt_setup.rs` + `permissions.rs` + `encryption/password.rs` |
 | `QPDF_json.cc` | `document_json.rs`（出力側） + `json/document.rs`（入力境界） |
 | `QPDF_linearization.cc` | `linearization/` |
 | `QPDF_optimization.cc` | `optimization.rs` |
@@ -203,7 +203,7 @@ reader.rs に残す）とは移動の種類が異なる。本設計もこれに�
 `resolve.rs` の対象リストからこの3メソッドを外す。
 
 **`pub(crate)` 化により、`engine.rs`/将来の `resolve.rs`/`obj_cache.rs`/
-`security/*`/`object_copy.rs` はどれも lib.rs 直下の並列モジュールの
+`encryption/*`/`object_copy.rs` はどれも lib.rs 直下の並列モジュールの
 ままでよい**。フィールド・helper の可視性だけ `pub(crate)` に広げれば、
 モジュール階層をどう組んでも private 境界の問題は起きない。
 
@@ -217,7 +217,7 @@ reader.rs に残す）とは移動の種類が異なる。本設計もこれに�
 `Pdf` を除去（`EncryptionInfo`/`PdfOpenOptions`/`Permissions` は
 reader.rs に残ったまま）。
 
-**`security/standard.rs`/`encrypt_setup.rs`/`permissions.rs`/
+**`encryption/standard.rs`/`encrypt_setup.rs`/`permissions.rs`/
 `object_copy.rs` も同じ解決法をそのまま使える**: `is_encrypted`
 （`self.encryption.borrow()`。フィールド定義は `pdf.rs:154`、メソッド本体は
 `reader.rs:558-560`）や `take_foreign_object_map`（`self.foreign_object_maps`。
@@ -339,11 +339,11 @@ reader.rs に残ったまま）。
   `apply_explicit_crypt_filters` が呼ぶ `explicit_crypt_mode`
   (`reader.rs:3650-`)/`decode_params_at`(`reader.rs:3617-`)/
   `filter_prefix_dict`(`reader.rs:3626-`) も同じ閉包に含める
-  （`decrypt_object_strings`(`security/standard.rs`)の呼び出し先は既に
+  （`decrypt_object_strings`(`encryption/standard.rs`)の呼び出し先は既に
   security 側にあり対象外。混同しないこと）。**`explicit_crypt_mode` は
   `interpret_cf`(`reader.rs:3980-`、現状 private) を呼ぶ**が、
   `interpret_cf`/`interpret_cf_name` 自体は下記「新規ファイルを作らず
-  既存へ委譲するもの」の暗号エントリ依存閉包の一部として `security/*`
+  既存へ委譲するもの」の暗号エントリ依存閉包の一部として `encryption/*`
   へ移す対象なので、`resolve.rs` からは `pub(crate)` 化した
   `interpret_cf` を呼ぶ形になる（`EncryptionState` と同じ
   cross-module `pub(crate)` シームパターン）
@@ -360,19 +360,19 @@ reader.rs に残ったまま）。
   「resolve.rs のエントリポイントが engine.rs から呼ばれ、resolve.rs
   内部で完結する」という二層構造の一例で、上記 legacy 閉包とは名前も
   対象型も別なので統合しない。閉包が呼ぶ `decrypt_cipher_bytes` は既に
-  `security/standard.rs` 側にある。**訂正**:
+  `encryption/standard.rs` 側にある。**訂正**:
   `EncryptionState::string_method`/`with_object_cipher` は
-  `security/standard.rs` に**まだ無い**——`impl EncryptionState`
+  `encryption/standard.rs` に**まだ無い**——`impl EncryptionState`
   （`reader.rs:98-`、`string_method`(135)/`compute_data_key`(174)/
   `with_object_cipher`(207)/`key_for_object`(239) を含む、全て
   private）は reader.rs にあり、上記「新規ファイルを作らず既存へ
   委譲するもの」の暗号エントリ依存閉包が既に挙げている
   `EncryptionState`(`reader.rs:54-`) の実装本体そのものである。新たな
   移動対象を増やすのではなく、この既存の closure が struct 定義と
-  一緒に impl ブロックごと security/* へ移る、という1点を明記すれば
+  一緒に impl ブロックごと encryption/* へ移る、という1点を明記すれば
   よい。resolve.rs 側は `interpret_cf` と同じ cross-module `pub(crate)`
   シームでこれらを呼ぶ。**この resolve.rs 抽出は `EncryptionState` の
-  security/* 移動より前には実装できない**（移動前は呼び出すための
+  encryption/* 移動より前には実装できない**（移動前は呼び出すための
   `pub(crate)` シームが存在しない）——「次のステップ」の実装順序に
   この依存を明記する
 - **`aes128_object_key`(`reader.rs:3677-`、`private`) も同じ暗号エントリ
@@ -479,7 +479,7 @@ reader.rs に残ったまま）。
   `encrypt_dictionary`, `encryption_ref`, `uses_weak_crypto`,
   `encryption_info`, `permissions`, `user_password_matched`,
   `owner_password_matched`, `encryption_file_key`）は `QPDF_encryption.cc`
-  の既存受け皿（`security/standard.rs` / `encrypt_setup.rs` /
+  の既存受け皿（`encryption/standard.rs` / `encrypt_setup.rs` /
   `permissions.rs`）へ移す。reader.rs 側の実装は重複であり、削除対象。
   **この10個の公開メソッドだけでは実装が終わらない**: `authenticate_if_
   encrypted`（`reader.rs:782-`）は reader.rs 内で private 定義されている
@@ -505,7 +505,7 @@ reader.rs に残ったまま）。
   （`impl Permissions`、`reader.rs:259-`、`private`、呼び出しは
   `reader.rs:793`）も同じ閉包に含める。`Permissions` 型自体は公開型
   だが、コンストラクタは reader モジュール private のため、
-  `security/*` へ移った `authenticate_if_encrypted` から呼ぶには
+  `encryption/*` へ移った `authenticate_if_encrypted` から呼ぶには
   `impl Permissions` ごと一緒に移すか `pub(crate)` 化が必要
 - `signatures`（`reader.rs:708-710`、`crate::signatures::signatures` への
   薄い委譲）は上記グループに**含めない**。qpdf の `QPDF.cc` に signature
@@ -595,15 +595,15 @@ reader.rs に残ったまま）。
    既存モジュール**（`Pdf::empty()` のみ実装済み）なので、「追加」では
    なく「拡張」する（`open`/`open_with_repair_mode` 等をこのファイルに
    足していく）。`Pdf` 側で必要なフィールド/helper は既に `pub(crate)`
-   になっている前例に倣って広げる。暗号/認証エントリの `security/*` への
+   になっている前例に倣って広げる。暗号/認証エントリの `encryption/*` への
    移動、`take_foreign_object_map` 等の `object_copy.rs` への移動も
    同じ手法（該当フィールド・呼び出し先ヘルパーを `pub(crate)` にする）
    でよい。**依存順序の制約**: `resolve.rs` の native `ObjectHandle`
    復号閉包（`decrypt_object_value_strings` 系、上記参照）は
    `EncryptionState`（`impl EncryptionState` 全体、`reader.rs:98-`）が
-   `security/*` へ移り `pub(crate)` シームができるまで抽出できない
+   `encryption/*` へ移り `pub(crate)` シームができるまで抽出できない
    （移動前はこの閉包が呼ぶ `string_method`/`with_object_cipher` へ
-   到達する手段が無い）。暗号/認証エントリの `security/*` 移動を
+   到達する手段が無い）。暗号/認証エントリの `encryption/*` 移動を
    `resolve.rs` のこの部分より先に実施する
 3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、対応表側の既存
    記載時点での行数 `reader.rs`(7898) — 実際の現状行数（8475、上記
@@ -626,10 +626,10 @@ reader.rs に残ったまま）。
    `:135`（`EncryptionParameters` → `EncryptionState`）と
    `:136`（`interpretCF` → `interpret_cf`/`interpret_cf_name`/
    `interpret_cf_from_handle`）が指す実装は、上記「新規ファイルを作らず
-   既存へ委譲するもの」の暗号エントリ依存閉包の一部として `security/*`
-   （`security/standard.rs` 等）へ移る対象であり、`resolve.rs` には
+   既存へ委譲するもの」の暗号エントリ依存閉包の一部として `encryption/*`
+   （`encryption/standard.rs` 等）へ移る対象であり、`resolve.rs` には
    残らない。この2行は「`reader/resolver.rs` という記述」を
-   `resolve.rs` に置き換えつつ、実装の帰属列は `security/*` の該当
+   `resolve.rs` に置き換えつつ、実装の帰属列は `encryption/*` の該当
    モジュールへ retarget する（ファイル名置換と実装先の変更を両方行う
    必要があり、単純な文字列置換では済まない）。`:137`/`:140`/`:199`/
    `:200` は実装がそのまま resolve/pipe-time 側に残るので、単純な
@@ -663,7 +663,7 @@ reader.rs に残ったまま）。
    `:179`（`QPDF_encryption.cc` 行、地の文で「`reader.rs:604` が呼ぶ」と
    `normalize_password` の呼び出し元を名指し——実際の呼び出し元は
    `authenticate_if_encrypted`（`reader.rs:782-`）で、上記「暗号/認証
-   エントリ」閉包の一部として `security/*` へ移る対象）、
+   エントリ」閉包の一部として `encryption/*` へ移る対象）、
    `:200`（`Pl_RC4` 行、`reader/resolver.rs` の pipe-time decrypt stage
    とは別に「`reader.rs` / `writer.rs` の既存 stream consumer」も併記——
    前者は `decrypt_stream_bytes`（`reader.rs:3508-`）で、これは既に

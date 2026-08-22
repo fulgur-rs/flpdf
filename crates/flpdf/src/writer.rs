@@ -36,7 +36,7 @@ where
     writer.get_buffer()
 }
 
-use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
+use crate::encryption::{CopyEncryptionSource, EncryptParams};
 use crate::linearization::writer::write_linearized_for_pdf_writer;
 use crate::object_handle::ObjectValue;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
@@ -697,7 +697,7 @@ fn forced_version_disables_encryption(options: &WriterOptions) -> bool {
 
 fn encryption_shape(options: &WriterOptions) -> Option<(i64, i64, bool)> {
     if let Some(params) = options.encrypt.as_ref() {
-        use crate::encrypt_setup::EncryptMethod;
+        use crate::encryption::EncryptMethod;
         return Some(match params.method {
             EncryptMethod::V1Rc440 => (1, 2, false),
             EncryptMethod::V2Rc4128 => (2, 3, false),
@@ -717,8 +717,8 @@ fn encryption_shape(options: &WriterOptions) -> Option<(i64, i64, bool)> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use crate::encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
-    use crate::security::standard::ObjectKeyAlg;
+    use crate::encryption::standard::ObjectKeyAlg;
+    use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams};
 
     fn options_for(method: EncryptMethod) -> WriterOptions {
         let params = match method {
@@ -1444,7 +1444,7 @@ pub(crate) struct WriterOptions {
     ///
     /// - `qdf` may be enabled; encrypted strings and stream dictionaries retain
     ///   QDF layout while their encrypted bytes remain ciphertext.
-    pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
+    pub encrypt: Option<crate::encryption::EncryptParams>,
 
     /// Copy the authenticated encryption parameters from a donor PDF and
     /// re-use its file encryption key (qpdf `--copy-encryption`
@@ -1462,7 +1462,7 @@ pub(crate) struct WriterOptions {
     ///
     /// V=1/V=2 RC4, V=4 AESV2, and V=5 R=5/R=6 AESV3 donors are supported by
     /// the canonical writer.
-    pub copy_encryption: Option<crate::encrypt_setup::CopyEncryptionSource>,
+    pub copy_encryption: Option<crate::encryption::CopyEncryptionSource>,
 
     /// Emit qpdf's PCLm-oriented object order and header.
     pub pclm: bool,
@@ -1674,7 +1674,7 @@ pub(crate) fn effective_pdf_version<'a>(
 /// qpdf's copy path forces AES for V>=4, so a copied V=4 source has the AESV2
 /// floor even when the donor used RC4.
 fn encryption_version_floor(options: &WriterOptions) -> Option<PdfVersion> {
-    use crate::encrypt_setup::EncryptMethod;
+    use crate::encryption::EncryptMethod;
     if let Some(ref enc) = options.encrypt {
         return Some(match enc.method {
             EncryptMethod::V5R6Aes256 => PdfVersion::new(1, 7, 8),
@@ -2199,9 +2199,9 @@ mod _writer_doc_anchor {} // keeps the `emit_canonical_pdf` docstring above atta
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WriteCipher {
     /// V=1/V=2/V=4: per-object key via Algorithm 1, then RC4 or AES-128
-    /// (the [`ObjectKeyAlg`](crate::security::standard::ObjectKeyAlg) selects
+    /// (the [`ObjectKeyAlg`](crate::encryption::standard::ObjectKeyAlg) selects
     /// the `sAlT` salt and the resulting cipher).
-    PerObject(crate::security::standard::ObjectKeyAlg),
+    PerObject(crate::encryption::standard::ObjectKeyAlg),
     /// V=5 R=5/R=6: the 32-byte file key is used directly with AES-256-CBC.
     /// There is no Algorithm-1 per-object derivation.
     FileKeyAes256,
@@ -2282,16 +2282,16 @@ pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> O
 /// deriving `/O`/`/U`, and `writeTrailer`'s later call is a no-op).
 pub(crate) fn build_encryption_context(
     options: &WriterOptions,
-    params: &crate::encrypt_setup::EncryptParams,
+    params: &crate::encryption::EncryptParams,
     existing_max: u32,
     metadata_ref: Option<ObjectRef>,
     id0: &[u8],
 ) -> Result<EncryptionContext> {
-    use crate::encrypt_setup::EncryptMethod;
-    use crate::security::standard::{
+    use crate::encryption::standard::{
         build_v1_v2_encrypt_dict, build_v4_encrypt_dict, ObjectKeyAlg, V1V2EncryptParams,
         V4CryptMethod, V4EncryptParams,
     };
+    use crate::encryption::EncryptMethod;
 
     let id0 = id0.to_vec();
 
@@ -2309,7 +2309,7 @@ pub(crate) fn build_encryption_context(
             (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Aes), 4, 4)
         }
         EncryptMethod::V5R6Aes256 => {
-            use crate::security::standard::{build_v5_r6_encrypt_dict, V5R6EncryptParams};
+            use crate::encryption::standard::{build_v5_r6_encrypt_dict, V5R6EncryptParams};
             // V=5 R=6 needs 68 bytes of fresh secret material (file key + four
             // 8-byte salts + 4-byte /Perms tail). Unlike V<5, /ID[0] does NOT
             // feed the key derivation — the file key is a standalone CSPRNG
@@ -2331,7 +2331,7 @@ pub(crate) fn build_encryption_context(
             )
         }
         EncryptMethod::V5R5Aes256 => {
-            use crate::security::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
+            use crate::encryption::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
             let secrets = generate_v5r6_secrets(options)?;
             let v5 = V5R6EncryptParams {
                 user_password: &params.user_password,
@@ -2427,10 +2427,10 @@ pub(crate) fn build_encryption_context(
 /// than panicking (mirrors the AES-IV generation in the stream pass).
 fn generate_v5r6_secrets(
     _options: &WriterOptions,
-) -> Result<crate::security::standard::V5R6Secrets> {
+) -> Result<crate::encryption::standard::V5R6Secrets> {
     #[cfg(any(test, feature = "qpdf-zlib-compat"))]
     if let Some(randomness) = _options.v5_randomness {
-        return Ok(crate::security::standard::V5R6Secrets {
+        return Ok(crate::encryption::standard::V5R6Secrets {
             file_key: randomness.file_key,
             user_validation_salt: randomness.user_validation_salt,
             user_key_salt: randomness.user_key_salt,
@@ -2448,7 +2448,7 @@ fn generate_v5r6_secrets(
     })?;
     // Each range is a fixed, exact-length slice of `buf`, so the array
     // conversions are infallible by construction.
-    Ok(crate::security::standard::V5R6Secrets {
+    Ok(crate::encryption::standard::V5R6Secrets {
         file_key: buf[0..32].try_into().unwrap(),
         user_validation_salt: buf[32..40].try_into().unwrap(),
         user_key_salt: buf[40..48].try_into().unwrap(),
@@ -2469,7 +2469,7 @@ fn generate_v5r6_secrets(
 /// canonical dictionary here so a V4 RC4 donor has the same observable result
 /// as qpdf's copy path.
 pub(crate) fn build_copy_encryption_context(
-    src: &crate::encrypt_setup::CopyEncryptionSource,
+    src: &crate::encryption::CopyEncryptionSource,
     options: &WriterOptions,
     existing_max: u32,
     metadata_ref: Option<ObjectRef>,
@@ -2501,9 +2501,9 @@ pub(crate) fn build_copy_encryption_context(
 /// Rebuild the dictionary qpdf emits from `copyEncryptionParameters` and
 /// select the corresponding object-key cipher.
 fn canonical_copy_encryption(
-    src: &crate::encrypt_setup::CopyEncryptionSource,
+    src: &crate::encryption::CopyEncryptionSource,
 ) -> Result<(Dictionary, i32, i32, WriteCipher)> {
-    use crate::security::standard::ObjectKeyAlg;
+    use crate::encryption::standard::ObjectKeyAlg;
 
     let version = copy_integer(&src.encrypt_dict, "V")?;
     let revision = copy_integer(&src.encrypt_dict, "R")?;
@@ -2624,7 +2624,7 @@ fn insert_standard_crypt_filter(dict: &mut Dictionary, cfm: &[u8], length: i64) 
 /// only changes its default when `/EncryptMetadata` is present and boolean;
 /// an absent or otherwise unusable entry means metadata remains encrypted.
 pub(crate) fn copy_encryption_encrypts_metadata(
-    src: &crate::encrypt_setup::CopyEncryptionSource,
+    src: &crate::encryption::CopyEncryptionSource,
 ) -> bool {
     copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict)
 }
@@ -2997,7 +2997,7 @@ fn build_writer_trailer_handle<R: Read + Seek>(
 /// `crate::linearization::writer::write_linearized` (which draws the hint
 /// stream's single per-invocation IV under the same condition).
 pub(crate) fn cipher_needs_aes_iv(cipher: WriteCipher) -> bool {
-    use crate::security::standard::ObjectKeyAlg;
+    use crate::encryption::standard::ObjectKeyAlg;
     matches!(
         cipher,
         WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
@@ -3085,12 +3085,12 @@ fn pipe_writer_stream_payload(
         }
 
         match ctx.cipher {
-            WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4) => {
+            WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Rc4) => {
                 let mut stage =
                     crate::pipeline::rc4::PlRc4::new("rc4 stream encryption", &mut count, key)?;
                 run_writer_pipeline(&mut stage, data)
             }
-            WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Aes)
+            WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Aes)
             | WriteCipher::FileKeyAes256 => {
                 if let Some(iv) = explicit_iv {
                     count.write(&iv)?;
@@ -4027,7 +4027,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // /V 1 (R=2) ⇒ 1.3, /V 2/R=3 ⇒ 1.4, /V 4/R=4 ⇒ 1.5 or 1.6
     // depending on the crypt filter, /V 5 ⇒ 1.7.
     if let Some(params) = options.encrypt.as_ref() {
-        use crate::encrypt_setup::EncryptMethod;
+        use crate::encryption::EncryptMethod;
         let floor = match params.method {
             EncryptMethod::V1Rc440 => PdfVersion::new(1, 3, 0),
             EncryptMethod::V2Rc4128 => PdfVersion::new(1, 4, 0),
@@ -6020,7 +6020,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(source)).expect("source parses");
         let mut output = Vec::new();
         let options = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
@@ -7030,11 +7030,11 @@ mod tests {
         let fixture = build_partition_fixture();
         let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
-            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+            copy_encryption: Some(crate::encryption::CopyEncryptionSource {
                 encrypt_dict: Dictionary::new(),
                 file_key: Vec::new(),
                 id0: Vec::new(),
@@ -7056,7 +7056,7 @@ mod tests {
         let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let opts = WriterOptions {
             deterministic_id: true,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
@@ -7202,7 +7202,7 @@ mod tests {
         let options = WriterOptions {
             static_id: true,
             static_aes_iv: true,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
@@ -7272,7 +7272,7 @@ mod tests {
             let mut out = Vec::new();
             // static_id = false (default): /ID[1] is random → output differs
             let options = WriterOptions {
-                encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                     b"user".to_vec(),
                     b"owner".to_vec(),
                 )),
@@ -7344,8 +7344,8 @@ mod tests {
     /// object. Re-opening the result exercises that non-colliding allocation.
     #[test]
     fn qdf_copy_encryption_allocates_encrypt_after_length_holders() {
-        use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
-        use crate::security::standard::ObjectKeyAlg;
+        use crate::encryption::standard::ObjectKeyAlg;
+        use crate::encryption::{CopyEncryptionSource, EncryptParams};
         use crate::PdfOpenOptions;
         use std::io::Cursor;
 
@@ -7475,7 +7475,7 @@ mod tests {
         );
     }
 
-    fn fixed_v5_encrypted_output(params: crate::encrypt_setup::EncryptParams) -> Vec<u8> {
+    fn fixed_v5_encrypted_output(params: crate::encryption::EncryptParams) -> Vec<u8> {
         use crate::PdfOpenOptions;
         use std::io::Cursor;
 
@@ -7510,11 +7510,11 @@ mod tests {
 
     #[test]
     fn v5_r6_fixed_randomness_is_byte_stable() {
-        let first = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r6(
+        let first = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r6(
             b"user-pw".to_vec(),
             b"owner-pw".to_vec(),
         ));
-        let second = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r6(
+        let second = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r6(
             b"user-pw".to_vec(),
             b"owner-pw".to_vec(),
         ));
@@ -7526,11 +7526,11 @@ mod tests {
 
     #[test]
     fn v5_r5_fixed_randomness_is_byte_stable() {
-        let first = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r5(
+        let first = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r5(
             b"user-pw".to_vec(),
             b"owner-pw".to_vec(),
         ));
-        let second = fixed_v5_encrypted_output(crate::encrypt_setup::EncryptParams::v5_r5(
+        let second = fixed_v5_encrypted_output(crate::encryption::EncryptParams::v5_r5(
             b"user-pw".to_vec(),
             b"owner-pw".to_vec(),
         ));
@@ -7558,7 +7558,7 @@ mod tests {
             // Keep the stream uncompressed so the decrypted payload is exactly
             // the original bytes (no filter round-trip to account for).
             compress_streams: CompressStreams::No,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
                 b"user-pw".to_vec(),
                 b"owner-pw".to_vec(),
             )),
@@ -7607,7 +7607,7 @@ mod tests {
             // Keep the stream uncompressed so the decrypted payload is exactly
             // the original bytes (no filter round-trip to account for).
             compress_streams: CompressStreams::No,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r5(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r5(
                 b"user-pw".to_vec(),
                 b"owner-pw".to_vec(),
             )),
@@ -7699,7 +7699,7 @@ mod tests {
         adjust_aes_stream_length(
             &mut rc4_length,
             &context(WriteCipher::PerObject(
-                crate::security::standard::ObjectKeyAlg::Rc4,
+                crate::encryption::standard::ObjectKeyAlg::Rc4,
             )),
             true,
         )
@@ -7731,7 +7731,7 @@ mod tests {
         let context = EncryptionContext {
             encrypt_dict: Dictionary::new(),
             file_key: vec![0x11; 16],
-            cipher: WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4),
+            cipher: WriteCipher::PerObject(crate::encryption::standard::ObjectKeyAlg::Rc4),
             encryption_v: 1,
             encryption_r: 2,
             encrypt_ref: ObjectRef::new(99, 0),
@@ -8024,7 +8024,7 @@ mod tests {
 
     #[test]
     fn rc4_methods_round_trip_string_and_stream_via_reader() {
-        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::encryption::{EncryptMethod, EncryptParams};
         use crate::PdfOpenOptions;
         use std::io::Cursor;
 
@@ -8081,7 +8081,7 @@ mod tests {
     /// qpdf-equivalent floor for a 1.4 input.
     #[test]
     fn v4_encryption_floors_pdf_header_per_qpdf_table() {
-        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::encryption::{EncryptMethod, EncryptParams};
         use std::io::Cursor;
 
         let fixture = build_partition_fixture();
@@ -8127,7 +8127,7 @@ mod tests {
     /// is routed through `PdfVersion`.
     #[test]
     fn encryption_repairs_unparseable_source_header() {
-        use crate::encrypt_setup::EncryptParams;
+        use crate::encryption::EncryptParams;
         use std::io::Cursor;
 
         let mut fixture = build_partition_fixture();
@@ -8207,7 +8207,7 @@ mod tests {
             let mut pdf = Pdf::open(Cursor::new(fixture.clone())).unwrap();
             let mut out = Vec::new();
             let mut params =
-                crate::encrypt_setup::EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec());
+                crate::encryption::EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec());
             params.encrypt_metadata = encrypt_metadata;
             let options = WriterOptions {
                 // No compression so cleartext metadata is a literal substring.
@@ -8348,7 +8348,7 @@ mod tests {
 
     #[test]
     fn encryption_version_floor_matches_qpdf_table() {
-        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::encryption::{EncryptMethod, EncryptParams};
         for (method, expected) in [
             (EncryptMethod::V5R6Aes256, PdfVersion::new(1, 7, 8)),
             (EncryptMethod::V5R5Aes256, PdfVersion::new(1, 7, 3)),
@@ -8373,7 +8373,7 @@ mod tests {
 
     #[test]
     fn encryption_version_floor_copy_r5_uses_r5_extension_level() {
-        use crate::encrypt_setup::CopyEncryptionSource;
+        use crate::encryption::CopyEncryptionSource;
 
         let mut encrypt_dict = Dictionary::new();
         encrypt_dict.insert("V", Object::Integer(5));
@@ -8399,7 +8399,7 @@ mod tests {
     fn effective_pdf_version_folds_each_encryption_floor_arm() {
         // Below-floor source for each encryption method — exercises every
         // PdfVersion::static_version_str arm reachable from the encryption floor race.
-        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::encryption::{EncryptMethod, EncryptParams};
         for (method, expected) in [
             (EncryptMethod::V1Rc440, "1.3"),
             (EncryptMethod::V2Rc4128, "1.4"),
@@ -8436,10 +8436,7 @@ mod tests {
         // Before the fix, effective_pdf_version returned "1.3" and the emitted
         // %PDF header contradicted the encryption method.
         let options = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                vec![],
-                vec![],
-            )),
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(vec![], vec![])),
             ..WriterOptions::default()
         };
         assert_eq!(effective_pdf_version("1.3", &options, false, false), "1.6");
@@ -8451,7 +8448,7 @@ mod tests {
         // bumps to 1.7, encryption contributes ext=8 (source's 1.3 was outbid,
         // no min_version, no ObjStm).
         let options = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(vec![], vec![])),
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(vec![], vec![])),
             ..WriterOptions::default()
         };
         let (v, e) = effective_pdf_version_and_ext("1.3", 0, &options, false, false);
@@ -8465,10 +8462,7 @@ mod tests {
         // (1.6, 0)) → ver bumps to 1.6, source ext dropped (source's 1.3
         // doesn't tie with 1.6). Result (1.6, 0) — stale ADBE must NOT survive.
         let options = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                vec![],
-                vec![],
-            )),
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(vec![], vec![])),
             ..WriterOptions::default()
         };
         let (v, e) = effective_pdf_version_and_ext("1.3", 8, &options, false, false);
@@ -8482,7 +8476,7 @@ mod tests {
         // tie at 1.7 → ext = max(3, 8) = 8 (encryption wins the extension race
         // at the tied version).
         let options = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(vec![], vec![])),
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(vec![], vec![])),
             ..WriterOptions::default()
         };
         let (v, e) = effective_pdf_version_and_ext("1.7", 3, &options, false, false);
@@ -8496,10 +8490,7 @@ mod tests {
         // wins the version race, source ext survives → (1.7, 8). Encryption
         // floor was outbid so its ext=0 contributes nothing.
         let options = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                vec![],
-                vec![],
-            )),
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(vec![], vec![])),
             ..WriterOptions::default()
         };
         let (v, e) = effective_pdf_version_and_ext("1.7", 8, &options, false, false);
@@ -9307,7 +9298,7 @@ mod tests {
         let options = WriterOptions {
             static_id: true,
             static_aes_iv: true,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 b"u".to_vec(),
                 b"o".to_vec(),
             )),

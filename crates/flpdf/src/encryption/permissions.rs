@@ -1,16 +1,78 @@
-//! qpdf correspondence: QPDF_encryption.cc permission-bit encoding split from the Standard security handler.
+//! qpdf correspondence: `QPDF_encryption.cc` permission projection and `/P` encoding.
 //! Typed permission configuration for writer-side `/Encrypt` `/P` encoding.
 //!
-//! [`Permissions`](crate::Permissions) (in `reader.rs`) is the read-only
-//! view of an already-encrypted document's `/P` bitfield, with one accessor
-//! per capability bit. This module is its writer-side counterpart: a typed
+//! [`Permissions`] is the read-only view of an already-encrypted document's
+//! `/P` bitfield, with one accessor per capability bit. This module also owns
+//! the writer-side counterpart: a typed
 //! configuration that callers populate and then encode into the `/P`
 //! bitfield via [`PermissionsConfig::to_p_bits`], which the various
-//! `/Encrypt` dictionary builders in `security::standard` consume.
+//! `/Encrypt` dictionary builders in the encryption Standard handler consume.
 //!
-//! The reader and writer types are intentionally separate so the read path
-//! cannot accidentally widen its `/P` interpretation when the writer gains
-//! new options.
+//! The reader and writer projections are intentionally separate so the read
+//! path cannot accidentally widen its `/P` interpretation when the writer
+//! gains new options.
+
+/// Standard security handler permission bits read from an encrypted
+/// document's `/P` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permissions {
+    raw: i32,
+}
+
+impl Permissions {
+    pub(crate) fn new(raw: i32) -> Self {
+        Self { raw }
+    }
+
+    /// Raw signed `/P` value.
+    pub fn raw(self) -> i32 {
+        self.raw
+    }
+
+    /// Print the document, possibly at degraded quality if high-quality printing is denied.
+    pub fn can_print(self) -> bool {
+        self.has_bit(0x0004)
+    }
+
+    /// Modify document contents by operations other than controlled form/annotation edits.
+    pub fn can_modify(self) -> bool {
+        self.has_bit(0x0008)
+    }
+
+    /// Copy or otherwise extract text and graphics.
+    pub fn can_copy(self) -> bool {
+        self.has_bit(0x0010)
+    }
+
+    /// Add or modify annotations and interactive form fields.
+    pub fn can_annotate(self) -> bool {
+        self.has_bit(0x0020)
+    }
+
+    /// Fill in existing interactive form fields.
+    pub fn can_fill_forms(self) -> bool {
+        self.has_bit(0x0100)
+    }
+
+    /// Extract text and graphics for accessibility purposes.
+    pub fn can_extract_for_accessibility(self) -> bool {
+        self.has_bit(0x0200)
+    }
+
+    /// Assemble the document by inserting, rotating, or deleting pages/bookmarks.
+    pub fn can_assemble(self) -> bool {
+        self.has_bit(0x0400)
+    }
+
+    /// Print the document at high quality.
+    pub fn can_print_high_quality(self) -> bool {
+        self.has_bit(0x0800)
+    }
+
+    fn has_bit(self, bit: u32) -> bool {
+        (self.raw as u32) & bit != 0
+    }
+}
 
 /// Print-permission level (PDF 1.7 §7.6.3.2 Table 22, bits 3 and 12).
 ///

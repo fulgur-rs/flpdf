@@ -94,7 +94,7 @@ pub mod default_appearance;
 pub mod diagnostics;
 pub mod document_json;
 pub mod embedded_files;
-pub mod encrypt_setup;
+pub mod encryption;
 pub mod engine;
 pub mod error;
 pub mod filespec_helper;
@@ -133,7 +133,6 @@ pub mod parser;
 pub mod pdf;
 pub mod pdf_string;
 pub mod pdf_version;
-pub mod permissions;
 pub mod pipeline;
 pub mod qdf_fix;
 pub(crate) mod qpdf_null;
@@ -162,9 +161,6 @@ pub mod xref_entry;
 
 pub use logger::QPDFLogger;
 
-// Internal security primitives — not part of the public API.
-pub(crate) mod security;
-
 pub use acroform_document_helper::{AcroFormDocumentHelper, AcroFormFieldInfo};
 pub use annotation_helper::AnnotationObjectHelper;
 pub use cache::{CacheEntry, ObjectCache};
@@ -181,7 +177,11 @@ pub use embedded_files::{
     list_embedded_files_with_max_depth, remove_attachment, EmbeddedFileDocumentHelper,
     DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
 };
-pub use encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
+pub use encryption::permissions::{Permissions, PermissionsConfig, PrintPermission};
+pub use encryption::EncryptionInfo;
+pub use encryption::{
+    CopyEncryptionSource, EncryptMethod, EncryptParams, ObjectKeyAlg, PasswordMode,
+};
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{
     add_attachment_from_path, encode_utf16be, extract_attachment, extract_attachment_to_path,
@@ -231,13 +231,10 @@ pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_dept
 pub use parser::parse_object;
 pub use pdf::Pdf;
 pub use pdf_version::{parse_pdf_version, PdfVersion};
-pub use permissions::{PermissionsConfig, PrintPermission};
 pub use pipeline::{Pipeline, PipelineError, PipelineResult};
 pub use qdf_fix::fix_qdf;
-pub use reader::{EncryptionInfo, PdfOpenOptions, Permissions};
+pub use reader::PdfOpenOptions;
 pub use resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
-pub use security::password::PasswordMode;
-pub use security::standard::ObjectKeyAlg;
 pub use signatures::{
     acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
     signatures, signatures_with_max_depth, strip_signature_values, SignatureInfo,

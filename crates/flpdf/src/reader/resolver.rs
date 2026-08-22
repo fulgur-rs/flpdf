@@ -84,7 +84,8 @@
 //! released its input adapter, so each source token contributes at most one
 //! document warning.
 
-use super::{interpret_cf_from_handle, EncryptionMode, EncryptionState};
+use crate::encryption::crypt_filters::interpret_cf_from_handle;
+use crate::encryption::state::{EncryptionMode, EncryptionState};
 use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, NO_PARSED_OFFSET};
 use crate::parser::{
     parse_live_file_object_with_decrypter, parse_qpdf_direct_object_handle_with_diagnostics,
@@ -365,7 +366,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// separate `encrypted`/`encryption_initialized` pair — the outer
     /// `Option` serves both; see the field-mapping table in this issue's
     /// design (`bd show flpdf-25kg.3.11`) for the disclosed collapse.
-    encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    encryption_parameters: Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
 }
 
 pub(crate) struct ResolverWarningOptions {
@@ -644,7 +645,7 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
 /// before `QPDFParser::parse` (`libqpdf/QPDF.cc:1331-1340`).
 struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
     object_ref: ObjectRef,
-    encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    encryption_parameters: Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
     resolver: &'resolver ResolverHandle<R>,
 }
 
@@ -665,7 +666,7 @@ struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
 /// string on the resolver instead.
 struct ForeignStreamData<R: Read + Seek + 'static> {
     input: Rc<StreamInput<R>>,
-    encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    encryption_parameters: Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
     object_ref: ObjectRef,
     parsed_offset: i64,
     stream_length: usize,
@@ -1798,12 +1799,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// then does I/O through `self` cannot double-borrow.
     ///
     /// Crate-visible because the canonical [`crate::pdf::Pdf`] container is a
-    /// sibling of `reader`; the returned [`crate::reader::EncryptionState`]
+    /// sibling of `reader`; the returned [`crate::encryption::state::EncryptionState`]
     /// has the same visibility. No public API exposes either implementation
     /// type.
     pub(crate) fn encryption_parameters(
         &self,
-    ) -> Rc<RefCell<Option<crate::reader::EncryptionState>>> {
+    ) -> Rc<RefCell<Option<crate::encryption::state::EncryptionState>>> {
         self.core.borrow().encryption_parameters.clone()
     }
 
@@ -3310,7 +3311,7 @@ const INPUT_CHUNK: usize = 4096;
 #[allow(clippy::too_many_arguments)]
 fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
-    encryption_parameters: &Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    encryption_parameters: &Rc<RefCell<Option<crate::encryption::state::EncryptionState>>>,
     recovered_stream_eol_length: usize,
     warning_sink: &dyn DocumentResolver,
     description_override: Option<&str>,
@@ -4198,8 +4199,8 @@ mod tests {
     use super::ResolveMark;
     use super::ResolverHandle;
     use super::ResolverWarningOptions;
+    use crate::encryption::state::{EncryptionMode, EncryptionState};
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
-    use crate::reader::{EncryptionMode, EncryptionState};
     use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
     use std::collections::BTreeMap;
     use std::fs;
@@ -5215,7 +5216,7 @@ mod tests {
         let mut key_derivation = encryption.clone();
         let key = key_derivation.key_for_object(object_ref, false).to_vec();
         let mut ciphertext = plaintext.to_vec();
-        crate::security::rc4::Rc4::new(&key)
+        crate::encryption::rc4::Rc4::new(&key)
             .expect("authenticated RC4 key is non-empty")
             .process_in_place(&mut ciphertext);
         ciphertext
@@ -5527,9 +5528,9 @@ mod tests {
             .expect("V4 AES object key");
         let plaintext = b"V4 /StmF AES plaintext";
         let mut ciphertext = plaintext.to_vec();
-        crate::security::standard::encrypt_cipher_bytes(
+        crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -5563,9 +5564,9 @@ mod tests {
             .expect("V5 AES object key");
         let plaintext = b"V5 /StmF AES-256 plaintext";
         let mut ciphertext = plaintext.to_vec();
-        crate::security::standard::encrypt_cipher_bytes(
+        crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::security::standard::StringEncryptCipher::Aes256 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes256 { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES-256 ciphertext");
@@ -5604,9 +5605,9 @@ mod tests {
         let plaintext = b"AES stream with the string's cached key";
         let key: [u8; 16] = cached_string_key.clone().try_into().expect("V4 object key");
         let mut ciphertext = plaintext.to_vec();
-        crate::security::standard::encrypt_cipher_bytes(
+        crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext with qpdf's cached key");
@@ -5614,7 +5615,7 @@ mod tests {
         let resolver = resolver_over(ciphertext.clone());
         *resolver.encryption_parameters().borrow_mut() = Some(encryption);
         let mut encrypted_string = b"string first".to_vec();
-        crate::security::rc4::Rc4::new(&cached_string_key)
+        crate::encryption::rc4::Rc4::new(&cached_string_key)
             .expect("RC4 object key")
             .process_in_place(&mut encrypted_string);
         resolver
@@ -5659,9 +5660,9 @@ mod tests {
             .expect("V4 AES object key");
         let stream_plaintext = b"stream first";
         let mut stream_ciphertext = stream_plaintext.to_vec();
-        crate::security::standard::encrypt_cipher_bytes(
+        crate::encryption::standard::encrypt_cipher_bytes(
             &mut stream_ciphertext,
-            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -5685,7 +5686,7 @@ mod tests {
 
         let string_plaintext = b"RC4 string with the stream's cached key";
         let mut string_ciphertext = string_plaintext.to_vec();
-        crate::security::rc4::Rc4::new(&cached_stream_key)
+        crate::encryption::rc4::Rc4::new(&cached_stream_key)
             .expect("cached object key")
             .process_in_place(&mut string_ciphertext);
         resolver
@@ -5714,9 +5715,9 @@ mod tests {
             .expect("V4 AES object key");
         let plaintext = b"unknown /StmF defaults to AES";
         let mut ciphertext = plaintext.to_vec();
-        crate::security::standard::encrypt_cipher_bytes(
+        crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -5992,9 +5993,9 @@ mod tests {
             .expect("V4 AES object key");
         let plaintext = b"unknown Crypt falls through to unknown /StmF";
         let mut ciphertext = plaintext.to_vec();
-        crate::security::standard::encrypt_cipher_bytes(
+        crate::encryption::standard::encrypt_cipher_bytes(
             &mut ciphertext,
-            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            crate::encryption::standard::StringEncryptCipher::Aes128 { key: &key },
             &[0x5a; 16],
         )
         .expect("build AES ciphertext");
@@ -6684,7 +6685,7 @@ mod tests {
         assert_eq!(encryption.encryption_v, 2);
         assert_eq!(
             encryption.cf_stream,
-            crate::reader::EncryptionMode::Identity
+            crate::encryption::state::EncryptionMode::Identity
         );
         // RC4-128 derives a 16-byte file key (qpdf Algorithm 2, key length
         // bits / 8). cf_stream and file_key are sibling fields of one
@@ -6714,7 +6715,10 @@ mod tests {
         let cell = pdf.resolver.encryption_parameters();
         let guard = cell.borrow();
         let encryption = guard.as_ref().expect("AES fixture must authenticate");
-        assert_eq!(encryption.cf_stream, crate::reader::EncryptionMode::Aes128);
+        assert_eq!(
+            encryption.cf_stream,
+            crate::encryption::state::EncryptionMode::Aes128
+        );
         assert_eq!(encryption.file_key.len(), 16);
     }
 
@@ -6724,7 +6728,7 @@ mod tests {
     // the top-level or nested string assertion fail.
     #[test]
     fn canonical_resolver_decrypts_strings_at_parse_time() {
-        use crate::encrypt_setup::EncryptParams;
+        use crate::encryption::EncryptParams;
         use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
 
         let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -6808,7 +6812,7 @@ mod tests {
 
     fn encrypted_info_fixture(
         info_body: &[u8],
-        encrypt: crate::encrypt_setup::EncryptParams,
+        encrypt: crate::encryption::EncryptParams,
     ) -> Vec<u8> {
         use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
 
@@ -6852,7 +6856,7 @@ mod tests {
     }
 
     fn encrypted_stream_fixture(
-        encrypt: crate::encrypt_setup::EncryptParams,
+        encrypt: crate::encryption::EncryptParams,
     ) -> (Vec<u8>, &'static [u8]) {
         use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
 
@@ -6914,19 +6918,19 @@ mod tests {
         for (name, encrypt) in [
             (
                 "rc4-v2",
-                crate::encrypt_setup::EncryptParams::rc4(
-                    crate::encrypt_setup::EncryptMethod::V2Rc4128,
+                crate::encryption::EncryptParams::rc4(
+                    crate::encryption::EncryptMethod::V2Rc4128,
                     b"user-pw",
                     b"owner-pw",
                 ),
             ),
             (
                 "aes128-v4",
-                crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+                crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
             ),
             (
                 "aes256-v5",
-                crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw", b"owner-pw"),
+                crate::encryption::EncryptParams::v5_r6(b"user-pw", b"owner-pw"),
             ),
         ] {
             let (encrypted, plaintext) = encrypted_stream_fixture(encrypt);
@@ -7067,10 +7071,10 @@ mod tests {
         assert_eq!(qpdf_contents_bytes("<< /Contents (literal) >>"), b"literal");
     }
 
-    fn aes128_encryption_state() -> crate::reader::EncryptionState {
+    fn aes128_encryption_state() -> crate::encryption::state::EncryptionState {
         let encrypted = encrypted_info_fixture(
             b"<< /Title (TopSecretTitle) >>",
-            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+            crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
         // cov:ignore-start: fixture setup failures are reported only by this parser-error regression test
         let pdf = Pdf::open_with_options(
@@ -7172,7 +7176,7 @@ mod tests {
     fn canonical_resolver_warns_once_for_an_unknown_string_filter() {
         let encrypted = encrypted_info_fixture(
             b"<< /Title (TopSecretTitle) /Metadata << /Label (NestedSecret) >> >>",
-            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+            crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
         let mut pdf = Pdf::open_with_options(
             Cursor::new(encrypted),
@@ -7187,7 +7191,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .expect("encryption parameters")
-            .cf_string = crate::reader::EncryptionMode::Unknown;
+            .cf_string = crate::encryption::state::EncryptionMode::Unknown;
 
         let info_ref = match pdf.trailer().get("Info") {
             Some(crate::Object::Reference(object_ref)) => *object_ref,
@@ -7219,7 +7223,7 @@ mod tests {
     fn unknown_string_filter_warning_sink_failure_propagates() {
         let encrypted = encrypted_info_fixture(
             b"<< /Title (TopSecretTitle) >>",
-            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+            crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
         let mut pdf = Pdf::open_with_options(
             Cursor::new(encrypted),
@@ -7234,7 +7238,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .unwrap()
-            .cf_string = crate::reader::EncryptionMode::Unknown;
+            .cf_string = crate::encryption::state::EncryptionMode::Unknown;
         let logger = crate::QPDFLogger::create();
         logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
             crate::pipeline::test_support::NthWriteFailure::new(1),
@@ -7256,7 +7260,7 @@ mod tests {
     // plaintext assertions fail while qpdf continues to show the literals.
     #[test]
     fn canonical_resolver_string_ciphers_match_pinned_qpdf() {
-        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+        use crate::encryption::{EncryptMethod, EncryptParams};
 
         // cov:ignore-start: CI has pinned qpdf; this fallback is for developer hosts only.
         if Command::new("qpdf").arg("--version").output().is_err() {
@@ -7325,7 +7329,7 @@ mod tests {
 
         let encrypted = encrypted_info_fixture(
             b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents (SignatureCipher) /Reason (ReasonPlain) >>",
-            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+            crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
         let (info_ref, values) = canonical_info_dictionary(encrypted.clone());
         assert_eq!(
@@ -7349,7 +7353,7 @@ mod tests {
 
         let no_byte_range = encrypted_info_fixture(
             b"<< /Type /Sig /Contents (SignatureCipher) >>",
-            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+            crate::encryption::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
         );
         let (_, values) = canonical_info_dictionary(no_byte_range);
         assert_eq!(

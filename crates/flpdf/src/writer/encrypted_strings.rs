@@ -1,8 +1,8 @@
 //! qpdf correspondence: QPDFWriter.cc:785-803 encryption-dictionary binary-key hex selection, QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities.
 
+use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::object::{write_hex_string, write_name_escaped, write_string_value};
 use crate::object_handle::ObjectHandle;
-use crate::security::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::{EncryptionContext, WriteCipher, WriterOptions};
 use crate::{Dictionary, Object, ObjectRef};
@@ -584,10 +584,10 @@ mod tests {
         serialize_encrypted_string, write_encryption_dictionary,
         write_encryption_dictionary_handle, EncryptedStringEmitter, StreamDictOptions,
     };
-    use crate::encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
-    use crate::security::standard::{
+    use crate::encryption::standard::{
         decrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringCipher,
     };
+    use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams};
     use crate::writer::{
         build_copy_encryption_context, build_encryption_context, EncryptionContext, WriteCipher,
         WriterOptions,

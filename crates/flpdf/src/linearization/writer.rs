@@ -1179,7 +1179,7 @@ fn finalize_linearized_id(
     options: &WriterOptions,
     source_trailer: &Dictionary,
     det_id_source_id0: Option<&[u8]>,
-    copy_encryption: Option<&crate::encrypt_setup::CopyEncryptionSource>,
+    copy_encryption: Option<&crate::encryption::CopyEncryptionSource>,
 ) -> Object {
     if options.deterministic_id {
         // Size the all-zero permanent-identifier placeholder to the source
@@ -4711,8 +4711,7 @@ mod tests {
             include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
         ))
         .expect("three-page fixture should parse");
-        let mut params =
-            crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec());
+        let mut params = crate::encryption::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec());
         params.encrypt_metadata = false;
         let options = WriterOptions {
             encrypt: Some(params),
@@ -4857,7 +4856,7 @@ mod tests {
     fn canonical_linearized_copy_encryption_propagates_shape_errors() {
         let mut pdf = open_tiny_pdf();
         let options = WriterOptions {
-            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+            copy_encryption: Some(crate::encryption::CopyEncryptionSource {
                 encrypt_dict: Dictionary::new(),
                 file_key: Vec::new(),
                 id0: Vec::new(),
@@ -6967,7 +6966,7 @@ mod tests {
     fn configure_deterministic_aes128(options: &mut WriterOptions) {
         options.static_id = true;
         options.static_aes_iv = true;
-        options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+        options.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
             Vec::new(),
             b"owner".to_vec(),
         ));
@@ -7150,7 +7149,7 @@ mod tests {
     fn encrypted_linearized_empty_source_id0_matches_emitted_id1() {
         let source = tiny_pdf_with("/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", None);
         let output = linearize_with(&source, |options| {
-            options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            options.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
                 Vec::new(),
                 b"owner".to_vec(),
             ));
@@ -7191,7 +7190,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
             deterministic_id: true,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
@@ -7237,7 +7236,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
             deterministic_id: true,
-            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+            copy_encryption: Some(crate::encryption::CopyEncryptionSource {
                 encrypt_dict: Dictionary::new(),
                 file_key: Vec::new(),
                 id0: Vec::new(),
@@ -7289,7 +7288,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
             // `deterministic_id` left at its default `false`.
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
@@ -7321,12 +7320,9 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams {
+            encrypt: Some(crate::encryption::EncryptParams {
                 encrypt_metadata: false,
-                ..crate::encrypt_setup::EncryptParams::v4_aes128(
-                    b"user".to_vec(),
-                    b"owner".to_vec(),
-                )
+                ..crate::encryption::EncryptParams::v4_aes128(b"user".to_vec(), b"owner".to_vec())
             }),
             ..WriterOptions::default()
         };
@@ -7381,7 +7377,7 @@ mod tests {
         let expected_encrypt_num = renumber.hint_stream_slot();
 
         let out = linearize_with(&tiny_pdf_bytes(), |o| {
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            o.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             ));
@@ -7770,7 +7766,7 @@ mod tests {
         let out = linearize_with(&src, |o| {
             o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
             o.static_aes_iv = true;
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            o.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
                 Vec::new(),
                 b"owner".to_vec(),
             ));
@@ -7824,7 +7820,7 @@ mod tests {
         );
         let out = linearize_with(&src, |options| {
             options.static_aes_iv = true;
-            options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            options.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
                 Vec::new(),
                 b"owner".to_vec(),
             ));
@@ -7867,7 +7863,7 @@ mod tests {
         let out = linearize_with(&src, |o| {
             o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
             o.static_aes_iv = true;
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            o.encrypt = Some(crate::encryption::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             ));
@@ -7988,7 +7984,7 @@ mod tests {
         let out = linearize_with(&src, |o| {
             o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
             o.static_aes_iv = true;
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v5_r5(
+            o.encrypt = Some(crate::encryption::EncryptParams::v5_r5(
                 Vec::new(),
                 b"owner".to_vec(),
             ));
@@ -8143,7 +8139,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
@@ -8221,7 +8217,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
@@ -8298,7 +8294,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
@@ -8376,7 +8372,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
@@ -8450,7 +8446,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let opts = WriterOptions {
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+            encrypt: Some(crate::encryption::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
@@ -8615,9 +8611,9 @@ mod tests {
         let out = linearize_with(&src, |o| {
             o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
             o.static_aes_iv = true;
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams {
+            o.encrypt = Some(crate::encryption::EncryptParams {
                 encrypt_metadata: false,
-                ..crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
+                ..crate::encryption::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
             });
         });
 
@@ -8781,9 +8777,9 @@ mod tests {
         let out = linearize_with(&src, |o| {
             o.stream_data = Some(crate::writer::StreamDataMode::Compress);
             o.static_aes_iv = true;
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams {
+            o.encrypt = Some(crate::encryption::EncryptParams {
                 encrypt_metadata: false,
-                ..crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
+                ..crate::encryption::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
             });
         });
 
@@ -9711,7 +9707,7 @@ mod tests {
             // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
             // uses. `static_aes_iv` stays at its default `false`, so this
             // case uses a genuinely random IV.
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            o.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
                 Vec::new(),
                 b"owner".to_vec(),
             ));
@@ -10044,7 +10040,7 @@ mod tests {
         let unencrypted = linearize_with(&src, |_o| {});
         let encrypted = linearize_with(&src, |o| {
             o.static_aes_iv = true;
-            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            o.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
                 Vec::new(),
                 b"owner".to_vec(),
             ));

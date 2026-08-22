@@ -3,7 +3,7 @@
 
 use std::ffi::CStr;
 
-use crate::security::primitives::PrimitiveError;
+use crate::encryption::primitives::PrimitiveError;
 
 /// Stateful RC4 compatibility cipher mirroring qpdf's `RC4_native`.
 ///

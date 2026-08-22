@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
+use crate::encryption::{CopyEncryptionSource, EncryptParams};
 
 use super::{
     CompressStreams, NewlineBeforeEndstream, ObjectStreamMode, ProgressReporter, StreamDataMode,

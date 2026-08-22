@@ -11,10 +11,10 @@ security-layer authentication truncates supplied V=5 passwords to 127 bytes.
 
 ## Files in scope
 
-- `crates/flpdf/src/security/password.rs`
+- `crates/flpdf/src/encryption/password.rs`
   - remove the encryption-specific truncation from generic normalization and
     update its focused unit test/docs.
-- `crates/flpdf/src/security/standard.rs`
+- `crates/flpdf/src/encryption/standard.rs`
   - remove truncation from R=5/R=6 hash primitives;
   - add a private 127-byte prefix helper;
   - apply it at all four V=5 user/owner authentication entry points;
@@ -32,10 +32,10 @@ Do not modify `crates/flpdf/src/reader.rs` or `crates/flpdf/src/writer.rs`.
 
 ### 1. RED: pin the corrected contracts
 
-1. In `security/password.rs`, change the existing long-password expectation to
+1. In `encryption/password.rs`, change the existing long-password expectation to
    assert that V=5 normalization preserves all bytes. This should fail before
    the production normalization change.
-2. In `security/standard.rs`, change the R=5 and R=6 long-password hash tests
+2. In `encryption/standard.rs`, change the R=5 and R=6 long-password hash tests
    to expected full-password oracle values, and add suffix-sensitivity
    assertions where useful. These should fail while the hash helpers still
    clamp at 127 bytes.
@@ -60,8 +60,8 @@ Run the narrow tests and record the expected failures. Do not implement until
 the RED signal is confirmed:
 
 ```bash
-cargo test -p flpdf security::password::tests::r5_preserves_password_bytes
-cargo test -p flpdf security::standard::tests::r5_salted_hash_ --lib
+cargo test -p flpdf encryption::password::tests::r5_preserves_password_bytes
+cargo test -p flpdf encryption::standard::tests::r5_salted_hash_ --lib
 cargo test -p flpdf --test qpdf_v5_password_parity
 ```
 
@@ -71,7 +71,7 @@ cargo test -p flpdf --test qpdf_v5_password_parity
    write order: password, salt, extra.
 2. Remove the pre-slice in `r6_password_hash`; let Algorithm 2.B's repeated
    input use the complete password passed by the caller.
-3. Add a private helper in `security/standard.rs` that returns the first 127
+3. Add a private helper in `encryption/standard.rs` that returns the first 127
    bytes without allocation.
 4. At the start of each of `check_user_password_r5`,
    `check_owner_password_r5`, `check_user_password_r6`, and
@@ -87,8 +87,8 @@ cargo test -p flpdf --test qpdf_v5_password_parity
 Run the focused tests until all are green:
 
 ```bash
-cargo test -p flpdf security::password::tests --lib
-cargo test -p flpdf security::standard::tests --lib
+cargo test -p flpdf encryption::password::tests --lib
+cargo test -p flpdf encryption::standard::tests --lib
 cargo test -p flpdf --test qpdf_v5_password_parity
 ```
 

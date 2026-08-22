@@ -161,7 +161,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Checked arithmetic and non-negative validation on parser-derived sizes (`/Length` bounds, PNG-predictor row math, LZW table size cap of 4096 entries) | `parser.rs`, `filters.rs` |
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
 | Weak-crypto write gate: selecting new RC4 or deprecated R=5 (AES-256) encryption parameters via `--encrypt` requires the explicit `--allow-weak-crypto` opt-in (a preserve-only rewrite of an already weakly encrypted input is not gated) | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the new selection; encrypted inputs remain readable, matching qpdf's write-only weak-crypto policy |
-| OS CSPRNG for AES IVs and key material | `getrandom` in `security/` |
+| OS CSPRNG for AES IVs and key material | `getrandom` in `encryption/` |
 | Signed-PDF qpdf-compatible handling (full rewrite proceeds, leaving signatures present-but-invalid like qpdf; signatures are stripped only via the explicit `--remove-restrictions` opt-in, never silently). A preserve-by-default *refusal* is a deferred post-v1.0 improvement (`flpdf-hn1g.14`). | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Traversal boundaries on page closures: stop at other `Page`/`Catalog` dicts and skip `/Kids` on `/Pages` nodes; `/Parent` is intentionally followed upward for inherited resources, bounded by the `Page`/`Catalog` stop; no brute-force scans of all live objects | `page_closure.rs`, [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
 
@@ -215,7 +215,7 @@ Entry points through which untrusted bytes reach flpdf:
 | Document opening (repair — widest surface) | `Pdf::open_with_repair`, `Pdf::open_best_effort`, `Pdf::open_with_options` and `open_mem*` variants |
 | Lazy object loading | `Pdf::resolve` / `resolve_borrowed` (xref offsets, object syntax, object streams) |
 | Stream decoding | filter pipeline in `filters.rs`: Flate, LZW, ASCII85, ASCIIHex, RunLength (+ pass-through DCT/JBIG2/JPX/CCITT) |
-| Decryption | standard security handler (`security/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); qpdf-compatible UTF-8 validation/raw password bytes and the reader-side V5 prefix boundary (qpdf does not apply SASLprep) |
+| Decryption | standard security handler (`encryption/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); qpdf-compatible UTF-8 validation/raw password bytes and the reader-side V5 prefix boundary (qpdf does not apply SASLprep) |
 | Validation | `job::QPDFJob::check` and the CLI `--check` route |
 | Writing (reads everything it writes) | `PdfWriter`, QDF repair, linearization |
 | Signature inspection | `signatures.rs` (`/ByteRange`, signature dictionaries, certificates) |

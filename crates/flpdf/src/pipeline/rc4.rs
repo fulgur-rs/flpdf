@@ -1,7 +1,7 @@
 //! qpdf correspondence: Pl_RC4.cc bounded streaming over one retained RC4 state.
 
 use super::{Pipeline, PipelineError, PipelineResult};
-use crate::security::rc4::Rc4;
+use crate::encryption::rc4::Rc4;
 use std::ffi::CStr;
 
 pub(crate) const DEFAULT_OUT_BUFFER_SIZE: usize = 65_536;
@@ -148,8 +148,8 @@ impl Pipeline for PlRc4<'_> {
 #[cfg(test)]
 mod tests {
     use super::{DiscardSink, PlRc4, DEFAULT_OUT_BUFFER_SIZE};
+    use crate::encryption::rc4::Rc4;
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-    use crate::security::rc4::Rc4;
     use std::ffi::{CStr, CString};
     use std::path::Path;
     use std::process::Command;

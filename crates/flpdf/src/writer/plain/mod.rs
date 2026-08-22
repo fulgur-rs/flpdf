@@ -131,7 +131,7 @@ mod tests {
             reset_pipeline_calls();
             write_with(&WriterOptions {
                 object_streams,
-                encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                encrypt: Some(crate::encryption::EncryptParams::v4_aes128(
                     b"user".to_vec(),
                     b"owner".to_vec(),
                 )),
@@ -203,7 +203,7 @@ mod tests {
 
             let copy_options = WriterOptions {
                 object_streams: mode,
-                copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                copy_encryption: Some(crate::encryption::CopyEncryptionSource {
                     encrypt_dict: crate::Dictionary::new(),
                     file_key: Vec::new(),
                     id0: Vec::new(),

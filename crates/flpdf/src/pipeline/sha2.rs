@@ -127,7 +127,7 @@ impl Pipeline for PlSha2<'_> {
             // was left uncommitted (resetBits() never called); this
             // converts qpdf's null-pointer UB into a defined logic error.
             // Unreachable from any parsed PDF: PlSha2 is pub(crate) and
-            // its only production caller (security/standard.rs) always
+            // its only production caller (encryption/standard.rs) always
             // passes bits in {256,384,512}.
             None => {
                 let identifier = &self.identifier;
