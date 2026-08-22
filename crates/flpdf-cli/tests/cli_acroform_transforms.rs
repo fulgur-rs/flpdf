@@ -33,7 +33,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 mod common;
-use common::first_widget_ref;
+use common::{first_widget_ref, page_annotation_handles};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────────
 
@@ -687,7 +687,7 @@ fn flatten_all_annot_removed_and_do_in_content() {
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
 
     // Annotation must be gone from /Annots.
-    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
     assert!(
         annots.is_empty(),
         "flatten=all must remove widget from /Annots, found {} annotation(s)",
@@ -731,7 +731,7 @@ fn generate_then_flatten_all_do_in_content() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
 
-    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
     assert!(
         annots.is_empty(),
         "generate+flatten=all must remove widget from /Annots, found {} annotation(s)",
@@ -772,9 +772,7 @@ fn generate_then_flatten_clears_need_appearances() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     assert!(
-        flpdf::enumerate_page_annotations(&mut pdf, page_ref)
-            .unwrap()
-            .is_empty(),
+        page_annotation_handles(&mut pdf, page_ref).is_empty(),
         "generated widget must be flattened after qpdf clears NeedAppearances"
     );
 }
@@ -802,9 +800,7 @@ fn generate_then_flatten_replaces_indirect_null_normal_appearance() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
     assert!(
-        flpdf::enumerate_page_annotations(&mut pdf, page_ref)
-            .unwrap()
-            .is_empty(),
+        page_annotation_handles(&mut pdf, page_ref).is_empty(),
         "generated widget must be flattened after qpdf clears NeedAppearances"
     );
     let content = flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap();
@@ -841,7 +837,7 @@ fn flatten_print_draws_print_bit_annot_and_removes_all_selected_appearances() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
 
-    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
     assert!(annots.is_empty());
 
     // Page content must have a Do (from the Print-bit annotation being flattened).

@@ -8,7 +8,7 @@ use std::io::BufReader;
 use std::io::Write;
 
 mod common;
-use common::first_widget_ref;
+use common::{first_widget_ref, page_annotation_handles};
 
 /// `true` when `needle` appears as a contiguous byte subslice of `hay`.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -7830,7 +7830,7 @@ fn rewrite_flatten_annotations_all_removes_widget_from_annots() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
     assert!(
         annots.is_empty(),
         "flattened widget should be removed from /Annots, found {} annotation(s)",
@@ -7864,7 +7864,7 @@ fn rewrite_generate_then_flatten_cooperate() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
-    let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
+    let annots = page_annotation_handles(&mut pdf, page_refs[0]);
     assert!(
         annots.is_empty(),
         "widget should be generated-then-flattened away, found {} annotation(s)",
