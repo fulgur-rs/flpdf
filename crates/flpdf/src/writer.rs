@@ -3817,6 +3817,20 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     } else {
         None
     };
+    let normalized_stream_refs: BTreeSet<ObjectRef> = if options.content_normalization {
+        let mut refs = BTreeSet::new();
+        let page_refs = qdf_page_refs
+            .as_ref()
+            .expect("content normalization prepares page references");
+        for page_ref in page_refs {
+            refs.extend(collect_content_stream_refs_tolerant(pdf, *page_ref)?);
+        }
+        refs
+    } else {
+        BTreeSet::new()
+    };
+    let cached_stream_outputs: RefCell<BTreeMap<ObjectRef, plain::plan::CachedStreamOutput>> =
+        RefCell::new(BTreeMap::new());
     // The specialized writer is a live ObjectHandle consumer. Its
     // Catalog-first walk must therefore use the same canonical graph as the
     // emission loop; the legacy raw-Object walk would parse a content holder
@@ -3826,11 +3840,40 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // with every input object; QDF changes formatting and ObjStm policy, not
     // the reachability setting (`QPDFWriter.cc:2907-2914`). Keep the setting
     // alive on this specialized coordinator, which is the route QDF uses.
-    let renumber = CanonicalCatalogFirstRenumber::build_qpdf(
+    let stream_parameters_removed = |handle: &ObjectHandle| {
+        if let Some(source) = handle.object_ref().filter(|_| handle.is_data_modified()) {
+            if let Some(parameters_removed) = cached_stream_outputs
+                .borrow()
+                .get(&source)
+                .map(|cached| cached.parameters_removed)
+            {
+                return Ok(parameters_removed); // cov:ignore: the canonical walk probes each source object once; emission reads this cache directly, so a repeated probe is defensive only
+            }
+            let (dict, data, refiltered, parameters_removed) =
+                plain::body::canonical_stream_output_for_rewrite_with_status(
+                    handle,
+                    options,
+                    normalized_stream_refs.contains(&source),
+                )?; // cov:ignore: LLVM maps this covered cache-fill call terminator to a zero-count continuation region
+            cached_stream_outputs.borrow_mut().insert(
+                source,
+                plain::plan::CachedStreamOutput {
+                    dict,
+                    data,
+                    refiltered,
+                    parameters_removed,
+                },
+            );
+            return Ok(parameters_removed);
+        }
+        plain::body::canonical_stream_will_be_refiltered(handle, options)
+    };
+    let renumber = CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
         pdf,
         true,
         options.preserve_unreferenced_objects,
         &removed_refs,
+        Some(&stream_parameters_removed),
     )?; // cov:ignore: llvm-cov assigns no executable counter to this multiline-call terminator; the preserve qdf call is exercised by the writer contract test.
 
     // The new /Root reference (always seeded first by the walk, so present).
@@ -4449,12 +4492,19 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // This is the qpdf stream writer's live-handle path: filtering and
             // payload framing are decided from the stream handle, while the
             // dictionary serializer remaps only child reference tokens.
-            let (stream_dict, stream_data, refiltered) =
+            let cached = cached_stream_outputs
+                .borrow()
+                .get(old_ref)
+                .map(|cached| (cached.dict.clone(), cached.data.clone(), cached.refiltered));
+            let (stream_dict, stream_data, refiltered) = if let Some(cached) = cached {
+                cached
+            } else {
                 plain::body::canonical_stream_output_for_rewrite(
                     &object_handle,
                     options,
                     options.content_normalization && contents_seq.contains_key(old_ref),
-                )?; // cov:ignore: canonical stream output is validated before this success continuation
+                )? // cov:ignore: canonical stream output is validated before this success continuation
+            };
             let stream_encryption = encrypt_ctx
                 .as_ref()
                 .filter(|ctx| emit_ref != ctx.encrypt_ref);
