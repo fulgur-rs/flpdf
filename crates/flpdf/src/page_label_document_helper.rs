@@ -835,156 +835,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
-
-    /// Insert or replace the label range whose first page index is
-    /// `first_page_idx`. Rebuilds the `/Nums` tree and points the catalog
-    /// `/PageLabels` at the new (indirect) root.
-    ///
-    /// # Errors
-    ///
-    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
-    ///   exceeded while reading the existing tree.
-    /// - Any error from [`Pdf::resolve`].
-    pub fn set_range(&mut self, first_page_idx: i64, range: LabelRange) -> Result<()> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(());
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
-            return Ok(());
-        }
-        let tree = match catalog.try_has_key(b"/PageLabels")? {
-            true => crate::nntree::HandleNumberTree::new(
-                catalog.try_get_key(b"/PageLabels")?,
-                DEFAULT_MAX_TREE_DEPTH,
-            ),
-            false => crate::nntree::HandleNumberTree::new_empty(self.pdf, DEFAULT_MAX_TREE_DEPTH)?,
-        };
-        tree.insert(
-            self.pdf,
-            first_page_idx,
-            Self::page_label_dict(range.style, range.start, &range.prefix),
-        )?;
-        catalog.replace_key(b"/PageLabels", tree.root_handle(self.pdf)?)?;
-        self.pdf.mark_object_handle_dirty(&catalog)?;
-        Ok(())
-    }
-
-    /// Remove the label range whose first page index is `first_page_idx`.
-    /// Returns `false` if no such range exists. When the last range is removed,
-    /// `/PageLabels` is dropped from the catalog.
-    ///
-    /// # Errors
-    ///
-    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
-    ///   exceeded while reading the existing tree.
-    /// - Any error from [`Pdf::resolve`].
-    pub fn remove_range(&mut self, first_page_idx: i64) -> Result<bool> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(false);
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
-            return Ok(false);
-        }
-        if !catalog.try_has_key(b"/PageLabels")? {
-            return Ok(false);
-        }
-        let tree = crate::nntree::HandleNumberTree::new(
-            catalog.try_get_key(b"/PageLabels")?,
-            DEFAULT_MAX_TREE_DEPTH,
-        );
-        if tree.remove(self.pdf, first_page_idx)?.is_none() {
-            return Ok(false);
-        }
-        if tree.entries(self.pdf)?.is_empty() {
-            catalog.remove_key(b"/PageLabels");
-        } else {
-            catalog.replace_key(b"/PageLabels", tree.root_handle(self.pdf)?)?;
-        }
-        self.pdf.mark_object_handle_dirty(&catalog)?;
-        Ok(true)
-    }
-
-    /// Replace the entire `/PageLabels` tree with `ranges` — `(first_page_idx,
-    /// LabelRange)` pairs, ascending by index (the same shape [`Self::ranges`]
-    /// returns). An empty slice removes `/PageLabels` from the catalog
-    /// entirely.
-    ///
-    /// This is the bulk counterpart to [`Self::set_range`]/[`Self::remove_range`]:
-    /// where those mutate one entry of the existing tree, `write_labels`
-    /// discards whatever the tree currently holds and rebuilds it from the
-    /// given list (rebalanced through the canonical `HandleNumberTree` with qpdf's split
-    /// behavior).
-    ///
-    /// # Errors
-    ///
-    /// - [`crate::Error::Unsupported`] if any range's `/St` (`start`) is
-    ///   non-positive, or if any `first_page_idx` is negative — ISO 32000-2
-    ///   §7.9.7 defines `/St` as a starting page number (`>= 1`), and a page
-    ///   index cannot be negative.
-    /// - Any error from [`Pdf::resolve`].
-    pub fn write_labels(&mut self, ranges: &[(i64, LabelRange)]) -> Result<()> {
-        for (idx, range) in ranges {
-            if *idx < 0 {
-                return Err(Error::Unsupported(format!(
-                    "page label first_page_idx must be >= 0, got {idx}"
-                )));
-            }
-            if range.start < 1 {
-                return Err(Error::Unsupported(format!(
-                    "page label /St must be >= 1, got {}",
-                    range.start
-                )));
-            }
-        }
-        let mut entries: Vec<(i64, LabelRange)> = ranges
-            .iter()
-            .map(|(idx, range)| (*idx, range.clone()))
-            .collect();
-        // build_number_tree requires pre-sorted UNIQUE input; callers
-        // (merge_adjacent_ranges, shifted insert/remove lists) already preserve
-        // ascending order and normally uniqueness, but this is a public entry
-        // point, so sort defensively and dedup by key. ISO 32000-1 §7.9.7
-        // requires number-tree keys to be unique; a duplicate would produce
-        // a malformed PDF.
-        entries.sort_by_key(|(idx, _)| *idx);
-        entries.dedup_by(|a, b| a.0 == b.0);
-        self.rebuild(entries)
-    }
-
-    /// Rebuild `/PageLabels` from sorted entries and patch the catalog. Empty
-    /// entries → remove `/PageLabels`.
-    fn rebuild(&mut self, entries: Vec<(i64, LabelRange)>) -> Result<()> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(());
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        catalog.try_dereference()?;
-        if catalog.try_as_dictionary()?.is_none() {
-            return Ok(());
-        }
-
-        if entries.is_empty() {
-            catalog.remove_key(b"/PageLabels");
-            self.pdf.mark_object_handle_dirty(&catalog)?;
-            return Ok(());
-        }
-
-        let tree = crate::nntree::HandleNumberTree::new_empty(self.pdf, DEFAULT_MAX_TREE_DEPTH)?;
-        for (index, range) in entries {
-            tree.insert(
-                self.pdf,
-                index,
-                Self::page_label_dict(range.style, range.start, &range.prefix),
-            )?;
-        }
-        catalog.replace_key(b"/PageLabels", tree.root_handle(self.pdf)?)?;
-        self.pdf.mark_object_handle_dirty(&catalog)?;
-        Ok(())
-    }
 }
 
 /// Extension constructor mirroring [`Pdf::acroform`].
@@ -1556,81 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn set_range_inserts_and_round_trips() {
-        let mut pdf = pdf_with_pagelabels(vec![]); // start with empty /PageLabels root
-        {
-            let mut h = pdf.page_labels();
-            h.set_range(
-                0,
-                LabelRange {
-                    style: LabelStyle::RomanLower,
-                    prefix: String::new(),
-                    start: 1,
-                },
-            )
-            .unwrap();
-            h.set_range(
-                3,
-                LabelRange {
-                    style: LabelStyle::Decimal,
-                    prefix: "A-".into(),
-                    start: 1,
-                },
-            )
-            .unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[0].0, 0);
-        assert_eq!(ranges[0].1.style, LabelStyle::RomanLower);
-        assert_eq!(ranges[1].0, 3);
-        assert_eq!(ranges[1].1.prefix, "A-");
-        assert_eq!(h.label_string_for_page(4).unwrap(), "A-2");
-    }
-
-    #[test]
-    fn set_range_replaces_existing_index() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.set_range(
-                0,
-                LabelRange {
-                    style: LabelStyle::RomanUpper,
-                    prefix: String::new(),
-                    start: 1,
-                },
-            )
-            .unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].1.style, LabelStyle::RomanUpper);
-    }
-
-    #[test]
-    fn remove_range_drops_entry_and_pagelabels_when_empty() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            assert!(h.remove_range(0).unwrap());
-            assert!(!h.remove_range(99).unwrap(), "absent index => false");
-        }
-        let mut h = pdf.page_labels();
-        assert!(
-            !h.has_page_labels().unwrap(),
-            "/PageLabels dropped when empty"
-        );
-        assert_eq!(
-            h.label_string_for_page(0).unwrap(),
-            "1",
-            "defaults after removal"
-        );
-    }
-
-    #[test]
     fn roman_matches_spec() {
         assert_eq!(to_roman(1, true), "I");
         assert_eq!(to_roman(4, true), "IV");
@@ -1736,36 +1511,6 @@ mod tests {
         let ranges = h.ranges().unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].1.start, 7, "indirect /St must be resolved");
-    }
-
-    #[test]
-    fn set_range_round_trips_multi_leaf_tree() {
-        let mut pdf = pdf_with_pagelabels(vec![]);
-        {
-            let mut h = pdf.page_labels();
-            for i in 0..40i64 {
-                h.set_range(
-                    i * 2,
-                    LabelRange {
-                        style: LabelStyle::Decimal,
-                        prefix: String::new(),
-                        start: 1,
-                    },
-                )
-                .unwrap();
-            }
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        assert_eq!(
-            ranges.len(),
-            40,
-            "all 40 ranges survive the multi-leaf tree"
-        );
-        // Spot-check ordering + a mid entry.
-        assert_eq!(ranges[0].0, 0);
-        assert_eq!(ranges[39].0, 78);
-        assert!(ranges.windows(2).all(|w| w[0].0 < w[1].0), "ascending");
     }
 
     #[test]
@@ -1928,17 +1673,6 @@ mod tests {
             "non-dict catalog => no labels"
         );
         assert_eq!(h.ranges().unwrap(), vec![]);
-        // rebuild path bails out gracefully when the catalog is not a dict.
-        h.set_range(
-            0,
-            LabelRange {
-                style: LabelStyle::Decimal,
-                prefix: String::new(),
-                start: 1,
-            },
-        )
-        .unwrap();
-        assert!(!h.remove_range(0).unwrap());
     }
 
     #[test]
@@ -1961,15 +1695,6 @@ mod tests {
         let mut h = pdf.page_labels();
         assert!(!h.has_page_labels().unwrap());
         assert_eq!(h.ranges().unwrap(), vec![]);
-        h.set_range(
-            0,
-            LabelRange {
-                style: LabelStyle::Decimal,
-                prefix: String::new(),
-                start: 1,
-            },
-        )
-        .unwrap();
     }
 
     /// Shorthand for a plain decimal range starting at `start`, no prefix.
@@ -1992,83 +1717,6 @@ mod tests {
     }
 
     // ── write_labels ──────────────────────────────────────────────────────
-
-    #[test]
-    fn write_labels_round_trips_multi_style_ranges() {
-        let mut pdf = pdf_with_pagelabels(vec![]); // start with no /PageLabels
-        let ranges = vec![
-            (
-                0,
-                LabelRange {
-                    style: LabelStyle::RomanLower,
-                    prefix: String::new(),
-                    start: 1,
-                },
-            ),
-            (
-                3,
-                LabelRange {
-                    style: LabelStyle::Decimal,
-                    prefix: "A-".into(),
-                    start: 1,
-                },
-            ),
-            (
-                7,
-                LabelRange {
-                    style: LabelStyle::AlphaUpper,
-                    prefix: String::new(),
-                    start: 1,
-                },
-            ),
-        ];
-        {
-            let mut h = pdf.page_labels();
-            h.write_labels(&ranges).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), ranges);
-    }
-
-    #[test]
-    fn write_labels_empty_removes_pagelabels() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.write_labels(&[]).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        assert!(
-            !h.has_page_labels().unwrap(),
-            "/PageLabels removed by an empty write_labels"
-        );
-    }
-
-    #[test]
-    fn write_labels_rejects_negative_start() {
-        let mut pdf = bare_one_page_pdf();
-        let mut h = pdf.page_labels();
-        let err = h
-            .write_labels(&[(0, dec(-1))])
-            .expect_err("/St < 1 must be rejected");
-        assert!(matches!(err, Error::Unsupported(_)));
-        assert!(
-            !h.has_page_labels().unwrap(),
-            "rejected write must not partially apply"
-        );
-    }
-
-    #[test]
-    fn write_labels_rejects_negative_index() {
-        let mut pdf = bare_one_page_pdf();
-        let mut h = pdf.page_labels();
-        let err = h
-            .write_labels(&[(-1, dec(1))])
-            .expect_err("negative first_page_idx must be rejected");
-        assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    // ── write_reconstructed_labels / to_reconstructed_dict ────────────────
 
     #[test]
     fn to_reconstructed_dict_always_includes_st() {
