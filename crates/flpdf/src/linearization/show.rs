@@ -29,8 +29,8 @@
 //! `H_length` added before display (qpdf's `adjusted_offset`).
 
 use super::check::{
-    check_linearization_parameters, check_linearization_warnings, load_hint_stream,
-    LinearizationCheckError, LinearizationParameterCheck,
+    check_linearization_parameters, check_linearization_warnings, load_hint_stream_with_damage,
+    HintStreamLoadError, LinearizationCheckError, LinearizationParameterCheck,
 };
 use crate::bit_stream::{BitStream, BitStreamError};
 #[cfg(test)]
@@ -122,6 +122,41 @@ macro_rules! malformed {
     ($($arg:tt)*) => {
         ShowLinearizationError::Malformed { message: format!($($arg)*) }
     };
+}
+
+enum ShowTablesError {
+    QpdfDamage {
+        object: &'static str,
+        offset: u64,
+        detail: String,
+    },
+    Other(ShowLinearizationError),
+}
+
+impl From<ShowLinearizationError> for ShowTablesError {
+    fn from(error: ShowLinearizationError) -> Self {
+        Self::Other(error)
+    }
+}
+
+fn load_hint_stream_for_show(
+    pdf: &mut Pdf<Cursor<Vec<u8>>>,
+    file_bytes: &[u8],
+    offset: usize,
+    expected_h_length: u64,
+) -> std::result::Result<(ObjectHandle, Rc<Vec<u8>>), ShowTablesError> {
+    match load_hint_stream_with_damage(pdf, file_bytes, offset, expected_h_length) {
+        Ok(result) => Ok(result),
+        Err(HintStreamLoadError::Damage(damage)) => Err(ShowTablesError::QpdfDamage {
+            object: damage.object,
+            offset: damage.offset,
+            detail: damage.detail,
+        }),
+        Err(HintStreamLoadError::Core(crate::Error::Unsupported(message))) => {
+            Err(malformed!("{message}").into())
+        }
+        Err(HintStreamLoadError::Core(error)) => Err(ShowLinearizationError::from(error).into()), // cov:ignore: Cursor<Vec<u8>> show inputs cannot produce this generic source-I/O arm
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,8 +836,10 @@ fn show_with_pdf(
     // accumulated so far with that one message and skips the dump, but
     // check_linearization_warnings's InvalidParam (matched separately,
     // right below) appends instead and lets the dump proceed.
-    let tables =
-        (|| -> ShowResult<(LinParameters, HPageOffset, HSharedObject, Option<HGeneric>)> {
+    let tables = (|| -> std::result::Result<
+        (LinParameters, HPageOffset, HSharedObject, Option<HGeneric>),
+        ShowTablesError,
+    > {
             // 2. Param-dict values (qpdf's LinParameters).
             let params = read_lin_parameters(&param_dict, file_size)?;
             match check_linearization_warnings(pdf, file_bytes, true) {
@@ -810,12 +847,12 @@ fn show_with_pdf(
                 // cov:ignore-start: a Cursor<Vec<u8>> cannot produce a source I/O error;
                 // retain the defensive mapping for the generic checker contract.
                 Err(LinearizationCheckError::Io(error)) => {
-                    return Err(ShowLinearizationError::Io(error)); // cov:ignore: in-memory source failures are defensive
+                    return Err(ShowLinearizationError::Io(error).into()); // cov:ignore: in-memory source failures are defensive
                 }
                 // cov:ignore-end
-                // flpdf's /T backscan (check.rs:710-726, marked as a qpdf deviation)
-                // reports as InvalidParam because it has no qpdf throw
-                // counterpart to fall back to -- qpdf's own /T check
+                // flpdf's /T backscan (check.rs:710-726) remains a tracked qpdf
+                // parity debt. It reports as InvalidParam because it has no
+                // qpdf throw counterpart to fall back to -- qpdf's own /T check
                 // (QPDF_linearization.cc:452-470) is a soft warning inside
                 // checkLinearizationInternal, which never throws. Append the
                 // message as a warning and keep building the dump, instead of
@@ -830,7 +867,8 @@ fn show_with_pdf(
                 Err(LinearizationCheckError::NotLinearized) => {
                     return Err(malformed!(
                         "not a linearized PDF: the first object in the file has no /Linearized key"
-                    ));
+                    )
+                    .into());
                 } // cov:ignore-end
             }
 
@@ -845,15 +883,7 @@ fn show_with_pdf(
                 // fits; this only fires on 32-bit targets.
                 .map_err(|_| malformed!("/H[0] does not fit in platform usize"))?;
             let (hint_dict, primary_decompressed) =
-                load_hint_stream(pdf, file_bytes, h_usize, params.h_length).map_err(|error| {
-                    match error {
-                        crate::Error::Unsupported(message) => malformed!("{message}"),
-                        // public show entry points use Cursor<Vec<u8>>; the canonical
-                        // resolver catches parse/unsupported failures and this
-                        // in-memory source cannot produce a read I/O error.
-                        error => ShowLinearizationError::from(error), // cov:ignore: see comment above
-                    }
-                })?;
+                load_hint_stream_for_show(pdf, file_bytes, h_usize, params.h_length)?;
             // qpdf pipes the primary and (when present) overflow hint streams into
             // the SAME buffer before parsing any table (`readLinearizationData`,
             // `QPDF_linearization.cc:241-245`: both `readHintStream` calls write to
@@ -869,12 +899,12 @@ fn show_with_pdf(
                     // cov:ignore: on 64-bit usize is u64, so a non-negative overflow
                     // offset always fits; this only fires on 32-bit targets.
                     .map_err(|_| malformed!("/H[2] does not fit in platform usize"))?;
-                let (_overflow_dict, overflow_decompressed) =
-                    load_hint_stream(pdf, file_bytes, overflow_offset, params.h_overflow_length)
-                        .map_err(|error| match error {
-                            crate::Error::Unsupported(message) => malformed!("{message}"),
-                            error => ShowLinearizationError::from(error), // cov:ignore: see the primary hint-stream error arm above
-                        })?;
+                let (_overflow_dict, overflow_decompressed) = load_hint_stream_for_show(
+                    pdf,
+                    file_bytes,
+                    overflow_offset,
+                    params.h_overflow_length,
+                )?;
                 decompressed.extend_from_slice(&overflow_decompressed);
             }
 
@@ -882,10 +912,11 @@ fn show_with_pdf(
             // the HINT STREAM dictionary — not the parameter dict.
             let (s_offset, outline_offset) = read_hint_offsets(&hint_dict)?;
             if s_offset >= decompressed.len() {
-                return Err(malformed!(
-                    "hint stream /S offset ({s_offset}) is out of bounds (hint size {})",
-                    decompressed.len()
-                ));
+                return Err(ShowTablesError::QpdfDamage {
+                    object: "linearization hint table",
+                    offset: pdf.source_last_offset(),
+                    detail: "/S (shared object) offset is out of bounds".to_owned(),
+                });
             }
 
             // 4. Decode each table from a fresh reader at its offset.
@@ -897,10 +928,11 @@ fn show_with_pdf(
                 // flpdf's output (read_h_generic itself is unit-tested directly).
                 Some(off) => {
                     if off >= decompressed.len() {
-                        return Err(malformed!(
-                            "hint stream /O offset ({off}) is out of bounds (hint size {})",
-                            decompressed.len()
-                        ));
+                        return Err(ShowTablesError::QpdfDamage {
+                            object: "linearization hint table",
+                            offset: pdf.source_last_offset(),
+                            detail: "/O (outline) offset is out of bounds".to_owned(),
+                        });
                     }
                     Some(read_h_generic(&decompressed[off..])?)
                 }
@@ -922,20 +954,32 @@ fn show_with_pdf(
             ),
             warnings,
         }),
-        Err(ShowLinearizationError::Malformed { message }) => Ok(ShowLinearizationOutput {
+        Err(ShowTablesError::QpdfDamage {
+            object,
+            offset,
+            detail,
+        }) => Ok(ShowLinearizationOutput {
             dump: String::new(),
-            // cov:ignore-start: linearization_parameter_warning's only Err
-            // arm is a source I/O failure from linearization_candidate_ref,
-            // and a Cursor<Vec<u8>> cannot produce one (see the identical
-            // reasoning on the Io arm just below).
-            warnings: vec![linearization_parameter_warning(
-                pdf,
-                display_name,
-                &message,
-            )?],
-            // cov:ignore-end
+            warnings: vec![format!(
+                "{display_name} ({object}, offset {offset}): {detail}"
+            )],
         }),
-        Err(err @ ShowLinearizationError::Io(_)) => Err(err), // cov:ignore: in-memory source failures are defensive
+        Err(ShowTablesError::Other(ShowLinearizationError::Malformed { message })) => {
+            Ok(ShowLinearizationOutput {
+                dump: String::new(),
+                // cov:ignore-start: linearization_parameter_warning's only Err
+                // arm is a source I/O failure from linearization_candidate_ref,
+                // and a Cursor<Vec<u8>> cannot produce one (see the identical
+                // reasoning on the Io arm just below).
+                warnings: vec![linearization_parameter_warning(
+                    pdf,
+                    display_name,
+                    &message,
+                )?],
+                // cov:ignore-end
+            })
+        }
+        Err(ShowTablesError::Other(err @ ShowLinearizationError::Io(_))) => Err(err), // cov:ignore: Cursor<Vec<u8>> show inputs cannot produce this generic source-I/O arm
     }
 }
 
@@ -1845,6 +1889,38 @@ mod tests {
         doc.bytes
     }
 
+    fn compat_linearized_bytes() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat/linearized-one-page.pdf"),
+        )
+        .expect("linearized fixture")
+    }
+
+    fn replace_numeric_value(bytes: &mut [u8], key: &[u8], replacement: &[u8]) {
+        let key_pos = bytes
+            .windows(key.len())
+            .position(|window| window == key)
+            .expect("linearization numeric key");
+        let mut start = key_pos + key.len();
+        while bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        let end = start
+            + bytes[start..]
+                .iter()
+                .position(|&byte| byte.is_ascii_whitespace())
+                .expect("/H[0] value");
+        assert!(replacement.len() <= end - start);
+        let mut padded = vec![b' '; end - start];
+        padded[..replacement.len()].copy_from_slice(replacement);
+        bytes[start..end].copy_from_slice(&padded);
+    }
+
+    fn replace_hint_offset(bytes: &mut [u8], replacement: &[u8]) {
+        replace_numeric_value(bytes, b"/H [", replacement);
+    }
+
     #[test]
     fn show_linearized_happy_path_produces_dump() {
         let bytes = linearized_bytes();
@@ -2267,12 +2343,9 @@ mod tests {
         // Verified against `/usr/bin/qpdf` 11.9.0 on this same fixture
         // shape: it prints exactly one `WARNING: ...: ... /S (shared
         // object) offset is out of bounds` line, no dump, and exits 3.
-        // flpdf's message text does not match qpdf's `filename (object,
-        // offset N): detail` form here (a pre-existing, separately
-        // tracked wording gap -- `load_hint_stream`'s and this bounds
-        // check's messages are not run through `linearization_parameter_warning`),
-        // but the shape this test asserts -- empty dump, exactly one
-        // warning -- matches qpdf exactly.
+        // The warning keeps qpdf's damagedPDF category and source offset,
+        // including the distinction between the hint table and hint stream
+        // failures.
         let mut bytes = linearized_bytes();
         let s_pos = bytes.windows(3).position(|w| w == b"/S ").expect("hint /S");
         let dstart = s_pos + 3;
@@ -2289,11 +2362,61 @@ mod tests {
         let result = show_linearization_bytes_with_warnings(&bytes, "badS.pdf")
             .expect("an out-of-bounds /S is a qpdf warning, not a hard error");
         assert!(result.dump.is_empty());
-        assert_eq!(result.warnings.len(), 1);
-        assert!(
-            result.warnings[0].contains("/S") && result.warnings[0].contains("out of bounds"),
-            "unexpected warning: {:?}",
-            result.warnings
+        assert_eq!(
+            result.warnings,
+            ["badS.pdf (linearization hint table, offset 568): /S (shared object) offset is out of bounds".to_owned()]
+        );
+    }
+
+    #[test]
+    fn compat_hint_stream_s_offset_uses_qpdf_source_offset() {
+        let mut bytes = compat_linearized_bytes();
+        replace_numeric_value(&mut bytes, b"/S ", b"99");
+
+        let result = show_linearization_bytes_with_warnings(&bytes, "compatS.pdf")
+            .expect("an out-of-bounds /S is a qpdf warning");
+        assert!(result.dump.is_empty());
+        assert_eq!(
+            result.warnings,
+            ["compatS.pdf (linearization hint table, offset 660): /S (shared object) offset is out of bounds".to_owned()]
+        );
+    }
+
+    #[test]
+    fn hint_stream_header_failure_uses_qpdf_damage_context() {
+        // qpdf's readObjectAtOffset throws damagedPDF(offset,
+        // "expected n n obj") while the current object description is
+        // "linearization hint stream" (QPDF.cc:1542-1636).
+        let mut bytes = compat_linearized_bytes();
+        replace_hint_offset(&mut bytes, b"999");
+
+        let result = show_linearization_bytes_with_warnings(&bytes, "badH.pdf")
+            .expect("a bad hint-stream header is a qpdf warning");
+        assert!(result.dump.is_empty());
+        assert_eq!(
+            result.warnings,
+            ["badH.pdf (linearization hint stream, offset 999): expected n n obj".to_owned()]
+        );
+    }
+
+    #[test]
+    fn non_stream_hint_object_uses_qpdf_dictionary_damage_context() {
+        // qpdf's readHintStream reports a non-stream H object through
+        // damagedPDF("linearization dictionary", "hint table is not a stream")
+        // (QPDF_linearization.cc:286-294), with the parser's last source
+        // offset supplied by the overload.
+        let mut bytes = compat_linearized_bytes();
+        replace_hint_offset(&mut bytes, b"533");
+
+        let result = show_linearization_bytes_with_warnings(&bytes, "badHn.pdf")
+            .expect("a non-stream hint object is a qpdf warning");
+        assert!(result.dump.is_empty());
+        assert_eq!(
+            result.warnings,
+            [
+                "badHn.pdf (linearization dictionary, offset 594): hint table is not a stream"
+                    .to_owned()
+            ]
         );
     }
 
