@@ -148,7 +148,6 @@ mod resource_replacer;
 pub mod resources;
 pub(crate) mod rewrite_renumber;
 pub mod signatures;
-pub mod standard_font_metrics;
 pub(crate) mod stream_filter;
 pub mod struct_tree_pg;
 pub mod subset_prune;
@@ -238,7 +237,6 @@ pub use signatures::{
     signatures, signatures_with_max_depth, strip_signature_values, SignatureInfo,
     DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
-pub use standard_font_metrics::StandardFont;
 pub use struct_tree_pg::{
     drop_struct_elem_dangling_pg, drop_struct_elem_dangling_pg_with_max_depth,
     DEFAULT_MAX_STRUCT_TREE_DEPTH,
