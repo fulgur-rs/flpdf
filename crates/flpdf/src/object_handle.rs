@@ -688,10 +688,10 @@ impl std::fmt::Debug for ObjectHandle {
         let slot = self.0.borrow();
         let state = slot.state.borrow();
         let state: &str = match &*state {
-            ObjectState::Resolved(ObjectValue::Unresolved) => "Unresolved",
-            ObjectState::Resolved(ObjectValue::Reserved) => "Reserved",
-            ObjectState::Resolved(ObjectValue::Destroyed) => "Destroyed",
-            ObjectState::Resolved(_) => "Resolved(..)",
+            ObjectValue::Unresolved => "Unresolved",
+            ObjectValue::Reserved => "Reserved",
+            ObjectValue::Destroyed => "Destroyed",
+            _ => "Resolved(..)",
         };
         let label = if slot.object_ref.is_some() {
             "ObjectHandle::Indirect"
@@ -733,18 +733,16 @@ pub(crate) enum ObjectDescription {
 fn expand_description_template(
     template: &str,
     object_ref: Option<ObjectRef>,
-    state: &ObjectState,
+    state: &ObjectValue,
     parsed_offset: i64,
 ) -> String {
     let og = object_ref
         .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation))
         .unwrap_or_default();
     let shift = match state {
-        ObjectState::Resolved(value) => match value {
-            ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
-            ObjectValue::Array(_) => 1,
-            _ => 0,
-        },
+        ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
+        ObjectValue::Array(_) => 1,
+        _ => 0,
     };
     let offset = if parsed_offset >= 0 {
         (parsed_offset + shift).to_string()
@@ -774,7 +772,7 @@ struct ObjectSlot {
     /// The payload state is separately reference-counted so qpdf's
     /// `QPDFObject::assign` boundary can make two distinct handles observe
     /// one replacement value while retaining their own handle identities.
-    state: Rc<RefCell<ObjectState>>,
+    state: Rc<RefCell<ObjectValue>>,
     /// Every slot whose payload is the [`Self::state`] allocation. Normally
     /// this contains only the slot itself; qpdf's `QPDFObject::assign` can
     /// temporarily make a direct replacement handle and an indirect target
@@ -1072,16 +1070,6 @@ struct ContainmentOwner {
     object_ref: ObjectRef,
 }
 
-/// The resolution state of an object handle's uniform backing slot.
-///
-/// qpdf stores unresolved, reserved, destroyed, and ordinary values in the
-/// same `QPDFValue` hierarchy. Resolution failures are represented by the
-/// ordinary `ObjectValue::Null`, matching qpdf's `updateCache` fallback.
-#[derive(Debug)]
-pub(crate) enum ObjectState {
-    Resolved(ObjectValue),
-}
-
 impl ObjectHandle {
     /// Parse one standalone PDF object without an owning document context.
     ///
@@ -1123,10 +1111,7 @@ impl ObjectHandle {
     /// identity is this sentinel's common case, not a universal one.
     pub fn is_reserved(&self) -> bool {
         let state = self.0.borrow().state.clone();
-        let reserved = matches!(
-            &*state.borrow(),
-            ObjectState::Resolved(ObjectValue::Reserved)
-        );
+        let reserved = matches!(&*state.borrow(), ObjectValue::Reserved);
         reserved
     }
 
@@ -1231,7 +1216,7 @@ impl ObjectHandle {
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::Resolved(ObjectValue::Reserved))),
+            state: Rc::new(RefCell::new(ObjectValue::Reserved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
             active_pdf_unique_id: Some(pdf_unique_id),
@@ -1262,7 +1247,7 @@ impl ObjectHandle {
     /// from.
     fn new_reserved_direct() -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::Resolved(ObjectValue::Reserved))),
+            state: Rc::new(RefCell::new(ObjectValue::Reserved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
             active_pdf_unique_id: None,
@@ -1318,7 +1303,7 @@ impl ObjectHandle {
     ) -> Self {
         let _ = offset;
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::Resolved(ObjectValue::Unresolved))),
+            state: Rc::new(RefCell::new(ObjectValue::Unresolved)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
             active_pdf_unique_id: pdf_unique_id,
@@ -1347,7 +1332,7 @@ impl ObjectHandle {
     ) -> Self {
         let value = canonicalize_object_value(value);
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: Rc::new(RefCell::new(ObjectState::Resolved(value))),
+            state: Rc::new(RefCell::new(value)),
             state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
             active_pdf_unique_id: None,
@@ -1425,15 +1410,13 @@ impl ObjectHandle {
         }
     }
 
-    fn state_children(state: &ObjectState) -> Vec<ObjectHandle> {
-        match state {
-            ObjectState::Resolved(value) => Self::direct_children(value),
-        }
+    fn state_children(state: &ObjectValue) -> Vec<ObjectHandle> {
+        Self::direct_children(state)
     }
 
     /// Replace the shared payload and keep every slot that owns it in sync
     /// with the payload's direct-child containment edges.
-    fn replace_shared_state(&self, new_state: ObjectState) -> ObjectState {
+    fn replace_shared_state(&self, new_state: ObjectValue) -> ObjectValue {
         let state = self.0.borrow().state.clone();
         let old_state = {
             let mut state = state.borrow_mut();
@@ -1468,7 +1451,7 @@ impl ObjectHandle {
     /// currently share its payload untouched. qpdf's remove/disconnect
     /// transitions rebind the departing `QPDFObject`; they do not mutate the
     /// `QPDFValue` allocation that a replacement alias still observes.
-    fn replace_detached_state(&self, new_state: ObjectState) {
+    fn replace_detached_state(&self, new_state: ObjectValue) {
         let old_state = self.0.borrow().state.clone();
         let old_owners = self.0.borrow().state_owners.clone();
         let old_children = {
@@ -1502,12 +1485,6 @@ impl ObjectHandle {
         if !self.is_direct() {
             return Err(crate::Error::Unsupported(
                 "replacement ObjectHandle must be direct".to_string(),
-            ));
-        }
-        let source_state = self.0.borrow().state.clone();
-        if !matches!(&*source_state.borrow(), ObjectState::Resolved(_)) {
-            return Err(crate::Error::Unsupported(
-                "replacement ObjectHandle is not initialized".to_string(),
             ));
         }
         Ok(())
@@ -1581,7 +1558,7 @@ impl ObjectHandle {
         if !self.is_indirect() {
             return;
         }
-        self.replace_detached_state(ObjectState::Resolved(ObjectValue::Null));
+        self.replace_detached_state(ObjectValue::Null);
         let mut slot = self.0.borrow_mut();
         slot.object_ref = None;
         slot.active_pdf_unique_id = None;
@@ -1614,9 +1591,7 @@ impl ObjectHandle {
             slot.resolver = Some(resolver);
             slot.pdf_unique_ids.insert(pdf_unique_id);
             let state = slot.state.borrow();
-            match &*state {
-                ObjectState::Resolved(value) => Self::direct_children(value),
-            }
+            Self::direct_children(&state)
         };
         let mut visited = BTreeSet::new();
         visited.insert(Rc::as_ptr(&self.0) as usize);
@@ -1691,15 +1666,13 @@ impl ObjectHandle {
             let slot = self.0.borrow();
             let state = slot.state.borrow();
             match &*state {
-                ObjectState::Resolved(
-                    value @ (ObjectValue::Unresolved
-                    | ObjectValue::Reserved
-                    | ObjectValue::Destroyed),
-                ) => {
+                value @ (ObjectValue::Unresolved
+                | ObjectValue::Reserved
+                | ObjectValue::Destroyed) => {
                     let _ = value;
                     return None;
                 }
-                ObjectState::Resolved(value) => Self::direct_children(value),
+                value => Self::direct_children(value),
             }
         };
         for child in children {
@@ -1707,9 +1680,7 @@ impl ObjectHandle {
         }
         let slot = Rc::try_unwrap(self.0).ok()?.into_inner();
         let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
-        match state {
-            ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
-        }
+        Some((state, slot.parsed_offset))
     }
 
     /// Legacy cloning helper for the unchanged public
@@ -1752,24 +1723,22 @@ impl ObjectHandle {
             return Ok(None);
         }
         let state = slot.state.borrow();
-        match &*state {
-            ObjectState::Resolved(value) => Ok(Some(match value {
-                ObjectValue::Reserved => return Err(reserved_clone_error()),
-                ObjectValue::Unresolved | ObjectValue::Destroyed => return Ok(None),
-                ObjectValue::Stream {
-                    stream_dict,
-                    stream_data,
-                    stream_provider,
-                    stream_length,
-                } => ObjectValue::Stream {
-                    stream_dict: shallow_copy_child(stream_dict)?,
-                    stream_data: stream_data.clone(),
-                    stream_provider: stream_provider.clone(),
-                    stream_length: *stream_length,
-                },
-                other => other.clone(),
-            })),
-        }
+        Ok(Some(match &*state {
+            ObjectValue::Reserved => return Err(reserved_clone_error()),
+            ObjectValue::Unresolved | ObjectValue::Destroyed => return Ok(None),
+            ObjectValue::Stream {
+                stream_dict,
+                stream_data,
+                stream_provider,
+                stream_length,
+            } => ObjectValue::Stream {
+                stream_dict: shallow_copy_child(stream_dict)?,
+                stream_data: stream_data.clone(),
+                stream_provider: stream_provider.clone(),
+                stream_length: *stream_length,
+            },
+            other => other.clone(),
+        }))
     }
 
     /// Copy the source description and parsed offset that belong to this
@@ -1806,7 +1775,7 @@ impl ObjectHandle {
         if self.is_indirect() {
             let value = canonicalize_object_value(value);
             let is_null = matches!(value, ObjectValue::Null);
-            self.replace_shared_state(ObjectState::Resolved(value));
+            self.replace_shared_state(value);
             if is_null {
                 let mut slot = self.0.borrow_mut();
                 slot.parsed_offset = NO_PARSED_OFFSET;
@@ -1823,7 +1792,7 @@ impl ObjectHandle {
     /// replacement alias must not observe the target's null mutation.
     pub(crate) fn detach_value_to_null(&self) {
         if self.is_indirect() {
-            self.replace_detached_state(ObjectState::Resolved(ObjectValue::Null));
+            self.replace_detached_state(ObjectValue::Null);
             let mut slot = self.0.borrow_mut();
             slot.parsed_offset = NO_PARSED_OFFSET;
             slot.end_before_space = NO_PARSED_OFFSET;
@@ -1941,10 +1910,10 @@ impl ObjectHandle {
                 return;
             }
             let state = slot.state.borrow();
-            !matches!(&*state, ObjectState::Resolved(ObjectValue::Null))
+            !matches!(&*state, ObjectValue::Null)
         };
         if should_destroy {
-            self.replace_detached_state(ObjectState::Resolved(ObjectValue::Destroyed));
+            self.replace_detached_state(ObjectValue::Destroyed);
         }
         let mut slot = self.0.borrow_mut();
         slot.object_ref = None;
@@ -1973,10 +1942,7 @@ impl ObjectHandle {
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
         let state = self.0.borrow().state.clone();
-        let resolved = !matches!(
-            &*state.borrow(),
-            ObjectState::Resolved(ObjectValue::Unresolved)
-        );
+        let resolved = !matches!(&*state.borrow(), ObjectValue::Unresolved);
         resolved
     }
 
@@ -1992,7 +1958,7 @@ impl ObjectHandle {
                 return Ok(());
             };
             let state = slot.state.borrow();
-            if !matches!(&*state, ObjectState::Resolved(ObjectValue::Unresolved)) {
+            if !matches!(&*state, ObjectValue::Unresolved) {
                 return Ok(());
             }
             (object_ref, slot.resolver.clone())
@@ -2046,10 +2012,7 @@ impl ObjectHandle {
         // branch above intentionally preserves that context-aware warning.
         // Non-null direct children still use the parent fallback below, and
         // indirect nulls retain their own resolver above.
-        if matches!(
-            &*slot.state.borrow(),
-            ObjectState::Resolved(ObjectValue::Null)
-        ) {
+        if matches!(&*slot.state.borrow(), ObjectValue::Null) {
             return None;
         }
 
@@ -2809,7 +2772,7 @@ impl ObjectHandle {
     /// owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
         let state = self.0.borrow().state.clone();
-        let is_null = matches!(&*state.borrow(), ObjectState::Resolved(ObjectValue::Null));
+        let is_null = matches!(&*state.borrow(), ObjectValue::Null);
         is_null
     }
 
@@ -3259,7 +3222,7 @@ impl ObjectHandle {
         let item_is_destroyed = {
             let slot = item.0.borrow();
             let state = slot.state.borrow();
-            let destroyed = matches!(&*state, ObjectState::Resolved(ObjectValue::Destroyed));
+            let destroyed = matches!(&*state, ObjectValue::Destroyed);
             destroyed
         };
         if item_is_destroyed {
@@ -3396,9 +3359,7 @@ impl ObjectHandle {
             if !visited.insert(identity) {
                 continue;
             }
-            let children = match &*state.borrow() {
-                ObjectState::Resolved(value) => Self::direct_children(value),
-            };
+            let children = Self::direct_children(&state.borrow());
             pending.extend(children.into_iter().filter(|child| child.is_direct()));
         }
 
@@ -3489,9 +3450,7 @@ impl ObjectHandle {
                 slot.pdf_unique_ids.insert(pdf_unique_id);
                 let state = slot.state.clone();
                 drop(slot);
-                let children = match &*state.borrow() {
-                    ObjectState::Resolved(value) => Self::direct_children(value),
-                };
+                let children = Self::direct_children(&state.borrow());
                 children
             };
             pending.extend(children);
@@ -5447,9 +5406,7 @@ impl ObjectHandle {
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
         let state = state.borrow();
-        match &*state {
-            ObjectState::Resolved(value) => f(Some(value)),
-        }
+        f(Some(&state))
     }
 
     // Mutable twin of `with_value`: every resolved qpdf value, including the
@@ -5457,9 +5414,7 @@ impl ObjectHandle {
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
         let mut state = state.borrow_mut();
-        match &mut *state {
-            ObjectState::Resolved(value) => f(Some(value)),
-        }
+        f(Some(&mut state))
     }
 
     /// Convert this handle's value into a legacy [`crate::Object`] tree —
@@ -5624,7 +5579,7 @@ impl ObjectHandle {
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
             self.0.borrow().stream_token_filters.borrow_mut().clear();
-            self.replace_shared_state(ObjectState::Resolved(canonicalize_object_value(value)));
+            self.replace_shared_state(canonicalize_object_value(value));
         }
     }
 
@@ -12488,6 +12443,17 @@ mod resolution_state_tests {
     use super::*;
 
     #[test]
+    fn object_slot_shares_object_value_without_a_redundant_state_wrapper() {
+        let source = include_str!("object_handle.rs");
+        let state_name = ["Object", "State"].concat();
+        let resolved_name = [state_name.as_str(), "::Resolved"].concat();
+        let state_field = ["state: Rc<RefCell<", "ObjectValue>>"].concat();
+        assert!(!source.contains(&format!("enum {state_name}")));
+        assert!(!source.contains(&resolved_name));
+        assert!(source.contains(&state_field));
+    }
+
+    #[test]
     fn direct_handle_is_always_resolved() {
         // A direct handle has no resolution state to wait on — its value was
         // known at construction time.
@@ -12556,8 +12522,8 @@ mod resolution_state_tests {
         assert!(null.is_null());
         let state = null.0.borrow().state.clone();
         assert!(
-            matches!(&*state.borrow(), ObjectState::Resolved(ObjectValue::Null)),
-            "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
+            matches!(&*state.borrow(), ObjectValue::Null),
+            "`set_resolved(Null)` must leave the slot in the value layer"
         );
     }
 
@@ -12957,7 +12923,7 @@ mod materialize_tests {
         let state = slot.state.clone();
         drop(slot);
         let state = state.borrow();
-        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &*state else {
+        let ObjectValue::Dictionary(entries) = &*state else {
             panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
         };
         let replaced_key_allocation = entries
@@ -17970,7 +17936,7 @@ mod mutation_tests {
         let state = slot.state.clone();
         drop(slot);
         let state = state.borrow();
-        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &*state else {
+        let ObjectValue::Dictionary(entries) = &*state else {
             panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries
