@@ -1542,16 +1542,12 @@ the decoded key must be at most 32 bytes. Mirrors qpdf \
 from a known password, then reopen the file with that key."
     )]
     password_is_hex_key: bool,
-    /// Accepted for qpdf script compatibility; currently a documented no-op.
+    /// Disable qpdf's alternate password-encoding recovery attempts.
     #[arg(
         long = "suppress-password-recovery",
         long_help = "Accepted for qpdf script compatibility. qpdf retries \
 alternate password encodings (UTF-8 / PDFDocEncoding) when authentication \
-fails on V<5 documents; this flag disables that recovery. flpdf performs a \
-single authentication attempt with no encoding fallback, so there is no \
-recovery to suppress: this flag is a DOCUMENTED NO-OP. It is parsed without \
-error so scripts passing it do not break, and the contract is reserved so \
-encoding fallback can be added later without changing the CLI surface."
+fails; this flag disables that recovery."
     )]
     suppress_password_recovery: bool,
 }
@@ -6296,10 +6292,7 @@ fn open_pdf_file_impl(
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
     let allow_weak_crypto = password.allow_weak_crypto;
     let password_is_hex_key = password.password_is_hex_key;
-    // `--suppress-password-recovery` is a documented no-op (see PasswordArgs):
-    // flpdf has no encoding-recovery path to suppress. Bind it so the field is
-    // observed by the compiler and the intent is explicit at the wiring site.
-    let _suppress_password_recovery = password.suppress_password_recovery;
+    let suppress_password_recovery = password.suppress_password_recovery;
     let password_mode = password.password_mode.into();
     let password = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
@@ -6322,6 +6315,7 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         repair: repair || PdfOpenOptions::default().repair,
         password,
         password_mode,
+        suppress_password_recovery,
         allow_weak_crypto,
         password_is_hex_key,
         ..PdfOpenOptions::default()

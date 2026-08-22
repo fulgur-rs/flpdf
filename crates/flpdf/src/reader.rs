@@ -18,7 +18,9 @@ use crate::parser::array_item_source_offset;
 use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
-use crate::security::password::{password_bytes_for_read, PasswordMode};
+use crate::security::password::{
+    password_bytes_for_read, password_candidates_for_read, PasswordMode,
+};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
     check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
@@ -421,6 +423,9 @@ pub struct PdfOpenOptions {
     /// applies `hex-bytes` on the read path; the other modes pass these bytes
     /// through unchanged. See [`PasswordMode`] for the write-side semantics.
     pub password_mode: PasswordMode,
+    /// Disable qpdf's alternate password-encoding retry path
+    /// (`--suppress-password-recovery`).
+    pub suppress_password_recovery: bool,
     /// Permit deprecated RC4-backed handlers and revision 5 AES-256.
     pub allow_weak_crypto: bool,
     /// Interpret [`password`](Self::password) as the precomputed file
@@ -450,6 +455,7 @@ impl Default for PdfOpenOptions {
             ignore_xref_streams: false,
             password: Vec::new(),
             password_mode: PasswordMode::default(),
+            suppress_password_recovery: false,
             allow_weak_crypto: false,
             password_is_hex_key: false,
             logger: None,
@@ -752,6 +758,43 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn authenticate_if_encrypted(&mut self, options: &PdfOpenOptions) -> Result<()> {
+        if self.encrypt_dictionary()?.is_none() {
+            return Ok(());
+        }
+        if options.password_is_hex_key || options.suppress_password_recovery {
+            return self.authenticate_if_encrypted_once(options);
+        }
+
+        let candidates = password_candidates_for_read(&options.password, options.password_mode)?;
+        if candidates.len() == 1 {
+            return self.authenticate_if_encrypted_once(options);
+        }
+
+        // qpdf tries the original candidate first, then each repaired encoding,
+        // and appends the original one again so the terminal error has the
+        // supplied password's wording and context (`QPDFJob.cc:1752-1790`).
+        let original = candidates[0].clone();
+        let mut final_bad_password = None;
+        for candidate in candidates.into_iter().chain(std::iter::once(original)) {
+            let mut attempt = options.clone();
+            // Candidates are already decoded bytes. Mark them as bytes so a
+            // hex-bytes input is not decoded a second time.
+            attempt.password = candidate;
+            attempt.password_mode = PasswordMode::Bytes;
+            attempt.suppress_password_recovery = true;
+            match self.authenticate_if_encrypted_once(&attempt) {
+                Ok(()) => return Ok(()),
+                Err(error) if matches!(error, Error::Encrypted(EncryptedError::BadPassword)) => {
+                    final_bad_password = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(final_bad_password.expect("qpdf password recovery always has the original candidate"))
+    }
+
+    fn authenticate_if_encrypted_once(&mut self, options: &PdfOpenOptions) -> Result<()> {
         let encrypt_ref = self.trailer().get_ref("Encrypt");
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(());
