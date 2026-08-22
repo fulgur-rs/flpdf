@@ -347,8 +347,15 @@ fn resolve_resource_reference<R: Read + Seek>(
 ) -> Result<Option<(Object, Option<ObjectRef>)>> {
     match resolve_ref_chain(pdf, value) {
         Ok(resolved) => Ok(Some(resolved)),
-        Err(Error::Parse { message, .. }) | Err(Error::Unsupported(message)) => {
-            pdf.push_warning(message)?;
+        Err(error @ (Error::Parse { .. } | Error::Unsupported(_))) => {
+            // `error.to_string()`, not the bare `message` field, matches the
+            // canonical resolve-time catch boundary
+            // (`xref.rs`'s `resolve_indirect`, `self.push_warning(error.to_string(), offset)`):
+            // a `Parse` offset and the `Unsupported` "unsupported PDF
+            // feature:" classification are both embedded in the `Display`
+            // text (`error.rs`'s `#[error(...)]` formats), so destructuring
+            // straight to `message` silently drops them.
+            pdf.push_warning(error.to_string())?;
             Ok(None)
         }
         Err(error) => Err(error), // cov:ignore: I/O and other non-recoverable resolver errors must remain visible to callers
