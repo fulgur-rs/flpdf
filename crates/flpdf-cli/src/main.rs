@@ -8152,6 +8152,16 @@ mod tests {
              flpdf-cli's usage_exit path rather than the generic error path"
         );
 
+        // A digit run too long to even fit in the i128 staging type used to
+        // detect i64 overflow (rather than merely exceeding i64's range).
+        let huge = qpdf_selector_integer("99999999999999999999999999999999999999999999999999")
+            .expect_err("digit run exceeding i128");
+        assert_eq!(
+            huge.to_string(),
+            "overflow/underflow converting 99999999999999999999999999999999999999999999999999 to 64-bit integer"
+        );
+        assert!(huge.downcast_ref::<UsageError>().is_some());
+
         let narrowing = qpdf_selector_integer("2147483648").expect_err("i32 narrowing overflow");
         assert_eq!(
             narrowing.to_string(),
