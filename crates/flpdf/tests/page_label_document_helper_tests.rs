@@ -59,7 +59,7 @@ fn ranges_follows_two_hop_holder_chain_for_label_dict() {
 
 #[test]
 fn page_label_mutations_use_only_the_canonical_handle_route() {
-    let source = include_str!("../src/page_label_document_helper.rs");
+    let source = include_str!("../src/page_label_document_helper.rs").replace("\r\n", "\n");
     let production = source
         .split("\n#[cfg(test)]\nmod tests")
         .next()
