@@ -20,8 +20,6 @@ pub mod writer;
 // ObjStm writer (compressed `/Predictor 12` `/W [1 2 1]` streams in qpdf's fixed
 // key order, with qpdf's two-pass writePad region sizing). The implementation
 // lives in the shared writer serializer and is also used by the plain pipeline.
-pub(crate) mod xref_stream;
-
 pub use back_patch::back_patch_param_dict;
 pub use check::{
     check_linearization, check_linearization_bytes, check_linearization_path, CheckResult,
