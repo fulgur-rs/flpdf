@@ -93,8 +93,8 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // those exact handles through the eligibility and removal paths: direct
     // annotation dictionaries have no ObjectRef and must not be projected
     // away before the appearance/flag gate. The annotation helper validates
-    // /Rect only after that gate, so this route stays lazy instead of using
-    // enumerate_page_annotations, whose public result materializes /Rect.
+    // /Rect only after that gate, so this route stays lazy and does not
+    // materialize /Rect before eligibility is known.
     let annotations = page_annotation_handles(pdf, page_ref)?;
 
     // ── Step 2: for each annotation, decide eligibility and collect data ───

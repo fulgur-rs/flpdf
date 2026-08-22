@@ -4,7 +4,17 @@
 //! treat it as its own test binary; each test file pulls it in with
 //! `mod common;`.
 
-use flpdf::{ObjectRef, Pdf};
+use flpdf::{ObjectHandle, ObjectRef, PageObjectHelper, Pdf};
+
+/// Return the canonical annotation handles listed by a page.
+pub fn page_annotation_handles<R: std::io::Read + std::io::Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Vec<ObjectHandle> {
+    PageObjectHelper::new(page_ref, pdf)
+        .get_annotations_filtered(None)
+        .unwrap()
+}
 
 /// Find the single Widget annotation on the first page by structure.
 ///
@@ -18,11 +28,9 @@ pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> O
         .unwrap()
         .first()
         .expect("fixture must have at least one page");
-    let widgets: Vec<_> = flpdf::enumerate_page_annotations(pdf, page_ref)
-        .unwrap()
-        .into_iter()
-        .filter(|a| a.is_widget)
-        .collect();
+    let widgets: Vec<_> = PageObjectHelper::new(page_ref, pdf)
+        .get_annotations_filtered(Some(b"/Widget"))
+        .unwrap();
     assert_eq!(
         widgets.len(),
         1,
@@ -30,7 +38,6 @@ pub fn first_widget_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> O
         widgets.len()
     );
     widgets[0]
-        .annotation
         .object_ref()
         .expect("fixture Widget annotation must be indirect")
 }

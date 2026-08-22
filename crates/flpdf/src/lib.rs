@@ -119,7 +119,6 @@ pub mod outline_document_helper;
 pub mod outline_object_helper;
 pub(crate) mod overlay_annotations;
 pub(crate) mod overlay_appearance_stream;
-pub mod page_annotation_enum;
 mod page_annotation_flatten;
 pub mod page_closure;
 pub mod page_document_helper;
@@ -216,7 +215,6 @@ pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};
 pub use outline_document_helper::OutlineDocumentHelper;
 pub use outline_object_helper::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
-pub use page_annotation_enum::{enumerate_page_annotations, EnumeratedAnnotation};
 pub use page_document_helper::{PageDocumentHelper, PageInput};
 pub use page_extract::{extract_page, extract_pages};
 pub use page_label_document_helper::{

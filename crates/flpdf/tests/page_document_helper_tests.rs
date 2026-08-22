@@ -5,7 +5,8 @@
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
 use flpdf::{
-    Dictionary, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf, Stream,
+    Dictionary, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, PageObjectHelper,
+    Pdf, Stream,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -780,8 +781,9 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
         let qpdf_pages = PageDocumentHelper::new(&mut qpdf_output)
             .get_all_pages()
             .unwrap();
-        let qpdf_annots =
-            flpdf::enumerate_page_annotations(&mut qpdf_output, qpdf_pages[0]).unwrap();
+        let qpdf_annots = PageObjectHelper::new(qpdf_pages[0], &mut qpdf_output)
+            .get_annotations_filtered(None)
+            .unwrap();
         assert!(qpdf_annots.is_empty());
         let Object::Dictionary(qpdf_catalog) = qpdf_output.resolve(ObjectRef::new(1, 0)).unwrap()
         else {
