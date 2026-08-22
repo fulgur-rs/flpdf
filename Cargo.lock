@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "flpdf"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "ar_archive_writer",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "flpdf-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "flpdf-libjpeg-compat"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "cc",
 ]
