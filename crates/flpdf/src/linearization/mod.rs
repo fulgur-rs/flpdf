@@ -38,5 +38,8 @@ pub use hint_stream::{encode_hint_stream, HintStreamBytes};
 pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
 pub use renumber::{ObjStmRelocation, RenumberMap};
-pub use show::{show_linearization_bytes, show_linearization_path, ShowLinearizationError};
+pub use show::{
+    show_linearization_bytes, show_linearization_bytes_with_warnings, show_linearization_path,
+    show_linearization_path_with_warnings, ShowLinearizationError, ShowLinearizationOutput,
+};
 pub use writer::{LinearizedDocument, LinearizedOffsets};

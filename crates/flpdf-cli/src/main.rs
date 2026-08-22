@@ -26,7 +26,7 @@ use flpdf::{
     filters, flatten_rotation_on_pages,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
-        check_linearization_path, show_linearization_path, LinearizationCheckError,
+        check_linearization_path, show_linearization_path_with_warnings, LinearizationCheckError,
         ShowLinearizationError,
     },
     normalize_content_stream, pages,
@@ -5682,16 +5682,32 @@ fn write_page_descriptions<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &QPDFLogger
 
 fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
-    match show_linearization_path(&input) {
-        Ok(dump) => {
-            // `dump` already ends with a trailing newline (the hint-table
+    match show_linearization_path_with_warnings(&input) {
+        Ok(result) => {
+            for warning in &result.warnings {
+                logger_warn(format!("WARNING: {}: {warning}\n", input.display()))?;
+            }
+            // `result.dump` already ends with a trailing newline (the hint-table
             // dump, or qpdf's "<name> is not linearized" line). qpdf prints
             // both to stdout and exits 0; use print! to avoid a second LF.
-            logger_info(dump)
+            logger_info(result.dump)?;
+            if result.warnings.is_empty() {
+                Ok(())
+            } else {
+                finish_warning_state(true, false)
+            }
         }
         Err(ShowLinearizationError::Malformed { message }) => {
-            logger_error(format!("flpdf: malformed linearization data: {message}\n"))?; // cov:ignore: exercised by malformed linearization subprocess integration test
+            // cov:ignore-start: none of show.rs's public entry points return
+            // this variant any more (see ShowLinearizationError's doc) --
+            // every linearization-data decode failure qpdf's
+            // showLinearizationData would catch is now surfaced as an `Ok`
+            // with an empty dump and one warning, matching qpdf's own single
+            // try/catch around readLinearizationData. Retained as a
+            // defensive arm since the type still has this variant.
+            logger_error(format!("flpdf: malformed linearization data: {message}\n"))?;
             std::process::exit(ExitCode::Errors.as_i32());
+            // cov:ignore-end
         }
         Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
     }
