@@ -351,7 +351,7 @@ fn resolve_resource_reference<R: Read + Seek>(
             pdf.push_warning(message)?;
             Ok(None)
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error), // cov:ignore: I/O and other non-recoverable resolver errors must remain visible to callers
     }
 }
 
@@ -1239,6 +1239,37 @@ mod tests {
             resources.get_key(b"/XObject").is_null(),
             "qpdf drops a malformed XObject category during pruning"
         );
+    }
+
+    #[test]
+    fn direct_non_dictionary_xobject_category_is_removed_like_qpdf() {
+        let bytes = build_page_with_resources_carrier_pdf(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+               /Resources << /XObject 42 >> >>",
+            "<< >>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
+            .expect("non-dictionary XObject category must be skipped");
+
+        let mut page_helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+        let resources = page_helper
+            .get_resources(false)
+            .expect("page resources should remain available");
+        assert!(resources.get_key(b"/XObject").is_null());
+    }
+
+    #[test]
+    fn form_resource_pruning_removes_non_dictionary_xobject_category() {
+        let mut pdf = Pdf::empty().expect("empty PDF should be constructible");
+        let mut resources = Dictionary::new();
+        resources.insert("XObject", Object::Integer(42));
+
+        prune_font_and_xobject_dictionaries(&mut pdf, &mut resources, &BTreeMap::new())
+            .expect("malformed resource categories should be recoverable");
+
+        assert!(resources.get("XObject").is_none());
     }
 
     // ISO 32000-1 §8.6.8: only /DeviceGray, /DeviceRGB, /DeviceCMYK, /Pattern
