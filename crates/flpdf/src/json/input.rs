@@ -25,6 +25,7 @@ use std::rc::Rc;
 
 use super::value::format_qpdf_real;
 use super::{Json, Reactor};
+use crate::filespec_helper::qpdf_style_open_error;
 use crate::object_handle::{ObjectValue, StreamDataProvider};
 use crate::pipeline::{Base64Action, Pipeline, PlBase64};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
@@ -240,7 +241,7 @@ impl StreamDataProvider for DatafileStreamDataProvider {
         pipeline: &mut dyn Pipeline,
     ) -> Result<()> {
         let mut file = File::open(&self.filename)
-            .map_err(|error| Error::System(format!("open {}: {error}", self.filename.display())))?;
+            .map_err(|error| qpdf_style_open_error(&self.filename, error))?;
         let mut buffer = [0_u8; STREAM_PROVIDER_BUFFER_SIZE];
         loop {
             let read = loop {
