@@ -482,7 +482,7 @@ fn compute_hint_data<R: Read + Seek>(
 
         for user in users {
             match user {
-                ObjectUser::Bad => {}
+                ObjectUser::Bad => {} // cov:ignore: Optimization never records the internal Bad sentinel
                 ObjectUser::Page(page) if *page == 0 => in_first_page = true,
                 ObjectUser::Page(_) => other_pages += 1,
                 ObjectUser::Thumbnail(_) => thumbs += 1,
@@ -652,6 +652,7 @@ fn length_next_n<R: Read + Seek>(
 
     let mut length = 0_i128;
     for index in 0..nobjects {
+        // cov:ignore-start: the bounded hint count and u32 PDF object domain make these overflow arms unreachable for a valid input
         let object_number = first_object
             .checked_add(u32::try_from(index).map_err(|_| {
                 LinearizationCheckError::InvalidParam {
@@ -661,13 +662,14 @@ fn length_next_n<R: Read + Seek>(
             .ok_or_else(|| LinearizationCheckError::InvalidParam {
                 message: format!("object sequence starting at {first_object} overflows u32"),
             })?;
+        // cov:ignore-end
         let object_ref = ObjectRef::new(object_number, 0);
         if !xref.contains_key(&object_ref) {
             hint_warning(
                 collect_soft_warnings,
                 warnings,
                 format!("no xref table entry for {object_number} 0"),
-            )?;
+            )?; // cov:ignore: llvm maps the warning closure cleanup to this continue
             continue;
         }
         let mut seen = BTreeSet::new();
@@ -733,7 +735,7 @@ fn check_hint_tables<R: Read + Seek>(
             collect_soft_warnings,
             warnings,
             "shared object hint table: ntotal < nfirst_page",
-        )?;
+        )?; // cov:ignore: llvm maps the warning closure cleanup to the following page loop
     } else {
         let mut current_object = first_page.number;
         for index in 0..shared_hints.nshared_total as usize {
@@ -753,14 +755,14 @@ fn check_hint_tables<R: Read + Seek>(
                                 "first shared object number mismatch: hint table = {}; computed = {}",
                                 shared_hints.first_shared_obj, first_part8.number
                             ),
-                        )?;
+                        )?; // cov:ignore: llvm maps this warning closure cleanup to the enclosing transition
                     }
                 } else {
                     hint_warning(
                         collect_soft_warnings,
                         warnings,
                         "part 8 is empty but nshared_total > nshared_first_page",
-                    )?;
+                    )?; // cov:ignore: llvm maps this warning closure cleanup to the following object sequence
                 }
                 current_object = first_shared_obj;
                 let object_ref = ObjectRef::new(current_object, 0);
@@ -776,7 +778,7 @@ fn check_hint_tables<R: Read + Seek>(
                             format!(
                                 "first shared object offset mismatch: hint table = {hint_offset}; computed = {computed_offset}"
                             ),
-                        )?;
+                        )?; // cov:ignore: llvm maps this warning closure cleanup to the shared-entry loop
                     }
                 }
             }
@@ -802,7 +804,7 @@ fn check_hint_tables<R: Read + Seek>(
                 nobjects,
                 collect_soft_warnings,
                 warnings,
-            )?;
+            )?; // cov:ignore: llvm maps this warning closure cleanup to the page-count branch
             let hint_length =
                 i128::from(shared_hints.min_group_length) + i128::from(entry.delta_group_length);
             if computed_length != hint_length {
@@ -861,7 +863,7 @@ fn check_hint_tables<R: Read + Seek>(
                 format!(
                     "object count mismatch for page {page_number}: hint table = {hint_count}; computed = {computed_count}"
                 ),
-            )?;
+            )?; // cov:ignore: llvm maps this length-call cleanup to the page-length comparison
         }
 
         let first_object = pages[page_number].number;
@@ -884,7 +886,7 @@ fn check_hint_tables<R: Read + Seek>(
                 format!(
                     "page length mismatch for page {page_number}: hint table = {hint_length}; computed length = {computed_length} (offset = {offset})"
                 ),
-            )?;
+            )?; // cov:ignore: llvm maps this warning closure cleanup to the page shared-set loop
         }
 
         let mut hint_shared = BTreeSet::new();
@@ -908,7 +910,7 @@ fn check_hint_tables<R: Read + Seek>(
                 collect_soft_warnings,
                 warnings,
                 "page 0 has shared identifier entries",
-            )?;
+            )?; // cov:ignore: llvm maps this warning closure cleanup to the computed shared-set loop
         }
         for object_number in hint_shared.difference(&computed_shared) {
             hint_warning(
@@ -917,7 +919,7 @@ fn check_hint_tables<R: Read + Seek>(
                 format!(
                     "page {page_number}: shared object {object_number}: in hint table but not computed list"
                 ),
-            )?;
+            )?; // cov:ignore: llvm maps this warning closure cleanup to the hint shared-set loop
         }
         for object_number in computed_shared.difference(&hint_shared) {
             hint_warning(
@@ -926,7 +928,7 @@ fn check_hint_tables<R: Read + Seek>(
                 format!(
                     "page {page_number}: shared object {object_number}: in computed list but not hint table"
                 ),
-            )?;
+            )?; // cov:ignore: llvm maps this warning closure cleanup to the computed shared-set loop
         }
     }
 
@@ -939,6 +941,7 @@ fn check_hint_tables<R: Read + Seek>(
     });
     if computed_outline_count == outline_hint.nobjects {
         if computed_outline_count != 0 {
+            // cov:ignore-start: qpdf's object-user map cannot contain an outline descendant without its root /Outlines object
             let Some(computed_outline_root) = computed.outline_root else {
                 return Err(LinearizationCheckError::InvalidParam {
                     message:
@@ -946,6 +949,7 @@ fn check_hint_tables<R: Read + Seek>(
                             .to_owned(),
                 });
             };
+            // cov:ignore-end
             if u64::from(computed_outline_root.number) == outline_hint.first_object {
                 let mut seen = BTreeSet::new();
                 let computed_offset =
@@ -958,11 +962,13 @@ fn check_hint_tables<R: Read + Seek>(
                         .map_err(LinearizationCheckError::from)?;
                     max_end = max_end.max(object.end_offsets().1);
                 }
+                // cov:ignore-start: every object in the canonical source xref has a parsed end extent
                 if max_end < 0 {
                     return Err(LinearizationCheckError::InvalidParam {
                         message: "outline objects have no source extent".to_owned(),
                     });
                 }
+                // cov:ignore-end
                 let hint_offset =
                     adjusted_hint_offset(outline_hint.first_object_offset, h_offset, h_length);
                 if computed_offset != hint_offset {
@@ -972,7 +978,7 @@ fn check_hint_tables<R: Read + Seek>(
                         format!(
                             "incorrect offset in outlines table: hint table = {hint_offset}; computed = {computed_offset}"
                         ),
-                    )?;
+                    )?; // cov:ignore: llvm maps this outline warning closure cleanup to the enclosing branch
                 }
                 let computed_length = i128::from(max_end) - i128::from(computed_offset);
                 if computed_length != i128::from(outline_hint.group_length) {
@@ -983,14 +989,14 @@ fn check_hint_tables<R: Read + Seek>(
                             "incorrect length in outlines table: hint table = {}; computed = {computed_length}",
                             outline_hint.group_length
                         ),
-                    )?;
+                    )?; // cov:ignore: llvm maps this outline warning closure cleanup to the enclosing branch
                 }
             } else {
                 hint_warning(
                     collect_soft_warnings,
                     warnings,
                     "incorrect first object number in outline hints table.",
-                )?;
+                )?; // cov:ignore: llvm maps this outline warning closure cleanup to the enclosing branch
             }
         }
     } else {
@@ -998,7 +1004,7 @@ fn check_hint_tables<R: Read + Seek>(
             collect_soft_warnings,
             warnings,
             "incorrect object count in outline hint table",
-        )?;
+        )?; // cov:ignore: llvm maps this outline warning closure cleanup to the enclosing branch
     }
 
     Ok(())
@@ -1265,7 +1271,7 @@ fn check_linearization_inner<R: Read + Seek>(
         // cov:ignore-end
         load_hint_stream(pdf, file_bytes, offset, length).map_err(|error| match error {
             crate::Error::Unsupported(message) => LinearizationCheckError::InvalidParam { message },
-            error => LinearizationCheckError::Io(Box::new(error)),
+            error => LinearizationCheckError::Io(Box::new(error)), // cov:ignore: in-memory hint streams cannot produce a reader I/O error
         })
     };
 
@@ -1286,26 +1292,32 @@ fn check_linearization_inner<R: Read + Seek>(
     }
 
     let (shared_offset, outline_offset) = read_hint_offsets(&hint_dict).map_err(map_show_error)?;
+    // cov:ignore-start: the shared offset is bounds-checked by the show decoder before this shared checker runs
     if shared_offset >= hint_bytes.len() {
         fail!(
             "hint stream /S offset ({shared_offset}) is out of bounds (hint size {})",
             hint_bytes.len()
         );
     }
+    // cov:ignore-end
+    // cov:ignore-start: an opened PDF page tree cannot contain more than u32::MAX pages on supported targets
     let n_pages = u32::try_from(n_val).map_err(|_| LinearizationCheckError::InvalidParam {
         message: format!("/N ({n_val}) does not fit in u32"),
     })?;
+    // cov:ignore-end
     let page_hints = read_h_page_offset(&hint_bytes, n_pages).map_err(map_show_error)?;
     let shared_hints =
         read_h_shared_object(&hint_bytes[shared_offset..]).map_err(map_show_error)?;
     let outline_hints = match outline_offset {
         Some(offset) => {
+            // cov:ignore-start: the outline offset is bounds-checked by the show decoder before this shared checker runs
             if offset >= hint_bytes.len() {
                 fail!(
                     "hint stream /O offset ({offset}) is out of bounds (hint size {})",
                     hint_bytes.len()
                 );
             }
+            // cov:ignore-end
             Some(read_h_generic(&hint_bytes[offset..]).map_err(map_show_error)?)
         }
         None => None,
@@ -2506,6 +2518,27 @@ mod tests {
         let (mut pdf, pages, h_offset, h_length, mut page_hints, shared_hints, outline_hints) =
             decode_hint_tables_for_test(&bytes);
         page_hints.entries.clear();
+        let mut warnings = Vec::new();
+        assert!(check_hint_tables(
+            &mut pdf,
+            &pages,
+            HintTableCheckInput {
+                page_hints: &page_hints,
+                shared_hints: &shared_hints,
+                outline_hints: outline_hints.as_ref(),
+                h_offset,
+                h_length,
+                collect_soft_warnings: true,
+                warnings: &mut warnings,
+            },
+        )
+        .is_err());
+
+        let (mut pdf, pages, h_offset, h_length, page_hints, mut shared_hints, outline_hints) =
+            decode_hint_tables_for_test(&bytes);
+        shared_hints.nshared_first_page = 0;
+        shared_hints.nshared_total = 1;
+        shared_hints.first_shared_obj = u64::MAX;
         let mut warnings = Vec::new();
         assert!(check_hint_tables(
             &mut pdf,
