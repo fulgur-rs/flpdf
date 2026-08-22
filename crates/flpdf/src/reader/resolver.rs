@@ -264,6 +264,12 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// The teardown walk moved with it: [`ResolverHandle::disconnect_all`] is
     /// what `Pdf::drop` now calls.
     object_cache: BTreeMap<ObjectRef, ObjectHandle>,
+    /// Object-cache entries created by qpdf-shaped allocation/replacement,
+    /// rather than by looking up an unresolved reference. qpdf keeps both
+    /// cases in `m->obj_cache`, but the provenance is needed by the Pdf
+    /// object-ref view to distinguish a real allocated null from a resolved
+    /// dangling reference (`QPDF.cc:1882-1894,1986-1993`).
+    allocated_object_refs: BTreeSet<ObjectRef>,
     /// qpdf `m->resolving` (`include/qpdf/QPDF.hh:1468`), the set
     /// `QPDF::resolve` tests to detect "an object references itself directly
     /// or indirectly in some key that has to be resolved during object
@@ -794,6 +800,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 header_offset,
                 source_xref_entries,
                 object_cache: BTreeMap::new(),
+                allocated_object_refs: BTreeSet::new(),
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
@@ -845,11 +852,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let object_ref = self.next_obj_gen()?;
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         let reserved = ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id, resolver);
-        let previous = self
-            .core
-            .borrow_mut()
-            .object_cache
-            .insert(object_ref, reserved.clone());
+        let mut core = self.core.borrow_mut();
+        let previous = core.object_cache.insert(object_ref, reserved.clone());
+        core.allocated_object_refs.insert(object_ref);
         debug_assert!(
             previous.is_none(),
             "next_obj_gen must return a fresh ObjGen"
@@ -1035,11 +1040,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
         let reserved = ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id, resolver);
-        let previous = self
-            .core
-            .borrow_mut()
-            .object_cache
-            .insert(object_ref, reserved.clone());
+        let mut core = self.core.borrow_mut();
+        let previous = core.object_cache.insert(object_ref, reserved.clone());
+        core.allocated_object_refs.insert(object_ref);
         previous.unwrap_or(reserved)
     }
 
@@ -1096,6 +1099,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `&self` callers that ask whether a reference has a handle at all.
     pub(crate) fn registered_handle(&self, object_ref: ObjectRef) -> Option<ObjectHandle> {
         self.core.borrow().object_cache.get(&object_ref).cloned()
+    }
+
+    /// Whether `object_ref` was created through a qpdf-shaped allocation or
+    /// replacement path rather than merely cached while resolving a reference.
+    /// This is the provenance distinction required when both cases currently
+    /// hold a resolved null in the same canonical object cache.
+    pub(crate) fn is_allocated_object(&self, object_ref: ObjectRef) -> bool {
+        self.core
+            .borrow()
+            .allocated_object_refs
+            .contains(&object_ref)
     }
 
     /// Every canonical handle minted so far, in [`ObjectRef`] order.
@@ -1218,11 +1232,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let object_ref = self.next_obj_gen()?;
         let promoted =
             handle.promote_to_indirect(object_ref, self.pdf_unique_id, self.self_weak.clone());
-        let previous = self
-            .core
-            .borrow_mut()
-            .object_cache
-            .insert(object_ref, promoted.clone());
+        let mut core = self.core.borrow_mut();
+        let previous = core.object_cache.insert(object_ref, promoted.clone());
+        core.allocated_object_refs.insert(object_ref);
         debug_assert!(
             previous.is_none(),
             "next_obj_gen must return a fresh ObjGen"
@@ -1271,6 +1283,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         target.clear_description();
         target.reset_parsed_offset();
         target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
+        if self.xref_entry(object_ref).is_none() {
+            self.core
+                .borrow_mut()
+                .allocated_object_refs
+                .insert(object_ref);
+        }
         Ok(target)
     }
 
@@ -1291,6 +1309,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.source_xref_entries.remove(&object_ref);
             core.default_xref_entries.remove(&object_ref);
             core.fixed_dangling_refs = false;
+            core.allocated_object_refs.remove(&object_ref);
             core.object_cache.remove(&object_ref)
         };
         if let Some(handle) = cached {
@@ -1313,6 +1332,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.source_xref_entries.remove(&object_ref);
             core.default_xref_entries.remove(&object_ref);
             core.fixed_dangling_refs = false;
+            core.allocated_object_refs.remove(&object_ref);
             core.object_cache.get(&object_ref).cloned()
         };
         if let Some(handle) = cached {
