@@ -192,6 +192,17 @@ fn metadata_stream_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> Ob
     }
 }
 
+fn probe_stream_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
+    let root = pdf.root_ref().expect("output must have a /Root");
+    match pdf.resolve(root).expect("resolve /Root") {
+        Object::Dictionary(d) => match d.get("Probe") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("Catalog /Probe must be a reference, got {other:?}"),
+        },
+        other => panic!("/Root must be a dictionary, got {other:?}"),
+    }
+}
+
 /// flpdf-9hc.13.2: default (no-flag) /ID strategy, full-rewrite path.
 ///
 /// First save of a source with no /ID emits a fresh two-element random /ID;
@@ -2316,6 +2327,47 @@ fn build_minimal_pdf_with_stream(stream_data: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// Build a Flate stream whose `/Filter` and `/DecodeParms` values are
+/// indirect objects. Re-filtering the stream should make both objects
+/// unreachable, just as qpdf's `willFilterStream` removes those keys before
+/// its writer queue walks the stream dictionary.
+fn build_pdf_with_indirect_stream_parameters(stream_data: &[u8]) -> Vec<u8> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(stream_data).unwrap();
+    let compressed = enc.finish().unwrap();
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::<usize>::new();
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 3 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Filter 4 0 R /DecodeParms 5 0 R /Length {} >>\nstream\n",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"4 0 obj\n/FlateDecode\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"5 0 obj\n<< /Predictor 1 >>\nendobj\n");
+
+    let startxref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 /// Build a minimal PDF whose stream uses a multi-filter chain: [ASCII85Decode, FlateDecode].
 /// This is the kind of output produced by ReportLab.
 ///
@@ -2435,6 +2487,70 @@ fn pdf_writer_reencodes_single_flatedecode_filter() {
     // Verify the stream decodes to the original data.
     let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
     assert_eq!(decoded, b"stream payload data for filter check");
+}
+
+#[test]
+fn pdf_writer_drops_indirect_stream_parameters_after_refiltering() {
+    let source = build_pdf_with_indirect_stream_parameters(b"refiltered stream payload");
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let settings = WriterTestSettings {
+        recompress_flate: true,
+        ..WriterTestSettings::default()
+    };
+
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &settings).unwrap();
+
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    let object_refs = reopened.object_refs();
+    assert_eq!(
+        object_refs.len(),
+        3,
+        "orphaned filter objects must be dropped"
+    );
+    assert!(!object_refs.contains(&ObjectRef::new(4, 0)));
+    assert!(!object_refs.contains(&ObjectRef::new(5, 0)));
+
+    let stream_ref = probe_stream_ref(&mut reopened);
+    let Object::Stream(stream) = reopened.resolve(stream_ref).unwrap() else {
+        panic!("/Probe must resolve to a stream");
+    };
+    assert_eq!(
+        filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        b"refiltered stream payload"
+    );
+}
+
+#[test]
+fn pdf_writer_drops_refiltered_stream_parameters_before_objstm_packing() {
+    for object_streams in [ObjectStreamMode::Disable, ObjectStreamMode::Generate] {
+        let source = build_pdf_with_indirect_stream_parameters(b"objstm refilter payload");
+        let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+        let settings = WriterTestSettings {
+            object_streams,
+            recompress_flate: true,
+            ..WriterTestSettings::default()
+        };
+
+        let (output, mapping) = write_with_settings_and_mapping(
+            &mut pdf,
+            &settings,
+            &[ObjectRef::new(4, 0), ObjectRef::new(5, 0)],
+        )
+        .unwrap();
+        assert!(!mapping.contains_key(&ObjectRef::new(4, 0)));
+        assert!(!mapping.contains_key(&ObjectRef::new(5, 0)));
+
+        let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+        let stream_ref = probe_stream_ref(&mut reopened);
+        let Object::Stream(stream) = reopened.resolve(stream_ref).unwrap() else {
+            panic!("/Probe must resolve to a stream");
+        };
+        assert_eq!(
+            filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+            b"objstm refilter payload"
+        );
+    }
 }
 
 #[test]

@@ -3151,6 +3151,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_tx_qdf_reuses_cached_token_filter_output() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf_with_existing_ap())).expect("parse");
+        let result =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_qdf_mode(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("write reused appearance in QDF mode");
+        let renumbered = writer
+            .get_renumbered_obj_gen(result)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse output");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let decoded = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("QDF appearance must decode via its declared filter");
+        assert!(
+            decoded.windows(b"(text)".len()).any(|w| w == b"(text)"),
+            "QDF decoded appearance is missing the field value: {decoded:?}"
+        );
+    }
+
     /// PDF whose widget's existing `/AP/N` (obj 5) has a `/BBox [0 0 190
     /// 20]` that predates the widget's current, enlarged `/Rect [10 10 400
     /// 130]` -- a caller regenerating the appearance after resizing the

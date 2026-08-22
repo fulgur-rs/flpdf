@@ -3219,7 +3219,9 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
         options.object_streams
     };
 
-    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(pdf, mode)?;
+    let mut plan_options = options.clone();
+    plan_options.object_streams = mode;
+    let plan = LinearizationPlan::from_pdf_with_writer_options(pdf, &plan_options)?;
     // qpdf allocates generated ObjStm placeholders before it removes page and
     // Catalog members from the mapping (QPDFWriter.cc:1970-2005, 2141-2161).
     // Count those pre-filter containers for progress even when a later filter

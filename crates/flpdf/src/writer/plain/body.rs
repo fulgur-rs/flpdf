@@ -156,7 +156,12 @@ fn emit_source_from_handle<R: Read + Seek>(
     };
 
     if handle.as_stream_dict().is_some() {
-        let (dict, data, refiltered) = canonical_stream_output(&handle, options)?;
+        let (dict, data, refiltered) = if let Some(cached) = plan.cached_stream_outputs.get(&source)
+        {
+            (cached.dict.clone(), cached.data.clone(), cached.refiltered)
+        } else {
+            canonical_stream_output(&handle, options)?
+        };
         dict.unparse_stream_body_with_ref_map_and_removed(
             bytes,
             refiltered,
@@ -174,7 +179,23 @@ pub(crate) fn canonical_stream_output(
     handle: &ObjectHandle,
     options: &WriterOptions,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
-    canonical_stream_output_with_rewrite_policy(handle, options, true, false)
+    let (dict, data, refiltered, _) =
+        canonical_stream_output_with_status(handle, options, true, false)?;
+    Ok((dict, data, refiltered))
+}
+
+pub(crate) fn canonical_stream_output_with_status(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+    canonical_stream_output_with_rewrite_policy(
+        handle,
+        options,
+        apply_full_rewrite_metadata_policy,
+        normalize_content,
+    )
 }
 
 /// Full-rewrite variant of [`canonical_stream_output`]. The legacy writer
@@ -188,7 +209,17 @@ pub(crate) fn canonical_stream_output_for_rewrite(
     options: &WriterOptions,
     normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
-    canonical_stream_output_with_rewrite_policy(handle, options, true, normalize_content)
+    let (dict, data, refiltered, _) =
+        canonical_stream_output_for_rewrite_with_status(handle, options, normalize_content)?;
+    Ok((dict, data, refiltered))
+}
+
+pub(crate) fn canonical_stream_output_for_rewrite_with_status(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    normalize_content: bool,
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+    canonical_stream_output_with_status(handle, options, true, normalize_content)
 }
 
 /// Emit a page or indirect `/Contents` array holder that owns direct stream
@@ -590,7 +621,68 @@ pub(crate) fn canonical_stream_output_for_linearization(
     handle: &ObjectHandle,
     options: &WriterOptions,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
-    canonical_stream_output_with_rewrite_policy(handle, options, false, false)
+    let (dict, data, refiltered, _) =
+        canonical_stream_output_for_linearization_with_status(handle, options)?;
+    Ok((dict, data, refiltered))
+}
+
+pub(crate) fn canonical_stream_output_for_linearization_with_status(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
+    canonical_stream_output_with_status(handle, options, false, false)
+}
+
+/// Return whether the qpdf-shaped stream pipeline will replace the source
+/// `/Filter` and `/DecodeParms` entries for a plain rewrite.
+///
+/// The plain writer must know this before it assigns object numbers: qpdf's
+/// `unparseObject` removes those entries before it enqueues dictionary
+/// children (`QPDFWriter.cc:1438-1447`). Probe the same pipeline with a
+/// discard sink so the reachability walk can omit references that the emitted
+/// stream dictionary will no longer contain. A failed filter probe follows
+/// qpdf's retry-to-raw path and therefore returns `false`. Stateful token
+/// filters are excluded here; the plain planner caches their complete output
+/// through [`canonical_stream_output`] instead of running them twice.
+pub(crate) fn canonical_stream_will_be_refiltered(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+) -> crate::Result<bool> {
+    // Token filters are stateful qpdf ValueSetter-style consumers. The plain
+    // planner caches their complete output before walking references; callers
+    // that cannot retain that output must leave the stream edge intact rather
+    // than consuming the filter and running it again during emission.
+    if handle.is_data_modified() {
+        return Ok(false);
+    }
+    let Some((encode_flags, decode_level)) =
+        canonical_stream_filter_plan(handle, options, true, false)?
+    else {
+        return Ok(false);
+    };
+
+    for attempt in 1..=2 {
+        let mut discard = crate::pipeline::Discard;
+        let mut filtering_attempted = false;
+        let (attempt_encode_flags, attempt_decode_level) = if attempt == 1 {
+            (encode_flags, decode_level)
+        } else {
+            (0, crate::writer::DecodeLevel::None)
+        };
+        let success = handle.pipe_stream_data(
+            &mut discard,
+            &mut filtering_attempted,
+            attempt_encode_flags,
+            attempt_decode_level,
+            true,
+            attempt == 1,
+        )?;
+        if success || attempt == 2 {
+            return Ok(filtering_attempted && success);
+        }
+    }
+
+    unreachable!("the two-attempt stream filter probe always returns") // cov:ignore: the bounded two-attempt loop returns from both attempts
 }
 
 fn canonical_stream_output_with_rewrite_policy(
@@ -598,7 +690,7 @@ fn canonical_stream_output_with_rewrite_policy(
     options: &WriterOptions,
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
-) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
+) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
@@ -607,7 +699,6 @@ fn canonical_stream_output_with_rewrite_policy(
     // QDF normalization, because replacement bytes alone do not establish
     // that this particular consumer has already normalized them.
     let normalize_content = normalize_content && !handle.content_normalization_applied();
-    let source_has_lone_flate = canonical_is_lone_flate(&stream_dict)?;
     // QPDFWriter.cc:1251-1278 gives cleartext /Type /Metadata streams their
     // own policy: decode fully and emit without a filter, even when the global
     // writer policy would preserve or compress a lone-Flate source. The plain
@@ -635,39 +726,19 @@ fn canonical_stream_output_with_rewrite_policy(
     } else {
         crate::writer::effective_stream_policy(options)
     };
-    let decode_level = if is_metadata_stream {
-        crate::writer::DecodeLevel::All
-    } else {
-        options.decode_level
-    };
-    let preserve_lone_flate = matches!(policy, Some(CompressStreams::Yes))
-        && source_has_lone_flate
-        && !handle.is_data_modified()
-        && !options.recompress_flate
-        && !normalize_content
-        && !stream_dict.try_has_key(b"/F")?;
     let source_for_pipe = handle.clone();
 
     // QPDFWriter::willFilterStream starts with `isDataModified()` before it
     // considers the user compression policy (`QPDFWriter.cc:1234-1245`). A
     // token-filtered stream must therefore take the pipe path even under
     // Preserve mode; only an unmodified stream may be emitted verbatim.
-    let (data, filtering_attempted) = if !handle.is_data_modified()
-        && (policy.is_none() || preserve_lone_flate)
-    {
-        (
-            source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
-            false,
-        )
-    } else {
-        let mut encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
-            crate::object_handle::STREAM_ENCODE_COMPRESS
-        } else {
-            0
-        };
-        if normalize_content {
-            encode_flags |= crate::object_handle::STREAM_ENCODE_NORMALIZE;
-        }
+    let filter_plan = canonical_stream_filter_plan(
+        handle,
+        options,
+        apply_full_rewrite_metadata_policy,
+        normalize_content,
+    )?; // cov:ignore: canonical stream policy validation is exercised by the body tests; llvm-cov attributes this continuation to the defensive error path
+    let (data, filtering_attempted) = if let Some((encode_flags, decode_level)) = filter_plan {
         let mut attempt = 1_u8;
         let (data, filtering_attempted) = loop {
             let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
@@ -699,6 +770,11 @@ fn canonical_stream_output_with_rewrite_policy(
             attempt = 2;
         };
         (data, filtering_attempted)
+    } else {
+        (
+            source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
+            false,
+        )
     };
 
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
@@ -726,7 +802,60 @@ fn canonical_stream_output_with_rewrite_policy(
     );
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
     let refiltered = filtering_attempted && matches!(policy, Some(CompressStreams::Yes));
-    Ok((dict, data, refiltered))
+    Ok((dict, data, refiltered, filtering_attempted))
+}
+
+fn canonical_stream_filter_plan(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
+) -> crate::Result<Option<(u32, crate::writer::DecodeLevel)>> {
+    let stream_dict = handle
+        .as_stream_dict()
+        .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
+    let normalize_content = normalize_content && !handle.content_normalization_applied();
+    let source_has_lone_flate = canonical_is_lone_flate(&stream_dict)?;
+    let is_metadata_stream = apply_full_rewrite_metadata_policy
+        && stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?
+        && options
+            .encrypt
+            .as_ref()
+            .is_none_or(|params| !params.encrypt_metadata)
+        && options
+            .copy_encryption
+            .as_ref()
+            .is_none_or(|source| !crate::writer::copy_encryption_encrypts_metadata(source));
+    let normalize_content = normalize_content && !is_metadata_stream;
+    let policy = if is_metadata_stream {
+        Some(CompressStreams::No)
+    } else {
+        crate::writer::effective_stream_policy(options)
+    };
+    let decode_level = if is_metadata_stream {
+        crate::writer::DecodeLevel::All
+    } else {
+        options.decode_level
+    };
+    let preserve_lone_flate = matches!(policy, Some(CompressStreams::Yes))
+        && source_has_lone_flate
+        && !handle.is_data_modified()
+        && !options.recompress_flate
+        && !normalize_content
+        && !stream_dict.try_has_key(b"/F")?;
+    if !handle.is_data_modified() && (policy.is_none() || preserve_lone_flate) {
+        return Ok(None);
+    }
+
+    let mut encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
+        crate::object_handle::STREAM_ENCODE_COMPRESS
+    } else {
+        0
+    };
+    if normalize_content {
+        encode_flags |= crate::object_handle::STREAM_ENCODE_NORMALIZE;
+    }
+    Ok(Some((encode_flags, decode_level)))
 }
 
 /// Mirror `QPDFWriter::unparseObject`'s unfiltered-stream cleanup
@@ -1155,6 +1284,51 @@ mod tests {
             .get_key(b"/Filter")
             .try_is_name_and_equals(b"FlateDecode")
             .unwrap());
+    }
+
+    #[test]
+    fn refilter_probe_retries_an_invalid_source_as_raw() {
+        let fixture =
+            include_bytes!("../../../../../tests/fixtures/test_driver/stream_flate_error.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        let stream = pdf.get_object_handle(ObjectRef::new(6, 0));
+        pdf.resolve_object_handle(&stream).unwrap();
+        let options = WriterOptions {
+            recompress_flate: true,
+            ..WriterOptions::default()
+        };
+
+        assert!(!canonical_stream_will_be_refiltered(&stream, &options).unwrap());
+    }
+
+    #[test]
+    fn refilter_probe_does_not_consume_a_stateful_token_filter() {
+        struct ForwardTokenFilter;
+
+        impl crate::token_filter::TokenFilter for ForwardTokenFilter {
+            fn handle_token(
+                &mut self,
+                token: &crate::tokenizer::Token,
+                output: &mut crate::token_filter::TokenFilterOutput<'_>,
+            ) -> crate::pipeline::PipelineResult<()> {
+                output.write_token(token)
+            }
+        }
+
+        let mut filter = ForwardTokenFilter;
+        let token = crate::tokenizer::Token::new(crate::tokenizer::TokenType::Word, b"q".to_vec());
+        let mut output = crate::token_filter::TokenFilterOutput::new(None);
+        crate::token_filter::TokenFilter::handle_token(&mut filter, &token, &mut output).unwrap();
+
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(1))]),
+            Rc::new(b"q".to_vec()),
+        );
+        stream
+            .add_token_filter(Rc::new(RefCell::new(filter)))
+            .unwrap();
+
+        assert!(!canonical_stream_will_be_refiltered(&stream, &WriterOptions::default()).unwrap());
     }
 
     #[test]
