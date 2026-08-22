@@ -1,6 +1,6 @@
 //! qpdf parity tests for the V=5 reader/writer password boundary.
 
-use flpdf::{EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
+use flpdf::{EncryptParams, PasswordMode, Pdf, PdfOpenOptions, PdfWriter};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -187,5 +187,24 @@ fn v5_password_truncation_matches_qpdf_reader_writer_split() {
         });
         write_qpdf_encrypted(&input_path, &qpdf_127_path, &prefix, r5);
         assert_flpdf_accepts(&fs::read(&qpdf_127_path).unwrap(), &longer, r5);
+    }
+}
+
+#[test]
+fn reader_password_mode_does_not_validate_raw_password_bytes() {
+    let password = b"\xff\xfeA".to_vec();
+    let encrypted = flpdf_encrypted(&minimal_fixture(), &password, false);
+
+    let result = Pdf::open_with_options(
+        Cursor::new(encrypted),
+        PdfOpenOptions {
+            password: password.clone(),
+            password_mode: PasswordMode::Unicode,
+            ..PdfOpenOptions::default()
+        },
+    );
+
+    if let Err(error) = result {
+        panic!("reader-side password-mode must not reject raw password bytes: {error}");
     }
 }

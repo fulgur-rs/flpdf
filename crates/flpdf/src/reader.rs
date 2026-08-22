@@ -18,7 +18,7 @@ use crate::parser::array_item_source_offset;
 use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
-use crate::security::password::{normalize_password, PasswordMode};
+use crate::security::password::{password_bytes_for_read, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
     check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
@@ -417,8 +417,9 @@ pub struct PdfOpenOptions {
     pub ignore_xref_streams: bool,
     /// Password bytes supplied to the Standard security handler.
     pub password: Vec<u8>,
-    /// How `password` should be interpreted before key derivation. See
-    /// [`PasswordMode`] for the qpdf-compatible semantics.
+    /// How `password` should be interpreted before authentication. qpdf only
+    /// applies `hex-bytes` on the read path; the other modes pass these bytes
+    /// through unchanged. See [`PasswordMode`] for the write-side semantics.
     pub password_mode: PasswordMode,
     /// Permit deprecated RC4-backed handlers and revision 5 AES-256.
     pub allow_weak_crypto: bool,
@@ -799,15 +800,15 @@ impl<R: Read + Seek> Pdf<R> {
             }
         };
         // Under `--password-is-hex-key` the --password value is a raw hex key,
-        // not a password, so password-encoding normalization (which can reject
-        // e.g. `--password-mode=unicode` on V<5) must not run and is unused by
-        // the hex-key branch. Skip it; the hex-key branch decodes the raw
-        // value itself. The `else` (layer-2) branches still see the normalized
-        // password unchanged.
+        // not a password, so input password-mode handling is unused by the
+        // hex-key branch. Skip it; the hex-key branch decodes the raw value
+        // itself. The `else` (layer-2) branches follow qpdf's read-side rule:
+        // only hex-bytes decodes the input; every other mode passes bytes
+        // unchanged.
         let password = if options.password_is_hex_key {
             Vec::new()
         } else {
-            normalize_password(&options.password, options.password_mode, revision)?
+            password_bytes_for_read(&options.password, options.password_mode)?
         };
         // The RC4 classification the weak-crypto gate uses on every branch
         // that is not R=5/R=6. Reads the effective methods, not the raw
