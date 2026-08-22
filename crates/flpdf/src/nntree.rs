@@ -349,12 +349,9 @@ impl LiveDictionary {
         self.handle.remove_key(&key);
     }
 
-    fn contains(&self, key: &str) -> bool {
+    fn contains(&self, key: &str) -> Result<bool> {
         let key = self.actual_key(key);
-        self.handle
-            .try_get_key(&key)
-            .ok()
-            .is_some_and(|value| !value.is_null())
+        self.handle.try_has_key(&key)
     }
 
     fn mark_dirty<R: Read + Seek>(&self, pdf: &mut Pdf<R>) -> Result<()> {
@@ -2835,7 +2832,10 @@ impl<K: TreeKey> NNTree<K> {
             return Ok(false);
         }
         let dictionary = LiveDictionary::new(kid)?;
-        Ok(dictionary.contains("Kids") || dictionary.contains(K::ITEMS_KEY))
+        if dictionary.contains("Kids")? {
+            return Ok(true);
+        }
+        dictionary.contains(K::ITEMS_KEY)
     }
 
     fn warn<R: Read + Seek>(
@@ -3243,6 +3243,16 @@ mod tests {
                 .expect("lift dictionary"),
         )
         .expect("dictionary handle")
+    }
+
+    #[test]
+    fn live_dictionary_contains_resolves_an_indirect_null_value() {
+        let mut pdf = empty_pdf();
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Kids", Object::Reference(ObjectRef::new(99, 0)));
+        let dictionary = live_dictionary(&mut pdf, dictionary);
+
+        assert!(!dictionary.contains("Kids").expect("resolve /Kids"));
     }
 
     fn fail_warning_delivery(pdf: &mut TestPdf) {
@@ -4435,7 +4445,7 @@ mod tests {
         let dictionary = tree
             .load_node(&mut pdf, &NodeHandle::indirect(object_ref))
             .unwrap();
-        assert!(dictionary.contains("Names"));
+        assert!(dictionary.contains("Names").expect("resolve /Names"));
     }
 
     #[test]

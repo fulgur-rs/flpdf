@@ -1316,7 +1316,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             core.object_cache.get(&object_ref).cloned()
         };
         if let Some(handle) = cached {
-            handle.set_resolved(ObjectValue::Null);
+            handle.detach_value_to_null();
         }
         Ok(())
     }
