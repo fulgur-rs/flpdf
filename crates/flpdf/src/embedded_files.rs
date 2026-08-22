@@ -523,7 +523,8 @@ pub fn delete_embedded_file<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filespec_helper::{add_attachment_from_path, FileSpecBuilder};
+    use crate::filespec_helper::FileSpecBuilder;
+    use crate::job::add_attachment_from_path;
 
     // ── Minimal PDF fixture (same as filespec_helper tests) ───────────────────
 

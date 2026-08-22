@@ -183,16 +183,17 @@ pub use encryption::{
 };
 pub use error::{EncryptedError, Error, Result};
 pub use filespec_helper::{
-    add_attachment_from_path, encode_utf16be, extract_attachment, extract_attachment_to_path,
-    format_pdf_date, md5_checksum, write_attachment, EmbeddedFileStream, FileParamDates, FileSpec,
+    encode_utf16be, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates, FileSpec,
     FileSpecBuilder,
 };
 pub use form_field_object_helper::FormFieldObjectHelper;
 pub use job::{
-    apply_overlay_specs, collate, format_attachment_list, format_attachment_list_with_sink,
-    list_attachment_info, merge_documents, overlay_verbose_report, prune_acroform_after_subset,
-    prune_acroform_after_subset_with_max_depth, AttachmentInfo, CombinedPage, CombinedPlan,
-    Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage,
+    add_attachment_from_path, apply_overlay_specs, ascii_filename_fallback, collate,
+    extract_attachment, extract_attachment_to_path, format_attachment_list,
+    format_attachment_list_with_sink, list_attachment_info, merge_documents,
+    overlay_verbose_report, prune_acroform_after_subset,
+    prune_acroform_after_subset_with_max_depth, write_attachment, AttachmentInfo, CombinedPage,
+    CombinedPlan, Endpoint, InputSpec, MergeInput, OverlayKind, OverlaySpec, OverlayVerbosePage,
     OverlayVerboseSource, PagePlan, PageRange, PageRangeEntry, Parity, RotateSpec, SelectedPage,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };

@@ -34,7 +34,10 @@ pub use acroform_field_prune::{
 pub use attachment_list::{
     format_attachment_list, format_attachment_list_with_sink, list_attachment_info, AttachmentInfo,
 };
-pub use attachments::{AttachmentAddOptions, AttachmentCopyOptions};
+pub use attachments::{
+    add_attachment_from_path, ascii_filename_fallback, extract_attachment,
+    extract_attachment_to_path, write_attachment, AttachmentAddOptions, AttachmentCopyOptions,
+};
 #[cfg(test)]
 pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
