@@ -1646,6 +1646,17 @@ impl<R: Read + Seek> Pdf<R> {
                 if matches!(cache_entry, Some(CacheEntry::Missing)) {
                     return None;
                 }
+                if self.resolver.xref_entry(object_ref).is_none()
+                    && cache_entry.is_none()
+                    && handle.is_null()
+                    && !self.handle_mutated_object_refs.contains(&object_ref)
+                {
+                    // A canonical handle can resolve an absent reference to
+                    // null without creating a legacy Missing entry. qpdf's
+                    // xref membership still distinguishes that dangling
+                    // cache value from an allocated indirect object.
+                    return None;
+                }
                 if live_only && self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
                     // A historical xref stream is in qpdf's object cache but
                     // its effective xref row is free/superseded. It belongs
@@ -10411,6 +10422,22 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_detaches_a_shared_replacement_before_nulling_the_target() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        let replacement_alias = replacement.clone();
+
+        pdf.replace_object_handle(object_ref, replacement)
+            .expect("replace canonical object");
+        pdf.delete_object(object_ref);
+
+        assert!(replacement_alias.as_dictionary().is_some());
+        assert_eq!(replacement_alias.get_key(b"/Value").as_integer(), Some(7));
+    }
+
+    #[test]
     fn set_object_handle_is_the_dirty_marking_handle_form_of_set_object() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
@@ -11538,6 +11565,19 @@ mod tests {
         assert!(pdf.object_refs().contains(&placeholder_ref));
         assert!(!pdf.live_object_refs().contains(&placeholder_ref));
         assert!(pdf.live_object_refs().contains(&allocated_ref));
+    }
+
+    #[test]
+    fn object_refs_excludes_a_resolved_dangling_registry_slot() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let dangling_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(dangling_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve dangling reference");
+        assert!(handle.is_null());
+
+        assert!(!pdf.object_refs().contains(&dangling_ref));
+        assert!(!pdf.live_object_refs().contains(&dangling_ref));
     }
 
     #[test]
