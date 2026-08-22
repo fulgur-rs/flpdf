@@ -1120,13 +1120,50 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         object_ref: ObjectRef,
     ) -> Result<Option<u64>> {
+        Ok(self
+            .qtest_object_value_source_offsets(&[object_ref])?
+            .into_iter()
+            .next()
+            .flatten())
+    }
+
+    /// Return source offsets for the direct values of multiple indirect
+    /// objects, reading each distinct source object at most once.
+    ///
+    /// qpdf's `QPDF::resolve` stops at the persistent `obj_cache` entry once
+    /// an object is resolved (`libqpdf/QPDF.cc:1700-1704`). The qtest offset
+    /// surface is a compatibility-only source-position lookup, so it keeps
+    /// the same one-read-per-object property across repeated warning
+    /// attributions instead of charging the global fallback budget once per
+    /// filter index.
+    #[doc(hidden)]
+    #[cfg(feature = "qtest-driver")]
+    pub fn qtest_object_value_source_offsets(
+        &mut self,
+        object_refs: &[ObjectRef],
+    ) -> Result<Vec<Option<u64>>> {
         self.synchronize_legacy_resolution_state();
-        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
-            return Ok(None);
-        };
-        let body_start =
-            self.qtest_read_source_object_with_retry(offset, Self::object_body_start_within)?;
-        Ok(Some(offset.saturating_add(body_start as u64)))
+        let mut offsets = BTreeMap::new();
+        for &object_ref in object_refs {
+            if offsets.contains_key(&object_ref) {
+                continue;
+            }
+            let value_offset = match self.resolver.xref_entry(object_ref) {
+                Some(XrefEntry::Uncompressed { offset }) => {
+                    let body_start = self.qtest_read_source_object_with_retry(
+                        offset,
+                        Self::object_body_start_within,
+                    )?; // cov:ignore: qtest-driver-only source-read error propagation is covered by feature-gated reader tests, not the workspace coverage profile
+                    Some(offset.saturating_add(body_start as u64))
+                }
+                _ => None,
+            };
+            offsets.insert(object_ref, value_offset);
+        }
+        Ok(object_refs
+            .iter()
+            .map(|object_ref| offsets.get(object_ref).copied().flatten())
+            .collect())
     }
 
     /// Return the source offset of the item at `array_index` in an indirect
@@ -1147,17 +1184,44 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         array_index: usize,
     ) -> Result<Option<u64>> {
+        Ok(self
+            .qtest_array_item_source_offsets(object_ref, &[array_index])?
+            .into_iter()
+            .next()
+            .flatten())
+    }
+
+    /// Return source offsets for multiple items in one indirect array, using
+    /// one bounded read and at most one full-source retry for the container.
+    /// Duplicate indices therefore cannot consume duplicate fallback budget.
+    #[doc(hidden)]
+    #[cfg(feature = "qtest-driver")]
+    pub fn qtest_array_item_source_offsets(
+        &mut self,
+        object_ref: ObjectRef,
+        array_indices: &[usize],
+    ) -> Result<Vec<Option<u64>>> {
         self.synchronize_legacy_resolution_state();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
-            return Ok(None);
+            return Ok(vec![None; array_indices.len()]);
         };
-        let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
+        let value_offsets = self.qtest_read_source_object_with_retry(offset, |bytes| {
             let body_start = Self::object_body_start_within(bytes)?;
             let body = &bytes[body_start..];
-            let value_offset = array_item_source_offset(body, array_index)?;
-            Ok(value_offset.map(|value_offset| body_start + value_offset))
+            array_indices
+                .iter()
+                .map(|&array_index| {
+                    let value_offset = array_item_source_offset(body, array_index)?;
+                    Ok(value_offset.map(|value_offset| body_start + value_offset))
+                })
+                .collect::<Result<Vec<_>>>()
         })?;
-        Ok(value_offset.map(|value_offset| offset.saturating_add(value_offset as u64)))
+        Ok(value_offsets
+            .into_iter()
+            .map(|value_offset| {
+                value_offset.map(|value_offset| offset.saturating_add(value_offset as u64))
+            })
+            .collect())
     }
 
     /// Read an indirect object's bytes bounded by the next recorded object
@@ -8215,6 +8279,78 @@ mod tests {
             pdf.qtest_array_item_source_offset(ObjectRef::new(99, 0), 0)
                 .expect("unknown object"),
             None
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_array_item_source_offsets_batch_duplicate_indices_with_one_retry() {
+        let catalog_body = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let pages_body = b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n";
+        let array_body = b"3 0 obj\n[ null null ]\nendobj\n";
+        let bytes = classic_pdf_with_bodies(
+            &[catalog_body, pages_body, array_body],
+            ObjectRef::new(1, 0),
+        );
+        let array_offset = bytes
+            .windows(b"3 0 obj".len())
+            .position(|window| window == b"3 0 obj")
+            .expect("array object") as u64;
+        let false_next_offset = array_offset + b"3 0 ".len() as u64;
+        let first = bytes
+            .windows(b"[ null null ]".len())
+            .position(|window| window == b"[ null null ]")
+            .expect("array value")
+            + b"[ ".len();
+        let second = first + b"null ".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-array fixture");
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+
+        assert_eq!(
+            pdf.qtest_array_item_source_offsets(ObjectRef::new(3, 0), &[0, 1, 0])
+                .expect("batch array offset lookup"),
+            vec![Some(first as u64), Some(second as u64), Some(first as u64)]
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1),
+            "one source container must consume one fallback retry"
+        );
+    }
+
+    #[cfg(feature = "qtest-driver")]
+    #[test]
+    fn qtest_object_value_source_offsets_batch_duplicate_refs_with_one_retry() {
+        let catalog_body = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let pages_body = b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n";
+        let scalar_body = b"3 0 obj\n42\nendobj\n";
+        let bytes = classic_pdf_with_bodies(
+            &[catalog_body, pages_body, scalar_body],
+            ObjectRef::new(1, 0),
+        );
+        let scalar_offset = bytes
+            .windows(b"3 0 obj".len())
+            .position(|window| window == b"3 0 obj")
+            .expect("scalar object") as u64;
+        let false_next_offset = scalar_offset + b"3 0 ".len() as u64;
+        let expected = scalar_offset + b"3 0 obj".len() as u64;
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect-scalar fixture");
+        pdf.sorted_object_offsets.push(false_next_offset);
+        pdf.sorted_object_offsets.sort_unstable();
+        let initial_budget = pdf.resolution_fallbacks_remaining;
+        let object_ref = ObjectRef::new(3, 0);
+
+        assert_eq!(
+            pdf.qtest_object_value_source_offsets(&[object_ref, object_ref])
+                .expect("batch object offset lookup"),
+            vec![Some(expected), Some(expected)]
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining,
+            initial_budget.saturating_sub(1),
+            "one source object must consume one fallback retry"
         );
     }
 

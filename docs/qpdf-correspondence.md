@@ -196,6 +196,15 @@ The initial file-open boundary also preserves the platform CRT diagnostic via
 (`libqpdf/QPDFSystemError.cc:13-29`). The differential tests cover missing
 paths and Windows directory-open failures for both metadata helpers.
 
+`flpdf-enoa` は `QPDF::resolve` の persistent `obj_cache` gate
+(`libqpdf/QPDF.cc:1700-1704`) を qtest の parsed-offset warning attribution にも
+適用する。`Pdf::qtest_object_value_source_offsets` と
+`qtest_array_item_source_offsets` は同一 ObjectBody/array container を一度だけ
+bounded-read/retry し、`test_0_1` は DecodeParms warning を source ref ごとに batch
+してから元の warning 順序で出力する。qpdf に存在しない flpdf の
+`resolution_fallbacks_remaining` を filter index ごとに消費する再読は増やさず、
+既存の qtest-only offset boundary に閉じ込める。
+
 ## 1. オブジェクトモデル
 
 | qpdf | 行 | flpdf | 状態 |
