@@ -3606,21 +3606,23 @@ mod tests {
     use super::{
         append_xref_size_warning_for, empty_bootstrap_cache, find_xref_stream_trailer_candidate,
         is_xref_stream_handle, load_xref_and_trailer_with_repair, load_xref_state_with_options,
-        merge_bootstrap_cache_prefer_source, merge_previous_xref_sections,
-        merge_xref_stream_from_classic_trailer, parse_trailer_candidate, parse_xref_index,
-        parse_xref_stream, parse_xref_table, prepend_repair_diagnostics,
-        recover_trailer_from_xref_stream_candidate, recover_xref_from_linear_scan,
-        BootstrapHandleDocument, ByteCursor, LoadedXref, LoadedXrefState, RecoveryPolicy,
-        XrefEntryLookup, XrefForm, XrefLoadOptions, XrefObjectDescription, XrefReadContext,
-        XrefReadContextSpec, XrefRegistration,
+        merge_bootstrap_cache_prefer_source, merge_bootstrap_handle_state_prefer_source,
+        merge_previous_xref_sections, merge_xref_stream_from_classic_trailer,
+        parse_trailer_candidate, parse_xref_index, parse_xref_stream, parse_xref_table,
+        prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
+        recover_xref_from_linear_scan, BootstrapHandleDocument, BootstrapHandleState, ByteCursor,
+        LoadedXref, LoadedXrefState, RecoveryPolicy, XrefEntryLookup, XrefForm, XrefLoadOptions,
+        XrefObjectDescription, XrefReadContext, XrefReadContextSpec, XrefRegistration,
     };
     use crate::filters;
     use crate::object_handle::DocumentResolver;
     use crate::{
         Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, XrefEntry,
     };
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
+    use std::rc::Rc;
 
     fn test_objstm_payload(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
         let mut header = Vec::new();
@@ -4701,6 +4703,131 @@ mod tests {
 
         assert!(first_handle.is_same_object_as(&second_handle));
         assert_eq!(second_handle.try_as_integer().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn bootstrap_handle_seed_converts_every_raw_scalar_kind() {
+        let registration = XrefRegistration::default();
+        let document = BootstrapHandleDocument::new(
+            b"",
+            XrefEntryLookup::Registration(&registration.entries),
+            XrefLoadOptions::default(),
+        );
+
+        assert!(matches!(
+            document
+                .object_value_from_raw(&Object::Boolean(true))
+                .unwrap(),
+            crate::object_handle::ObjectValue::Boolean(true)
+        ));
+        assert!(matches!(
+            document
+                .object_value_from_raw(&Object::Real(1.25))
+                .unwrap(),
+            crate::object_handle::ObjectValue::Real(value) if value == 1.25
+        ));
+        assert!(matches!(
+            document
+                .object_value_from_raw(&Object::RealLiteral {
+                    value: 0.4,
+                    literal: b".400".to_vec(),
+                })
+                .unwrap(),
+            crate::object_handle::ObjectValue::RealLiteral { value, literal }
+                if value == 0.4 && literal == b".400"
+        ));
+        assert!(matches!(
+            document
+                .object_value_from_raw(&Object::Operator(b"q".to_vec()))
+                .unwrap(),
+            crate::object_handle::ObjectValue::Operator(value) if value == b"q"
+        ));
+        assert!(matches!(
+            document
+                .object_value_from_raw(&Object::InlineImage(b"data".to_vec()))
+                .unwrap(),
+            crate::object_handle::ObjectValue::InlineImage(value) if value == b"data"
+        ));
+        assert!(matches!(
+            document
+                .object_value_from_raw(&Object::Reference(ObjectRef::new(9, 0)))
+                .unwrap(),
+            crate::object_handle::ObjectValue::Reference(ObjectRef {
+                number: 9,
+                generation: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn shared_bootstrap_handle_state_merge_preserves_source_diagnostics() {
+        let destination = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        destination
+            .borrow_mut()
+            .diagnostics
+            .push(Diagnostic::warning("destination", None));
+        let source = Rc::new(RefCell::new(BootstrapHandleState::default()));
+        source
+            .borrow_mut()
+            .diagnostics
+            .push(Diagnostic::warning("source", None));
+
+        merge_bootstrap_handle_state_prefer_source(&destination, &destination);
+        merge_bootstrap_handle_state_prefer_source(&destination, &source);
+
+        assert_eq!(
+            source
+                .borrow()
+                .diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["destination", "source"]
+        );
+    }
+
+    #[test]
+    fn shared_bootstrap_cache_merge_retains_both_handle_resolver_owners() {
+        let bytes = b"1 0 obj\n4\nendobj\n";
+        let object_ref = ObjectRef::new(1, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 0 });
+        let destination = empty_bootstrap_cache();
+        let source = empty_bootstrap_cache();
+
+        {
+            let context = XrefReadContext::new(
+                bytes,
+                XrefReadContextSpec::ActiveSectionWithCache {
+                    bootstrap_cache: &destination,
+                },
+                &registration,
+                XrefLoadOptions::default(),
+            );
+            context.handle_document();
+        }
+        {
+            let context = XrefReadContext::new(
+                bytes,
+                XrefReadContextSpec::ActiveSectionWithCache {
+                    bootstrap_cache: &source,
+                },
+                &registration,
+                XrefLoadOptions::default(),
+            );
+            context.handle_document();
+        }
+
+        let source_document = source.borrow().handle_document.clone().unwrap();
+        merge_bootstrap_cache_prefer_source(&destination, &source);
+
+        let merged = destination.borrow();
+        assert!(Rc::ptr_eq(
+            merged.handle_document.as_ref().unwrap(),
+            &source_document
+        ));
+        assert_eq!(merged.handle_document_owners.len(), 1);
     }
 
     #[test]
