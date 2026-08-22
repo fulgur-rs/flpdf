@@ -7,31 +7,18 @@
 //! `QPDFFormFieldObjectHelper::generateAppearance` dispatches only `/Tx` and
 //! `/Ch` (`QPDFFormFieldObjectHelper.cc:472-478`).
 //!
-//! # Observable-equivalence policy
-//!
-//! Appearance streams target observable equivalence with qpdf (same rendered
-//! value/position), **not byte-identical output**.  Whitespace, operator
-//! ordering, and auto-size heuristics may differ.
-//!
-//! # Limitations
-//!
-//! - **WinAnsi re-encoding**: Characters in the range U+0080–U+009F are
-//!   represented with a `?` byte because their WinAnsi (cp1252) mappings are
-//!   not implemented.  All other Latin-1 / WinAnsi characters round-trip
-//!   correctly.
-//! - **Comb fields** (`/Ff` bit 25 set, with `/MaxLen`): not implemented.
-//!   The text is rendered as a plain single-line field.  Document "Comb
-//!   layout is a known unimplemented feature" for callers.
-//! - Only the 14 standard PDF fonts are supported via the embedded metrics
-//!   table.  Unknown fonts fall back to Helvetica.
-//! - **Btn `/MK/BG` background fill and `/MK/BC` border** are not rendered.
-//!   These are best-effort decorations; callers that require them should
-//!   generate the appearance themselves.
+//! The production route follows qpdf's limited generator rather than adding a
+//! font-metrics layout engine: quadding is ignored, and text is encoded as
+//! ASCII unless qpdf finds a `/Encoding /WinAnsiEncoding` or
+//! `/MacRomanEncoding` font in the existing appearance resources or
+//! document-level `/AcroForm /DR` (`QPDFFormFieldObjectHelper.cc:576-577,
+//! 811-849`).
 
 use std::cell::RefCell;
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+use crate::annotation_helper::AnnotationObjectHelper;
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::default_appearance::parse_default_appearance;
 #[cfg(test)]
@@ -43,6 +30,7 @@ use crate::object::write_literal_string;
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
 use crate::pipeline::PipelineResult;
+#[cfg(test)]
 use crate::standard_font_metrics::StandardFont;
 use crate::token_filter::{TokenFilter, TokenFilterOutput};
 use crate::tokenizer::{Token, TokenType};
@@ -157,38 +145,51 @@ fn resolve_appearance_bbox_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget: &ObjectHandle,
 ) -> Result<Option<PageBox>> {
-    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
-    if ap.as_dictionary().is_some() {
-        let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
-        if let Some(stream_dict) = normal.as_stream_dict() {
-            return resolve_rectangle_canonical(pdf, &stream_dict, b"/BBox");
-        }
+    let normal = resolve_normal_appearance_canonical(pdf, widget)?;
+    if let Some(stream_dict) = normal.as_stream_dict() {
+        return resolve_rectangle_canonical(pdf, &stream_dict, b"/BBox");
     }
     resolve_rect_canonical(pdf, widget)
 }
 
-/// Resolve the standard-14 font named by a field's document-level `/DR`.
-#[cfg(test)]
-fn lookup_dr_basefont_canonical<R: Read + Seek>(
+/// Select `/AP/N`, including qpdf's `/AS` lookup when `/N` is a state
+/// dictionary. The annotation helper owns this qpdf responsibility.
+fn resolve_normal_appearance_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field_ref: ObjectRef,
-    resource_name: &[u8],
-) -> Result<Option<StandardFont>> {
-    let field = pdf.get_object_handle(field_ref);
-    lookup_dr_basefont_canonical_handles(pdf, field, resource_name)
+    widget: &ObjectHandle,
+) -> Result<ObjectHandle> {
+    let mut annotation = AnnotationObjectHelper::from_object_handle(widget.clone(), pdf);
+    annotation.get_appearance_stream(b"N", None)
 }
 
-fn lookup_dr_basefont_canonical_handles<R: Read + Seek>(
+#[derive(Clone, Copy)]
+enum AppearanceEncoding {
+    Ascii,
+    WinAnsi,
+    MacRoman,
+}
+
+#[derive(Clone)]
+struct AppearanceFont {
+    resource_name: Vec<u8>,
+    font: ObjectHandle,
+    encoding: AppearanceEncoding,
+    from_default_resources: bool,
+}
+
+fn font_from_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field: ObjectHandle,
+    resources: ObjectHandle,
     resource_name: &[u8],
-) -> Result<Option<StandardFont>> {
-    let resources = FormFieldObjectHelper::from_object_handle(field, pdf).default_resources()?;
-    let Some(resources) = resources else {
-        return Ok(None);
-    };
+) -> Result<Option<ObjectHandle>> {
     let resources = resolve_canonical(pdf, resources)?;
+    if resources.as_dictionary().is_none() {
+        return Ok(None);
+    }
     let font_dict = resolve_canonical(pdf, resources.get_key(b"/Font"))?;
+    if font_dict.as_dictionary().is_none() {
+        return Ok(None);
+    }
     let resource_key = {
         let mut key = Vec::with_capacity(resource_name.len() + 1);
         key.push(b'/');
@@ -196,10 +197,67 @@ fn lookup_dr_basefont_canonical_handles<R: Read + Seek>(
         key
     };
     let font = resolve_canonical(pdf, font_dict.get_key(&resource_key))?;
-    let base_font = resolve_canonical(pdf, font.get_key(b"/BaseFont"))?;
-    Ok(base_font
-        .as_name()
-        .and_then(|name| StandardFont::from_base_name(&name)))
+    Ok((!font.is_null()).then_some(font))
+}
+
+fn appearance_font_encoding<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    font: &ObjectHandle,
+) -> Result<AppearanceEncoding> {
+    let font = resolve_canonical(pdf, font.clone())?;
+    let encoding = resolve_canonical(pdf, font.get_key(b"/Encoding"))?;
+    Ok(match encoding.as_name().as_deref() {
+        Some(b"WinAnsiEncoding") => AppearanceEncoding::WinAnsi,
+        Some(b"MacRomanEncoding") => AppearanceEncoding::MacRoman,
+        _ => AppearanceEncoding::Ascii,
+    })
+}
+
+fn lookup_appearance_font<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field: ObjectHandle,
+    normal_appearance: &ObjectHandle,
+    resource_name: Option<&[u8]>,
+) -> Result<Option<AppearanceFont>> {
+    let Some(resource_name) = resource_name.filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Some(stream_dict) = normal_appearance.as_stream_dict() {
+        let resources = resolve_canonical(pdf, stream_dict.get_key(b"/Resources"))?;
+        if let Some(font) = font_from_resources(pdf, resources, resource_name)? {
+            let encoding = appearance_font_encoding(pdf, &font)?;
+            return Ok(Some(AppearanceFont {
+                resource_name: resource_name.to_vec(),
+                font,
+                encoding,
+                from_default_resources: false,
+            }));
+        }
+    }
+
+    let resources = FormFieldObjectHelper::from_object_handle(field, pdf).default_resources()?;
+    let Some(resources) = resources else {
+        return Ok(None);
+    };
+    let Some(font) = font_from_resources(pdf, resources, resource_name)? else {
+        return Ok(None);
+    };
+    let encoding = appearance_font_encoding(pdf, &font)?;
+    Ok(Some(AppearanceFont {
+        resource_name: resource_name.to_vec(),
+        font,
+        encoding,
+        from_default_resources: true,
+    }))
+}
+
+fn encode_appearance_text(value: &str, encoding: AppearanceEncoding) -> Vec<u8> {
+    match encoding {
+        AppearanceEncoding::Ascii => crate::qutil::utf8_to_ascii(value.as_bytes()),
+        AppearanceEncoding::WinAnsi => crate::qutil::utf8_to_win_ansi(value.as_bytes()),
+        AppearanceEncoding::MacRoman => crate::qutil::utf8_to_mac_roman(value.as_bytes()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -303,59 +361,87 @@ impl TokenFilter for AppearanceTokenFilter {
 /// freshly built stream is never linked into the widget's `/AP/N`. `None`
 /// keeps that outcome visible to the caller instead of returning a stream
 /// ref the widget does not actually reference.
+fn resource_key(name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(name.len() + 1);
+    key.push(b'/');
+    key.extend_from_slice(name);
+    key
+}
+
+fn add_default_font_to_existing_appearance<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    normal: &ObjectHandle,
+    font: &AppearanceFont,
+) -> Result<()> {
+    let Some(stream_dict) = normal.as_stream_dict() else {
+        return Ok(());
+    };
+    let resources = resolve_canonical(pdf, stream_dict.get_key(b"/Resources"))?;
+    if resources.as_dictionary().is_none() {
+        return Ok(());
+    }
+    let resources = if resources.is_indirect() {
+        let copy = resources.shallow_copy()?;
+        let indirect = pdf.make_indirect_object_handle(copy)?;
+        stream_dict.replace_key(b"/Resources", indirect.clone())?;
+        indirect
+    } else {
+        resources
+    };
+    let empty_font = ObjectHandle::dictionary(vec![(
+        b"/Font".to_vec(),
+        ObjectHandle::dictionary(Vec::new()),
+    )]);
+    resources.merge_resources(&empty_font, None)?;
+    resources
+        .get_key(b"/Font")
+        .replace_key(&resource_key(&font.resource_name), font.font.clone())?;
+    pdf.mark_object_handle_dirty(&resources)?;
+    pdf.mark_object_handle_dirty(&stream_dict)
+}
+
 fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget: ObjectHandle,
     content: Vec<u8>,
     bbox_w: f64,
     bbox_h: f64,
-    font_resource: (Vec<u8>, Vec<u8>),
+    font_resource: Option<AppearanceFont>,
 ) -> Result<Option<ObjectRef>> {
     pdf.resolve_object_handle(&widget)?;
-    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
+    let normal = resolve_normal_appearance_canonical(pdf, &widget)?;
 
     // qpdf keeps an existing normal appearance stream and installs a
     // `ValueSetter` token filter on that same canonical stream
-    // (`QPDFFormFieldObjectHelper.cc:766-860`). The filter runs lazily over
-    // decoded original bytes; the writer then applies its normal encode
-    // policy. This preserves both the source payload and the source filter
-    // declaration until the canonical pipe is actually requested.
-    if ap.as_dictionary().is_some() {
-        let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
-        if normal.as_stream_dict().is_some() {
-            normal.add_token_filter(Rc::new(RefCell::new(AppearanceTokenFilter::new(&content))))?;
-            normal
-                .as_stream_dict()
-                .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
-                .transpose()?;
-            return normal
-                .object_ref()
-                .ok_or_else(|| {
-                    Error::Unsupported("normal appearance stream is not indirect".to_string())
-                })
-                .map(Some);
+    // (`QPDFFormFieldObjectHelper.cc:766-860`).
+    if normal.as_stream_dict().is_some() {
+        if let Some(font) = font_resource
+            .as_ref()
+            .filter(|font| font.from_default_resources)
+        {
+            add_default_font_to_existing_appearance(pdf, &normal, font)?;
         }
+        normal.add_token_filter(Rc::new(RefCell::new(AppearanceTokenFilter::new(&content))))?;
+        pdf.mark_object_handle_dirty(
+            &normal
+                .as_stream_dict()
+                .expect("stream checked immediately above"),
+        )?;
+        return normal
+            .object_ref()
+            .ok_or_else(|| {
+                Error::Unsupported("normal appearance stream is not indirect".to_string())
+            })
+            .map(Some);
     }
 
-    let (resource_name, base_name) = font_resource;
-    let font_dict = ObjectHandle::dictionary(vec![
-        (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
-        (b"/Subtype".to_vec(), ObjectHandle::name(b"Type1".to_vec())),
-        (b"/BaseFont".to_vec(), ObjectHandle::name(base_name)),
-        (
-            b"/Encoding".to_vec(),
-            ObjectHandle::name(b"WinAnsiEncoding".to_vec()),
-        ),
-    ]);
-    let font = pdf.make_indirect_object_handle(font_dict)?;
-
+    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
     let stream = pdf.new_stream_with_data(Rc::new(content))?;
     let stream_dict = stream
         .as_stream_dict()
         .ok_or_else(|| Error::Unsupported("new appearance stream has no dictionary".to_string()))?;
     stream_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
     stream_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
-    stream_dict.replace_key(b"/FormType", ObjectHandle::integer(1))?;
     let bbox = ObjectHandle::array(vec![
         ObjectHandle::real(0.0),
         ObjectHandle::real(0.0),
@@ -364,18 +450,20 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     ]);
     stream_dict.replace_key(b"/BBox", bbox)?;
 
-    let mut resources = vec![(
+    let resources = ObjectHandle::dictionary(vec![(
         b"/ProcSet".to_vec(),
         ObjectHandle::array(vec![
             ObjectHandle::name(b"PDF".to_vec()),
             ObjectHandle::name(b"Text".to_vec()),
         ]),
-    )];
-    resources.push((
-        b"/Font".to_vec(),
-        ObjectHandle::dictionary(vec![(resource_name, font)]),
-    ));
-    stream_dict.replace_key(b"/Resources", ObjectHandle::dictionary(resources))?;
+    )]);
+    if let Some(font) = font_resource {
+        resources.replace_key(
+            b"/Font",
+            ObjectHandle::dictionary(vec![(resource_key(&font.resource_name), font.font)]),
+        )?;
+    }
+    stream_dict.replace_key(b"/Resources", resources)?;
     pdf.mark_object_handle_dirty(&stream_dict)?;
 
     let ap = if ap.is_null() {
@@ -387,11 +475,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
         ap
     };
 
-    // qpdf's replaceKey is a no-op for a non-dictionary /AP value. Mirror
-    // that no-op exactly -- do not force the malformed container into a
-    // dictionary -- but report the true outcome to the caller: `None` when
-    // the AP container did not accept the mutation, so the newly allocated
-    // stream is not mistaken for an installed appearance.
+    // qpdf's replaceKey is a no-op for a non-dictionary /AP value.
     if ap.as_dictionary().is_some() {
         ap.replace_key(b"/N", stream.clone())?;
         pdf.mark_object_handle_dirty(&ap)?;
@@ -451,33 +535,30 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     let da = parse_default_appearance(default_appearance.as_bytes());
     drop(helper);
 
-    let font_name = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
-    let standard_font = if let Some(font) = StandardFont::from_base_name(&font_name) {
-        font
-    } else {
-        lookup_dr_basefont_canonical_handles(pdf, field.clone(), &font_name)?
-            .unwrap_or(StandardFont::Helvetica)
-    };
+    let normal_appearance = resolve_normal_appearance_canonical(pdf, &widget)?;
+    let font = lookup_appearance_font(
+        pdf,
+        field.clone(),
+        &normal_appearance,
+        da.font_name.as_deref(),
+    )?;
+    let encoding = font
+        .as_ref()
+        .map(|font| font.encoding)
+        .unwrap_or(AppearanceEncoding::Ascii);
     // qpdf's ValueSetter ignores quadding and uses 11pt when the /DA Tf
     // operand is absent or auto-sized (`QPDFFormFieldObjectHelper.cc:797-860`).
     let font_size = if da.auto_size { 11.0 } else { da.font_size };
     let content = build_qpdf_choice_appearance_content(
         default_appearance.as_bytes(),
-        &to_winansi_bytes(&value),
+        &encode_appearance_text(&value, encoding),
         &[],
         bbox_w,
         bbox_h,
         font_size,
         true,
     );
-    install_normal_appearance_canonical_handles(
-        pdf,
-        widget,
-        content,
-        bbox_w,
-        bbox_h,
-        (font_name, official_base_name(standard_font).to_vec()),
-    )
+    install_normal_appearance_canonical_handles(pdf, widget, content, bbox_w, bbox_h, font)
 }
 
 /// Canonical Ch appearance generation. Choice values and option entries are
@@ -543,37 +624,34 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
     let options = helper.choices()?;
     drop(helper);
 
-    let font_name = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
-    let standard_font = if let Some(font) = StandardFont::from_base_name(&font_name) {
-        font
-    } else {
-        lookup_dr_basefont_canonical_handles(pdf, field.clone(), &font_name)?
-            .unwrap_or(StandardFont::Helvetica)
-    };
+    let normal_appearance = resolve_normal_appearance_canonical(pdf, &widget)?;
+    let font = lookup_appearance_font(
+        pdf,
+        field.clone(),
+        &normal_appearance,
+        da.font_name.as_deref(),
+    )?;
+    let encoding = font
+        .as_ref()
+        .map(|font| font.encoding)
+        .unwrap_or(AppearanceEncoding::Ascii);
     // qpdf's ValueSetter starts from the Tf operand in /DA. A missing or
     // auto-sized Tf uses its source default of 11pt; it does not invent a
     // field-height-dependent size here.
     let font_size = if da.auto_size { 11.0 } else { da.font_size };
     let content = build_qpdf_choice_appearance_content(
         default_appearance.as_bytes(),
-        &to_winansi_bytes(&value),
+        &encode_appearance_text(&value, encoding),
         &options
             .iter()
-            .map(|option| to_winansi_bytes(option))
+            .map(|option| encode_appearance_text(option, encoding))
             .collect::<Vec<_>>(),
         bbox_w,
         bbox_h,
         font_size,
         flags & 0x20000 != 0,
     );
-    install_normal_appearance_canonical_handles(
-        pdf,
-        widget,
-        content,
-        bbox_w,
-        bbox_h,
-        (font_name, official_base_name(standard_font).to_vec()),
-    )
+    install_normal_appearance_canonical_handles(pdf, widget, content, bbox_w, bbox_h, font)
 }
 
 /// Substitute `/DA`'s `Tf` size operand with `resolved_font_size` when it
@@ -1459,6 +1537,7 @@ fn install_state_appearances<R: Read + Seek>(
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 /// Return the official PDF BaseFont name for a [`StandardFont`].
+#[cfg(test)]
 fn official_base_name(font: StandardFont) -> &'static [u8] {
     match font {
         StandardFont::Helvetica => b"Helvetica",
@@ -1502,6 +1581,7 @@ fn fmt_f64(v: f64) -> String {
 /// equals the code point value).  Characters U+0080–U+009F are replaced with
 /// `b'?'` (known limitation documented in the module doc).  Characters outside
 /// U+00FF are replaced with `b'?'`.
+#[cfg(test)]
 fn to_winansi_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     for ch in s.chars() {
@@ -3094,6 +3174,86 @@ mod tests {
     }
 
     #[test]
+    fn canonical_tx_does_not_synthesize_a_font_without_a_qpdf_resource() {
+        let mut pdf = Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve appearance") else {
+            panic!("appearance must be a stream");
+        };
+        let Object::Dictionary(resources) = stream.dict.get("Resources").expect("resources") else {
+            panic!("resources must be a dictionary");
+        };
+        assert!(
+            resources.get("Font").is_none(),
+            "qpdf does not synthesize /Resources/Font when /DR has no matching font"
+        );
+        assert!(
+            stream.dict.get("FormType").is_none(),
+            "qpdf's newly-created appearance stream does not add /FormType"
+        );
+    }
+
+    #[test]
+    fn canonical_tx_reuses_the_actual_document_resource_font() {
+        let mut pdf = Pdf::open(Cursor::new(build_dr_font_tx_pdf())).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve appearance") else {
+            panic!("appearance must be a stream");
+        };
+        let Object::Dictionary(resources) = stream.dict.get("Resources").expect("resources") else {
+            panic!("resources must be a dictionary");
+        };
+        let Object::Dictionary(fonts) = resources.get("Font").expect("font resources") else {
+            panic!("font resources must be a dictionary");
+        };
+        assert_eq!(
+            fonts.get("F1"),
+            Some(&Object::Reference(ObjectRef::new(5, 0))),
+            "qpdf reuses the /DR font object instead of synthesizing a duplicate"
+        );
+    }
+
+    fn replace_bytes_once(input: &mut Vec<u8>, from: &[u8], to: &[u8]) {
+        let start = input
+            .windows(from.len())
+            .position(|window| window == from)
+            .expect("fixture replacement must be present");
+        input.splice(start..start + from.len(), to.iter().copied());
+    }
+
+    #[test]
+    fn canonical_tx_uses_the_dr_font_encoding_for_value_bytes() {
+        let mut raw = build_dr_font_tx_pdf();
+        replace_bytes_once(&mut raw, b"/V (Hi)", b"/V <e9>");
+        replace_bytes_once(
+            &mut raw,
+            b"/BaseFont /Times-Roman",
+            b"/BaseFont /Times-Roman /Encoding /MacRomanEncoding",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse MacRoman fixture");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let appearance = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&appearance)
+            .expect("resolve appearance");
+        let content = appearance.as_stream_data().expect("appearance content");
+        assert!(
+            content
+                .windows(b"\\216".len())
+                .any(|window| window == b"\\216"),
+            "MacRoman U+00e9 must be emitted as 0x8e, not WinAnsi 0xe9: {content:?}"
+        );
+    }
+
+    #[test]
     fn canonical_tx_reuses_an_existing_normal_appearance_stream() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf_with_existing_ap())).expect("parse");
         let existing = pdf.get_object_handle(ObjectRef::new(5, 0));
@@ -3149,6 +3309,64 @@ mod tests {
             decoded.windows(b"(text)".len()).any(|w| w == b"(text)"),
             "decoded appearance is missing the field value: {decoded:?}"
         );
+    }
+
+    #[test]
+    fn canonical_tx_reuses_the_selected_state_stream_from_ap_dictionary() {
+        let mut pdf =
+            Pdf::open(Cursor::new(build_pdf_with_state_appearance())).expect("parse state AP");
+        let result =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            result,
+            ObjectRef::new(5, 0),
+            "qpdf updates the stream selected by /AS instead of replacing /N"
+        );
+    }
+
+    fn build_pdf_with_state_appearance() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (text) /Rect [10 10 200 30] /AP <</N <</On 5 0 R>>>> /AS /On>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+              /BBox [0 0 190 20] /Length 4>>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
     }
 
     #[test]
@@ -3745,22 +3963,9 @@ mod tests {
         let resources = stream_dict.get_key(b"/Resources");
         pdf.resolve_object_handle(&resources)
             .expect("resolve resources");
-        let font_dict = resources.get_key(b"/Font");
-        pdf.resolve_object_handle(&font_dict)
-            .expect("resolve font dict");
-        let fonts = font_dict.as_dictionary().expect("font dict is a map");
-        assert_eq!(fonts.len(), 1, "exactly one synthesized font entry");
-        let (_, font) = fonts.into_iter().next().expect("one font entry");
-        pdf.resolve_object_handle(&font).expect("resolve font");
-        let base_font = font.get_key(b"/BaseFont");
-        pdf.resolve_object_handle(&base_font)
-            .expect("resolve BaseFont");
-        assert_eq!(
-            base_font.as_name(),
-            Some(b"Helvetica".to_vec()),
-            "the /DR font (Times-Roman) must NOT be matched -- the \
-             corrupted name misses it just like qpdf, so flpdf falls back \
-             to its Helvetica default"
+        assert!(
+            resources.get_key(b"/Font").is_null(),
+            "the corrupted resource name must not synthesize a font entry"
         );
     }
 
@@ -4202,17 +4407,24 @@ mod tests {
     #[test]
     fn canonical_dr_lookup_uses_live_resources_and_qpdf_null_fallback() {
         let mut with_dr = Pdf::open(Cursor::new(build_dr_font_tx_pdf())).expect("parse /DR");
-        assert_eq!(
-            lookup_dr_basefont_canonical(&mut with_dr, ObjectRef::new(4, 0), b"F1")
-                .expect("lookup /DR font"),
-            Some(StandardFont::TimesRoman)
-        );
+        let field = with_dr.get_object_handle(ObjectRef::new(4, 0));
+        let widget = with_dr.get_object_handle(ObjectRef::new(4, 0));
+        let normal = resolve_normal_appearance_canonical(&mut with_dr, &widget)
+            .expect("lookup existing normal appearance");
+        let font = lookup_appearance_font(&mut with_dr, field, &normal, Some(b"F1"))
+            .expect("lookup /DR font")
+            .expect("/DR font must be found");
+        assert_eq!(font.font.object_ref(), Some(ObjectRef::new(5, 0)));
 
         let mut without_dr = Pdf::open(Cursor::new(build_tx_no_value_pdf())).expect("parse no /DR");
-        assert_eq!(
-            lookup_dr_basefont_canonical(&mut without_dr, ObjectRef::new(4, 0), b"F1")
-                .expect("missing /DR font"),
-            None
+        let field = without_dr.get_object_handle(ObjectRef::new(4, 0));
+        let widget = without_dr.get_object_handle(ObjectRef::new(4, 0));
+        let normal = resolve_normal_appearance_canonical(&mut without_dr, &widget)
+            .expect("lookup missing normal appearance");
+        assert!(
+            lookup_appearance_font(&mut without_dr, field, &normal, Some(b"F1"))
+                .expect("missing /DR font")
+                .is_none()
         );
 
         let raw = String::from_utf8(build_dr_font_tx_pdf())
