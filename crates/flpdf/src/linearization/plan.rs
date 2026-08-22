@@ -440,21 +440,6 @@ fn handle_has_dropped_parameter_ref(
     Ok(false) // cov:ignore: the production stream walk filters these keys before this defensive probe can observe a non-matching edge
 }
 
-/// Collect the references contained by an already-selected indirect object.
-/// Unlike [`collect_direct_handle_refs_with_context`], this deliberately
-/// expands the handle's own value instead of recording the handle's identity
-/// as a new edge in the graph.
-#[allow(dead_code)] // compatibility wrapper retained for existing closure tests
-fn collect_handle_children_with_context(
-    handle: &ObjectHandle,
-    depth: usize,
-    out: &mut Vec<(ObjectRef, bool)>,
-) -> Result<()> {
-    collect_direct_handle_children(handle, depth, false, &mut |child, child_depth, in_array| {
-        collect_direct_handle_refs_with_context(child, child_depth, in_array, out)
-    })
-}
-
 fn collect_handle_children_with_stream_parameters(
     handle: &ObjectHandle,
     depth: usize,
