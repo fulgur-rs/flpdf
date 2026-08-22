@@ -300,6 +300,12 @@ struct Cli {
     password: PasswordArgs,
     #[arg(long)]
     show_object: Option<String>,
+    /// Emit stored stream bytes for `--show-object` (qpdf --raw-stream-data).
+    #[arg(long = "raw-stream-data", requires = "show_object")]
+    raw_stream_data: bool,
+    /// Emit decoded stream bytes for `--show-object` (qpdf --filtered-stream-data).
+    #[arg(long = "filtered-stream-data", requires = "show_object")]
+    filtered_stream_data: bool,
     #[arg(long)]
     show_npages: bool,
     #[arg(long)]
@@ -1732,7 +1738,14 @@ fn main() {
     } else if let Some(command) = args.command {
         run_command(command, &overlay_specs)
     } else if let Some(object_ref) = args.show_object.as_deref() {
-        run_dump_object(args.input, args.repair, &args.password, object_ref)
+        run_show_object(
+            args.input,
+            args.repair,
+            &args.password,
+            object_ref,
+            args.raw_stream_data,
+            args.filtered_stream_data,
+        )
     } else if args.show_npages {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
@@ -5374,6 +5387,143 @@ fn run_dump_object(
     finish_operation_warnings(&pdf, false)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ShowObjectSelector {
+    Trailer,
+    Object(ObjectRef),
+    Null,
+    NoObject,
+}
+
+/// Parse qpdf's `--show-object` selector without changing the shared
+/// `ObjectRef::parse` syntax used by the legacy `dump-object` command.
+fn parse_show_object_selector(value: &str) -> CliResult<ShowObjectSelector> {
+    if value == "trailer" {
+        return Ok(ShowObjectSelector::Trailer);
+    }
+
+    let (number, generation) = value.split_once(',').unwrap_or((value, "0"));
+    let number = qpdf_selector_integer(number)?;
+    let generation = if generation.is_empty() {
+        0
+    } else {
+        qpdf_selector_integer(generation)?
+    };
+    if number <= 0 {
+        return Ok(ShowObjectSelector::NoObject);
+    }
+    if !(0..=i32::from(u16::MAX)).contains(&generation) {
+        return Ok(ShowObjectSelector::Null);
+    }
+    Ok(ShowObjectSelector::Object(ObjectRef::new(
+        u32::try_from(number).expect("positive i32 fits u32"),
+        u16::try_from(generation).expect("validated u16 generation"),
+    )))
+}
+
+/// qpdf's `QUtil::string_to_int` uses `strtoll`: it accepts a signed decimal
+/// prefix and returns zero when no digits are present. `--show-object` treats
+/// object number zero as a no-output selector, so retain that observable
+/// leniency instead of routing this option through the stricter shared parser.
+fn qpdf_selector_integer(value: &str) -> CliResult<i32> {
+    let original = value;
+    let value = value.trim_start_matches(|character| {
+        matches!(
+            character,
+            ' ' | '\n' | '\r' | '\t' | '\u{000c}' | '\u{000b}'
+        )
+    });
+    let digits_start = usize::from(matches!(value.as_bytes().first(), Some(b'+') | Some(b'-')));
+    let digits_end = digits_start
+        + value[digits_start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+    if digits_end == digits_start {
+        return Ok(0);
+    }
+    let prefix = &value[..digits_end];
+    let parsed = prefix.parse::<i128>().map_err(|_| {
+        UsageError::new(format!(
+            "overflow/underflow converting {original} to 64-bit integer"
+        ))
+    })?;
+    if !(i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&parsed) {
+        return Err(UsageError::new(format!(
+            "overflow/underflow converting {original} to 64-bit integer"
+        ))
+        .into());
+    }
+    let parsed = parsed as i64;
+    Ok(i32::try_from(parsed).map_err(|_| {
+        UsageError::new(format!(
+            "integer out of range converting {parsed} from a 8-byte signed type to a 4-byte signed type"
+        ))
+    })?)
+}
+
+/// Show one object through qpdf's canonical object/stream inspection split.
+fn run_show_object(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    selector: &str,
+    raw_stream_data: bool,
+    filtered_stream_data: bool,
+) -> CliResult<()> {
+    // qpdf's Config::showObject callback parses the selector during argv
+    // parsing, before QPDFJob::run() ever opens the input file, so a usage
+    // error in the selector must surface even when no input file is given.
+    let selector = parse_show_object_selector(selector)?;
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    let object = match selector {
+        ShowObjectSelector::Trailer => pdf.trailer_handle(),
+        ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
+        ShowObjectSelector::NoObject => return finish_operation_warnings(&pdf, false),
+        ShowObjectSelector::Null => {
+            logger_info(b"null\n")?;
+            return finish_operation_warnings(&pdf, false);
+        }
+    };
+
+    // qpdf's doShowObj starts with isStream(), which dereferences the selected
+    // handle. The canonical type query has the same ownership boundary.
+    let _ = object.type_code()?;
+    if object.as_stream_dict().is_some() {
+        if raw_stream_data || filtered_stream_data {
+            let warning_count = pdf.repair_diagnostics().entries().len();
+            let data = if filtered_stream_data {
+                object.get_stream_data(StreamDecodeLevel::All)
+            } else {
+                object.get_raw_stream_data()
+            };
+            let data = match data {
+                Ok(data) => data,
+                Err(_error) if pdf.repair_diagnostics().entries().len() > warning_count => {
+                    return finish_operation_warnings(&pdf, false);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            standard_save_writer()?.write_all(&data)?;
+        } else {
+            let dictionary = object
+                .as_stream_dict()
+                .expect("stream type code guarantees a stream dictionary");
+            let mut output = b"Object is stream.  Dictionary:\n".to_vec();
+            output.extend_from_slice(&dictionary.unparse_resolved());
+            output.push(b'\n');
+            logger_info(output)?;
+        }
+    } else {
+        let mut output = object.unparse_resolved();
+        output.push(b'\n');
+        logger_info(output)?;
+    }
+
+    finish_operation_warnings(&pdf, false)
+}
+
 fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     let object_ref = ObjectRef::parse(&cmd.object_ref)?;
     let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
@@ -7968,5 +8118,76 @@ mod tests {
         let built = build_overlay_specs(&cli_specs, false).unwrap();
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
+    }
+
+    #[test]
+    fn show_object_selector_defaults_generation_like_qpdf() {
+        assert!(matches!(
+            parse_show_object_selector("1"),
+            Ok(ShowObjectSelector::Object(ObjectRef {
+                number: 1,
+                generation: 0,
+            }))
+        ));
+        assert!(matches!(
+            parse_show_object_selector("1,"),
+            Ok(ShowObjectSelector::Object(ObjectRef {
+                number: 1,
+                generation: 0,
+            }))
+        ));
+    }
+
+    #[test]
+    fn show_object_selector_integer_errors_match_qpdf() {
+        let overflow = qpdf_selector_integer("9223372036854775808").expect_err("i64 overflow");
+        assert_eq!(
+            overflow.to_string(),
+            "overflow/underflow converting 9223372036854775808 to 64-bit integer"
+        );
+        assert!(
+            overflow.downcast_ref::<UsageError>().is_some(),
+            "qpdf reports this as a QPDFUsage-class error (thrown from argv parsing, \
+             before the input file is opened), so it must route through \
+             flpdf-cli's usage_exit path rather than the generic error path"
+        );
+
+        // A digit run too long to even fit in the i128 staging type used to
+        // detect i64 overflow (rather than merely exceeding i64's range).
+        let huge = qpdf_selector_integer("99999999999999999999999999999999999999999999999999")
+            .expect_err("digit run exceeding i128");
+        assert_eq!(
+            huge.to_string(),
+            "overflow/underflow converting 99999999999999999999999999999999999999999999999999 to 64-bit integer"
+        );
+        assert!(huge.downcast_ref::<UsageError>().is_some());
+
+        let narrowing = qpdf_selector_integer("2147483648").expect_err("i32 narrowing overflow");
+        assert_eq!(
+            narrowing.to_string(),
+            "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        );
+        assert!(narrowing.downcast_ref::<UsageError>().is_some());
+    }
+
+    #[test]
+    fn show_object_selector_parses_before_checking_for_an_input_file() {
+        // qpdf's Config::showObject parses the selector during argv parsing,
+        // before QPDFJob::run() ever opens an input file, so a usage error in
+        // the selector must surface even when no input file was given.
+        let error = run_show_object(
+            None,
+            false,
+            &PasswordArgs::default(),
+            "2147483648",
+            false,
+            false,
+        )
+        .expect_err("overflow selector with no input file");
+        assert!(
+            error.downcast_ref::<UsageError>().is_some(),
+            "got {error} instead of a UsageError -- the missing-input-file check must not \
+             run before selector parsing"
+        );
     }
 }

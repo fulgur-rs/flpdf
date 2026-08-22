@@ -1463,11 +1463,13 @@ fn dump_object_accepts_ref_with_r_suffix() {
 }
 
 #[test]
-fn dump_object_rejects_invalid_ref() {
+fn show_object_invalid_selector_matches_qpdf_no_output() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--show-object", "bad", "../../tests/fixtures/minimal.pdf"])
         .assert()
-        .failure();
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
