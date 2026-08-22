@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 /// Wrapper for a `/EmbeddedFile` stream (ISO 32000-1 §7.11.4).
 ///
-/// Construct via [`FileSpec::embedded_file`] rather than directly.
+/// Construct via [`crate::FileSpec::embedded_file`] rather than directly.
 ///
 /// All accessors are cheap: only [`payload`](EmbeddedFileStream::payload)
 /// performs I/O (decoding the filter chain).

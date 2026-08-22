@@ -9,8 +9,8 @@
 //! metadata (MIME type, dates, checksum, size).
 //!
 //! [`FileSpecBuilder`] constructs a `/Filespec` dictionary and its associated
-//! `/EmbeddedFile` stream in-memory and registers them in a [`Pdf`] document via
-//! qpdf's indirect-handle factory.  The returned [`ObjectRef`] can then be inserted into
+//! `/EmbeddedFile` stream in-memory and registers them in a [`crate::Pdf`] document via
+//! qpdf's indirect-handle factory.  The returned [`crate::ObjectRef`] can then be inserted into
 //! the `/Names /EmbeddedFiles` name tree using
 //! [`crate::embedded_files::insert_embedded_file`].
 //!
