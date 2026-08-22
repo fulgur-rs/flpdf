@@ -1766,6 +1766,7 @@ fn main() {
             &args.password,
             &key,
             args.deterministic_id,
+            args.static_id,
             args.preserve_unreferenced,
         )
     } else if !args.add_attachment.is_empty() {
@@ -1776,6 +1777,7 @@ fn main() {
             &args.password,
             attachment_segments,
             args.deterministic_id,
+            args.static_id,
             args.preserve_unreferenced,
             args.verbose,
         )
@@ -1787,6 +1789,7 @@ fn main() {
             &args.password,
             args.copy_attachments_from,
             args.deterministic_id,
+            args.static_id,
             args.preserve_unreferenced,
             args.verbose,
         )
@@ -6596,6 +6599,7 @@ fn run_add_attachment(
     password: &PasswordArgs,
     segments: Vec<Vec<String>>,
     deterministic_id: bool,
+    static_id: bool,
     preserve_unreferenced: bool,
     verbose: bool,
 ) -> CliResult<()> {
@@ -6644,6 +6648,7 @@ fn run_add_attachment(
 
     let options = WriterOptions {
         deterministic_id,
+        static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
@@ -6664,6 +6669,7 @@ fn run_add_attachment(
 }
 
 /// `--remove-attachment KEY [input] [output]`
+#[allow(clippy::too_many_arguments)]
 fn run_remove_attachment(
     input: Option<PathBuf>,
     output: Option<PathBuf>,
@@ -6671,6 +6677,7 @@ fn run_remove_attachment(
     password: &PasswordArgs,
     key: &str,
     deterministic_id: bool,
+    static_id: bool,
     preserve_unreferenced: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
@@ -6685,6 +6692,7 @@ fn run_remove_attachment(
 
     let options = WriterOptions {
         deterministic_id,
+        static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
@@ -6750,6 +6758,7 @@ fn run_copy_attachments_from(
     password: &PasswordArgs,
     tokens: Vec<String>,
     deterministic_id: bool,
+    static_id: bool,
     preserve_unreferenced: bool,
     verbose: bool,
 ) -> CliResult<()> {
@@ -6804,6 +6813,7 @@ fn run_copy_attachments_from(
 
     let writer_options = WriterOptions {
         deterministic_id,
+        static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
