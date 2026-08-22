@@ -1520,10 +1520,9 @@ struct PasswordArgs {
     /// File containing password bytes. One trailing LF or CRLF is stripped.
     #[arg(long = "password-file", value_name = "PATH")]
     password_file: Option<PathBuf>,
-    /// How to interpret --password bytes before key derivation. Defaults to
-    /// `auto` which picks `bytes` for V<5 documents and `unicode` (UTF-8
-    /// validation without normalization) for V=5 R=5/R=6. Mirrors qpdf's
-    /// --password-mode flag.
+    /// How qpdf-style password modes interpret --password bytes. On read
+    /// paths, only `hex-bytes` transforms the bytes; `auto`, `bytes`, and
+    /// `unicode` pass them through unchanged. Mirrors qpdf's flag.
     #[arg(long = "password-mode", value_enum, default_value_t = CliPasswordMode::Auto)]
     password_mode: CliPasswordMode,
     /// Permit deprecated RC4-backed handlers and revision 5 encryption.

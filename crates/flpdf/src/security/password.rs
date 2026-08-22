@@ -2,12 +2,10 @@
 //! Password input mode handling and normalization for Standard security handler.
 //!
 //! qpdf exposes `--password-mode={auto,bytes,hex-bytes,unicode}` to control how
-//! a CLI-supplied password is interpreted before it is fed to key derivation.
-//! qpdf 11.9.0 validates Unicode-mode input as UTF-8 and passes those bytes
-//! directly to its V=5 authentication code. Although the PDF specification
-//! describes SASLprep, qpdf's reader does not apply it.
-//! This module centralises that preprocessing so the security handler can stay
-//! ignorant of input encoding concerns.
+//! a CLI-supplied password is interpreted when writing an encrypted file.
+//! qpdf's read-side `QPDFJob::doProcess` has one exception: `hex-bytes` decodes
+//! the input password, while every other mode passes the supplied bytes to the
+//! Standard security handler unchanged (`QPDFJob.cc:1734-1742`).
 
 use crate::error::EncryptedError;
 use crate::Result;
@@ -15,50 +13,32 @@ use crate::Result;
 /// How a raw `--password` byte string should be interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PasswordMode {
-    /// Pick the mode based on the document's encryption revision:
-    /// R<5 → `Bytes`, R>=5 → `Unicode`. Matches qpdf default behaviour.
+    /// Pick the write-side mode based on the document's encryption revision:
+    /// R<5 → `Bytes`, R>=5 → `Unicode`. On read, this passes bytes unchanged.
     #[default]
     Auto,
     /// Treat the supplied bytes as the password verbatim.
     Bytes,
     /// Decode the supplied bytes as a hex string before use.
-    /// Useful for round-tripping non-printable passwords through shells.
+    /// This is the only mode that transforms a read-side password.
     HexBytes,
-    /// Interpret the supplied bytes as UTF-8. For V<5 this mode is currently
-    /// unsupported and surfaces an error. For V>=5 the validated bytes are
-    /// passed through unchanged, matching qpdf 11.9.0.
+    /// Interpret the supplied bytes as UTF-8 when writing. On read, qpdf does
+    /// not validate the bytes, so this passes them through unchanged.
     Unicode,
 }
 
-/// Normalize a CLI-supplied password byte string for a Standard handler of the
-/// given encryption revision.
+/// Prepare a CLI-supplied password for qpdf's read-side Standard handler.
 ///
-/// For V=5 R=5/R=6 the bytes are validated as UTF-8 and passed through
-/// unchanged, matching qpdf 11.9.0's reader-side behavior. The Standard
-/// security handler applies qpdf's 127-byte V=5 truncation at its reader-side
-/// authentication boundary; this normalization helper does not apply that
-/// encryption-specific rule. Hex-bytes mode decodes the input first; bytes
-/// mode passes the input through unchanged.
-pub(crate) fn normalize_password(raw: &[u8], mode: PasswordMode, revision: i64) -> Result<Vec<u8>> {
-    let resolved = match mode {
-        PasswordMode::Auto => {
-            if revision >= 5 {
-                PasswordMode::Unicode
-            } else {
-                PasswordMode::Bytes
-            }
-        }
-        other => other,
-    };
-
-    let bytes = match resolved {
-        PasswordMode::Bytes => raw.to_vec(),
-        PasswordMode::HexBytes => decode_hex(raw)?,
-        PasswordMode::Unicode => unicode_password(raw, revision)?,
-        PasswordMode::Auto => unreachable!("Auto resolved above"),
-    };
-
-    Ok(bytes)
+/// This mirrors qpdf's `QPDFJob::doProcess`: `hex-bytes` is decoded for input,
+/// while `auto`, `bytes`, and `unicode` do not inspect or rewrite the bytes.
+/// Revision-specific truncation remains the responsibility of the Standard
+/// security handler, just as it is in qpdf's authentication functions.
+pub(crate) fn password_bytes_for_read(raw: &[u8], mode: PasswordMode) -> Result<Vec<u8>> {
+    if mode == PasswordMode::HexBytes {
+        decode_hex(raw)
+    } else {
+        Ok(raw.to_vec())
+    }
 }
 
 fn decode_hex(raw: &[u8]) -> Result<Vec<u8>> {
@@ -75,100 +55,43 @@ fn decode_hex(raw: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
-fn unicode_password(raw: &[u8], revision: i64) -> Result<Vec<u8>> {
-    if revision < 5 {
-        return Err(EncryptedError::Malformed {
-            reason: "--password-mode=unicode is only supported for V=5 (R=5/R=6) documents; \
-                 use --password-mode=bytes or --password-mode=auto for legacy handlers"
-                .into(),
-        }
-        .into());
-    }
-    std::str::from_utf8(raw).map_err(|_| EncryptedError::Malformed {
-        reason: "--password-mode=unicode: password is not valid UTF-8".into(),
-    })?;
-    Ok(raw.to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn auto_for_legacy_revisions_is_bytes() {
-        let out = normalize_password(b"abc\xff", PasswordMode::Auto, 4).unwrap();
+    fn read_auto_preserves_raw_password_bytes() {
+        let out = password_bytes_for_read(b"abc\xff", PasswordMode::Auto).unwrap();
         assert_eq!(out, b"abc\xff");
     }
 
     #[test]
-    fn auto_for_r5_preserves_ascii_utf8_bytes() {
-        let out = normalize_password(b"hello", PasswordMode::Auto, 6).unwrap();
-        assert_eq!(out, b"hello");
+    fn read_unicode_preserves_invalid_utf8_bytes() {
+        let out = password_bytes_for_read(b"\xff\xfe", PasswordMode::Unicode).unwrap();
+        assert_eq!(out, b"\xff\xfe");
     }
 
     #[test]
-    fn auto_for_r5_preserves_qpdf_password_bytes_without_saslprep() {
-        // qpdf 11.9.0's reader-side QPDF_encryption.cc:671-676 documents
-        // SASLprep as a specification requirement but passes the supplied
-        // UTF-8 bytes directly to truncate_password_V5. A no-break space is
-        // mapped to an ordinary space by SASLprep, so this distinguishes the
-        // qpdf path from the current flpdf normalization.
-        let raw = "a\u{00a0}b".as_bytes();
-
-        let out = normalize_password(raw, PasswordMode::Auto, 6).unwrap();
-
-        assert_eq!(out, raw);
-    }
-
-    #[test]
-    fn auto_for_r5_preserves_utf8_bytes() {
-        // "café" — NFC, non-ASCII but no prohibited characters.
-        let out = normalize_password("café".as_bytes(), PasswordMode::Auto, 6).unwrap();
-        assert_eq!(out, "café".as_bytes());
-    }
-
-    #[test]
-    fn unicode_on_legacy_revision_errors() {
-        let err = normalize_password(b"hi", PasswordMode::Unicode, 4).unwrap_err();
-        assert!(err.to_string().contains("only supported for V=5"));
-    }
-
-    #[test]
-    fn unicode_rejects_invalid_utf8() {
-        let err = normalize_password(b"\xff\xfe", PasswordMode::Unicode, 6).unwrap_err();
-        assert!(err.to_string().contains("not valid UTF-8"));
+    fn read_unicode_preserves_legacy_password_bytes() {
+        let out = password_bytes_for_read(b"legacy", PasswordMode::Unicode).unwrap();
+        assert_eq!(out, b"legacy");
     }
 
     #[test]
     fn hex_bytes_decodes() {
-        let out = normalize_password(b"68656c6c6f", PasswordMode::HexBytes, 4).unwrap();
+        let out = password_bytes_for_read(b"68656c6c6f", PasswordMode::HexBytes).unwrap();
         assert_eq!(out, b"hello");
     }
 
     #[test]
     fn hex_bytes_tolerates_whitespace() {
-        let out = normalize_password(b"68 65 6c 6c 6f", PasswordMode::HexBytes, 4).unwrap();
+        let out = password_bytes_for_read(b"68 65 6c 6c 6f", PasswordMode::HexBytes).unwrap();
         assert_eq!(out, b"hello");
     }
 
     #[test]
     fn hex_bytes_rejects_invalid_hex() {
-        let err = normalize_password(b"zz", PasswordMode::HexBytes, 4).unwrap_err();
+        let err = password_bytes_for_read(b"zz", PasswordMode::HexBytes).unwrap_err();
         assert!(err.to_string().contains("invalid hex input"));
-    }
-
-    #[test]
-    fn r5_preserves_password_bytes() {
-        let raw = vec![b'a'; 200];
-        let out = normalize_password(&raw, PasswordMode::Bytes, 6).unwrap();
-        assert_eq!(out.len(), 200);
-        assert!(out.iter().all(|&b| b == b'a'));
-    }
-
-    #[test]
-    fn legacy_revision_does_not_truncate() {
-        let raw = vec![b'a'; 200];
-        let out = normalize_password(&raw, PasswordMode::Bytes, 2).unwrap();
-        assert_eq!(out.len(), 200);
     }
 }

@@ -1,4 +1,7 @@
 use assert_cmd::Command;
+use flpdf::{EncryptParams, Pdf, PdfWriter};
+use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> PathBuf {
@@ -17,10 +20,42 @@ fn check_cmd(fixture_name: &str, password: &str, mode: Option<&str>) -> Command 
     cmd
 }
 
+fn encrypted_fixture_with_password(password: &[u8]) -> Vec<u8> {
+    let input_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let input = fs::read(input_path).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(input)).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_encryption_parameters(EncryptParams::v5_r6(password.to_vec(), b"owner".to_vec()));
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    writer.get_buffer().unwrap()
+}
+
 #[test]
 fn auto_mode_authenticates_composed_nfc_password() {
     // The fixture was qpdf-encrypted with user password "café" (NFC composed).
     check_cmd("v5-aes-256-r6-utf8.pdf", "café", None)
+        .assert()
+        .success();
+}
+
+#[test]
+fn unicode_mode_reads_non_utf8_password_file_as_raw_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("encrypted.pdf");
+    let password_file = temp.path().join("password.bin");
+    let password = b"\xff\xfeA";
+    fs::write(&input, encrypted_fixture_with_password(password)).unwrap();
+    fs::write(&password_file, password).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "check",
+            "--password-mode=unicode",
+            &format!("--password-file={}", password_file.display()),
+        ])
+        .arg(&input)
         .assert()
         .success();
 }
@@ -91,16 +126,14 @@ fn unicode_mode_works_for_ascii_password_on_v5() {
 }
 
 #[test]
-fn unicode_mode_rejected_on_legacy_revision() {
+fn unicode_mode_is_raw_on_legacy_revision() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.arg("check")
         .arg(fixture("v2-rc4-128-r3.pdf"))
         .arg("--password=user-v2")
         .arg("--allow-weak-crypto")
         .arg("--password-mode=unicode");
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains("only supported for V=5"));
+    cmd.assert().success();
 }
 
 #[test]

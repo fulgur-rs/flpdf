@@ -4427,17 +4427,16 @@ mod tests {
     /// builder + reader pair as the supplied UTF-8 bytes.
     #[test]
     fn build_v5_r6_encrypt_dict_round_trips_utf8_passwords() {
-        use crate::security::password::{normalize_password, PasswordMode};
         let user_raw = "café".as_bytes();
         let owner_raw = "résumé".as_bytes();
-        let user_pw = normalize_password(user_raw, PasswordMode::Unicode, 6).unwrap();
-        let owner_pw = normalize_password(owner_raw, PasswordMode::Unicode, 6).unwrap();
+        let user_pw = user_raw;
+        let owner_pw = owner_raw;
 
         let s = fixture_v5_secrets();
         let dict = build_v5_r6_encrypt_dict(
             &V5R6EncryptParams {
-                user_password: &user_pw,
-                owner_password: &owner_pw,
+                user_password: user_pw,
+                owner_password: owner_pw,
                 p: -4,
                 encrypt_metadata: true,
             },
@@ -4474,8 +4473,8 @@ mod tests {
             ue: &ue32,
             oe: &oe32,
         };
-        let user_key = check_user_password_r6(&user_pw, &inputs).unwrap();
-        let owner_key = check_owner_password_r6(&owner_pw, &inputs).unwrap();
+        let user_key = check_user_password_r6(user_pw, &inputs).unwrap();
+        let owner_key = check_owner_password_r6(owner_pw, &inputs).unwrap();
         assert_eq!(user_key, s.file_key.to_vec());
         assert_eq!(owner_key, s.file_key.to_vec());
     }
