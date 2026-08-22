@@ -108,7 +108,7 @@ qtest pass 数は各部品の完了時に before/after を**報告する**指標
 本書の各部品に書いた D2 の対象は、**T0-1 を除き暫定**である。PR #550 の Codex
 レビューは 3 巡にわたり、毎回「既存 production 実装とその呼び出し元の見落とし」を
 指摘した（`ResourceFinder` / `Parser` / `normalize_content_stream` / `base64_encode` /
-`overlay.rs` の行列 / `json.rs` の値モデル / `name_number_tree` の builder）。
+`overlay.rs` の行列 / `json.rs` の値モデル / `nntree` の builder）。
 ファイル名からの推測で D2 スコープを書くと必ず漏れる。
 
 各部品の着手時に、次を機械的に出してから実装計画を確定すること。
@@ -327,8 +327,8 @@ D2 を満たさない。
 
 | 既存 API | 位置 | 備考 |
 |---|---|---|
-| `read_name_tree` / `read_number_tree` | `name_number_tree.rs`(38, 76) | 読み取り |
-| `build_name_tree` / `build_number_tree` | `name_number_tree.rs`(125, 201) | `/Kids` リーフへの**分割**を含む |
+| `NameTree::as_map` / `NumberTree::as_map` | `nntree.rs` | canonical name/number-tree 読み取り |
+| `NameTree` / `NumberTree` insertion | `nntree.rs` | `/Kids` リーフへの**分割**を含む |
 | `insert_name_tree_dest` | `name_tree_dests.rs`(116) | 上記 builder 経由の再構築による**挿入** |
 | `delete_name_tree_dest` | `name_tree_dests.rs`(149) | 同じ read/rebuild 経路による**削除**。`lib.rs`(193) から re-export |
 

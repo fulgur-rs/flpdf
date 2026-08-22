@@ -1,6 +1,4 @@
-use flpdf::{
-    read_name_tree, read_number_tree, Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf,
-};
+use flpdf::{Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::process::Command;
@@ -578,7 +576,7 @@ fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
 }
 
 #[test]
-fn compatibility_name_reader_returns_qpdf_normalized_utf8_key() {
+fn canonical_name_reader_returns_qpdf_normalized_utf8_key() {
     let mut pdf = empty_pdf();
     let mut root = Dictionary::new();
     root.insert(
@@ -586,19 +584,14 @@ fn compatibility_name_reader_returns_qpdf_normalized_utf8_key() {
         Object::Array(vec![Object::String(vec![0x80]), Object::Integer(7)]),
     );
 
-    let entries = read_name_tree(
-        &mut pdf,
-        Object::Dictionary(root),
-        |_, value| Ok(Some(value)),
-        100,
-    )
-    .expect("read");
+    let mut tree = NameTree::new(Object::Dictionary(root), false);
+    let entries = tree.as_map(&mut pdf).expect("read");
 
-    assert_eq!(entries, vec![("•".as_bytes().to_vec(), Object::Integer(7))]);
+    assert_eq!(entries.get("•".as_bytes()), Some(&Object::Integer(7)));
 }
 
 #[test]
-fn compatibility_number_reader_accepts_direct_kid() {
+fn canonical_number_reader_accepts_direct_kid() {
     let mut pdf = empty_pdf();
     let mut kid = Dictionary::new();
     kid.insert(
@@ -608,15 +601,10 @@ fn compatibility_number_reader_accepts_direct_kid() {
     let mut root = Dictionary::new();
     root.insert("Kids", Object::Array(vec![Object::Dictionary(kid)]));
 
-    let entries = read_number_tree(
-        &mut pdf,
-        Object::Dictionary(root),
-        |_, value| Ok(Some(value)),
-        100,
-    )
-    .expect("read");
+    let mut tree = NumberTree::new(Object::Dictionary(root), false);
+    let entries = tree.as_map(&mut pdf).expect("read");
 
-    assert_eq!(entries, vec![(4, Object::String(b"four".to_vec()))]);
+    assert_eq!(entries.get(&4), Some(&Object::String(b"four".to_vec())));
 }
 
 #[test]

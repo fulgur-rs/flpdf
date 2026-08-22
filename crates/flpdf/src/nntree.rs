@@ -33,6 +33,12 @@ use std::sync::Arc;
 
 pub(crate) const DEFAULT_SPLIT_THRESHOLD: usize = 32;
 
+/// Default `/Kids` descent depth limit for name and number tree traversal.
+pub const DEFAULT_MAX_TREE_DEPTH: usize = 100;
+
+/// Default qpdf split threshold for name and number tree leaves.
+pub const LEAF_MAX: usize = DEFAULT_SPLIT_THRESHOLD;
+
 pub(crate) trait TreeKey {
     type Key: Clone + Debug + Eq + Ord;
     const ITEMS_KEY: &'static str;
@@ -1192,10 +1198,6 @@ impl NumberTree {
     pub fn set_split_threshold(&mut self, threshold: usize) {
         self.inner.set_split_threshold(threshold);
     }
-
-    pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
-        self.inner.max_depth = Some(max_depth);
-    }
 }
 
 /// Handle-native name-tree facade for qpdf-shaped consumers.
@@ -2302,7 +2304,7 @@ impl<K: TreeKey> NNTree<K> {
             {
                 let max_depth = self.max_depth.expect("checked above");
                 return Err(Error::Unsupported(format!(
-                    "name_number_tree: /Kids depth limit {max_depth} exceeded"
+                    "name/number tree: /Kids depth limit {max_depth} exceeded"
                 )));
             }
             if !seen.insert(node.identity()) {
@@ -2506,7 +2508,7 @@ impl<K: TreeKey> NNTree<K> {
             {
                 let max_depth = self.max_depth.expect("checked above");
                 return Err(Error::Unsupported(format!(
-                    "name_number_tree: /Kids depth limit {max_depth} exceeded"
+                    "name/number tree: /Kids depth limit {max_depth} exceeded"
                 )));
             }
             if !seen.insert(node.identity()) {
@@ -3084,126 +3086,6 @@ fn structural_message(object_ref: Option<ObjectRef>, message: impl AsRef<str>) -
         None => "Name/Number tree node: ".to_string(),
     };
     format!("{prefix}{}", message.as_ref())
-}
-
-pub(crate) fn build_name_tree_compat<A>(
-    entries: &[(Vec<u8>, Object)],
-    mut alloc: A,
-) -> (ObjectRef, Vec<(ObjectRef, Object)>)
-where
-    A: FnMut() -> ObjectRef,
-{
-    debug_assert!(
-        !entries.is_empty(),
-        "build_name_tree requires non-empty entries"
-    );
-    let mut nodes = Vec::new();
-
-    if entries.len() <= DEFAULT_SPLIT_THRESHOLD {
-        let root_ref = alloc();
-        let mut root = Dictionary::new();
-        root.insert("Names", Object::Array(name_pairs(entries)));
-        nodes.push((root_ref, Object::Dictionary(root)));
-        return (root_ref, nodes);
-    }
-
-    let leaf_count = entries.len().div_ceil(DEFAULT_SPLIT_THRESHOLD);
-    let chunk_size = entries.len().div_ceil(leaf_count);
-    let mut kids = Vec::with_capacity(leaf_count);
-    for chunk in entries.chunks(chunk_size) {
-        let leaf_ref = alloc();
-        nodes.push((leaf_ref, Object::Dictionary(build_name_leaf(chunk))));
-        kids.push(Object::Reference(leaf_ref));
-    }
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(kids));
-    let root_ref = alloc();
-    nodes.push((root_ref, Object::Dictionary(root)));
-    (root_ref, nodes)
-}
-
-fn name_pairs(entries: &[(Vec<u8>, Object)]) -> Vec<Object> {
-    let mut pairs = Vec::with_capacity(entries.len() * 2);
-    for (key, value) in entries {
-        pairs.push(Object::String(key.clone()));
-        pairs.push(value.clone());
-    }
-    pairs
-}
-
-fn build_name_leaf(entries: &[(Vec<u8>, Object)]) -> Dictionary {
-    let first = entries
-        .first()
-        .map(|(key, _)| key.clone())
-        .unwrap_or_default();
-    let last = entries
-        .last()
-        .map(|(key, _)| key.clone())
-        .unwrap_or_default();
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![Object::String(first), Object::String(last)]),
-    );
-    leaf.insert("Names", Object::Array(name_pairs(entries)));
-    leaf
-}
-
-pub(crate) fn build_number_tree_compat<A>(
-    entries: &[(i64, Object)],
-    mut alloc: A,
-) -> (ObjectRef, Vec<(ObjectRef, Object)>)
-where
-    A: FnMut() -> ObjectRef,
-{
-    debug_assert!(
-        !entries.is_empty(),
-        "build_number_tree requires non-empty entries"
-    );
-    let mut nodes = Vec::new();
-
-    if entries.len() <= DEFAULT_SPLIT_THRESHOLD {
-        let root_ref = alloc();
-        let mut root = Dictionary::new();
-        root.insert("Nums", Object::Array(number_pairs(entries)));
-        nodes.push((root_ref, Object::Dictionary(root)));
-        return (root_ref, nodes);
-    }
-
-    let leaf_count = entries.len().div_ceil(DEFAULT_SPLIT_THRESHOLD);
-    let chunk_size = entries.len().div_ceil(leaf_count);
-    let mut kids = Vec::with_capacity(leaf_count);
-    for chunk in entries.chunks(chunk_size) {
-        let leaf_ref = alloc();
-        nodes.push((leaf_ref, Object::Dictionary(build_number_leaf(chunk))));
-        kids.push(Object::Reference(leaf_ref));
-    }
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(kids));
-    let root_ref = alloc();
-    nodes.push((root_ref, Object::Dictionary(root)));
-    (root_ref, nodes)
-}
-
-fn number_pairs(entries: &[(i64, Object)]) -> Vec<Object> {
-    let mut pairs = Vec::with_capacity(entries.len() * 2);
-    for (key, value) in entries {
-        pairs.push(Object::Integer(*key));
-        pairs.push(value.clone());
-    }
-    pairs
-}
-
-fn build_number_leaf(entries: &[(i64, Object)]) -> Dictionary {
-    let first = entries.first().map(|(key, _)| *key).unwrap_or_default();
-    let last = entries.last().map(|(key, _)| *key).unwrap_or_default();
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![Object::Integer(first), Object::Integer(last)]),
-    );
-    leaf.insert("Nums", Object::Array(number_pairs(entries)));
-    leaf
 }
 
 #[cfg(test)]
@@ -6192,7 +6074,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "unsupported PDF feature: name_number_tree: /Kids depth limit 2 exceeded"
+            "unsupported PDF feature: name/number tree: /Kids depth limit 2 exceeded"
         );
     }
 
@@ -6413,7 +6295,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "unsupported PDF feature: name_number_tree: /Kids depth limit 2 exceeded"
+            "unsupported PDF feature: name/number tree: /Kids depth limit 2 exceeded"
         );
         assert_eq!(tree.root(), &original);
         assert!(pdf.repair_diagnostics().entries().is_empty());
