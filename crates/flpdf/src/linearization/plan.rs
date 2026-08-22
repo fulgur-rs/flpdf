@@ -195,6 +195,7 @@ fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
                 true,
                 options.content_normalization,
             )?
+        // cov:ignore: the stream guard and qpdf-shaped probe make this only a defensive error propagation edge
         {
             skipped_streams.insert(object_ref);
         }

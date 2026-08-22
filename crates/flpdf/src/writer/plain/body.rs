@@ -1321,6 +1321,20 @@ mod tests {
     }
 
     #[test]
+    fn refilter_probe_rejects_a_non_stream_handle() {
+        let error = canonical_stream_will_be_refiltered_with_policy(
+            &ObjectHandle::integer(1),
+            &WriterOptions::default(),
+            true,
+            false,
+        )
+        .expect_err("refilter probing requires a stream handle");
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message.contains("stream dictionary"))
+        );
+    }
+
+    #[test]
     fn refilter_probe_does_not_consume_a_stateful_token_filter() {
         struct ForwardTokenFilter;
 
