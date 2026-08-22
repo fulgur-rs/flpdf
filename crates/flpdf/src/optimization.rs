@@ -92,7 +92,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(&Stream) -> u8,
+        F: FnMut(Option<ObjectRef>, &Stream) -> u8,
     {
         let prepared = Self::prepare_pdf(pdf, allow_changes)?;
         let page_refs = prepared
@@ -167,7 +167,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(&Stream) -> u8,
+        F: FnMut(Option<ObjectRef>, &Stream) -> u8,
     {
         let mut maps = Self::default();
 
@@ -221,11 +221,12 @@ impl Optimization {
     ) -> crate::Result<()>
     where
         R: Read + Seek,
-        F: FnMut(&Stream) -> u8,
+        F: FnMut(Option<ObjectRef>, &Stream) -> u8,
     {
         let mut visited = BTreeSet::new();
         let mut stack = vec![Pending {
             object,
+            object_ref: None,
             user,
             top: true,
             via_array: false,
@@ -262,6 +263,7 @@ impl Optimization {
                     self.record(pending.user.clone(), object_ref);
                     stack.push(Pending {
                         object: resolved,
+                        object_ref: Some(object_ref),
                         user: pending.user,
                         top: pending.top,
                         via_array: false,
@@ -272,6 +274,7 @@ impl Optimization {
                     for item in items.into_iter().rev() {
                         stack.push(Pending {
                             object: item,
+                            object_ref: None,
                             user: pending.user.clone(),
                             top: false,
                             via_array: true,
@@ -301,6 +304,7 @@ impl Optimization {
                     for (object, user) in children.into_iter().rev() {
                         stack.push(Pending {
                             object,
+                            object_ref: None,
                             user,
                             top: false,
                             via_array: false,
@@ -309,7 +313,7 @@ impl Optimization {
                     }
                 }
                 Object::Stream(stream) => {
-                    let skip_level = skip_stream_parameters(&stream);
+                    let skip_level = skip_stream_parameters(pending.object_ref, &stream);
                     let entries = crate::qpdf_null::snapshot_entries(&stream.dict, false);
                     let entries = entries
                         .into_iter()
@@ -322,6 +326,7 @@ impl Optimization {
                     for (_, object) in children.into_iter().rev() {
                         stack.push(Pending {
                             object,
+                            object_ref: None,
                             user: pending.user.clone(),
                             top: false,
                             via_array: false,
@@ -356,6 +361,7 @@ impl ObjectUser {
 
 struct Pending {
     object: Object,
+    object_ref: Option<ObjectRef>,
     user: ObjectUser,
     top: bool,
     via_array: bool,
@@ -432,7 +438,7 @@ mod tests {
     }
 
     fn build_maps(pdf: &mut Pdf<Cursor<Vec<u8>>>, skip_level: u8) -> Optimization {
-        Optimization::optimize(pdf, &BTreeMap::new(), true, |_| skip_level)
+        Optimization::optimize(pdf, &BTreeMap::new(), true, |_, _| skip_level)
             .expect("object-user maps should build")
     }
 
@@ -465,7 +471,7 @@ mod tests {
     fn optimize_makes_direct_outlines_indirect_before_building_maps() {
         let mut pdf = direct_outlines_pdf();
 
-        let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_| 1).unwrap();
+        let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_, _| 1).unwrap();
 
         assert_eq!(
             maps.objects_for(&ObjectUser::RootKey(b"Outlines".to_vec()))
@@ -485,7 +491,7 @@ mod tests {
         let mut pdf = direct_outlines_pdf();
         let root = pdf.root_ref().unwrap();
 
-        Optimization::optimize(&mut pdf, &BTreeMap::new(), false, |_| 1).unwrap();
+        Optimization::optimize(&mut pdf, &BTreeMap::new(), false, |_, _| 1).unwrap();
 
         assert!(matches!(
             pdf.resolve(root).unwrap(),
@@ -499,7 +505,7 @@ mod tests {
         let mut pdf = open_pdf(&[(1, b"null")], b"");
         let root = pdf.root_ref().unwrap();
 
-        let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_| 1).unwrap();
+        let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_, _| 1).unwrap();
 
         assert!(maps.users_for(root).contains(&ObjectUser::Root));
         assert!(matches!(pdf.resolve(root).unwrap(), Object::Null));
@@ -832,12 +838,12 @@ mod tests {
         let mut without_root =
             Pdf::open_mem_owned(without_root).expect("rootless fixture should parse");
         assert!(without_root.root_ref().is_none());
-        let maps = Optimization::build_maps(&mut without_root, &[], |_| 1)
+        let maps = Optimization::build_maps(&mut without_root, &[], |_, _| 1)
             .expect("rootless document should build empty maps");
         assert!(maps.objects_for(&ObjectUser::Root).is_empty());
 
         let mut non_dictionary_root = open_pdf(&[(1, b"42")], b"");
-        let maps = Optimization::build_maps(&mut non_dictionary_root, &[], |_| 1)
+        let maps = Optimization::build_maps(&mut non_dictionary_root, &[], |_, _| 1)
             .expect("non-dictionary root should retain its identity");
         assert_eq!(
             maps.objects_for(&ObjectUser::Root),
@@ -860,7 +866,7 @@ mod tests {
             b"/CustomTrailer 5 0 R",
         );
         trailer_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
-        let error = Optimization::build_maps(&mut trailer_pdf, &[], |_| 1)
+        let error = Optimization::build_maps(&mut trailer_pdf, &[], |_, _| 1)
             .expect_err("trailer traversal error must propagate");
         assert!(matches!(error, crate::Error::Unsupported(_)));
 
@@ -877,7 +883,7 @@ mod tests {
             b"",
         );
         catalog_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
-        let error = Optimization::build_maps(&mut catalog_pdf, &[], |_| 1)
+        let error = Optimization::build_maps(&mut catalog_pdf, &[], |_, _| 1)
             .expect_err("catalog traversal error must propagate");
         assert!(matches!(error, crate::Error::Unsupported(_)));
     }
@@ -905,7 +911,7 @@ mod tests {
         page.insert("Deep", too_deep_object());
         pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
 
-        let error = Optimization::build_maps(&mut pdf, &pages, |_| 1)
+        let error = Optimization::build_maps(&mut pdf, &pages, |_, _| 1)
             .expect_err("excessive direct nesting must fail");
         assert!(
             matches!(error, crate::Error::Unsupported(ref message) if message.contains("inline object nesting exceeds maximum")),

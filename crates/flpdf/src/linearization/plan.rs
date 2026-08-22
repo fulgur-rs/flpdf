@@ -168,42 +168,38 @@ pub(crate) fn collect_direct_refs(
     Ok(())
 }
 
-fn stream_parameter_refs_to_drop<R: Read + Seek>(
+fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &crate::writer::WriterOptions,
 ) -> Result<BTreeSet<ObjectRef>> {
-    let mut dropped = BTreeSet::new();
+    let mut skipped_streams = BTreeSet::new();
     for object_ref in pdf.object_refs() {
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle)?;
-        if handle.as_stream_dict().is_none()
-            || !crate::writer::plain::body::canonical_stream_will_be_refiltered(&handle, options)?
-        {
+        let Some(stream_dict) = handle.as_stream_dict() else {
             continue;
-        }
-        let stream_dict = handle
-            .as_stream_dict()
-            .ok_or_else(|| crate::Error::Internal("stream dictionary disappeared".to_string()))?;
+        };
+        // Avoid a filter probe for the common case where this stream has no
+        // indirect parameter edge that the reachability walk could drop.
+        let mut has_indirect_parameter = false;
         for key in [b"/Filter".as_slice(), b"/DecodeParms".as_slice()] {
             let value = stream_dict.try_get_key(key)?;
             let mut refs = Vec::new();
             collect_direct_handle_refs(&value, 0, &mut refs)?;
-            dropped.extend(refs);
+            has_indirect_parameter |= !refs.is_empty();
+        }
+        if has_indirect_parameter
+            && crate::writer::plain::body::canonical_stream_will_be_refiltered_with_policy(
+                &handle,
+                options,
+                true,
+                options.content_normalization,
+            )?
+        {
+            skipped_streams.insert(object_ref);
         }
     }
-    Ok(dropped)
-}
-
-fn stream_has_dropped_parameter_ref(stream: &crate::Stream, dropped: &BTreeSet<ObjectRef>) -> bool {
-    ["Filter", "DecodeParms"].into_iter().any(|key| {
-        stream.dict.get(key).is_some_and(|value| {
-            let mut refs = Vec::new();
-            collect_direct_refs(value, 0, &mut refs).is_ok()
-                && refs
-                    .into_iter()
-                    .any(|reference| dropped.contains(&reference))
-        })
-    })
+    Ok(skipped_streams)
 }
 
 /// Like [`collect_direct_refs`] but tracks whether each ref was discovered
@@ -278,7 +274,7 @@ fn collect_direct_handle_refs_with_stream_parameters(
     handle: &ObjectHandle,
     depth: usize,
     out: &mut Vec<ObjectRef>,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let mut contextual = Vec::new();
     collect_direct_handle_refs_with_stream_parameters_context(
@@ -286,7 +282,7 @@ fn collect_direct_handle_refs_with_stream_parameters(
         depth,
         false,
         &mut contextual,
-        dropped_stream_parameter_refs,
+        skipped_stream_parameter_streams,
     )?; // cov:ignore: thin projection into the context-carrying walker; its stream-policy branches are covered by the closure tests
     out.extend(contextual.into_iter().map(|(object_ref, _)| object_ref));
     Ok(())
@@ -326,7 +322,7 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
     depth: usize,
     in_array: bool,
     out: &mut Vec<(ObjectRef, bool)>,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
@@ -341,14 +337,14 @@ fn collect_direct_handle_refs_with_stream_parameters_context(
         handle,
         depth,
         in_array,
-        dropped_stream_parameter_refs,
+        skipped_stream_parameter_streams,
         &mut |child, child_depth, child_in_array| {
             collect_direct_handle_refs_with_stream_parameters_context(
                 child,
                 child_depth,
                 child_in_array,
                 out,
-                dropped_stream_parameter_refs,
+                skipped_stream_parameter_streams,
             )
         },
     )
@@ -378,7 +374,7 @@ fn collect_direct_handle_children_with_stream_parameters<F>(
     handle: &ObjectHandle,
     depth: usize,
     _parent_in_array: bool,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
     visit: &mut F,
 ) -> Result<()>
 where
@@ -390,7 +386,7 @@ where
             return Ok(());
         };
         let skip_stream_parameters =
-            handle_has_dropped_parameter_ref(handle, dropped_stream_parameter_refs)?;
+            handle_has_stream_parameter_skip(handle, skipped_stream_parameter_streams)?;
         for (key, child) in entries {
             if key == b"/Length"
                 || (skip_stream_parameters
@@ -416,48 +412,33 @@ where
     Ok(())
 }
 
-fn handle_has_dropped_parameter_ref(
+fn handle_has_stream_parameter_skip(
     handle: &ObjectHandle,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
-    if dropped_stream_parameter_refs.is_empty() {
-        return Ok(false);
-    }
-    let Some(stream_dict) = handle.as_stream_dict() else {
-        return Ok(false); // cov:ignore: this helper is called only after the stream-dictionary guard in its production caller
-    };
-    for key in [b"/Filter".as_slice(), b"/DecodeParms".as_slice()] {
-        let value = stream_dict.try_get_key(key)?;
-        let mut refs = Vec::new();
-        collect_direct_handle_refs_with_context(&value, 0, false, &mut refs)?;
-        if refs
-            .into_iter()
-            .any(|(reference, _)| dropped_stream_parameter_refs.contains(&reference))
-        {
-            return Ok(true); // cov:ignore: the production stream walk filters these keys before this defensive probe can observe a matching edge
-        }
-    }
-    Ok(false) // cov:ignore: the production stream walk filters these keys before this defensive probe can observe a non-matching edge
+    Ok(handle
+        .object_ref()
+        .is_some_and(|object_ref| skipped_stream_parameter_streams.contains(&object_ref)))
 }
 
 fn collect_handle_children_with_stream_parameters(
     handle: &ObjectHandle,
     depth: usize,
     out: &mut Vec<(ObjectRef, bool)>,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     collect_direct_handle_children_with_stream_parameters(
         handle,
         depth,
         false,
-        dropped_stream_parameter_refs,
+        skipped_stream_parameter_streams,
         &mut |child, child_depth, in_array| {
             collect_direct_handle_refs_with_stream_parameters_context(
                 child,
                 child_depth,
                 in_array,
                 out,
-                dropped_stream_parameter_refs,
+                skipped_stream_parameter_streams,
             )
         },
     )
@@ -501,7 +482,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
     root: ObjectRef,
     live: &BTreeSet<ObjectRef>,
     resurrectable: &BTreeSet<ObjectRef>,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> crate::Result<Vec<ObjectRef>> {
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut order: Vec<ObjectRef> = Vec::new();
@@ -651,7 +632,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                                 &child_handle,
                                 0,
                                 &mut child_refs,
-                                dropped_stream_parameter_refs,
+                                skipped_stream_parameter_streams,
                             )?;
                             // Push in reverse so the first reference is popped
                             // first, preserving left-to-right discovery order.
@@ -704,7 +685,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                             v,
                             0,
                             &mut to_visit,
-                            dropped_stream_parameter_refs,
+                            skipped_stream_parameter_streams,
                         )?; // cov:ignore: LLVM maps this covered parent-seed call terminator to a zero-count continuation region
 
                         while let Some(parent_ref) = to_visit.pop() {
@@ -748,7 +729,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                                     0,
                                     false,
                                     &mut refs,
-                                    dropped_stream_parameter_refs,
+                                    skipped_stream_parameter_streams,
                                 )?; // cov:ignore: LLVM maps this covered ancestor-entry call terminator to a zero-count continuation region
                                 for (r, va) in refs {
                                     if va {
@@ -767,7 +748,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                         0,
                         false,
                         &mut refs_raw,
-                        dropped_stream_parameter_refs,
+                        skipped_stream_parameter_streams,
                     )?; // cov:ignore: LLVM maps this covered page-entry call terminator to a zero-count continuation region
                 }
                 for &(r, va) in &refs_raw {
@@ -791,7 +772,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                 &current_handle,
                 0,
                 &mut refs,
-                dropped_stream_parameter_refs,
+                skipped_stream_parameter_streams,
             )?; // cov:ignore: LLVM maps this covered ordinary-object call terminator to a zero-count continuation region
             for &(r, va) in &refs {
                 if va {
@@ -1097,15 +1078,21 @@ impl LinearizationPlan {
                 )
             })?;
         }
-        let dropped_stream_parameter_refs = stream_parameter_refs_to_drop(pdf, options)?;
-        let optimization =
-            crate::optimization::Optimization::optimize(pdf, &BTreeMap::new(), true, |stream| {
-                if stream_has_dropped_parameter_ref(stream, &dropped_stream_parameter_refs) {
+        let skipped_stream_parameter_streams = stream_refs_to_skip_parameter_edges(pdf, options)?;
+        let optimization = crate::optimization::Optimization::optimize(
+            pdf,
+            &BTreeMap::new(),
+            true,
+            |stream_ref, _stream| {
+                if stream_ref.is_some_and(|object_ref| {
+                    skipped_stream_parameter_streams.contains(&object_ref)
+                }) {
                     2
                 } else {
                     1
                 }
-            })?;
+            },
+        )?;
         if pdf.root_ref().is_some()
             && optimization
                 .objects_for(&crate::optimization::ObjectUser::Page(0))
@@ -1145,7 +1132,7 @@ impl LinearizationPlan {
         let reachable = crate::rewrite_renumber::reachable_object_set_with_stream_parameters(
             pdf,
             true,
-            &dropped_stream_parameter_refs,
+            &skipped_stream_parameter_streams,
         )?;
         let object_refs = pdf.object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
@@ -1294,7 +1281,7 @@ impl LinearizationPlan {
                 first_page,
                 &live,
                 &resurrectable,
-                &dropped_stream_parameter_refs,
+                &skipped_stream_parameter_streams,
             )? // cov:ignore: LLVM maps this covered first-page closure call terminator to a zero-count continuation region
         } else {
             Vec::new()
@@ -1333,7 +1320,7 @@ impl LinearizationPlan {
                 page_ref,
                 &live,
                 &resurrectable,
-                &dropped_stream_parameter_refs,
+                &skipped_stream_parameter_streams,
             )?; // cov:ignore: LLVM maps this covered later-page closure call terminator to a zero-count continuation region
             let page_users =
                 optimization.objects_for(&crate::optimization::ObjectUser::Page(page_idx as u32));
@@ -3074,8 +3061,10 @@ mod tests {
     fn stream_parameter_probe_filters_matching_refs_and_handles_non_streams() {
         let filter_ref = ObjectRef::new(5, 0);
         let other_ref = ObjectRef::new(6, 0);
-        let stream = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![
+        let stream_ref = ObjectRef::new(10, 0);
+        let stream = ObjectHandle::new_indirect_unresolved(stream_ref, 0);
+        stream.set_resolved(crate::object_handle::ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![
                 (
                     b"Filter".to_vec(),
                     ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(
@@ -3084,21 +3073,23 @@ mod tests {
                 ),
                 (b"DecodeParms".to_vec(), ObjectHandle::integer(1)),
             ]),
-            std::rc::Rc::new(Vec::new()),
-        );
-        let dropped = BTreeSet::from([filter_ref]);
+            stream_data: Some(std::rc::Rc::new(Vec::new())),
+            stream_provider: None,
+            stream_length: 0,
+        });
+        let skipped = BTreeSet::from([stream_ref]);
         let mut refs = Vec::new();
 
-        collect_direct_handle_refs_with_stream_parameters(&stream, 0, &mut refs, &dropped)
+        collect_handle_children_with_stream_parameters(&stream, 0, &mut refs, &skipped)
             .expect("stream policy walk");
         assert!(
             refs.is_empty(),
-            "dropped filter edges must not be collected"
+            "skipped parameter edges must not be collected"
         );
-        assert!(handle_has_dropped_parameter_ref(&stream, &dropped).unwrap());
-        assert!(!handle_has_dropped_parameter_ref(&stream, &BTreeSet::from([other_ref])).unwrap());
-        assert!(!handle_has_dropped_parameter_ref(&ObjectHandle::integer(1), &dropped).unwrap());
-        assert!(!handle_has_dropped_parameter_ref(&stream, &BTreeSet::new()).unwrap());
+        assert!(handle_has_stream_parameter_skip(&stream, &skipped).unwrap());
+        assert!(!handle_has_stream_parameter_skip(&stream, &BTreeSet::from([other_ref])).unwrap());
+        assert!(!handle_has_stream_parameter_skip(&ObjectHandle::integer(1), &skipped).unwrap());
+        assert!(!handle_has_stream_parameter_skip(&stream, &BTreeSet::new()).unwrap());
     }
 
     // -----------------------------------------------------------------------
@@ -7488,5 +7479,102 @@ mod tests {
         assert!(!assigned.contains(&ObjectRef::new(5, 0)));
         assert!(!assigned.contains(&ObjectRef::new(6, 0)));
         assert!(assigned.contains(&ObjectRef::new(4, 0)));
+    }
+
+    fn indirect_metadata_filter_linearization_pdf() -> Vec<u8> {
+        let content = b"q Q\n";
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, content).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let metadata = b"<x:xmpmeta/>\n";
+        let mut metadata_encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut metadata_encoder, metadata).unwrap();
+        let metadata_encoded = metadata_encoder.finish().unwrap();
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        let mut push = |number: u32, body: Vec<u8>| {
+            offsets.push((number, bytes.len()));
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(&body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        };
+        push(
+            1,
+            b"<< /Type /Catalog /Pages 2 0 R /Metadata 7 0 R >>".to_vec(),
+        );
+        push(2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec());
+        push(
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>".to_vec(),
+        );
+        let mut content_stream = format!(
+            "<< /Filter 5 0 R /DecodeParms 6 0 R /Length {} >>\nstream\n",
+            encoded.len()
+        )
+        .into_bytes();
+        content_stream.extend_from_slice(&encoded);
+        content_stream.extend_from_slice(b"\nendstream");
+        push(4, content_stream);
+        push(5, b"/FlateDecode".to_vec());
+        push(6, b"<< /Predictor 1 >>".to_vec());
+        let mut metadata_stream = format!(
+            "<< /Type /Metadata /Subtype /XML /Filter 8 0 R /Length {} >>\nstream\n",
+            metadata_encoded.len()
+        )
+        .into_bytes();
+        metadata_stream.extend_from_slice(&metadata_encoded);
+        metadata_stream.extend_from_slice(b"\nendstream");
+        push(7, metadata_stream);
+        push(8, b"/FlateDecode".to_vec());
+
+        let xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+        let mut by_number = [0usize; 9];
+        for (number, offset) in offsets {
+            by_number[number as usize] = offset;
+        }
+        for offset in by_number.iter().skip(1) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn linearization_keeps_metadata_filter_reachable_until_emission_drops_it() {
+        let mut pdf = Pdf::open(Cursor::new(indirect_metadata_filter_linearization_pdf())).unwrap();
+        let options = crate::writer::WriterOptions {
+            object_streams: crate::ObjectStreamMode::Disable,
+            compress_streams: crate::writer::CompressStreams::Yes,
+            ..crate::writer::WriterOptions::default()
+        };
+
+        crate::linearization::writer::write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect("metadata stream parameter reachability must match qpdf");
+    }
+
+    #[test]
+    fn linearization_keeps_shared_filter_for_a_preserved_content_stream() {
+        let mut bytes = indirect_metadata_filter_linearization_pdf();
+        let old = b"/Filter 8 0 R";
+        let position = bytes
+            .windows(old.len())
+            .position(|window| window == old)
+            .expect("metadata filter reference");
+        bytes[position + b"/Filter ".len()..position + old.len()].copy_from_slice(b"5 0 R");
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let options = crate::writer::WriterOptions {
+            object_streams: crate::ObjectStreamMode::Disable,
+            compress_streams: crate::writer::CompressStreams::Yes,
+            ..crate::writer::WriterOptions::default()
+        };
+
+        crate::linearization::writer::write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect("shared stream parameters must be evaluated per referencing stream");
     }
 }

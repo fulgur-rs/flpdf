@@ -612,11 +612,9 @@ fn push_spaces(out: &mut Vec<u8>, count: usize) {
 
 /// Canonical stream output for qpdf's linearized body route.
 ///
-/// `QPDFWriter::writeLinearized` applies the stream compression decision before
-/// its encryption-stage cleartext-metadata exemption. The full-rewrite route's
-/// metadata suppression therefore must not run here: a metadata stream can be
-/// re-filtered to `/FlateDecode` first, after which the linearization writer
-/// prepends `/Crypt /Identity` (`QPDFWriter.cc:1234-1314`).
+/// `QPDFWriter::writeLinearized` uses the same metadata decision in its
+/// `willFilterStream` probe and its final emission (`QPDFWriter.cc:1234-1314`),
+/// so planning and writing must share the full-rewrite metadata policy here.
 pub(crate) fn canonical_stream_output_for_linearization(
     handle: &ObjectHandle,
     options: &WriterOptions,
@@ -630,7 +628,7 @@ pub(crate) fn canonical_stream_output_for_linearization_with_status(
     handle: &ObjectHandle,
     options: &WriterOptions,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
-    canonical_stream_output_with_status(handle, options, false, false)
+    canonical_stream_output_with_status(handle, options, true, options.content_normalization)
 }
 
 /// Return whether the qpdf-shaped stream pipeline will replace the source
@@ -648,6 +646,23 @@ pub(crate) fn canonical_stream_will_be_refiltered(
     handle: &ObjectHandle,
     options: &WriterOptions,
 ) -> crate::Result<bool> {
+    canonical_stream_will_be_refiltered_with_policy(handle, options, true, false)
+}
+
+/// Probe whether a writer-owned stream will replace its source filter
+/// parameters under a specific qpdf writer policy.
+///
+/// `QPDFWriter::willFilterStream` is called with the state of the writer that
+/// will emit the stream. Planning callers must therefore pass the same
+/// metadata and content-normalization policy as their emission route; a
+/// document-wide default is not equivalent when linearization and full
+/// rewrite have different metadata handling.
+pub(crate) fn canonical_stream_will_be_refiltered_with_policy(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
+) -> crate::Result<bool> {
     // Token filters are stateful qpdf ValueSetter-style consumers. The plain
     // planner caches their complete output before walking references; callers
     // that cannot retain that output must leave the stream edge intact rather
@@ -655,8 +670,12 @@ pub(crate) fn canonical_stream_will_be_refiltered(
     if handle.is_data_modified() {
         return Ok(false);
     }
-    let Some((encode_flags, decode_level)) =
-        canonical_stream_filter_plan(handle, options, true, false)?
+    let Some((encode_flags, decode_level)) = canonical_stream_filter_plan(
+        handle,
+        options,
+        apply_full_rewrite_metadata_policy,
+        normalize_content,
+    )?
     else {
         return Ok(false);
     };
