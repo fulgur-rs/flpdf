@@ -77,7 +77,7 @@ use crate::writer::object_streams::{
 use crate::writer::{
     decrement_progress_event, effective_pdf_version_and_ext, effective_stream_policy,
     inject_adbe_extension, report_progress_event, serialize::xref_stream, strip_adbe_extension,
-    CompressStreams, NewlineBeforeEndstream, WriterOptions, WriterResult,
+    CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
 };
 use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result};
 
@@ -331,7 +331,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     let body = emit_objstm_body_from_handles_with_writer(
         &members,
         &mut |out, _member_index, _object_ref, handle| {
-            handle.unparse_object_with_ref_map_and_removed(out, &map, removed_refs)
+            handle.write_object_with_ref_map_and_removed(out, &map, removed_refs)
         },
     )?;
     let compress = if filtered {
@@ -365,17 +365,17 @@ fn append_objstm_container_object<R: Read + Seek>(
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} 0 obj\n", container.container_new_num).as_bytes());
     bytes.extend_from_slice(b"<< /Type ");
-    stream_dict.get_key(b"/Type").unparse_object(bytes)?;
+    stream_dict.get_key(b"/Type").write_object(bytes)?;
     bytes.extend_from_slice(b" /Length ");
-    stream_dict.get_key(b"/Length").unparse_object(bytes)?;
+    stream_dict.get_key(b"/Length").write_object(bytes)?;
     if filtered {
         bytes.extend_from_slice(b" /Filter ");
-        stream_dict.get_key(b"/Filter").unparse_object(bytes)?;
+        stream_dict.get_key(b"/Filter").write_object(bytes)?;
     }
     bytes.extend_from_slice(b" /N ");
-    stream_dict.get_key(b"/N").unparse_object(bytes)?;
+    stream_dict.get_key(b"/N").write_object(bytes)?;
     bytes.extend_from_slice(b" /First ");
-    stream_dict.get_key(b"/First").unparse_object(bytes)?;
+    stream_dict.get_key(b"/First").write_object(bytes)?;
     bytes.extend_from_slice(b" >>");
     if let Some(ctx) = encrypt_ctx {
         crate::writer::write_stream_payload_with_pipeline(
@@ -519,7 +519,7 @@ fn append_object(
             removed_refs,
         )?; // cov:ignore: canonical handle emission only errors for an invalid source graph.
     } else {
-        object.unparse_object_with_ref_map_and_removed(bytes, map, removed_refs)?;
+        object.write_object_with_ref_map_and_removed(bytes, map, removed_refs)?;
     }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
@@ -675,7 +675,7 @@ fn append_body_object(
             None,
         )?; // cov:ignore: canonical stream-dictionary emission only errors for an invalid source graph.
     } else {
-        dict.unparse_stream_body_with_ref_map_and_removed(bytes, refiltered, &map, removed_refs)?;
+        dict.write_stream_body_with_ref_map_and_removed(bytes, refiltered, &map, removed_refs)?;
     }
 
     if let Some(ctx) = payload_ctx.filter(|_| !cleartext_metadata) {
@@ -882,7 +882,7 @@ fn write_part1_xref_and_trailer(
     let id_value = source_trailer.try_get_key(b"/ID")?;
     match id_writer {
         Some(write_id) => write_id(bytes),
-        None => id_value.unparse_id_value_with_ref_map(bytes, map, removed_refs)?,
+        None => id_value.write_id_value_with_ref_map(bytes, map, removed_refs)?,
     }
 
     // /Encrypt — reference to the `/Encrypt` dictionary object, written right
@@ -1035,7 +1035,7 @@ fn write_main_xref_and_trailer(
     let id_value = source_trailer.try_get_key(b"/ID")?;
     match id_writer {
         Some(write_id) => write_id(bytes),
-        None => id_value.unparse_id_value_with_ref_map(bytes, map, removed_refs)?,
+        None => id_value.write_id_value_with_ref_map(bytes, map, removed_refs)?,
     }
     bytes.extend_from_slice(b" ");
     bytes.extend_from_slice(b">>");
@@ -1148,7 +1148,7 @@ fn canonical_linearization_trailer_entries(
             let mapped = map(object_ref)?;
             value_bytes.extend_from_slice(mapped.to_string().as_bytes());
         } else {
-            value.unparse_object_with_ref_map_and_removed(&mut value_bytes, map, removed_refs)?;
+            value.write_object_with_ref_map_and_removed(&mut value_bytes, map, removed_refs)?;
         }
         serialized.push((key, value_bytes));
     }

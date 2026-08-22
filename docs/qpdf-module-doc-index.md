@@ -79,7 +79,7 @@
 | `crates/flpdf/src/nntree.rs` | correspondence | NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries |
 | `crates/flpdf/src/object.rs` | correspondence | QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model |
 | `crates/flpdf/src/object_copy.rs` | correspondence | the canonical \`QPDF::copyForeignObject\` graph copy lives here |
-| `crates/flpdf/src/object_handle.rs` | correspondence | \`QPDFObjectHandle\`, \`QPDFObject\`, and \`QPDFValue\` identity and payload ownership, \`QPDF::newReserved\`/\`QPDF_Reserved\`, \`QPDFObjectHandle::copyStream\`/\`QPDF::copyStreamData\` stream-copy primitives, \`QPDF::setImmediateCopyFrom\`, plus \`QPDFWriter.cc\` \`unparseObject\`/\`writeTrailer\` writer-emission primitives (\`unparse_object\`/\`unparse_object_qdf\`/\`unparse_stream_body\`/\`unparse_stream_body_qdf\`/\`unparse_trailer\`) |
+| `crates/flpdf/src/object_handle.rs` | correspondence | \`QPDFObjectHandle\`, \`QPDFObject\`, and \`QPDFValue\` identity and payload ownership, \`QPDF::newReserved\`/\`QPDF_Reserved\`, \`QPDFObjectHandle::copyStream\`/\`QPDF::copyStreamData\` stream-copy primitives, and \`QPDF::setImmediateCopyFrom\` |
 | `crates/flpdf/src/objr_obj_annot_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations |
 | `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding |
 | `crates/flpdf/src/optimization/inherited_attrs.rs` | correspondence | QPDF_optimization.cc inherited-page-attribute push |
@@ -151,6 +151,7 @@
 | `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc writer lifecycle and responsibilities shared with writer submodules and linearization |
 | `crates/flpdf/src/writer/encrypted_strings.rs` | correspondence | QPDFWriter.cc:785-803 encryption-dictionary binary-key hex selection, QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities |
 | `crates/flpdf/src/writer/encryption_state.rs` | correspondence | QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state |
+| `crates/flpdf/src/writer/object.rs` | correspondence | \`QPDFWriter::unparseObject\`, \`unparseChild\`, \`writeTrailer\`, and the writer-owned live-handle emission boundary |
 | `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |
 | `crates/flpdf/src/writer/pclm.rs` | correspondence | \`QPDFWriter::enqueueObjectsPCLm\` |
 | `crates/flpdf/src/writer/plain/body.rs` | correspondence | QPDFWriter.cc plain object-body emission split from planning and xref output |

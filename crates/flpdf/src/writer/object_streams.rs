@@ -16,7 +16,7 @@ use std::num::NonZeroUsize;
 use crate::object::ObjectRef;
 #[cfg(test)]
 use crate::object::{Dictionary, Object};
-use crate::writer::WriterOptions;
+use crate::writer::{ObjectWriterEmission, WriterOptions};
 use crate::ObjectHandle;
 use crate::XrefEntry;
 
@@ -738,7 +738,7 @@ pub(crate) fn emit_objstm_body_from_handles(
 ) -> crate::Result<ObjStmBody> {
     emit_objstm_body_from_handles_with_writer(
         members,
-        &mut |out, _member_index, _object_ref, handle| handle.unparse_object(out),
+        &mut |out, _member_index, _object_ref, handle| handle.write_object(out),
     )
 }
 
