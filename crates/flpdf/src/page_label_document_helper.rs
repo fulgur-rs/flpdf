@@ -681,6 +681,30 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         src_indices: &[i64],
         out_start_idx: i64,
     ) -> Result<Vec<(i64, LabelRange)>> {
+        self.labels_for_selection_with_prefix_presence(src_indices, out_start_idx)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(index, label, _prefix_present)| (index, label))
+                    .collect()
+            })
+    }
+
+    /// Batch variant of [`Self::labels_for_selection`] that also returns
+    /// whether each effective label dictionary carries an explicit `/P` key.
+    ///
+    /// The raw label lookup and the typed [`LabelRange`] projection happen in
+    /// one pass. Callers that need to preserve the distinction between an
+    /// absent prefix and an explicit empty `/P ()` should use this method so
+    /// they do not traverse the number tree again for each selected page.
+    /// This follows qpdf's `getLabelForPage` raw-dictionary construction
+    /// (`QPDFPageLabelDocumentHelper.cc:23-51`), which retains `/P` key
+    /// presence while projecting the effective `/St` value.
+    pub fn labels_for_selection_with_prefix_presence(
+        &mut self,
+        src_indices: &[i64],
+        out_start_idx: i64,
+    ) -> Result<Vec<(i64, LabelRange, bool)>> {
         let tree = self.pagelabels_tree()?;
         let mut out = Vec::with_capacity(src_indices.len());
         for (i, &src_idx) in src_indices.iter().enumerate() {
@@ -696,20 +720,27 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 Some(tree) => self.get_label_for_page_from_tree(tree, src_idx)?,
                 None => None,
             };
-            let label = match label {
-                Some(label) => LabelRange::from_handle(self.pdf, &label)?.ok_or_else(|| {
-                    // cov:ignore-start: get_label_for_page_from_tree returns Some only for a dictionary handle.
-                    Error::Unsupported("page label range is not a dictionary".to_string())
-                })?, // cov:ignore-end
-                None => LabelRange {
-                    style: LabelStyle::None,
-                    prefix: String::new(),
-                    start: out_idx.checked_add(1).ok_or_else(|| {
-                        Error::Unsupported("page label fabricated start overflow".to_string())
-                    })?,
-                },
+            let (label, prefix_present) = match label {
+                Some(label) => {
+                    let prefix_present = label.try_has_key(b"/P")?;
+                    let label = LabelRange::from_handle(self.pdf, &label)?.ok_or_else(|| {
+                        // cov:ignore-start: get_label_for_page_from_tree returns Some only for a dictionary handle.
+                        Error::Unsupported("page label range is not a dictionary".to_string())
+                    })?; // cov:ignore-end
+                    (label, prefix_present)
+                }
+                None => (
+                    LabelRange {
+                        style: LabelStyle::None,
+                        prefix: String::new(),
+                        start: out_idx.checked_add(1).ok_or_else(|| {
+                            Error::Unsupported("page label fabricated start overflow".to_string())
+                        })?,
+                    },
+                    false,
+                ),
             };
-            out.push((out_idx, label));
+            out.push((out_idx, label, prefix_present));
         }
         Ok(out)
     }
@@ -1543,6 +1574,44 @@ mod tests {
                     start: 3,
                 }
             )
+        );
+    }
+
+    #[test]
+    fn labels_for_selection_with_prefix_presence_preserves_raw_prefix_presence() {
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            label_dict("D", Some(1), Some("")),
+            Object::Integer(1),
+            label_dict("D", Some(1), None),
+        ]);
+        let labels = pdf
+            .page_labels()
+            .labels_for_selection_with_prefix_presence(&[0, 1], 0)
+            .expect("selection labels with prefix presence");
+
+        assert_eq!(
+            labels,
+            vec![
+                (
+                    0,
+                    LabelRange {
+                        style: LabelStyle::Decimal,
+                        prefix: String::new(),
+                        start: 1,
+                    },
+                    true,
+                ),
+                (
+                    1,
+                    LabelRange {
+                        style: LabelStyle::Decimal,
+                        prefix: String::new(),
+                        start: 1,
+                    },
+                    false,
+                ),
+            ]
         );
     }
 
