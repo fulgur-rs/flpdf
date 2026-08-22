@@ -6086,7 +6086,7 @@ mod tests {
 
         let error = match tree.begin(&mut pdf) {
             Err(error) => error,
-            Ok(_) => panic!("begin must enforce the depth limit before loading the root"),
+            Ok(_) => panic!("begin must enforce the depth limit before loading the root"), // cov:ignore: negative-path assertion
         };
         assert_eq!(
             error.to_string(),
