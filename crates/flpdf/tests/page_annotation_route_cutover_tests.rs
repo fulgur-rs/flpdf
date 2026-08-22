@@ -45,7 +45,7 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
         .unwrap();
     assert_eq!(widgets.len(), 5);
 
-    let mut acroform = AcroFormDocumentHelper::new(&mut pdf);
+    let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
     let annotation_to_field = acroform.annotation_to_field_map().unwrap();
     let top_level_fields: Vec<ObjectRef> = widgets
         .into_iter()

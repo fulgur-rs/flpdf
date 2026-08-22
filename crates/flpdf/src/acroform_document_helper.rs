@@ -192,22 +192,19 @@ pub struct AcroFormDocumentHelper<'a, R: Read + Seek + 'static> {
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
-    /// Create a new helper borrowing `pdf` mutably.
-    // qpdf's QPDFAcroFormDocumentHelper constructor eagerly calls analyze()
-    // (QPDFAcroFormDocumentHelper.cc:14-21, with an explicit comment there on
-    // avoiding an "unstable configuration"), so its cache is always valid.
-    // This constructor is lazy (cache: None) instead. That gap was harmless
-    // before the mutators below started maintaining the cache incrementally,
-    // since every mutator used to nuke it anyway. It has teeth now: a caller
-    // that mutates the field-tree graph directly (bypassing this helper's
-    // mutators) between construction and first use would see a fresher cache
-    // than qpdf's eager analyze() would have captured, where qpdf would
-    // require an explicit invalidateCache() to observe the same mutation. No
-    // current caller holds a warm helper across such a mutation (every
-    // production call site constructs, does one mutation, and drops), so
-    // this is not yet observable -- worth closing before one does.
-    pub fn new(pdf: &'a mut Pdf<R>) -> Self {
-        Self { pdf, cache: None }
+    /// Create a new helper borrowing `pdf` mutably and eagerly build qpdf's
+    /// annotation/field cache.
+    ///
+    /// qpdf's `QPDFAcroFormDocumentHelper` constructor calls `analyze()`
+    /// before returning (`QPDFAcroFormDocumentHelper.cc:14-21`) so callers
+    /// observe a stable snapshot until [`Self::invalidate_cache`] is called.
+    /// Rust exposes the same fallible boundary as `Result` because lazy
+    /// resolver and page-walk failures cannot be represented by an infallible
+    /// constructor without a compatibility sentinel or panic.
+    pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
+        let mut helper = Self { pdf, cache: None };
+        helper.analyze()?;
+        Ok(helper)
     }
 
     /// Invalidate the cached field/annotation associations.
@@ -443,18 +440,46 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         // qpdf's orphan-widget fallback walks the canonical page annotation
         // route and associates an otherwise-unreachable widget with itself.
-        // Keep direct annotations here: their live identity is the only stable
-        // key available, and qpdf's handle-native route also retains them.
-        for page_ref in crate::pages::page_refs(self.pdf)? {
-            let widgets = {
-                let mut page = PageObjectHelper::new(page_ref, self.pdf);
-                page.get_annotation_handles(Some(b"/Widget"))?
-            };
-            for annotation in widgets {
-                let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
-                let identity = annotation.identity_key();
-                if !cache.annotation_to_field.contains_key(&identity) {
-                    record_association(&mut cache, annotation.clone(), annotation);
+        // QPDF::getAllPages returns an empty vector when the catalog has no
+        // `/Pages` entry, so do not route that malformed-but-readable shape
+        // through flpdf's stricter public `page_refs` missing-key error.
+        let pages = self
+            .pdf
+            .root_ref()
+            .map(|root_ref| self.pdf.get_object_handle(root_ref))
+            .map(|root| root.try_get_key(b"/Pages"))
+            .transpose()?;
+        if let Some(pages) = pages {
+            // `QPDF::getAllPages` only enters its page walk when `/Pages`
+            // has `/Kids`; `try_has_key` also preserves qpdf's type warning
+            // and empty-result behavior for a non-dictionary `/Pages` value.
+            if !pages.is_null() && pages.try_has_key(b"/Kids")? {
+                // `crate::pages::page_refs` requires `/Pages` to be an
+                // indirect reference (`PageWalk::with_max_depth`); qpdf's own
+                // `getAllPages` has no such requirement. A malformed-but-
+                // readable catalog that embeds `/Pages` directly must not
+                // fail this eager `analyze()` (and so take down unrelated
+                // AcroForm operations like `fields`/`has_acro_form`) just
+                // because the stricter public helper can't walk it -- treat
+                // it the same as the "no `/Pages`" case above and skip the
+                // orphan-widget fallback.
+                let page_refs = match crate::pages::page_refs(self.pdf) {
+                    Ok(page_refs) => page_refs,
+                    Err(Error::Missing("/Pages")) => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                for page_ref in page_refs {
+                    let widgets = {
+                        let mut page = PageObjectHelper::new(page_ref, self.pdf);
+                        page.get_annotation_handles(Some(b"/Widget"))?
+                    };
+                    for annotation in widgets {
+                        let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
+                        let identity = annotation.identity_key();
+                        if !cache.annotation_to_field.contains_key(&identity) {
+                            record_association(&mut cache, annotation.clone(), annotation);
+                        }
+                    }
                 }
             }
         }
@@ -687,7 +712,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// duplication and geometry transform as [`Self::transform_annotations`].
     ///
     /// `copy_foreign_object` owns the source-to-target graph copy and keeps
-    /// source identity stable across the field-tree and annotation passes.
+    /// source identity stable across the field-tree and annotation work in
+    /// the same per-annotation transform loop.
     /// Source/destination `/DA` and `/Q` defaults are reconciled by pinning
     /// the source value onto a copied field that has no explicit value of
     /// its own, matching qpdf's `adjustInheritedFields`. This slice also
@@ -702,32 +728,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         source: &mut Pdf<RS>,
     ) -> Result<AnnotationTransformResult> {
         let mut transformed = AnnotationTransformResult::default();
-        let (source_defaults, source_annotations) = {
-            let mut source_helper = AcroFormDocumentHelper::new(source);
-            let source_defaults = source_helper.canonical_acroform_defaults()?;
-            let old_annots = source_helper
-                .pdf
-                .resolve_object_handle_to_terminal(&old_annots)?;
-            let Some(annotations) = old_annots.try_as_array()? else {
-                return Ok(transformed);
-            };
-            let mut source_annotations = Vec::with_capacity(annotations.len());
-            for annotation in annotations {
-                let annotation = source_helper
-                    .pdf
-                    .resolve_object_handle_to_terminal(&annotation)?;
-                if annotation.as_stream_dict().is_some() {
-                    annotation.warn_if_possible("ignoring annotation that's a stream")?;
-                    continue;
-                }
-                let top_field = source_helper
-                    .canonical_field_for_annotation(annotation.clone())?
-                    .map(|field| source_helper.canonical_top_level_field(field))
-                    .transpose()?;
-                source_annotations.push((annotation, top_field));
-            }
-            (source_defaults, source_annotations)
+        let mut source_helper = AcroFormDocumentHelper::new(source)?;
+        let source_defaults = source_helper.canonical_acroform_defaults()?;
+        let old_annots = source_helper
+            .pdf
+            .resolve_object_handle_to_terminal(&old_annots)?;
+        let Some(annotations) = old_annots.try_as_array()? else {
+            return Ok(transformed);
         };
+        // Snapshot only the annotation array handles. qpdf resolves the
+        // field association and starts copying each annotation in one loop;
+        // do not pre-survey all top fields in a separate pass.
+        let annotations = annotations.to_vec();
         let target_defaults = self.canonical_acroform_defaults()?;
         let inherited_overrides = InheritedFieldOverrides {
             override_da: source_defaults.default_appearance != target_defaults.default_appearance,
@@ -755,17 +767,29 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut orig_to_copy = HashMap::<ObjectHandleIdentity, ObjectHandle>::new();
         let mut copied_field_trees = HashSet::<ObjectHandleIdentity>::new();
         let mut added_new_fields = BTreeSet::new();
-        for (source_annotation, source_top_field) in source_annotations {
-            let source_annotation = ensure_foreign_indirect(source, source_annotation)?;
+        for annotation in annotations {
+            let source_annotation = source_helper
+                .pdf
+                .resolve_object_handle_to_terminal(&annotation)?;
+            if source_annotation.as_stream_dict().is_some() {
+                source_annotation.warn_if_possible("ignoring annotation that's a stream")?;
+                continue;
+            }
+            let source_top_field = source_helper
+                .canonical_field_for_annotation(source_annotation.clone())?
+                .map(|field| source_helper.canonical_top_level_field(field))
+                .transpose()?;
+            let source_annotation = ensure_foreign_indirect(source_helper.pdf, source_annotation)?;
 
             if let Some(source_top_field) = source_top_field {
-                let source_top_field = ensure_foreign_indirect(source, source_top_field)?;
+                let source_top_field =
+                    ensure_foreign_indirect(source_helper.pdf, source_top_field)?;
                 let copied_source_top = self.pdf.copy_foreign_object(&source_top_field)?;
                 if copied_field_trees.insert(copied_source_top.identity_key()) {
                     if foreign_resources.is_none() {
                         foreign_resources = Some(self.prepare_foreign_resource_plan(
                             source_defaults.resources.clone(),
-                            source,
+                            source_helper.pdf,
                         )?); // cov:ignore: LLVM maps this multiline resource-plan call to a defensive continuation edge
                     }
                     let copied_top = self.copy_field_tree_with_overrides(
@@ -819,10 +843,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         if let Some(copied) = orig_to_copy.get(&identity) {
             return Ok(Some(copied.clone()));
         }
-        if source.as_stream_dict().is_some() {
-            source.warn_if_possible("ignoring annotation that's a stream")?;
-            return Ok(None);
-        }
         let copied = self
             .pdf
             .make_indirect_object_handle(source.shallow_copy()?)?;
@@ -841,10 +861,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             let parent = self
                 .pdf
                 .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
-            if parent.is_null() || parent.as_dictionary().is_none() {
+            if parent.is_null() {
                 return Ok(current);
             }
             current = parent;
+            // qpdf's `getKeyIfDict` checks only whether the receiver is null;
+            // a non-dictionary parent is followed once, emits the normal
+            // dictionary type warning from `getKey`, and is returned as the
+            // top-level handle (`QPDFFormFieldObjectHelper.cc:36-47`).
+            if current.as_dictionary().is_none() {
+                let _ = current.try_get_key(b"/Parent")?;
+                return Ok(current);
+            }
         }
     }
 
@@ -901,12 +929,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             if let Some(kids) = kids_holder.try_as_array()? {
                 for (index, kid) in kids.into_iter().enumerate() {
                     let kid = self.pdf.resolve_object_handle_to_terminal(&kid)?;
-                    if kid.as_stream_dict().is_some() {
-                        kid.warn_if_possible("ignoring AcroForm field that's a stream")?;
-                        continue;
-                    }
                     let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
-                        continue; // cov:ignore: copy_transform_object returns None only for streams filtered immediately above
+                        continue; // cov:ignore: defensive compatibility arm; stream copies now propagate qpdf's clone error
                     };
                     kids_holder.set_array_item(index, copied_kid.clone())?;
                     self.pdf.mark_object_handle_dirty(&kids_holder)?;
@@ -1411,9 +1435,19 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let field = self.pdf.resolve_object_handle_to_terminal(&field)?;
         let Some(field_ref) = field.object_ref() else {
+            field.warn_if_possible(
+                "encountered a direct object as a field or annotation while traversing /AcroForm; ignoring field or annotation",
+            )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
             return Ok(());
         };
-        if field.as_dictionary().is_none() || !visited.insert(field_ref) {
+        if field.as_dictionary().is_none() {
+            field.warn_if_possible(
+                "encountered a non-dictionary as a field or annotation while traversing /AcroForm; ignoring field or annotation",
+            )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
+            return Ok(());
+        }
+        if !visited.insert(field_ref) {
+            field.warn_if_possible("loop detected while traversing /AcroForm")?;
             return Ok(());
         }
 
@@ -1452,9 +1486,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(())
     }
 
-    /// Walk `/Parent` from `start` up to the top-level field — the node with
-    /// no `/Parent`, or whose `/Parent` does not resolve to a dictionary via
-    /// an indirect reference.
+    /// Walk `/Parent` from `start` up to qpdf's top-level field handle.
     ///
     /// Mirrors `QPDFFormFieldObjectHelper::getTopLevelField`
     /// (`libqpdf/QPDFFormFieldObjectHelper.cc:36-47`). This is
@@ -1858,7 +1890,7 @@ impl FieldInheritance {
 
 impl<R: Read + Seek> Pdf<R> {
     /// Return a high-level AcroForm helper for this document.
-    pub fn acroform(&mut self) -> AcroFormDocumentHelper<'_, R> {
+    pub fn acroform(&mut self) -> Result<AcroFormDocumentHelper<'_, R>> {
         AcroFormDocumentHelper::new(self)
     }
 }
@@ -2564,7 +2596,7 @@ mod tests {
             ])),
         );
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let map = helper.annotation_to_field_map().unwrap();
         assert_eq!(map.get(&ObjectRef::new(7, 0)), Some(&ObjectRef::new(7, 0)));
         // `annotation_to_field` maps a separated widget with its own
@@ -2600,6 +2632,7 @@ mod tests {
         );
         // Must terminate rather than looping forever.
         let top = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .get_top_level_field(ObjectRef::new(5, 0))
             .unwrap();
         assert!(top == ObjectRef::new(5, 0) || top == ObjectRef::new(6, 0));
@@ -2622,9 +2655,108 @@ mod tests {
         pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
 
         let top = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .get_top_level_field(ObjectRef::new(5, 0))
             .unwrap();
         assert_eq!(top, ObjectRef::new(6, 0));
+    }
+
+    #[test]
+    fn canonical_top_level_field_keeps_qpdfs_non_dictionary_parent() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(6, 0)))])),
+        );
+        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
+
+        let field = pdf.get_object_handle(ObjectRef::new(5, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        let top = helper
+            .canonical_top_level_field(field)
+            .expect("non-dictionary parent is a qpdf warning path");
+        assert_eq!(top.object_ref(), Some(ObjectRef::new(6, 0)));
+    }
+
+    #[test]
+    fn constructor_analyzes_before_external_graph_mutation() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[("Pages", Object::Reference(ObjectRef::new(2, 0)))])),
+        );
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+
+        helper.pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Dictionary(dict(&[
+                ("Subtype", Object::Name(b"Widget".to_vec())),
+                ("T", Object::String(b"late".to_vec())),
+            ])),
+        );
+        helper.pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[5]))])),
+                ),
+            ])),
+        );
+
+        assert!(
+            helper
+                .annotation_to_field_map()
+                .expect("eager cache should still be readable")
+                .is_empty(),
+            "qpdf's constructor caches analyze() before later graph mutation"
+        );
+    }
+
+    #[test]
+    fn eager_analyze_warns_and_ignores_a_stream_field_kid() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(2, 0),
+            Object::Dictionary(dict(&[
+                ("Type", Object::Name(b"Pages".to_vec())),
+                ("Kids", Object::Array(Vec::new())),
+                ("Count", Object::Integer(0)),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(1, 0),
+            Object::Dictionary(dict(&[
+                ("Pages", Object::Reference(ObjectRef::new(2, 0))),
+                (
+                    "AcroForm",
+                    Object::Dictionary(dict(&[("Fields", refs(&[7]))])),
+                ),
+            ])),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[(
+                "Kids",
+                Object::Array(vec![Object::Reference(ObjectRef::new(8, 0))]),
+            )])),
+        );
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+        );
+
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        assert!(helper.annotation_to_field_map().unwrap().is_empty());
     }
 
     #[test]
@@ -2670,6 +2802,7 @@ mod tests {
         );
 
         let map = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .annotation_to_field_map()
             .unwrap();
         assert_eq!(map.get(&ObjectRef::new(5, 0)), Some(&ObjectRef::new(5, 0)));
@@ -2713,7 +2846,7 @@ mod tests {
             Object::Dictionary(dict(&[("Subtype", Object::Name(b"Widget".to_vec()))])),
         );
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let map = helper.annotation_to_field_map().unwrap();
         assert!(map.is_empty());
         helper.generate_appearances_if_needed().unwrap();
@@ -2725,6 +2858,7 @@ mod tests {
         let mut pdf = rootless_pdf();
 
         assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
@@ -2733,7 +2867,7 @@ mod tests {
     #[test]
     fn appearance_marker_helpers_without_root_are_noops() {
         let mut pdf = rootless_pdf();
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
 
         assert!(!helper.has_acro_form().unwrap());
         assert!(!helper.get_need_appearances().unwrap());
@@ -2749,6 +2883,7 @@ mod tests {
         );
 
         assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
@@ -2796,6 +2931,7 @@ mod tests {
         }
 
         assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
@@ -2834,6 +2970,7 @@ mod tests {
         );
 
         assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .annotation_to_field_map()
             .unwrap()
             .is_empty());
@@ -2865,6 +3002,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(9, 0), Object::Null);
 
         let map = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .annotation_to_field_map()
             .expect("a malformed indirect /AcroForm must degrade to an empty map, not Err");
         assert!(map.is_empty());
@@ -2894,7 +3032,7 @@ mod tests {
         );
 
         let old_annots = pdf.get_object_handle(ObjectRef::new(6, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let transformed = helper
             .transform_annotations(old_annots, crate::Matrix::new(2.0, 0.0, 0.0, 2.0, 3.0, 4.0))
             .unwrap();
@@ -2983,6 +3121,7 @@ mod tests {
             .expect("page annotations");
 
         let transformed = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .transform_annotations(old_annots, Matrix::default())
             .unwrap();
 
@@ -3009,7 +3148,7 @@ mod tests {
 
         let copied_field_ref = copied_field.object_ref().unwrap();
         {
-            let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+            let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
             helper
                 .add_and_rename_form_fields(vec![copied_field.clone()])
                 .unwrap();
@@ -3052,6 +3191,7 @@ mod tests {
             .map(|field_ref| pdf.get_object_handle(ObjectRef::new(field_ref, 0)))
             .collect();
         AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .add_and_rename_form_fields(copied_fields)
             .unwrap();
 
@@ -3103,6 +3243,7 @@ mod tests {
             .map(|field_ref| pdf.get_object_handle(ObjectRef::new(field_ref, 0)))
             .collect();
         AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .add_and_rename_form_fields(copied_fields)
             .unwrap();
 
@@ -3152,11 +3293,11 @@ mod tests {
         }
 
         let copied = pdf.get_object_handle(ObjectRef::new(7, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         helper
             .update_cached_field(copied.clone())
-            .expect("a cold helper has no cache to update");
-        assert!(helper.cache.is_none());
+            .expect("the eagerly analyzed cache accepts incremental field updates");
+        assert!(helper.cache.is_some());
         helper
             .canonical_annotation_to_field_handles()
             .expect("warm the qpdf name cache");
@@ -3217,7 +3358,7 @@ mod tests {
         );
 
         let copied = pdf.get_object_handle(ObjectRef::new(7, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         helper
             .canonical_annotation_to_field_handles()
             .expect("warm the qpdf name cache");
@@ -3261,7 +3402,7 @@ mod tests {
             );
         }
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         helper
             .canonical_annotation_to_field_handles()
             .expect("warm the qpdf name cache");
@@ -3341,7 +3482,7 @@ mod tests {
             Object::Dictionary(dict(&[("T", Object::String(b"name".to_vec()))])),
         );
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let associations = helper
             .canonical_annotation_to_field_handles()
             .expect("warm the qpdf association and name caches");
@@ -3397,7 +3538,7 @@ mod tests {
         let field_one = pdf.get_object_handle(ObjectRef::new(4, 0));
         let field_two = pdf.get_object_handle(ObjectRef::new(7, 0));
         let annotation = pdf.get_object_handle(ObjectRef::new(9, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
 
         let mut cache = AcroFormCache::default();
         record_association(&mut cache, annotation.clone(), field_one.clone());
@@ -3478,6 +3619,7 @@ mod tests {
 
         let old_annots = pdf.get_object_handle(ObjectRef::new(10, 0));
         let transformed = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .transform_annotations(old_annots, Matrix::new(2.0, 0.0, 0.0, 2.0, 1.0, 1.0))
             .unwrap();
         let copied = transformed.new_annotations[0].clone();
@@ -3557,6 +3699,7 @@ mod tests {
         let old_annots = pdf.get_object_handle(ObjectRef::new(10, 0));
         let third = 1.0 / 3.0;
         let transformed = AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .transform_annotations(old_annots, Matrix::new(third, 0.0, 0.0, third, 0.0, 0.0))
             .unwrap();
         let copied = transformed.new_annotations[0].clone();
@@ -3580,7 +3723,7 @@ mod tests {
     #[test]
     fn transform_annotations_handles_non_arrays_and_stream_annotations() {
         let mut pdf = empty_pdf();
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
 
         let transformed = helper
             .transform_annotations(
@@ -3605,6 +3748,7 @@ mod tests {
         let mut source = empty_pdf();
         let mut target = empty_pdf();
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(
                 ObjectHandle::name(b"not-an-array".to_vec()),
                 Matrix::default(),
@@ -3616,6 +3760,7 @@ mod tests {
         let stream =
             ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new()));
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(
                 ObjectHandle::array(vec![stream]),
                 Matrix::default(),
@@ -3683,6 +3828,7 @@ mod tests {
         let source_annots = source_annots.try_get_key(b"/Annots").unwrap();
         let mut target = empty_pdf();
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(source_annots, Matrix::default(), &mut source)
             .unwrap();
 
@@ -3699,7 +3845,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_field_tree_handles_cycles_stream_kids_and_unseen_parents() {
+    fn copy_field_tree_handles_cycles_and_unseen_parents() {
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(6, 0),
@@ -3712,10 +3858,27 @@ mod tests {
                 ("Parent", Object::Reference(ObjectRef::new(6, 0))),
                 (
                     "Kids",
-                    Object::Array(vec![
-                        Object::Reference(ObjectRef::new(7, 0)),
-                        Object::Reference(ObjectRef::new(8, 0)),
-                    ]),
+                    Object::Array(vec![Object::Reference(ObjectRef::new(7, 0))]),
+                ),
+            ])),
+        );
+
+        let top = pdf.get_object_handle(ObjectRef::new(7, 0));
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        let copied = helper.copy_field_tree(&top, &mut HashMap::new()).unwrap();
+        assert!(copied.object_ref().is_some());
+    }
+
+    #[test]
+    fn copy_field_tree_propagates_qpdf_stream_clone_error_for_a_stream_kid() {
+        let mut pdf = empty_pdf();
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(dict(&[
+                ("T", Object::String(b"top".to_vec())),
+                (
+                    "Kids",
+                    Object::Array(vec![Object::Reference(ObjectRef::new(8, 0))]),
                 ),
             ])),
         );
@@ -3725,9 +3888,14 @@ mod tests {
         );
 
         let top = pdf.get_object_handle(ObjectRef::new(7, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
-        let copied = helper.copy_field_tree(&top, &mut HashMap::new()).unwrap();
-        assert!(copied.object_ref().is_some());
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        let error = helper
+            .copy_field_tree(&top, &mut HashMap::new())
+            .expect_err("qpdf shallowCopy must reject a stream kid");
+        assert!(matches!(
+            error,
+            Error::System(ref message) if message == "stream objects cannot be cloned"
+        ));
     }
 
     #[test]
@@ -3744,11 +3912,14 @@ mod tests {
             Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(5, 0)))])),
         );
         let field = pdf.get_object_handle(ObjectRef::new(5, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
-        assert!(helper
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        let error = helper
             .copy_transform_object(&stream, &mut HashMap::new())
-            .unwrap()
-            .is_none());
+            .expect_err("qpdf shallowCopy must reject a stream");
+        assert!(matches!(
+            error,
+            Error::System(ref message) if message == "stream objects cannot be cloned"
+        ));
         assert!(helper
             .canonical_top_level_field(field)
             .unwrap()
@@ -3790,7 +3961,7 @@ mod tests {
             b"/T".to_vec(),
             ObjectHandle::string(b"field".to_vec()),
         )]);
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         helper
             .add_and_rename_form_fields(vec![first.clone(), first.clone(), second.clone()])
             .unwrap();
@@ -3839,6 +4010,7 @@ mod tests {
         let field =
             ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(utf16_name))]);
         AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .add_and_rename_form_fields(vec![field.clone()])
             .unwrap();
 
@@ -3860,6 +4032,7 @@ mod tests {
     fn add_and_rename_form_fields_empty_input_is_a_noop() {
         let mut pdf = empty_pdf();
         AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .add_and_rename_form_fields(Vec::new())
             .unwrap();
     }
@@ -3883,7 +4056,7 @@ mod tests {
             b"/T".to_vec(),
             ObjectHandle::string(b"field".to_vec()),
         )]);
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         helper.add_and_rename_form_fields(Vec::new()).unwrap();
         let created = helper.canonical_get_or_create_acroform().unwrap();
         assert!(created.object_ref().is_some());
@@ -3914,6 +4087,7 @@ mod tests {
             ObjectHandle::string(b"field".to_vec()),
         )]);
         AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .add_and_rename_form_fields(vec![field])
             .unwrap();
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
@@ -3937,7 +4111,7 @@ mod tests {
             b"/T".to_vec(),
             ObjectHandle::string(b"field".to_vec()),
         )]);
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         helper.add_form_fields(Vec::new()).unwrap();
         helper.add_form_fields(vec![field.clone()]).unwrap();
         drop(helper);
@@ -3963,6 +4137,7 @@ mod tests {
         );
         let replacement_field = ObjectHandle::dictionary(Vec::new());
         AcroFormDocumentHelper::new(&mut malformed)
+            .unwrap()
             .add_form_fields(vec![replacement_field.clone()])
             .unwrap();
         let root = malformed.get_object_handle(ObjectRef::new(1, 0));
@@ -3994,7 +4169,7 @@ mod tests {
         );
         let child = pdf.get_object_handle(ObjectRef::new(6, 0));
         {
-            let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+            let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
             assert_eq!(
                 helper.canonical_fully_qualified_name(child).unwrap(),
                 "root.child"
@@ -4017,6 +4192,7 @@ mod tests {
         );
         let cyclic = pdf.get_object_handle(ObjectRef::new(7, 0));
         assert!(!AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .canonical_fully_qualified_name(cyclic)
             .unwrap()
             .is_empty());
@@ -4147,6 +4323,7 @@ mod tests {
 
         let mut target = empty_pdf();
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(
                 source_annots,
                 Matrix::new(2.0, 0.0, 0.0, 2.0, 3.0, 4.0),
@@ -4252,6 +4429,7 @@ mod tests {
         );
 
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(source_annots, Matrix::default(), &mut source)
             .unwrap();
         let copied_field = &transformed.new_fields[0];
@@ -4340,6 +4518,7 @@ mod tests {
         );
 
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(source_annots, Matrix::default(), &mut source)
             .unwrap();
         let copied_field = &transformed.new_fields[0];
@@ -4464,6 +4643,7 @@ mod tests {
         );
 
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(source_annots, Matrix::default(), &mut source)
             .unwrap();
         let copied_field = &transformed.new_fields[0];
@@ -4590,6 +4770,7 @@ mod tests {
         );
 
         let transformed = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .transform_annotations_from(source_annots, Matrix::default(), &mut source)
             .unwrap();
         let copied_field = &transformed.new_fields[0];
@@ -4611,7 +4792,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_field_tree_skips_stream_kids() {
+    fn copy_field_tree_rejects_stream_kids() {
         let mut pdf = empty_pdf();
         pdf.set_object(
             ObjectRef::new(5, 0),
@@ -4624,15 +4805,14 @@ mod tests {
         pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(Dictionary::new()));
 
         let top = pdf.get_object_handle(ObjectRef::new(5, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
-        let copied = helper.copy_field_tree(&top, &mut HashMap::new()).unwrap();
-        let kids = copied
-            .try_get_key(b"/Kids")
-            .unwrap()
-            .try_as_array()
-            .unwrap()
-            .unwrap();
-        assert_eq!(kids.len(), 2);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        let error = helper
+            .copy_field_tree(&top, &mut HashMap::new())
+            .expect_err("qpdf stream cloning must fail");
+        assert!(matches!(
+            error,
+            Error::System(ref message) if message == "stream objects cannot be cloned"
+        ));
     }
 
     #[test]
@@ -4648,7 +4828,7 @@ mod tests {
             destination_resources: destination_resources.clone(),
             renames,
         };
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
 
         let field = ObjectHandle::dictionary(vec![
             (b"/DR".to_vec(), ObjectHandle::dictionary(Vec::new())),
@@ -4718,7 +4898,7 @@ mod tests {
             destination_resources,
             renames,
         };
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
 
         // UTF-16BE (with BOM) encoding of "/Fsrc 10 Tf".
         let utf16_da: Vec<u8> = vec![
@@ -4740,7 +4920,7 @@ mod tests {
     #[test]
     fn canonical_acroform_resources_reuse_indirect_promote_direct_or_create() {
         let mut pdf = empty_pdf();
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let indirect_dr = helper
             .pdf
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
@@ -4767,7 +4947,7 @@ mod tests {
                 Object::Dictionary(dict(&[("DR", Object::Dictionary(Dictionary::new()))])),
             )])),
         );
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let promoted = helper.canonical_get_or_create_acroform_resources().unwrap();
         assert!(promoted.object_ref().is_some());
         drop(helper);
@@ -4780,7 +4960,7 @@ mod tests {
                 Object::Dictionary(dict(&[("Fields", Object::Array(Vec::new()))])),
             )])),
         );
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let created = helper.canonical_get_or_create_acroform_resources().unwrap();
         assert!(created.object_ref().is_some());
         assert!(created.as_dictionary().is_some());
@@ -4813,6 +4993,7 @@ mod tests {
         )]);
         let mut source = empty_pdf();
         let plan = AcroFormDocumentHelper::new(&mut target)
+            .unwrap()
             .prepare_foreign_resource_plan(Some(source_resources), &mut source)
             .unwrap();
 
@@ -4851,7 +5032,7 @@ mod tests {
         let cycle = pdf.get_object_handle(ObjectRef::new(7, 0));
         let leaf = ObjectHandle::dictionary(Vec::new());
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         assert!(helper.field_has_explicit_value(&parented, b"/DA").unwrap());
         assert!(!helper
             .field_has_explicit_value(&parented, b"/Missing")
@@ -4899,7 +5080,7 @@ mod tests {
         );
 
         let field = pdf.get_object_handle(ObjectRef::new(5, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         assert_eq!(
             helper.effective_field_appearance(&field).unwrap(),
             b"/FAcro 10 Tf".to_vec()
@@ -4935,7 +5116,7 @@ mod tests {
         );
 
         let field = pdf.get_object_handle(ObjectRef::new(5, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         assert_eq!(helper.effective_field_quadding(&field).unwrap(), 2);
     }
 
@@ -4973,7 +5154,7 @@ mod tests {
 
         let direct_null = pdf.get_object_handle(ObjectRef::new(5, 0));
         let indirect_null = pdf.get_object_handle(ObjectRef::new(8, 0));
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         for field in [&direct_null, &indirect_null] {
             assert_eq!(
                 helper.effective_field_appearance(field).unwrap(),
@@ -4992,6 +5173,7 @@ mod tests {
         );
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
+                .unwrap()
                 .get_field_for_annotation(ObjectRef::new(5, 0))
                 .unwrap(),
             None
@@ -5004,6 +5186,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(dict(&[])));
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
+                .unwrap()
                 .get_field_for_annotation(ObjectRef::new(5, 0))
                 .unwrap(),
             None
@@ -5040,6 +5223,7 @@ mod tests {
         );
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
+                .unwrap()
                 .get_field_for_annotation(ObjectRef::new(7, 0))
                 .unwrap(),
             Some(ObjectRef::new(7, 0))
@@ -5081,6 +5265,7 @@ mod tests {
         );
         assert_eq!(
             AcroFormDocumentHelper::new(&mut pdf)
+                .unwrap()
                 .get_field_for_annotation(ObjectRef::new(7, 0))
                 .unwrap(),
             Some(ObjectRef::new(7, 0))
@@ -5096,6 +5281,7 @@ mod tests {
         )]);
 
         assert!(AcroFormDocumentHelper::new(&mut pdf)
+            .unwrap()
             .canonical_field_for_annotation(annotation)
             .unwrap()
             .is_none());
@@ -5137,7 +5323,7 @@ mod tests {
             ])),
         );
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         let associations = helper
             .canonical_annotation_to_field_handles()
             .expect("canonical handle association analysis");
@@ -5188,7 +5374,7 @@ mod tests {
             ])),
         );
 
-        let mut helper = AcroFormDocumentHelper::new(&mut pdf);
+        let mut helper = AcroFormDocumentHelper::new(&mut pdf).unwrap();
         assert_eq!(
             helper
                 .canonical_annotation_to_field_handles()

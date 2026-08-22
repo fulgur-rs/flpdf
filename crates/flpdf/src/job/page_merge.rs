@@ -502,9 +502,9 @@ struct PrimaryAcroForm {
 /// The `/DR` / `/DA` values are returned verbatim (still in the source's
 /// numbering); [`build_merged_acroform`] remaps them after the copy.
 fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<PrimaryAcroForm> {
-    let entries = source.acroform().acroform_inherited_entries()?;
+    let entries = source.acroform()?.acroform_inherited_entries()?;
     let mut out = PrimaryAcroForm {
-        had_fields_array: source.acroform().has_fields_array()?,
+        had_fields_array: source.acroform()?.has_fields_array()?,
         ..Default::default()
     };
     // One shared `seen` across /DR and /DA so a font referenced by both is
@@ -541,7 +541,7 @@ fn discover_primary_acroform<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Prim
 pub(crate) fn source_top_level_field_names<R: Read + Seek>(
     source: &mut Pdf<R>,
 ) -> Result<Vec<(ObjectRef, Option<Vec<u8>>)>> {
-    let top_fields = source.acroform().top_level_fields()?;
+    let top_fields = source.acroform()?.top_level_fields()?;
     let mut out = Vec::with_capacity(top_fields.len());
     for field_ref in top_fields {
         // A top-level `/Fields` element may be a holder chain (a ref to a ref to
@@ -637,7 +637,7 @@ fn build_merged_acroform<R: Read + Seek>(
         return Ok(());
     }
 
-    let acroform = target.acroform().canonical_get_or_create_acroform()?;
+    let acroform = target.acroform()?.canonical_get_or_create_acroform()?;
     if acroform.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: ensure_acroform_ref always yields a dictionary
     }

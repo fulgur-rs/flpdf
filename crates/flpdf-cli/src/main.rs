@@ -3449,7 +3449,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
 /// Route `--generate-appearances` through qpdf's
 /// `QPDFAcroFormDocumentHelper::generateAppearancesIfNeeded` boundary.
 fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    AcroFormDocumentHelper::new(pdf).generate_appearances_if_needed()?;
+    AcroFormDocumentHelper::new(pdf)?.generate_appearances_if_needed()?;
     Ok(())
 }
 

@@ -116,7 +116,7 @@ impl QPDFJob {
         })?);
         // cov:ignore-end
         let has_page_labels = source.page_labels().has_page_labels()?;
-        let has_acro_form = source.acroform().has_acro_form()?;
+        let has_acro_form = source.acroform()?.has_acro_form()?;
         let source_version =
             crate::parse_pdf_version(source.version()).map(|version| version.get_version().0);
         let source_extension_level = source.adobe_extension_level().unwrap_or(0);
@@ -764,9 +764,9 @@ mod tests {
         let mut first = Pdf::open_mem_owned(std::fs::read(&written[0]).unwrap()).unwrap();
         let mut second = Pdf::open_mem_owned(std::fs::read(&written[1]).unwrap()).unwrap();
         let mut third = Pdf::open_mem_owned(std::fs::read(&written[2]).unwrap()).unwrap();
-        assert!(!first.acroform().has_acro_form().unwrap());
-        assert!(second.acroform().has_acro_form().unwrap());
-        assert_eq!(second.acroform().fields().unwrap().len(), 1);
+        assert!(!first.acroform().unwrap().has_acro_form().unwrap());
+        assert!(second.acroform().unwrap().has_acro_form().unwrap());
+        assert_eq!(second.acroform().unwrap().fields().unwrap().len(), 1);
         assert_eq!(first_page_annotation_count(&mut first), 0);
         assert_eq!(first_page_annotation_count(&mut second), 1);
         assert_eq!(first_page_annotation_count(&mut third), 1);

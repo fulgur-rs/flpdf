@@ -982,7 +982,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let old_annots = page.try_get_key(b"/Annots")?;
         if old_annots.try_as_array()?.is_some() {
             let transformed = {
-                let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+                let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
                 let transformed = acroform.transform_annotations(old_annots, matrix)?;
                 acroform.remove_form_fields(&transformed.old_fields)?;
                 acroform.add_form_fields(transformed.new_fields.clone())?;
@@ -1025,7 +1025,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
             let transformed = acroform.transform_annotations(old_annots, cm)?;
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
@@ -1075,7 +1075,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
             let transformed =
                 acroform.transform_annotations_from(old_annots, Matrix::default(), source)?;
             acroform.add_and_rename_form_fields_with_reserved_names(
@@ -1108,7 +1108,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf);
+            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
             let transformed = acroform.transform_annotations_from(old_annots, cm, source)?;
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
