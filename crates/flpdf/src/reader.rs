@@ -1032,6 +1032,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.last_xref_form
     }
 
+    /// Return qpdf's xref-parser-owned `first_xref_item_offset` used by the
+    /// linearization `/T` check.
+    pub(crate) fn first_xref_item_offset(&self) -> u64 {
+        self.first_xref_item_offset
+    }
+
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.resolver.source_xref_entries()
     }

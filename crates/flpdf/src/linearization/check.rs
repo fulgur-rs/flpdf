@@ -16,7 +16,7 @@
 //! | `/O`  | Refers to an existing object whose dict contains `/Type /Page` |
 //! | `/H`  | `H[0]` byte offset exists and the stream there is FlateDecode-decodable |
 //! | `/E`  | Value is less than the file length (first-page section is bounded) |
-//! | `/T`  | Byte offset has the `xref` keyword |
+//! | `/T`  | Whitespace from the byte offset reaches qpdf's first xref item |
 //!
 //! # Exit semantics (used by CLI)
 //!
@@ -413,9 +413,8 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
 /// not a non-negative integer, `/O` does not fit in `u32` or does not refer to
 /// a Page object, `/L` does not equal the file length, `/N` does not equal the
 /// page count, `/E` is not less than the file length, `/H` is malformed or out
-/// of bounds, the hint stream cannot be located or decoded, or `/T` does not
-/// fall within the last cross-reference section (no `xref` keyword in the
-/// backscan window and no `/Type /XRef` stream at the `/T` target).
+/// of bounds, the hint stream cannot be located or decoded, or strict `/T`
+/// position comparison reports a mismatch against the xref parser's first item.
 ///
 /// Returns [`LinearizationCheckError::Io`] when resolving an object via `pdf`
 /// or enumerating the page references fails.
@@ -670,181 +669,38 @@ fn check_linearization_inner<R: Read + Seek>(
     }
 
     // -----------------------------------------------------------------------
-    // 5. /T must be within the last cross-reference *section*.
-    //
-    // Different PDF producers use slightly different /T conventions:
-    // - ISO 32000-1 Annex F: /T = byte offset of the xref keyword itself
-    // - qpdf convention: /T = byte offset just before the first xref entry
-    //   (i.e. offset of the last '\n' in the "xref\n0 N\n" header)
-    // - cross-reference *stream* (ObjStm-bearing / split-xref linearized
-    //   output, flpdf-9hc.5.8.4): there is no `xref` keyword at all — the
-    //   cross-reference data lives in an indirect XRef stream object and /T
-    //   points at that object's `<num> <gen> obj` header (the first-page xref
-    //   stream the main xref's `/Prev` chains back to).
-    //
-    // We accept either form: a classic `xref` keyword reachable by a short
-    // backscan, OR an XRef stream object header at the /T target.
-    //
-    // qpdf checks /T before /E (`QPDF_linearization.cc:452-470` runs before
-    // the `/E` check at `:496-524`); this checker follows the same order so
-    // that a file with both a /T and an /E mismatch reports them in qpdf's
-    // order.
+    // 5. /T must point at the whitespace immediately before the first xref
+    // item. qpdf's xref parser records that item offset while loading the
+    // section (`QPDF.cc:845-869,1110-1120`); checkLinearizationInternal then
+    // only seeks to `/T`, skips PDF whitespace, and compares positions
+    // (`QPDF_linearization.cc:452-470`).
     // -----------------------------------------------------------------------
     let t_obj = first_obj
         .try_get_key(b"/T")
         .map_err(LinearizationCheckError::from)?;
     let t_val = as_u64(&t_obj, "T")?;
-    // /T must fit in the platform's `usize` (matters on 32-bit targets where
-    // `u64 as usize` would silently truncate) and must leave at least 4 bytes
-    // before EOF for the `xref` keyword.  Use checked_add to avoid wrap-around
-    // overflow surprises in release builds.
-    let t_usize = usize::try_from(t_val).map_err(|_| LinearizationCheckError::InvalidParam {
-        message: format!("/T ({t_val}) does not fit in platform usize"),
-    })?;
-    if t_usize
-        .checked_add(4)
-        .is_none_or(|end| end > file_bytes.len())
-    {
-        fail!("/T ({t_val}) is too close to end of file to contain xref keyword");
+    // qpdf's xref parser already recorded the comparison target. Do not
+    // rediscover xref syntax from file bytes here: qpdf's /T check only seeks
+    // to /T, skips whitespace, and compares positions.
+    let mut file_cursor = t_val;
+    if t_val < file_bytes.len() as u64 {
+        let mut cursor = t_val as usize;
+        while cursor < file_bytes.len() && is_pdf_whitespace(file_bytes[cursor]) {
+            cursor += 1;
+        }
+        file_cursor = cursor as u64;
     }
-    // qpdf-deviation-start: no structural search below has a qpdf counterpart.
-    // qpdf's own /T check (`QPDF_linearization.cc:452-470`) only seeks to the
-    // already-known `p.xref_zero_offset`, skips PDF whitespace, and compares
-    // the resulting position against `first_xref_item_offset` -- a value
-    // established during xref parsing (`QPDF.cc:845-869`), long before this
-    // function runs. It never searches for the `xref` keyword, never parses a
-    // subsection header, and never throws from this check. This checker has
-    // no equivalent "offset of the first xref entry, established during xref
-    // parsing" value threaded through to here, so it re-derives an
-    // equivalent position with a local backscan instead; a backscan failure
-    // (no `xref` keyword found, a malformed subsection header, or a /T target
-    // that is not a `/Type /XRef` stream header) is therefore an flpdf-only
-    // failure mode with no qpdf counterpart, and reports as a hard
-    // `InvalidParam` error rather than a soft warning even when
-    // `collect_soft_warnings` is set. Tracked in flpdf-4g14.2 for threading a
-    // real `first_xref_item_offset` through from xref parsing, which would
-    // let this become a pure position compare with no local failure mode.
-    // Allow /T to fall anywhere inside the cross-reference section header.
-    // The window covers both ISO convention (/T = xref keyword) and
-    // qpdf convention (/T = first_entry_pos - 1, ~= xref + header_len - 1).
-    // 32 bytes is enough for `xref\n0 N\n` headers up to u32-sized object
-    // counts (up to 10 decimal digits).
-    const T_BACKSCAN_WINDOW: usize = 32;
-    let search_start = t_usize.saturating_sub(T_BACKSCAN_WINDOW);
-    // Extend the window 3 bytes past `t_usize` so a `/T` that points exactly
-    // at the start of `xref` (Annex F convention) can still find all four
-    // bytes of the keyword in the slice.
-    let window_end = (t_usize + 4).min(file_bytes.len());
-    let window = &file_bytes[search_start..window_end];
-    // Match `xref` only as a standalone token (whitespace-bounded).  A naive
-    // substring search would false-positively match the `xref` inside the
-    // `startxref` keyword which sits in the trailer near the end of the file.
-    // Boundary checks use absolute `file_bytes` positions so the slice edges
-    // are not mistaken for file boundaries.
-    let xref_pos = window.windows(4).enumerate().find_map(|(i, w)| {
-        if w != b"xref" {
-            return None;
-        }
-        let absolute = search_start + i;
-        let prev_ok = absolute == 0 || is_pdf_whitespace(file_bytes[absolute - 1]);
-        let next = absolute + 4;
-        let next_ok = next >= file_bytes.len() || is_pdf_whitespace(file_bytes[next]);
-        if prev_ok && next_ok {
-            Some(absolute)
+    let computed = pdf.first_xref_item_offset();
+    if file_cursor != computed {
+        let message = format!(
+            "space before first xref item (/T) mismatch (computed = {computed}; file = {file_cursor}"
+        );
+        if collect_soft_warnings {
+            warnings.push(message);
         } else {
-            None
-        }
-    });
-    if let Some(xref_pos) = xref_pos {
-        // Tighten: /T must lie inside the xref subsection header itself
-        // (`xref\n<start> <count>\n`), i.e. in `[xref_pos, first_entry_pos)`.
-        // Without this, a /T that lands in the middle of the first xref entry
-        // (or further into the table) would silently pass.
-        let first_entry_pos =
-            parse_xref_first_entry_pos(file_bytes, xref_pos).ok_or_else(|| {
-                LinearizationCheckError::InvalidParam {
-                    message: format!(
-                        "/T ({t_val}) backscan found `xref` at byte {xref_pos}, but the \
-                         subsection header (`<start> <count>\\n`) is malformed or truncated"
-                    ),
-                }
-            })?;
-        if t_usize < xref_pos || t_usize >= first_entry_pos {
-            fail!(
-                "/T ({t_val}) is outside the xref subsection header range \
-                 [{xref_pos}, {first_entry_pos}) — must point at the `xref` keyword \
-                 or inside its subsection header line, not into the entries"
-            );
-        }
-
-        // qpdf seeks to /T and consumes only PDF whitespace before comparing the
-        // resulting position with its exact `first_xref_item_offset`
-        // (`QPDF_linearization.cc:452-470`, populated by `QPDF.cc:845-869`).  A
-        // backscan that merely finds an earlier `xref` keyword would accept a
-        // header position qpdf rejects, so reproduce that cursor movement here.
-        let mut first_entry_cursor = t_usize;
-        while first_entry_cursor < first_entry_pos
-            && is_pdf_whitespace(file_bytes[first_entry_cursor])
-        {
-            first_entry_cursor += 1;
-        }
-        if first_entry_cursor != first_entry_pos {
-            if collect_soft_warnings {
-                warnings.push(format!(
-                    "space before first xref item (/T) mismatch (computed = {first_entry_pos}; file = {first_entry_cursor}"
-                ));
-            } else {
-                fail!(
-                    "/T ({t_val}) does not point at the whitespace immediately before the \
-                     first xref item ({first_entry_pos})"
-                );
-            }
-        }
-    } else {
-        // No classic `xref` keyword: this is a cross-reference *stream* file
-        // (ObjStm-bearing / split-xref linearized output).  /T must point at
-        // an indirect object header whose object is a `/Type /XRef` stream.
-        // The first-page xref stream is emitted before /E and the main xref's
-        // `/Prev` chains back to it, so /T = that object's `<num> <gen> obj`
-        // header offset.
-        let (xref_obj_num, xref_obj_gen) =
-            parse_obj_header_at(&file_bytes[t_usize..]).ok_or_else(|| {
-                LinearizationCheckError::InvalidParam {
-                    message: format!(
-                        "/T ({t_val}) is not within the last cross-reference section \
-                     (no `xref` keyword in the backscan window and no `<num> <gen> obj` \
-                     header at /T for a cross-reference stream)"
-                    ),
-                }
-            })?;
-        // Resolve with the *parsed* generation, not a hardcoded 0: this
-        // checker validates arbitrary linearized PDFs (including third-party
-        // producers), and a cross-reference stream with gen != 0 is
-        // spec-legal — hardcoding 0 would mis-resolve and spuriously reject it.
-        let xref_obj = pdf.get_object_handle(ObjectRef::new(xref_obj_num, xref_obj_gen));
-        xref_obj
-            .try_dereference()
-            .map_err(LinearizationCheckError::from)?;
-        let is_xref_stream = if let Some(xref_dict) = xref_obj.as_stream_dict() {
-            let type_obj = xref_dict
-                .try_get_key(b"/Type")
-                .map_err(LinearizationCheckError::from)?;
-            type_obj
-                .try_dereference()
-                .map_err(LinearizationCheckError::from)?;
-            type_obj.as_name().as_deref() == Some(b"XRef")
-        } else {
-            false
-        };
-        if !is_xref_stream {
-            fail!(
-                "/T ({t_val}) points at object {xref_obj_num} which is not a \
-                 `/Type /XRef` cross-reference stream"
-            );
+            fail!("/T ({t_val}) does not match the first xref item offset ({computed})");
         }
     }
-    // qpdf-deviation-end
-
     // -----------------------------------------------------------------------
     // 6. /E must match the source extent envelope of qpdf's part 6, not merely
     //    be smaller than EOF.
@@ -879,50 +735,6 @@ fn check_linearization_inner<R: Read + Seek>(
     }
 
     Ok(warnings)
-}
-
-/// Given the byte position of an `xref` keyword in `file_bytes`, parse the
-/// first subsection header (`xref\n<start> <count>\n`) and return the byte
-/// position of the *first* entry that follows it.
-///
-/// Returns `None` if the bytes after `xref_pos` do not match the expected
-/// shape `xref\n<digits> <digits>\n` within a small window.
-fn parse_xref_first_entry_pos(file_bytes: &[u8], xref_pos: usize) -> Option<usize> {
-    // Skip past `xref` keyword.
-    let mut i = xref_pos.checked_add(4)?;
-    // Skip the EOL (CR / LF / CRLF) immediately after `xref`.
-    while i < file_bytes.len() && is_pdf_whitespace(file_bytes[i]) {
-        i += 1;
-    }
-    // <start>
-    let digits1_start = i;
-    while i < file_bytes.len() && file_bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == digits1_start {
-        return None;
-    }
-    // single space
-    if i >= file_bytes.len() || file_bytes[i] != b' ' {
-        return None;
-    }
-    i += 1;
-    // <count>
-    let digits2_start = i;
-    while i < file_bytes.len() && file_bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == digits2_start {
-        return None;
-    }
-    // EOL after the header line.
-    if i >= file_bytes.len() || !is_pdf_whitespace(file_bytes[i]) {
-        return None;
-    }
-    while i < file_bytes.len() && is_pdf_whitespace(file_bytes[i]) {
-        i += 1;
-    }
-    Some(i)
 }
 
 /// Resolve and decode the hint stream object at `offset` through the canonical
@@ -2196,7 +2008,7 @@ mod tests {
         assert!(matches!(
             check_linearization_bytes(&non_xref),
             Err(LinearizationCheckError::InvalidParam { ref message })
-                if message.contains("cross-reference stream")
+                    if message.contains("does not match the first xref item offset")
         ));
     }
 
@@ -2249,41 +2061,58 @@ mod tests {
             matches!(
                 result,
                 Err(LinearizationCheckError::InvalidParam { ref message })
-                    if message.contains("is outside the xref subsection header range")
+                    if message.contains("does not match the first xref item offset")
             ),
             "a /T pointing into an xref entry must be rejected: {result:?}"
         );
     }
 
     #[test]
-    fn check_rejects_a_t_value_at_an_xref_keyword_with_a_malformed_subsection_header() {
-        // qpdf has no equivalent of this backscan (see the flpdf-only
-        // block marked above the /T section in check_linearization_inner);
-        // this only tests that flpdf's own
-        // structural search reports a clear error rather than panicking or
-        // silently miscomputing when the bytes right after a found `xref`
-        // keyword do not form a valid `<start> <count>` header line. A
-        // trailing comment after `%%EOF` cannot move any other file offset.
+    fn warning_check_treats_a_malformed_t_backscan_as_a_soft_warning() {
         let mut bytes = linearized_fixture_bytes();
-        // `\n% xref not-a-number\n`: `xref` (the token the backscan matches)
-        // starts 3 bytes after the appended region begins (`\n`, `%`, ` `).
         let appended_region_start = bytes.len();
         bytes.extend_from_slice(b"\n% xref not-a-number\n");
         let malformed_xref_pos = appended_region_start + 3;
-        // `is_linearized` requires /L to match the actual file size
-        // (QPDF_linearization.cc's L check); keep it in sync with the
-        // trailing comment this test appends.
         let new_len = bytes.len();
         replace_parameter_number(&mut bytes, b"/L ", new_len);
         replace_parameter_number(&mut bytes, b"/T ", malformed_xref_pos);
-        let result = check_linearization_bytes(&bytes);
+
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("linearized fixture should open");
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect("qpdf treats an unparseable /T neighborhood as a warning");
         assert!(
-            matches!(
-                result,
-                Err(LinearizationCheckError::InvalidParam { ref message })
-                    if message.contains("malformed or truncated")
-            ),
-            "a /T at an xref keyword with no valid subsection header must be rejected: {result:?}"
+            warnings.iter().any(|message| {
+                message.starts_with("space before first xref item (/T) mismatch")
+            }),
+            "qpdf's /T warning must survive a malformed backscan neighborhood: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warning_check_treats_a_t_offset_beyond_eof_as_a_position_warning() {
+        let mut bytes = linearized_fixture_bytes();
+        replace_parameter_number(&mut bytes, b"/T ", 9999);
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("linearized fixture should open");
+
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect("qpdf does not structurally parse a /T neighborhood");
+        assert!(
+            warnings
+                .iter()
+                .any(|message| message.starts_with("space before first xref item (/T) mismatch")),
+            "the out-of-range /T must remain a position warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn xref_parser_records_qpdf_first_xref_item_offset() {
+        let bytes = linearized_fixture_bytes();
+        let pdf = Pdf::open_mem_owned(bytes).expect("linearized fixture should open");
+
+        assert_eq!(
+            pdf.first_xref_item_offset(),
+            1524,
+            "the xref parser must expose the offset qpdf uses for /T"
         );
     }
 
@@ -2300,7 +2129,7 @@ mod tests {
             matches!(
                 result,
                 Err(LinearizationCheckError::InvalidParam { ref message })
-                    if message.contains("does not point at the whitespace immediately before")
+                    if message.contains("does not match the first xref item offset")
             ),
             "qpdf rejects /T at the xref keyword itself: {result:?}"
         );
@@ -2626,40 +2455,6 @@ mod tests {
     #[test]
     fn parse_obj_header_skips_leading_whitespace() {
         assert_eq!(parse_obj_header_at(b"  \n5 0 obj\n"), Some((5, 0)));
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_xref_first_entry_pos: helper unit tests
-    // -----------------------------------------------------------------------
-    #[test]
-    fn parse_xref_first_entry_pos_basic() {
-        // `xref\n0 4\n` — header is 9 bytes (4 + 1 + 1 + 1 + 1 + 1).
-        let bytes = b"xref\n0 4\n0000000000 65535 f \n";
-        // xref keyword is at position 0; first entry starts after `xref\n0 4\n`.
-        assert_eq!(parse_xref_first_entry_pos(bytes, 0), Some(9));
-    }
-
-    #[test]
-    fn parse_xref_first_entry_pos_with_offset() {
-        // Same header preceded by some prefix bytes.
-        let bytes = b"prefix\nxref\n12 100\n0000000000 ...";
-        let xref_pos = bytes.windows(4).position(|w| w == b"xref").unwrap();
-        // header = `xref\n12 100\n` = 4 + 1 + 6 + 1 = 12 bytes.
-        let expected_first_entry = xref_pos + 12;
-        assert_eq!(
-            parse_xref_first_entry_pos(bytes, xref_pos),
-            Some(expected_first_entry)
-        );
-    }
-
-    #[test]
-    fn parse_xref_first_entry_pos_rejects_malformed() {
-        // No newline after `xref`.
-        assert_eq!(parse_xref_first_entry_pos(b"xrefjunk", 0), None);
-        // No <count>.
-        assert_eq!(parse_xref_first_entry_pos(b"xref\n0\n", 0), None);
-        // Truncated.
-        assert_eq!(parse_xref_first_entry_pos(b"xref\n0 ", 0), None);
     }
 
     // -----------------------------------------------------------------------

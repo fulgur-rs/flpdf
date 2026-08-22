@@ -54,6 +54,9 @@ fn empty_bootstrap_cache() -> SharedBootstrapCache {
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedXrefState {
     pub(crate) loaded: LoadedXref,
+    /// qpdf's `m->first_xref_item_offset`, populated while reading the xref
+    /// section and consumed later by `checkLinearizationInternal`.
+    pub(crate) first_xref_item_offset: u64,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
     /// Objects resolved while reading xref streams stay available to the
@@ -1420,7 +1423,7 @@ fn parse_xref_from_start(
         .is_some_and(|tail| tail.starts_with(b"xref"))
     {
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
-        let (entries, trailer, trailer_diagnostics) =
+        let (entries, trailer, trailer_diagnostics, first_xref_item_offset) =
             parse_xref_table(&mut cursor, bytes, error_diagnostics_sink.as_deref_mut())?;
         let mut deferred_free = Vec::new();
         for entry in entries {
@@ -1441,6 +1444,7 @@ fn parse_xref_from_start(
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset,
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -1615,6 +1619,9 @@ fn merge_xref_stream_from_classic_trailer(
     for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
     }
+    if hybrid.first_xref_item_offset != 0 {
+        loaded.first_xref_item_offset = hybrid.first_xref_item_offset;
+    }
     loaded
         .trailer_references
         .extend(hybrid.trailer_references.iter().copied());
@@ -1707,6 +1714,9 @@ fn merge_previous_xref_sections(
         )?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        if previous.first_xref_item_offset != 0 {
+            loaded.first_xref_item_offset = previous.first_xref_item_offset;
         }
         loaded
             .trailer_references
@@ -1834,35 +1844,36 @@ fn recover_xref_from_linear_scan(
     // caller (`load_xref_state_with_options`) always overwrites it via
     // `merge_recovered_qpdf_state` with the already-successfully-parsed
     // revision's own real form once this returns.
-    let (trailer, recovered_startxref, recovered_form) = if let Some(trailer) = fallback_trailer {
-        (trailer.clone(), startxref, XrefForm::Table)
-    } else {
-        match recovered.trailer {
-            Some(trailer) => (trailer, startxref, XrefForm::Table),
-            None => match recover_trailer_from_xref_stream_candidate(
-                bytes,
-                &version,
-                options,
-                &mut entries,
-                &mut parsed_xref_streams,
-                &mut repair_diagnostics,
-                &mut extra_trailer_references,
-            ) {
-                Ok((trailer, max_offset, form, _deleted_objects)) => {
-                    // Candidate re-entry has already consumed its local
-                    // tombstones while filtering `entries`; never retain
-                    // them past this recovery operation.
-                    (trailer, max_offset, form)
-                }
-                Err(candidate_error) => {
-                    return Err(Error::with_open_diagnostics(
-                        candidate_error,
-                        repair_diagnostics,
-                    ));
-                }
-            },
-        }
-    };
+    let (trailer, recovered_startxref, recovered_form, recovered_first_xref_item_offset) =
+        if let Some(trailer) = fallback_trailer {
+            (trailer.clone(), startxref, XrefForm::Table, 0)
+        } else {
+            match recovered.trailer {
+                Some(trailer) => (trailer, startxref, XrefForm::Table, 0),
+                None => match recover_trailer_from_xref_stream_candidate(
+                    bytes,
+                    &version,
+                    options,
+                    &mut entries,
+                    &mut parsed_xref_streams,
+                    &mut repair_diagnostics,
+                    &mut extra_trailer_references,
+                ) {
+                    Ok((trailer, max_offset, form, _deleted_objects, first_xref_item_offset)) => {
+                        // Candidate re-entry has already consumed its local
+                        // tombstones while filtering `entries`; never retain
+                        // them past this recovery operation.
+                        (trailer, max_offset, form, first_xref_item_offset)
+                    }
+                    Err(candidate_error) => {
+                        return Err(Error::with_open_diagnostics(
+                            candidate_error,
+                            repair_diagnostics,
+                        ));
+                    }
+                },
+            }
+        };
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
@@ -1876,6 +1887,7 @@ fn recover_xref_from_linear_scan(
             last_xref_form: recovered_form,
             repair_diagnostics,
         },
+        first_xref_item_offset: recovered_first_xref_item_offset,
         trailer_references,
         parsed_xref_streams,
         bootstrap_cache: empty_bootstrap_cache(),
@@ -1911,6 +1923,9 @@ fn merge_recovered_qpdf_state(
     // the already-successfully-parsed newest revision's real one, is always
     // the correct value here, not `recovered`'s `Table` placeholder.
     recovered.loaded.last_xref_form = accumulated.loaded.last_xref_form;
+    if recovered.first_xref_item_offset == 0 {
+        recovered.first_xref_item_offset = accumulated.first_xref_item_offset;
+    }
     // qpdf `reconstruct_xref` removes existing type-1 entries before scanning,
     // and `insertReconstructedXrefEntry` suppresses object numbers in that
     // scan's local filter (`QPDF.cc:516-575`, `:1194-1210`). It clears the
@@ -2050,7 +2065,7 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
-) -> Result<(Dictionary, u64, XrefForm, BTreeSet<u32>)> {
+) -> Result<(Dictionary, u64, XrefForm, BTreeSet<u32>, u64)> {
     let (candidate, discovery_diagnostics) =
         find_xref_stream_trailer_candidate(bytes, entries, options);
     // qpdf's candidate search resolves every type-1 entry unconditionally
@@ -2163,6 +2178,7 @@ fn recover_trailer_from_xref_stream_candidate(
         ));
     }
 
+    let first_xref_item_offset = reentry.first_xref_item_offset;
     let deleted_objects = reentry_registration.deleted_objects.clone();
 
     // `reentry.loaded.entries` is already the live-only snapshot of
@@ -2223,6 +2239,7 @@ fn recover_trailer_from_xref_stream_candidate(
         max_offset,
         reentry.loaded.last_xref_form,
         deleted_objects,
+        first_xref_item_offset,
     ))
 }
 
@@ -2599,8 +2616,9 @@ fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
     error_diagnostics_sink: Option<&mut Diagnostics>,
-) -> Result<(Vec<ParsedXrefEntry>, Dictionary, Vec<Diagnostic>)> {
+) -> Result<(Vec<ParsedXrefEntry>, Dictionary, Vec<Diagnostic>, u64)> {
     let mut entries = Vec::new();
+    let mut first_xref_item_offset = 0;
     loop {
         let first_token = cursor.read_token()?;
         if first_token.is_word_value(b"trailer") {
@@ -2609,6 +2627,10 @@ fn parse_xref_table(
 
         let first = parse_xref_subsection_u32(&first_token)?;
         let count = cursor.read_u32()?;
+        if first == 0 && count > 0 {
+            cursor.skip_ws();
+            first_xref_item_offset = cursor.pos as u64;
+        }
         for index in 0..count {
             cursor.skip_ws();
             let offset = cursor.read_fixed_u64(10)?;
@@ -2675,7 +2697,7 @@ fn parse_xref_table(
         }
     };
 
-    Ok((entries, trailer, diagnostics))
+    Ok((entries, trailer, diagnostics, first_xref_item_offset))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2769,7 +2791,7 @@ fn parse_xref_stream(
         // function's own `Err` propagates -- mirroring that same qpdf ordering
         // without changing what any `error_diagnostics_sink: None` caller
         // observes (the sink is write-only, and only on this closure's `Err`).
-        let build = || -> Result<(Dictionary, Vec<ParsedXrefEntry>, BTreeSet<ObjectRef>)> {
+        let build = || -> Result<(Dictionary, Vec<ParsedXrefEntry>, BTreeSet<ObjectRef>, bool)> {
             let stream = match &object {
                 Object::Stream(stream) => stream,
                 _ => return Err(Error::parse(xref_pos, "xref not found")),
@@ -2797,6 +2819,7 @@ fn parse_xref_stream(
             let widths = parse_xref_widths_handle(&handle_stream_dict)?;
             let index = parse_xref_index_handle(&handle_stream_dict, size)?;
             let ranges = build_xref_ranges(index)?;
+            let has_first_xref_item = ranges.iter().any(|&(start, count)| start == 0 && count > 0);
             let handle_stream_data = handle_object
                 .as_stream_data()
                 .ok_or_else(|| Error::parse(xref_pos, "xref stream has no data"))?;
@@ -2809,11 +2832,20 @@ fn parse_xref_stream(
             let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
             let trailer_references = collect_trailer_references(&trailer);
 
-            Ok((trailer, entries, trailer_references))
+            Ok((trailer, entries, trailer_references, has_first_xref_item))
         };
-        let build_result = build().map(|(trailer, entries, trailer_references)| {
-            (object_ref, object, trailer, entries, trailer_references)
-        });
+        let build_result = build().map(
+            |(trailer, entries, trailer_references, has_first_xref_item)| {
+                (
+                    object_ref,
+                    object,
+                    trailer,
+                    entries,
+                    trailer_references,
+                    has_first_xref_item,
+                )
+            },
+        );
         let reconstruction_trigger = context.take_reconstruction_trigger();
         context.append_diagnostics_to(&mut repair_diagnostics);
         context.cache.commit();
@@ -2821,18 +2853,19 @@ fn parse_xref_stream(
         (build_result, reconstruction_trigger, bootstrap_cache)
     };
 
-    let (object_ref, object, trailer, entries, trailer_references) = match build_result {
-        Ok(built) => built,
-        Err(error) => {
-            let error = reconstruction_trigger.unwrap_or(error);
-            if let Some(sink) = error_diagnostics_sink {
-                for diagnostic in repair_diagnostics.entries() {
-                    sink.push(diagnostic.clone());
+    let (object_ref, object, trailer, entries, trailer_references, has_first_xref_item) =
+        match build_result {
+            Ok(built) => built,
+            Err(error) => {
+                let error = reconstruction_trigger.unwrap_or(error);
+                if let Some(sink) = error_diagnostics_sink {
+                    for diagnostic in repair_diagnostics.entries() {
+                        sink.push(diagnostic.clone());
+                    }
                 }
+                return Err(error);
             }
-            return Err(error);
-        }
-    };
+        };
 
     for entry in entries {
         match entry {
@@ -2853,6 +2886,11 @@ fn parse_xref_stream(
             trailer,
             last_xref_form: XrefForm::Stream,
             repair_diagnostics,
+        },
+        first_xref_item_offset: if has_first_xref_item {
+            xref_pos as u64
+        } else {
+            0
         },
         trailer_references,
         parsed_xref_streams,
@@ -4368,6 +4406,7 @@ mod tests {
                     last_xref_form: XrefForm::Table,
                     repair_diagnostics: Diagnostics::default(),
                 },
+                first_xref_item_offset: 0,
                 trailer_references: BTreeSet::new(),
                 parsed_xref_streams: BTreeMap::new(),
                 bootstrap_cache: empty_bootstrap_cache(),
@@ -4604,6 +4643,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -4680,6 +4720,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5230,6 +5271,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5286,6 +5328,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5339,6 +5382,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5382,6 +5426,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5453,6 +5498,7 @@ mod tests {
                     last_xref_form: XrefForm::Table,
                     repair_diagnostics: Diagnostics::default(),
                 },
+                first_xref_item_offset: 0,
                 trailer_references: BTreeSet::new(),
                 parsed_xref_streams: BTreeMap::new(),
                 bootstrap_cache: empty_bootstrap_cache(),
@@ -5533,6 +5579,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5596,6 +5643,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -5653,6 +5701,7 @@ mod tests {
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
             },
+            first_xref_item_offset: 0,
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
             bootstrap_cache: empty_bootstrap_cache(),
@@ -7709,7 +7758,7 @@ mod tests {
             ..XrefLoadOptions::default()
         };
 
-        let (_trailer, max_offset, form, _deleted_objects) =
+        let (_trailer, max_offset, form, _deleted_objects, _first_xref_item_offset) =
             recover_trailer_from_xref_stream_candidate(
                 &bytes,
                 "1.5",
@@ -7763,7 +7812,7 @@ mod tests {
             ..XrefLoadOptions::default()
         };
 
-        let (_trailer, _max_offset, _form, deleted_objects) =
+        let (_trailer, _max_offset, _form, deleted_objects, _first_xref_item_offset) =
             recover_trailer_from_xref_stream_candidate(
                 &bytes,
                 "1.5",
@@ -7932,9 +7981,10 @@ mod tests {
     fn parse_xref_table_surfaces_a_duplicate_trailer_key_warning() {
         let bytes = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Foo 1 /Foo 2 >>\n";
         let mut cursor = ByteCursor::new(bytes, 4);
-        let (entries, trailer, diagnostics) =
+        let (entries, trailer, diagnostics, first_xref_item_offset) =
             parse_xref_table(&mut cursor, bytes, None).expect("valid classic xref section");
         assert_eq!(entries.len(), 1);
+        assert_eq!(first_xref_item_offset, 9);
         assert_eq!(
             trailer.get("Foo"),
             Some(&Object::Integer(2)),
