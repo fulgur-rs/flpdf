@@ -5128,6 +5128,35 @@ fn rewrite_newline_before_endstream_n_accepted_and_produces_valid_output() {
         .success();
 }
 
+#[test]
+fn rewrite_newline_before_endstream_garbage_uses_qpdf_bare_flag_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("in.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, one_page_pdf_with_content(b"q Q")).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--compress-streams=n",
+            "--newline-before-endstream=garbage",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let output_bytes = std::fs::read(&output).unwrap();
+    assert!(contains(&output_bytes, b"q Q\nendstream"));
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check", output.to_str().unwrap()])
+        .assert()
+        .success();
+}
+
 // ── help text contains qpdf-compatible defaults ───────────────────────────────
 
 #[test]
