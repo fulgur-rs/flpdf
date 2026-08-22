@@ -1411,21 +1411,83 @@ fn check_linearization_inner<R: Read + Seek>(
     Ok(warnings)
 }
 
-/// Resolve and decode the hint stream object at `offset` through the canonical
-/// object/stream route.
+/// A qpdf `damagedPDF` raised while loading a linearization hint stream.
 ///
-/// The raw byte slice is used only to identify the object reference at `/H[0]`.
-/// The object itself is then resolved as an [`ObjectHandle`], its qpdf source
-/// extents are used for the `/H[1]` check, and `get_stream_data` runs the
-/// specialized stream pipeline. This mirrors qpdf's `readHintStream` boundary
-/// (`libqpdf/QPDF_linearization.cc:245-321`) without materializing a legacy
-/// `Object::Stream` value.
+/// `load_hint_stream` keeps its existing checker-facing error text, while the
+/// `show-linearization` route needs the source category and offset that qpdf
+/// attaches to the same failure.  Keep both forms at this boundary so the
+/// shared loader does not make either consumer reconstruct context from a
+/// free-form message.
+pub(crate) struct HintStreamDamage {
+    pub(crate) object: &'static str,
+    pub(crate) offset: u64,
+    pub(crate) detail: String,
+    legacy: String,
+}
+
+impl HintStreamDamage {
+    fn new(
+        object: &'static str,
+        offset: u64,
+        detail: impl Into<String>,
+        legacy: impl Into<String>,
+    ) -> Self {
+        Self {
+            object,
+            offset,
+            detail: detail.into(),
+            legacy: legacy.into(),
+        }
+    }
+}
+
+pub(crate) enum HintStreamLoadError {
+    Damage(HintStreamDamage),
+    Core(crate::Error),
+}
+
+impl From<crate::Error> for HintStreamLoadError {
+    fn from(error: crate::Error) -> Self {
+        Self::Core(error)
+    }
+}
+
+/// Resolve and decode the hint stream object at `offset` through the canonical
+/// object/stream route, preserving the checker-facing error messages.
+///
+/// The qpdf damage context used by `show-linearization` is retained internally
+/// by [`load_hint_stream_with_damage`].
 pub(crate) fn load_hint_stream<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     file_bytes: &[u8],
     offset: usize,
     expected_h_length: u64,
 ) -> Result<(ObjectHandle, Rc<Vec<u8>>)> {
+    load_hint_stream_with_damage(pdf, file_bytes, offset, expected_h_length).map_err(|error| {
+        match error {
+            HintStreamLoadError::Damage(damage) => crate::Error::Unsupported(damage.legacy),
+            HintStreamLoadError::Core(error) => error,
+        }
+    })
+}
+
+/// Resolve and decode a hint stream while retaining qpdf's `damagedPDF`
+/// category and source offset for `--show-linearization` warning formatting.
+///
+/// This mirrors `readHintStream` and `readObjectAtOffset` from
+/// `libqpdf/QPDF_linearization.cc:283-322` and `libqpdf/QPDF.cc:1542-1636`.
+pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    file_bytes: &[u8],
+    offset: usize,
+    expected_h_length: u64,
+) -> std::result::Result<(ObjectHandle, Rc<Vec<u8>>), HintStreamLoadError> {
+    // The raw byte slice is used only to identify the object reference at
+    // `/H[0]`. The object itself is then resolved as an [`ObjectHandle`], its
+    // qpdf source extents are used for the `/H[1]` check, and `get_stream_data`
+    // runs the specialized stream pipeline. This mirrors qpdf's
+    // `readHintStream` boundary (`QPDF_linearization.cc:245-321`) without
+    // materializing a legacy `Object::Stream` value.
     // /H[0] must point exactly at the `N G obj` header (after at most a few
     // leading whitespace bytes).  A loose scan that just searches for `obj`
     // anywhere in a window would accept misaligned offsets that happen to
@@ -1433,18 +1495,28 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
     // corruption we want to detect.
     const SCAN_WINDOW: usize = 64;
     if offset >= file_bytes.len() {
-        return Err(crate::Error::Unsupported(format!(
-            "/H[0] offset ({offset}) is beyond file length ({})",
-            file_bytes.len()
+        return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
+            "linearization hint stream",
+            offset as u64,
+            "expected n n obj",
+            format!(
+                "/H[0] offset ({offset}) is beyond file length ({})",
+                file_bytes.len()
+            ),
         )));
     }
     let scan_end = offset.saturating_add(SCAN_WINDOW).min(file_bytes.len());
     let window = &file_bytes[offset..scan_end];
 
     let Some((obj_num, obj_gen)) = parse_obj_header_at(window) else {
-        return Err(crate::Error::Unsupported(format!(
-            "/H[0] offset ({offset}) does not point at an indirect object header \
-             (expected `N G obj`)"
+        return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
+            "linearization hint stream",
+            offset as u64,
+            "expected n n obj",
+            format!(
+                "/H[0] offset ({offset}) does not point at an indirect object header \
+                 (expected `N G obj`)"
+            ),
         )));
     };
 
@@ -1453,14 +1525,32 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
     let hint_obj = pdf.resolve_object_handle_at_offset(offset as u64, hint_ref)?;
+    // qpdf's `InputSource::getLastOffset()` remains at the start of the
+    // `endobj` token when `readObject` reports a non-stream hint object. The
+    // canonical resolver stores the extent immediately after that token, so
+    // subtract the token width to preserve qpdf's damagedPDF location.
+    let hint_object_damage_offset = u64::try_from(hint_obj.end_offsets().0)
+        .ok()
+        .and_then(|offset| offset.checked_sub(b"endobj".len() as u64))
+        .unwrap_or_else(|| pdf.source_last_offset());
     let Some(hint_dict) = hint_obj.as_stream_dict() else {
         if hint_obj.is_null() {
-            return Err(crate::Error::Unsupported(format!(
-                "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) does not exist"
+            return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
+                "linearization dictionary",
+                hint_object_damage_offset,
+                "hint table is not a stream",
+                format!(
+                    "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) does not exist"
+                ),
             )));
         }
-        return Err(crate::Error::Unsupported(format!(
-            "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) is not a stream"
+        return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
+            "linearization dictionary",
+            hint_object_damage_offset,
+            "hint table is not a stream",
+            format!(
+                "hint stream object {obj_num} {obj_gen} (at /H[0] offset {offset}) is not a stream"
+            ),
         )));
     };
 
@@ -1476,8 +1566,8 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
     // cov:ignore-start: the canonical resolver rejects an unresolved indirect
     // `/Length` while parsing the stream, so a parsed stream always has extents.
     if end_before_space < 0 || end_after_space < 0 {
-        return Err(crate::Error::Unsupported(format!(
-            "hint stream object {obj_num} {obj_gen} has no source extent"
+        return Err(HintStreamLoadError::Core(crate::Error::Unsupported(
+            format!("hint stream object {obj_num} {obj_gen} has no source extent"),
         )));
     }
     // cov:ignore-end
@@ -1499,9 +1589,14 @@ pub(crate) fn load_hint_stream<R: Read + Seek>(
         && (i64::try_from(computed_end).unwrap_or(i64::MAX) < end_before_space
             || i64::try_from(computed_end).unwrap_or(i64::MAX) > end_after_space)
     {
-        return Err(crate::Error::Unsupported(format!(
-            "/H[1] ({expected_h_length}) does not match hint stream object span \
-             {end_before_space}..{end_after_space} from offset {offset}"
+        return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
+            "linearization dictionary",
+            pdf.source_last_offset(),
+            "hint table length mismatch",
+            format!(
+                "/H[1] ({expected_h_length}) does not match hint stream object span \
+                 {end_before_space}..{end_after_space} from offset {offset}"
+            ),
         )));
     }
 
