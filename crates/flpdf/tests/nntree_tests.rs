@@ -257,6 +257,53 @@ fn number_tree_insert_exposes_value_through_find_object() {
 }
 
 #[test]
+fn number_tree_set_max_depth_bounds_kids_chain_traversal() {
+    let mut pdf = empty_pdf();
+    let leaf_ref = ObjectRef::new(3, 0);
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Nums",
+        Object::Array(vec![Object::Integer(0), Object::String(b"zero".to_vec())]),
+    );
+    leaf.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+    );
+    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+
+    let branch_ref = ObjectRef::new(2, 0);
+    let mut branch = Dictionary::new();
+    branch.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+    branch.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+    );
+    pdf.set_object(branch_ref, Object::Dictionary(branch));
+
+    let mut root = Dictionary::new();
+    root.insert("Kids", Object::Array(vec![Object::Reference(branch_ref)]));
+
+    let mut bounded = NumberTree::new(Object::Dictionary(root.clone()), true);
+    bounded.set_max_depth(1);
+    let error = bounded
+        .find_object(&mut pdf, 0)
+        .expect_err("a 1-level cap must reject a 2-level /Kids chain");
+    assert!(
+        error.to_string().contains("depth limit"),
+        "unexpected error: {error}"
+    );
+
+    let mut unbounded_enough = NumberTree::new(Object::Dictionary(root), true);
+    unbounded_enough.set_max_depth(flpdf::DEFAULT_MAX_TREE_DEPTH);
+    assert_eq!(
+        unbounded_enough
+            .find_object(&mut pdf, 0)
+            .expect("within the default depth cap"),
+        Some(Object::String(b"zero".to_vec()))
+    );
+}
+
+#[test]
 fn number_tree_end_cursor_moves_to_first_or_last_entry() {
     let mut pdf = empty_pdf();
     let mut root = Dictionary::new();

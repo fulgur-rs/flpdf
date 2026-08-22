@@ -685,7 +685,13 @@ impl NameTree {
         self.inner.set_split_threshold(threshold);
     }
 
-    pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
+    /// Bound `/Kids` chain traversal to `max_depth` levels.
+    ///
+    /// Unbounded by default; a caller reading an untrusted document should
+    /// set this (e.g. to [`DEFAULT_MAX_TREE_DEPTH`]) to reject a
+    /// pathologically deep tree with [`crate::Error::Unsupported`] instead
+    /// of recursing without bound.
+    pub fn set_max_depth(&mut self, max_depth: usize) {
         self.inner.max_depth = Some(max_depth);
     }
 
@@ -1197,6 +1203,16 @@ impl NumberTree {
     /// retain the default threshold of 32.
     pub fn set_split_threshold(&mut self, threshold: usize) {
         self.inner.set_split_threshold(threshold);
+    }
+
+    /// Bound `/Kids` chain traversal to `max_depth` levels.
+    ///
+    /// Unbounded by default; a caller reading an untrusted document should
+    /// set this (e.g. to [`DEFAULT_MAX_TREE_DEPTH`]) to reject a
+    /// pathologically deep tree with [`crate::Error::Unsupported`] instead
+    /// of recursing without bound.
+    pub fn set_max_depth(&mut self, max_depth: usize) {
+        self.inner.max_depth = Some(max_depth);
     }
 }
 
