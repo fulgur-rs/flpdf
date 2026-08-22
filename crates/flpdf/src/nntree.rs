@@ -6079,6 +6079,22 @@ mod tests {
     }
 
     #[test]
+    fn begin_enforces_depth_limit_before_loading_the_root() {
+        let mut pdf = empty_pdf();
+        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(Dictionary::new()), true);
+        tree.max_depth = Some(0);
+
+        let error = match tree.begin(&mut pdf) {
+            Err(error) => error,
+            Ok(_) => panic!("begin must enforce the depth limit before loading the root"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: name/number tree: /Kids depth limit 0 exceeded"
+        );
+    }
+
+    #[test]
     fn repair_preserves_raw_name_keys_and_split_limits() {
         let mut pdf = empty_pdf();
         let leaf_ref = ObjectRef::new(10, 0);
