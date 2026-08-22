@@ -1,5 +1,5 @@
 //! qpdf correspondence: QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete.
-use crate::security::primitives::PrimitiveError;
+use crate::encryption::primitives::PrimitiveError;
 use thiserror::Error;
 
 /// Crate-wide [`std::result::Result`] specialization.
@@ -190,7 +190,7 @@ pub enum EncryptedError {
 
 /// Bridge from the low-level `PrimitiveError` to [`Error::Encrypted`].
 ///
-/// This allows `?`-propagation from `security::primitives` functions directly
+/// This allows `?`-propagation from `encryption::primitives` functions directly
 /// into the public error type without exposing `PrimitiveError` in the public
 /// API.
 impl From<PrimitiveError> for Error {
@@ -216,7 +216,7 @@ impl EncryptedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::primitives::PrimitiveError;
+    use crate::encryption::primitives::PrimitiveError;
     use crate::Diagnostic;
     use std::error::Error as _;
 

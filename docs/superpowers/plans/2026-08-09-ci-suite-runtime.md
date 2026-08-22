@@ -191,7 +191,7 @@
           // Empty user password lets the checker and hint-stream decoder
           // reopen the encrypted output without an explicit password.
           // static_aes_iv remains false so this covers the production random-IV path.
-          o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+          o.encrypt = Some(crate::encryption::EncryptParams::v4_aes128(
               Vec::new(),
               b"owner".to_vec(),
           ));

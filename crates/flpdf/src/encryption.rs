@@ -1,5 +1,10 @@
-//! qpdf correspondence: QPDF_encryption.cc writer-side encryption configuration split from the security handler.
-//! User-facing encryption parameters for the writer side.
+//! qpdf correspondence: `QPDF_encryption.cc` encryption facade and domain configuration.
+//!
+//! This is the only crate-level encryption route. The child modules group the
+//! qpdf-owned state, Standard handler, key derivation, crypt-filter
+//! interpretation, password normalization, permission projection, and crypto
+//! primitives under one source-equivalent tree. Writer emission lifecycle and
+//! Pipeline stages remain in their corresponding QPDFWriter/Pl_* modules.
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API
 //! arguments) and pass it through [`crate::PdfWriter::set_encryption_parameters`]; the
@@ -25,8 +30,19 @@
 //! testing is the separate `--static-aes-iv` flag.
 
 use crate::object::Dictionary;
-use crate::permissions::PermissionsConfig;
-use crate::security::standard::ObjectKeyAlg;
+pub(crate) mod crypt_filters;
+pub(crate) mod keys;
+pub(crate) mod password;
+pub mod permissions;
+pub(crate) mod primitives;
+pub(crate) mod rc4;
+pub(crate) mod standard;
+pub(crate) mod state;
+
+pub use keys::ObjectKeyAlg;
+pub use password::PasswordMode;
+pub use permissions::{Permissions, PermissionsConfig, PrintPermission};
+pub use state::EncryptionInfo;
 
 /// Encryption method to apply at write time.
 ///
@@ -68,7 +84,7 @@ pub struct EncryptParams {
     /// Standard handler V/R/Length/CFM tuple to emit.
     pub method: EncryptMethod,
     /// User-password bytes, already normalized per the appropriate
-    /// [`PasswordMode`](crate::PasswordMode). For V=4 (this PR) the bytes
+    /// [`PasswordMode`]. For V=4 (this PR) the bytes
     /// mode is the spec-defined `Bytes` interpretation.
     pub user_password: Vec<u8>,
     /// Owner-password bytes, already normalized. Empty falls back to the

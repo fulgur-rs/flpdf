@@ -42,12 +42,20 @@
 //! keeps the lint quiet here without silencing it elsewhere.
 #![allow(dead_code)]
 
+#[cfg(test)]
+pub(crate) use super::crypt_filters::{
+    cfm_to_object_key_alg, select_crypt_filter, CryptFilter, CryptFilterMethod, CryptFilterRef,
+    V4UseSiteSelectors,
+};
+#[cfg(test)]
+pub(crate) use super::keys::per_object_key;
+pub(crate) use super::keys::ObjectKeyAlg;
+use crate::encryption::primitives::md5;
+use crate::encryption::rc4::Rc4;
 use crate::error::{EncryptedError, Result};
 use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::sha2::PlSha2;
 use crate::pipeline::Pipeline;
-use crate::security::primitives::md5;
-use crate::security::rc4::Rc4;
 use crate::{Dictionary, Object, ObjectRef};
 use aes::{Aes128, Aes256};
 use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
@@ -351,84 +359,6 @@ fn decrypt_r6_file_key(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// V=4 Crypt Filter types
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Crypt-filter method (PDF 1.7 §7.6.5 /CFM).
-///
-/// Only the three methods used by V=4 are represented.  An unknown /CFM value
-/// encountered during parsing should be rejected with `UnsupportedHandler`
-/// before a `CryptFilter` is constructed — the type system then guarantees
-/// that any `CryptFilter` in scope uses a supported method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CryptFilterMethod {
-    /// `/CFM /V2` — RC4-128.
-    V2,
-    /// `/CFM /AESV2` — AES-128 CBC.
-    AesV2,
-    /// `/CFM /Identity` — no-op pass-through.
-    Identity,
-}
-
-/// A single entry in the `/CF` dictionary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CryptFilter {
-    /// The name of this filter as it appears in the `/CF` dictionary.
-    pub name: String,
-    /// The cipher method for this filter.
-    pub cfm: CryptFilterMethod,
-    /// Optional `/Length` override in **bits** (some PDFs include this per-entry).
-    pub length_bits: Option<i64>,
-}
-
-/// The result of resolving a use-site name against the `/CF` table.
-///
-/// Returned by [`select_crypt_filter`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CryptFilterRef<'a> {
-    /// The use-site name was `None` or `"/Identity"` — no encryption is applied.
-    Identity,
-    /// The use-site name resolved to a specific entry in the `/CF` table.
-    Named(&'a CryptFilter),
-}
-
-/// Convenience holder for the three use-site selector fields from `/Encrypt`
-/// for a V=4 document.
-///
-/// PDF 1.7 §7.6.5.1 default semantics, encoded here as the value-stored
-/// `Option<String>` plus the resolver method [`V4UseSiteSelectors::eff_or_stm`]:
-///
-/// - `/StmF` absent ⇒ `/Identity` (no encryption applied to streams)
-/// - `/StrF` absent ⇒ `/Identity` (no encryption applied to strings)
-/// - `/EFF`  absent ⇒ **falls back to `/StmF`** — embedded file streams use
-///   the same crypt filter as regular streams. Resolving `eff` raw via
-///   [`select_crypt_filter`] would treat absence as `/Identity` and miss
-///   encrypted embedded files; callers MUST go through `eff_or_stm()` for
-///   the EFF use-site.
-#[derive(Debug, Clone)]
-pub(crate) struct V4UseSiteSelectors {
-    /// `/StmF` — default crypt filter for streams.
-    pub stm_f: Option<String>,
-    /// `/StrF` — default crypt filter for strings.
-    pub str_f: Option<String>,
-    /// `/EFF` — default crypt filter for embedded file streams.
-    ///
-    /// **Do not resolve this field directly with [`select_crypt_filter`].**
-    /// Use [`V4UseSiteSelectors::eff_or_stm`] to honor the
-    /// `/EFF absent ⇒ /StmF` fallback from the spec.
-    pub eff: Option<String>,
-}
-
-impl V4UseSiteSelectors {
-    /// Effective embedded-file-stream selector name, per PDF 1.7 §7.6.5.1:
-    /// returns `self.eff` if present, otherwise `self.stm_f`. Pass the result
-    /// to [`select_crypt_filter`] as the use-site name.
-    pub(crate) fn eff_or_stm(&self) -> Option<&str> {
-        self.eff.as_deref().or(self.stm_f.as_deref())
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Public API
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -567,47 +497,6 @@ pub(crate) fn check_owner_password_r6(
         inputs.oe,
         inputs.u,
     )
-}
-
-/// Select the [`CryptFilter`] for a given use-site name from the `/CF` table.
-///
-/// The name is the value of `/StmF`, `/StrF`, or `/EFF` for the relevant
-/// use site.  Resolution rules:
-///
-/// - `name == None` or `name == Some("/Identity")` → [`CryptFilterRef::Identity`]
-/// - `name == Some(n)` and `cf_table` contains `n` → [`CryptFilterRef::Named`]
-/// - `name == Some(n)` and `cf_table` does **not** contain `n` →
-///   [`EncryptedError::Malformed`]
-///
-/// `/Identity` is a PDF-specified no-op pass-through and does not need to
-/// appear in the `/CF` dictionary.
-pub(crate) fn select_crypt_filter<'a>(
-    cf_table: &'a std::collections::HashMap<String, CryptFilter>,
-    name: Option<&str>,
-) -> Result<CryptFilterRef<'a>> {
-    match name {
-        None | Some("Identity") => Ok(CryptFilterRef::Identity),
-        Some(n) => match cf_table.get(n) {
-            Some(cf) => Ok(CryptFilterRef::Named(cf)),
-            None => Err(EncryptedError::Malformed {
-                reason: format!("/CF entry '{}' not found", n),
-            }
-            .into()),
-        },
-    }
-}
-
-/// Map a [`CryptFilterMethod`] to the [`ObjectKeyAlg`] required by
-/// [`per_object_key`].
-///
-/// Returns `None` for [`CryptFilterMethod::Identity`] because no key derivation
-/// is needed — the data is passed through unchanged.
-pub(crate) fn cfm_to_object_key_alg(cfm: CryptFilterMethod) -> Option<ObjectKeyAlg> {
-    match cfm {
-        CryptFilterMethod::V2 => Some(ObjectKeyAlg::Rc4),
-        CryptFilterMethod::AesV2 => Some(ObjectKeyAlg::Aes),
-        CryptFilterMethod::Identity => None,
-    }
 }
 
 /// PDF 1.7 §7.6.3.3 Algorithm 6 — Authenticate the user password.
@@ -956,7 +845,7 @@ pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8
 ///
 /// The file key is returned alongside the dictionary because the
 /// string/stream encryption passes need it
-/// to derive per-object keys via [`per_object_key`]; the dictionary alone
+/// to derive per-object keys via [`super::keys::per_object_key`]; the dictionary alone
 /// does not carry it.
 ///
 /// Algorithmic order: `/O` (Algorithm 3) → file key (Algorithm 2, consumes
@@ -1158,7 +1047,7 @@ pub(crate) fn compute_perms_blob(
     block[8] = if encrypt_metadata { b'T' } else { b'F' };
     block[9..12].copy_from_slice(b"adb");
     block[12..16].copy_from_slice(random_tail);
-    crate::security::primitives::aes256_ecb_encrypt_block(file_key, &mut block);
+    crate::encryption::primitives::aes256_ecb_encrypt_block(file_key, &mut block);
     block
 }
 
@@ -1506,23 +1395,6 @@ pub(crate) fn build_v5_r5_encrypt_dict(
 // Algorithm 1 — Per-object key derivation (V=1/V=2/V=4)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Selects the cipher variant used for per-object key derivation (Algorithm 1).
-///
-/// For AES-based crypt filters (V=4, `/CFM /AESV2`), a 4-byte salt `sAlT`
-/// (`0x73 0x41 0x6C 0x54`) is appended to the MD5 input.  For all RC4 variants
-/// (V=1, V=2, and V=4 `/CFM /V2`) no salt is added.
-///
-/// Exposed as `pub` so that [`crate::CopyEncryptionSource`]
-/// can carry the donor's algorithm selection across the CLI→library boundary
-/// without needing a separate parallel enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectKeyAlg {
-    /// RC4 variant — no salt appended.
-    Rc4,
-    /// AES variant — 4-byte salt `sAlT` appended.
-    Aes,
-}
-
 /// Cipher material selected for decrypting string objects at a given use site.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StringCipher<'a> {
@@ -1623,46 +1495,6 @@ pub(crate) fn decrypt_cipher_bytes(bytes: &mut Vec<u8>, cipher: StringCipher<'_>
     }
 }
 
-/// PDF 1.7 §7.6.2 Algorithm 1 — derive a per-object key.
-///
-/// Constructs the object-specific encryption key from the file encryption key,
-/// the object number, and the generation number.  Used for non-CF streams and
-/// strings (V<5) and for explicit `/Crypt` filter entries when V<5.
-///
-/// # Arguments
-/// - `file_key` — the file encryption key (`n` bytes, `n ∈ [5, 16]`).
-/// - `obj`      — the indirect object number.
-/// - `gen`      — the object generation number.
-/// - `alg`      — [`ObjectKeyAlg::Rc4`] or [`ObjectKeyAlg::Aes`].
-///
-/// # Algorithm
-/// 1. Concatenate: `file_key ‖ obj[0..3] ‖ gen[0..2]`
-///    where `obj[0..3]` is the three **low** bytes of `obj` in little-endian
-///    order, and `gen[0..2]` is the two **low** bytes of `gen` in little-endian
-///    order.
-/// 2. If `alg == Aes`, append `0x73 0x41 0x6C 0x54` ("sAlT").
-/// 3. Take the MD5 digest.
-/// 4. Return the first `min(n + 5, 16)` bytes.
-pub(crate) fn per_object_key(file_key: &[u8], obj: u32, gen: u32, alg: ObjectKeyAlg) -> Vec<u8> {
-    let n = file_key.len();
-    // Capacity: n + 3 (obj) + 2 (gen) + optional 4 (sAlT).
-    let mut md5_input = Vec::with_capacity(n + 9);
-    md5_input.extend_from_slice(file_key);
-    // Low 3 bytes of obj in little-endian order.
-    let obj_le = obj.to_le_bytes();
-    md5_input.extend_from_slice(&obj_le[..3]);
-    // Low 2 bytes of gen in little-endian order.
-    let gen_le = gen.to_le_bytes();
-    md5_input.extend_from_slice(&gen_le[..2]);
-    // AES salt.
-    if alg == ObjectKeyAlg::Aes {
-        md5_input.extend_from_slice(&[0x73, 0x41, 0x6C, 0x54]);
-    }
-    let digest = md5(&md5_input);
-    let out_len = (n + 5).min(16);
-    digest[..out_len].to_vec()
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Writer side — String / stream encryption passes
 // (flpdf-9hc.4.5 strings, flpdf-9hc.4.6 stream payloads)
@@ -1677,7 +1509,7 @@ pub(crate) fn per_object_key(file_key: &[u8], obj: u32, gen: u32, alg: ObjectKey
 /// `iv_gen` closure in [`encrypt_strings_in_object`] or the explicit `iv`
 /// parameter on [`encrypt_cipher_bytes`].
 ///
-/// For V<5, the per-object key from [`per_object_key`] is the key material.
+/// For V<5, the per-object key from [`super::keys::per_object_key`] is the key material.
 /// For V=5, the file key itself or a selected `/CF` key is used directly.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StringEncryptCipher<'a> {
@@ -1987,8 +1819,8 @@ pub(crate) fn prepend_crypt_filter_to_stream_dict(dict: &mut Dictionary, cf_name
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encryption::rc4::Rc4;
     use crate::object::MAX_INLINE_DEPTH;
-    use crate::security::rc4::Rc4;
     use crate::{Dictionary, Object, ObjectRef, Stream};
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -4230,7 +4062,7 @@ mod tests {
 
         // Decrypt and inspect the underlying 16-byte block.
         let mut decrypted = encrypted;
-        crate::security::primitives::aes256_ecb_decrypt_block(&file_key, &mut decrypted);
+        crate::encryption::primitives::aes256_ecb_decrypt_block(&file_key, &mut decrypted);
         assert_eq!(&decrypted[0..4], &p.to_le_bytes());
         assert_eq!(&decrypted[4..8], &[0xFFu8; 4]);
         assert_eq!(decrypted[8], b'T');
@@ -4240,7 +4072,7 @@ mod tests {
         // And with encrypt_metadata=false, byte 8 flips to 'F'.
         let encrypted_f = compute_perms_blob(p, false, &random_tail, &file_key);
         let mut decrypted_f = encrypted_f;
-        crate::security::primitives::aes256_ecb_decrypt_block(&file_key, &mut decrypted_f);
+        crate::encryption::primitives::aes256_ecb_decrypt_block(&file_key, &mut decrypted_f);
         assert_eq!(decrypted_f[8], b'F');
     }
 
@@ -4414,7 +4246,7 @@ mod tests {
                 unreachable!()
             };
             let mut perms_block: [u8; 16] = perms_bytes.as_slice().try_into().unwrap();
-            crate::security::primitives::aes256_ecb_decrypt_block(&s.file_key, &mut perms_block);
+            crate::encryption::primitives::aes256_ecb_decrypt_block(&s.file_key, &mut perms_block);
             assert_eq!(i32::from_le_bytes(perms_block[0..4].try_into().unwrap()), p);
             assert_eq!(&perms_block[4..8], &[0xFFu8; 4]);
             assert_eq!(perms_block[8], if encrypt_metadata { b'T' } else { b'F' });

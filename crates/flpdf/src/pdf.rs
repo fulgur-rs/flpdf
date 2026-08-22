@@ -1,8 +1,8 @@
 //! qpdf correspondence: QPDF's central document container, direct document-state accessors, and teardown (`include/qpdf/QPDF.hh:1438-1518`; `libqpdf/QPDF.cc:215-232,2323-2358,2647-2651`).
 
 use crate::cache::ObjectCache;
+use crate::encryption::state::EncryptionState;
 use crate::reader::resolver::ResolverHandle;
-use crate::reader::EncryptionState;
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};

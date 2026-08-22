@@ -112,7 +112,7 @@ Expected: both PASS, including password round-trip and exact byte equality.
 ```bash
 cargo test -p flpdf --lib writer::tests::v5_r6_encrypt_round_trips_string_and_stream_via_reader
 cargo test -p flpdf --lib writer::tests::v5_r5_encrypt_round_trips_string_and_stream_via_reader
-cargo test -p flpdf --lib security::standard::tests::build_v5_r6_encrypt_dict_round_trips_user_owner_and_perms
+cargo test -p flpdf --lib encryption::standard::tests::build_v5_r6_encrypt_dict_round_trips_user_owner_and_perms
 ```
 
 - [x] **Step 2: Run the qpdf-zlib feature build and tests**

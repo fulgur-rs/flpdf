@@ -1,0 +1,853 @@
+//! qpdf correspondence: `QPDF.hh:899-923` and `QPDF_encryption.cc:700-1205` encryption state, crypt-filter dispatch, object-key cache, and inspection projection.
+
+use super::crypt_filters::{crypt_filter_method, crypt_filter_modes, interpret_cf};
+use super::password::{password_bytes_for_read, PasswordMode};
+use super::permissions::Permissions;
+use super::standard::{
+    check_owner_password, check_owner_password_r5, check_owner_password_r6,
+    check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
+    check_user_password_v4, StandardHandlerInputs, StandardHandlerR5Inputs,
+};
+use crate::encryption::standard::{decrypt_cipher_bytes, StringCipher};
+use crate::error::{EncryptedError, Result};
+use crate::{Dictionary, Object, ObjectRef};
+use std::collections::BTreeMap;
+
+/// qpdf's `QPDF::EncryptionParameters` state for an authenticated document.
+///
+/// qpdf's `encrypted` and `encryption_initialized` flags are folded into this
+/// being an `Option<EncryptionState>`; password fields are consumed during
+/// authentication and are not retained here.
+#[derive(Debug, Clone)]
+pub(crate) struct EncryptionState {
+    pub(crate) file_key: Vec<u8>,
+    /// qpdf `encryption_V` / `encryption_R`.
+    pub(crate) encryption_v: i64,
+    pub(crate) encryption_r: i64,
+    /// qpdf `cf_stream` / `cf_string` / `cf_file`.
+    pub(crate) cf_stream: EncryptionMode,
+    pub(crate) cf_string: EncryptionMode,
+    pub(crate) cf_file: EncryptionMode,
+    pub(crate) crypt_filters: BTreeMap<Vec<u8>, EncryptionMode>,
+    pub(crate) encrypt_metadata: bool,
+    pub(crate) encrypt_ref: Option<ObjectRef>,
+    pub(crate) weak_crypto: bool,
+    pub(crate) permissions: Permissions,
+    pub(crate) user_password_matched: bool,
+    pub(crate) owner_password_matched: bool,
+    /// qpdf `cached_object_encryption_key` / `cached_key_og`
+    /// (`include/qpdf/QPDF.hh:918-919`).
+    pub(crate) cached_object_encryption_key: Vec<u8>,
+    pub(crate) cached_key_og: Option<ObjectRef>,
+}
+
+/// What qpdf's crypt-filter switch decided: whether AES is used, whether the
+/// caller returns without a decrypt stage, and whether an unknown-filter
+/// warning is owed.
+type MethodChoice = (Option<bool>, bool);
+
+impl EncryptionState {
+    /// qpdf's `decryptString` and `decryptStream` crypt-filter switch
+    /// (`QPDF_encryption.cc:982-1006,1062-1134`).
+    pub(crate) fn select_method(
+        method: EncryptionMode,
+        cf: &mut EncryptionMode,
+        encryption_v: i64,
+    ) -> MethodChoice {
+        if encryption_v < 4 {
+            // qpdf enters this switch only for V >= 4. Older revisions always
+            // use RC4, regardless of the stored crypt-filter fields.
+            return (Some(false), false);
+        }
+        match method {
+            EncryptionMode::Identity => (None, false),
+            EncryptionMode::Aes128 | EncryptionMode::Aes256 => (Some(true), false),
+            EncryptionMode::Rc4 => (Some(false), false),
+            EncryptionMode::Unknown => {
+                // qpdf rewrites the selected field so the warning is emitted
+                // only once for subsequent objects.
+                *cf = EncryptionMode::Aes128;
+                (Some(true), true)
+            }
+        }
+    }
+
+    /// qpdf `QPDF::decryptString` method selection.
+    pub(crate) fn string_method(&mut self) -> MethodChoice {
+        let (method, encryption_v) = (self.cf_string, self.encryption_v);
+        Self::select_method(method, &mut self.cf_string, encryption_v)
+    }
+
+    /// qpdf `QPDF::decryptString` for one literal string.
+    pub(crate) fn decrypt_object_string(
+        &mut self,
+        object_ref: ObjectRef,
+        bytes: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let (use_aes, warn_unknown_string) = self.string_method();
+        if let Some(use_aes) = use_aes {
+            self.with_object_cipher(object_ref, use_aes, |cipher| {
+                decrypt_cipher_bytes(bytes, cipher)
+            })?;
+        }
+        Ok(warn_unknown_string)
+    }
+
+    /// qpdf `QPDF::decryptStream` method selection, after the caller has
+    /// inspected the stream's own `/Crypt` filter.
+    pub(crate) fn stream_method(&mut self, method: Option<EncryptionMode>) -> MethodChoice {
+        let (method, encryption_v) = (method.unwrap_or(self.cf_stream), self.encryption_v);
+        Self::select_method(method, &mut self.cf_stream, encryption_v)
+    }
+
+    /// Whether qpdf would prepend a decryption stage for this stream method,
+    /// without applying the unknown-filter state rewrite.
+    pub(crate) fn stream_method_transforms(&self, method: Option<EncryptionMode>) -> bool {
+        let method = method.unwrap_or(self.cf_stream);
+        self.encryption_v < 4 || !matches!(method, EncryptionMode::Identity)
+    }
+
+    /// qpdf `QPDF::compute_data_key` (`QPDF_encryption.cc:325-357`),
+    /// Algorithm 3.1 from the PDF 1.7 Reference Manual.
+    ///
+    /// Not the same function as [`super::keys::per_object_key`], which
+    /// truncates to `min(file_key.len() + 5, 16)` and so drops the four salt
+    /// bytes from the length qpdf takes the minimum against. The two agree for
+    /// every `/V` and `/R` pair the standard handler actually admits, because
+    /// AES requires a 128-bit key and `min(21, 16) == min(25, 16)`.
+    pub(crate) fn compute_data_key(&self, og: ObjectRef, use_aes: bool) -> Vec<u8> {
+        let mut result = self.file_key.clone();
+        if self.encryption_v >= 5 {
+            return result;
+        }
+
+        let objid = og.number;
+        let generation = u32::from(og.generation);
+        result.push((objid & 0xff) as u8);
+        result.push(((objid >> 8) & 0xff) as u8);
+        result.push(((objid >> 16) & 0xff) as u8);
+        result.push((generation & 0xff) as u8);
+        result.push(((generation >> 8) & 0xff) as u8);
+        if use_aes {
+            result.extend_from_slice(b"sAlT");
+        }
+
+        let digest = crate::encryption::primitives::md5(&result);
+        digest[..result.len().min(16)].to_vec()
+    }
+
+    pub(crate) fn with_object_cipher<T>(
+        &mut self,
+        og: ObjectRef,
+        use_aes: bool,
+        apply: impl FnOnce(StringCipher<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let key = self.key_for_object(og, use_aes).to_vec();
+        if !use_aes {
+            return apply(StringCipher::Rc4 { key: &key });
+        }
+        if let Ok(key) = <&[u8; 32]>::try_from(key.as_slice()) {
+            return apply(StringCipher::Aes256 { key });
+        }
+        let key = aes128_object_key(&key)?;
+        apply(StringCipher::Aes128 { key: &key })
+    }
+
+    /// qpdf `QPDF::getKeyForObject` cache semantics. The cache key is only the
+    /// object/generation pair; `use_aes` is intentionally omitted.
+    pub(crate) fn key_for_object(&mut self, og: ObjectRef, use_aes: bool) -> &[u8] {
+        if self.cached_key_og != Some(og) {
+            self.cached_object_encryption_key = self.compute_data_key(og, use_aes);
+            self.cached_key_og = Some(og);
+        }
+        &self.cached_object_encryption_key
+    }
+}
+
+pub(crate) fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
+    key.try_into().map_err(|_| {
+        EncryptedError::Malformed {
+            reason: "AES-128 object key is not 16 bytes".into(),
+        }
+        .into()
+    })
+}
+
+/// qpdf `QPDF::encryption_method_e` (`QPDF.hh:436`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncryptionMode {
+    Rc4,
+    Aes128,
+    Identity,
+    Aes256,
+    /// Unknown `/CFM` or crypt-filter name. qpdf defers judgment until the
+    /// filter is actually referenced.
+    Unknown,
+}
+
+impl EncryptionMode {
+    /// qpdf `show_encryption_method()` spelling.
+    pub(crate) fn qpdf_name(self) -> &'static str {
+        match self {
+            Self::Rc4 => "RC4",
+            Self::Aes128 => "AESv2",
+            Self::Aes256 => "AESv3",
+            Self::Identity => "none",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Read-only snapshot of an encrypted document's `/Encrypt` parameters.
+#[derive(Debug, Clone)]
+pub struct EncryptionInfo {
+    pub v: i64,
+    pub r: i64,
+    pub length_bits: i64,
+    pub filter: String,
+    pub permissions: Permissions,
+    pub encrypt_metadata: bool,
+    pub stream_method: &'static str,
+    pub string_method: &'static str,
+    pub eff_method: &'static str,
+    pub named_crypt_filters: Vec<(String, &'static str)>,
+}
+
+/// Result of qpdf's `initializeEncryption` plus password authentication.
+pub(crate) struct AuthenticationResult {
+    pub(crate) state: EncryptionState,
+    pub(crate) perms_warning: Option<String>,
+}
+
+/// Authenticate one password candidate and construct the canonical encryption
+/// state. The reader supplies only document-owned dictionary/trailer values;
+/// all Standard-handler parsing and key derivation stays in this module.
+pub(crate) fn authenticate(
+    encrypt: &Dictionary,
+    trailer: &Dictionary,
+    encrypt_ref: Option<ObjectRef>,
+    password: &[u8],
+    password_mode: PasswordMode,
+    password_is_hex_key: bool,
+) -> Result<AuthenticationResult> {
+    let raw_password = password;
+    let revision = required_revision(encrypt)?;
+    let version = required_version(encrypt)?;
+    let permissions = Permissions::new(required_permissions(encrypt)?);
+    let crypt_filters = crypt_filter_modes(encrypt, version);
+    let (cf_stream, cf_string, cf_file) = if matches!(version, 4 | 5) {
+        let cf_stream = interpret_cf(&crypt_filters, encrypt.get("StmF"));
+        let cf_string = interpret_cf(&crypt_filters, encrypt.get("StrF"));
+        let cf_file = match encrypt.get("EFF") {
+            Some(eff) if eff.as_name().is_some() => interpret_cf(&crypt_filters, Some(eff)),
+            _ => cf_stream,
+        };
+        (cf_stream, cf_string, cf_file)
+    } else {
+        (
+            EncryptionMode::Identity,
+            EncryptionMode::Identity,
+            EncryptionMode::Identity,
+        )
+    };
+
+    let effective = |cf: EncryptionMode| {
+        if version >= 4 {
+            cf
+        } else {
+            EncryptionMode::Rc4
+        }
+    };
+    let rc4_in_use = || {
+        matches!(effective(cf_stream), EncryptionMode::Rc4)
+            || matches!(effective(cf_string), EncryptionMode::Rc4)
+            || crypt_filters
+                .values()
+                .any(|mode| matches!(mode, EncryptionMode::Rc4))
+    };
+    let password = if password_is_hex_key {
+        Vec::new()
+    } else {
+        password_bytes_for_read(password, password_mode)?
+    };
+
+    let (file_key, encrypt_metadata, weak_crypto, user_password_matched, owner_password_matched) =
+        if password_is_hex_key {
+            // qpdf `--password-is-hex-key`: the value passed via --password is
+            // the precomputed file encryption key as hex, NOT a user/owner
+            // password. We skip ALL password→key derivation (Algorithm 2 /
+            // 2.A / 2.B / 6 / 7) and the layer-2 user/owner attempt +
+            // bad-password ordering block entirely. This is a SEPARATE
+            // sibling branch: the `else` below preserves layer-2's password
+            // authentication logic (flpdf-9hc.3.21).
+            //
+            // revision / crypt_filters / encrypt_ref / permissions and the
+            // crypt-filter methods are already determined above and do NOT
+            // depend on the password. /EncryptMetadata is likewise
+            // password-independent; compute it with the SAME revision-aware
+            // split layer-2 uses.
+            let file_key = decode_hex_file_key(raw_password)?;
+            let (encrypt_metadata, weak_crypto) = if matches!(revision, 5 | 6) {
+                let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
+                // Same weak-crypto classification as layer-2's R5/R6 branch.
+                (encrypt_metadata, revision == 5 || rc4_in_use())
+            } else {
+                let inputs = standard_handler_inputs(encrypt, trailer)?;
+                (inputs.encrypt_metadata, rc4_in_use())
+            };
+            // A raw key bypasses authentication, so neither the user nor the
+            // owner password was matched. qpdf likewise reports no password
+            // match for `--password-is-hex-key`; report both as false.
+            (file_key, encrypt_metadata, weak_crypto, false, false)
+        } else if matches!(revision, 5 | 6) {
+            // Authentication error behavior must match qpdf (see
+            // flpdf-9hc.3.21):
+            //
+            //   1. Password authentication runs FIRST.  If neither the user nor
+            //      the owner password authenticates, return `BadPassword`.
+            //   2. A wrong-length `/U` or `/O` entry on this authentication
+            //      path is reported as `BadPassword` (an unusable credential
+            //      entry is indistinguishable from a wrong password to a
+            //      caller), not `Malformed`.  This is scoped to the auth path
+            //      via `standard_handler_r5_inputs` (its only caller); all
+            //      other `Malformed` reclassification is intentionally NOT done
+            //      (e.g. `/UE`/`/OE` length errors stay `Malformed`).
+            //
+            // Keep this authentication ordering identical in the `else`
+            // (V<5 / V=4) branch below.
+            let inputs =
+                standard_handler_r5_inputs(encrypt).map_err(map_uo_length_to_bad_password)?;
+            let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
+            let weak_crypto = revision == 5 || rc4_in_use();
+            let user_attempt = if revision == 5 {
+                check_user_password_r5(&password, &inputs)
+            } else {
+                check_user_password_r6(&password, &inputs)
+            };
+            let owner_attempt = if revision == 5 {
+                check_owner_password_r5(&password, &inputs)
+            } else {
+                check_owner_password_r6(&password, &inputs)
+            };
+            let user_password_matched = user_attempt.is_ok();
+            let owner_password_matched = owner_attempt.is_ok();
+            let file_key = match (user_attempt, owner_attempt) {
+                (Ok(key), _) => key,
+                (Err(_), Ok(key)) => key,
+                (Err(user_err), Err(_owner_err)) => return Err(user_err),
+            };
+            (
+                file_key,
+                encrypt_metadata,
+                weak_crypto,
+                user_password_matched,
+                owner_password_matched,
+            )
+        } else {
+            let inputs = standard_handler_inputs(encrypt, trailer)?;
+            let encrypt_metadata = inputs.encrypt_metadata;
+            let weak_crypto = rc4_in_use();
+            // Password authentication runs before any state is committed, so
+            // both failing attempts return `BadPassword`.
+            let v4_path = inputs.v == 4 && inputs.r == 4;
+            let user_attempt = if v4_path {
+                check_user_password_v4(&password, &inputs)
+            } else {
+                check_user_password(&password, &inputs)
+            };
+            let owner_attempt = if v4_path {
+                check_owner_password_v4(&password, &inputs)
+            } else {
+                check_owner_password(&password, &inputs)
+            };
+            let user_password_matched = user_attempt.is_ok();
+            let owner_password_matched = owner_attempt.is_ok();
+            let file_key = match (user_attempt, owner_attempt) {
+                (Ok(key), _) => key,
+                (Err(_), Ok(key)) => key,
+                (Err(user_err), Err(_owner_err)) => return Err(user_err),
+            };
+            (
+                file_key,
+                encrypt_metadata,
+                weak_crypto,
+                user_password_matched,
+                owner_password_matched,
+            )
+        };
+
+    let perms_warning = if revision == 6 {
+        r6_perms_warning(encrypt, &file_key, permissions, encrypt_metadata)?
+    } else {
+        None
+    };
+    Ok(AuthenticationResult {
+        state: EncryptionState {
+            file_key,
+            encryption_v: version,
+            encryption_r: revision,
+            cf_stream,
+            cf_string,
+            cf_file,
+            crypt_filters,
+            encrypt_metadata,
+            encrypt_ref,
+            weak_crypto,
+            permissions,
+            user_password_matched,
+            owner_password_matched,
+            cached_object_encryption_key: Vec::new(),
+            cached_key_og: None,
+        },
+        perms_warning,
+    })
+}
+
+fn standard_handler_inputs<'a>(
+    encrypt: &'a Dictionary,
+    trailer: &'a Dictionary,
+) -> Result<StandardHandlerInputs<'a>> {
+    let filter = required_name(encrypt, "Filter")?;
+    let v = required_integer(encrypt, "V")?;
+    let r = required_integer(encrypt, "R")?;
+    if filter != "Standard" || !matches!((v, r), (1 | 2, 2 | 3) | (4, 4)) {
+        return Err(crate::error::EncryptedError::UnsupportedHandler {
+            filter: filter.to_string(),
+            v,
+            r,
+            cfm: crypt_filter_method(encrypt),
+        }
+        .into());
+    }
+    let length_bits = match encrypt.get("Length") {
+        Some(Object::Integer(value)) => *value,
+        Some(_) => {
+            return Err(crate::error::EncryptedError::Malformed {
+                reason: "/Length entry is not an integer".into(),
+            }
+            .into())
+        }
+        None => 40,
+    };
+    let p = required_permissions(encrypt)?;
+    let u = required_32_byte_string(encrypt, "U")?;
+    let o = required_32_byte_string(encrypt, "O")?;
+    let id0 = first_file_id(trailer)?;
+    let encrypt_metadata = encrypt_metadata_flag(encrypt)?;
+    Ok(StandardHandlerInputs {
+        v,
+        r,
+        length_bits,
+        p,
+        id0,
+        u,
+        o,
+        encrypt_metadata,
+    })
+}
+
+fn standard_handler_r5_inputs(encrypt: &Dictionary) -> Result<StandardHandlerR5Inputs<'_>> {
+    let filter = required_name(encrypt, "Filter")?;
+    let v = required_integer(encrypt, "V")?;
+    let r = required_integer(encrypt, "R")?;
+    if filter != "Standard" || v != 5 || !matches!(r, 5 | 6) {
+        return Err(crate::error::EncryptedError::UnsupportedHandler {
+            filter: filter.to_string(),
+            v,
+            r,
+            cfm: crypt_filter_method(encrypt),
+        }
+        .into());
+    }
+    Ok(StandardHandlerR5Inputs {
+        u: required_48_byte_string(encrypt, "U")?,
+        o: required_48_byte_string(encrypt, "O")?,
+        ue: required_32_byte_string(encrypt, "UE")?,
+        oe: required_32_byte_string(encrypt, "OE")?,
+    })
+}
+
+/// Scoped to the V=5 R=5/R=6 authentication path (the sole caller of
+/// `standard_handler_r5_inputs`): a `/U` or `/O` entry that is not exactly
+/// 48 bytes is an unusable credential entry that is indistinguishable, from a
+/// caller's perspective, from supplying the wrong password — qpdf reports
+/// "invalid password" here, so we map to `BadPassword` for parity.
+///
+/// Only the `/U` / `/O` *length* error is remapped. `/UE` / `/OE` length
+/// errors, missing entries, and non-string entries stay `Malformed`: those are
+/// genuine structural defects, not credential mismatches. No broader
+/// `Malformed` reclassification is performed.
+fn map_uo_length_to_bad_password(err: crate::Error) -> crate::Error {
+    match &err {
+        crate::Error::Encrypted(crate::error::EncryptedError::Malformed { reason })
+            if reason == "/U entry is not 48 bytes" || reason == "/O entry is not 48 bytes" =>
+        {
+            crate::error::EncryptedError::BadPassword.into()
+        }
+        _ => err,
+    }
+}
+
+fn decode_hex_file_key(raw: &[u8]) -> Result<Vec<u8>> {
+    let trimmed: Vec<u8> = raw
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let key = hex::decode(&trimmed).map_err(|err| crate::error::EncryptedError::Malformed {
+        reason: format!("--password-is-hex-key: --password is not valid hex ({err})"),
+    })?;
+    if key.len() > 32 {
+        return Err(crate::error::EncryptedError::Malformed {
+            reason: format!(
+                "--password-is-hex-key: decoded key is {} bytes; the Standard security handler key is at most 32 bytes",
+                key.len()
+            ),
+        }
+        .into());
+    }
+    Ok(key)
+}
+
+fn encrypt_metadata_flag(encrypt: &Dictionary) -> Result<bool> {
+    match encrypt.get("EncryptMetadata") {
+        Some(Object::Boolean(value)) => Ok(*value),
+        Some(_) => Err(crate::error::EncryptedError::Malformed {
+            reason: "/EncryptMetadata entry is not a boolean".into(),
+        }
+        .into()),
+        None => Ok(true),
+    }
+}
+
+fn required_permissions(encrypt: &Dictionary) -> Result<i32> {
+    i32::try_from(required_integer(encrypt, "P")?).map_err(|_| {
+        crate::error::EncryptedError::Malformed {
+            reason: "/P entry is out of i32 range".into(),
+        }
+        .into()
+    })
+}
+
+fn r6_perms_warning(
+    encrypt: &Dictionary,
+    file_key: &[u8],
+    permissions: Permissions,
+    encrypt_metadata: bool,
+) -> Result<Option<String>> {
+    let Some(perms) = encrypt.get("Perms") else {
+        return Ok(None);
+    };
+    let Object::String(bytes) = perms else {
+        return Ok(Some("R=6 /Perms entry is not a string".into()));
+    };
+    let Ok(mut block) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        return Ok(Some("R=6 /Perms entry is not 16 bytes".into()));
+    };
+    let Ok(file_key) = <&[u8; 32]>::try_from(file_key) else {
+        return Ok(Some(
+            "R=6 /Perms cannot be verified with non-256-bit file key".into(),
+        ));
+    };
+    super::primitives::aes256_ecb_decrypt_block(file_key, &mut block);
+    let perms_p = i32::from_le_bytes(block[..4].try_into().expect("slice length checked"));
+    let perms_metadata = match block[8] {
+        b'T' => true,
+        b'F' => false,
+        _ => {
+            return Ok(Some(
+                "R=6 /Perms encrypted-metadata flag is not T or F".into(),
+            ))
+        }
+    };
+    if perms_p != permissions.raw() {
+        return Ok(Some(format!(
+            "R=6 /Perms permissions value {perms_p} does not match /P {}",
+            permissions.raw()
+        )));
+    }
+    if block[4..8] != [0xff; 4] {
+        return Ok(Some("R=6 /Perms reserved bytes are invalid".into()));
+    }
+    if perms_metadata != encrypt_metadata {
+        return Ok(Some(
+            "R=6 /Perms encrypted-metadata flag does not match /EncryptMetadata".into(),
+        ));
+    }
+    if &block[9..12] != b"adb" {
+        return Ok(Some("R=6 /Perms magic bytes are not 'adb'".into()));
+    }
+    Ok(None)
+}
+
+fn required_revision(encrypt: &Dictionary) -> Result<i64> {
+    required_integer(encrypt, "R")
+}
+
+fn required_version(encrypt: &Dictionary) -> Result<i64> {
+    required_integer(encrypt, "V")
+}
+
+fn required_integer(dict: &Dictionary, key: &'static str) -> Result<i64> {
+    match dict.get(key) {
+        Some(Object::Integer(value)) => Ok(*value),
+        Some(_) => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not an integer"),
+        }
+        .into()),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+pub(crate) fn required_name<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a str> {
+    match dict.get(key) {
+        Some(Object::Name(name)) => std::str::from_utf8(name).map_err(|_| {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not valid UTF-8"),
+            }
+            .into()
+        }),
+        Some(_) => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a name"),
+        }
+        .into()),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+fn required_32_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a [u8; 32]> {
+    match dict.get(key) {
+        Some(Object::String(bytes)) => bytes.as_slice().try_into().map_err(|_| {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not 32 bytes"),
+            }
+            .into()
+        }),
+        Some(_) => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a string"),
+        }
+        .into()),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+fn required_48_byte_string<'a>(dict: &'a Dictionary, key: &'static str) -> Result<&'a [u8; 48]> {
+    match dict.get(key) {
+        Some(Object::String(bytes)) => bytes.as_slice().try_into().map_err(|_| {
+            crate::error::EncryptedError::Malformed {
+                reason: format!("/{key} entry is not 48 bytes"),
+            }
+            .into()
+        }),
+        Some(_) => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("/{key} entry is not a string"),
+        }
+        .into()),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: format!("missing /{key} entry"),
+        }
+        .into()),
+    }
+}
+
+pub(crate) fn first_file_id(trailer: &Dictionary) -> Result<&[u8]> {
+    match trailer.get("ID") {
+        Some(Object::Array(ids)) => match ids.first() {
+            Some(Object::String(id0)) => Ok(id0),
+            Some(_) => Err(crate::error::EncryptedError::Malformed {
+                reason: "/ID first entry is not a string".into(),
+            }
+            .into()),
+            None => Err(crate::error::EncryptedError::Malformed {
+                reason: "/ID array is empty".into(),
+            }
+            .into()),
+        },
+        Some(_) => Err(crate::error::EncryptedError::Malformed {
+            reason: "/ID entry is not an array".into(),
+        }
+        .into()),
+        None => Err(crate::error::EncryptedError::Malformed {
+            reason: "missing /ID entry".into(),
+        }
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_dictionary() -> Dictionary {
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("Filter", Object::Name(b"Standard".to_vec()));
+        encrypt.insert("V", Object::Integer(2));
+        encrypt.insert("R", Object::Integer(3));
+        encrypt.insert("P", Object::Integer(-4));
+        encrypt.insert("U", Object::String(vec![0; 32]));
+        encrypt.insert("O", Object::String(vec![0; 32]));
+        encrypt
+    }
+
+    fn legacy_trailer() -> Dictionary {
+        let mut trailer = Dictionary::new();
+        trailer.insert("ID", Object::Array(vec![Object::String(vec![1, 2, 3])]));
+        trailer
+    }
+
+    #[test]
+    fn dictionary_validation_reports_qpdf_error_shapes() {
+        let mut unsupported = legacy_dictionary();
+        unsupported.insert("Filter", Object::Name(b"Other".to_vec()));
+        assert!(standard_handler_inputs(&unsupported, &legacy_trailer()).is_err());
+
+        let mut wrong_length = legacy_dictionary();
+        wrong_length.insert("Length", Object::Name(b"bad".to_vec()));
+        assert!(standard_handler_inputs(&wrong_length, &legacy_trailer()).is_err());
+
+        let mut unsupported_v5 = legacy_dictionary();
+        unsupported_v5.insert("V", Object::Integer(4));
+        unsupported_v5.insert("R", Object::Integer(4));
+        assert!(standard_handler_r5_inputs(&unsupported_v5).is_err());
+
+        let mut bad_permissions = legacy_dictionary();
+        bad_permissions.insert("P", Object::Integer(i64::MAX));
+        assert!(standard_handler_inputs(&bad_permissions, &legacy_trailer()).is_err());
+
+        let mut missing = Dictionary::new();
+        assert!(required_integer(&missing, "V").is_err());
+        missing.insert("V", Object::Name(b"not-an-integer".to_vec()));
+        assert!(required_integer(&missing, "V").is_err());
+
+        assert!(required_name(&Dictionary::new(), "Filter").is_err());
+        let mut wrong_name = Dictionary::new();
+        wrong_name.insert("Filter", Object::Integer(1));
+        assert!(required_name(&wrong_name, "Filter").is_err());
+        wrong_name.insert("Filter", Object::Name(vec![0xff]));
+        assert!(required_name(&wrong_name, "Filter").is_err());
+
+        let mut wrong_32 = Dictionary::new();
+        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        wrong_32.insert("U", Object::Integer(1));
+        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+        wrong_32.insert("U", Object::String(vec![0; 31]));
+        assert!(required_32_byte_string(&wrong_32, "U").is_err());
+
+        let mut wrong_48 = Dictionary::new();
+        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        wrong_48.insert("U", Object::Integer(1));
+        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+        wrong_48.insert("U", Object::String(vec![0; 47]));
+        assert!(required_48_byte_string(&wrong_48, "U").is_err());
+
+        assert!(first_file_id(&Dictionary::new()).is_err());
+        let mut id = Dictionary::new();
+        id.insert("ID", Object::Name(b"not-an-array".to_vec()));
+        assert!(first_file_id(&id).is_err());
+        id.insert("ID", Object::Array(Vec::new()));
+        assert!(first_file_id(&id).is_err());
+        id.insert("ID", Object::Array(vec![Object::Integer(1)]));
+        assert!(first_file_id(&id).is_err());
+
+        assert!(encrypt_metadata_flag(&Dictionary::new()).unwrap());
+        let mut metadata = Dictionary::new();
+        metadata.insert("EncryptMetadata", Object::Integer(1));
+        assert!(encrypt_metadata_flag(&metadata).is_err());
+        metadata.insert("EncryptMetadata", Object::Boolean(false));
+        assert!(!encrypt_metadata_flag(&metadata).unwrap());
+    }
+
+    fn encrypted_perms(p: i32, encrypt_metadata: bool, edit: impl FnOnce(&mut [u8; 16])) -> Object {
+        let file_key = [0x42; 32];
+        let mut block = crate::encryption::standard::compute_perms_blob(
+            p,
+            encrypt_metadata,
+            &[1, 2, 3, 4],
+            &file_key,
+        );
+        crate::encryption::primitives::aes256_ecb_decrypt_block(&file_key, &mut block);
+        edit(&mut block);
+        crate::encryption::primitives::aes256_ecb_encrypt_block(&file_key, &mut block);
+        Object::String(block.to_vec())
+    }
+
+    fn perms_warning(
+        perms: Object,
+        file_key: &[u8],
+        expected: i32,
+        metadata: bool,
+    ) -> Option<String> {
+        let mut encrypt = Dictionary::new();
+        encrypt.insert("Perms", perms);
+        r6_perms_warning(&encrypt, file_key, Permissions::new(expected), metadata).unwrap()
+    }
+
+    #[test]
+    fn perms_validation_covers_qpdf_warning_order() {
+        let key = [0x42; 32];
+        assert_eq!(
+            r6_perms_warning(&Dictionary::new(), &key, Permissions::new(-4), true).unwrap(),
+            None
+        );
+        assert_eq!(
+            perms_warning(Object::Integer(1), &key, -4, true).as_deref(),
+            Some("R=6 /Perms entry is not a string")
+        );
+        assert_eq!(
+            perms_warning(Object::String(vec![0; 15]), &key, -4, true).as_deref(),
+            Some("R=6 /Perms entry is not 16 bytes")
+        );
+        assert_eq!(
+            perms_warning(Object::String(vec![0; 16]), &[0; 31], -4, true).as_deref(),
+            Some("R=6 /Perms cannot be verified with non-256-bit file key")
+        );
+        assert_eq!(
+            perms_warning(
+                encrypted_perms(-4, true, |block| block[8] = b'X'),
+                &key,
+                -4,
+                true
+            )
+            .as_deref(),
+            Some("R=6 /Perms encrypted-metadata flag is not T or F")
+        );
+        assert!(perms_warning(encrypted_perms(-4, true, |_| {}), &key, -3, true).is_some());
+        assert_eq!(
+            perms_warning(
+                encrypted_perms(-4, true, |block| block[4] = 0),
+                &key,
+                -4,
+                true
+            )
+            .as_deref(),
+            Some("R=6 /Perms reserved bytes are invalid")
+        );
+        assert_eq!(
+            perms_warning(encrypted_perms(-4, false, |_| {}), &key, -4, true).as_deref(),
+            Some("R=6 /Perms encrypted-metadata flag does not match /EncryptMetadata")
+        );
+        assert_eq!(
+            perms_warning(
+                encrypted_perms(-4, true, |block| block[9] = b'X'),
+                &key,
+                -4,
+                true
+            )
+            .as_deref(),
+            Some("R=6 /Perms magic bytes are not 'adb'")
+        );
+        assert_eq!(
+            perms_warning(encrypted_perms(-4, true, |_| {}), &key, -4, true),
+            None
+        );
+    }
+}
