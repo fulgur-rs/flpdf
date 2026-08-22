@@ -62,7 +62,6 @@
 | `crates/flpdf/src/linearization/renumber.rs` | correspondence | QPDFWriter.cc linearized object renumbering layered over the shared rewrite renumberer |
 | `crates/flpdf/src/linearization/show.rs` | correspondence | QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting |
 | `crates/flpdf/src/linearization/writer.rs` | correspondence | QPDFWriter.cc linearized write path split from the standard writer |
-| `crates/flpdf/src/linearization/xref_stream.rs` | correspondence | compatibility namespace for QPDFWriter.cc xref-stream serialization |
 | `crates/flpdf/src/logger.rs` | correspondence | QPDFLogger.cc shared info, warning, error, and binary-save pipeline routing |
 | `crates/flpdf/src/matrix.rs` | mirror | libqpdf/QPDFMatrix.cc |
 | `crates/flpdf/src/name_number_tree.rs` | correspondence | compatibility wrappers around the qpdf-shaped \`NameTree\` and \`NumberTree\` helpers in \`nntree.rs\` |
