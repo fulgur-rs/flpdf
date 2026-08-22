@@ -1252,10 +1252,6 @@ impl NumberTree {
     pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
         self.inner.max_depth = Some(max_depth);
     }
-
-    pub(crate) fn make_root_indirect<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
-        self.inner.make_root_indirect(pdf)
-    }
 }
 
 /// Handle-native name-tree facade for qpdf-shaped consumers.

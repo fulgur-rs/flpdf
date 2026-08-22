@@ -75,6 +75,9 @@ fn set_range_mutates_existing_page_labels_root() {
         1,
     );
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
+    let page_labels_root = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&page_labels_root)
+        .expect("resolve page-label root");
 
     pdf.page_labels()
         .set_range(
@@ -102,6 +105,27 @@ fn set_range_mutates_existing_page_labels_root() {
         pdf.page_labels().label_string_for_page(5).expect("label"),
         "AII"
     );
+    let nums = page_labels_root
+        .get_key(b"/Nums")
+        .as_array()
+        .expect("/Nums present");
+    assert!(nums.iter().any(|value| value.as_integer() == Some(5)));
+}
+
+#[test]
+fn page_label_mutations_use_only_the_canonical_handle_route() {
+    let source = include_str!("../src/page_label_document_helper.rs");
+    let production = source
+        .split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .expect("page-label production source");
+
+    for forbidden in ["crate::NumberTree::", "resolve_borrowed(", ".set_object("] {
+        assert!(
+            !production.contains(forbidden),
+            "page-label production route still contains {forbidden}"
+        );
+    }
 }
 
 #[test]

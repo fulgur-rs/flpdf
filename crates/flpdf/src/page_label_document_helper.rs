@@ -7,7 +7,9 @@
 //! existing page-operation callers.
 
 use crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH;
-use crate::{Dictionary, Error, Object, ObjectHandle, Pdf, Result};
+#[cfg(test)]
+use crate::{Dictionary, Object};
+use crate::{Error, ObjectHandle, Pdf, Result};
 use std::io::{Read, Seek};
 
 /// Page-label numbering style (ISO 32000-1 §12.4.2 `/S`).
@@ -75,6 +77,7 @@ impl LabelRange {
     /// [`PageLabelDocumentHelper::ranges`], which reads the canonical
     /// `ObjectHandle` graph; this plain form is for the
     /// non-resolving JSON-inspection path.
+    #[cfg(test)]
     pub fn from_dict(dict: &Dictionary) -> Self {
         let style = match dict.get("S") {
             Some(Object::Name(bytes)) => LabelStyle::from_name(bytes),
@@ -138,6 +141,7 @@ impl LabelRange {
     /// `String`'s raw UTF-8 bytes verbatim would be misread by
     /// PDFDocEncoding-only readers — a source `§` (`c2 a7`) would come back as
     /// `Â§`.
+    #[cfg(test)]
     pub fn to_dict(&self) -> Dictionary {
         let mut d = Dictionary::new();
         if let Some(name) = self.style.to_name() {
@@ -845,23 +849,25 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(());
         };
-        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference()?;
+        if catalog.try_as_dictionary()?.is_none() {
             return Ok(());
+        }
+        let tree = match catalog.try_has_key(b"/PageLabels")? {
+            true => crate::nntree::HandleNumberTree::new(
+                catalog.try_get_key(b"/PageLabels")?,
+                DEFAULT_MAX_TREE_DEPTH,
+            ),
+            false => crate::nntree::HandleNumberTree::new_empty(self.pdf, DEFAULT_MAX_TREE_DEPTH)?,
         };
-        let mut tree = match catalog.get("PageLabels").cloned() {
-            Some(root) => crate::NumberTree::new(root, true),
-            None => crate::NumberTree::new_empty(self.pdf, true)?,
-        };
-        tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
         tree.insert(
             self.pdf,
             first_page_idx,
-            Object::Dictionary(range.to_dict()),
+            Self::page_label_dict(range.style, range.start, &range.prefix),
         )?;
-        tree.make_root_indirect(self.pdf)?;
-        catalog.insert("PageLabels", tree.into_root());
-        self.pdf
-            .set_object(catalog_ref, Object::Dictionary(catalog));
+        catalog.replace_key(b"/PageLabels", tree.root_handle(self.pdf)?)?;
+        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
 
@@ -878,25 +884,27 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(false);
         };
-        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference()?;
+        if catalog.try_as_dictionary()?.is_none() {
             return Ok(false);
-        };
-        let Some(root) = catalog.get("PageLabels").cloned() else {
+        }
+        if !catalog.try_has_key(b"/PageLabels")? {
             return Ok(false);
-        };
-        let mut tree = crate::NumberTree::new(root, true);
-        tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
+        }
+        let tree = crate::nntree::HandleNumberTree::new(
+            catalog.try_get_key(b"/PageLabels")?,
+            DEFAULT_MAX_TREE_DEPTH,
+        );
         if tree.remove(self.pdf, first_page_idx)?.is_none() {
             return Ok(false);
         }
-        if tree.begin(self.pdf)?.valid() {
-            tree.make_root_indirect(self.pdf)?;
-            catalog.insert("PageLabels", tree.into_root());
+        if tree.entries(self.pdf)?.is_empty() {
+            catalog.remove_key(b"/PageLabels");
         } else {
-            catalog.remove("PageLabels");
+            catalog.replace_key(b"/PageLabels", tree.root_handle(self.pdf)?)?;
         }
-        self.pdf
-            .set_object(catalog_ref, Object::Dictionary(catalog));
+        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(true)
     }
 
@@ -908,7 +916,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// This is the bulk counterpart to [`Self::set_range`]/[`Self::remove_range`]:
     /// where those mutate one entry of the existing tree, `write_labels`
     /// discards whatever the tree currently holds and rebuilds it from the
-    /// given list (rebalanced through [`crate::NumberTree`] with qpdf's split
+    /// given list (rebalanced through the canonical `HandleNumberTree` with qpdf's split
     /// behavior).
     ///
     /// # Errors
@@ -932,9 +940,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 )));
             }
         }
-        let mut entries: Vec<(i64, Object)> = ranges
+        let mut entries: Vec<(i64, LabelRange)> = ranges
             .iter()
-            .map(|(idx, range)| (*idx, Object::Dictionary(range.to_dict())))
+            .map(|(idx, range)| (*idx, range.clone()))
             .collect();
         // build_number_tree requires pre-sorted UNIQUE input; callers
         // (merge_adjacent_ranges, shifted insert/remove lists) already preserve
@@ -947,227 +955,34 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         self.rebuild(entries)
     }
 
-    /// Shift every label range at or after `at` forward by `count`, modeling
-    /// `count` pages inserted at 0-based position `at`. Ranges before `at` are
-    /// left untouched, so pages inserted in the middle of an existing range's
-    /// span inherit that range's numbering (no new explicit entry is needed).
-    /// [`merge_adjacent_ranges`] then folds away a shifted range that the
-    /// insertion happened to turn into a redundant continuation of its
-    /// predecessor (an intentional gap of exactly `count` pages closes up).
-    ///
-    /// A no-op when `count == 0` or when the document has no `/PageLabels`
-    /// (this never fabricates a tree where none existed).
-    ///
-    /// # Errors
-    ///
-    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
-    ///   exceeded while reading the existing tree.
-    /// - Any error from [`Pdf::resolve`].
-    // qpdf-deviation-start: index-shift-and-preserve update of an existing
-    // /PageLabels tree (this method and remove_pages below) has no qpdf
-    // counterpart -- QPDF::insertPage/removePage (libqpdf/QPDF_pages.cc:
-    // 205-276) never touch /PageLabels, and QPDFJob's only two
-    // label-rebuilding paths (--set-page-labels, --pages' handlePageSpecs)
-    // always rebuild /Nums from scratch via getLabelsForPageRange per
-    // output page instead of shifting an existing tree's surviving keys.
-    pub fn insert_pages(&mut self, at: usize, count: usize) -> Result<()> {
-        if count == 0 {
-            return Ok(());
-        }
-        let ranges = self.ranges()?;
-        if ranges.is_empty() {
-            return Ok(());
-        }
-        let at = i64::try_from(at)
-            .map_err(|_| Error::Unsupported(format!("insert_pages: at={} exceeds i64::MAX", at)))?;
-        let count = i64::try_from(count).map_err(|_| {
-            Error::Unsupported(format!("insert_pages: count={} exceeds i64::MAX", count))
-        })?;
-
-        // Compute the label that old source page `at` was showing — the
-        // first surviving page (which will end up at output index `at +
-        // count`) has to keep that label. Without this, an insertion inside
-        // an existing range (or inside the default-decimal prefix) shifts
-        // the effective numbering: `insert_pages(2, 1)` on a single decimal
-        // range at 0 makes old page 2 (previously "3") render as "4"
-        // instead of "3"; the same happens in the default prefix when
-        // no explicit range covers `at`.
-        let mut effective_at: Option<&(i64, LabelRange)> = None;
-        for entry in &ranges {
-            if entry.0 <= at {
-                effective_at = Some(entry);
-            } else {
-                break;
-            }
-        }
-        let preservation_label = match effective_at {
-            Some((first, r)) => LabelRange {
-                style: r.style,
-                prefix: r.prefix.clone(),
-                start: r.start.saturating_add(at.saturating_sub(*first)),
-            },
-            // Default-decimal prefix before the first explicit range: old
-            // source page `at` was rendering as decimal `at + 1`.
-            None => LabelRange {
-                style: LabelStyle::Decimal,
-                prefix: String::new(),
-                start: at.saturating_add(1),
-            },
-        };
-
-        let mut result: Vec<(i64, LabelRange)> = ranges
-            .into_iter()
-            .map(|(idx, range)| {
-                if idx >= at {
-                    (idx.saturating_add(count), range)
-                } else {
-                    (idx, range)
-                }
-            })
-            .collect();
-        // Insert the preservation range at `at + count` so surviving pages
-        // keep their original labels. merge_adjacent_ranges below folds it
-        // away when it is redundant with a predecessor.
-        result.push((at.saturating_add(count), preservation_label));
-        result.sort_by_key(|(idx, _)| *idx);
-
-        // Shifting + preservation may leave neighbours that are structurally
-        // equivalent (e.g. the preservation range equals a shifted first
-        // range's continuation); fold them away like `remove_pages` does.
-        let merged = merge_adjacent_ranges(result);
-        self.write_labels(&merged)
-    }
-
-    /// Update label ranges for `count` pages removed at 0-based position
-    /// `at`, modeling the effect of deleting document pages `at..at+count`.
-    ///
-    /// Ranges entirely before `at` are kept verbatim. Ranges from `at+count`
-    /// onward are recomputed with [`Self::labels_for_page_range`] (the same
-    /// renumbering qpdf's `getLabelsForPageRange` performs for page
-    /// extraction/merging), so a range whose span is partially consumed by
-    /// the removal gets a fresh `/St` reflecting the pages actually lost, and
-    /// a range whose entire span falls inside `at..at+count` disappears.
-    /// [`merge_adjacent_ranges`] then collapses a trailing entry that turns
-    /// out to be redundant with its new predecessor (the common case when the
-    /// removed pages sat inside a single, otherwise-uninterrupted range).
-    ///
-    /// This helper does not know the document's total page count, so
-    /// removing pages up to (or past) the end of the labeled range can
-    /// still produce a trailing entry describing pages that no longer
-    /// exist — e.g. `remove_pages(4, 1)` on a 5-page document writes an
-    /// explicit range at output index 4 even though the output has only
-    /// pages 0..3. That entry is inert for lookups
-    /// ([`Self::label_for_page`] never queries past the caller's page
-    /// count) but the on-disk `/PageLabels` tree carries a stale key.
-    /// Callers who care about a clean tree at output time should call
-    /// [`Self::write_labels`] afterwards with the trimmed range list.
-    ///
-    /// A no-op when `count == 0` or when the document has no `/PageLabels`.
-    ///
-    /// # Errors
-    ///
-    /// - [`crate::Error::Unsupported`] when the number-tree depth limit is
-    ///   exceeded while reading the existing tree.
-    /// - Any error from [`Pdf::resolve`].
-    pub fn remove_pages(&mut self, at: usize, count: usize) -> Result<()> {
-        if count == 0 {
-            return Ok(());
-        }
-        let ranges = self.ranges()?;
-        if ranges.is_empty() {
-            return Ok(());
-        }
-        let at = i64::try_from(at)
-            .map_err(|_| Error::Unsupported(format!("remove_pages: at={} exceeds i64::MAX", at)))?;
-        let count = i64::try_from(count).map_err(|_| {
-            Error::Unsupported(format!("remove_pages: count={} exceeds i64::MAX", count))
-        })?;
-        let removed_end = at.saturating_add(count);
-
-        // Everything before `at` is unchanged.
-        let mut result: Vec<(i64, LabelRange)> = ranges
-            .iter()
-            .filter(|(idx, _)| *idx < at)
-            .cloned()
-            .collect();
-
-        // Fabricate the tail's first-label entry from the range effective at
-        // `removed_end` (or a LabelStyle::None default if no range applies) —
-        // both use `at` as the new base index in the output. This mirrors what
-        // the previous `labels_for_page_range` call did, but reuses `ranges`
-        // already in scope: O(N) in-memory pass instead of an O(M × N) tree
-        // re-parse per surviving explicit index.
-        let mut effective_at_removed_end: Option<&(i64, LabelRange)> = None;
-        for entry in &ranges {
-            if entry.0 <= removed_end {
-                effective_at_removed_end = Some(entry);
-            } else {
-                break;
-            }
-        }
-        let tail_first_label = match effective_at_removed_end {
-            Some((first, r)) => {
-                let offset = removed_end.saturating_sub(*first);
-                LabelRange {
-                    style: r.style,
-                    prefix: r.prefix.clone(),
-                    start: r.start.saturating_add(offset),
-                }
-            }
-            // No explicit range covers `removed_end`: those pages were
-            // showing the PDF default label sequence (decimal starting at
-            // 1). After removal the page at output index `at` was previously
-            // source page `removed_end`, whose default label was
-            // `removed_end + 1`; preserve that decimal sequence rather than
-            // fabricating a LabelStyle::None entry that would render every
-            // surviving page's label as an empty string.
-            None => LabelRange {
-                style: LabelStyle::Decimal,
-                prefix: String::new(),
-                start: removed_end.saturating_add(1),
-            },
-        };
-        result.push((at, tail_first_label));
-
-        // Every explicit entry past `removed_end` survives, shifted left by
-        // `count` so its output index accounts for the removed span.
-        let idx_offset = at.saturating_sub(removed_end);
-        for (idx, range) in &ranges {
-            if *idx > removed_end {
-                result.push((idx.saturating_add(idx_offset), range.clone()));
-            }
-        }
-
-        let merged = merge_adjacent_ranges(result);
-        self.write_labels(&merged)
-    }
-    // qpdf-deviation-end
-
     /// Rebuild `/PageLabels` from sorted entries and patch the catalog. Empty
     /// entries → remove `/PageLabels`.
-    fn rebuild(&mut self, entries: Vec<(i64, Object)>) -> Result<()> {
+    fn rebuild(&mut self, entries: Vec<(i64, LabelRange)>) -> Result<()> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(());
         };
-        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference()?;
+        if catalog.try_as_dictionary()?.is_none() {
             return Ok(());
-        };
+        }
 
         if entries.is_empty() {
-            catalog.remove("PageLabels");
-            self.pdf
-                .set_object(catalog_ref, Object::Dictionary(catalog));
+            catalog.remove_key(b"/PageLabels");
+            self.pdf.mark_object_handle_dirty(&catalog)?;
             return Ok(());
         }
 
-        let mut tree = crate::NumberTree::new_empty(self.pdf, true)?;
-        let mut cursor = tree.end();
-        for (index, value) in entries {
-            cursor.insert_after(&mut tree, self.pdf, index, value)?;
+        let tree = crate::nntree::HandleNumberTree::new_empty(self.pdf, DEFAULT_MAX_TREE_DEPTH)?;
+        for (index, range) in entries {
+            tree.insert(
+                self.pdf,
+                index,
+                Self::page_label_dict(range.style, range.start, &range.prefix),
+            )?;
         }
-        catalog.insert("PageLabels", tree.into_root());
-        self.pdf
-            .set_object(catalog_ref, Object::Dictionary(catalog));
+        catalog.replace_key(b"/PageLabels", tree.root_handle(self.pdf)?)?;
+        self.pdf.mark_object_handle_dirty(&catalog)?;
         Ok(())
     }
 }
@@ -2491,513 +2306,6 @@ mod tests {
         h.write_reconstructed_labels(&[(0, none_range(1))]).unwrap();
         h.write_reconstructed_labels_with_prefix_presence(&[(0, none_range(1), false)])
             .unwrap();
-    }
-
-    // ── insert_pages ──────────────────────────────────────────────────────
-
-    #[test]
-    fn insert_pages_in_middle_shifts_only_ranges_at_or_after_it() {
-        // Roman range at 0, decimal range at 5. Insert 2 pages at position 3,
-        // inside the roman range's span.
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            label_dict("r", Some(1), None),
-            Object::Integer(5),
-            label_dict("D", Some(1), None),
-        ]);
-        {
-            let mut h = pdf.page_labels();
-            h.insert_pages(3, 2).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        // Three ranges after insertion:
-        //   0: original roman start 1 (inserted pages 3, 4 render iv, v)
-        //   5: preservation roman start 4 (old page 3, now output page 5,
-        //      keeps its original "iv" label instead of drifting to "vi")
-        //   7: original decimal restart shifted from 5 by count
-        assert_eq!(ranges.len(), 3, "got {ranges:?}");
-        assert_eq!(ranges[0].0, 0);
-        assert_eq!(ranges[1].0, 5);
-        assert_eq!(ranges[1].1.start, 4, "old source page 3's roman position");
-        assert_eq!(ranges[2].0, 7);
-        // End-to-end: old page 3's label survives at its new position.
-        assert_eq!(h.label_string_for_page(5).unwrap(), "iv");
-    }
-
-    #[test]
-    fn insert_pages_at_beginning_shifts_first_range_and_leading_pages_default() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.insert_pages(0, 2).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), vec![(2, dec(1))]);
-        // The two newly-inserted leading pages precede any range, so they fall
-        // back to the plain 1-based default rather than inheriting page 2's "1".
-        assert_eq!(h.label_string_for_page(0).unwrap(), "1");
-        assert_eq!(h.label_string_for_page(2).unwrap(), "1");
-    }
-
-    /// Cover the `None` arm of insert_pages's preservation-label match:
-    /// when `at` sits BEFORE the first explicit range, no entry has
-    /// `entry.0 <= at`, so `effective_at` stays None and the fabricated
-    /// LabelStyle::Decimal-at-1 range at `at + count` runs.
-    #[test]
-    fn insert_pages_before_first_range_fabricates_decimal_preservation() {
-        // First explicit range at index 5 (roman), leaving pages 0..4 with
-        // the PDF default decimal sequence "1".."5".
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("r", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            // Insert 2 pages at position 0 — inside the default prefix, no
-            // explicit range covers `at = 0`.
-            h.insert_pages(0, 2).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        // Old page 0 (previously "1") moves to output index 2 and must
-        // still render as "1"; the fabricated Decimal-start-1 preservation
-        // range at index 2 encodes that.
-        assert_eq!(h.label_string_for_page(2).unwrap(), "1");
-        // Old page 4 (previously "5") moves to output index 6, still "5".
-        assert_eq!(h.label_string_for_page(6).unwrap(), "5");
-        // Roman range shifted from 5 to 7.
-        assert_eq!(h.label_string_for_page(7).unwrap(), "i");
-    }
-
-    #[test]
-    fn insert_pages_preserves_old_page_labels_across_gap_close() {
-        // (5, Decimal, start 8) is an intentional forward jump over
-        // (0, Decimal, start 1) — numbers 6 and 7 are deliberately skipped.
-        // Insert 2 pages at position 2. The pre-fix version dropped the
-        // preservation range and merged everything into a single (0, dec 1)
-        // sequence, breaking old page 2's original "3" → it showed "5"
-        // instead after insertion. The correct behaviour keeps old pages'
-        // labels stable: old page 2 stays "3" at its new position 4.
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            label_dict("D", Some(1), None),
-            Object::Integer(5),
-            label_dict("D", Some(8), None),
-        ]);
-        {
-            let mut h = pdf.page_labels();
-            h.insert_pages(2, 2).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        // Old page 2 (label "3") now sits at output page 4 and must still
-        // render as "3", not drift to "5".
-        assert_eq!(h.label_string_for_page(4).unwrap(), "3");
-        // Old page 5 (the deliberate restart to "8") now sits at output
-        // page 7 and must still render as "8".
-        assert_eq!(h.label_string_for_page(7).unwrap(), "8");
-    }
-
-    #[test]
-    fn insert_pages_after_last_range_leaves_entries_unchanged() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.insert_pages(10, 3).unwrap(); // append pages well past the only range
-        }
-        let mut h = pdf.page_labels();
-        // Inserted pages 10-12 continue the decimal-1 sequence (labels
-        // "11","12","13"); old page 10 moves to position 13 but its label
-        // was already "11" under the (0, dec 1) range, so it must still
-        // render as "11" — the preservation range at index 13 with start
-        // 11 encodes this invariant even though it looks redundant to a
-        // naïve reader.
-        assert_eq!(h.label_string_for_page(13).unwrap(), "11");
-        // Pages before the insertion point are untouched.
-        assert_eq!(h.label_string_for_page(0).unwrap(), "1");
-        assert_eq!(h.label_string_for_page(9).unwrap(), "10");
-    }
-
-    #[test]
-    fn insert_pages_noop_on_empty_tree() {
-        let mut pdf = bare_one_page_pdf();
-        let mut h = pdf.page_labels();
-        h.insert_pages(0, 5).unwrap();
-        assert!(
-            !h.has_page_labels().unwrap(),
-            "insert_pages must not fabricate a tree where none existed"
-        );
-    }
-
-    #[test]
-    fn insert_pages_noop_when_count_zero() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.insert_pages(3, 0).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
-    }
-
-    // ── remove_pages ──────────────────────────────────────────────────────
-
-    #[test]
-    fn remove_pages_partial_delete_leaves_gap_entry() {
-        // A single range at 0 covers the whole document. Deleting page index 2
-        // means the numbers that belonged to it are gone, so the surviving
-        // pages after it need a fresh explicit entry (no silent renumbering).
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(2, 1).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), vec![(0, dec(1)), (2, dec(4))]);
-    }
-
-    #[test]
-    fn remove_pages_wipes_range_entirely_consumed_by_removal() {
-        // Decimal at 0, roman spanning indices 5..8, alpha at 8. Remove exactly
-        // the roman range's span.
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            label_dict("D", Some(1), None),
-            Object::Integer(5),
-            label_dict("R", Some(1), None),
-            Object::Integer(8),
-            label_dict("A", Some(1), None),
-        ]);
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(5, 3).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        assert_eq!(
-            ranges,
-            vec![
-                (0, dec(1)),
-                (
-                    5,
-                    LabelRange {
-                        style: LabelStyle::AlphaUpper,
-                        prefix: String::new(),
-                        start: 1
-                    }
-                ),
-            ]
-        );
-        assert!(
-            !ranges
-                .iter()
-                .any(|(_, r)| r.style == LabelStyle::RomanUpper),
-            "the roman range is fully consumed by the removal"
-        );
-    }
-
-    #[test]
-    fn remove_pages_spanning_multiple_ranges_consumes_middle_range() {
-        // Decimal at 0, roman spanning 3..7, alpha at 7. Remove indices 2..8:
-        // the tail of decimal, all of roman, and the head of alpha.
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            label_dict("D", Some(1), None),
-            Object::Integer(3),
-            label_dict("R", Some(1), None),
-            Object::Integer(7),
-            label_dict("A", Some(1), None),
-        ]);
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(2, 6).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        assert_eq!(
-            ranges,
-            vec![
-                (0, dec(1)),
-                (
-                    2,
-                    LabelRange {
-                        style: LabelStyle::AlphaUpper,
-                        prefix: String::new(),
-                        start: 2
-                    }
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn remove_pages_collapses_pre_existing_redundant_neighbor() {
-        // (5, Decimal, start 6) is already exactly the natural continuation of
-        // (0, Decimal, start 1) (1 + (5-0) == 6); this pair survives untouched
-        // in the head, and write_labels re-merges it via merge_adjacent_ranges
-        // on every rebuild. Removing pages far past both (20..23) exercises the
-        // real-gap tail entry at the same time: it must NOT merge with (0,1)
-        // once the redundant (5,6) is folded away, because 3 pages of real
-        // numbering were actually consumed by the removal.
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            label_dict("D", Some(1), None),
-            Object::Integer(5),
-            label_dict("D", Some(6), None),
-        ]);
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(20, 3).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        assert_eq!(ranges, vec![(0, dec(1)), (20, dec(24))]);
-    }
-
-    #[test]
-    fn remove_pages_noop_on_empty_tree() {
-        let mut pdf = bare_one_page_pdf();
-        let mut h = pdf.page_labels();
-        h.remove_pages(0, 3).unwrap();
-        assert!(
-            !h.has_page_labels().unwrap(),
-            "remove_pages must not fabricate a tree where none existed"
-        );
-    }
-
-    #[test]
-    fn remove_pages_noop_when_count_zero() {
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", Some(1), None)]);
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(0, 0).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        assert_eq!(h.ranges().unwrap(), vec![(0, dec(1))]);
-    }
-
-    /// Covers the `None` arm of the `effective_at_removed_end` match in
-    /// remove_pages: when `removed_end` is BEFORE the first explicit range,
-    /// the surviving pages must keep the PDF-default decimal label sequence
-    /// they had before removal (starting at `removed_end + 1`), NOT get a
-    /// LabelStyle::None entry that would render every label as an empty
-    /// string.
-    #[test]
-    fn remove_pages_before_first_range_preserves_default_decimal_sequence() {
-        // Ranges start at index 5 (roman), leaving 0..5 with the PDF
-        // default label sequence "1"…"5".
-        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(5), label_dict("r", Some(1), None)]);
-        // Remove pages 0..2 — removed_end=2, before the first range at index 5.
-        // Old source page 2 (previously "3") now becomes output page 0.
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(0, 2).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        // Two entries survive: an explicit decimal range starting at 3 (so
-        // new page 0 renders as "3", matching source page 2), and the
-        // original roman range now at index 3 (5 - 2 shift).
-        assert_eq!(ranges.len(), 2, "got {ranges:?}");
-        assert_eq!(ranges[0].0, 0);
-        assert_eq!(ranges[0].1.style, LabelStyle::Decimal);
-        assert_eq!(ranges[0].1.start, 3);
-        assert_eq!(ranges[1].0, 3);
-        assert_eq!(ranges[1].1.style, LabelStyle::RomanLower);
-        // End-to-end: the rendered label for new page 0 must be "3".
-        assert_eq!(h.label_string_for_page(0).unwrap(), "3");
-    }
-
-    /// Cover the trailing shift-loop `if *idx > removed_end` in remove_pages:
-    /// deletion touches only the first range, so a downstream range must
-    /// survive with its output index shifted left.
-    #[test]
-    fn remove_pages_shifts_trailing_range_past_removed_span() {
-        // Two ranges: roman starting at 0, decimal restart at 4. Remove
-        // one page at index 0, so the trailing range must shift to index 3.
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            label_dict("r", Some(1), None),
-            Object::Integer(4),
-            label_dict("D", Some(1), None),
-        ]);
-        {
-            let mut h = pdf.page_labels();
-            h.remove_pages(0, 1).unwrap();
-        }
-        let mut h = pdf.page_labels();
-        let ranges = h.ranges().unwrap();
-        // Trailing decimal range slides from index 4 to 3.
-        assert!(
-            ranges
-                .iter()
-                .any(|(idx, r)| *idx == 3 && r.style == LabelStyle::Decimal),
-            "trailing range must survive at shifted index 3: {ranges:?}"
-        );
-    }
-
-    // ── merge_adjacent_ranges ─────────────────────────────────────────────
-
-    #[test]
-    fn merge_adjacent_ranges_collapses_contiguous_identical_neighbor() {
-        // 1 + (5-0) == 6: the second entry adds no information.
-        let merged = merge_adjacent_ranges(vec![(0, dec(1)), (5, dec(6))]);
-        assert_eq!(merged, vec![(0, dec(1))]);
-    }
-
-    #[test]
-    fn merge_adjacent_ranges_keeps_non_contiguous_start() {
-        let ranges = vec![(0, dec(1)), (5, dec(100))];
-        assert_eq!(merge_adjacent_ranges(ranges.clone()), ranges);
-    }
-
-    #[test]
-    fn merge_adjacent_ranges_keeps_style_mismatch() {
-        let b = LabelRange {
-            style: LabelStyle::RomanUpper,
-            prefix: String::new(),
-            start: 6, // numerically contiguous with dec(1), but a different style
-        };
-        let ranges = vec![(0, dec(1)), (5, b)];
-        assert_eq!(
-            merge_adjacent_ranges(ranges.clone()),
-            ranges,
-            "different style must block the merge even when /St lines up"
-        );
-    }
-
-    #[test]
-    fn merge_adjacent_ranges_keeps_prefix_mismatch() {
-        let a = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: "A-".into(),
-            start: 1,
-        };
-        let b = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: "B-".into(),
-            start: 6,
-        };
-        let ranges = vec![(0, a), (5, b)];
-        assert_eq!(
-            merge_adjacent_ranges(ranges.clone()),
-            ranges,
-            "different prefix must block the merge even when style/St line up"
-        );
-    }
-
-    #[test]
-    fn merge_adjacent_ranges_with_prefix_presence_keeps_raw_key_mismatch() {
-        let range = dec(1);
-        let raw_mismatch = vec![(0, range.clone(), false), (1, range.clone(), true)];
-        assert_eq!(
-            merge_adjacent_ranges_with_prefix_presence(raw_mismatch.clone()),
-            raw_mismatch,
-            "absent /P and explicit empty /P are distinct qpdf label dictionaries"
-        );
-
-        let redundant = vec![(0, range.clone(), true), (1, dec(2), true)];
-        assert_eq!(
-            merge_adjacent_ranges_with_prefix_presence(redundant),
-            vec![(0, range, true)],
-            "matching raw /P presence still permits qpdf's normal continuation fold"
-        );
-
-        assert_eq!(
-            merge_adjacent_ranges_with_prefix_presence(Vec::new()),
-            Vec::new()
-        );
-        let unsorted = vec![(10, dec(1), false), (5, dec(1), false)];
-        assert_eq!(
-            merge_adjacent_ranges_with_prefix_presence(unsorted.clone()),
-            unsorted
-        );
-        let overflow = vec![
-            (
-                0,
-                LabelRange {
-                    style: LabelStyle::Decimal,
-                    prefix: String::new(),
-                    start: i64::MAX,
-                },
-                false,
-            ),
-            (1, dec(1), false),
-        ];
-        assert_eq!(
-            merge_adjacent_ranges_with_prefix_presence(overflow.clone()),
-            overflow
-        );
-    }
-
-    #[test]
-    fn merge_adjacent_ranges_handles_empty_and_singleton() {
-        assert_eq!(merge_adjacent_ranges(vec![]), vec![]);
-        let only = vec![(0, dec(1))];
-        assert_eq!(merge_adjacent_ranges(only.clone()), only);
-    }
-
-    #[test]
-    fn merge_adjacent_ranges_skips_merge_on_arithmetic_overflow() {
-        // Unsorted input (idx < prev_idx) → checked_sub underflows → no merge.
-        // The function is total: it must not panic and must preserve the entry.
-        let a = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: String::new(),
-            start: 1,
-        };
-        let b = a.clone();
-        let unsorted = vec![(10, a), (5, b)];
-        assert_eq!(
-            merge_adjacent_ranges(unsorted.clone()),
-            unsorted,
-            "underflow in gap arithmetic must fall through, not merge"
-        );
-
-        // Add-overflow branch: prev.start = i64::MAX with a positive gap
-        // saturates in the old code; checked_add now short-circuits.
-        let big = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: String::new(),
-            start: i64::MAX,
-        };
-        let follow = LabelRange {
-            style: LabelStyle::Decimal,
-            prefix: String::new(),
-            start: 0, // any value; the point is that checked_add must be None
-        };
-        let overflow = vec![(0, big), (1, follow)];
-        assert_eq!(
-            merge_adjacent_ranges(overflow.clone()),
-            overflow,
-            "add overflow must fall through, not merge"
-        );
-    }
-
-    #[test]
-    fn insert_pages_rejects_at_or_count_exceeding_i64_max() {
-        // Need a document with at least one range so we get past the
-        // early-return; usize::MAX > i64::MAX on any target with usize >= 64-bit.
-        // (On 32-bit targets usize::MAX < i64::MAX and try_from succeeds; those
-        // are not our supported targets for this behaviour.)
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            Object::Dictionary(Dictionary::new()),
-        ]);
-        let mut helper = PageLabelDocumentHelper::new(&mut pdf);
-        let err = helper.insert_pages(usize::MAX, 1).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-        let err = helper.insert_pages(0, usize::MAX).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn remove_pages_rejects_at_or_count_exceeding_i64_max() {
-        let mut pdf = pdf_with_pagelabels(vec![
-            Object::Integer(0),
-            Object::Dictionary(Dictionary::new()),
-        ]);
-        let mut helper = PageLabelDocumentHelper::new(&mut pdf);
-        let err = helper.remove_pages(usize::MAX, 1).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-        let err = helper.remove_pages(0, usize::MAX).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
 
     // ---- live-qpdf 11.9.0 oracle: get_label_for_page / get_labels_for_page_range ----
