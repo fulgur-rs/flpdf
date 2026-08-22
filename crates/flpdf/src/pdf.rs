@@ -79,6 +79,10 @@ pub struct Pdf<R: Read + Seek + 'static> {
     pub(crate) version: String,
     pub(crate) trailer: Dictionary,
     pub(crate) last_xref_form: XrefForm,
+    /// qpdf's xref-parser-owned `first_xref_item_offset` used by the
+    /// linearization `/T` check; zero preserves qpdf's initialized default
+    /// when no parsed xref section contains object 0.
+    pub(crate) first_xref_item_offset: u64,
     pub(crate) cache: ObjectCache,
     // The canonical indirect-object handle registry that used to live here is
     // now `ResolverCore::object_cache`, reached through `self.resolver`. It
