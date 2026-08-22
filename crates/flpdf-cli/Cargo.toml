@@ -35,12 +35,12 @@ qpdf-libjpeg-compat = ["flpdf/qpdf-libjpeg-compat"]
 
 [dependencies]
 clap.workspace = true
-flpdf = { path = "../flpdf", version = "0.4.0" }
+flpdf = { path = "../flpdf", version = "0.5.0" }
 same-file.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-flpdf = { path = "../flpdf", version = "0.4.0" }
+flpdf = { path = "../flpdf", version = "0.5.0" }
 predicates.workspace = true
 regex.workspace = true
 serde_json = { workspace = true }

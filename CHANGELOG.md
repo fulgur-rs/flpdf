@@ -232,6 +232,1377 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/fulgur-rs/flpdf/compare/v0.4.0...v0.5.0) - 2026-08-22
+
+### Added
+
+- *(cli)* expose preserve-unreferenced writer option
+- *(job)* port qpdf document check consumer
+- *(job)* route attachment copy through QPDFJob
+- route page splice through ObjectHandle
+- *(job)* route attachment addition through QPDFJob
+- *(job)* route split pages through QPDFJob
+- *(job)* route multi-source page specs through QPDFJob
+- *(job)* route attachment inspection through QPDFJob
+- *(json)* project acroform by page widgets
+- *(job)* migrate ordinary page inspection lifecycle
+- *(job)* migrate JSON inspection lifecycle
+- *(job)* migrate JSON route onto QPDFJob lifecycle
+- *(job)* add shared qpdf lifecycle state
+- route page annotations through live helpers
+- wire qpdf JSON input job boundary
+- add qpdf JSON document boundary
+- implement qpdf JSONReactor state machine
+- add deferred JSON stream providers
+- add qpdf JSON value factory
+- *(acroform)* gate appearance generation on need marker
+- *(acroform)* merge foreign form resources
+- *(acroform)* preserve foreign inherited defaults
+- *(acroform)* add canonical annotation transform graph
+- *(acroform)* cache canonical field associations
+- canonicalize historical xref stream cache ([#851](https://github.com/fulgur-rs/flpdf/pull/851))
+- *(qtest)* decode DCT streams in test driver ([#836](https://github.com/fulgur-rs/flpdf/pull/836))
+- *(resources)* prune Form-owned resources ([#834](https://github.com/fulgur-rs/flpdf/pull/834))
+- *(writer)* cut over full rewrite consumers to ObjectHandle
+- emit writer bodies from ObjectHandle
+- route object stream planning through ObjectHandle ([#820](https://github.com/fulgur-rs/flpdf/pull/820))
+- add qpdf-shaped ObjectHandle encryption surface ([#818](https://github.com/fulgur-rs/flpdf/pull/818))
+- *(json)* port qpdf stream JSON writer
+- *(json)* route qpdf objects through ObjectHandle
+- move ordinary JSON serialization to ObjectHandle
+- *(object-handle)* port qpdf reserved sentinel
+- *(object-handle)* port qpdf stream copying
+- *(embedded-files)* migrate helper to live handles
+- *(nntree)* add handle-native name tree facade
+- *(filespec)* stream path attachments through providers
+- *(filespec)* centralize embedded-file stream finalization
+- *(object-handle)* dispatch provider-backed stream data
+- *(object-handle)* add qpdf stream data provider source
+- *(reader)* add qpdf new stream factory
+- *(object-handle)* expose owner-aware dirty marking
+- *(object)* emit qpdf dictionary accessor warnings
+- *(object-handle)* expose array mutation to consumers
+- *(reader)* expose qpdf xref and object enumeration
+- migrate page-tree repair to canonical handles
+- migrate NNTree to canonical ObjectHandle graph
+- add canonical array mutation primitives
+- use qpdf canonical dictionary keys
+- migrate plain writer to canonical object handles
+- add qpdf canonical object allocation primitive
+- *(stream)* connect qpdf filter pipeline to object handles
+- route QPDFWriter linearization through canonical emitter
+- wire qpdf writer headers progress and PCLm
+- preserve qpdf source encryption in writer
+- return qpdf writer results
+- match qpdf stream decode-level semantics
+- preserve unreferenced qpdf writer objects
+- introduce qpdf writer lifecycle
+- port qpdf TIFF predictor
+- *(reader)* implement resolution xref reconstruction retry and fallback
+- *(xref)* read hybrid xref streams
+- *(object)* port getIntValue and getIntValueAsInt
+- *(object)* warn from getKey and getKeys like qpdf
+- *(object)* port warnIfPossible and objectWarning
+- *(object)* port QPDFObjectHandle::typeWarning through a document warn receiver
+- *(linearization)* expose writer-owned pass1 output
+- route document warnings through qpdf logger
+- add qpdf-style shared logger
+- *(stream-filter)* register SF_Crypt through the filter factory
+- *(stream-filter)* add getDecodePipeline-equivalent stage factory
+- *(pipeline)* add PipelineRef for borrowed-or-owned next slots
+- *(pipeline)* add public Discard terminal
+- *(object_handle)* unify direct and indirect object identity
+- *(reader)* add Pdf::empty() canonical minimal-document factory
+- *(reader)* port qpdf stream decryption pipeline
+- *(reader)* decrypt strings during object parsing
+- *(parser)* add qpdf string decrypter hook
+- *(parser)* port live qpdf file-object parsing
+- *(writer)* add emitted-object data key state
+- *(linearization)* encrypt body-object strings/streams and the hint stream
+- *(linearization)* write /Encrypt in the first-half trailer only
+- *(linearization)* emit the /Encrypt dictionary object
+- *(linearization)* build EncryptionContext and reserve its object slot
+- *(linearization)* reject object-streams + encrypt + linearize
+- *(linearization)* add RenumberMap::reserve_encrypt_dict_slot
+- *(object_handle)* add ObjectHandle::unparse_trailer
+- *(object_handle)* add ObjectHandle::unparse_stream_body
+- *(object_handle)* add ObjectHandle::unparse_object_qdf
+- *(object_handle)* add unparse_object with null-suppression
+- *(reader)* port qpdf's EncryptionParameters and interpretCF verbatim
+- *(resolver)* report a failing input source instead of swallowing it
+- *(resolver)* warn on a negative stream offset instead of failing silently
+- *(resolver)* port pipeStreamData's failure arm and finish-once rule
+- *(resolver)* warn on a truncated stream read as qpdf does
+- *(resolver)* port QPDF::pipeStreamData's read path
+- *(pipeline)* port Pl_AES_PDF's remaining vector and padding controls
+- *(pipeline)* port Pl_AES_PDF's encrypting CBC path and setIV
+- *(pipeline)* port Pl_AES_PDF's decrypting CBC path
+- *(object_handle)* share stream payloads like qpdf's shared_ptr<Buffer>
+- *(resolver)* resolve uncompressed objects by streaming the input source
+- *(resolver)* move qpdf's `m->warnings` onto the resolver and emit the loop warning
+- *(resolver)* port qpdf's `ResolveRecorder` as a `Drop` guard
+- *(reader)* own the canonical resolver and attach it to every vended handle
+- *(object_handle)* carry both PDF identity and resolver on one slot
+- decode stream data from an ObjectHandle dictionary
+- read filter specs from an ObjectHandle stream dictionary
+- add lazily-dereferencing ObjectHandle value accessors
+- align annotation flatten with qpdf helper ([#619](https://github.com/fulgur-rs/flpdf/pull/619))
+- *(flpdf)* complete qpdf Filespec helper D1 ([#617](https://github.com/fulgur-rs/flpdf/pull/617))
+- *(flpdf)* align qpdf page document helper boundary ([#616](https://github.com/fulgur-rs/flpdf/pull/616))
+- add qpdf-native ObjectHandle dereference primitive ([#620](https://github.com/fulgur-rs/flpdf/pull/620))
+- *(flpdf)* migrate json_inspect.rs section builders to ObjectHandle (flpdf-9ctq) ([#613](https://github.com/fulgur-rs/flpdf/pull/613))
+- *(flpdf)* migrate pdf_object_to_json to ObjectHandle (flpdf-egzr.3.2.4) ([#612](https://github.com/fulgur-rs/flpdf/pull/612))
+- *(flpdf)* chase ObjectValue::Reference redirects to their terminal value ([#607](https://github.com/fulgur-rs/flpdf/pull/607))
+- *(flpdf)* ObjectHandle in-place mutation API (flpdf-egzr.3.2.12) ([#606](https://github.com/fulgur-rs/flpdf/pull/606))
+- *(object_handle)* add qpdf-compatible unparse/unparse_resolved
+- *(object_handle)* add qpdf-compatible type_code/type_name
+- *(object_handle)* promote is_resolved to public API
+- *(object_handle)* round out boolean/real/name/string/reference accessors
+- *(object_handle)* add Operator/InlineImage value representation
+- *(reader)* get_all_object_handles and trailer_handle
+- *(reader)* materialization bridge - resolve/resolve_borrowed cut onto ObjectHandle graph
+- *(parser)* build the ObjectHandle graph with parsed offsets for file objects
+- *(reader)* dual-write ObjectHandle resolution alongside the legacy engine
+- *(reader)* canonical indirect ObjectHandle registry on Pdf
+- *(object_handle)* real ObjectValue payload for direct handles
+- *(object_handle)* parsed-offset sentinel and set-once contract
+- *(object_handle)* scaffold ObjectHandle identity
+- *(qtest)* expose canonical qpdf string operations
+- *(filters)* configure filter chain limit
+- *(pipeline)* add qpdf PlStdioFile terminal
+- *(pipeline)* add sticky PlOStream terminal
+- *(pipeline)* add qpdf-compatible PlBase64
+- *(pipeline)* add PlConcatenate finish suppression
+- *(pipeline)* publish contract and add PlString
+- *(pipeline)* add qpdf Pl_LZWDecoder and Pl_PNGFilter components
+- route ASCII and RunLength decode through pipelines
+- add qpdf RunLength pipeline
+- add qpdf ASCIIHex pipeline
+- add qpdf ASCII85 pipeline
+- *(content)* add qpdf resource replacer
+- *(content)* add qpdf resource finder
+- add qpdf token filter pipeline
+- expose stream filter driver contract
+- run stream flate through pipeline
+- add qpdf stream filter driver
+- *(rc4)* add qpdf PlRc4 pipeline stage
+- build qpdf object-user maps
+- add optimization object-user maps
+- add xref entry value component
+- add pipeline-backed bit writer
+- add qpdf bit stream reader
+- add qpdf-compatible flate pipeline
+- add buffer and count pipeline stages
+- add pipeline lifecycle contract
+- *(content)* add qpdf token normalizer
+- *(json)* add qpdf stdio side-file adapter
+- *(json)* port qpdf JSON handler
+- *(json)* port qpdf schema checking
+- *(json)* add qpdf parser Reactor
+- *(json)* parse qpdf JSON containers
+- *(json)* parse qpdf scalar JSON
+- *(json)* add qpdf incremental writer
+- *(json)* match qpdf tree and blob writing
+- *(json)* add qpdf shared containers
+- *(json)* add qpdf shared scalar model
+- *(content)* add qpdf parser callbacks
+- *(object)* add qpdf content object values
+- *(tokenizer)* match qpdf inline image scanning
+- *(tokenizer)* port qpdf push state machine
+- *(nntree)* add typed helpers and migrate consumers
+- *(nntree)* port structural auto-repair
+- *(nntree)* port mutation and recursive splitting
+- *(nntree)* port targeted lookup
+- *(nntree)* port bidirectional cursor traversal
+- *(pdf-version)* add qpdf-compatible value type
+
+### Fixed
+
+- fix writer reachability after stream refiltering
+- *(security)* recover alternate password encodings
+- *(security)* keep read passwords as raw bytes
+- *(test)* update outline JSON lifecycle caller
+- *(test)* follow merged JSON job API
+- *(xref)* share bootstrap handle cache
+- *(qtest)* batch DecodeParms offset lookups
+- *(object-handle)* retain allocated null objects
+- *(linearization)* keep catalog in qpdf part four
+- *(object-handle)* close canonical regression gaps
+- *(linearization)* match qpdf show warning context
+- *(xref)* preserve first row offset through recovery
+- *(linearization)* match qpdf's single try/catch around readLinearizationData
+- *(linearization)* surface show warnings and exit status
+- *(reader)* charge the object-stream framing probe's own EOF retry
+- *(reader)* retry through EOF when the bounded probe finds a bare dict
+- *(reader)* retry object stream framing probes
+- *(cli)* route show-object selector overflow through usage_exit
+- *(reader)* preserve source extent when a changed node writes back
+- *(reader)* only write back changed inherited-attribute nodes
+- *(linearization)* avoid unreachable negative extent conversions
+- *(linearization)* tolerate missing replacement extents
+- *(reader)* clear replacement source extents
+- *(reader)* keep deep replacements on canonical handles
+- *(streams)* preserve DecodeLevel::None pass-through and address review
+- *(qtest)* use pipe stream data for object streams
+- *(streams)* reject gated filter data as decoded
+- *(attachments)* remove non-qpdf copy summary
+- *(attachments)* stream show failures as qpdf warnings
+- *(security)* preserve qpdf unicode password bytes
+- keep the unknown-crypt-filter warning when a later step fails
+- decrypt AES through Pl_AES_PDF instead of a strict one-shot
+- retry explicit crypt filter failures like qpdf
+- keep preserved orphans out of generated objstms
+- align preserve attachment and ObjStm routes
+- *(acroform)* make /P removal independent of null-out ordering
+- *(acroform)* cover the widget /P null-removal branch with a lib-level test
+- *(acroform)* restrict widget /P removal to dangling/null targets only
+- *(acroform)* remove stale widget page references
+- *(writer)* retain encryption trailer for reused object refs
+- *(job)* preserve direct primary AcroForm
+- *(page_merge)* decode /T before AcroForm collision comparison
+- *(job)* reserve unselected primary AcroForm names
+- narrow qpdf time unsafe boundary
+- match qpdf local attachment dates
+- remove attachment provider preflight open
+- *(qpdf-deviation)* strip 5 markers that mis-classified byte-affecting divergences
+- *(job)* match qpdf linearization parameter warnings
+- *(reader)* avoid double allocation in read_logical_bytes
+- preserve page merge carrier remaps
+- *(pages)* preserve the type-warning diagnostic on a malformed parent
+- *(pages)* fix the depth-boundary off-by-one from the shared attribute walk
+- *(cli)* align check linearization status with qpdf
+- *(job)* restore the copied N attachment(s) count diagnostic
+- *(job)* install the job logger on source before copying attachments
+- repair page trees for decoded streams
+- close off retry before the new page-tree repair mutation
+- *(writer)* snapshot progress after page repair
+- match qpdf's early return when no overlay/underlay specs given
+- *(overlay)* repair page boxes before placement
+- remove stale /AcroForm when no fields survive page selection
+- preserve primary catalog and trailer in pages merge
+- honor qpdf auto resource scan heuristic
+- materialize inherited resources during page extraction
+- *(pages)* preserve indirect inherited attribute identity in tree_rebuild
+- *(writer)* keep QDF page-tree repair across the ADBE catalog restore
+- run QDF page-tree repair before object numbering, not after
+- *(writer)* enumerate direct catalog pages through helper
+- validate inserted page dictionaries into direct intermediates
+- preserve direct page-tree intermediates
+- drop preflight /Parent rewrite and mark getAllPages called
+- normalize malformed page tree types
+- normalize page-tree preflight invariants
+- normalize direct and duplicate page-tree kids
+- preserve page-tree object identities during splice
+- *(job)* preserve raw bytes in verbose diagnostic, make permission test root-safe
+- *(job)* reject add_attachments on a PDF without a catalog root
+- *(job)* match qpdf's portable NotFound wording on Windows too
+- *(job)* match qpdf's empty-batch and file-open diagnostics for add_attachments
+- *(job)* forward --static-id to split-pages chunk writers
+- *(docs)* resolve split job rustdoc link
+- *(docs)* qualify page specs job link
+- *(json)* re-export build_acroform_section for parity with sibling builders
+- *(json)* preserve raw name bytes in AcroForm JSON output
+- *(docs)* keep qpdf classifications terminal
+- *(acroform)* gate appearance-stream adjustment on /Resources being a dictionary
+- *(docs)* satisfy qpdf module correspondence checker
+- *(writer)* preserve linearization stream recovery order
+- *(writer)* match qpdf progress accounting for generated objstms
+- *(writer)* match qpdf progress event accounting
+- *(overlay)* document and prove the copy_foreign_object source lifetime
+- *(cli)* remove --show-info/--show-catalog/--show-metadata/--show-outline
+- allow JSON jobs through inspection routes
+- propagate a stream_position failure instead of assuming offset 0
+- correct deferred stream offsets and fatal-error precedence in JSON import
+- keep trailer_key_handle, root_ref, and adobe_extension_level live after JSON import
+- use cov:ignore-start/end block form for the unreachable Number Err arm
+- correct JSONReactor overflow, real-literal, description, and warning-format divergences from qpdf
+- *(reader)* match qpdf stream copy null replacement
+- *(object-handle)* preserve qpdf non-dictionary diagnostics
+- *(object-handle)* align dictionary accessors with qpdf
+- *(object-handle)* resolve nested merge resources values
+- *(flatten)* gate widget default resources by field association
+- *(acroform)* update every duplicate page occurrence's direct widget /P
+- preserve direct annotation and widget handles
+- *(flatten)* resolve widget appearance before skip
+- *(flatten)* interleave source/destination category resolution, mark dirty before the fallible merge
+- *(flatten)* resolve DR merge lazily and only the categories it touches
+- *(flatten)* privatize an indirect appearance /Resources before merge
+- *(flatten)* merge widget resources through object handles
+- *(acroform)* maintain field cache incrementally
+- *(overlay)* finalize addAndRenameFormFields per placement, not per page
+- *(acroform)* freeze qpdf field rename cache
+- *(acroform)* sync /AS for a direct merged checkbox field/widget
+- *(acroform)* match qpdf's DR-merge gating and /DA decode step
+- *(acroform)* apply inherited-default override on terminal fields
+- *(acroform)* preserve field-tree copy compatibility
+- *(acroform)* decode field names and round reals to qpdf precision
+- *(reader)* mirror replace_object_handle's promotion precondition in remove_object_handle
+- *(annotations)* drop a direct annotation with an unusable legacy-bridge appearance
+- *(annotations)* preserve direct annotation handles
+- *(resources)* preserve unresolved veto state
+- *(resources)* veto pruning for unresolved form names
+- *(signatures)* treat an indirect zero SigFlags as a real change
+- *(signatures)* remove null-valued /Sig field keys, don't over-report SigFlags change
+- preserve field identities in signature traversal
+- move signature disabling to live handles
+- *(acroform)* skip orphan-widget fallback when /AcroForm lacks /Fields
+- align acroform analysis with qpdf depth guards
+- fix qpdf oracle test clippy condition
+- *(json)* don't drop the fabricated pagelabels entry for a zero-page document
+- *(json)* match qpdf pagelabels output
+- *(acroform)* share and lazily build the field-association map
+- *(acroform)* use direct widget field for appearances
+- don't consume an /Fxo name for a skipped annotation
+- keep annotation resource merge on refs-only route
+- defer annotation rectangle validation
+- bridge direct annotation appearance holders
+- keep annotation flattening on canonical route
+- align page label null and tree warning parity ([#854](https://github.com/fulgur-rs/flpdf/pull/854))
+- *(xref)* overwrite reentrant object stream member cache ([#853](https://github.com/fulgur-rs/flpdf/pull/853))
+- *(writer)* align generated xref-stream serialization ([#848](https://github.com/fulgur-rs/flpdf/pull/848))
+- route direct content streams through ObjectHandle ([#845](https://github.com/fulgur-rs/flpdf/pull/845))
+- *(xref)* forward trailer diagnostics on parse_xref_table's error paths
+- *(xref)* surface trailer dictionary parser diagnostics as qpdf does
+- *(parser)* emit qpdf's duplicated-key warning from the legacy dictionary parser
+- preserve parsed qpdf ownership context
+- align array ownership with qpdf
+- *(json)* chase set_object reference redirects in document JSON entries
+- match qpdf JSON stream depth and error mapping
+- preserve qpdf JSON dictionary key write chunks
+- route page content decoding through ObjectHandle ([#812](https://github.com/fulgur-rs/flpdf/pull/812))
+- *(qdf_fix)* mirror qpdf raw XRef/ObjStm scan, exact xref-line stop, and reject ObjStm-typed /Length holders
+- *(qdf_fix)* match oracle on XRef-stream truncation, trailing garbage, and generation
+- support object-stream and cross-reference-stream QDF input
+- *(qpdf)* align xref tombstone lifetime
+- *(qpdf)* clarify xref tombstone clear timing
+- *(qpdf)* align xref tombstone lifetime
+- *(qpdf)* preserve effective xref replacements
+- *(qpdf)* retain cache-only replacement boundary
+- *(pages)* use stable direct object identity lookup
+- *(outline)* normalize cursor before identity/nullness checks (PR #796 codex round-3)
+- *(outline)* chase set_object redirects and direct-handle cycles (PR #796 codex round-2)
+- *(outline)* use qpdf's null-excluding hasKey for /Title,/Count,/Dest gates
+- *(json-inspect)* dereference outline /Dest before JSON conversion
+- *(outline)* chase a set_object redirect chain in legacy /Dests lookup
+- *(reader)* drop a private intra-doc link from a public method's doc
+- *(object-handle)* reject a direct reserved value in direct_value_clone
+- *(object-handle)* reject a direct reserved child during materialize
+- *(object-handle)* preserve reserved sentinel across shallow_copy
+- *(object-handle)* stop rejecting indirect reserved children as writer errors
+- *(nntree)* reject foreign Pdf for handle trees
+- *(nntree)* preserve lower-layer cursor surface
+- *(writer)* mark initial provider pipe retryable
+- *(writer)* honor live trailer ID and name order
+- *(writer)* remap canonical trailer entries
+- *(reader)* preserve canonical set_object replacements
+- *(reader)* resolve trailer-only references before enumeration
+- *(reader)* carry candidate xref tombstones
+- *(reader)* filter tombstoned entries during xref recovery
+- *(reader)* carry loaded xref tombstones into resolver
+- *(reader)* preserve deleted object-number tombstones
+- *(object-handle)* release borrow before reference mapping
+- *(object-handle)* report rejected direct cycles
+- *(object-handle)* reject multi-hop direct array cycles
+- *(reader)* preserve strict stream warning offsets
+- *(stream)* scope saturation warnings to consuming keys
+- *(stream)* warn on qpdf integer saturation
+- *(stream)* validate filter factories before decode parms
+- *(reader)* retain lift depth guard for nulls
+- *(object)* keep lifted null handles contextless
+- *(qtest)* align handle comparison with qpdf
+- *(object-handle)* preserve array bounds warnings
+- *(object-handle)* document array mutation boundaries
+- use canonical decoded page streams
+- *(ci)* prevent resolver and writer stack failures
+- *(reader)* preserve qpdf stream header offsets
+- *(reader)* enlarge Windows resolver stack
+- *(reader)* size Windows resolver fiber for warnings
+- *(reader)* grow stack before stream length resolution
+- *(reader)* attribute empty object warnings
+- *(reader)* retain object identity on parser warnings
+- *(reader)* retain offsets on stream warnings
+- *(page-combine)* preserve wrapped auth errors
+- preserve encrypted auth classification after repair
+- *(qtest)* match metadata error diagnostics
+- *(reader)* preserve deep stream replacement identity
+- *(reader)* avoid reconciling lazy source snapshots
+- *(reader)* finish canonical enumeration review fixes
+- *(reader)* complete canonical object enumeration
+- *(reader)* enumerate top-level replacement targets
+- *(reader)* align canonical object enumeration with qpdf
+- *(pages)* guard direct page-tree cycles
+- guard canonical page repair aliases and cycles
+- *(reader)* hide unresolved registry placeholders from live refs
+- *(nntree)* prepare dangling refs before split preflight
+- *(nntree)* bind cursors and preflight canonical limits
+- complete canonical NNTree review follow-ups
+- normalize canonical dictionary aliases before collection
+- preserve canonical dictionary keys across bridges
+- migrate stacked consumers to canonical dictionary keys
+- address canonical mutation feedback
+- auto-repair canonical number-tree kids
+- match qpdf number-tree read tolerance
+- match qpdf number-tree read tolerance
+- match qpdf collision-time alias snapshots
+- freeze overlay resource name pools
+- invalidate stale overlay resource aliases
+- match qpdf overlay resource name scope
+- *(reader)* align canonical stream recovery with qpdf
+- port canonical stream recovery scan
+- reconcile qpdf writer API after rebase
+- match qpdf writer xref result contract
+- preserve plain free xref generations
+- opt out plain emitter metadata policy
+- preserve full rewrite metadata policy
+- match qpdf cleartext metadata filters
+- preserve donor metadata encryption policy
+- complete qpdf content stream parity
+- normalize qdf page content streams
+- apply qpdf qdf stream defaults
+- preserve qpdf writer decode defaults
+- make qpdf writer placeholders explicit
+- keep V=5 truncation on reader auth path
+- *(json)* honor qpdf stream decode levels
+- keep qpdf module classification on one line
+- reject predictors on non-codec filters
+- *(xref)* trust resolved indirect stream lengths
+- rebase bootstrap object stream parse diagnostics
+- stop bootstrap object streams after member parse errors
+- use live parser for bootstrap object streams
+- recover bootstrap object stream members
+- resolve bootstrap type-2 object streams
+- report absolute bootstrap parse offsets
+- revalidate xref size after reconstruction
+- align xref recovery cache with qpdf
+- reuse hybrid xref bootstrap cache
+- reuse candidate xref bootstrap cache
+- resolve indirect xref size on active path
+- resolve indirect xref size during recovery
+- *(xref)* preserve first valid recovered trailer
+- remove obsolete xref recovery state
+- preserve candidate xref diagnostic order
+- keep parser docs valid outside tests
+- align damaged xref recovery with qpdf ObjStm behavior
+- *(linearization)* satisfy review quality gates
+- *(linearization)* splice hint stream from single pass
+- *(docs)* qualify recovered object handle link
+- *(reader)* enumerate recovered xref objects
+- *(reader)* route recovered state through public paths
+- *(reader)* sync recovered xref before mutations
+- *(reader)* preserve qpdf recovery fallbacks
+- synchronize legacy state after xref recovery
+- oracle-match corrections from Codex review (C1/C2/C3/C4/C6)
+- *(xref)* require type on hybrid xref streams
+- *(object)* propagate the clamp-warning sink failure try_get_int_value_as_int's doc claimed it couldn't
+- *(object)* propagate live resolution failures from warnIfPossible
+- *(linearization)* match qpdf pass1 stdio lifecycle
+- *(linearization)* match qpdf pass1 boundaries
+- *(linearization)* satisfy pass1 clippy gate
+- *(reader)* avoid duplicate object warning offsets
+- *(reader)* preserve object warning prefix syntax
+- *(check)* preserve terminal repair warnings
+- *(check)* propagate warning logger failures
+- *(reader)* route warnings before terminal open errors
+- *(reader)* format warning locations like qpdf
+- *(logger)* normalize standard output streams
+- *(stream-filter)* correct the SF_Crypt citation and re-measure the mutation map
+- *(stream-filter)* keep every /DecodeParms key on a Crypt stage
+- *(object)* keep a promoted stream's dictionary private again
+- *(object)* refuse to shallow-copy a stream, matching QPDF_Stream::copy
+- *(object)* share a promoted stream's dictionary instead of privatizing it
+- *(object)* return the canonical terminal handle instead of a copy
+- *(writer)* rebuild null-replaced source ObjStm
+- *(writer)* rebuild deleted source ObjStm placeholders
+- *(engine)* retain factory rustdoc links
+- *(object_handle)* attach children after terminal replacement
+- *(object_handle)* disconnect shared values like qpdf
+- *(page_extract,page_merge)* delegate target construction to Pdf::empty()
+- fix filespec payload from lazy original source
+- distinguish destroyed handles from null
+- align qpdf header validation
+- *(parser)* match qpdf reference diagnostics
+- *(parser)* use qpdf-style live frame stack
+- *(parser)* scope live input conversion by target width
+- *(writer)* match qpdf AES data key length
+- *(linearization)* pin the hint stream's AES IV across the convergence loop
+- *(linearization)* replace shape-enumeration with a generic /Extensions indirect-ref walk
+- *(linearization)* also reject a nested indirect /ADBE, not just top-level
+- *(linearization)* cov:ignore catalog_extensions_is_indirect's defensive guards
+- *(linearization)* inject /Extensions /ADBE /ExtensionLevel for V5 encryption
+- *(linearization)* replace vacuous hint-stream ciphertext check with a falsifiable one
+- *(linearization)* cov:ignore the V5 reopen failure-only panic branches
+- *(linearization)* port --cleartext-metadata exemption to the linearized writer
+- *(linearization)* collapse encrypt-skip nested ifs, cov:ignore phantom-uncovered lines
+- *(linearization)* pin exact byte spacing of /Encrypt in trailer test
+- *(linearization)* move cov:ignore markers inline (patch-coverage keys off the code line, not a preceding comment line)
+- *(linearization)* avoid the literal cov:ignore token in a doc comment
+- *(object_handle)* defer Sig+ByteRange detection to the loop's own key
+- *(object_handle)* apply Sig+ByteRange hex-string case and fix refiltered ordering
+- *(object_handle)* correct doc nits in unparse_stream_body_qdf
+- *(object_handle)* add ObjectHandle::unparse_stream_body_qdf
+- *(object_handle)* address review findings on 26ebf6af
+- *(object_handle)* handle Stream self in unparse_stream_body
+- *(object_handle)* address review findings on 275dad04
+- *(object_handle)* correct unparse_object doc claims, pin boundary cases
+- *(resolver)* report getLastOffset and make the stream allocation fallible
+- *(resolver)* finish the pipeline after every failure, and seek before allocating
+- *(writer)* use qpdf's static AES initialization vector
+- *(pipeline)* put the AES module's qpdf classification on one line
+- *(resolver)* report a malformed object's position in the file
+- *(resolver)* let a direct value end the input, as the stream path does
+- *(resolver)* grow the stack on a chained `/Length` instead of aborting
+- *(resolver)* raise the body parse's own diagnostics as warnings
+- *(resolver)* validate a declared /Length before allocating it
+- *(resolver)* keep the D4 classification on one line
+- *(resolver)* use is_multiple_of in the reluctant-reader fixture
+- *(resolver)* repair the CI doc gate, prune 20 redundant bounds, and correct four claims
+- *(fuzz)* repair the fuzz target the `Arc<[u8]>` change broke, and correct four ledger claims
+- drop beads issue IDs from user-facing help and error text
+- match qpdf doListAttachments in --list-attachments
+- resolve /DecodeParms values only for filters that read them
+- apply codec prefix decode params outside debug_assert (flpdf-4rfl)
+- track direct handle containment owners ([#623](https://github.com/fulgur-rs/flpdf/pull/623))
+- *(filespec)* align factory ownership with qpdf ([#622](https://github.com/fulgur-rs/flpdf/pull/622))
+- *(flpdf)* address Codex post-merge findings on PR #613 (flpdf-9ctq) ([#614](https://github.com/fulgur-rs/flpdf/pull/614))
+- *(reader)* don't charge a stream dictionary its own inline-nesting level
+- *(reader)* decrypt native-parsed strings at handle population, not just on the legacy resolve() path
+- make the ar_archive_writer MSRV pin an active resolver constraint
+- *(flpdf)* preserve content-token objects passed to set_object
+- *(flpdf)* reset parsed offset when disconnecting a handle
+- *(flpdf)* reset parsed offset when a handle is marked missing
+- *(flpdf)* stop ObjectHandle Debug from recursing through indirect cycles
+- *(flpdf)* break Rc reference cycles between resolved indirect handles
+- *(reader)* memoize trailer_handle for canonical identity across calls
+- *(reader)* address review findings in the materialization bridge
+- *(parser,reader)* resolve two code-quality Minor findings
+- *(reader)* fall back to lift when the native bounded window is insufficient
+- *(reader)* bound lift/lift_to_handle recursion depth, fix test docstring overclaim
+- *(reader)* correct qpdf citation path, record Send/Sync auto-trait deviation
+- *(object_handle)* is_null must not assume null for unresolved indirect handles
+- *(object_handle)* cover the zero-offset boundary, drop stale dead_code on Repr
+- *(object_handle)* correct QPDFValue.hh citation for set-once offset guard
+- *(object_handle)* satisfy qpdf-module-docs check, derive Debug on handle types
+- *(object_handle)* move Rc<RefCell> deviation note to a plain comment
+- *(writer)* escape non-QDF dictionary keys
+- *(xref)* honor leading PDF header origin
+- *(xref)* scope qpdf header validation to repair
+- *(qtest)* close final driver parity gaps
+- *(xref)* allow empty reconstructed xref
+- *(filters)* avoid strict decode data cloning
+- *(qtest)* preserve failed repair diagnostics
+- *(reader)* retry bounded stream offset parsing
+- *(qtest)* preserve bounded recovery event ordering
+- *(qtest)* preserve downstream cleanup boundary
+- *(qtest)* preserve multistage recovery order
+- *(qtest)* preserve recovery output event order
+- *(filters)* replay warnings after decode errors
+- *(qtest)* preserve stream diagnostic order
+- *(qtest)* recover partial stream decode output
+- *(qtest)* derive stream warning offsets from parser
+- *(json)* retain oversized stdio tails
+- *(json)* match stdio buffered write boundaries
+- *(json)* preserve stdio interrupted writes
+- *(pipeline)* match qpdf interrupted writes
+- *(json)* buffer file output and refresh fuzz lock
+- *(json)* preserve raw PDF write units
+- *(json)* match qpdf pipeline write boundaries
+- *(pipeline)* integrate byte-exact errors after rebase
+- *(json)* match qpdf dictionary key writes
+- *(filters)* construct every decode pipeline before decoding any stage
+- satisfy stable Rust clippy
+- preflight stream codec pipelines
+- *(resources)* avoid cloning borrowed operands
+- *(resources)* preserve replacements before inline image EOF
+- *(resources)* preserve XObject encounter order
+- *(resources)* avoid redundant callback clones
+- *(resources)* address review findings
+- *(resources)* align qpdf edge contracts
+- address final stream filter review
+- surface flate warnings during checks
+- reject unreported flate warnings
+- preserve RC4 stream allocations
+- address PlRc4 review findings
+- mirror qpdf pipeline error propagation
+- align flate dictionary timing with qpdf
+- complete flate streaming state semantics
+- *(cli)* tolerate non-stream page contents
+- *(cli)* normalize indirect page content streams
+- *(tokenizer)* mirror qpdf constructed tokens
+- *(json)* match qpdf lazy object failure prefix
+- *(json)* match qpdf side-file finish semantics
+- *(json)* make stdio adapter writes retry-safe
+- *(json)* preserve raw dictionary key order
+- *(json)* preserve side-file error context
+- *(json)* match qpdf file-mode failure boundaries
+- *(json)* write file payloads incrementally
+- *(json)* preserve decoded payloads and verify output handles
+- *(json)* normalize emitted stream dictionaries
+- *(json)* reject output aliases of input
+- *(json)* preserve empty qpdf object map shape
+- *(json)* preserve PDF real number tokens
+- *(json)* break recursive handler ownership cycles
+- *(json)* preserve validation diagnostic bytes
+- *(json)* refresh active recursive snapshots
+- *(json)* re-read live container callbacks
+- *(json)* match qpdf handler ownership and live lookup
+- *(json)* make handler dispatch live and cycle-safe
+- *(json)* allow shared callback reentry
+- *(json)* support recursive handler graphs
+- *(json)* preserve parser diagnostic bytes
+- *(json)* retry interrupted parser reads
+- *(json)* parse readers incrementally
+- *(json)* match qpdf low surrogate sentinel
+- *(json)* batch blob base64 writes
+- *(json)* preserve Base64 tails across writes
+- *(json)* match qpdf blob callback boundaries
+- *(json)* observe live writer mutations
+- *(json)* write dictionaries from live entries
+- *(json)* release array borrow before callbacks
+- *(json)* stream blob base64 output
+- *(json)* allow dictionary mutation during iteration
+- *(json)* preserve NaN sign
+- *(json)* match qpdf special real values
+- *(parser)* count dictionary close in recovery streak
+- *(parser)* recover malformed content like qpdf
+- *(parser)* remove remaining pull scanners
+- *(nntree)* attribute search errors to root
+- *(nntree)* preserve split invariants
+- *(json)* preserve indirect names holder chains
+- *(nntree)* enforce helper boundaries
+- *(nntree)* attribute deep lookup errors
+- *(nntree)* harden indirect tree updates
+- *(nntree)* preserve NUL in PDFDocEncoding keys
+- preserve compressed object warnings
+- preserve tokenizer review parity
+- address tokenizer review feedback
+- match qpdf JSON name projection
+- preserve integer tokenizer diagnostics
+- parse objects through qpdf-shaped tokens
+- *(writer)* derive xref form from final object placement
+- *(writer)* enforce plain pipeline invariants
+- *(writer)* exclude deleted preserve fallback refs
+- *(writer)* exclude removed and structural sources
+- *(writer)* preserve legacy routing intent
+- *(writer)* repair unparseable headers for plain xref streams
+- *(writer)* enforce plain stream plan floors
+- *(writer)* validate plain write plan consistency
+- *(writer)* preserve plain xref entry bounds
+- *(writer)* validate classic xref layouts
+- preserve previous xref diagnostics
+- preserve lazy stream recovery diagnostics
+- keep strict recovery terminators line-anchored
+
+### Other
+
+- Merge pull request #1068 from fulgur-rs/feature/flpdf-3yn9-26-encryption-module-tree
+- *(encryption)* restore rationale comments dropped during the module move
+- cover encryption state error paths
+- *(encryption)* [**breaking**] align encryption module tree with qpdf
+- remove linearization xref stream alias
+- Merge pull request #1065 from fulgur-rs/feature/flpdf-3yn9-25-page-annotation-enum
+- [**breaking**] remove page annotation aggregate route
+- Merge pull request #1063 from fulgur-rs/feature/flpdf-214j
+- *(linearization)* delete genuinely-dead collect_handle_children_with_context
+- *(password)* stop labeling the weak-crypto gate test as qpdf parity
+- *(job)* derive JSON completion destination
+- *(json)* remove staged job compatibility re-exports
+- reuse page label prefix lookup
+- *(object-handle)* share ObjectValue state directly
+- *(xref)* cover shared bootstrap cache branches
+- *(linearization)* update /T warning test for parser-owned offset check
+- *(linearization)* ignore llvm cleanup artifact
+- *(linearization)* cover hint edge cases
+- *(linearization)* cover malformed hint metadata
+- *(linearization)* cover hint warning paths
+- *(linearization)* validate decoded hint tables
+- Merge pull request #1042 from fulgur-rs/feature/flpdf-whcr-malformed-xobject-skip
+- Merge pull request #1043 from fulgur-rs/feature/flpdf-4g14-2-first-xref-item-offset
+- Merge pull request #1034 from fulgur-rs/feature/flpdf-25kg-11-remove-missing
+- Merge pull request #1041 from fulgur-rs/feature/flpdf-uxa9-outline-json-warning-order
+- Merge pull request #1038 from fulgur-rs/feature/flpdf-4g14-1-linearization-check-warnings
+- Merge pull request #1031 from fulgur-rs/feature/flpdf-egzr-3-2-6-31-page-label-handles
+- Merge pull request #1033 from fulgur-rs/feature/flpdf-25kg-10-object-state-values
+- Merge pull request #1030 from fulgur-rs/feature/flpdf-hsno-promotion-map
+- *(object-handle)* delegate type reporting to values
+- *(streams)* keep public pipe docs link-safe
+- Merge pull request #1022 from fulgur-rs/feature/flpdf-25kg-8-type-result
+- *(object-handle)* drop internal-progress wording from type_code doc
+- remove redundant handle dereferences
+- make object type inspection fallible
+- *(check)* remove non-qpdf public check API
+- Merge pull request #1018 from fulgur-rs/feature/flpdf-glm2-endstream
+- Merge pull request #1012 from fulgur-rs/feature/flpdf-acgw-decrypt-prepend
+- assert tolerance property, not exact byte count, for lenient AES unpad
+- skip AES CBC crypt-filter oracle tests when qpdf is unavailable
+- record the AES CBC cutover in the correspondence table
+- make the new crypt assertions fully executable
+- attribute fallback warning coverage
+- attribute crypt warning coverage directly
+- cover crypt fallback boundaries
+- cover explicit crypt fallback diagnostics
+- Merge pull request #1010 from fulgur-rs/worktree-job-module-moves
+- *(job)* relocate overlay, page_collate, acroform_field_prune, attachment_list, and rotate_spec under job/
+- Merge pull request #1007 from fulgur-rs/feature/flpdf-r71b-generate-reachability
+- Merge pull request #1005 from fulgur-rs/feature/flpdf-3yn9-24-cli-preserve-unreferenced
+- root PdfWriter lifecycle in writer module
+- migrate check and filespec consumers to handles
+- Merge pull request #999 from fulgur-rs/feature/flpdf-3yn9-15-6-json-followups
+- *(json)* record qpdf input substitutions
+- *(acroform)* cover non-page widget refs
+- *(job)* move page merge into job ownership
+- Merge pull request #991 from fulgur-rs/feature/flpdf-25kg-3-40-1-object-warning
+- register qpdf time correspondence
+- design qpdf local PDF dates
+- align path helper open error expectation
+- Merge pull request #987 from fulgur-rs/worktree-qpdf-deviation-audit
+- *(qpdf-deviation)* mark 26 previously-unmarked no-qpdf-counterpart deviations
+- *(job)* cover qpdf document check failure routes
+- Merge pull request #982 from fulgur-rs/feature/flpdf-egzr-3-2-6-29-page-merge
+- keep carrier replacement coverage on one line
+- refactor page merge consumers onto ObjectHandle
+- *(pages)* share inherited attribute walk
+- Merge pull request #977 from fulgur-rs/feature/flpdf-egzr-3-2-6-22-depth-boundary
+- Merge pull request #975 from fulgur-rs/feature/flpdf-u1ro-check-parity
+- *(check)* require clean linearization diagnostics
+- *(cli)* use qpdf-clean linearization fixture
+- Merge pull request #971 from fulgur-rs/feature/flpdf-s5cw-7-copy-attachments
+- Merge pull request #970 from fulgur-rs/feature/flpdf-egzr-3.2.6.28-stream-decode-trigger
+- cover specialized decoded page repair
+- Merge pull request #967 from fulgur-rs/feature/flpdf-egzr-3.2.6.20-cycle-null
+- Merge pull request #966 from fulgur-rs/feature/flpdf-egzr-3.2.6.17-overlay-media-repair
+- Merge pull request #961 from fulgur-rs/feature/flpdf-egzr-3-2-6-18-page-merge-resources
+- Merge pull request #960 from fulgur-rs/feature/flpdf-egzr-3-2-6-23-resources-copy
+- cover auto resource heuristic guards
+- Cover page tree handle migration
+- Migrate page tree rebuild to live object handles
+- Merge pull request #957 from fulgur-rs/feature/flpdf-egzr-3-2-6-15-page-parent-handles
+- Cover page parent handle edge paths
+- Migrate page parent traversal to ObjectHandle
+- Merge pull request #954 from fulgur-rs/feature/flpdf-egzr-3-2-6-12-direct-pages-root
+- *(page_extract)* use canonical foreign page copy
+- *(page_document_helper)* mutate pages through ObjectHandle
+- *(page_form_xobject)* keep production on canonical helper
+- *(page_rotate)* use canonical ObjectHandle route
+- Merge pull request #948 from fulgur-rs/feature/flpdf-pages-tree-rebuild-move
+- Merge pull request #947 from fulgur-rs/feature/flpdf-egzr-3-2-6-6-coalesce-dict
+- Merge pull request #945 from fulgur-rs/feature/flpdf-egzr-3-2-6-5-direct-pages
+- cover direct page splice defenses
+- *(page_split)* cover digit_width's n=0 edge case
+- *(page_split)* fold naming helpers into job::page_split, drop compat facade
+- Merge pull request #943 from fulgur-rs/feature/flpdf-egzr-3-2-6-3-coalesce-fetch
+- allow page-tree traversal argument set
+- account for page-tree fixture guard
+- account for page-tree fixture guard
+- cover page-tree promotion guards
+- cover page splice validation branches
+- Merge pull request #940 from fulgur-rs/feature/flpdf-egzr-3-2-6-page-resources
+- Merge pull request #937 from fulgur-rs/feature/flpdf-25kg-6-8-primary-encryption
+- Merge pull request #939 from fulgur-rs/feature/flpdf-s5cw-2-attachment-add
+- *(job)* mark the root-only branch of the permission-denied test as cov:ignore
+- *(job)* cover the non-NotFound branch of qpdf_style_open_error
+- *(job)* re-target rootless-catalog coverage at set_attachment_page_mode
+- *(job)* make same-file guard checks portable
+- *(json)* mark assert! failure-message arms cov:ignore
+- *(acroform)* route overlay appearance adjustment through handles
+- *(acroform)* route appearance resources through ObjectHandle
+- Merge pull request #930 from fulgur-rs/feature/flpdf-q2fo-1-json-nonacroform
+- fix stale qpdf correspondence after json_sections move
+- *(json)* cover migrated job section branches
+- *(json)* move qpdf job sections into job layer
+- Merge pull request #928 from fulgur-rs/feature/flpdf-37z3-progress-recovery
+- Merge pull request #927 from fulgur-rs/feature/flpdf-xm72-repair-default
+- *(job)* correct QPDFJob::new's qpdf citation
+- *(writer)* cover the stream-recovery ordering fix with a regression test
+- *(writer)* cover linearized progress decrement
+- *(writer)* cover qpdf progress contract
+- cover non-array annotation copy
+- cover live annotation helper routes
+- Merge pull request #917 from fulgur-rs/feature/flpdf-tgcm-outline-live-recompute
+- Merge pull request #915 from fulgur-rs/feature/flpdf-3yn9-16-json-cli
+- close patch-coverage gaps left by the overflow/description fixes
+- close JSONReactor patch coverage
+- cover page and stream shape failures
+- cover JSONReactor error paths
+- [**breaking**] remove --show-fonts CLI flag and fonts.rs (no qpdf equivalent)
+- classify qpdf JSON input tests
+- exclude unreachable JSON key guard
+- cover qpdf JSON value boundary
+- Fix AcroForm typed inheritance fallback
+- *(object-handle)* assert non-dictionary has-key warning
+- *(flatten)* cover production resource merge errors
+- Merge pull request #898 from fulgur-rs/feature/flpdf-5j3c-6-merge-resources-precondition
+- *(object-handle)* document nested unresolved-value gap in merge_resources
+- *(object-handle)* document merge resource resolution precondition
+- Merge pull request #897 from fulgur-rs/feature/flpdf-5j3c-3-direct-handles
+- *(flatten)* make the NeedAppearances oracle probe genuinely exercise the skip path
+- Merge pull request #895 from fulgur-rs/feature/flpdf-5j3c-4-merge-resources
+- *(acroform)* record two qpdf-divergence rationales found in review
+- *(overlay)* describe field finalization as per-placement
+- *(acroform)* cover appearance marker branches
+- *(acroform)* cover foreign resource branches
+- *(acroform)* cover inherited default boundaries
+- Merge pull request #888 from fulgur-rs/feature/flpdf-2tfv-annotation-transform
+- *(acroform)* exclude llvm coverage join artifacts
+- *(acroform)* cover annotation transform boundaries
+- avoid private acroform API link
+- Merge pull request #883 from fulgur-rs/feature/flpdf-otki-remove-object-handle-preconditions
+- Merge pull request #881 from fulgur-rs/feature/flpdf-5j3c-1-4-xobject-closure
+- *(annotations)* cover direct-handle flattening paths
+- Merge pull request #878 from fulgur-rs/feature/flpdf-5j3c-1-1-invert-gate
+- migrate acroform analysis to canonical handles
+- exclude defensive multiline error edges
+- cover page helper error routes
+- test canonical page helper routes
+- snapshot page contents for lazy Form conversion
+- migrate page consumers to canonical helper
+- port remaining PageObjectHelper canonical routes
+- add canonical PageObjectHelper XObject traversal
+- port PageObjectHelper content and resource access
+- port PageObjectHelper attributes to ObjectHandle
+- *(acroform)* enumerate widgets through qpdf field map
+- Merge pull request #872 from fulgur-rs/rename/acroform-get-field-and-top-level
+- Merge pull request #871 from fulgur-rs/rename/overlay-geometry-qpdf-names
+- Merge pull request #867 from fulgur-rs/feature/flpdf-tlz8-chain-cleanup
+- Merge pull request #870 from fulgur-rs/rename/outline-get-outlines-for-page
+- Merge pull request #869 from fulgur-rs/rename/writer-get-compressible-objgens
+- Merge pull request #868 from fulgur-rs/rename/xref-resolve-objects-in-stream
+- Merge pull request #863 from fulgur-rs/feature/flpdf-tlz8-direct-object-number
+- Merge pull request #866 from fulgur-rs/feature/flpdf-9ng9-remaining
+- cover indirect annotation appearance dictionaries
+- simplify appearance holder detection
+- make flatten result coverage explicit
+- exercise bridge coverage paths
+- cover annotation flattening routes
+- centralize annotation appearance content
+- Merge pull request #865 from fulgur-rs/feature/flpdf-3yn9-17-pagelabels-oracle
+- *(reader)* note that the ASCII85 crypt-prefix expectation is not the target state
+- *(reader)* pin the non-head /Crypt ASCII85 boundary against qpdf
+- clarify post-cutover ASCII85 status
+- format changed decoder-route file
+- keep ASCII85 fixtures independent of production encoder
+- *(filters)* remove legacy ASCII85 encoder route
+- *(pipeline)* name the ASCII85 decoder after qpdf
+- *(filters)* pin unsupported ASCII85 encode boundary
+- Merge pull request #862 from fulgur-rs/feature/flpdf-tlz8-oracle
+- *(reader)* fail closed on qpdf probe errors
+- *(reader)* keep parity red checks explicit
+- *(reader)* pin qpdf direct object-stream behavior
+- migrate reader/xref consumers to ObjectHandle ([#859](https://github.com/fulgur-rs/flpdf/pull/859))
+- *(annotation)* rewrite AnnotationObjectHelper on ObjectHandle, generalize field linkage ([#856](https://github.com/fulgur-rs/flpdf/pull/856))
+- *(xref)* read bootstrap filter metadata through handles ([#850](https://github.com/fulgur-rs/flpdf/pull/850))
+- *(writer)* migrate Catalog extension updates to ObjectHandle ([#847](https://github.com/fulgur-rs/flpdf/pull/847))
+- *(writer)* keep plain trailer and ObjStm emission on ObjectHandle ([#846](https://github.com/fulgur-rs/flpdf/pull/846))
+- canonicalize linearization hint encryption and cleanup ([#844](https://github.com/fulgur-rs/flpdf/pull/844))
+- route linearization ObjStm and xref through ObjectHandle ([#843](https://github.com/fulgur-rs/flpdf/pull/843))
+- move linearization body streams to ObjectHandle ([#842](https://github.com/fulgur-rs/flpdf/pull/842))
+- *(linearization)* cut consumers over to ObjectHandle ([#841](https://github.com/fulgur-rs/flpdf/pull/841))
+- [flpdf-3yn9.4] Port linearization producer through ObjectHandle ([#840](https://github.com/fulgur-rs/flpdf/pull/840))
+- fuzz xref and trailer loading
+- Merge pull request #837 from fulgur-rs/feature/flpdf-icv7-attachment-warnings
+- Merge pull request #833 from fulgur-rs/feature/flpdf-egzr-3-2-17-handle-writeback
+- Merge pull request #831 from fulgur-rs/feature/flpdf-egzr-3-2-5-4-writer-consumers
+- *(writer)* cover handle-native serializer routes
+- Merge pull request #828 from fulgur-rs/feature/flpdf-3yn9-20-empty-flate-fixture
+- *(xref)* cover the sink=None branch of parse_xref_table's error paths
+- Merge pull request #824 from fulgur-rs/feature/flpdf-25kg-3-16-7-1-array-ownership
+- Merge pull request #822 from fulgur-rs/feature/flpdf-h1q6-xref-diagnostic
+- Merge pull request #821 from fulgur-rs/feature/flpdf-egzr-3-2-5-2-body
+- Merge pull request #815 from fulgur-rs/feature/flpdf-25kg-3-37-json-deref
+- cover JSON v1 dictionary key encoding
+- close canonical JSON coverage gaps
+- cover canonical object JSON writer branches
+- fix private JSON writer link
+- map qpdf content primitive correspondence ([#811](https://github.com/fulgur-rs/flpdf/pull/811))
+- Merge pull request #810 from fulgur-rs/feature/flpdf-3yn9-13-content-parser-entrypoints
+- Merge pull request #807 from fulgur-rs/flpdf-9hc.43-objstm-fix-qdf
+- *(qdf_fix)* cover xref-keyword-at-true-EOF boundary
+- *(qdf_fix)* close patch-coverage gaps on the oracle-parity fix
+- use cov:ignore-start/end so the marker lands on the reported line
+- mark the unreachable Free-entry match arm cov:ignore
+- simplify per /simplify review (reuse, dedup, minor efficiency)
+- cover objstm marker/extends edge cases and classic-form rejection
+- confine xref tombstones to registration
+- correct reconstruction removal oracle
+- establish tombstone lifetime oracle
+- *(pages)* cover wide direct page trees
+- *(object-handle)* require canonical identity keys
+- Merge pull request #796 from fulgur-rs/feature/flpdf-2mkd-outline-handles
+- *(outline)* bundle sibling seen-state to keep the chase call on one line
+- Merge remote-tracking branch 'origin/main' into feature/flpdf-2mkd-outline-handles
+- Migrate outline items to ObjectHandle
+- Merge pull request #789 from fulgur-rs/feature/flpdf-25kg-3-16-1-reserved
+- *(object-handle)* tighten stale reserved-rejection comment wording
+- *(object-handle)* document ot_reserved reachability and unparse_resolved fallback
+- *(object-handle)* exercise reserved map callback
+- *(object-handle)* cover reserved writer guards
+- *(object-handle)* cover copy stream destination guard
+- *(reader)* cover stream copy contract guards
+- *(form-field)* keep coverage on checkbox dispatch
+- *(form-field)* cover malformed appearance fallback
+- *(form-field)* cover canonical mutation branches
+- *(form-field)* use canonical object handles
+- *(embedded-files)* avoid duplicate root probing
+- *(embedded-files)* cover malformed helper initialization
+- *(nntree)* cover handle-native iteration and removal
+- *(filespec)* cover embedded stream failure paths
+- *(object-handle)* cover provider adapter contracts
+- *(writer)* cover deterministic ID assertion
+- *(reader)* satisfy strict xref lint
+- *(reader)* move legacy stream memo payloads
+- *(object-handle)* avoid scalar snapshot clones
+- *(resolver)* exclude non-executable match terminator
+- *(object-handle)* cover decoded stream failure
+- *(reader)* mark exhaustive length cases for coverage
+- *(reader)* isolate deep resolver teardown
+- *(reader)* describe stream warning offsets
+- *(reader)* accept attributed parser diagnostics
+- *(reader)* update attributed warning expectations
+- preserve qpdf stream warning attribution
+- *(page-combine)* cover parse error attribution
+- *(reader)* cover deep memo error paths
+- *(reader)* cover materialized memo error paths
+- *(pdf)* qualify replacement memo link
+- *(reader)* cover parsed xref handle guards
+- *(reader)* cover stale memo enumeration guard
+- cover indirect page-tree kids holders
+- keep coverage marker on ignored branch
+- document unreachable null parent coverage branch
+- *(nntree)* remove unreachable coverage branch
+- *(nntree)* update preflight error expectation
+- cover live canonical deletion filtering
+- cover redirected tree boundary limits
+- keep canonical key regression covered
+- account for number-tree warning coverage markers
+- account for number-tree warning coverage marker
+- cover page label tree edge paths
+- Port page label helper onto canonical handles
+- Merge pull request #726 from fulgur-rs/feature/flpdf-3yn9-19-dr-hidden-collision
+- cover overlay resource resolution errors
+- scope overlay DR collision assertions
+- record overlay DR hidden collision divergence
+- Merge pull request #721 from fulgur-rs/feature/flpdf-25kg-3-5-1-stream-recovery
+- cover canonical stream recovery branches
+- Merge pull request #715 from fulgur-rs/feature/flpdf-25kg-4-2-1-dct-streaming
+- fix fixture paths for CI checkout
+- account for pclm coverage mapping
+- finish writer patch coverage
+- close writer patch coverage gaps
+- update linearization writer links
+- declare writer qpdf correspondence
+- complete qpdf full-rewrite writer cutover
+- migrate integration tests to qpdf writer
+- migrate more tests to qpdf writer
+- migrate linearized and page integration tests
+- migrate writer integration tests to qpdf route
+- make split-pages use QPDFWriter
+- simplify live xref result assembly
+- cover qpdf writer result xref details
+- restore legacy plain writer filter contract
+- align cleartext metadata assertion with qpdf
+- cover qpdf-checked contents holder shapes
+- cover qpdf writer metadata and QDF contracts
+- resolve rewritten metadata reference
+- require one qpdf writer pipeline write
+- cover qpdf writer output sinks
+- require exact qpdf oracle version
+- cover qpdf writer lifecycle and prev gates
+- clarify qpdf writer retry semantics
+- add qpdf writer contract red gates
+- gate qpdf parity on the expected oracle version
+- *(json)* cover stream decode fallbacks
+- inject deterministic V5 writer randomness
+- *(xref)* harden indirect stream length coverage
+- Merge pull request #706 from fulgur-rs/fix/flpdf-p1t9-bootstrap-objstm
+- Merge pull request #702 from fulgur-rs/fix/flpdf-25kg.3.34.2-resolved-size
+- cover reconstructed xref size diagnostics
+- cover reconstruction xref cache contexts
+- share xref bootstrap cache overlays
+- Merge pull request #701 from fulgur-rs/codex/ci-suite-runtime
+- close CI suite review gaps
+- correct linearization framing test references
+- *(linearization)* cover both encrypted framing outcomes end to end
+- *(linearization)* remove redundant random stress loop
+- cover xref diagnostic propagation paths
+- Merge pull request #693 from fulgur-rs/fix/flpdf-4zt3-drop-objstm-recovery
+- Merge pull request #691 from fulgur-rs/feature/flpdf-26l3-linearized-hint-splice
+- *(linearization)* close patch coverage gaps
+- *(linearization)* cover malformed page plan
+- Merge pull request #690 from fulgur-rs/fix/flpdf-2unc-hint-stream-convergence-predicate
+- Merge pull request #689 from fulgur-rs/feature/flpdf-25kg.3.30-effective-xref
+- Merge pull request #688 from fulgur-rs/feature/flpdf-25kg.3.33
+- Merge pull request #687 from fulgur-rs/feat/flpdf-25kg.3.32
+- *(cache)* cover recovered enumeration states
+- *(reader)* cover public recovery bridge branches
+- add coverage tests and cov:ignore annotations for xref reconstruction
+- initialize PdfOpenOptions using struct literal in tests
+- format resolver tests with cargo fmt
+- Merge pull request #683 from fulgur-rs/feature/flpdf-9hc.17.1-ignore-xref-streams
+- *(plans)* fix five more plan/comment inaccuracies caught by review
+- *(object)* serialize the default-logger captures and pin the silent getKey
+- *(object)* defer the getKey and getKeys warning arms
+- *(object)* cover the sinkless-resolver, dropped-document, and live-resolver routes
+- *(linearization)* classify pass1 coverage exclusions
+- *(linearization)* document pass1 marker invariant
+- *(reader)* format warning regression
+- *(reader)* update warning formatter test
+- cover logger reset and identity contracts
+- *(stream-filter)* cover the test doubles' decode_pipeline bodies
+- state observability and finish labelling the deviation records
+- name the byte gate and correct the decode-pipeline deviation records
+- record the decode-pipeline ownership and factory substitutions
+- *(stream-filter)* cover decode_pipeline construction, streaming, and faults
+- *(pipeline)* let Flate and LZW take a borrowed or owned next
+- *(reader)* record why the chased terminal is never NotYetResolved
+- Merge pull request #676 from fulgur-rs/fix/flpdf-um4z-source-objstm
+- *(writer)* cover ObjStm planning error paths
+- *(writer)* place Preserve ObjStm by source identity
+- *(writer)* renumber source-backed ObjStm groups
+- *(writer)* retain Preserve ObjStm group identity
+- Merge pull request #668 from fulgur-rs/feature/flpdf-qynx.8-pl-discard
+- *(filespec)* use canonical Discard terminal
+- restore factory correspondence accuracy
+- record Pdf engine factory ownership
+- *(engine)* extract Pdf factory orchestration
+- Merge pull request #664 from fulgur-rs/feature/flpdf-25kg.3.26-uniform-object
+- *(object_handle)* cover disconnect terminal states
+- *(object_handle)* close uniform identity branch coverage
+- *(object_handle)* satisfy clippy for stream identity assertion
+- *(object_handle)* correct qpdf teardown scope
+- *(object_handle)* map uniform slots to qpdf 11.9.0
+- *(object_handle)* derive containment roots from shared slots
+- Merge pull request #657 from fulgur-rs/feature/flpdf-25kg.3.19-empty-pdf-factory
+- *(engine)* move Pdf::empty() out of reader.rs into new engine.rs
+- port lazy original stream source
+- complete string decryption coverage
+- cover parser string decryption parity
+- Merge pull request #651 from fulgur-rs/feature/flpdf-25kg.3.18-qpdf-parser-live
+- *(parser)* scope qpdf small-stack coverage
+- *(parser)* cover explicit parse recovery errors
+- *(parser)* cover live recovery boundaries
+- Merge pull request #649 from fulgur-rs/feature/flpdf-25kg.3.15-interpret-cf
+- Merge pull request #646 from fulgur-rs/feature/flpdf-txag-linearize-encrypt
+- *(linearization)* stop overclaiming the hint-stream IV-pinning fix
+- *(linearization)* mark remaining defensive/coverage-artifact lines
+- *(writer)* extract cipher_needs_aes_iv to fix a coverage-region split
+- *(linearization)* fix stale test comment claiming linearize+encrypt is unsupported
+- *(linearization)* cover resolve_catalog_adbe_status's non-Dict/Ref arm
+- *(writer)* update stale single-caller comments on the ADBE helpers
+- *(linearization)* note the V5 negative plaintext-leak checks' premise
+- *(linearization)* cover V5R6Aes256/V5R5Aes256 and hint/xref encryption qualitative checks
+- *(linearization)* guard cleartext-metadata against the default re-filter policy
+- *(linearization)* fix stale qpdf citation, warn future implementers about shared xref-stream fns
+- *(linearization)* cov:ignore the encrypt-emission test's failure-only lines
+- *(linearization)* document write_linearized's new copy-encryption error arm
+- *(linearization)* harden the id0-placeholder invariant with a debug_assert
+- *(linearization)* rename cleartext-metadata test to match what it proves
+- *(linearization)* cover the new encrypt-context block, mark ignored test's body cov:ignore
+- *(linearization)* make the guard-message assertion branch-independent
+- *(linearization)* compute /ID before renumbering
+- *(linearization)* clarify ObjStm+encrypt guard is not a qpdf constraint
+- *(writer)* widen encryption context visibility to pub(crate)
+- *(json)* name the QPDF_json.cc module document_json (flpdf-ridh)
+- *(json)* retire the materialized qpdf-key twin (flpdf-ridh)
+- *(json)* split QPDF::writeJSON out of json_inspect (flpdf-ridh)
+- *(qpdf-correspondence)* record ObjectHandle writer-emission primitives
+- *(object_handle)* close DecodeParms non-refiltered coverage gap on 878c878c
+- *(object_handle)* address review finding on faa40220
+- *(object_handle)* promote try_dereference/try_is_null out of dead-code
+- *(object)* promote real_literal_is_safe to pub(crate)
+- Merge pull request #643 from fulgur-rs/feature/flpdf-25kg.3.13-encryption-parameters-parity
+- *(reader)* point EncryptionMode at the methods that resolve a cipher
+- *(reader)* pin the missing-/V rejection on both authentication paths
+- *(reader)* cover the unknown crypt-filter report and the /EFF selector
+- Merge pull request #640 from fulgur-rs/feature/flpdf-25kg.3.10-pipe-stream-data
+- *(resolver)* share one finish counter across the pipe tests
+- *(resolver)* escape the placeholder in the decoding-failure message
+- *(resolver)* drop the fault reader's unreachable healthy read path
+- Merge pull request #639 from fulgur-rs/feature/flpdf-bv2r-u-padding
+- Merge pull request #637 from fulgur-rs/feature/flpdf-25kg.3.11-resolver-encp
+- *(pipeline)* close the last two uncovered AES lines
+- *(pipeline)* cover the AES stage's non-PKCS#7 strip and short-block recovery
+- *(pipeline)* mark the AES stage not-yet-wired, matching the other Pl_* stages
+- sweep comments that still name the old stream fields
+- *(object_handle)* name the stream fields after qpdf's members
+- *(object_handle)* state why sharing the payload is sound
+- *(object_handle)* drop the shape-correspondence claim for Rc<Vec<u8>>
+- *(object_handle)* assert buffer identity against the test's own Rc
+- Merge pull request #632 from fulgur-rs/feature/flpdf-1c7z-sha2-pipeline
+- Merge pull request #630 from fulgur-rs/feature/flpdf-25kg.3.5-canonical-resolver
+- *(resolver)* pin that a buffer-boundary EOF still refills
+- *(resolver)* cite the throw that raises `expected n n obj`
+- *(resolver)* pull the input in geometric steps, not fixed ones
+- *(resolver)* tighten the QPDFParser citations
+- *(page_split)* take the source by value instead of copying it
+- *(resolver)* pin the `endobj` half of the EOF token, and the two seeks
+- *(resolver)* assert the overflow refusal without an uncovered arm
+- *(resolver)* pin /AP /N nested dereference through the owning document
+- *(resolver)* replace two reasoned claims in the new fixture with measured ones
+- *(resolver)* pin the /Length seam with a self-referential fixture
+- *(object-handle)* assert the null variants with matches!, not a mapping
+- *(resolver)* evict the legacy read helpers from ResolverCore
+- *(resolver)* pin that two nested read_stream frames keep separate offsets
+- *(resolver)* cover the streaming read's error and EOF branches
+- *(resolver)* move the canonical handle registry onto the resolver
+- *(check)* drop a clone the owned snapshot made redundant, and pin why snapshots are safe
+- *(resolver)* record that the loop null's two routes differ but are unobservable
+- *(reader)* pin the `Arc`-not-`Rc` rationale with doctests instead of asserting it
+- *(reader)* require `R: 'static`, and take `Arc<[u8]>` in `open_mem`
+- *(object_handle)* correct three parity-ledger claims on the new constructor
+- *(object_handle)* make the dead_code note true in both builds
+- bound a /DecodeParms name to the Crypt stage that reads it
+- cover inline and non-dictionary filespec name-tree values
+- Merge pull request #626 from fulgur-rs/feature/flpdf-25kg.3.4-objecthandle-stream-decode
+- say max_filter_chain's None is a caller's choice, not the default
+- correct three claims in the replicated-snapshot ledger
+- snapshot a replicated /DecodeParms once, not once per filter
+- qualify the qpdf and flpdf citations added for the length accessor
+- correct what a dropped document does to a /Filter handle (D1)
+- size both filter arrays before snapshotting them
+- state the retention-insensitivity claim for both readers
+- retain only the /DecodeParms keys a filter reads
+- pin the per-spec threading; narrow the non-resolving classification claim
+- keep the new assertions' failure paths off the coverage gate
+- pin the corpus helper's direct-only guard arm
+- scope the shared-engine claim to max_output
+- record the ObjectHandle-native decode boundary
+- pin the warning text and zlib code the corpus leans on
+- scope the D4 corpus row to reader agreement
+- pin legacy and ObjectHandle decode equivalence
+- pin the native decode path's Crypt provider and live indirect dictionary
+- pin that the native entry point dereferences its stream dictionary
+- scope the getStreamData and recovering-form parity claims
+- scope the chain-count and /DecodeParms parity claims to what holds
+- scope the key-order note and record the shared-fixture contract
+- cite the qpdf base-class default behind set_decode_params
+- pin that a non-dictionary /DecodeParms reduces to Present, not Absent
+- scope the Crypt arm pinning claim to the mutations proved
+- state the D2 test's pinning claim as the mutation actually proved it
+- bound the ParamValue integer invariant to what each reader can honor
+- split the getIntValueAsInt clamp from its Object reader
+- pass DecodeParams to the Crypt stage provider
+- pin what a non-dictionary /DecodeParms actually leaves in place
+- take DecodeParams in StreamFilter::set_decode_params
+- correct DecodeParams qpdf attributions and tighten the bridge
+- give FilterSpec a shape-neutral DecodeParams
+- Port qpdf page insertion ownership ([#621](https://github.com/fulgur-rs/flpdf/pull/621))
+- 対応表を Phase 2 着手時に再測し、責務の帰属誤りを訂正 (flpdf-1e5g) ([#615](https://github.com/fulgur-rs/flpdf/pull/615))
+- pin the exact MAX_PARSE_DEPTH boundary for trailer_key_handle ([#611](https://github.com/fulgur-rs/flpdf/pull/611))
+- remove driver::Handle, consume ObjectHandle directly ([#610](https://github.com/fulgur-rs/flpdf/pull/610))
+- Merge pull request #603 from fulgur-rs/feat/flpdf-egzr-3-2-1-objecthandle-api
+- Fix stack-overflow abort in native ObjectHandle parser recursion
+- *(flpdf)* fix accessor docs to say only unresolved indirect handles miss
+- Fix resolve()/resolve_borrowed() regression on deeply nested compressed objects
+- *(flpdf)* cover the remaining ObjectHandle Debug resolution states
+- *(flpdf)* cover the direct-handle arm of ObjectHandle::strong_count
+- *(reader)* cover delete_object's split-out object-0 early return
+- *(object_handle)* close patch-coverage gaps in the materialization bridge
+- *(reader)* record the narrow bounded-window-only native reparse gap
+- *(reader)* mark lift's now-unreachable Stream/Operator/InlineImage/Reference arm
+- *(parser)* close patch-coverage gaps in the new ObjectHandle native path
+- *(reader)* cite qpdf's per-document object cache for get_object_handle identity
+- *(object_handle)* fix is_null/dictionary/real_literal doc accuracy
+- Merge pull request #597 from fulgur-rs/flpdf-egzr.4
+- Fix rustdoc private-intra-doc-link on prepare_for_optimization
+- Address remaining flpdf-test-tokenizer review findings
+- Move token_type_name back out of flpdf, matching qpdf's own layout
+- Simplify tokenizer_runner.rs and dedup token_type_name
+- Fix rustdoc private_intra_doc_links on resolve_ref_chain
+- Follow the full /Type reference chain when classifying object streams
+- Fix endstream search to match qpdf's Finder algorithm, narrow qtest-driver exposure
+- Remove qtest_tokenizer.rs; make tokenizer module directly pub under feature gate
+- Move token_type_name to tokenizer_runner, matching qpdf test_tokenizer.cc placement
+- Add flpdf-test-tokenizer binary: qtest helper for tokenizer observable parity
+- classify qtest string correspondence
+- *(filters)* cover leading identity Crypt stage
+- *(qtest)* eliminate final patch coverage gaps
+- *(qtest)* cover final parity boundaries
+- *(xref)* simplify strict header parse
+- *(coverage)* exercise adapter and writer boundaries
+- *(qtest)* cover strict replay boundaries
+- *(qtest)* cover predictor warning replay
+- *(qtest)* simplify bounded fixture assertion
+- *(qtest)* cover bounded recovery cleanup
+- *(qtest)* cover recovery boundary mapping
+- *(qtest)* cover chained recovery cleanup
+- *(qtest)* cover prior recovery error data
+- *(qtest)* cover final recovery warning order
+- *(json)* cover portable side-file error assertion
+- *(json)* make side-file open error portable
+- *(pipeline)* record JSON stdio correspondence
+- *(pipeline)* assert stdio callback lifecycle
+- *(pipeline)* cover qpdf stdio lifecycle oracle
+- *(json)* use qpdf top-level file lifecycle
+- *(json)* expose side-file lifecycle for tests
+- *(json)* cut side files over to PlStdioFile
+- *(json)* keep batching assertion covered
+- *(json)* cover raw non-finite scalar rejection
+- *(json)* close chunk trace coverage gaps
+- *(pipeline)* restore coverage assertions
+- *(pipeline)* annotate unreachable coverage regions
+- *(pipeline)* close JSON stage coverage gaps
+- *(pipeline)* record JSON stage correspondence
+- *(cli)* delegate JSON terminals to library
+- *(json)* pin reader errors to parse category
+- *(json)* remove obsolete Write surfaces
+- *(json)* cut serialization over to Pipeline
+- *(pipeline)* add qpdf JSON stage oracle
+- *(pipeline)* verify empty concatenate writes
+- Merge pull request #586 from fulgur-rs/fix/flpdf-eata-probe-etxtbsy
+- *(probe)* run stand-in probe scripts through /bin/sh
+- *(pipeline)* drive the LZW/PNG fake probe through a shell script
+- *(pipeline)* replay every LZW/PNG oracle case against flpdf itself
+- *(filters)* drop the unreachable legacy decode route
+- *(filters)* correct the decode and encode contracts after the cutover
+- *(filters)* route LZW and PNG predictor through the qpdf stream filter
+- clarify check codec limits
+- use portable true probe path
+- keep codec parity assertions covered
+- avoid direct exec for fake codec probes
+- execute RunLength boundary fallbacks
+- verify stream codecs against qpdf
+- remove whole-buffer stream codecs
+- cover ASCII85 pipeline edge paths
+- Merge pull request #578 from fulgur-rs/feature/flpdf-qynx-3-resource-cutover
+- *(resources)* exclude sink boilerplate from coverage
+- clarify resource pipeline ownership
+- *(content)* make resource finder failure probe portable
+- *(content)* cover resource finder oracle boundary
+- *(content)* remove obsolete scanner helpers
+- *(resources)* use shared resource finder
+- *(overlay)* cut appearance streams over to resource replacer
+- *(overlay)* cut default appearance over to resource replacer
+- *(content)* cut normalizer over to tokenizer pipeline
+- cover qpdf token filter pipeline
+- scope stream warning helper to tests
+- borrow first stream filter input
+- cover inline content warning location
+- retain flate warnings before later decode errors
+- cover stream filter driver branches
+- align empty object streams with PlFlate
+- cut filters over to PlFlate
+- cover tokenizer probe wrapper
+- *(rc4)* cover pipeline contract boundaries
+- *(rc4)* stabilize probe process boundary
+- *(rc4)* cut stream consumers over to PlRc4
+- *(rc4)* add qpdf PlRc4 differential
+- cover optimization error paths
+- index optimization correspondence
+- cut linearization over to optimization maps
+- align xref coverage exclusions
+- finish xref entry cutover
+- cut over all xref entry consumers
+- Merge pull request #572 from fulgur-rs/feature/flpdf-qynx-2-1-rc4-core
+- pin qpdf flate finish error category
+- scope stack budget regression to linux x86_64
+- close pipeline review gaps
+- cover pipeline boundary contracts
+- record pipeline component correspondence
+- satisfy pipeline lint gates
+- route hint decoding through bit stream
+- route hint encoding through pipelines
+- share flate buffer status handling
+- remove unreachable flate test states
+- align flate framing cases with qpdf oracle
+- exercise flate buffer exhaustion paths
+- cover flate defensive state paths
+- cover flate streaming edge states
+- *(content)* address review feedback
+- *(pages)* avoid private intra-doc link
+- *(content)* cover oracle harness and string forms
+- *(docs)* audit content normalizer mirror
+- *(content)* gate qpdf normalizer parity
+- *(content)* retain inline image callback coverage
+- *(content)* replace object normalizer
+- *(json)* [**breaking**] finalize exact output API
+- *(json)* cover final stdio retry boundaries
+- *(json)* align integration tests with live API
+- *(json)* update side-file path ownership
+- *(json)* update stream payload helper purpose
+- *(json)* cover integration projection branches
+- *(json)* cut CLI over to qpdf streaming
+- *(json)* stream qpdf JSON document output
+- *(json)* migrate inspection values
+- *(json)* use keyed schema lookups
+- *(json)* assert handler errors as bytes
+- *(json)* cover unconfigured boolean handler
+- *(json)* make handlers live shared handles
+- *(json)* classify validation qpdf correspondence
+- *(json)* cover live fallback replacement
+- *(json)* remove unreachable schema branch
+- *(json)* cover validation fallthroughs
+- *(json)* cover every pattern schema member
+- *(json)* cover schema recursive validation
+- *(json)* correct parser streaming contract
+- *(json)* cover diagnostic message debug output
+- *(json)* classify parser qpdf correspondence
+- *(json)* complete live writer branch coverage
+- *(json)* document unreachable writer tag guards
+- *(json)* classify core qpdf correspondence
+- *(json)* cover qpdf real rounding
+- *(json)* cover snapshot routing
+- *(json)* cover scalar and container edges
+- *(json)* cover shared value behavior
+- *(tokenizer)* lock qpdf all-mode parity
+- *(content)* remove duplicate content lexer
+- *(appearance)* consume qpdf content events
+- *(content)* migrate core callback consumers
+- *(tokenizer)* mark inline layer as qpdf mirror
+- *(tokenizer)* keep core layer correspondence partial
+- *(tokenizer)* mark qpdf component mirror
+- *(parser)* route pulls through qpdf tokenizer
+- *(tokenizer)* mirror qpdf token values
+- classify flpdf modules by qpdf correspondence
+- *(nntree)* cover repair boundary branches
+- *(nntree)* consolidate outline destination lookup
+- *(nntree)* cover repaired holder writeback
+- *(page-labels)* cover malformed insert propagation
+- *(nntree)* cover helper boundary paths
+- *(nntree)* avoid duplicate direct-array clone
+- *(nntree)* pin NUL repair to qpdf oracle
+- *(nntree)* share qpdf string encoding
+- *(nntree)* cover malformed indirect limits
+- *(nntree)* clarify qpdf lookup and allocation parity
+- *(nntree)* record malformed-array parity
+- *(nntree)* annotate coverage mapping artifacts
+- *(nntree)* close patch coverage gaps
+- *(nntree)* cover defensive engine paths
+- *(nntree)* complete engine parity gates
+- *(nntree)* add shared key and node storage
+- *(matrix)* centralize qpdf affine transforms
+- *(pdf-version)* centralize version constants
+- *(writer)* cover malformed version encryption floor
+- route PDF versions through PdfVersion
+- cover qpdf name escape recovery
+- cover qpdf tokenizer edge states
+- route lexical readers through tokenizer
+- align real fixture with qpdf number tokens
+- add qpdf-shaped object tokenizer
+- *(writer)* preserve xref stream path coverage
+- *(writer)* drop duplicated plain xref cases
+- *(writer)* route generate through plain pipeline
+- *(writer)* make preserve fallback assertion exhaustive
+- *(writer)* align preserve assertions with plain plan
+- *(writer)* pin preserve ObjStm source-number order
+- *(writer)* route preserve through plain pipeline
+- *(writer)* make disable placement assertion exhaustive
+- *(writer)* cover plain body error propagation
+- *(writer)* route disable through plain pipeline
+- *(writer)* document planner coverage invariants
+- *(writer)* cover plain plan invariants
+- *(writer)* add logical plain write plan
+- *(writer)* cover plain xref edge cases
+- *(writer)* assemble xref from body layout
+- *(writer)* exclude unreachable ObjStm wrap error arm
+- *(writer)* extract physical serializers
+- cover xref diagnostics through fallback
+- Merge branch 'stack/flpdf-15jp-normal-object-routing' into stack/flpdf-15jp-container-xref-routing
+- Merge branch 'stack/flpdf-15jp-stream-completion' into stack/flpdf-15jp-normal-object-routing
+- require real endstream when requested
+- require a stream recovery terminator
+- Merge branch 'stack/flpdf-15jp-file-object-syntax' into stack/flpdf-15jp-stream-completion
+- gate stacked layers with complete coverage
+- add qpdf file-object syntax model
+
 ## [0.4.0](https://github.com/fulgur-rs/flpdf/compare/v0.3.0...v0.4.0) - 2026-07-24
 
 ### Fixed
