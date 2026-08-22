@@ -1255,9 +1255,12 @@ struct RewriteCommand {
     /// `y` and `n`: enable qpdf's boolean option and always write exactly one
     /// `\n` before `endstream`. qpdf 11.9.0 accepts both value spellings as
     /// the presence of the flag.
+    /// Unrecognized attached values are also treated as flag presence, as in
+    /// qpdf's bare-option parser.
     ///
     /// Only affects the full-rewrite path.
-    #[arg(long = "newline-before-endstream", value_enum,
+    #[arg(long = "newline-before-endstream", value_enum, num_args = 0..=1,
+          require_equals = true, default_missing_value = "y",
           default_value_t = CliNewlineBeforeEndstream::Never,
           help = "Insert newline before endstream keyword (qpdf default: never)")]
     newline_before_endstream: CliNewlineBeforeEndstream,
@@ -3933,7 +3936,16 @@ fn normalize_qpdf_bare_equals(args: Vec<String>) -> Vec<String> {
         }
 
         if let Some(name) = long_option_name(&arg).map(str::to_owned) {
-            if bare_options.contains(name.as_str()) && arg.contains('=') {
+            // qpdf registers this option with addBare, but flpdf retains its
+            // value_enum extension for the recognized y/n/never spellings.
+            // Unknown attached values still have qpdf's bare-flag meaning.
+            let discard_equals_value = if name == "newline-before-endstream" {
+                arg.split_once('=')
+                    .is_some_and(|(_, value)| !matches!(value, "y" | "n" | "never"))
+            } else {
+                bare_options.contains(name.as_str()) && arg.contains('=')
+            };
+            if discard_equals_value {
                 arg = format!("--{name}");
             }
             active_segment = QpdfArgSegment::from_option_name(&name);
@@ -7521,6 +7533,16 @@ mod tests {
             "--newline-before-endstream=never",
         ]);
         assert_eq!(normalize_qpdf_bare_equals(args.clone()), args);
+    }
+
+    #[test]
+    fn newline_before_endstream_discards_an_unrecognized_equals_value() {
+        let args = strs(&["flpdf", "--newline-before-endstream=garbage"]);
+
+        assert_eq!(
+            normalize_qpdf_bare_equals(args),
+            strs(&["flpdf", "--newline-before-endstream"])
+        );
     }
 
     #[test]
