@@ -782,3 +782,65 @@ fn generate_appearances_if_needed_handles_a_direct_orphan_widget() {
         .unwrap();
     assert!(normal.as_stream_dict().is_some());
 }
+
+#[test]
+fn direct_non_indirect_pages_does_not_fail_eager_analyze() {
+    // A catalog that embeds /Pages as a direct (non-indirect) dictionary is
+    // malformed-but-readable: qpdf's getAllPages tolerates it, but flpdf's
+    // public page_refs requires /Pages to be an indirect reference
+    // (PageWalk::with_max_depth). Because analyze() now runs eagerly in the
+    // constructor, that mismatch used to fail the entire helper -- not just
+    // the orphan-widget fallback that triggers it -- for a document real
+    // qpdf 11.9.0 opens cleanly (verified live).
+    let bytes = build_pdf(
+        &[(
+            1,
+            "<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 0 >> /AcroForm << /Fields [] >> >>",
+        )],
+        1,
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+    let mut acroform = pdf
+        .acroform()
+        .expect("direct /Pages must not fail AcroFormDocumentHelper construction");
+    assert!(acroform.fields().unwrap().is_empty());
+}
+
+#[test]
+fn other_page_refs_errors_still_propagate_from_analyze() {
+    // Only page_refs()'s Error::Missing("/Pages") is swallowed by the
+    // fallback above (a malformed-but-qpdf-tolerated direct /Pages shape).
+    // Any other page_refs() failure -- here, an indirect /Pages chain
+    // deeper than DEFAULT_MAX_PAGE_TREE_DEPTH -- must still fail analyze(),
+    // matching qpdf's own page-tree depth guard.
+    const FIRST_PAGES_NODE: u32 = 2;
+    let last_pages_node = FIRST_PAGES_NODE + flpdf::pages::DEFAULT_MAX_PAGE_TREE_DEPTH as u32 + 1;
+
+    let mut objects = vec![(
+        1u32,
+        format!("<< /Type /Catalog /Pages {FIRST_PAGES_NODE} 0 R /AcroForm << /Fields [] >> >>"),
+    )];
+    for node in FIRST_PAGES_NODE..last_pages_node {
+        objects.push((node, format!("<< /Type /Pages /Kids [{} 0 R] >>", node + 1)));
+    }
+    objects.push((last_pages_node, "<< /Type /Pages /Kids [] >>".to_string()));
+
+    let object_refs: Vec<(u32, &str)> = objects
+        .iter()
+        .map(|(n, body)| (*n, body.as_str()))
+        .collect();
+    let bytes = build_pdf(&object_refs, 1);
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+    let error = match pdf.acroform() {
+        Ok(_) => {
+            panic!("a page-tree depth overflow from page_refs() must still fail eager analyze()")
+        }
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("depth exceeds"),
+        "unexpected error: {error}"
+    );
+}
