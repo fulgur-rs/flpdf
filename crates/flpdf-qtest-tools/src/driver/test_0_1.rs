@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
@@ -262,8 +263,44 @@ fn write_object_details<R: Read + Seek>(
             writeln!(stdout, "Uncompressed stream data:")?;
 
             let stream_ref = terminal_ref;
-            let decode_param_warnings = decode_dictionary
-                .decode_param_type_warnings()
+            // qpdf resolves one object into its persistent cache and then
+            // reuses that parsed value for every DecodeParms warning
+            // (`QPDF.cc:1700-1704`). Keep the qtest-only source-offset
+            // compatibility lookup on the same one-read boundary: a malformed
+            // next-object offset must not consume one global fallback retry
+            // per filter index when several warnings point into one container.
+            let warnings = decode_dictionary.decode_param_type_warnings();
+            let mut object_body_refs = Vec::new();
+            let mut array_item_indices: BTreeMap<ObjectRef, Vec<usize>> = BTreeMap::new();
+            for warning in warnings {
+                match warning.source {
+                    DecodeParmsWarningSource::ObjectBody(object_ref) => {
+                        object_body_refs.push(object_ref);
+                    }
+                    DecodeParmsWarningSource::ArrayItem(object_ref, index) => {
+                        array_item_indices
+                            .entry(object_ref)
+                            .or_default()
+                            .push(index);
+                    }
+                    DecodeParmsWarningSource::StreamDictionary => {}
+                }
+            }
+            object_body_refs.sort_unstable();
+            object_body_refs.dedup();
+            let object_body_offsets = pdf
+                .qtest_object_value_source_offsets(&object_body_refs)?
+                .into_iter()
+                .enumerate()
+                .map(|(index, offset)| (object_body_refs[index], offset))
+                .collect::<BTreeMap<_, _>>();
+            let mut array_item_offsets: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+            for (object_ref, indices) in array_item_indices {
+                let offsets = pdf.qtest_array_item_source_offsets(object_ref, &indices)?;
+                array_item_offsets.insert(object_ref, indices.into_iter().zip(offsets).collect());
+            }
+
+            let decode_param_warnings = warnings
                 .iter()
                 .map(|warning| {
                     let (object_ref, offset) = match warning.source {
@@ -280,14 +317,18 @@ fn write_object_details<R: Read + Seek>(
                             )?;
                             (object_ref, offset)
                         }
-                        DecodeParmsWarningSource::ObjectBody(object_ref) => {
-                            let offset = pdf.qtest_object_value_source_offset(object_ref)?;
-                            (object_ref, offset)
-                        }
-                        DecodeParmsWarningSource::ArrayItem(object_ref, index) => {
-                            let offset = pdf.qtest_array_item_source_offset(object_ref, index)?;
-                            (object_ref, offset)
-                        }
+                        DecodeParmsWarningSource::ObjectBody(object_ref) => (
+                            object_ref,
+                            object_body_offsets.get(&object_ref).copied().flatten(),
+                        ),
+                        DecodeParmsWarningSource::ArrayItem(object_ref, index) => (
+                            object_ref,
+                            array_item_offsets
+                                .get(&object_ref)
+                                .and_then(|offsets| offsets.get(&index))
+                                .copied()
+                                .flatten(),
+                        ),
                     };
                     Ok((object_ref, warning.object_type, offset))
                 })
@@ -896,6 +937,86 @@ mod tests {
              operation for dictionary attempted on object of type integer: treating as empty\n"
         );
         assert_eq!(stderr, warning.repeat(2).into_bytes());
+    }
+
+    #[test]
+    fn indirect_decode_params_array_warning_offsets_are_batched() {
+        let stream = b"<< /Filter [ /FlateDecode /LZWDecode ] /DecodeParms 8 0 R /Length 0 >>\n\
+                       stream\n\nendstream"
+            .to_vec();
+        let array = b"[ 42 43 ]".to_vec();
+        let bytes = pdf_with_qtest(b"7 0 R", &[(7, stream), (8, array)]);
+        let first = bytes
+            .windows(b"[ 42 43 ]".len())
+            .position(|window| window == b"[ 42 43 ]")
+            .expect("DecodeParms array")
+            + b"[ ".len();
+        let second = first + b"42 ".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect DecodeParms array");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+
+        let first_warning = format!(
+            "WARNING: fixture.pdf, object 8 0 at offset {first}: operation for dictionary attempted \
+             on object of type integer: treating as empty\n"
+        );
+        let second_warning = format!(
+            "WARNING: fixture.pdf, object 8 0 at offset {second}: operation for dictionary attempted \
+             on object of type integer: treating as empty\n"
+        );
+        assert_eq!(
+            stderr,
+            [
+                first_warning.as_bytes(),
+                second_warning.as_bytes(),
+                first_warning.as_bytes(),
+                second_warning.as_bytes(),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn indirect_decode_params_scalar_warning_offsets_are_batched() {
+        let stream = b"<< /Filter [ /FlateDecode /LZWDecode ] /DecodeParms 8 0 R /Length 0 >>\n\
+                       stream\n\nendstream"
+            .to_vec();
+        let scalar = b"42".to_vec();
+        let bytes = pdf_with_qtest(b"7 0 R", &[(7, stream), (8, scalar)]);
+        let offset = bytes
+            .windows(b"8 0 obj".len())
+            .position(|window| window == b"8 0 obj")
+            .expect("DecodeParms scalar")
+            + b"8 0 obj".len();
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open indirect DecodeParms scalar");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
+
+        run_test_0_1(
+            &mut pdf,
+            b"fixture.pdf",
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("run test_0_1");
+
+        let warning = format!(
+            "WARNING: fixture.pdf, object 8 0 at offset {offset}: operation for dictionary attempted \
+             on object of type integer: treating as empty\n"
+        );
+        assert_eq!(stderr, warning.repeat(4).into_bytes());
     }
 
     #[test]
