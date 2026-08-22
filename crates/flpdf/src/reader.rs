@@ -1649,12 +1649,13 @@ impl<R: Read + Seek> Pdf<R> {
                 if self.resolver.xref_entry(object_ref).is_none()
                     && cache_entry.is_none()
                     && handle.is_null()
+                    && !self.resolver.is_allocated_object(object_ref)
                     && !self.handle_mutated_object_refs.contains(&object_ref)
                 {
                     // A canonical handle can resolve an absent reference to
                     // null without creating a legacy Missing entry. qpdf's
-                    // xref membership still distinguishes that dangling
-                    // cache value from an allocated indirect object.
+                    // source/cache provenance still distinguishes that
+                    // dangling cache value from an allocated indirect object.
                     return None;
                 }
                 if live_only && self.qpdf_parsed_xref_stream_refs.contains(&object_ref) {
@@ -11564,6 +11565,27 @@ mod tests {
         assert!(!handle.is_resolved());
         assert!(pdf.object_refs().contains(&placeholder_ref));
         assert!(!pdf.live_object_refs().contains(&placeholder_ref));
+        assert!(pdf.live_object_refs().contains(&allocated_ref));
+    }
+
+    #[test]
+    fn live_object_refs_includes_a_canonical_indirect_null_allocation() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let resources = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Null".to_vec(), ObjectHandle::null())]),
+        )]);
+
+        resources
+            .make_resources_indirect(&mut pdf)
+            .expect("promote the direct null resource value");
+        let allocated_null = resources.get_key(b"/XObject").get_key(b"/Null");
+        let allocated_ref = allocated_null
+            .object_ref()
+            .expect("promoted null must have an indirect identity");
+
+        assert!(allocated_null.is_null());
+        assert!(pdf.object_refs().contains(&allocated_ref));
         assert!(pdf.live_object_refs().contains(&allocated_ref));
     }
 
