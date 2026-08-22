@@ -468,10 +468,16 @@ fn datafile_stream_provider_reports_missing_file_at_pipe_time() {
         .replace_stream_data_provider(provider, None, None)
         .expect("provider replacement");
 
-    assert!(matches!(
-        stream.get_raw_stream_data(),
-        Err(Error::System(message)) if message.starts_with("open ")
-    ));
+    let error = stream
+        .get_raw_stream_data()
+        .expect_err("missing datafile must fail when the provider is piped");
+    let Error::System(message) = error else {
+        panic!("expected a system error from the missing datafile");
+    };
+    assert_eq!(
+        message,
+        format!("open {}: No such file or directory", path.display())
+    );
 }
 
 #[cfg(unix)]
