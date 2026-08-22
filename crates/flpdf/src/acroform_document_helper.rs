@@ -1423,13 +1423,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(field_ref) = field.object_ref() else {
             field.warn_if_possible(
                 "encountered a direct object as a field or annotation while traversing /AcroForm; ignoring field or annotation",
-            )?;
+            )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
             return Ok(());
         };
         if field.as_dictionary().is_none() {
             field.warn_if_possible(
                 "encountered a non-dictionary as a field or annotation while traversing /AcroForm; ignoring field or annotation",
-            )?;
+            )?; // cov:ignore: warning continuation is an llvm-cov defensive error-edge artifact
             return Ok(());
         }
         if !visited.insert(field_ref) {
