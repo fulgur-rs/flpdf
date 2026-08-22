@@ -5698,8 +5698,16 @@ fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
             }
         }
         Err(ShowLinearizationError::Malformed { message }) => {
-            logger_error(format!("flpdf: malformed linearization data: {message}\n"))?; // cov:ignore: exercised by malformed linearization subprocess integration test
+            // cov:ignore-start: none of show.rs's public entry points return
+            // this variant any more (see ShowLinearizationError's doc) --
+            // every linearization-data decode failure qpdf's
+            // showLinearizationData would catch is now surfaced as an `Ok`
+            // with an empty dump and one warning, matching qpdf's own single
+            // try/catch around readLinearizationData. Retained as a
+            // defensive arm since the type still has this variant.
+            logger_error(format!("flpdf: malformed linearization data: {message}\n"))?;
             std::process::exit(ExitCode::Errors.as_i32());
+            // cov:ignore-end
         }
         Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
     }
