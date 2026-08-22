@@ -1,10 +1,10 @@
 //! qpdf correspondence: `QPDFPageLabelDocumentHelper.cc` canonical page-label access and reconstruction.
 //!
-//! [`PageLabelDocumentHelper`] reads, reconstructs, renders (ISO 32000-1
-//! §12.4.2), and edits the catalog `/PageLabels` number tree. The qpdf-shaped
-//! read methods retain live [`ObjectHandle`] values for raw `/S`, `/P`, and
-//! `/St` semantics; [`LabelRange`] is the typed compatibility view used by
-//! existing page-operation callers.
+//! [`PageLabelDocumentHelper`] reads, reconstructs, and renders (ISO 32000-1
+//! §12.4.2) the catalog `/PageLabels` number tree. The qpdf-shaped read
+//! methods retain live [`ObjectHandle`] values for raw `/S`, `/P`, and `/St`
+//! semantics; [`LabelRange`] is the typed view used by reconstruction and
+//! display APIs.
 
 use crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH;
 #[cfg(test)]
@@ -778,9 +778,6 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// freshly built flat array — never merging with, or preserving the
     /// shape of, any prior value. Pair with [`Self::labels_for_page_range`] /
     /// [`Self::label_for_page`], which produce the `entries` this expects.
-    /// Contrast with [`Self::write_labels`], which instead rebuilds a
-    /// balanced number tree (the shape used for directly authored ranges).
-    ///
     /// A no-op when the document has no catalog, or the catalog is not a
     /// dictionary.
     ///
@@ -1678,7 +1675,7 @@ mod tests {
     #[test]
     fn helper_tolerates_missing_root() {
         // A trailer without /Root makes root_ref() return None; the helper must
-        // degrade gracefully (no labels, rebuild is a no-op).
+        // degrade gracefully (no labels, reconstruction is a no-op).
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"%PDF-1.7\n");
         let off1 = bytes.len() as u64;
@@ -1716,7 +1713,7 @@ mod tests {
         }
     }
 
-    // ── write_labels ──────────────────────────────────────────────────────
+    // ── reconstructed-label serialization ────────────────────────────────
 
     #[test]
     fn to_reconstructed_dict_always_includes_st() {
@@ -1926,7 +1923,7 @@ mod tests {
     #[test]
     fn write_reconstructed_labels_noop_without_root() {
         // A trailer without /Root must degrade gracefully, matching the same
-        // tolerant style as rebuild()/set_range() elsewhere in this file.
+        // tolerant style as the other reconstruction helper.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"%PDF-1.7\n");
         let off1 = bytes.len() as u64;
