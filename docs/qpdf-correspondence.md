@@ -349,7 +349,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDF_encryption.cc` | 1410 | `security/standard.rs`(1879) + `writer.rs` の encryption context(~700) + `encrypt_setup.rs`(213) + `permissions.rs`(206) + `security/password.rs`(100: `password_bytes_for_read` — qpdf `QPDFJob.cc:1734-1742` と同じく read path では `hex-bytes` だけを decode し、auto/bytes/unicode は raw bytes を渡す。V=5 の 127-byte 切り詰めは Standard handler が担当。qpdf の `possible_repaired_encodings` に相当する入力 password recovery は別の follow-up debt) | 🔀 |
+| `QPDF_encryption.cc` | 1410 | `security/standard.rs`(1879) + `writer.rs` の encryption context(~700) + `encrypt_setup.rs`(213) + `permissions.rs`(206) + `security/password.rs`(380: `password_bytes_for_read` + `password_candidates_for_read` — qpdf `QPDFJob.cc:1734-1790` の read-side hex decode、raw-byte pass-through、alternate encoding retry と suppress gate、`QUtil.cc:1821-1900` の PDFDoc/WinAnsi/MacRoman candidates、V=5 の 127-byte 切り詰めは Standard handler が担当) | 🔀 |
 | `rijndael.cc` / `AES_PDF_native` / `MD5_native` / `SHA2_native` | 1668 | `security/primitives.rs`(106: AES single-block ECB と MD5) + `pipeline/sha2.rs` の `Sha2Digest`(SHA2)（外部 crate）。AES-CBC は `pipeline/aes.rs` の `PlAesPdf` に一本化済みで、`security/primitives.rs` には V=5 R=6 Algorithm 10/13 の single-block ECB だけが残る。qpdf は `SHA2_native` へ `Pl_SHA2` 経由でしか到達しない（`QPDF_encryption.cc:246,296` が唯一の production 利用）ため、RustCrypto の SHA-2 hasher も `Pl_SHA2` 移植の内部に閉じている。`security/primitives.rs` の一括 `sha256`/`sha384`/`sha512` wrapper は consumer cutover で削除済み | ⚪ |
 | `RC4.cc` / `RC4_native.cc` | 63 | `security/rc4.rs`(80)（明示長キー / C-string キー、state 保持、separate / in-place processing） | ✅ |
 | `QPDFCryptoProvider.cc` / `QPDFCrypto_*` | 774 | provider 抽象が無い | ⚪ |

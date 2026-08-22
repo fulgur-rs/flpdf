@@ -6,10 +6,8 @@
 //! password→key derivation (Algorithm 2 / 2.A / 2.B / 6 / 7) is skipped and
 //! the decoded bytes are used directly as the file key.
 //!
-//! `--suppress-password-recovery` (qpdf parity): a documented no-op — flpdf
-//! performs a single authentication attempt with no encoding fallback, so
-//! there is no recovery to suppress. It must parse without error and change
-//! nothing.
+//! `--suppress-password-recovery` (qpdf parity): disables alternate password
+//! encoding retries while leaving the first authentication attempt unchanged.
 //!
 //! End-to-end strategy: recover the hex key from a known password via the
 //! layer-4 `show-encryption-key` subcommand, then reopen the file with that
@@ -304,11 +302,12 @@ fn hex_key_check_weak_rc4_inspectable_exit_0() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance 3: --suppress-password-recovery is accepted and is a no-op
+// Acceptance 3: --suppress-password-recovery is accepted on a successful
+// password path. Its recovery behavior is covered in password_recovery_tests.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn suppress_password_recovery_is_accepted_and_noop() {
+fn suppress_password_recovery_is_accepted_on_successful_password_path() {
     // Baseline: normal password auth.
     let baseline = flpdf()
         .args([
@@ -322,8 +321,8 @@ fn suppress_password_recovery_is_accepted_and_noop() {
         .stdout
         .clone();
 
-    // With --suppress-password-recovery: parses without error, output
-    // unchanged (documented no-op — flpdf has no encoding recovery).
+    // With --suppress-password-recovery: a password that works on the first
+    // attempt remains successful and produces the same inspection output.
     let with_flag = flpdf()
         .args([
             "show-encryption",
@@ -339,7 +338,7 @@ fn suppress_password_recovery_is_accepted_and_noop() {
 
     assert_eq!(
         baseline, with_flag,
-        "--suppress-password-recovery must be a no-op (output unchanged)"
+        "suppressing recovery must not change a first-attempt success"
     );
 }
 
