@@ -43,6 +43,10 @@ fn encrypted_fixtures_rewrite_preserves_encryption_matching_qpdf_objects() {
 
 #[test]
 fn rc4_rewrite_accepts_correct_password_without_write_opt_in() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+
     let input = encrypted_fixture("v2-rc4-128-r3.pdf");
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("rc4-rewrite.pdf");

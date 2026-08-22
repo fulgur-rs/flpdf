@@ -884,7 +884,7 @@ impl<R: Read + Seek> Pdf<R> {
             let (encrypt_metadata, weak_crypto) = if matches!(revision, 5 | 6) {
                 let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
                 // Same weak-crypto classification as layer-2's R5/R6 branch.
-                (encrypt_metadata, revision == 5)
+                (encrypt_metadata, revision == 5 || rc4_in_use())
             } else {
                 let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
                 (inputs.encrypt_metadata, rc4_in_use())
@@ -912,7 +912,7 @@ impl<R: Read + Seek> Pdf<R> {
             let inputs =
                 standard_handler_r5_inputs(&encrypt).map_err(map_uo_length_to_bad_password)?;
             let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
-            let weak_crypto = revision == 5;
+            let weak_crypto = revision == 5 || rc4_in_use();
             let user_attempt = if revision == 5 {
                 check_user_password_r5(&password, &inputs)
             } else {

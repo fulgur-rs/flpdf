@@ -1024,6 +1024,13 @@ fn r5_and_r6_accept_an_rc4_crypt_filter_method() {
         assert_eq!(info.string_method, "none", "R={revision}");
         // No `/EFF`, so qpdf mirrors the stream method into the file method.
         assert_eq!(info.eff_method, "RC4", "R={revision}");
+        // An R=6 document actively using an RC4 crypt filter is weak crypto
+        // too, not just R=5: `uses_weak_crypto()` must look at the effective
+        // crypt-filter methods, not only the revision number.
+        assert!(
+            pdf.uses_weak_crypto(),
+            "R={revision} with an RC4 crypt filter must report weak crypto"
+        );
     }
 }
 

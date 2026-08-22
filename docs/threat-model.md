@@ -133,12 +133,14 @@ are not treated as vulnerabilities on their own:
   feature, not a bypass.
 - **Strength of legacy PDF cryptography.** Reading RC4- and MD5-based
   encryption (V=1/2/4, R=2/3/4) is required for compatibility and is not a
-  vulnerability. *Creating* RC4-weak output, and creating deprecated R=5
-  (AES-256) output, is gated behind an explicit `--allow-weak-crypto`
-  opt-in. Existing weakly encrypted inputs remain readable on every open path,
-  matching qpdf's write-only weak-crypto policy. AES-CBC without
-  integrity protection, MD5 in key derivation, etc. are properties of the PDF
-  standard security handler, not of flpdf.
+  vulnerability. *Selecting* RC4-weak encryption parameters via `--encrypt`,
+  and selecting deprecated R=5 (AES-256) parameters, is gated behind an
+  explicit `--allow-weak-crypto` opt-in; a rewrite that preserves an input's
+  existing weak encryption is not a new selection and is not gated, matching
+  qpdf's write-only weak-crypto policy. Existing weakly encrypted inputs
+  remain readable on every open path. AES-CBC without integrity protection,
+  MD5 in key derivation, etc. are properties of the PDF standard security
+  handler, not of flpdf.
 - **Bugs inside dependencies** (`flate2`, RustCrypto crates, …) that flpdf
   does not reach or amplify with attacker-controlled input. These should be
   reported upstream; flpdf's responsibility is to update promptly. A
@@ -158,7 +160,7 @@ Inventory of the mechanisms that uphold §2, as of the last review:
 | Cycle detection (visited sets) on iterative chain following: xref `/Prev` chains, outline `/Next` chains, field `/Parent` chains (an iterative `while`-loop with a visited set — terminating; the missing depth cap is hardening only, `flpdf-hn1g.3`) | `xref.rs` (`merge_previous_xref_sections`), `outline_document_helper.rs` (`build_item`), `annotation_helper.rs`, `signatures.rs`, `json_inspect.rs` |
 | Checked arithmetic and non-negative validation on parser-derived sizes (`/Length` bounds, PNG-predictor row math, LZW table size cap of 4096 entries) | `parser.rs`, `filters.rs` |
 | Reference resolution that cannot loop (cache-based; unresolvable references resolve to null) | `reader.rs` (`resolve`, `resolve_borrowed`) |
-| Weak-crypto write gate: RC4 output and deprecated R=5 (AES-256) output both require the explicit `--allow-weak-crypto` opt-in | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the write; encrypted inputs remain readable, matching qpdf's write-only weak-crypto policy |
+| Weak-crypto write gate: selecting new RC4 or deprecated R=5 (AES-256) encryption parameters via `--encrypt` requires the explicit `--allow-weak-crypto` opt-in (a preserve-only rewrite of an already weakly encrypted input is not gated) | `parse_encrypt_segment`'s `guard_weak` (`main.rs`) refuses the new selection; encrypted inputs remain readable, matching qpdf's write-only weak-crypto policy |
 | OS CSPRNG for AES IVs and key material | `getrandom` in `security/` |
 | Signed-PDF qpdf-compatible handling (full rewrite proceeds, leaving signatures present-but-invalid like qpdf; signatures are stripped only via the explicit `--remove-restrictions` opt-in, never silently). A preserve-by-default *refusal* is a deferred post-v1.0 improvement (`flpdf-hn1g.14`). | [signed-pdf.md](signed-pdf.md), `signatures.rs` |
 | Traversal boundaries on page closures: stop at other `Page`/`Catalog` dicts and skip `/Kids` on `/Pages` nodes; `/Parent` is intentionally followed upward for inherited resources, bounded by the `Page`/`Catalog` stop; no brute-force scans of all live objects | `page_closure.rs`, [.claude/rules/pdf-rust-review-patterns.md](../.claude/rules/pdf-rust-review-patterns.md) |
