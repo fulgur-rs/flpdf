@@ -1627,7 +1627,8 @@ fn main() {
     // before clap parses: clap's derive would flatten repeated occurrences and
     // lose the per-group boundaries that qpdf's job configuration preserves.
     // The residual argv retains one dispatch marker for each operation.
-    let rewritten_args = rewrite_qpdf_single_dash(std::env::args().collect());
+    let rewritten_args =
+        normalize_qpdf_bare_equals(rewrite_qpdf_single_dash(std::env::args().collect()));
     let (residual_args, overlay_specs) = match extract_overlay_groups(rewritten_args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -3828,6 +3829,119 @@ fn qpdf_bare_segment_flag(arg: &str) -> Option<&'static str> {
         Some("copy-attachments-from") => Some("--copy-attachments-from"),
         _ => None,
     }
+}
+
+/// qpdf 11.9.0 registers these options with `addBare` in
+/// `libqpdf/qpdf/auto_job_init.hh:40-91`. Keep value-bearing options out of
+/// this list: qpdf's parser preserves their equals value for the parameter
+/// handler, while a bare handler ignores it.
+const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
+    "add-attachment",
+    "allow-weak-crypto",
+    "check",
+    "check-linearization",
+    "coalesce-contents",
+    "copy-attachments-from",
+    "decrypt",
+    "deterministic-id",
+    "filtered-stream-data",
+    "flatten-rotation",
+    "generate-appearances",
+    "ignore-xref-streams",
+    "is-encrypted",
+    "json-input",
+    "keep-inline-images",
+    "linearize",
+    "list-attachments",
+    "newline-before-endstream",
+    "no-original-object-ids",
+    "no-warn",
+    "optimize-images",
+    "overlay",
+    "pages",
+    "password-is-hex-key",
+    "preserve-unreferenced",
+    "preserve-unreferenced-resources",
+    "progress",
+    "qdf",
+    "raw-stream-data",
+    "recompress-flate",
+    "remove-page-labels",
+    "remove-restrictions",
+    "replace-input",
+    "report-memory-usage",
+    "requires-password",
+    "set-page-labels",
+    "show-linearization",
+    "show-npages",
+    "show-pages",
+    "static-aes-iv",
+    "static-id",
+    "suppress-password-recovery",
+    "suppress-recovery",
+    "test-json-schema",
+    "underlay",
+    "verbose",
+    "warning-exit-0",
+    "empty",
+    "with-images",
+];
+
+fn collect_qpdf_bare_long_options(command: &clap::Command, names: &mut HashSet<String>) {
+    for arg in command.get_arguments() {
+        let Some(long) = arg.get_long() else {
+            continue;
+        };
+        if matches!(arg.get_action(), clap::ArgAction::SetTrue)
+            && QPDF_BARE_LONG_OPTIONS.contains(&long)
+        {
+            names.insert(long.to_owned());
+        }
+    }
+    for subcommand in command.get_subcommands() {
+        collect_qpdf_bare_long_options(subcommand, names);
+    }
+}
+
+/// Discard `=value` attached to qpdf bare flags before clap parses argv.
+///
+/// This follows `QPDFArgParser::parseArgs`: a value-terminated qpdf segment
+/// owns every token up to its `--` terminator, so normalization is suspended
+/// inside those segments. The top-level `--` also ends option processing, as it
+/// does for qpdf and clap.
+fn normalize_qpdf_bare_equals(args: Vec<String>) -> Vec<String> {
+    let mut bare_options = HashSet::new();
+    collect_qpdf_bare_long_options(&Cli::command(), &mut bare_options);
+
+    let mut out = Vec::with_capacity(args.len());
+    let mut active_segment = None;
+    let mut passthrough = false;
+    for mut arg in args {
+        if passthrough {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            out.push(arg);
+            if active_segment.take().is_none() {
+                passthrough = true;
+            }
+            continue;
+        }
+        if active_segment.is_some() {
+            out.push(arg);
+            continue;
+        }
+
+        if let Some(name) = long_option_name(&arg).map(str::to_owned) {
+            if bare_options.contains(name.as_str()) && arg.contains('=') {
+                arg = format!("--{name}");
+            }
+            active_segment = QpdfArgSegment::from_option_name(&name);
+        }
+        out.push(arg);
+    }
+    out
 }
 
 /// Rewrite recognized qpdf-style single-dash long options into double-dash form.
@@ -7366,6 +7480,75 @@ mod tests {
     fn single_dash_long_with_equals_becomes_double_dash() {
         let out = rewrite_qpdf_single_dash(strs(&["flpdf", "-object-streams=generate"]));
         assert_eq!(out, strs(&["flpdf", "--object-streams=generate"]));
+    }
+
+    #[test]
+    fn single_dash_bare_equals_value_is_discarded_after_rewriting() {
+        let out =
+            normalize_qpdf_bare_equals(rewrite_qpdf_single_dash(strs(&["flpdf", "-qdf=ignored"])));
+        assert_eq!(out, strs(&["flpdf", "--qdf"]));
+    }
+
+    #[test]
+    fn qpdf_bare_boolean_equals_values_are_discarded() {
+        let out = normalize_qpdf_bare_equals(strs(&[
+            "flpdf",
+            "--check=ignored",
+            "--qdf=ignored",
+            "--static-id=ignored",
+            "--verbose=ignored",
+            "--preserve-unreferenced=ignored",
+        ]));
+        assert_eq!(
+            out,
+            strs(&[
+                "flpdf",
+                "--check",
+                "--qdf",
+                "--static-id",
+                "--verbose",
+                "--preserve-unreferenced",
+            ])
+        );
+    }
+
+    #[test]
+    fn qpdf_bare_normalization_preserves_value_options() {
+        let args = strs(&[
+            "flpdf",
+            "--json=2",
+            "--object-streams=generate",
+            "--normalize-content=y",
+            "--newline-before-endstream=never",
+        ]);
+        assert_eq!(normalize_qpdf_bare_equals(args.clone()), args);
+    }
+
+    #[test]
+    fn qpdf_bare_normalization_preserves_value_terminated_segments() {
+        let args = strs(&[
+            "flpdf",
+            "--encrypt",
+            "user",
+            "owner",
+            "256",
+            "--qdf=an-encrypt-suboption-value",
+            "--",
+            "--check=after-segment",
+        ]);
+        assert_eq!(
+            normalize_qpdf_bare_equals(args),
+            strs(&[
+                "flpdf",
+                "--encrypt",
+                "user",
+                "owner",
+                "256",
+                "--qdf=an-encrypt-suboption-value",
+                "--",
+                "--check",
+            ])
+        );
     }
 
     #[test]

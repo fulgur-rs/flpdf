@@ -38,6 +38,15 @@ fn check_valid_fixture_exits_successfully() {
 }
 
 #[test]
+fn check_accepts_qpdf_bare_flag_with_discarded_equals_value() {
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check=ignored", "../../tests/fixtures/minimal.pdf"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("File is not encrypted\n"));
+}
+
+#[test]
 fn check_encrypted_fixture_accepts_correct_empty_password_flag() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
