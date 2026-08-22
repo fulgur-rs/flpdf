@@ -135,10 +135,8 @@ pub(crate) struct PendingHandleFileObject {
 
 #[derive(Debug)]
 pub(crate) struct HandleFileObjectRead {
-    #[allow(dead_code)]
     pub(crate) object_ref: ObjectRef,
     pub(crate) object: ObjectHandle,
-    #[allow(dead_code)]
     pub(crate) diagnostics: Vec<FileObjectDiagnostic>,
     pub(crate) included_recovery_eol: Option<IncludedStreamDataEol>,
 }
