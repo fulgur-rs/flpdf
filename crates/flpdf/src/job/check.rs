@@ -7,7 +7,7 @@
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::linearization::{
-    check_linearization, check_linearization_parameters, LinearizationCheckError,
+    check_linearization_parameters, check_linearization_warnings, LinearizationCheckError,
     LinearizationParameterCheck,
 };
 use crate::pipeline::Discard;
@@ -177,25 +177,35 @@ fn check_document<R: Read + Seek + 'static>(
         if !source_bytes.is_empty() {
             match check_linearization_parameters(pdf) {
                 Ok(LinearizationParameterCheck::Clean) => {
-                    match check_linearization(pdf, &source_bytes) {
-                        Ok(()) | Err(LinearizationCheckError::NotLinearized) => {}
-                        Err(error) => {
-                            warnings = true;
-                            let message = format!(
-                                "error encountered while checking linearization data: {error}"
-                            );
-                            emit_warning(logger, input_name, message)?;
-                        }
-                    }
+                    warnings |= emit_linearization_check_warnings(
+                        pdf,
+                        &source_bytes,
+                        logger,
+                        input_name,
+                        false,
+                    )?; // cov:ignore: shared logger failure propagation is covered by logger sink tests
                 }
                 Ok(LinearizationParameterCheck::Warning(message)) => {
                     warnings = true;
                     emit_warning(logger, input_name, message)?;
+                    warnings |= emit_linearization_check_warnings(
+                        pdf,
+                        &source_bytes,
+                        logger,
+                        input_name,
+                        true,
+                    )?; // cov:ignore: shared logger failure propagation is covered by logger sink tests
                 }
                 Ok(LinearizationParameterCheck::Error(message)) => {
                     warnings = true;
-                    let message =
-                        format!("error encountered while checking linearization data: {message}");
+                    let message = format!(
+                        "error encountered while checking linearization data: {}",
+                        linearization_parameter_error_message(
+                            input_name,
+                            message,
+                            linearization_parameter_offset(pdf, message)?
+                        )
+                    );
                     emit_warning(logger, input_name, message)?;
                 }
                 Err(error) => {
@@ -268,6 +278,73 @@ fn check_document<R: Read + Seek + 'static>(
     }
 
     Ok(CheckOutcome { warnings })
+}
+
+fn linearization_parameter_error_message(input_name: &str, message: &str, offset: u64) -> String {
+    for object in ["linearization dictionary", "linearization hint table"] {
+        let prefix = format!("{object}: ");
+        if let Some(detail) = message.strip_prefix(&prefix) {
+            return format!("{input_name} ({object}, offset {offset}): {detail}");
+        }
+    }
+    format!("linearization check failed: {message}")
+}
+
+fn linearization_parameter_offset<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    message: &str,
+) -> Result<u64> {
+    if message.starts_with("linearization dictionary: ") {
+        if let Some(candidate) = pdf.linearization_candidate_ref()? {
+            let parsed_offset = pdf.get_object_handle(candidate).get_parsed_offset();
+            // cov:ignore-start: parser-created linearization candidates always
+            // carry a non-negative parsed dictionary offset; this fallback is
+            // defensive for synthetic handles.
+            if parsed_offset >= 0 {
+                return Ok(parsed_offset as u64);
+            }
+            // cov:ignore-end
+        } // cov:ignore: candidate is guaranteed for a linearization parameter error
+    }
+    Ok(pdf.source_last_offset())
+}
+
+fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    source_bytes: &[u8],
+    logger: &QPDFLogger,
+    input_name: &str,
+    skip_first_page_warning: bool,
+) -> Result<bool> {
+    match check_linearization_warnings(pdf, source_bytes, skip_first_page_warning) {
+        Ok(messages) => {
+            let has_warnings = !messages.is_empty();
+            for message in messages {
+                emit_warning(logger, input_name, message)?;
+            }
+            Ok(has_warnings)
+        }
+        Err(LinearizationCheckError::NotLinearized) => Ok(false), // cov:ignore: check_document accepts only a linearized candidate before this helper
+        Err(LinearizationCheckError::InvalidParam { message }) => {
+            let message = format!(
+                "error encountered while checking linearization data: {}",
+                linearization_parameter_error_message(
+                    input_name,
+                    &message,
+                    linearization_parameter_offset(pdf, &message)?
+                )
+            );
+            emit_warning(logger, input_name, message)?;
+            Ok(true)
+        }
+        // cov:ignore-start: I/O and resolver failures are reported by the outer
+        // open/preflight boundaries; this is a defensive propagation arm.
+        Err(error) => {
+            let message = format!("error encountered while checking linearization data: {error}");
+            emit_warning(logger, input_name, message)?;
+            Ok(true)
+        } // cov:ignore-end
+    }
 }
 
 fn map_page_tree_error(
@@ -770,12 +847,71 @@ mod tests {
     }
 
     #[test]
+    fn document_check_continues_after_o_warning_and_reports_t_warning() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let logger = logger_with_capture(Arc::clone(&output));
+        let mut pdf = Pdf::open(Cursor::new(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/compat/linearized-one-page.pdf"
+            ))
+            .to_vec(),
+        ))
+        .expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/O", ObjectHandle::integer(7))
+            .expect("candidate should be mutable");
+        candidate_handle
+            .replace_key(b"/T", ObjectHandle::integer(1522))
+            .expect("candidate should be mutable");
+
+        let outcome = check_document(&mut pdf, &logger, "qpdf", "linearized.pdf")
+            .expect("linearization mismatches are warnings");
+        assert!(outcome.warnings);
+        let output = String::from_utf8(output.lock().expect("capture output").clone()).unwrap();
+        assert!(output.contains("WARNING: linearized.pdf: first page object (/O) mismatch\n"));
+        assert!(
+            output.contains("WARNING: linearized.pdf: space before first xref item (/T) mismatch"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn document_check_reports_qpdf_offset_for_n_mismatch() {
+        let output = check_linearized_candidate_warning(b"/N", ObjectHandle::integer(2));
+
+        assert!(output.contains(
+            "WARNING: linearized.pdf: error encountered while checking linearization data: "
+        ));
+        assert!(output.contains(
+            "linearized.pdf (linearization hint table, offset 908): /N does not match number of pages"
+        ), "{output}");
+    }
+
+    #[test]
+    fn document_check_reports_qpdf_offset_for_linearization_dictionary_type() {
+        let output = check_linearized_candidate_warning(b"/P", ObjectHandle::name(b"Bad".to_vec()));
+
+        assert!(output.contains(
+            "linearized.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type"
+        ), "{output}");
+    }
+
+    #[test]
     fn document_check_uses_qpdf_page_count_warning() {
         let output = check_linearized_candidate_warning(b"/N", ObjectHandle::integer(2));
 
         assert!(output.contains(
             "WARNING: linearized.pdf: error encountered while checking linearization data: \
-             linearization hint table: /N does not match number of pages\n"
+             linearized.pdf (linearization hint table, offset 908): /N does not match number of pages\n"
         ));
         assert!(!output.contains("linearization check failed:"));
     }
@@ -786,7 +922,7 @@ mod tests {
 
         assert!(output.contains(
             "WARNING: linearized.pdf: error encountered while checking linearization data: \
-             linearization dictionary: some keys in linearization dictionary are of the wrong type\n"
+             linearized.pdf (linearization dictionary, offset 23): some keys in linearization dictionary are of the wrong type\n"
         ));
         assert!(!output.contains("/P is present but is neither an integer nor null"));
     }

@@ -430,7 +430,30 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
 /// this way is not guaranteed to produce identical bytes to an unchecked
 /// `pdf` on a subsequent write, matching qpdf's own behavior.
 pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) -> CheckResult {
+    check_linearization_inner(pdf, file_bytes, false, false).map(|_| ())
+}
+
+/// Run the linearization checks while retaining qpdf's soft warning messages.
+///
+/// `skip_first_page_warning` is used after the parameter preflight has already
+/// emitted qpdf's `/O` warning. The referenced object is still validated by
+/// the shared checker; only the duplicate soft comparison is skipped.
+pub(crate) fn check_linearization_warnings<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    file_bytes: &[u8],
+    skip_first_page_warning: bool,
+) -> std::result::Result<Vec<String>, LinearizationCheckError> {
+    check_linearization_inner(pdf, file_bytes, true, skip_first_page_warning)
+}
+
+fn check_linearization_inner<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    file_bytes: &[u8],
+    collect_soft_warnings: bool,
+    skip_first_page_warning: bool,
+) -> std::result::Result<Vec<String>, LinearizationCheckError> {
     let file_len = file_bytes.len() as u64;
+    let mut warnings = Vec::new();
 
     // -----------------------------------------------------------------------
     // 1. Reuse qpdf's isLinearized candidate boundary. It scans only the
@@ -477,81 +500,93 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     let o_obj = first_obj
         .try_get_key(b"/O")
         .map_err(LinearizationCheckError::from)?;
-    let o_num = as_u64(&o_obj, "O")?;
-    // PDF object numbers are u32; an /O value beyond u32::MAX cannot refer to
-    // a real object — silently casting with `as u32` would wrap and look up
-    // the wrong slot, so reject up front.
-    let o_num_u32 = u32::try_from(o_num).map_err(|_| LinearizationCheckError::InvalidParam {
-        message: format!("/O ({o_num}) does not fit in u32 — invalid object number"),
-    })?;
-    let o_ref = ObjectRef::new(o_num_u32, 0);
-    let o_object = pdf.get_object_handle(o_ref);
-    let is_null = o_object
-        .try_is_null()
-        .map_err(LinearizationCheckError::from)?;
-    let Some(_) = o_object
-        .try_as_dictionary()
-        .map_err(LinearizationCheckError::from)?
-    else {
-        if is_null {
-            fail!("/O ({o_num}) refers to a non-existent object");
-        }
-        fail!("/O ({o_num}) does not refer to a dictionary");
-    };
+    // qpdf's readLinearizationData only requires `/O` to be an integer. When
+    // the parameter preflight already reported the soft `/O` mismatch, skip
+    // the stricter object-shape validation too: qpdf continues into
+    // checkLinearizationInternal without dereferencing the mismatching object.
+    // `as_u64` itself must stay inside this guard: it rejects a negative `/O`
+    // as a hard error, but qpdf's preflight has already turned a negative
+    // `/O` into the soft "first page object (/O) mismatch" warning by the
+    // time `skip_first_page_warning` is set, so re-validating it here would
+    // reject a file qpdf only warns about.
+    if !skip_first_page_warning {
+        let o_num = as_u64(&o_obj, "O")?;
+        // PDF object numbers are u32; an /O value beyond u32::MAX cannot refer
+        // to a real object — silently casting with `as u32` would wrap and
+        // look up the wrong slot, so reject up front.
+        let o_num_u32 =
+            u32::try_from(o_num).map_err(|_| LinearizationCheckError::InvalidParam {
+                message: format!("/O ({o_num}) does not fit in u32 — invalid object number"),
+            })?;
+        let o_ref = ObjectRef::new(o_num_u32, 0);
+        let o_object = pdf.get_object_handle(o_ref);
+        let is_null = o_object
+            .try_is_null()
+            .map_err(LinearizationCheckError::from)?;
+        let Some(_) = o_object
+            .try_as_dictionary()
+            .map_err(LinearizationCheckError::from)?
+        else {
+            if is_null {
+                fail!("/O ({o_num}) refers to a non-existent object");
+            }
+            fail!("/O ({o_num}) does not refer to a dictionary");
+        };
 
-    let type_obj = o_object
-        .try_get_key(b"/Type")
-        .map_err(LinearizationCheckError::from)?;
-    type_obj
-        .try_dereference()
-        .map_err(LinearizationCheckError::from)?;
-    if let Some(type_name) = type_obj.as_name() {
-        if type_name != b"Page" {
-            fail!(
-                "/O ({o_num}) points to an object with /Type /{} instead of /Page",
-                String::from_utf8_lossy(&type_name)
-            );
-        }
-    } else if type_obj
-        .try_is_null()
-        .map_err(LinearizationCheckError::from)?
-    {
-        let parent = o_object
-            .try_get_key(b"/Parent")
+        let type_obj = o_object
+            .try_get_key(b"/Type")
             .map_err(LinearizationCheckError::from)?;
-        let media_box = o_object
-            .try_get_key(b"/MediaBox")
+        type_obj
+            .try_dereference()
             .map_err(LinearizationCheckError::from)?;
-        if parent
+        if let Some(type_name) = type_obj.as_name() {
+            if type_name != b"Page" {
+                fail!(
+                    "/O ({o_num}) points to an object with /Type /{} instead of /Page",
+                    String::from_utf8_lossy(&type_name)
+                );
+            }
+        } else if type_obj
             .try_is_null()
             .map_err(LinearizationCheckError::from)?
-            && media_box
+        {
+            let parent = o_object
+                .try_get_key(b"/Parent")
+                .map_err(LinearizationCheckError::from)?;
+            let media_box = o_object
+                .try_get_key(b"/MediaBox")
+                .map_err(LinearizationCheckError::from)?;
+            if parent
                 .try_is_null()
                 .map_err(LinearizationCheckError::from)?
-        {
-            // Without /Type, require at least one of the structural keys every
-            // Page object must inherit or define.
-            fail!(
-                "/O ({o_num}) points to a dictionary with no /Type, /Parent or /MediaBox \
-                 — does not look like a Page object"
-            );
-        } // cov:ignore: qpdf's malformed no-Type failure returns before this brace
-    } // cov:ignore: llvm maps this completed conditional cleanup to an unhit brace
+                && media_box
+                    .try_is_null()
+                    .map_err(LinearizationCheckError::from)?
+            {
+                // Without /Type, require at least one of the structural keys every
+                // Page object must inherit or define.
+                fail!(
+                    "/O ({o_num}) points to a dictionary with no /Type, /Parent or /MediaBox \
+                     — does not look like a Page object"
+                );
+            } // cov:ignore: qpdf's malformed no-Type failure returns before this brace
+        } // cov:ignore: llvm maps this completed conditional cleanup to an unhit brace
 
-    // qpdf records this as a linearization warning in
-    // `checkLinearizationInternal` (`QPDF_linearization.cc:419-427`).  The
-    // flpdf checker has a boolean-equivalent error result rather than qpdf's
-    // warning accumulator, so surface the same failed-check condition after
-    // validating the referenced object itself.  Keeping the object validation
-    // first preserves the useful malformed-object diagnostics for a bad /O.
-    let Some(first_page_ref) = pages.first().copied() else {
-        fail!("/O ({o_num}) cannot be checked because the document has no pages");
-    };
-    if first_page_ref.number as u64 != o_num {
-        fail!(
-            "/O ({o_num}) does not match the first page object ({})",
-            first_page_ref.number
-        );
+        // qpdf records this as a linearization warning in
+        // `checkLinearizationInternal` (`QPDF_linearization.cc:419-427`).
+        let Some(first_page_ref) = pages.first().copied() else {
+            fail!("/O ({o_num}) cannot be checked because the document has no pages");
+        };
+        if first_page_ref.number as u64 != o_num {
+            if collect_soft_warnings {
+                warnings.push("first page object (/O) mismatch".to_owned());
+            } else {
+                fail!(
+                    "/O ({o_num}) does not match the first page object ({})",
+                    first_page_ref.number
+                );
+            }
+        }
     }
 
     // qpdf accepts an omitted or null `/P`, and accepts any integer (including
@@ -635,32 +670,7 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     }
 
     // -----------------------------------------------------------------------
-    // 5. /E must match the source extent envelope of qpdf's part 6, not merely
-    //    be smaller than EOF.
-    // -----------------------------------------------------------------------
-    let e_obj = first_obj
-        .try_get_key(b"/E")
-        .map_err(LinearizationCheckError::from)?;
-    let e_val = as_u64(&e_obj, "E")?;
-    if e_val >= file_len {
-        fail!("/E ({e_val}) must be less than file length ({file_len})");
-    }
-    let (min_e, max_e) = first_page_source_extent(pdf).map_err(LinearizationCheckError::from)?;
-    // qpdf leaves the envelope at (-1, -1) when part-6 objects have no source
-    // extents (`QPDF_linearization.cc:507-521`). In that case its `/E` check
-    // emits a warning rather than turning the missing metadata into a fatal
-    // parse error; this checker has no logger at this boundary, so it skips
-    // only the extent-range comparison and retains all structural checks.
-    if min_e >= 0 && max_e >= 0 {
-        let min_e = min_e as u64;
-        let max_e = max_e as u64;
-        if e_val < min_e || e_val > max_e {
-            fail!("/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 6. /T must be within the last cross-reference *section*.
+    // 5. /T must be within the last cross-reference *section*.
     //
     // Different PDF producers use slightly different /T conventions:
     // - ISO 32000-1 Annex F: /T = byte offset of the xref keyword itself
@@ -674,6 +684,11 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     //
     // We accept either form: a classic `xref` keyword reachable by a short
     // backscan, OR an XRef stream object header at the /T target.
+    //
+    // qpdf checks /T before /E (`QPDF_linearization.cc:452-470` runs before
+    // the `/E` check at `:496-524`); this checker follows the same order so
+    // that a file with both a /T and an /E mismatch reports them in qpdf's
+    // order.
     // -----------------------------------------------------------------------
     let t_obj = first_obj
         .try_get_key(b"/T")
@@ -692,6 +707,23 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
     {
         fail!("/T ({t_val}) is too close to end of file to contain xref keyword");
     }
+    // qpdf-deviation-start: no structural search below has a qpdf counterpart.
+    // qpdf's own /T check (`QPDF_linearization.cc:452-470`) only seeks to the
+    // already-known `p.xref_zero_offset`, skips PDF whitespace, and compares
+    // the resulting position against `first_xref_item_offset` -- a value
+    // established during xref parsing (`QPDF.cc:845-869`), long before this
+    // function runs. It never searches for the `xref` keyword, never parses a
+    // subsection header, and never throws from this check. This checker has
+    // no equivalent "offset of the first xref entry, established during xref
+    // parsing" value threaded through to here, so it re-derives an
+    // equivalent position with a local backscan instead; a backscan failure
+    // (no `xref` keyword found, a malformed subsection header, or a /T target
+    // that is not a `/Type /XRef` stream header) is therefore an flpdf-only
+    // failure mode with no qpdf counterpart, and reports as a hard
+    // `InvalidParam` error rather than a soft warning even when
+    // `collect_soft_warnings` is set. Tracked in flpdf-4g14.2 for threading a
+    // real `first_xref_item_offset` through from xref parsing, which would
+    // let this become a pure position compare with no local failure mode.
     // Allow /T to fall anywhere inside the cross-reference section header.
     // The window covers both ISO convention (/T = xref keyword) and
     // qpdf convention (/T = first_entry_pos - 1, ~= xref + header_len - 1).
@@ -723,7 +755,52 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
             None
         }
     });
-    let Some(xref_pos) = xref_pos else {
+    if let Some(xref_pos) = xref_pos {
+        // Tighten: /T must lie inside the xref subsection header itself
+        // (`xref\n<start> <count>\n`), i.e. in `[xref_pos, first_entry_pos)`.
+        // Without this, a /T that lands in the middle of the first xref entry
+        // (or further into the table) would silently pass.
+        let first_entry_pos =
+            parse_xref_first_entry_pos(file_bytes, xref_pos).ok_or_else(|| {
+                LinearizationCheckError::InvalidParam {
+                    message: format!(
+                        "/T ({t_val}) backscan found `xref` at byte {xref_pos}, but the \
+                         subsection header (`<start> <count>\\n`) is malformed or truncated"
+                    ),
+                }
+            })?;
+        if t_usize < xref_pos || t_usize >= first_entry_pos {
+            fail!(
+                "/T ({t_val}) is outside the xref subsection header range \
+                 [{xref_pos}, {first_entry_pos}) — must point at the `xref` keyword \
+                 or inside its subsection header line, not into the entries"
+            );
+        }
+
+        // qpdf seeks to /T and consumes only PDF whitespace before comparing the
+        // resulting position with its exact `first_xref_item_offset`
+        // (`QPDF_linearization.cc:452-470`, populated by `QPDF.cc:845-869`).  A
+        // backscan that merely finds an earlier `xref` keyword would accept a
+        // header position qpdf rejects, so reproduce that cursor movement here.
+        let mut first_entry_cursor = t_usize;
+        while first_entry_cursor < first_entry_pos
+            && is_pdf_whitespace(file_bytes[first_entry_cursor])
+        {
+            first_entry_cursor += 1;
+        }
+        if first_entry_cursor != first_entry_pos {
+            if collect_soft_warnings {
+                warnings.push(format!(
+                    "space before first xref item (/T) mismatch (computed = {first_entry_pos}; file = {first_entry_cursor}"
+                ));
+            } else {
+                fail!(
+                    "/T ({t_val}) does not point at the whitespace immediately before the \
+                     first xref item ({first_entry_pos})"
+                );
+            }
+        }
+    } else {
         // No classic `xref` keyword: this is a cross-reference *stream* file
         // (ObjStm-bearing / split-xref linearized output).  /T must point at
         // an indirect object header whose object is a `/Type /XRef` stream.
@@ -765,47 +842,43 @@ pub fn check_linearization<R: Read + Seek>(pdf: &mut Pdf<R>, file_bytes: &[u8]) 
                  `/Type /XRef` cross-reference stream"
             );
         }
-        return Ok(());
-    };
+    }
+    // qpdf-deviation-end
 
-    // Tighten: /T must lie inside the xref subsection header itself
-    // (`xref\n<start> <count>\n`), i.e. in `[xref_pos, first_entry_pos)`.
-    // Without this, a /T that lands in the middle of the first xref entry
-    // (or further into the table) would silently pass.
-    let first_entry_pos = parse_xref_first_entry_pos(file_bytes, xref_pos).ok_or_else(|| {
-        LinearizationCheckError::InvalidParam {
-            message: format!(
-                "/T ({t_val}) backscan found `xref` at byte {xref_pos}, but the \
-                 subsection header (`<start> <count>\\n`) is malformed or truncated"
-            ),
+    // -----------------------------------------------------------------------
+    // 6. /E must match the source extent envelope of qpdf's part 6, not merely
+    //    be smaller than EOF.
+    // -----------------------------------------------------------------------
+    let e_obj = first_obj
+        .try_get_key(b"/E")
+        .map_err(LinearizationCheckError::from)?;
+    let e_val = as_u64(&e_obj, "E")?;
+    if e_val >= file_len {
+        fail!("/E ({e_val}) must be less than file length ({file_len})");
+    }
+    let (min_e, max_e) = first_page_source_extent(pdf).map_err(LinearizationCheckError::from)?;
+    // qpdf leaves the envelope at (-1, -1) when part-6 objects have no source
+    // extents (`QPDF_linearization.cc:507-521`). In that case its `/E` check
+    // emits a warning rather than turning the missing metadata into a fatal
+    // parse error; this checker has no logger at this boundary, so it skips
+    // only the extent-range comparison and retains all structural checks.
+    if min_e >= 0 && max_e >= 0 {
+        let min_e = min_e as u64;
+        let max_e = max_e as u64;
+        if e_val < min_e || e_val > max_e {
+            if collect_soft_warnings {
+                warnings.push(format!(
+                    "end of first page section (/E) mismatch: /E = {e_val}; computed = {min_e}..{max_e}"
+                ));
+            } else {
+                fail!(
+                    "/E ({e_val}) does not match the part-6 source extent range ({min_e}..{max_e})"
+                );
+            }
         }
-    })?;
-    if t_usize < xref_pos || t_usize >= first_entry_pos {
-        fail!(
-            "/T ({t_val}) is outside the xref subsection header range \
-             [{xref_pos}, {first_entry_pos}) — must point at the `xref` keyword \
-             or inside its subsection header line, not into the entries"
-        );
     }
 
-    // qpdf seeks to /T and consumes only PDF whitespace before comparing the
-    // resulting position with its exact `first_xref_item_offset`
-    // (`QPDF_linearization.cc:452-470`, populated by `QPDF.cc:845-869`).  A
-    // backscan that merely finds an earlier `xref` keyword would accept a
-    // header position qpdf rejects, so reproduce that cursor movement here.
-    let mut first_entry_cursor = t_usize;
-    while first_entry_cursor < first_entry_pos && is_pdf_whitespace(file_bytes[first_entry_cursor])
-    {
-        first_entry_cursor += 1;
-    }
-    if first_entry_cursor != first_entry_pos {
-        fail!(
-            "/T ({t_val}) does not point at the whitespace immediately before the \
-             first xref item ({first_entry_pos})"
-        );
-    }
-
-    Ok(())
+    Ok(warnings)
 }
 
 /// Given the byte position of an `xref` keyword in `file_bytes`, parse the
@@ -1753,6 +1826,158 @@ mod tests {
     }
 
     #[test]
+    fn warning_check_accumulates_a_valid_nonfirst_page_object_mismatch() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/references/two-page/linearize.pdf"
+        ))
+        .to_vec();
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("two-page fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/O", ObjectHandle::integer(1))
+            .expect("candidate should be mutable");
+
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect("soft mismatch should not abort the warning route");
+        assert!(warnings
+            .iter()
+            .any(|message| message == "first page object (/O) mismatch"));
+    }
+
+    #[test]
+    fn warning_check_accumulates_an_e_mismatch() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))
+        .to_vec();
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/E", ObjectHandle::integer(0))
+            .expect("candidate should be mutable");
+
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect("soft mismatch should not abort the warning route");
+        assert!(warnings
+            .iter()
+            .any(|message| message.starts_with("end of first page section (/E) mismatch:")));
+    }
+
+    #[test]
+    fn warning_check_skips_o_revalidation_for_a_negative_o_after_the_parameter_preflight() {
+        // qpdf's `/O` check (`QPDF_linearization.cc:428-433`) is a plain
+        // `int` comparison against the first page's object number; it never
+        // rejects a negative `/O` as malformed. `check_linearization_parameters`
+        // (the preflight `job/check.rs` runs first) reports exactly that soft
+        // mismatch and no more; the caller then sets `skip_first_page_warning`
+        // and calls `check_linearization_warnings`, which must not re-run
+        // `as_u64` on `/O` at that point -- `as_u64` rejects a negative
+        // integer as an `InvalidParam` error, which would turn a file qpdf
+        // only warns about into a hard failure.
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))
+        .to_vec();
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/O", ObjectHandle::integer(-1))
+            .expect("candidate should be mutable");
+
+        assert_eq!(
+            check_linearization_parameters(&mut pdf).expect("preflight should not error"),
+            LinearizationParameterCheck::Warning("first page object (/O) mismatch"),
+            "the preflight itself must treat a negative /O as a soft mismatch"
+        );
+
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, true)
+            .expect("a negative /O must not be re-validated once the preflight already warned");
+        assert!(
+            !warnings
+                .iter()
+                .any(|message| message.starts_with("first page object (/O)")),
+            "the warning route must not duplicate the preflight's /O warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warning_check_reports_t_mismatch_before_e_mismatch() {
+        // qpdf checks /T (`QPDF_linearization.cc:452-470`) before /E
+        // (`:496-524`) in `checkLinearizationInternal`, so a file with both
+        // mismatches must report the /T warning first.
+        let mut bytes = linearized_fixture_bytes();
+        let xref_offset = bytes
+            .windows(b"xref\n0".len())
+            .rposition(|window| window == b"xref\n0")
+            .expect("classic xref section");
+        replace_parameter_number(&mut bytes, b"/T ", xref_offset);
+        let beyond_part6 = bytes.len() - 1;
+        replace_parameter_number(&mut bytes, b"/E ", beyond_part6);
+
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("fixture should open");
+        let warnings = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect("both mismatches should be soft warnings");
+        let t_index = warnings
+            .iter()
+            .position(|message| message.starts_with("space before first xref item (/T) mismatch"))
+            .expect("/T mismatch warning must be present");
+        let e_index = warnings
+            .iter()
+            .position(|message| message.starts_with("end of first page section (/E) mismatch:"))
+            .expect("/E mismatch warning must be present");
+        assert!(t_index < e_index, "qpdf reports /T before /E: {warnings:?}");
+    }
+
+    #[test]
+    fn strict_check_rejects_an_object_number_that_does_not_fit_u32() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/linearized-one-page.pdf"
+        ))
+        .to_vec();
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("linearized fixture should open");
+        let candidate = pdf
+            .linearization_candidate_ref()
+            .expect("candidate probe should work")
+            .expect("fixture should have a linearization object");
+        let candidate_handle = pdf.get_object_handle(candidate);
+        candidate_handle
+            .try_dereference()
+            .expect("candidate should resolve");
+        candidate_handle
+            .replace_key(b"/O", ObjectHandle::integer(i64::MAX))
+            .expect("candidate should be mutable");
+
+        let error = check_linearization_warnings(&mut pdf, &bytes, false)
+            .expect_err("out-of-range /O should remain a hard validation error");
+        assert!(error.to_string().contains("does not fit in u32"));
+    }
+
+    #[test]
     fn extent_walk_follows_outlines_and_stops_at_nested_pages() {
         let bytes = source_extent_graph_fixture();
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open extent graph");
@@ -1988,6 +2213,77 @@ mod tests {
                     if message.contains("does not match the part-6 source extent range")
             ),
             "an /E outside qpdf's source extent must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_an_e_value_at_or_beyond_file_length() {
+        let mut bytes = linearized_fixture_bytes();
+        let file_len = bytes.len();
+        replace_parameter_number(&mut bytes, b"/E ", file_len);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("must be less than file length")
+            ),
+            "an /E at file length must be rejected before the source-extent comparison: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_a_t_value_inside_an_xref_entry() {
+        // /T must point at the `xref` keyword or inside its subsection
+        // header line, not into the entries themselves.
+        let mut bytes = linearized_fixture_bytes();
+        let xref_offset = bytes
+            .windows(b"xref\n0".len())
+            .rposition(|window| window == b"xref\n0")
+            .expect("classic xref section");
+        // `xref\n0 3\n` is 9 bytes; land inside the first 20-byte entry.
+        let inside_first_entry = xref_offset + 9 + 5;
+        replace_parameter_number(&mut bytes, b"/T ", inside_first_entry);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("is outside the xref subsection header range")
+            ),
+            "a /T pointing into an xref entry must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_a_t_value_at_an_xref_keyword_with_a_malformed_subsection_header() {
+        // qpdf has no equivalent of this backscan (see the flpdf-only
+        // block marked above the /T section in check_linearization_inner);
+        // this only tests that flpdf's own
+        // structural search reports a clear error rather than panicking or
+        // silently miscomputing when the bytes right after a found `xref`
+        // keyword do not form a valid `<start> <count>` header line. A
+        // trailing comment after `%%EOF` cannot move any other file offset.
+        let mut bytes = linearized_fixture_bytes();
+        // `\n% xref not-a-number\n`: `xref` (the token the backscan matches)
+        // starts 3 bytes after the appended region begins (`\n`, `%`, ` `).
+        let appended_region_start = bytes.len();
+        bytes.extend_from_slice(b"\n% xref not-a-number\n");
+        let malformed_xref_pos = appended_region_start + 3;
+        // `is_linearized` requires /L to match the actual file size
+        // (QPDF_linearization.cc's L check); keep it in sync with the
+        // trailing comment this test appends.
+        let new_len = bytes.len();
+        replace_parameter_number(&mut bytes, b"/L ", new_len);
+        replace_parameter_number(&mut bytes, b"/T ", malformed_xref_pos);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("malformed or truncated")
+            ),
+            "a /T at an xref keyword with no valid subsection header must be rejected: {result:?}"
         );
     }
 

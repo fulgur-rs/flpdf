@@ -2398,6 +2398,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow_mut().source_length()
     }
 
+    /// Return qpdf's `InputSource::getLastOffset()` value for the most recent
+    /// source read (`QPDF.cc:2624-2628`). Linearization diagnostics use this
+    /// physical read offset when wrapping a damaged parameter error.
+    pub(crate) fn last_offset(&self) -> u64 {
+        self.core.borrow().input.last_offset()
+    }
+
     /// Return the logical source bytes while restoring the resolver's current
     /// input position. This is intentionally a reader-owned seam rather than a
     /// second file open: qpdf's `QPDF::checkLinearization` reads the same

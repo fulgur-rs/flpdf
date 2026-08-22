@@ -42,6 +42,35 @@ fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
     f
 }
 
+fn linearized_fixture_bytes() -> Vec<u8> {
+    include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/compat/linearized-one-page.pdf"
+    ))
+    .to_vec()
+}
+
+fn replace_linearization_parameter(bytes: &mut [u8], key: &[u8], replacement: &[u8]) {
+    let mut needle = key.to_vec();
+    needle.push(b' ');
+    let start = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| position + needle.len())
+        .unwrap_or_else(|| panic!("missing linearization parameter {:?}", key));
+    let end = start
+        + bytes[start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .expect("linearization parameter must be decimal");
+    assert_eq!(
+        end - start,
+        replacement.len(),
+        "replacement width must match"
+    );
+    bytes[start..end].copy_from_slice(replacement);
+}
+
 // ---------------------------------------------------------------------------
 // 1. Happy path: rewrite --linearize produces a file, check-linearization passes
 // ---------------------------------------------------------------------------
@@ -136,6 +165,50 @@ fn check_linearization_tampered_l_exits_1() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains("not a linearized PDF"));
+}
+
+#[test]
+fn check_reports_all_linearization_soft_warnings() {
+    let outdir = tempfile::tempdir().unwrap();
+    let input = outdir.path().join("o-and-t-mismatch.pdf");
+    let mut bytes = linearized_fixture_bytes();
+    replace_linearization_parameter(&mut bytes, b"/O", b"7");
+    replace_linearization_parameter(&mut bytes, b"/T", b"1522");
+    std::fs::write(&input, bytes).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["check", input.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "WARNING: ".to_owned() + input.to_str().unwrap() + ": first page object (/O) mismatch",
+        ))
+        .stderr(predicate::str::contains(
+            "space before first xref item (/T) mismatch (computed = 1524; file = 1522",
+        ));
+}
+
+#[test]
+fn check_reports_qpdf_linearization_parameter_offset() {
+    let outdir = tempfile::tempdir().unwrap();
+    let input = outdir.path().join("n-mismatch.pdf");
+    let mut bytes = linearized_fixture_bytes();
+    replace_linearization_parameter(&mut bytes, b"/N", b"2");
+    std::fs::write(&input, bytes).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["check", input.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "(linearization hint table, offset 908): /N does not match number of pages",
+        ));
 }
 
 // ---------------------------------------------------------------------------

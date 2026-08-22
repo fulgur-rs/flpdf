@@ -229,6 +229,13 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.source_bytes()
     }
 
+    /// Return the qpdf-logical offset from which the most recent source read
+    /// started (`InputSource::getLastOffset()`). This is used by linearization
+    /// damage warnings to reproduce qpdf's source-location context.
+    pub(crate) fn source_last_offset(&self) -> u64 {
+        self.resolver.last_offset()
+    }
+
     /// Configure this document as a qpdf source whose lazy stream data must
     /// be materialized when it is copied into another document. This is
     /// qpdf's `QPDF::setImmediateCopyFrom` (`include/qpdf/QPDF.hh:242-257`):
