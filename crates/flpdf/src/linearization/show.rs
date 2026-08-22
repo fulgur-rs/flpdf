@@ -115,7 +115,7 @@ impl From<BitStreamError> for ShowLinearizationError {
 }
 
 /// Shorthand result type for the decoder.
-type ShowResult<T> = std::result::Result<T, ShowLinearizationError>;
+pub(crate) type ShowResult<T> = std::result::Result<T, ShowLinearizationError>;
 
 /// Return a [`ShowLinearizationError::Malformed`] error with a formatted message.
 macro_rules! malformed {
@@ -159,66 +159,71 @@ impl LinParameters {
 }
 
 /// Decoded Page Offset Hint Table (qpdf's `HPageOffset`).
-struct HPageOffset {
-    min_nobjects: u32,
-    first_page_offset: u64,
-    nbits_delta_nobjects: u32,
-    min_page_length: u64,
-    nbits_delta_page_length: u32,
-    min_content_offset: u64,
-    nbits_delta_content_offset: u32,
-    min_content_length: u64,
-    nbits_delta_content_length: u32,
-    nbits_nshared_objects: u32,
-    nbits_shared_identifier: u32,
-    nbits_shared_numerator: u32,
-    shared_denominator: u32,
-    entries: Vec<HPageOffsetEntry>,
+#[derive(Clone)]
+pub(crate) struct HPageOffset {
+    pub(crate) min_nobjects: u32,
+    pub(crate) first_page_offset: u64,
+    pub(crate) nbits_delta_nobjects: u32,
+    pub(crate) min_page_length: u64,
+    pub(crate) nbits_delta_page_length: u32,
+    pub(crate) min_content_offset: u64,
+    pub(crate) nbits_delta_content_offset: u32,
+    pub(crate) min_content_length: u64,
+    pub(crate) nbits_delta_content_length: u32,
+    pub(crate) nbits_nshared_objects: u32,
+    pub(crate) nbits_shared_identifier: u32,
+    pub(crate) nbits_shared_numerator: u32,
+    pub(crate) shared_denominator: u32,
+    pub(crate) entries: Vec<HPageOffsetEntry>,
 }
 
 /// Decoded per-page entry of the Page Offset Hint Table.
-struct HPageOffsetEntry {
-    delta_nobjects: u64,
-    delta_page_length: u64,
-    nshared_objects: u32,
-    shared_identifiers: Vec<u64>,
-    shared_numerators: Vec<u64>,
-    delta_content_offset: u64,
-    delta_content_length: u64,
+#[derive(Clone)]
+pub(crate) struct HPageOffsetEntry {
+    pub(crate) delta_nobjects: u64,
+    pub(crate) delta_page_length: u64,
+    pub(crate) nshared_objects: u32,
+    pub(crate) shared_identifiers: Vec<u64>,
+    pub(crate) shared_numerators: Vec<u64>,
+    pub(crate) delta_content_offset: u64,
+    pub(crate) delta_content_length: u64,
 }
 
 /// Decoded Shared Object Hint Table (qpdf's `HSharedObject`).
-struct HSharedObject {
-    first_shared_obj: u64,
-    first_shared_offset: u64,
-    nshared_first_page: u32,
-    nshared_total: u32,
-    nbits_nobjects: u32,
-    min_group_length: u64,
-    nbits_delta_group_length: u32,
-    entries: Vec<HSharedObjectEntry>,
+#[derive(Clone)]
+pub(crate) struct HSharedObject {
+    pub(crate) first_shared_obj: u64,
+    pub(crate) first_shared_offset: u64,
+    pub(crate) nshared_first_page: u32,
+    pub(crate) nshared_total: u32,
+    pub(crate) nbits_nobjects: u32,
+    pub(crate) min_group_length: u64,
+    pub(crate) nbits_delta_group_length: u32,
+    pub(crate) entries: Vec<HSharedObjectEntry>,
 }
 
 /// Decoded per-entry data of the Shared Object Hint Table.
-struct HSharedObjectEntry {
-    delta_group_length: u64,
-    signature_present: bool,
-    nobjects_minus_one: u64,
+#[derive(Clone)]
+pub(crate) struct HSharedObjectEntry {
+    pub(crate) delta_group_length: u64,
+    pub(crate) signature_present: bool,
+    pub(crate) nobjects_minus_one: u64,
 }
 
 /// Decoded generic (Outlines) hint table (qpdf's `HGeneric`).
-struct HGeneric {
-    first_object: u64,
-    first_object_offset: u64,
-    nobjects: u32,
-    group_length: u64,
+#[derive(Clone)]
+pub(crate) struct HGeneric {
+    pub(crate) first_object: u64,
+    pub(crate) first_object_offset: u64,
+    pub(crate) nobjects: u32,
+    pub(crate) group_length: u64,
 }
 
 // ---------------------------------------------------------------------------
 // Page Offset Hint Table decoder — mirrors qpdf readHPageOffset
 // ---------------------------------------------------------------------------
 
-fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
+pub(crate) fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
     let mut bits = BitStream::new(buf);
 
     // 13 header fields (5×32 + 8×16 = 288 bits = 36 bytes, leaving the reader
@@ -328,7 +333,7 @@ fn read_h_page_offset(buf: &[u8], npages: u32) -> ShowResult<HPageOffset> {
 // Shared Object Hint Table decoder — mirrors qpdf readHSharedObject
 // ---------------------------------------------------------------------------
 
-fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
+pub(crate) fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
     let mut bits = BitStream::new(buf);
 
     // 7 header fields.
@@ -401,7 +406,7 @@ fn read_h_shared_object(buf: &[u8]) -> ShowResult<HSharedObject> {
 // Generic (Outlines) Hint Table decoder — mirrors qpdf readHGeneric
 // ---------------------------------------------------------------------------
 
-fn read_h_generic(buf: &[u8]) -> ShowResult<HGeneric> {
+pub(crate) fn read_h_generic(buf: &[u8]) -> ShowResult<HGeneric> {
     let mut bits = BitStream::new(buf);
     let first_object = bits.get_bits_i32(32)? as u32 as u64;
     let first_object_offset = bits.get_bits_i32(32)? as u32 as u64;
@@ -691,7 +696,7 @@ fn linearization_parameter_warning(
 /// from the **hint stream** dictionary (not the parameter dict).
 ///
 /// Returns `(s_offset, outline_offset)`.
-fn read_hint_offsets(hint_dict: &ObjectHandle) -> ShowResult<(usize, Option<usize>)> {
+pub(crate) fn read_hint_offsets(hint_dict: &ObjectHandle) -> ShowResult<(usize, Option<usize>)> {
     let s = hint_dict
         .try_get_key(b"/S")
         .map_err(ShowLinearizationError::from)?;
@@ -2216,27 +2221,15 @@ mod tests {
     }
 
     #[test]
-    fn t_backscan_failure_is_a_warning_with_dump_intact() {
-        // flpdf's /T backscan (check.rs:710-726, marked as a qpdf deviation) has
-        // no qpdf throw counterpart -- qpdf's own /T check
-        // (QPDF_linearization.cc:452-470) is a soft warning inside
-        // checkLinearizationInternal, which never throws. A /T value that
-        // cannot be backscanned to an `xref` keyword must therefore still
-        // produce a normal dump, with the backscan failure appended as a
-        // warning rather than replacing the dump with nothing (the way a
-        // genuine readLinearizationData throw does).
-        //
-        // /T = 0 is used here only to force flpdf's own backscan into its
-        // hard-failure arm (too close to EOF to contain the `xref`
-        // keyword) -- it does not reproduce what qpdf itself does with
-        // /T = 0. Verified against `/usr/bin/qpdf` 11.9.0: qpdf's own /T
-        // check reads `xref_zero_offset` directly and compares cursor
-        // positions, so /T = 0 there produces a different soft warning
-        // ("space before first xref item (/T) mismatch") and still dumps
-        // -- the same "warning, dump intact" shape this test asserts, via
-        // a different flpdf code path (`show_continues_past_a_qpdf_soft_check_mismatch`
-        // and the CLI's `show_linearization_soft_warnings_exit_3_after_dump`
-        // exercise that qpdf-matching path instead).
+    fn t_position_mismatch_is_a_warning_with_dump_intact() {
+        // qpdf's own /T check (QPDF_linearization.cc:452-470) is a soft
+        // warning inside checkLinearizationInternal, which never throws: it
+        // only seeks to /T, skips whitespace, and compares the resulting
+        // position against the xref parser's first_xref_item_offset
+        // (QPDF.cc:845-869,1110-1120). A /T value that does not match that
+        // position must therefore still produce a normal dump, with the
+        // mismatch appended as a warning rather than replacing the dump with
+        // nothing (the way a genuine readLinearizationData throw does).
         let mut bytes = linearized_bytes();
         let pos = bytes.windows(3).position(|w| w == b"/T ").expect("/T");
         let dstart = pos + 3;
@@ -2249,12 +2242,13 @@ mod tests {
         bytes[dstart..dend].copy_from_slice(&vec![b'0'; width]); // /T = 0
 
         let result = show_linearization_bytes_with_warnings(&bytes, "badT.pdf")
-            .expect("a /T backscan failure is a warning, not a hard error");
+            .expect("a /T position mismatch is a warning, not a hard error");
         assert!(result.dump.starts_with("badT.pdf: linearization data:\n\n"));
         assert!(result.dump.contains("\nPage Offsets Hint Table\n\n"));
         assert_eq!(result.warnings.len(), 1);
         assert!(
-            result.warnings[0].contains("/T (0)"),
+            result.warnings[0].contains("space before first xref item (/T) mismatch")
+                && result.warnings[0].contains("file = 0"),
             "unexpected warning: {:?}",
             result.warnings
         );
