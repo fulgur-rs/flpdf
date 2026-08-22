@@ -3497,6 +3497,52 @@ mod tests {
     }
 
     #[test]
+    fn handle_number_tree_mutation_preserves_live_handle_identity() {
+        let mut pdf = empty_pdf();
+        let mut tree =
+            HandleNumberTree::new_empty(&mut pdf, crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH)
+                .expect("empty canonical number tree");
+        let value = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"S".to_vec(),
+                ObjectHandle::name(b"D".to_vec()),
+            )]))
+            .expect("indirect label value");
+        let value_ref = value.object_ref().expect("label object reference");
+
+        tree.insert(&mut pdf, 0, value.clone())
+            .expect("insert label value");
+        let found = tree
+            .find_object_at_or_below(&mut pdf, 0)
+            .expect("find label value")
+            .expect("label value exists")
+            .0;
+        assert!(found.is_same_object_as(&value));
+
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"S".to_vec(), ObjectHandle::name(b"R".to_vec()))]);
+        tree.insert(&mut pdf, 0, replacement)
+            .expect("replace label value");
+        let replaced = tree
+            .find_object_at_or_below(&mut pdf, 0)
+            .expect("find replacement")
+            .expect("replacement exists")
+            .0;
+        assert_eq!(replaced.try_get_key(b"/S").unwrap().as_name(), Some(b"R"));
+
+        let removed = tree
+            .remove(&mut pdf, 0)
+            .expect("remove label value")
+            .expect("removed label value");
+        assert!(removed.is_same_object_as(&replaced));
+        assert_eq!(
+            value_ref,
+            value.object_ref().expect("value remains indirect")
+        );
+        assert!(tree.entries(&mut pdf).unwrap().is_empty());
+    }
+
+    #[test]
     fn handle_number_tree_prefers_non_empty_nums_over_kids() {
         let mut pdf = empty_pdf();
         let child = ObjectHandle::dictionary(vec![(
