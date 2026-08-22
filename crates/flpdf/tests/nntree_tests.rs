@@ -1,6 +1,4 @@
-use flpdf::{
-    read_name_tree, read_number_tree, Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf,
-};
+use flpdf::{Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::process::Command;
@@ -255,6 +253,53 @@ fn number_tree_insert_exposes_value_through_find_object() {
     assert_eq!(
         tree.find_object(&mut pdf, 7).expect("find"),
         Some(Object::String(b"seven".to_vec()))
+    );
+}
+
+#[test]
+fn number_tree_set_max_depth_bounds_kids_chain_traversal() {
+    let mut pdf = empty_pdf();
+    let leaf_ref = ObjectRef::new(3, 0);
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Nums",
+        Object::Array(vec![Object::Integer(0), Object::String(b"zero".to_vec())]),
+    );
+    leaf.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+    );
+    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+
+    let branch_ref = ObjectRef::new(2, 0);
+    let mut branch = Dictionary::new();
+    branch.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
+    branch.insert(
+        "Limits",
+        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+    );
+    pdf.set_object(branch_ref, Object::Dictionary(branch));
+
+    let mut root = Dictionary::new();
+    root.insert("Kids", Object::Array(vec![Object::Reference(branch_ref)]));
+
+    let mut bounded = NumberTree::new(Object::Dictionary(root.clone()), true);
+    bounded.set_max_depth(1);
+    let error = bounded
+        .find_object(&mut pdf, 0)
+        .expect_err("a 1-level cap must reject a 2-level /Kids chain");
+    assert!(
+        error.to_string().contains("depth limit"),
+        "unexpected error: {error}"
+    );
+
+    let mut unbounded_enough = NumberTree::new(Object::Dictionary(root), true);
+    unbounded_enough.set_max_depth(flpdf::DEFAULT_MAX_TREE_DEPTH);
+    assert_eq!(
+        unbounded_enough
+            .find_object(&mut pdf, 0)
+            .expect("within the default depth cap"),
+        Some(Object::String(b"zero".to_vec()))
     );
 }
 
@@ -578,7 +623,7 @@ fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
 }
 
 #[test]
-fn compatibility_name_reader_returns_qpdf_normalized_utf8_key() {
+fn canonical_name_reader_returns_qpdf_normalized_utf8_key() {
     let mut pdf = empty_pdf();
     let mut root = Dictionary::new();
     root.insert(
@@ -586,19 +631,14 @@ fn compatibility_name_reader_returns_qpdf_normalized_utf8_key() {
         Object::Array(vec![Object::String(vec![0x80]), Object::Integer(7)]),
     );
 
-    let entries = read_name_tree(
-        &mut pdf,
-        Object::Dictionary(root),
-        |_, value| Ok(Some(value)),
-        100,
-    )
-    .expect("read");
+    let mut tree = NameTree::new(Object::Dictionary(root), false);
+    let entries = tree.as_map(&mut pdf).expect("read");
 
-    assert_eq!(entries, vec![("•".as_bytes().to_vec(), Object::Integer(7))]);
+    assert_eq!(entries.get("•".as_bytes()), Some(&Object::Integer(7)));
 }
 
 #[test]
-fn compatibility_number_reader_accepts_direct_kid() {
+fn canonical_number_reader_accepts_direct_kid() {
     let mut pdf = empty_pdf();
     let mut kid = Dictionary::new();
     kid.insert(
@@ -608,15 +648,10 @@ fn compatibility_number_reader_accepts_direct_kid() {
     let mut root = Dictionary::new();
     root.insert("Kids", Object::Array(vec![Object::Dictionary(kid)]));
 
-    let entries = read_number_tree(
-        &mut pdf,
-        Object::Dictionary(root),
-        |_, value| Ok(Some(value)),
-        100,
-    )
-    .expect("read");
+    let mut tree = NumberTree::new(Object::Dictionary(root), false);
+    let entries = tree.as_map(&mut pdf).expect("read");
 
-    assert_eq!(entries, vec![(4, Object::String(b"four".to_vec()))]);
+    assert_eq!(entries.get(&4), Some(&Object::String(b"four".to_vec())));
 }
 
 #[test]

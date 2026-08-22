@@ -6,7 +6,7 @@
 //! semantics; [`LabelRange`] is the typed view used by reconstruction and
 //! display APIs.
 
-use crate::name_number_tree::DEFAULT_MAX_TREE_DEPTH;
+use crate::nntree::DEFAULT_MAX_TREE_DEPTH;
 #[cfg(test)]
 use crate::{Dictionary, Object};
 use crate::{Error, ObjectHandle, Pdf, Result};

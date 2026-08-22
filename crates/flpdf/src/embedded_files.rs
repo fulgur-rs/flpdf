@@ -382,9 +382,6 @@ fn resolve_embedded_file_stream_ref<R: Read + Seek>(
 
 // ── Writer constants ──────────────────────────────────────────────────────────
 
-/// Compatibility alias for qpdf's default NNTree split threshold.
-pub use crate::name_number_tree::LEAF_MAX;
-
 /// Legacy maximum depth for callers that explicitly select bounded traversal.
 ///
 /// qpdf's embedded-files helper does not use a numeric depth cap; its normal
