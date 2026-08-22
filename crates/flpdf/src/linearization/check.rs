@@ -2217,6 +2217,77 @@ mod tests {
     }
 
     #[test]
+    fn check_rejects_an_e_value_at_or_beyond_file_length() {
+        let mut bytes = linearized_fixture_bytes();
+        let file_len = bytes.len();
+        replace_parameter_number(&mut bytes, b"/E ", file_len);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("must be less than file length")
+            ),
+            "an /E at file length must be rejected before the source-extent comparison: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_a_t_value_inside_an_xref_entry() {
+        // /T must point at the `xref` keyword or inside its subsection
+        // header line, not into the entries themselves.
+        let mut bytes = linearized_fixture_bytes();
+        let xref_offset = bytes
+            .windows(b"xref\n0".len())
+            .rposition(|window| window == b"xref\n0")
+            .expect("classic xref section");
+        // `xref\n0 3\n` is 9 bytes; land inside the first 20-byte entry.
+        let inside_first_entry = xref_offset + 9 + 5;
+        replace_parameter_number(&mut bytes, b"/T ", inside_first_entry);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("is outside the xref subsection header range")
+            ),
+            "a /T pointing into an xref entry must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn check_rejects_a_t_value_at_an_xref_keyword_with_a_malformed_subsection_header() {
+        // qpdf has no equivalent of this backscan (see the flpdf-only
+        // block marked above the /T section in check_linearization_inner);
+        // this only tests that flpdf's own
+        // structural search reports a clear error rather than panicking or
+        // silently miscomputing when the bytes right after a found `xref`
+        // keyword do not form a valid `<start> <count>` header line. A
+        // trailing comment after `%%EOF` cannot move any other file offset.
+        let mut bytes = linearized_fixture_bytes();
+        // `\n% xref not-a-number\n`: `xref` (the token the backscan matches)
+        // starts 3 bytes after the appended region begins (`\n`, `%`, ` `).
+        let appended_region_start = bytes.len();
+        bytes.extend_from_slice(b"\n% xref not-a-number\n");
+        let malformed_xref_pos = appended_region_start + 3;
+        // `is_linearized` requires /L to match the actual file size
+        // (QPDF_linearization.cc's L check); keep it in sync with the
+        // trailing comment this test appends.
+        let new_len = bytes.len();
+        replace_parameter_number(&mut bytes, b"/L ", new_len);
+        replace_parameter_number(&mut bytes, b"/T ", malformed_xref_pos);
+        let result = check_linearization_bytes(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(LinearizationCheckError::InvalidParam { ref message })
+                    if message.contains("malformed or truncated")
+            ),
+            "a /T at an xref keyword with no valid subsection header must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
     fn check_rejects_a_classic_t_value_that_is_not_the_pre_entry_whitespace() {
         let mut bytes = linearized_fixture_bytes();
         let xref_offset = bytes
