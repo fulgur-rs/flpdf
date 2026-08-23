@@ -184,6 +184,25 @@ fn inherited_attributes_module_has_no_raw_snapshot_or_redirect_route() {
 }
 
 #[test]
+fn page_splice_module_has_no_raw_snapshot_route() {
+    let source = include_str!("../src/page_splice.rs");
+    for legacy in [
+        "use crate::Object;",
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+        "Dictionary",
+        "materialize(",
+        "set_object(",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "page_splice still contains the raw route marker {legacy:?}"
+        );
+    }
+}
+
+#[test]
 fn optimization_production_uses_the_canonical_handle_route() {
     let source = include_str!("../src/optimization.rs");
     let production = source

@@ -20,8 +20,6 @@
 //! (`QPDFObjectHandle.cc:2073-2077`) write it.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-#[cfg(test)]
-use crate::Object;
 use crate::ObjectHandle;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::HashSet;
@@ -877,11 +875,26 @@ mod tests {
         page_refs(pdf).expect("page_refs failed")
     }
 
-    fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
-        pdf.resolve_object(r)
-            .unwrap()
-            .into_dict()
-            .expect("not a dictionary")
+    fn dict_handle_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> ObjectHandle {
+        let handle = pdf.get_object_handle(r);
+        pdf.resolve(&handle).expect("object should resolve");
+        assert!(handle.as_dictionary().is_some(), "not a dictionary");
+        handle
+    }
+
+    fn new_page_handle() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"/MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ])
     }
 
     #[test]
@@ -914,8 +927,8 @@ mod tests {
         assert_eq!(pages[0], ObjectRef::new(4, 0)); // B
         assert_eq!(pages[1], ObjectRef::new(5, 0)); // C
                                                     // Root /Pages /Count should be 2.
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
     }
 
     #[test]
@@ -926,94 +939,52 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0], ObjectRef::new(3, 0)); // A
         assert_eq!(pages[1], ObjectRef::new(4, 0)); // B
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
     }
 
     #[test]
     fn insert_at_start_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object(
-            new_page,
-            Object::Dictionary({
-                let mut d = crate::Dictionary::new();
-                d.insert("Type", Object::Name(b"Page".to_vec()));
-                d.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                d
-            }),
-        );
+        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
         splice_pages(&mut pdf, 0..0, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 4);
         assert_eq!(pages[0], new_page);
         assert_eq!(pages[1], ObjectRef::new(3, 0));
         // /Parent of new_page must point at root /Pages (2 0 R).
-        let d = dict_of(&mut pdf, new_page);
-        assert_eq!(d.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
+        let d = dict_handle_of(&mut pdf, new_page);
+        assert_eq!(
+            d.get_key(b"/Parent").object_ref(),
+            Some(ObjectRef::new(2, 0))
+        );
         // /Count = 4
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(4)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(4));
     }
 
     #[test]
     fn insert_at_end_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object(
-            new_page,
-            Object::Dictionary({
-                let mut d = crate::Dictionary::new();
-                d.insert("Type", Object::Name(b"Page".to_vec()));
-                d.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                d
-            }),
-        );
+        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
         splice_pages(&mut pdf, 3..3, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 4);
         assert_eq!(pages[3], new_page);
-        let d = dict_of(&mut pdf, new_page);
-        assert_eq!(d.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
+        let d = dict_handle_of(&mut pdf, new_page);
+        assert_eq!(
+            d.get_key(b"/Parent").object_ref(),
+            Some(ObjectRef::new(2, 0))
+        );
     }
 
     #[test]
     fn insert_in_middle_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object(
-            new_page,
-            Object::Dictionary({
-                let mut d = crate::Dictionary::new();
-                d.insert("Type", Object::Name(b"Page".to_vec()));
-                d.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                d
-            }),
-        );
+        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
         // Insert after page B (between index 1 and 2)
         splice_pages(&mut pdf, 2..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
@@ -1031,8 +1002,8 @@ mod tests {
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0], ObjectRef::new(5, 0)); // C only
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(1)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(1));
     }
 
     #[test]
@@ -1077,9 +1048,9 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0], ObjectRef::new(3, 0));
         assert_ne!(pages[1], ObjectRef::new(3, 0));
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        let kids = root.get("Kids").and_then(Object::as_array).unwrap();
-        assert!(kids.iter().all(|kid| matches!(kid, Object::Reference(_))));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        let kids = root.get_key(b"/Kids").as_array().unwrap();
+        assert!(kids.iter().all(|kid| kid.object_ref().is_some()));
     }
 
     #[test]
@@ -1169,8 +1140,15 @@ mod tests {
                 ObjectRef::new(4, 0)
             ]
         );
-        let inserted = dict_of(&mut pdf, ObjectRef::new(5, 0));
-        assert!(inserted.get("Parent").is_none());
+        let inserted = dict_handle_of(&mut pdf, ObjectRef::new(5, 0));
+        assert!(
+            !inserted
+                .as_dictionary()
+                .expect("resolved dictionary")
+                .contains_key(b"/Parent".as_slice()),
+            "/Parent must be genuinely absent, not present as an explicit null \
+             (has_key alone can't distinguish the two)"
+        );
     }
 
     #[test]
@@ -1190,11 +1168,17 @@ mod tests {
         let mut pdf = open(build_pages_with_cross_parent_duplicate_pdf());
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(8, 0)]).unwrap();
 
-        let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
-        let duplicate = match right.get("Kids").and_then(Object::as_array) {
-            Some([Object::Reference(page_ref)]) => *page_ref,
-            other => panic!("right /Kids should contain one indirect page, got {other:?}"), // cov:ignore: the fixture always has one indirect page in this /Kids array
-        };
+        let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
+        let kids = right.get_key(b"/Kids").as_array().unwrap();
+        assert_eq!(
+            kids.len(),
+            1,
+            "right /Kids should contain one indirect page"
+        );
+        let duplicate = &kids[0];
+        let duplicate = duplicate
+            .object_ref()
+            .expect("right /Kids entry should be indirect");
         assert_ne!(duplicate, ObjectRef::new(4, 0));
         // qpdf's duplicate-page copy is a plain `QPDFObjectHandle::shallowCopy`
         // (`QPDFObjectHandle.cc:2073-2077`, `obj->copy()`) with no `/Parent`
@@ -1204,7 +1188,9 @@ mod tests {
         // the duplicate's copy keeps `/Parent 3 0 R`, the original kid's
         // parent, not the subtree it was copied into.
         assert_eq!(
-            dict_of(&mut pdf, duplicate).get_ref("Parent"),
+            dict_handle_of(&mut pdf, duplicate)
+                .get_key(b"/Parent")
+                .object_ref(),
             Some(ObjectRef::new(3, 0))
         );
     }
@@ -1232,9 +1218,9 @@ mod tests {
 
         let output = crate::writer::write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut round_trip = open(output);
-        let root = dict_of(&mut round_trip, ObjectRef::new(2, 0));
-        let kids = root.get("Kids").and_then(Object::as_array).unwrap();
-        assert!(matches!(kids.first(), Some(Object::Reference(_))));
+        let root = dict_handle_of(&mut round_trip, ObjectRef::new(2, 0));
+        let kids = root.get_key(b"/Kids").as_array().unwrap();
+        assert!(kids.first().is_some_and(|kid| kid.object_ref().is_some()));
     }
 
     #[test]
@@ -1243,16 +1229,22 @@ mod tests {
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(5, 0)]).unwrap();
 
         assert_eq!(
-            dict_of(&mut pdf, ObjectRef::new(2, 0)).get("Type"),
-            Some(&Object::Name(b"Pages".to_vec()))
+            dict_handle_of(&mut pdf, ObjectRef::new(2, 0))
+                .get_key(b"/Type")
+                .as_name(),
+            Some(b"Pages".to_vec())
         );
         assert_eq!(
-            dict_of(&mut pdf, ObjectRef::new(3, 0)).get("Type"),
-            Some(&Object::Name(b"Pages".to_vec()))
+            dict_handle_of(&mut pdf, ObjectRef::new(3, 0))
+                .get_key(b"/Type")
+                .as_name(),
+            Some(b"Pages".to_vec())
         );
         assert_eq!(
-            dict_of(&mut pdf, ObjectRef::new(4, 0)).get("Type"),
-            Some(&Object::Name(b"Page".to_vec()))
+            dict_handle_of(&mut pdf, ObjectRef::new(4, 0))
+                .get_key(b"/Type")
+                .as_name(),
+            Some(b"Page".to_vec())
         );
     }
 
@@ -1272,12 +1264,10 @@ mod tests {
         let mut pdf = open(build_empty_pages_without_kids_pdf());
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(3, 0)]).unwrap();
         assert_eq!(page_list(&mut pdf), vec![ObjectRef::new(3, 0)]);
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(1)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(1));
         assert_eq!(
-            root.get("Kids")
-                .and_then(Object::as_array)
-                .map(|items| items.len()),
+            root.get_key(b"/Kids").as_array().map(|items| items.len()),
             Some(1)
         );
     }
@@ -1292,8 +1282,11 @@ mod tests {
         assert_eq!(pages.len(), 4);
         assert_ne!(pages[0], original);
         assert_eq!(pages[1], original);
-        let copy = dict_of(&mut pdf, pages[0]);
-        assert_eq!(copy.get_ref("Parent"), Some(ObjectRef::new(2, 0)));
+        let copy = dict_handle_of(&mut pdf, pages[0]);
+        assert_eq!(
+            copy.get_key(b"/Parent").object_ref(),
+            Some(ObjectRef::new(2, 0))
+        );
     }
 
     #[test]
@@ -1460,7 +1453,8 @@ mod tests {
     fn non_dictionary_insert_page_is_rejected() {
         let mut pdf = open(build_flat_pdf());
         let bad_page = ObjectRef::new(6, 0);
-        pdf.set_object(bad_page, Object::Array(Vec::new()));
+        pdf.set_object_handle(bad_page, ObjectHandle::array(Vec::new()))
+            .unwrap();
         let err = splice_pages(&mut pdf, 0..0, &[bad_page]).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
@@ -1473,7 +1467,8 @@ mod tests {
         // non-dictionary object into /Kids uncaught.
         let mut pdf = open(build_pages_with_direct_intermediate_two_pages_pdf());
         let bad_page = ObjectRef::new(5, 0);
-        pdf.set_object(bad_page, Object::Array(Vec::new()));
+        pdf.set_object_handle(bad_page, ObjectHandle::array(Vec::new()))
+            .unwrap();
         let err = splice_pages(&mut pdf, 1..1, &[bad_page]).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }
@@ -1482,23 +1477,7 @@ mod tests {
     fn replace_middle_page_flat_tree() {
         let mut pdf = open(build_flat_pdf());
         let new_page = ObjectRef::new(6, 0);
-        pdf.set_object(
-            new_page,
-            Object::Dictionary({
-                let mut d = crate::Dictionary::new();
-                d.insert("Type", Object::Name(b"Page".to_vec()));
-                d.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                d
-            }),
-        );
+        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
         // Replace page B (index 1) with new_page.
         splice_pages(&mut pdf, 1..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
@@ -1507,8 +1486,8 @@ mod tests {
         assert_eq!(pages[1], new_page); // X
         assert_eq!(pages[2], ObjectRef::new(5, 0)); // C
                                                     // Count stays 3.
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(3)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(3));
     }
 
     /// Remove page B (index 1, in left subtree) from the nested tree.
@@ -1525,14 +1504,14 @@ mod tests {
         assert_eq!(pages[1], ObjectRef::new(7, 0)); // C
         assert_eq!(pages[2], ObjectRef::new(8, 0)); // D
                                                     // Root /Count = 3
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(3)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(3));
         // Left intermediate node /Count = 1 (only A remains)
-        let left = dict_of(&mut pdf, ObjectRef::new(3, 0));
-        assert_eq!(left.get("Count"), Some(&Object::Integer(1)));
+        let left = dict_handle_of(&mut pdf, ObjectRef::new(3, 0));
+        assert_eq!(left.get_key(b"/Count").as_integer(), Some(1));
         // Right intermediate node /Count = 2 (unchanged)
-        let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
-        assert_eq!(right.get("Count"), Some(&Object::Integer(2)));
+        let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
+        assert_eq!(right.get_key(b"/Count").as_integer(), Some(2));
     }
 
     /// Remove pages B and C (indices 1 and 2), which span both left and right subtrees.
@@ -1544,14 +1523,14 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0], ObjectRef::new(4, 0)); // A
         assert_eq!(pages[1], ObjectRef::new(8, 0)); // D
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
         // Left subtree: only A remains → /Count = 1
-        let left = dict_of(&mut pdf, ObjectRef::new(3, 0));
-        assert_eq!(left.get("Count"), Some(&Object::Integer(1)));
+        let left = dict_handle_of(&mut pdf, ObjectRef::new(3, 0));
+        assert_eq!(left.get_key(b"/Count").as_integer(), Some(1));
         // Right subtree: only D remains → /Count = 1
-        let right = dict_of(&mut pdf, ObjectRef::new(6, 0));
-        assert_eq!(right.get("Count"), Some(&Object::Integer(1)));
+        let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
+        assert_eq!(right.get_key(b"/Count").as_integer(), Some(1));
     }
 
     #[test]
@@ -1585,12 +1564,12 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0], ObjectRef::new(7, 0)); // C
         assert_eq!(pages[1], ObjectRef::new(8, 0)); // D
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
         // Root /Kids should only contain right subtree (6 0 R).
-        let kids = root.get("Kids").and_then(Object::as_array).unwrap();
+        let kids = root.get_key(b"/Kids").as_array().unwrap();
         assert_eq!(kids.len(), 1);
-        assert_eq!(kids[0].as_ref_id(), Some(ObjectRef::new(6, 0)));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(6, 0)));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(2));
     }
 
     /// Insert a new page at index 2 (between B and C, at the boundary of left and right subtrees).
@@ -1599,23 +1578,7 @@ mod tests {
     fn nested_insert_at_subtree_boundary() {
         let mut pdf = open(build_nested_pdf());
         let new_page = ObjectRef::new(9, 0);
-        pdf.set_object(
-            new_page,
-            Object::Dictionary({
-                let mut d = crate::Dictionary::new();
-                d.insert("Type", Object::Name(b"Page".to_vec()));
-                d.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                d
-            }),
-        );
+        pdf.set_object_handle(new_page, new_page_handle()).unwrap();
         splice_pages(&mut pdf, 2..2, &[new_page]).unwrap();
         let pages = page_list(&mut pdf);
         assert_eq!(pages.len(), 5);
@@ -1625,16 +1588,19 @@ mod tests {
         assert_eq!(pages[3], ObjectRef::new(7, 0)); // C
         assert_eq!(pages[4], ObjectRef::new(8, 0)); // D
                                                     // Root /Count = 5
-        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        assert_eq!(root.get("Count"), Some(&Object::Integer(5)));
+        let root = dict_handle_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(root.get_key(b"/Count").as_integer(), Some(5));
         // new_page's /Parent should point at an ancestor /Pages node.
-        let d = dict_of(&mut pdf, new_page);
-        let parent = d.get_ref("Parent").expect("/Parent must be set");
+        let d = dict_handle_of(&mut pdf, new_page);
+        let parent = d
+            .get_key(b"/Parent")
+            .object_ref()
+            .expect("/Parent must be set");
         // Parent must be a /Pages node in the tree
-        let parent_dict = dict_of(&mut pdf, parent);
+        let parent_dict = dict_handle_of(&mut pdf, parent);
         assert_eq!(
-            parent_dict.get("Type").and_then(Object::as_name),
-            Some(b"Pages".as_ref())
+            parent_dict.get_key(b"/Type").as_name(),
+            Some(b"Pages".to_vec())
         );
     }
 }
