@@ -69,7 +69,7 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
 
 #[test]
 fn page_annotation_flatten_production_has_no_legacy_object_route() {
-    let source = include_str!("../src/page_annotation_flatten.rs");
+    let source = include_str!("../src/page_annotation_flatten.rs").replace("\r\n", "\n");
     let production = source
         .split_once("#[cfg(test)]\nmod tests")
         .expect("page_annotation_flatten test module marker")
