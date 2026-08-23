@@ -153,8 +153,8 @@ fn push_node_attributes<R: Read + Seek>(
         else {
             continue;
         };
-        let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
-        if resolved.is_null() {
+        value.try_dereference()?;
+        if value.is_null() {
             continue;
         }
         if !allow_changes {
@@ -223,18 +223,14 @@ fn push_child_reference<R: Read + Seek>(
         return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     }
     for (&key, values) in key_ancestors.iter() {
-        // qpdf's hasKey resolves the ordinary parsed child once. The existing
-        // flpdf mutation fixture can additionally store a reference-to-reference
-        // redirect, which has no qpdf counterpart; follow that explicit chain so
-        // a terminal null remains absent just as the previous chain owner did.
         let present = match child
             .as_dictionary()
             .and_then(|entries| entries.get(key).cloned())
         {
             None => false,
             Some(value) => {
-                let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
-                !resolved.is_null()
+                value.try_dereference()?;
+                !value.is_null()
             }
         };
         if !present {
@@ -321,7 +317,7 @@ fn is_pages_dictionary(handle: &ObjectHandle) -> bool {
 }
 
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
-    handle.object_ref().or_else(|| handle.as_reference())
+    handle.object_ref()
 }
 
 #[cfg(test)]
@@ -329,7 +325,7 @@ mod tests {
     use super::*;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
-    use crate::{Dictionary, Object, Pdf};
+    use crate::{ObjectHandle, Pdf};
 
     fn pdf_bytes(bodies: &[(u32, &[u8])]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -393,12 +389,14 @@ mod tests {
             panic!("fixture has an indirect /Pages root");
             // cov:ignore-end
         };
-        let before = pdf.resolve_object(root).unwrap();
+        let root_handle = pdf.get_object_handle(root);
+        pdf.resolve(&root_handle).unwrap();
+        let before = root_handle.get_key(b"/Rotate").as_integer();
 
         let error = push(&mut pdf, &prepared, false, false).unwrap_err();
 
         assert!(error.to_string().contains("inheritable attribute"));
-        assert_eq!(pdf.resolve_object(root).unwrap(), before);
+        assert_eq!(root_handle.get_key(b"/Rotate").as_integer(), before);
     }
 
     #[test]
@@ -424,11 +422,11 @@ mod tests {
             .unwrap();
         push(&mut pdf, &prepared, true, false).unwrap();
 
-        assert!(
-            matches!(
-                pdf.resolve_object(leaf_ref).unwrap(),
-                Object::Dictionary(ref page) if page.get("Rotate") == Some(&Object::Integer(90))
-            ),
+        let leaf = pdf.get_object_handle(leaf_ref);
+        pdf.resolve(&leaf).unwrap();
+        assert_eq!(
+            leaf.get_key(b"/Rotate").as_integer(),
+            Some(90),
             "leaf must have actually inherited /Rotate"
         );
         assert_eq!(
@@ -478,10 +476,9 @@ mod tests {
             diagnostic.message.contains("Unknown key /Unknown")
                 && diagnostic.message.contains("/Pages")
         }));
-        assert!(matches!(
-            pdf.resolve_object(prepared.pages[0]).unwrap(),
-            Object::Dictionary(ref page) if page.get("MediaBox").is_some()
-        ));
+        let page = pdf.get_object_handle(prepared.pages[0]);
+        pdf.resolve(&page).unwrap();
+        assert!(page.has_key(b"/MediaBox"));
     }
 
     #[test]
@@ -515,23 +512,24 @@ mod tests {
         for depth in 0..MAX_DEPTH {
             let number = 2 + depth as u32;
             let child = number + 1;
-            let mut node = Dictionary::new();
-            node.insert("Type", Object::Name(b"Pages".to_vec()));
-            node.insert(
-                "Kids",
-                Object::Array(vec![Object::Reference(ObjectRef::new(child, 0))]),
-            );
-            node.insert("Count", Object::Integer(0));
-            pdf.set_object(ObjectRef::new(number, 0), Object::Dictionary(node));
+            let node = ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(child, 0))]),
+                ),
+                (b"/Count".to_vec(), ObjectHandle::integer(0)),
+            ]);
+            pdf.set_object_handle(ObjectRef::new(number, 0), node)
+                .unwrap();
         }
-        let mut boundary = Dictionary::new();
-        boundary.insert("Type", Object::Name(b"Pages".to_vec()));
-        boundary.insert("Kids", Object::Array(Vec::new()));
-        boundary.insert("Count", Object::Integer(0));
-        pdf.set_object(
-            ObjectRef::new(2 + MAX_DEPTH as u32, 0),
-            Object::Dictionary(boundary),
-        );
+        let boundary = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::array(Vec::new())),
+            (b"/Count".to_vec(), ObjectHandle::integer(0)),
+        ]);
+        pdf.set_object_handle(ObjectRef::new(2 + MAX_DEPTH as u32, 0), boundary)
+            .unwrap();
         let prepared = PreparedPages {
             root: PageTreeRoot::Indirect(ObjectRef::new(2, 0)),
             pages: Vec::new(),
