@@ -6855,6 +6855,42 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_json_mutated_cache_paths_reenter_canonical_resolution() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                b"2 0 obj\n42\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+
+        // A raw cache entry can already be resolved while its canonical handle
+        // remains unresolved. The qpdf-JSON path must resolve that handle before
+        // materializing the value, rather than trusting the stale raw snapshot.
+        let first_ref = ObjectRef::new(1, 0);
+        pdf.handle_mutated_object_refs.insert(first_ref);
+        pdf.cache.set_resolved(first_ref, Object::Null);
+        let mut expected_catalog = Dictionary::new();
+        expected_catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(first_ref)
+                .expect("canonical JSON resolution"),
+            Object::Dictionary(expected_catalog)
+        );
+
+        // The borrowed path reaches the same canonical re-entry after its raw
+        // cache read installs a fresh resolved entry.
+        let second_ref = ObjectRef::new(2, 0);
+        pdf.handle_mutated_object_refs.insert(second_ref);
+        assert_eq!(
+            pdf.resolve_qpdf_json_object_borrowed(second_ref)
+                .expect("borrowed canonical JSON resolution"),
+            &Object::Integer(42)
+        );
+    }
+
+    #[test]
     fn mark_object_dirty_makes_a_replace_key_mutation_survive_a_full_rewrite() {
         // Regression test: ObjectHandle::replace_key mutates the live
         // handle graph directly and has no path back to Pdf's dirty

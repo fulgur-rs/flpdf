@@ -3813,6 +3813,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_terminal_handle_collapses_a_bare_reference_redirect() {
+        let mut pdf = empty_pdf();
+        let holder = ObjectRef::new(20, 0);
+        let terminal = ObjectRef::new(21, 0);
+        pdf.set_object(holder, Object::Reference(terminal));
+        pdf.set_object(terminal, Object::Dictionary(Dictionary::new()));
+        let handle = pdf.get_object_handle(holder);
+        let mut tree = NNTree::<NameKey>::new(Object::Null, true);
+
+        let resolved = tree
+            .legacy_terminal_handle(&mut pdf, &handle)
+            .expect("redirect should resolve to its terminal handle");
+        assert_eq!(resolved.object_ref(), Some(terminal));
+    }
+
+    #[test]
     fn indirect_structural_arrays_are_resolved_and_mutated_in_place() {
         let mut pdf = empty_pdf();
         let items_ref = ObjectRef::new(70, 0);
