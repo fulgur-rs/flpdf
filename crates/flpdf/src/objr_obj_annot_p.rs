@@ -534,6 +534,7 @@ mod tests {
             .expect("stream target skipped without error");
         assert!(
             matches!(
+                // cov:ignore: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
                 pdf.resolve_object(ObjectRef::new(30, 0)),
                 Ok(Object::Stream(_))
             ),
