@@ -300,7 +300,7 @@ impl CanonicalCatalogFirstRenumber {
             let mut seeds = Vec::new();
             let source_objstm_containers = qpdf_source_objstm_containers(pdf);
             for object_ref in pdf
-                .get_all_object_handles()?
+                .get_all_objects()?
                 .into_iter()
                 .filter_map(|handle| handle.object_ref())
             {
@@ -1754,9 +1754,7 @@ mod tests {
             std::fs::File::open(path).expect("open ObjStm fixture"),
         ))
         .expect("ObjStm fixture must open");
-        let objects = pdf
-            .get_all_object_handles()
-            .expect("enumerate source objects");
+        let objects = pdf.get_all_objects().expect("enumerate source objects");
         assert!(
             objects
                 .iter()
