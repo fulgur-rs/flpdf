@@ -3939,6 +3939,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     data,
                     refiltered,
                     parameters_removed,
+                    fingerprint: plain::plan::stream_cache_fingerprint(handle)?,
                 },
             );
             return Ok(parameters_removed);
@@ -5679,6 +5680,45 @@ mod tests {
             writer.settings.newline_before_endstream,
             NewlineBeforeEndstream::Yes
         );
+    }
+
+    #[test]
+    fn specialized_rewrite_snapshots_modified_stream_source_state_for_cached_output() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct PassThroughTokenFilter;
+
+        impl crate::token_filter::TokenFilter for PassThroughTokenFilter {
+            fn handle_token(
+                &mut self,
+                token: &crate::tokenizer::Token,
+                output: &mut crate::token_filter::TokenFilterOutput<'_>,
+            ) -> crate::pipeline::PipelineResult<()> {
+                output.write_token(token)
+            }
+        }
+
+        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).unwrap();
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve(&stream).unwrap();
+        stream
+            .add_token_filter(Rc::new(RefCell::new(PassThroughTokenFilter)))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&stream).unwrap();
+
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            preserve_unreferenced_objects: true,
+            qdf: true,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options).unwrap();
+        assert!(output
+            .windows(b"hello".len())
+            .any(|window| window == b"hello"));
     }
 
     struct FinishAfterWriteError {

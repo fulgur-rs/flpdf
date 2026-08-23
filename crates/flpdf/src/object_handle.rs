@@ -804,6 +804,10 @@ struct ObjectSlot {
     /// data, while the writer must skip only the normalization that this
     /// particular consumer has already performed.
     content_normalization_applied: Rc<Cell<bool>>,
+    /// Monotonic identity for in-place mutations of this handle's payload.
+    /// Writer caches use it to distinguish a plan-time stream snapshot from
+    /// later qpdf-shaped replacement/filter mutations.
+    mutation_generation: Rc<Cell<u64>>,
 }
 
 impl ObjectSlot {
@@ -1221,6 +1225,7 @@ impl ObjectHandle {
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
             content_normalization_applied: Rc::new(Cell::new(false)),
+            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1252,6 +1257,7 @@ impl ObjectHandle {
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
             content_normalization_applied: Rc::new(Cell::new(false)),
+            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1308,6 +1314,7 @@ impl ObjectHandle {
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
             content_normalization_applied: Rc::new(Cell::new(false)),
+            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle
@@ -1337,6 +1344,7 @@ impl ObjectHandle {
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
             content_normalization_applied: Rc::new(Cell::new(false)),
+            mutation_generation: Rc::new(Cell::new(0)),
         })));
         handle.register_state_owner();
         handle.with_value(|value| {
@@ -1421,6 +1429,7 @@ impl ObjectHandle {
         };
         let new_token_filters = Rc::new(RefCell::new(Vec::new()));
         let new_content_normalization_applied = Rc::new(Cell::new(false));
+        let new_mutation_generation = Rc::new(Cell::new(0));
         for owner in self.state_owner_handles() {
             let parent = owner.containment_parent();
             {
@@ -1428,6 +1437,7 @@ impl ObjectHandle {
                 owner_slot.stream_token_filters = new_token_filters.clone();
                 owner_slot.content_normalization_applied =
                     new_content_normalization_applied.clone();
+                owner_slot.mutation_generation = new_mutation_generation.clone();
             }
             for child in &old_children {
                 Self::detach_child_from_parent(child, &parent);
@@ -1459,6 +1469,7 @@ impl ObjectHandle {
             slot.state_owners = Rc::new(RefCell::new(Vec::new()));
             slot.stream_token_filters = Rc::new(RefCell::new(Vec::new()));
             slot.content_normalization_applied = Rc::new(Cell::new(false));
+            slot.mutation_generation = Rc::new(Cell::new(0));
         }
         self.register_state_owner();
 
@@ -1500,6 +1511,7 @@ impl ObjectHandle {
             source_owners,
             source_token_filters,
             source_content_normalization_applied,
+            source_mutation_generation,
         ) = {
             let source_slot = source.0.borrow();
             (
@@ -1507,6 +1519,7 @@ impl ObjectHandle {
                 source_slot.state_owners.clone(),
                 source_slot.stream_token_filters.clone(),
                 source_slot.content_normalization_applied.clone(),
+                source_slot.mutation_generation.clone(),
             )
         };
         let old_state = {
@@ -1518,6 +1531,7 @@ impl ObjectHandle {
             target.state_owners = source_owners.clone();
             target.stream_token_filters = source_token_filters;
             target.content_normalization_applied = source_content_normalization_applied;
+            target.mutation_generation = source_mutation_generation;
             old_state
         };
         Self::register_state_owner(self);
@@ -4549,6 +4563,7 @@ impl ObjectHandle {
         for owner in self.state_owner_handles() {
             owner.0.borrow_mut().content_normalization_applied = marker.clone();
         }
+        self.bump_mutation_generation();
     }
 
     /// Register a qpdf-style lazy token filter on this stream. The original
@@ -4573,6 +4588,7 @@ impl ObjectHandle {
             owner.0.borrow_mut().stream_token_filters = filters.clone();
         }
         filters.borrow_mut().push(filter);
+        self.bump_mutation_generation();
         Ok(())
     }
 
@@ -5418,8 +5434,22 @@ impl ObjectHandle {
     // internal sentinels, is a real mutable value-layer slot.
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
         let state = self.0.borrow().state.clone();
-        let mut state = state.borrow_mut();
-        f(Some(&mut state))
+        let result = {
+            let mut state = state.borrow_mut();
+            f(Some(&mut state))
+        };
+        self.bump_mutation_generation();
+        result
+    }
+
+    fn bump_mutation_generation(&self) {
+        let generation = self.0.borrow().mutation_generation.clone();
+        generation.set(generation.get().wrapping_add(1));
+    }
+
+    pub(crate) fn mutation_fingerprint(&self) -> (usize, u64) {
+        let generation = self.0.borrow().mutation_generation.clone();
+        (Rc::as_ptr(&generation) as usize, generation.get())
     }
 
     /// Convert this handle's value into a legacy [`crate::Object`] tree —

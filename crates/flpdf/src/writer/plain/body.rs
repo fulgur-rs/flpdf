@@ -156,8 +156,17 @@ fn emit_source_from_handle<R: Read + Seek>(
     };
 
     if handle.as_stream_dict().is_some() {
-        let (dict, data, refiltered) = if let Some(cached) = plan.cached_stream_outputs.get(&source)
-        {
+        let cached = if let Some(cached) = plan.cached_stream_outputs.get(&source) {
+            if cached.fingerprint == crate::writer::plain::plan::stream_cache_fingerprint(&handle)?
+            {
+                Some(cached)
+            } else {
+                None
+            }
+        } else {
+            None // cov:ignore: every planned indirect source stream receives a cache entry; structural streams bypass this emitter
+        };
+        let (dict, data, refiltered) = if let Some(cached) = cached {
             (cached.dict.clone(), cached.data.clone(), cached.refiltered)
         } else {
             canonical_stream_output(&handle, options)?
@@ -644,12 +653,13 @@ pub(crate) fn canonical_stream_output_for_linearization_with_status(
 ///
 /// The plain writer must know this before it assigns object numbers: qpdf's
 /// `unparseObject` removes those entries before it enqueues dictionary
-/// children (`QPDFWriter.cc:1438-1447`). Probe the same pipeline with a
-/// discard sink so the reachability walk can omit references that the emitted
-/// stream dictionary will no longer contain. A failed filter probe follows
-/// qpdf's retry-to-raw path and therefore returns `false`. Stateful token
-/// filters are excluded here; the plain planner caches their complete output
-/// through [`canonical_stream_output`] instead of running them twice.
+/// children (`QPDFWriter.cc:1438-1455`); the dictionary child walk is
+/// `QPDFWriter.cc:1490-1503`. This helper probes the same pipeline
+/// with a discard sink for writer routes that cannot retain the produced
+/// buffer. A failed filter probe follows qpdf's retry-to-raw path and
+/// therefore returns `false`. The plain planner instead retains the complete
+/// output through [`canonical_stream_output_with_status`] so providers are not
+/// run again during emission.
 pub(crate) fn canonical_stream_will_be_refiltered(
     handle: &ObjectHandle,
     options: &WriterOptions,
@@ -1470,6 +1480,62 @@ mod tests {
         assert!(!bytes
             .windows(b"filtered provider bytes".len())
             .any(|window| window == b"filtered provider bytes"));
+    }
+
+    #[test]
+    fn body_emission_recomputes_cached_output_after_provider_replacement() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            compress_streams: CompressStreams::No,
+            static_id: true,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterOptions::default()
+        };
+        let source = pdf
+            .object_refs()
+            .into_iter()
+            .find_map(|source| {
+                let handle = pdf.get_object_handle(source);
+                pdf.resolve(&handle).ok()?;
+                handle.as_stream_dict().map(|_| source)
+            })
+            .expect("three-page fixture must contain a source stream");
+        let stream = pdf.get_object_handle(source);
+        pdf.resolve(&stream).unwrap();
+        stream
+            .replace_stream_data_with_callback(
+                |pipeline| {
+                    pipeline.write(b"provider A").map_err(crate::Error::from)?;
+                    pipeline.finish().map_err(crate::Error::from)
+                },
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            )
+            .unwrap();
+        pdf.mark_object_handle_dirty(&stream).unwrap();
+
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        stream
+            .replace_stream_data_with_callback(
+                |pipeline| {
+                    pipeline.write(b"provider B").map_err(crate::Error::from)?;
+                    pipeline.finish().map_err(crate::Error::from)
+                },
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            )
+            .unwrap();
+        pdf.mark_object_handle_dirty(&stream).unwrap();
+
+        let (bytes, _) = emit_bodies(&mut pdf, &options, &plan).unwrap();
+        assert!(bytes
+            .windows(b"provider B".len())
+            .any(|window| window == b"provider B"));
+        assert!(!bytes
+            .windows(b"provider A".len())
+            .any(|window| window == b"provider A"));
     }
 
     #[test]

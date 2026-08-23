@@ -46,6 +46,42 @@ pub(crate) struct CachedStreamOutput {
     pub(crate) data: Vec<u8>,
     pub(crate) refiltered: bool,
     pub(crate) parameters_removed: bool,
+    pub(crate) fingerprint: StreamCacheFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamCacheFingerprint {
+    stream: (usize, u64),
+    dictionary: (usize, u64),
+    parameter_handles: Vec<(usize, u64)>,
+}
+
+pub(crate) fn stream_cache_fingerprint(
+    handle: &crate::ObjectHandle,
+) -> crate::Result<StreamCacheFingerprint> {
+    let dictionary = handle
+        .as_stream_dict()
+        .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
+    let mut parameter_handles = Vec::new();
+    for key in [
+        b"/Filter".as_slice(),
+        b"/DecodeParms".as_slice(),
+        b"/F".as_slice(),
+        b"/FFilter".as_slice(),
+        b"/FDecodeParms".as_slice(),
+    ] {
+        let value = dictionary.try_get_key(key)?;
+        if value.try_is_null()? {
+            continue;
+        }
+        value.try_dereference()?;
+        parameter_handles.push(value.mutation_fingerprint());
+    }
+    Ok(StreamCacheFingerprint {
+        stream: handle.mutation_fingerprint(),
+        dictionary: dictionary.mutation_fingerprint(),
+        parameter_handles,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -86,32 +122,37 @@ impl PlainWritePlan {
         let cached_stream_outputs: RefCell<HashMap<ObjectRef, CachedStreamOutput>> =
             RefCell::new(HashMap::new());
         let stream_parameters_removed = |handle: &crate::ObjectHandle| {
-            if handle.is_data_modified() {
-                let Some(source) = handle.object_ref() else {
-                    return Ok(false); // cov:ignore: direct token-filtered streams have no source identity to cache
+            let Some(source) = handle.object_ref() else {
+                return if handle.is_data_modified() {
+                    Ok(false) // cov:ignore: direct token-filtered streams have no source identity to cache
+                } else {
+                    body::canonical_stream_will_be_refiltered(handle, options)
                 };
-                if let Some(parameters_removed) = cached_stream_outputs
-                    .borrow()
-                    .get(&source)
-                    .map(|cached| cached.parameters_removed)
-                {
-                    return Ok(parameters_removed); // cov:ignore: the canonical walk probes each source object once; emission reads this cache directly, so a repeated probe is defensive only
+            };
+            if let Some(cached) = cached_stream_outputs.borrow().get(&source) {
+                if cached.fingerprint == stream_cache_fingerprint(handle)? {
+                    return Ok(cached.parameters_removed); // cov:ignore: the canonical walk probes each source object once; emission reads this cache directly, so a repeated probe is defensive only
                 }
-                let (dict, data, refiltered, parameters_removed) =
-                    body::canonical_stream_output_with_status(handle, options, true, false)?;
-                cached_stream_outputs.borrow_mut().insert(
-                    source,
-                    CachedStreamOutput {
-                        dict,
-                        data,
-                        refiltered,
-                        parameters_removed,
-                    },
-                );
-                Ok(parameters_removed)
-            } else {
-                body::canonical_stream_will_be_refiltered(handle, options)
             }
+
+            // QPDFWriter::willFilterStream retains the produced buffer for the
+            // later unparseObject emission (`QPDFWriter.cc:1239-1314,1539-1560`).
+            // Cache every indirect source stream, not only data-modified ones,
+            // so deferred providers are invoked once across planning and emit.
+            let (dict, data, refiltered, parameters_removed) =
+                body::canonical_stream_output_with_status(handle, options, true, false)?;
+            let fingerprint = stream_cache_fingerprint(handle)?;
+            cached_stream_outputs.borrow_mut().insert(
+                source,
+                CachedStreamOutput {
+                    dict,
+                    data,
+                    refiltered,
+                    parameters_removed,
+                    fingerprint,
+                },
+            );
+            Ok(parameters_removed)
         };
 
         let placement = match options.object_streams {
@@ -800,6 +841,9 @@ mod tests {
     use crate::writer::plain::xref::{append_xref_and_trailer, BodyLayout, IdPlan, TrailerPlan};
     use crate::writer::WriterOptions;
     use crate::{NewlineBeforeEndstream, ObjectHandle, ObjectRef, Pdf, PdfWriter, XrefForm};
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     fn fixture_path(fixture: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -822,6 +866,76 @@ mod tests {
             Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
         let options = write_options(mode);
         PlainWritePlan::build(&mut pdf, &options).unwrap()
+    }
+
+    fn direct_stream_source() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let objects: &[(u32, &[u8])] = &[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+            ),
+            (4, b"<< /Length 3 >>\nstream\nq Q\nendstream"),
+        ];
+        let mut offsets = BTreeMap::new();
+        for (number, body) in objects {
+            offsets.insert(*number, bytes.len() as u64);
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref = bytes.len() as u64;
+        let size = 5;
+        bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+        for number in 1..size {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn plan_handles_direct_streams_without_a_source_cache_identity() {
+        struct PassThroughTokenFilter;
+
+        // cov:ignore-start: the direct-stream planning branch intentionally does not pipe data; this filter only flips qpdf's isDataModified bit.
+        impl crate::token_filter::TokenFilter for PassThroughTokenFilter {
+            fn handle_token(
+                &mut self,
+                token: &crate::tokenizer::Token,
+                output: &mut crate::token_filter::TokenFilterOutput<'_>,
+            ) -> crate::pipeline::PipelineResult<()> {
+                output.write_token(token)
+            }
+        }
+        // cov:ignore-end
+
+        for modified in [false, true] {
+            let mut pdf = Pdf::open_mem_owned(direct_stream_source()).unwrap();
+            let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+            pdf.resolve(&page).unwrap();
+            let direct_stream = ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
+                Rc::new(b"q Q".to_vec()),
+            );
+            page.replace_key(b"Contents", direct_stream).unwrap();
+            let contents = page.get_key(b"Contents");
+            if modified {
+                contents
+                    .add_token_filter(Rc::new(RefCell::new(PassThroughTokenFilter)))
+                    .unwrap();
+            }
+            pdf.mark_object_handle_dirty(&page).unwrap();
+
+            let plan =
+                PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
+            assert_eq!(plan.root, ObjectRef::new(1, 0));
+        }
     }
 
     fn source(source: u32, output: u32) -> PlannedIndirectObject {
