@@ -70,6 +70,14 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// current page list. The returned vector is an owned snapshot, so a later
     /// page insertion or removal requires a fresh call.
     pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+        // QPDFPageDocumentHelper::getAllPages delegates to QPDF::getAllPages,
+        // whose getRoot() boundary throws when the trailer has no /Root
+        // (`libqpdf/QPDF.cc:2355-2360`). Keep the lower-level optimization
+        // preparation helper's no-root no-op contract for its other callers,
+        // but enforce the public page-document boundary here.
+        if self.pdf.root_ref().is_none() {
+            return Err(Error::Missing("/Root"));
+        }
         Ok(crate::pages::repair::prepare_for_optimization(self.pdf)?
             .map(|prepared| prepared.pages)
             .unwrap_or_default())

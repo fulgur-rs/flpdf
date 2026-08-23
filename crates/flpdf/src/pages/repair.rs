@@ -71,9 +71,6 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     };
     let catalog = pdf.get_object_handle(root_ref);
     let mut pages = catalog.try_get_key(b"/Pages")?;
-    if pages.is_null() {
-        return Ok(None);
-    }
 
     // qpdf corrects a catalog that points into the tree by following
     // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Track canonical
@@ -98,6 +95,13 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         if repeated {
             break;
         }
+        // QPDF::getAllPages checks isDictionary before asking the current
+        // node for /Parent. This keeps a missing or scalar /Pages value on
+        // qpdf's warning-tolerant empty-page path rather than manufacturing
+        // a hard page-tree error.
+        if pages.try_as_dictionary()?.is_none() {
+            break;
+        }
         if !pages.try_has_key(b"/Parent")? {
             break;
         }
@@ -119,8 +123,10 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&catalog)?;
     }
 
-    // qpdf's getAllPages returns an empty cache for a dictionary without
-    // `/Kids`, but a scalar `/Pages` value cannot be a page-tree root.
+    // qpdf's getAllPages asks the final node for /Kids even when it is not a
+    // dictionary. That access is observable as a type warning for a missing
+    // or scalar /Pages entry and is followed by an empty page cache.
+    let has_kids = pages.try_has_key(b"/Kids")?;
     if pages.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
@@ -131,7 +137,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         visited_direct: HashSet::new(),
         pages: Vec::new(),
     };
-    if pages.try_has_key(b"/Kids")? {
+    if has_kids {
         repair_page_tree_handle(pdf, pages.clone(), &mut state, 0, false, max_depth)?;
     }
 

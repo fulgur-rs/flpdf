@@ -1684,6 +1684,72 @@ fn json_metadata_tracks_page_enumeration_without_pushing_inherited_resources() {
 }
 
 #[test]
+fn json_missing_catalog_pages_matches_qpdf_warning_contract() {
+    if !qpdf_11_9_available() {
+        return;
+    }
+
+    let mut fixture = tempfile::NamedTempFile::new().unwrap();
+    fixture.write_all(&catalog_without_pages_pdf()).unwrap();
+
+    let cases: [(&[&str], usize); 6] = [
+        (&["--json=2", "--json-key=pages"], 1),
+        (&["--json=2", "--json-key=pagelabels"], 1),
+        (&["--json=2", "--json-key=outlines"], 1),
+        (&["--json=2", "--json-key=acroform"], 1),
+        (&["--json=2"], 4),
+        (&["--json=2", "--json-key=qpdf"], 0),
+    ];
+
+    for (args, expected_warning_count) in cases {
+        let qpdf = std::process::Command::new("qpdf")
+            .args(args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            qpdf.status.code(),
+            Some(if expected_warning_count == 0 { 0 } else { 3 }),
+            "qpdf status for {args:?}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        let qpdf_json: serde_json::Value = serde_json::from_slice(&qpdf.stdout)
+            .unwrap_or_else(|error| panic!("qpdf JSON for {args:?} was invalid: {error}"));
+
+        let flpdf = Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(args)
+            .arg(fixture.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            flpdf.status.code(),
+            Some(if expected_warning_count == 0 { 0 } else { 3 }),
+            "flpdf status for {args:?}: {}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        let flpdf_json: serde_json::Value = serde_json::from_slice(&flpdf.stdout)
+            .unwrap_or_else(|error| panic!("flpdf JSON for {args:?} was invalid: {error}"));
+
+        assert_eq!(flpdf_json, qpdf_json, "JSON mismatch for {args:?}");
+        let warning = "operation for dictionary attempted on object of type null: \
+                       returning false for a key containment request";
+        assert_eq!(
+            String::from_utf8_lossy(&flpdf.stderr)
+                .matches(warning)
+                .count(),
+            expected_warning_count,
+            "warning count for {args:?}: {}",
+            String::from_utf8_lossy(&flpdf.stderr)
+        );
+        assert!(!flpdf
+            .stderr
+            .windows(b"missing required PDF entry: /Pages".len())
+            .any(|window| window == b"missing required PDF entry: /Pages"));
+    }
+}
+
+#[test]
 fn pages_external_source_matches_qpdf_resource_copy_modes() {
     // qpdf 11.9.0's --pages path uses a page-local copy for inherited or
     // shared /Resources when auto fires or yes is explicit. `no` leaves the
@@ -3855,6 +3921,10 @@ fn empty_object_json_pdf() -> Vec<u8> {
         b"6 0 obj\nnull\nendobj\n",
         b"7 0 obj\nendobj\n",
     ])
+}
+
+fn catalog_without_pages_pdf() -> Vec<u8> {
+    build_classic_pdf(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"])
 }
 
 fn top_level_bare_reference_json_pdf() -> Vec<u8> {
