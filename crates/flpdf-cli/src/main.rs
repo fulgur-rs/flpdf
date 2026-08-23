@@ -4976,7 +4976,7 @@ fn apply_rotate_specs<R: std::io::Read + std::io::Seek>(
             RotateSpec::parse(raw).map_err(|e| format!("--rotate: invalid spec {raw:?}: {e}"))?;
         let indices = spec
             .range
-            .resolve_object(total)
+            .resolve(total)
             .map_err(|e| format!("--rotate: page range out of bounds in {raw:?}: {e}"))?;
         let pages: Vec<ObjectRef> = indices
             .iter()
@@ -8017,12 +8017,7 @@ mod tests {
 
         let explicit = build_overlay_specs(&spec(Some("2")), false).unwrap();
         assert_eq!(
-            explicit[0]
-                .repeat
-                .as_ref()
-                .unwrap()
-                .resolve_object(3)
-                .unwrap(),
+            explicit[0].repeat.as_ref().unwrap().resolve(3).unwrap(),
             vec![2]
         );
     }
