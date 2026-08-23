@@ -193,11 +193,46 @@ fn own_page_attributes_of(path: &Path) -> Vec<(bool, bool)> {
         .map(|object| {
             let selector = format!("--show-object={object}");
             let output = flpdf_ok(&[&selector, path.to_str().unwrap()]);
-            let has_media_box = output.split_whitespace().any(|token| token == "/MediaBox");
-            let has_rotate = output.split_whitespace().any(|token| token == "/Rotate");
-            (has_media_box, has_rotate)
+            let keys = top_level_dict_keys(&output);
+            (keys.contains(&"/MediaBox"), keys.contains(&"/Rotate"))
         })
         .collect()
+}
+
+/// Return the key tokens that appear directly inside the outermost `<< >>`
+/// dictionary of `output` (as `--show-object` prints one object per
+/// invocation), skipping any nested dictionary or array. A `/Name` token
+/// nested inside a value (e.g. `/Resources << /XObject << /Rotate 4 0 R >>
+/// >>`) must not be mistaken for a key the outer dictionary itself owns.
+fn top_level_dict_keys(output: &str) -> Vec<&str> {
+    let mut depth = 0i32;
+    let mut keys = Vec::new();
+    for token in output.split_whitespace() {
+        match token {
+            "<<" => depth += 1,
+            ">>" => depth -= 1,
+            "[" => depth += 1,
+            "]" => depth -= 1,
+            name if depth == 1 && name.starts_with('/') => keys.push(name),
+            _ => {}
+        }
+    }
+    keys
+}
+
+#[test]
+fn top_level_dict_keys_ignores_nested_names_with_the_same_key_name() {
+    // A page with a nested /Resources /XObject dictionary that happens to
+    // contain a key literally named /Rotate must not be reported as if the
+    // page dictionary itself owned /Rotate.
+    let output = "<< /Resources << /XObject << /Rotate 4 0 R >> >> /Type /Page >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        !keys.contains(&"/Rotate"),
+        "a /Rotate key nested inside /Resources/XObject must not count as an own key: {keys:?}"
+    );
+    assert!(keys.contains(&"/Resources"), "got {keys:?}");
+    assert!(keys.contains(&"/Type"), "got {keys:?}");
 }
 
 fn assert_own_page_attributes_match(qpdf_output: &Path, flpdf_output: &Path) {
@@ -258,6 +293,50 @@ fn matrix_own_page_keys_do_not_use_inherited_show_pages_values() {
         vec![(false, false)]
     );
     assert_eq!(own_page_attributes_of(direct.path()), vec![(true, true)]);
+}
+
+#[test]
+fn matrix_pages_materializes_inherited_own_keys_like_qpdf() {
+    // The static comparison above only checks the two source fixtures
+    // directly; it never sends the inherited variant through a page
+    // operation. `--pages` selection flattens the page tree
+    // (`QPDFPageObjectHelper::getAttribute`, `QPDFPageObjectHelper.cc:
+    // 218-262`), so both tools must materialize the inherited /MediaBox and
+    // /Rotate as *own* keys on the selected output page — a regression that
+    // dropped or mis-copied an inherited attribute during --pages would
+    // otherwise go undetected, since every other operation cell in this
+    // matrix uses fixtures whose pages already own these keys directly.
+    if !qpdf_available() {
+        return;
+    }
+    let src = page_attribute_presence_pdf(false);
+    let tmp = tempfile::tempdir().unwrap();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    run_qpdf(&[
+        src.path().to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    flpdf_ok(&[
+        src.path().to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        "--",
+        f.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        own_page_attributes_of(&q),
+        vec![(true, true)],
+        "qpdf --pages must materialize the inherited attributes as own keys"
+    );
+    assert_own_page_attributes_match(&q, &f);
 }
 
 /// Write a structurally valid `n`-page PDF whose pages have *distinct*
