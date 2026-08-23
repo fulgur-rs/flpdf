@@ -120,3 +120,22 @@ fn thread_bead_production_uses_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn thread_bead_tests_have_no_raw_snapshot_route() {
+    let source = include_str!("../src/thread_bead_p.rs");
+    for legacy in [
+        "Object::",
+        "Dictionary",
+        "materialize",
+        "parse_object",
+        "set_object(",
+        "resolve_borrowed",
+        "resolve_object(",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "thread_bead_p still contains the raw test route marker {legacy:?}"
+        );
+    }
+}
