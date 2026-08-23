@@ -25,7 +25,8 @@ pub(crate) use planning::{
 
 #[cfg(test)]
 pub(crate) use planning::{
-    plan_object_streams, plan_qpdf_preserve_object_streams, DEFAULT_BATCH_SIZE_CAP,
+    plan_object_streams, plan_preserve_for_test, plan_qpdf_preserve_object_streams,
+    DEFAULT_BATCH_SIZE_CAP,
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1010,6 +1011,18 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], ObjectRef::new(2, 0));
         assert_eq!(batch[1], ObjectRef::new(3, 0));
+    }
+
+    #[test]
+    fn planner_preserve_skips_indirect_length_exclusions() {
+        let mut pdf = open_pdf(one_objstm_pdf_n(&[b"(hello)"]));
+        let ctx = eligibility_context(&mut pdf).unwrap();
+        let exclusions = BTreeSet::from([ObjectRef::new(2, 0)]);
+
+        let plan =
+            plan_preserve_for_test(&mut pdf, &ctx, &exclusions, NonZeroUsize::new(100).unwrap())
+                .unwrap();
+        assert_eq!(plan.batches, vec![vec![ObjectRef::new(3, 0)]]);
     }
 
     #[test]

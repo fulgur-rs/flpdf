@@ -348,6 +348,16 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn plan_preserve_for_test<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::Pdf<R>,
+    ctx: &EligibilityContext,
+    length_exclusions: &BTreeSet<ObjectRef>,
+    batch_size_cap: NonZeroUsize,
+) -> crate::Result<PackingPlan> {
+    plan_preserve(pdf, ctx, length_exclusions, batch_size_cap)
+}
+
 /// Generate mode: greedily pack all eligible objects in number/generation order.
 fn plan_generate<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
@@ -356,25 +366,9 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
 ) -> crate::Result<PackingPlan> {
-    // Collect refs, excluding free (deleted) entries — they resolve to Null but
-    // are not real objects and must never be placed in an ObjStm.
-    let source_entries = pdf.source_xref_entries();
-    let free_refs: BTreeSet<ObjectRef> = source_entries
-        .iter()
-        .filter_map(|(r, offset)| {
-            if matches!(offset, XrefEntry::Free { .. }) {
-                Some(*r)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let mut refs: Vec<ObjectRef> = pdf
-        .object_refs()
-        .into_iter()
-        .filter(|r| !free_refs.contains(r))
-        .collect();
+    // `Pdf::object_refs` mirrors qpdf's live-object enumeration and excludes
+    // free/deleted entries, which are not real objects for ObjStm placement.
+    let mut refs: Vec<ObjectRef> = pdf.object_refs().into_iter().collect();
     refs.sort_by_key(|r| (r.number, r.generation));
 
     let cap = config.batch_size_cap.get();
