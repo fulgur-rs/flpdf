@@ -84,3 +84,39 @@ fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn thread_bead_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/thread_bead_p.rs");
+    // Split at the `mod tests` boundary, not the first `#[cfg(test)]`: an
+    // earlier, narrower `#[cfg(test)]` gates only a single test-only import
+    // line above every production function, so stopping there would leave
+    // `production` covering just the module doc and imports.
+    let (before_tests, _) = source
+        .split_once("mod tests {")
+        .expect("thread_bead_p has a test module");
+    // Filter by trimmed line content, not a literal multi-line `\n`-joined
+    // substring: `include_str!` reflects the file's on-disk line endings, and
+    // a `\r\n` checkout (Windows) would otherwise silently fail to match.
+    let production: String = before_tests
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed != "#[cfg(test)]" && trimmed != "use crate::{Dictionary, Object};"
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_ref_chain",
+        "Object::",
+        "pdf.set_object(",
+        "use crate::{Dictionary, Object",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "thread_bead_p production still contains the raw route marker {legacy:?}"
+        );
+    }
+}
