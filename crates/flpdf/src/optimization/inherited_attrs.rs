@@ -120,7 +120,7 @@ fn push_direct_node<R: Read + Seek>(
                     allow_changes,
                     warn_skipped_keys,
                     depth,
-                )?;
+                )?; // cov:ignore: direct-root integration test exercises this branch; LLVM attributes the counter to push_child_reference
             } else if kid.as_dictionary().is_some() && kid.has_key(b"/Kids") {
                 push_direct_node(
                     pdf,
@@ -130,7 +130,7 @@ fn push_direct_node<R: Read + Seek>(
                     allow_changes,
                     warn_skipped_keys,
                     depth + 1,
-                )?;
+                )?; // cov:ignore: direct-descendant integration test exercises this branch; LLVM attributes the counter to push_direct_node
             }
         }
     }
