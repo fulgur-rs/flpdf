@@ -326,11 +326,10 @@ fn resolve_rect_array<R: Read + Seek>(
     node: ObjectRef,
     key: &[u8],
 ) -> Result<Option<Vec<ObjectHandle>>> {
-    let resolved = if val.is_indirect() || val.as_reference().is_some() {
-        pdf.resolve_to_terminal(&val)?
-    } else {
-        val
-    };
+    if val.is_indirect() || val.as_reference().is_some() {
+        pdf.resolve(&val)?;
+    }
+    let resolved = val;
     let Some(arr) = resolved.as_array() else {
         if resolved.is_null() {
             return Ok(None);
@@ -454,11 +453,10 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 
         if let Some(val) = rotate_val {
             // /Rotate may be stored as an indirect reference; resolve it first.
-            let resolved = if val.is_indirect() || val.as_reference().is_some() {
-                pdf.resolve_to_terminal(&val)?
-            } else {
-                val
-            };
+            if val.is_indirect() || val.as_reference().is_some() {
+                pdf.resolve(&val)?;
+            }
+            let resolved = val;
             if let Some(n) = resolved.as_integer() {
                 return Ok((true, n as i32));
             }
@@ -491,11 +489,10 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
     let Some(val) = uu_val else {
         return Ok((false, 1.0));
     };
-    let resolved = if val.is_indirect() || val.as_reference().is_some() {
-        pdf.resolve_to_terminal(&val)?
-    } else {
-        val
-    };
+    if val.is_indirect() || val.as_reference().is_some() {
+        pdf.resolve(&val)?;
+    }
+    let resolved = val;
     if resolved.is_null() {
         Ok((false, 1.0))
     } else {
@@ -575,12 +572,10 @@ fn page_group<R: Read + Seek>(
         None => Ok(None),
         Some(value) if value.is_null() => Ok(None),
         // shallowCopy: materialize the top level only (ref -> direct dict).
-        // cov:ignore-start: test-only indirect /Group characterization is covered by focused Form-XObject tests
         Some(value) if value.is_indirect() || value.as_reference().is_some() => {
             pdf.resolve(&value)?;
             Ok(Some(value.shallow_copy()?))
         }
-        // cov:ignore-end
         Some(direct) => Ok(Some(direct)),
     }
 }
@@ -1531,6 +1526,23 @@ mod tests {
         let got = page_group(&mut pdf, ObjectRef::new(3, 0))
             .unwrap()
             .expect("a present direct /Group dict must be returned");
+        assert!(got.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn page_group_shallow_copies_indirect_group() {
+        // qpdf's getFormXObjectForPage stores getAttribute("/Group", false)
+        // .shallowCopy(): an indirect /Group is resolved one level into a
+        // direct dictionary (libqpdf/QPDFPageObjectHelper.cc:706-733).
+        let mut pdf = open(one_page_doc(
+            "/Group 6 0 R",
+            "x",
+            &[(6, "<< /Type /Group /S /Transparency >>")],
+        ));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .expect("an indirect /Group must shallow-copy to a direct dict");
+        assert!(got.is_direct());
         assert!(got.as_dictionary().is_some());
     }
 
