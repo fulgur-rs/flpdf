@@ -58,6 +58,75 @@ enum WriterOutput {
     Pipeline(Box<dyn Pipeline>),
 }
 
+struct WriterOutputSink<'a> {
+    output: &'a mut WriterOutput,
+    failure: Option<Error>,
+}
+
+impl<'a> WriterOutputSink<'a> {
+    fn new(output: &'a mut WriterOutput) -> Self {
+        Self {
+            output,
+            failure: None,
+        }
+    }
+
+    fn finish_output(&mut self) -> Result<()> {
+        match self.output {
+            WriterOutput::Memory(_) => Ok(()),
+            WriterOutput::Writer(writer) => {
+                writer.flush()?;
+                Ok(())
+            }
+            WriterOutput::Pipeline(pipeline) => {
+                pipeline.finish()?;
+                Ok(())
+            }
+        }
+    }
+
+    fn take_failure(&mut self) -> Option<Error> {
+        self.failure.take()
+    }
+}
+
+impl Write for WriterOutputSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.output {
+            WriterOutput::Memory(buffer) => {
+                buffer.get_or_insert_with(Vec::new).extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            WriterOutput::Writer(writer) => match writer.write(bytes) {
+                Ok(written) => Ok(written),
+                Err(error) => {
+                    self.failure = Some(Error::Io(std::io::Error::new(
+                        error.kind(),
+                        error.to_string(),
+                    )));
+                    Err(error)
+                }
+            },
+            WriterOutput::Pipeline(pipeline) => match pipeline.write(bytes) {
+                Ok(()) => Ok(bytes.len()),
+                Err(error) => {
+                    let failure: Error = error.into();
+                    let message = failure.to_string();
+                    self.failure = Some(failure);
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, message))
+                }
+            },
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.output {
+            WriterOutput::Memory(_) | WriterOutput::Pipeline(_) => Ok(()),
+            WriterOutput::Writer(writer) => writer.flush(),
+        }
+    }
+}
+
 impl WriterOutput {
     fn write_complete(&mut self, bytes: Vec<u8>) -> Result<()> {
         match self {
@@ -547,23 +616,45 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             0,
             self.settings.linearization,
         )?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
-        let (bytes, result) = if self.settings.linearization {
+        let result = if self.settings.linearization {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
             let (mut document, result) =
                 write_linearized_for_pdf_writer(self.pdf, &options, pass1_path)?;
             document.back_patch()?;
-            (document.bytes, result)
+            self.output
+                .as_mut()
+                .expect("output was checked before writing")
+                .write_complete(document.bytes)?;
+            result
         } else {
-            let mut bytes = Vec::new();
-            let result = emit_canonical_pdf(self.pdf, &mut bytes, &options)?;
-            (bytes, result)
+            if matches!(self.output.as_ref(), Some(WriterOutput::Memory(_))) {
+                // The emitter owns the only complete output Vec. Move that Vec
+                // into the memory sink after emission rather than copying it
+                // through WriterOutput::write_complete.
+                let mut bytes = Vec::new();
+                let result = emit_canonical_pdf(self.pdf, &mut bytes, &options)?;
+                if let Some(WriterOutput::Memory(buffer)) = self.output.as_mut() {
+                    *buffer = Some(bytes);
+                }
+                result
+            } else {
+                let output = self
+                    .output
+                    .as_mut()
+                    .expect("output was checked before writing");
+                let mut sink = WriterOutputSink::new(output);
+                let result = match emit_canonical_pdf(self.pdf, &mut sink, &options) {
+                    Ok(result) => {
+                        sink.finish_output()?;
+                        result
+                    }
+                    Err(error) => return Err(sink.take_failure().unwrap_or(error)),
+                };
+                result
+            }
         };
 
-        self.output
-            .as_mut()
-            .expect("output was checked before writing")
-            .write_complete(bytes)?;
         report_progress_finished(&options);
         self.result = Some(result);
         self.write_succeeded = true;
