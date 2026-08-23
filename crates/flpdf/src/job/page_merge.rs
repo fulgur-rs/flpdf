@@ -1315,7 +1315,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             // logical value via `source.resolve()` regardless of
             // compression, so excluding only the container here does not
             // lose any member; flpdf's own writer
-            // (`writer/object_streams.rs`) already owns (re)compressing the
+            // (`writer/object_streams/{planning,emission}.rs`) already owns (re)compressing the
             // copied members into fresh containers. Without this exclusion,
             // the container's raw stream would be copied as an ordinary
             // object, duplicating its still-live members' content in a

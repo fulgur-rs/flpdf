@@ -5,7 +5,7 @@ pub(crate) mod encrypted_strings;
 pub(crate) mod encryption_state;
 #[path = "writer/object.rs"]
 pub(crate) mod object;
-#[path = "writer/object_streams.rs"]
+#[path = "writer/object_streams/mod.rs"]
 pub(crate) mod object_streams;
 #[path = "writer/pclm.rs"]
 pub(crate) mod pclm;
