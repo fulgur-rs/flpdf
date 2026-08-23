@@ -131,7 +131,7 @@ fn push_direct_node<R: Read + Seek>(
                     warn_skipped_keys,
                     depth + 1,
                 )?; // cov:ignore: direct-descendant integration test exercises this branch; LLVM attributes the counter to push_direct_node
-            }
+            } // cov:ignore: direct-descendant integration test exercises the branch; LLVM attributes the counter to the recursive callee
         }
     }
     pop_node_attributes(key_ancestors, own_keys);
