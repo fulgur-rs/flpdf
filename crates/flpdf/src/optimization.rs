@@ -3,7 +3,7 @@
 pub(crate) mod inherited_attrs;
 
 use crate::object::MAX_INLINE_DEPTH;
-use crate::{Object, ObjectRef, Pdf, Stream};
+use crate::{ObjectHandle, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::sync::OnceLock;
@@ -92,7 +92,7 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &Stream) -> u8,
+        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
     {
         let prepared = Self::prepare_pdf(pdf, allow_changes)?;
         let page_refs = prepared
@@ -109,13 +109,16 @@ impl Optimization {
         allow_changes: bool,
     ) -> crate::Result<Option<crate::pages::repair::PreparedPages>> {
         if let Some(root_ref) = pdf.root_ref() {
-            if let Object::Dictionary(mut root) = pdf.resolve_object(root_ref)? {
-                if let Some(Object::Dictionary(outlines)) = root.get("Outlines").cloned() {
-                    let outlines_ref = next_object_ref(pdf)?;
-                    pdf.set_object(outlines_ref, Object::Dictionary(outlines));
-                    root.insert("Outlines", Object::Reference(outlines_ref));
-                    pdf.set_object(root_ref, Object::Dictionary(root));
-                }
+            let root = pdf.get_object_handle(root_ref);
+            pdf.resolve(&root)?;
+            let outlines = root.try_get_key(b"/Outlines")?;
+            if outlines.try_as_dictionary()?.is_some() && outlines.is_direct() {
+                // qpdf's optimize makes a direct /Outlines dictionary indirect
+                // without cloning its live allocation
+                // (libqpdf/QPDF_optimization.cc:73-77).
+                let outlines = pdf.make_indirect_from_object_handle(outlines)?;
+                root.replace_key(b"/Outlines", outlines)?;
+                pdf.mark_object_handle_dirty(&root)?;
             }
         }
 
@@ -167,44 +170,41 @@ impl Optimization {
     ) -> crate::Result<Self>
     where
         R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &Stream) -> u8,
+        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
     {
         let mut maps = Self::default();
 
         for (page_number, &page_ref) in page_refs.iter().enumerate() {
+            let page = pdf.get_object_handle(page_ref);
             maps.update_object_maps(
-                pdf,
                 ObjectUser::Page(page_number as u32),
-                Object::Reference(page_ref),
+                page,
                 &mut skip_stream_parameters,
             )?;
         }
 
-        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
-        for (key, value) in crate::qpdf_null::visible_entries(pdf, trailer_entries)? {
-            if key != b"Root" {
-                let update = maps.update_object_maps(
-                    pdf,
-                    ObjectUser::TrailerKey(key),
-                    value,
+        let trailer = pdf.trailer();
+        for key in trailer.try_get_keys()? {
+            if key != b"/Root" {
+                let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
+                maps.update_object_maps(
+                    ObjectUser::TrailerKey(user_key),
+                    trailer.try_get_key(&key)?,
                     &mut skip_stream_parameters,
-                );
-                update?;
+                )?;
             }
         }
 
         if let Some(root_ref) = pdf.root_ref() {
-            if let Object::Dictionary(root) = pdf.resolve_object(root_ref)? {
-                let root_entries = crate::qpdf_null::snapshot_entries(&root, false);
-                for (key, value) in crate::qpdf_null::visible_entries(pdf, root_entries)? {
-                    let update = maps.update_object_maps(
-                        pdf,
-                        ObjectUser::RootKey(key),
-                        value,
-                        &mut skip_stream_parameters,
-                    );
-                    update?;
-                }
+            let root = pdf.get_object_handle(root_ref);
+            pdf.resolve(&root)?;
+            for key in root.try_get_keys()? {
+                let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
+                maps.update_object_maps(
+                    ObjectUser::RootKey(user_key),
+                    root.try_get_key(&key)?,
+                    &mut skip_stream_parameters,
+                )?;
             }
             maps.record(ObjectUser::Root, root_ref);
         }
@@ -212,24 +212,20 @@ impl Optimization {
         Ok(maps)
     }
 
-    fn update_object_maps<R, F>(
+    fn update_object_maps<F>(
         &mut self,
-        pdf: &mut Pdf<R>,
         user: ObjectUser,
-        object: Object,
+        object: ObjectHandle,
         skip_stream_parameters: &mut F,
     ) -> crate::Result<()>
     where
-        R: Read + Seek,
-        F: FnMut(Option<ObjectRef>, &Stream) -> u8,
+        F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
     {
         let mut visited = BTreeSet::new();
         let mut stack = vec![Pending {
             object,
-            object_ref: None,
             user,
             top: true,
-            via_array: false,
             inline_depth: 0,
         }];
 
@@ -240,109 +236,78 @@ impl Optimization {
                 )));
             }
 
-            match pending.object {
-                Object::Reference(object_ref) => {
-                    let reference = Object::Reference(object_ref);
-                    if crate::qpdf_null::value_is_null(pdf, &reference)? {
-                        if !visited.insert(object_ref) {
-                            continue;
-                        }
-                        if pending.via_array && object_ref.number > 0 {
-                            self.record(pending.user, object_ref);
-                        }
-                        continue;
-                    }
+            pending.object.try_dereference()?;
+            if is_page(&pending.object)? && !pending.top {
+                continue;
+            }
+            if let Some(object_ref) = pending.object.object_ref() {
+                if !visited.insert(object_ref) {
+                    continue;
+                }
+                self.record(pending.user.clone(), object_ref);
+            }
+            if pending.object.try_is_null()? {
+                continue;
+            }
+            // The inline-depth guard counts only direct container nesting.
+            // Crossing an indirect handle resets that count, matching the
+            // old resolver's reference arm and qpdf's handle traversal.
+            let inline_depth = if pending.object.is_indirect() {
+                0
+            } else {
+                pending.inline_depth
+            };
 
-                    let resolved = pdf.resolve_object(object_ref)?;
-                    if is_page(&resolved) && !pending.top {
-                        continue;
-                    }
-                    if !visited.insert(object_ref) {
-                        continue;
-                    }
-                    self.record(pending.user.clone(), object_ref);
+            if let Some(items) = pending.object.try_as_array()? {
+                for item in items.into_iter().rev() {
                     stack.push(Pending {
-                        object: resolved,
-                        object_ref: Some(object_ref),
-                        user: pending.user,
-                        top: pending.top,
-                        via_array: false,
-                        inline_depth: 0,
+                        object: item,
+                        user: pending.user.clone(),
+                        top: false,
+                        inline_depth: inline_depth + 1,
                     });
                 }
-                Object::Array(items) => {
-                    for item in items.into_iter().rev() {
-                        stack.push(Pending {
-                            object: item,
-                            object_ref: None,
-                            user: pending.user.clone(),
-                            top: false,
-                            via_array: true,
-                            inline_depth: pending.inline_depth + 1,
-                        });
-                    }
-                }
-                Object::Dictionary(dict) => {
-                    let page = is_page_dictionary(&dict);
-                    if page && !pending.top {
+                continue;
+            }
+
+            if let Some(stream_dict) = pending.object.as_stream_dict() {
+                let skip_level =
+                    skip_stream_parameters(pending.object.object_ref(), &pending.object);
+                for key in stream_dict.try_get_keys()?.into_iter().rev() {
+                    if (skip_level >= 1 && key == b"/Length")
+                        || (skip_level >= 2
+                            && matches!(key.as_slice(), b"/Filter" | b"/DecodeParms"))
+                    {
                         continue;
                     }
+                    stack.push(Pending {
+                        object: stream_dict.try_get_key(&key)?,
+                        user: pending.user.clone(),
+                        top: false,
+                        inline_depth: inline_depth + 1,
+                    });
+                }
+                continue;
+            }
 
-                    let entries = crate::qpdf_null::snapshot_entries(&dict, false);
-                    let mut children = Vec::new();
-                    for (key, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                        if page && key == b"Parent" {
-                            continue;
-                        }
-                        let child_user = if page && key == b"Thumb" {
-                            ObjectUser::Thumbnail(pending.user.page_number())
-                        } else {
-                            pending.user.clone()
-                        };
-                        children.push((value, child_user));
+            if pending.object.try_as_dictionary()?.is_some() {
+                let page = is_page(&pending.object)?;
+                for key in pending.object.try_get_keys()?.into_iter().rev() {
+                    if page && key == b"/Parent" {
+                        continue;
                     }
-                    for (object, user) in children.into_iter().rev() {
-                        stack.push(Pending {
-                            object,
-                            object_ref: None,
-                            user,
-                            top: false,
-                            via_array: false,
-                            inline_depth: pending.inline_depth + 1,
-                        });
-                    }
+                    let child_user = if page && key == b"/Thumb" {
+                        ObjectUser::Thumbnail(pending.user.page_number())
+                    } else {
+                        pending.user.clone()
+                    };
+                    stack.push(Pending {
+                        object: pending.object.try_get_key(&key)?,
+                        user: child_user,
+                        top: false,
+                        inline_depth: inline_depth + 1,
+                    });
                 }
-                Object::Stream(stream) => {
-                    let skip_level = skip_stream_parameters(pending.object_ref, &stream);
-                    let entries = crate::qpdf_null::snapshot_entries(&stream.dict, false);
-                    let entries = entries
-                        .into_iter()
-                        .filter(|(key, _)| {
-                            !((skip_level >= 1 && key == b"Length")
-                                || (skip_level >= 2 && (key == b"Filter" || key == b"DecodeParms")))
-                        })
-                        .collect();
-                    let children = crate::qpdf_null::visible_entries(pdf, entries)?;
-                    for (_, object) in children.into_iter().rev() {
-                        stack.push(Pending {
-                            object,
-                            object_ref: None,
-                            user: pending.user.clone(),
-                            top: false,
-                            via_array: false,
-                            inline_depth: pending.inline_depth + 1,
-                        });
-                    }
-                }
-                Object::Null
-                | Object::Boolean(_)
-                | Object::Integer(_)
-                | Object::Real(_)
-                | Object::RealLiteral { .. }
-                | Object::Name(_)
-                | Object::String(_)
-                | Object::Operator(_)
-                | Object::InlineImage(_) => {}
             }
         }
 
@@ -360,20 +325,14 @@ impl ObjectUser {
 }
 
 struct Pending {
-    object: Object,
-    object_ref: Option<ObjectRef>,
+    object: ObjectHandle,
     user: ObjectUser,
     top: bool,
-    via_array: bool,
     inline_depth: usize,
 }
 
-fn is_page(object: &Object) -> bool {
-    matches!(object, Object::Dictionary(dict) if is_page_dictionary(dict))
-}
-
-fn is_page_dictionary(dict: &crate::Dictionary) -> bool {
-    matches!(dict.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"Page")
+fn is_page(object: &ObjectHandle) -> crate::Result<bool> {
+    object.try_is_dictionary_of_type(b"Page", b"")
 }
 
 fn empty_object_refs() -> &'static BTreeSet<ObjectRef> {
@@ -386,22 +345,10 @@ fn empty_object_users() -> &'static BTreeSet<ObjectUser> {
     EMPTY.get_or_init(BTreeSet::new)
 }
 
-fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> crate::Result<ObjectRef> {
-    let number = pdf
-        .object_refs()
-        .into_iter()
-        .map(|object_ref| object_ref.number)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| crate::Error::Unsupported("object-number space exhausted".to_owned()))?;
-    Ok(ObjectRef::new(number, 0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ObjectUser, Optimization};
-    use crate::{Object, ObjectRef, Pdf};
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
@@ -442,10 +389,10 @@ mod tests {
             .expect("object-user maps should build")
     }
 
-    fn too_deep_object() -> Object {
-        let mut nested = Object::Null;
+    fn too_deep_handle() -> ObjectHandle {
+        let mut nested = ObjectHandle::null();
         for _ in 0..=crate::object::MAX_INLINE_DEPTH {
-            nested = Object::Array(vec![nested]);
+            nested = ObjectHandle::array(vec![nested]);
         }
         nested
     }
@@ -470,6 +417,10 @@ mod tests {
     #[test]
     fn optimize_makes_direct_outlines_indirect_before_building_maps() {
         let mut pdf = direct_outlines_pdf();
+        let catalog = pdf.get_object_handle(pdf.root_ref().unwrap());
+        pdf.resolve(&catalog).unwrap();
+        let outlines = catalog.get_key(b"/Outlines");
+        assert!(outlines.is_direct());
 
         let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_, _| 1).unwrap();
 
@@ -478,12 +429,11 @@ mod tests {
                 .len(),
             1
         );
-        let catalog = pdf.resolve_object(pdf.root_ref().unwrap()).unwrap();
-        assert!(matches!(
-            catalog,
-            Object::Dictionary(ref dict)
-                if matches!(dict.get("Outlines"), Some(Object::Reference(_)))
-        ));
+        assert!(
+            outlines.is_indirect(),
+            "promotion must mutate the existing live handle"
+        );
+        assert!(catalog.get_key(b"/Outlines").is_indirect());
     }
 
     #[test]
@@ -493,11 +443,9 @@ mod tests {
 
         Optimization::optimize(&mut pdf, &BTreeMap::new(), false, |_, _| 1).unwrap();
 
-        assert!(matches!(
-            pdf.resolve_object(root).unwrap(),
-            Object::Dictionary(ref dict)
-                if matches!(dict.get("Outlines"), Some(Object::Reference(_)))
-        ));
+        let root_handle = pdf.get_object_handle(root);
+        pdf.resolve(&root_handle).unwrap();
+        assert!(root_handle.get_key(b"/Outlines").is_indirect());
     }
 
     #[test]
@@ -508,7 +456,9 @@ mod tests {
         let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_, _| 1).unwrap();
 
         assert!(maps.users_for(root).contains(&ObjectUser::Root));
-        assert!(matches!(pdf.resolve_object(root).unwrap(), Object::Null));
+        let root_handle = pdf.get_object_handle(root);
+        pdf.resolve(&root_handle).unwrap();
+        assert!(root_handle.is_null());
     }
 
     #[test]
@@ -865,7 +815,9 @@ mod tests {
             ],
             b"/CustomTrailer 5 0 R",
         );
-        trailer_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
+        trailer_pdf
+            .set_object_handle(ObjectRef::new(5, 0), too_deep_handle())
+            .unwrap();
         let error = Optimization::build_maps(&mut trailer_pdf, &[], |_, _| 1)
             .expect_err("trailer traversal error must propagate");
         assert!(matches!(error, crate::Error::Unsupported(_)));
@@ -882,7 +834,9 @@ mod tests {
             ],
             b"",
         );
-        catalog_pdf.set_object(ObjectRef::new(5, 0), too_deep_object());
+        catalog_pdf
+            .set_object_handle(ObjectRef::new(5, 0), too_deep_handle())
+            .unwrap();
         let error = Optimization::build_maps(&mut catalog_pdf, &[], |_, _| 1)
             .expect_err("catalog traversal error must propagate");
         assert!(matches!(error, crate::Error::Unsupported(_)));
@@ -903,13 +857,10 @@ mod tests {
         );
         Optimization::prepare_for_linearized_write(&mut pdf).unwrap();
         let pages = crate::pages::page_refs(&mut pdf).unwrap();
-        let mut page = pdf
-            .resolve_object(ObjectRef::new(3, 0))
-            .unwrap()
-            .into_dict()
-            .expect("page should be a dictionary");
-        page.insert("Deep", too_deep_object());
-        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Deep", too_deep_handle()).unwrap();
+        pdf.mark_object_handle_dirty(&page).unwrap();
 
         let error = Optimization::build_maps(&mut pdf, &pages, |_, _| 1)
             .expect_err("excessive direct nesting must fail");
@@ -917,5 +868,40 @@ mod tests {
             matches!(error, crate::Error::Unsupported(ref message) if message.contains("inline object nesting exceeds maximum")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn indirect_edges_reset_inline_depth_before_traversing_the_target() {
+        let mut pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+                (4, b"null"),
+            ],
+            b"",
+        );
+        pdf.set_object_handle(
+            ObjectRef::new(4, 0),
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        )
+        .unwrap();
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        let mut nested = pdf.get_object_handle(ObjectRef::new(4, 0));
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH - 1) {
+            nested = ObjectHandle::array(vec![nested]);
+        }
+        page.replace_key(b"/Nested", nested).unwrap();
+        pdf.mark_object_handle_dirty(&page).unwrap();
+
+        let maps = build_maps(&mut pdf, 1);
+        assert!(maps
+            .objects_for(&ObjectUser::Page(0))
+            .contains(&ObjectRef::new(4, 0)));
     }
 }
