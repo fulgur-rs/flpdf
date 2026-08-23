@@ -3,12 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-use crate::object::{Object, ObjectRef};
+use crate::object_handle::is_scalar;
 use crate::pages::repair::{PageTreeRoot, PreparedPages};
-use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
+use crate::{ObjectHandle, ObjectRef};
 
-const INHERITABLE_KEYS: [&[u8]; 4] = [b"CropBox", b"MediaBox", b"Resources", b"Rotate"];
+const INHERITABLE_KEYS: [&[u8]; 4] = [b"/CropBox", b"/MediaBox", b"/Resources", b"/Rotate"];
 const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 
 pub(crate) fn push<R: Read + Seek>(
@@ -17,7 +17,7 @@ pub(crate) fn push<R: Read + Seek>(
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<()> {
-    let mut key_ancestors: BTreeMap<&'static [u8], Vec<Object>> = BTreeMap::new();
+    let mut key_ancestors: BTreeMap<&'static [u8], Vec<ObjectHandle>> = BTreeMap::new();
     let mut visited = BTreeSet::new();
     match prepared.root {
         PageTreeRoot::Indirect(root) => push_internal(
@@ -48,37 +48,35 @@ pub(crate) fn push<R: Read + Seek>(
 fn push_direct_root<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     catalog_ref: ObjectRef,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
 ) -> Result<()> {
     // cov:ignore-start: PreparedPages::Direct is created and consumed without an intervening public mutation
-    let Object::Dictionary(mut catalog) = pdf.resolve_object(catalog_ref)? else {
+    let catalog = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog)?;
+    let pages = catalog.get_key(b"/Pages");
+    if pages.as_dictionary().is_none() {
         return Ok(());
-    };
-    let Some(Object::Dictionary(mut root)) = catalog.get("Pages").cloned() else {
-        return Ok(());
-    };
+    }
     // cov:ignore-end
     push_direct_node(
         pdf,
-        &mut root,
+        &pages,
         key_ancestors,
         visited,
         allow_changes,
         warn_skipped_keys,
         0,
     )?;
-    catalog.insert("Pages", Object::Dictionary(root));
-    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     Ok(())
 }
 
 fn push_direct_node<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dict: &mut crate::Dictionary,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
+    dict: &ObjectHandle,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
@@ -90,21 +88,20 @@ fn push_direct_node<R: Read + Seek>(
             "page tree depth exceeds maximum of {MAX_DEPTH} in direct /Pages node"
         )));
     }
-    if !matches!(dict.get("Type"), Some(Object::Name(name)) if name == b"Pages") {
+    if !is_pages_dictionary(dict) {
         return Ok(());
     }
     // cov:ignore-end
 
     // cov:ignore-start: all production callers pass warn_skipped_keys=false
-    if warn_skipped_keys && dict.get("Parent").is_some() {
-        let entries = crate::qpdf_null::snapshot_entries(dict, false);
-        for (key, _) in crate::qpdf_null::visible_entries(pdf, entries)? {
+    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
+        for key in dict.try_get_keys()? {
             if !INHERITABLE_KEYS.contains(&key.as_slice())
-                && ![b"Type".as_slice(), b"Parent", b"Kids", b"Count"].contains(&key.as_slice())
+                && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
             {
                 pdf.push_warning(format!(
                     "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                    String::from_utf8_lossy(&key),
+                    String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
                 ))?;
             }
         }
@@ -112,60 +109,52 @@ fn push_direct_node<R: Read + Seek>(
     // cov:ignore-end
 
     let own_keys = push_node_attributes(pdf, dict, key_ancestors, allow_changes)?;
-    let mut kids = dict
-        .get("Kids")
-        .and_then(Object::as_array)
-        .map(<[Object]>::to_vec)
-        .unwrap_or_default();
-    for kid in &mut kids {
-        match kid {
-            Object::Reference(kid_ref) => push_child_reference(
-                pdf,
-                *kid_ref,
-                key_ancestors,
-                visited,
-                allow_changes,
-                warn_skipped_keys,
-                depth,
-            )?, // cov:ignore: direct-root integration test exercises this branch; llvm maps the counter to push_child_reference
-            Object::Dictionary(child) if child.get("Kids").is_some() => push_direct_node(
-                pdf,
-                child,
-                key_ancestors,
-                visited,
-                allow_changes,
-                warn_skipped_keys,
-                depth + 1,
-            )?, // cov:ignore: direct-descendant integration test exercises this branch; llvm maps the counter to the recursive callee
-            _ => {} // cov:ignore: direct non-dictionary /Kids regression exercises this arm; llvm emits no counter for the empty match arm
+    let kids = dict.get_key(b"/Kids");
+    if let Some(kids) = kids.as_array() {
+        for kid in kids {
+            if let Some(kid_ref) = handle_reference(&kid) {
+                push_child_reference(
+                    pdf,
+                    kid_ref,
+                    key_ancestors,
+                    visited,
+                    allow_changes,
+                    warn_skipped_keys,
+                    depth,
+                )?; // cov:ignore: direct-root integration test exercises this branch; LLVM attributes the counter to push_child_reference
+            } else if kid.as_dictionary().is_some() && kid.has_key(b"/Kids") {
+                push_direct_node(
+                    pdf,
+                    &kid,
+                    key_ancestors,
+                    visited,
+                    allow_changes,
+                    warn_skipped_keys,
+                    depth + 1,
+                )?; // cov:ignore: direct-descendant integration test exercises this branch; LLVM attributes the counter to push_direct_node
+            } // cov:ignore: direct-descendant integration test exercises the branch; LLVM attributes the counter to the recursive callee
         }
     }
-    dict.insert("Kids", Object::Array(kids));
     pop_node_attributes(key_ancestors, own_keys);
     Ok(())
 }
 
 fn push_node_attributes<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dict: &mut crate::Dictionary,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
+    dict: &ObjectHandle,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     allow_changes: bool,
 ) -> Result<Vec<&'static [u8]>> {
     let mut own_keys = Vec::new();
     for &key in &INHERITABLE_KEYS {
-        let Some(value) = dict.remove(key) else {
+        let Some(value) = dict
+            .as_dictionary()
+            .and_then(|entries| entries.get(key).cloned())
+        else {
             continue;
         };
-        let is_null = match &value {
-            Object::Null => true,
-            Object::Reference(reference) => {
-                let terminal = terminal_ref_of_chain(pdf, *reference)?;
-                matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
-            }
-            _ => false,
-        };
-        if is_null {
-            dict.insert(key, value);
+        let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
+        if resolved.is_null() {
             continue;
         }
         if !allow_changes {
@@ -174,23 +163,25 @@ fn push_node_attributes<R: Read + Seek>(
                     .to_owned(),
             ));
         }
-        let value = match value {
-            Object::Reference(_) => value,
-            Object::Array(_) | Object::Dictionary(_) => {
-                let new_ref = next_object_ref(pdf)?;
-                pdf.set_object(new_ref, value);
-                Object::Reference(new_ref)
-            }
-            scalar => scalar,
+        dict.remove_key(key);
+        let value = if value.is_indirect() {
+            value
+        } else if !is_scalar(&value)? {
+            pdf.make_indirect_from_object_handle(value)?
+        } else {
+            value
         };
         key_ancestors.entry(key).or_default().push(value);
         own_keys.push(key);
+    }
+    if !own_keys.is_empty() {
+        pdf.mark_object_handle_dirty(dict)?;
     }
     Ok(own_keys)
 }
 
 fn pop_node_attributes(
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     own_keys: Vec<&'static [u8]>,
 ) {
     for key in own_keys {
@@ -207,17 +198,15 @@ fn pop_node_attributes(
 fn push_child_reference<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kid_ref: ObjectRef,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
     depth: usize,
 ) -> Result<()> {
-    let is_pages_node = matches!(
-        pdf.resolve_borrowed(kid_ref)?,
-        Object::Dictionary(dict)
-            if matches!(dict.get("Type"), Some(Object::Name(name)) if name == b"Pages")
-    );
+    let child = pdf.get_object_handle(kid_ref);
+    pdf.resolve(&child)?;
+    let is_pages_node = is_pages_dictionary(&child);
     if is_pages_node {
         return push_internal(
             pdf,
@@ -230,42 +219,30 @@ fn push_child_reference<R: Read + Seek>(
         );
     }
 
-    let Object::Dictionary(mut leaf) = pdf.resolve_object(kid_ref)? else {
+    if child.as_dictionary().is_none() {
         return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
-    };
-    let mut changed = false;
+    }
     for (&key, values) in key_ancestors.iter() {
-        let present = match leaf.get(key) {
-            None | Some(Object::Null) => false,
-            Some(Object::Reference(reference)) => {
-                let terminal = terminal_ref_of_chain(pdf, *reference)?;
-                !matches!(pdf.resolve_borrowed(terminal)?, Object::Null)
+        // qpdf's hasKey resolves the ordinary parsed child once. The existing
+        // flpdf mutation fixture can additionally store a reference-to-reference
+        // redirect, which has no qpdf counterpart; follow that explicit chain so
+        // a terminal null remains absent just as the previous chain owner did.
+        let present = match child
+            .as_dictionary()
+            .and_then(|entries| entries.get(key).cloned())
+        {
+            None => false,
+            Some(value) => {
+                let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
+                !resolved.is_null()
             }
-            Some(_) => true,
         };
         if !present {
             if let Some(value) = values.last() {
-                leaf.insert(key, value.clone());
-                changed = true;
+                child.replace_key(key, value.clone())?;
+                pdf.mark_object_handle_dirty(&child)?;
             }
         }
-    }
-    // qpdf calls `kid.replaceKey(key, ...)` (`QPDF_optimization.cc:222-227`)
-    // only for a key actually being added; an already-complete leaf is never
-    // touched, and `replaceKey` itself never calls `updateCache`
-    // (`QPDFObjectHandle.cc:1199-1209` delegates straight to the
-    // dictionary's own key mutation), so even a leaf that *does* inherit a
-    // key keeps its recorded source extent in qpdf. `Pdf::set_object` has no
-    // equivalent surgical per-key primitive here (it always clears the
-    // extent, matching qpdf's whole-object `replaceObject`/`updateCache`,
-    // `QPDF.cc:1985-1993`); preserve the extent explicitly across the
-    // otherwise-equivalent whole-dictionary write-back this module uses.
-    if changed {
-        let handle = pdf.get_object_handle(kid_ref);
-        let extents = handle.end_offsets();
-        pdf.set_object(kid_ref, Object::Dictionary(leaf));
-        pdf.get_object_handle(kid_ref)
-            .set_end_offsets(extents.0, extents.1);
     }
     Ok(())
 }
@@ -273,7 +250,7 @@ fn push_child_reference<R: Read + Seek>(
 fn push_internal<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     node_ref: ObjectRef,
-    key_ancestors: &mut BTreeMap<&'static [u8], Vec<Object>>,
+    key_ancestors: &mut BTreeMap<&'static [u8], Vec<ObjectHandle>>,
     visited: &mut BTreeSet<ObjectRef>,
     allow_changes: bool,
     warn_skipped_keys: bool,
@@ -288,56 +265,35 @@ fn push_internal<R: Read + Seek>(
         return Ok(()); // cov:ignore: page-tree repair rejects cycles before inherited-attribute push
     }
 
-    let Object::Dictionary(mut dict) = pdf.resolve_object(node_ref)? else {
+    let dict = pdf.get_object_handle(node_ref);
+    pdf.resolve(&dict)?;
+    if dict.as_dictionary().is_none() {
         return Ok(());
-    };
-    if !matches!(dict.get("Type"), Some(Object::Name(name)) if name == b"Pages") {
+    }
+    if !is_pages_dictionary(&dict) {
         return Ok(());
     }
 
-    if warn_skipped_keys && dict.get("Parent").is_some() {
-        let entries = crate::qpdf_null::snapshot_entries(&dict, false);
-        for (key, _) in crate::qpdf_null::visible_entries(pdf, entries)? {
+    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
+        for key in dict.try_get_keys()? {
             if !INHERITABLE_KEYS.contains(&key.as_slice())
-                && ![b"Type".as_slice(), b"Parent", b"Kids", b"Count"].contains(&key.as_slice())
+                && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
             {
                 pdf.push_warning(format!(
                     "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
-                    String::from_utf8_lossy(&key),
+                    String::from_utf8_lossy(key.strip_prefix(b"/").unwrap_or(&key)),
                 ))?;
             }
         }
     }
 
-    let own_keys = push_node_attributes(pdf, &mut dict, key_ancestors, allow_changes)?;
+    let own_keys = push_node_attributes(pdf, &dict, key_ancestors, allow_changes)?;
 
-    let kids = dict
-        .get("Kids")
-        .and_then(Object::as_array)
-        .map(<[Object]>::to_vec);
-    // qpdf calls `cur_pages.removeKey(key)` (`QPDF_optimization.cc:200`)
-    // only for an inheritable key actually being pulled up; a node with no
-    // inheritable attributes of its own is never written back, and
-    // `removeKey` itself never calls `updateCache`
-    // (`QPDFObjectHandle.cc:1227-1236` delegates straight to the
-    // dictionary's own key mutation), so even a node that *does* have an
-    // attribute pulled up keeps its recorded source extent in qpdf.
-    // `Pdf::set_object` has no equivalent surgical per-key primitive here
-    // (it always clears the extent, matching qpdf's whole-object
-    // `replaceObject`/`updateCache`, `QPDF.cc:1985-1993`); preserve the
-    // extent explicitly across the otherwise-equivalent whole-dictionary
-    // write-back this module uses.
-    if !own_keys.is_empty() {
-        let handle = pdf.get_object_handle(node_ref);
-        let extents = handle.end_offsets();
-        pdf.set_object(node_ref, Object::Dictionary(dict));
-        pdf.get_object_handle(node_ref)
-            .set_end_offsets(extents.0, extents.1);
-    }
+    let kids = dict.get_key(b"/Kids").as_array();
 
     if let Some(kids) = kids {
         for kid in kids {
-            let Object::Reference(kid_ref) = kid else {
+            let Some(kid_ref) = handle_reference(&kid) else {
                 continue;
             };
             push_child_reference(
@@ -356,12 +312,16 @@ fn push_internal<R: Read + Seek>(
     Ok(())
 }
 
-fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
-    // qpdf's page optimization allocates through the same object cache that
-    // `getAllPagesInternal` uses for direct-leaf promotion and duplicate-page
-    // cloning. Looking only at the legacy raw cache can reuse a freshly minted
-    // canonical page object number (`QPDF.cc:1271-1283,1872-1888`).
-    pdf.next_obj_gen()
+fn is_pages_dictionary(handle: &ObjectHandle) -> bool {
+    handle
+        .as_dictionary()
+        .and_then(|entries| entries.get(b"/Type".as_slice()).cloned())
+        .and_then(|value| value.as_name())
+        .is_some_and(|name| name == b"Pages")
+}
+
+fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
+    handle.object_ref().or_else(|| handle.as_reference())
 }
 
 #[cfg(test)]
@@ -476,6 +436,33 @@ mod tests {
             before,
             "inheriting a key must not clear the leaf's source extent"
         );
+    }
+
+    #[test]
+    fn direct_pages_root_walks_direct_descendant_and_reference_kids() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages << /Type /Pages /Kids [<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>] /Count 1 >> >>",
+            ),
+            (
+                3,
+                b"<< /Type /Page /MediaBox [0 0 612 792] >>",
+            ),
+        ]))
+        .unwrap();
+        let prepared = PreparedPages {
+            root: PageTreeRoot::Direct {
+                catalog: ObjectRef::new(1, 0),
+            },
+            pages: vec![ObjectRef::new(3, 0)],
+        };
+
+        push(&mut pdf, &prepared, true, false).expect("direct root walk");
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).expect("resolve direct-root page");
+        assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
     }
 
     #[test]
