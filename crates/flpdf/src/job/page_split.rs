@@ -771,6 +771,39 @@ mod tests {
     }
 
     #[test]
+    fn split_pages_delivers_warnings_from_an_unsuppressed_source() {
+        // Companion to the suppressed case above: a source opened WITHOUT
+        // suppress_warnings must still have its orphan-widget warning
+        // delivered to the job's logger, proving the recording sink itself
+        // observes real warning traffic (not merely absence for an
+        // unrelated reason).
+        let bytes =
+            include_bytes!("../../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf")
+                .to_vec();
+        let mut source = Pdf::open_mem_owned(bytes).expect("fixture should parse");
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+            &recorded,
+        )))));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.split_pages(
+            &mut source,
+            SplitPageOptions::new(1, temp.path().join("out.pdf")),
+        )
+        .expect("split job should succeed with a recoverable warning");
+
+        assert!(
+            String::from_utf8_lossy(&recorded.lock().unwrap())
+                .contains("this widget annotation is not reachable from /AcroForm"),
+            "an unsuppressed source's orphan-widget warning must reach the job's logger"
+        );
+    }
+
+    #[test]
     fn split_pages_uses_a_fresh_catalog_and_preserves_explicit_empty_prefix() {
         let mut source = open_fixture("direct-outlines.pdf");
         let temp = tempfile::tempdir().expect("temporary directory");
