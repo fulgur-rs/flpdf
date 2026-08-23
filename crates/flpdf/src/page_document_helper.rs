@@ -242,7 +242,13 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         if refs.is_empty() {
             return self.clear_page_tree();
         }
-        rebuild_page_tree(self.pdf, &refs)
+        let result = rebuild_page_tree(self.pdf, &refs)?;
+        // The page mutation changes qpdf's page-based orphan-Widget analysis.
+        // `QPDFAcroFormDocumentHelper::invalidateCache` is the explicit
+        // boundary for such external mutations (qpdf/include/qpdf/
+        // QPDFAcroFormDocumentHelper.hh:68-78).
+        *self.pdf.acroform_cache.borrow_mut() = None;
+        Ok(result)
     }
 
     /// Remove the specified page from the document.
@@ -340,6 +346,10 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         root.replace_key(b"/Count", ObjectHandle::integer(0))?;
         root.remove_key(b"/Parent");
         self.pdf.mark_object_handle_dirty(&root)?;
+        // Final-page removal is the same page mutation as the non-empty
+        // rebuild above; keep the shared AcroForm analysis from observing
+        // the removed page on the next helper call.
+        *self.pdf.acroform_cache.borrow_mut() = None;
         Ok(RebuildResult {
             new_kids: Vec::new(),
             ref_map: BTreeMap::new(),

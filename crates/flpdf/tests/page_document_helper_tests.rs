@@ -3247,3 +3247,120 @@ fn get_all_pages_errors_on_a_non_dictionary_root() {
         .expect_err("a scalar /Root must be a hard error, not an empty page list");
     assert!(matches!(error, flpdf::Error::System(_)), "got {error:?}");
 }
+
+fn empty_pdf_with_acroform() -> Pdf<Cursor<Vec<u8>>> {
+    let mut output = Pdf::empty().unwrap();
+    let root_ref = output.root_ref().unwrap();
+    let root = output.get_object_handle(root_ref);
+    output.resolve(&root).unwrap();
+    let acroform = output
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Fields".to_vec(),
+            ObjectHandle::array(Vec::new()),
+        )]))
+        .unwrap();
+    root.replace_key(b"/AcroForm", acroform).unwrap();
+    output.mark_object_handle_dirty(&root).unwrap();
+    output
+}
+
+#[test]
+fn remove_page_invalidates_a_shared_acroform_cache() {
+    let bytes = fs::read("../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf").unwrap();
+    let mut first_source = Pdf::open(Cursor::new(bytes.clone())).unwrap();
+    let mut second_source = Pdf::open(Cursor::new(bytes)).unwrap();
+    let first_source_page = PageDocumentHelper::new(&mut first_source)
+        .get_all_pages()
+        .unwrap()[0];
+    let second_source_page = PageDocumentHelper::new(&mut second_source)
+        .get_all_pages()
+        .unwrap()[0];
+    let mut output = empty_pdf_with_acroform();
+
+    PageDocumentHelper::new(&mut output)
+        .add_page(
+            PageInput::foreign(&mut first_source, first_source_page),
+            false,
+        )
+        .unwrap();
+    let second_page = PageDocumentHelper::new(&mut output)
+        .add_page(
+            PageInput::foreign(&mut second_source, second_source_page),
+            false,
+        )
+        .unwrap()
+        .new_kids
+        .last()
+        .copied()
+        .unwrap();
+    let removed_widget = PageObjectHelper::new(second_page, &mut output)
+        .get_annotations_filtered(Some(b"/Widget"))
+        .unwrap()
+        .into_iter()
+        .next()
+        .and_then(|widget| widget.object_ref())
+        .expect("copied orphan widget should be indirect");
+
+    let before = output
+        .acroform()
+        .unwrap()
+        .get_field_for_annotation(removed_widget)
+        .unwrap();
+    assert_eq!(before, Some(removed_widget));
+
+    PageDocumentHelper::new(&mut output)
+        .remove_page(second_page)
+        .unwrap();
+
+    let after = output
+        .acroform()
+        .unwrap()
+        .get_field_for_annotation(removed_widget)
+        .unwrap();
+    assert!(
+        after.is_none(),
+        "removing a page must invalidate the shared AcroForm cache"
+    );
+}
+
+#[test]
+fn removing_the_last_page_invalidates_a_shared_acroform_cache() {
+    let bytes = fs::read("../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf").unwrap();
+    let mut source = Pdf::open(Cursor::new(bytes)).unwrap();
+    let source_page = PageDocumentHelper::new(&mut source)
+        .get_all_pages()
+        .unwrap()[0];
+    let mut output = empty_pdf_with_acroform();
+    let page = PageDocumentHelper::new(&mut output)
+        .add_page(PageInput::foreign(&mut source, source_page), false)
+        .unwrap()
+        .new_kids[0];
+    let removed_widget = PageObjectHelper::new(page, &mut output)
+        .get_annotations_filtered(Some(b"/Widget"))
+        .unwrap()
+        .into_iter()
+        .next()
+        .and_then(|widget| widget.object_ref())
+        .expect("copied orphan widget should be indirect");
+
+    let before = output
+        .acroform()
+        .unwrap()
+        .get_field_for_annotation(removed_widget)
+        .unwrap();
+    assert_eq!(before, Some(removed_widget));
+
+    PageDocumentHelper::new(&mut output)
+        .remove_page(page)
+        .unwrap();
+
+    let after = output
+        .acroform()
+        .unwrap()
+        .get_field_for_annotation(removed_widget)
+        .unwrap();
+    assert!(
+        after.is_none(),
+        "removing the last page must invalidate the shared AcroForm cache"
+    );
+}
