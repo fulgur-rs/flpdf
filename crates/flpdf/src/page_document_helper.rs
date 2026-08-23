@@ -70,6 +70,23 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// current page list. The returned vector is an owned snapshot, so a later
     /// page insertion or removal requires a fresh call.
     pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+        // QPDFPageDocumentHelper::getAllPages delegates to QPDF::getAllPages,
+        // whose `QPDFObjectHandle pages = getRoot().getKey("/Pages")` calls
+        // `getRoot()` first and unconditionally: a missing OR non-dictionary
+        // `/Root` both throw "unable to find /Root dictionary"
+        // (`libqpdf/QPDF.cc:2355-2360`, `libqpdf/QPDF_pages.cc:41-47`). Keep
+        // the lower-level optimization preparation helper's no-root no-op
+        // contract for its other callers, but enforce the public
+        // page-document boundary here via the same canonical dictionary gate
+        // `pages::page_refs` used before this helper replaced it. A trailer
+        // with no `/Root` key at all keeps flpdf's established
+        // `Error::Missing("/Root")` (used by every other `root_ref()`-gated
+        // caller in this crate); a `/Root` that resolves but is not a
+        // dictionary goes through `root_handle`'s own error.
+        if self.pdf.root_ref().is_none() {
+            return Err(Error::Missing("/Root"));
+        }
+        self.pdf.root_handle()?;
         Ok(crate::pages::repair::prepare_for_optimization(self.pdf)?
             .map(|prepared| prepared.pages)
             .unwrap_or_default())

@@ -3049,10 +3049,10 @@ mod tests {
     }
 
     #[test]
-    fn sink_writer_conversion_error_stops_before_selected_section_key() {
+    fn sink_writer_missing_pages_emits_an_empty_selected_section_with_warning() {
         let mut pdf = empty_pdf();
         let mut out = Vec::new();
-        let error = {
+        {
             let mut output = PlString::new("conversion error output", None, &mut out);
             write_qpdf_json_v2_selected_objects_with_options(
                 &mut pdf,
@@ -3062,35 +3062,30 @@ mod tests {
                 &[],
                 &mut output,
             )
-            .unwrap_err()
-        };
+            .unwrap();
+        }
 
-        assert!(matches!(
-            error,
-            JsonOutputError::Convert(ConvertError::PdfError(_))
-        ));
-        assert!(!out
-            .windows(b"\"pages\"".len())
-            .any(|window| window == b"\"pages\""));
+        let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(document["pages"], serde_json::json!([]));
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 
     #[test]
-    fn selected_vector_writer_propagates_conversion_errors() {
+    fn selected_vector_writer_missing_pages_returns_an_empty_section_with_warning() {
         let mut pdf = empty_pdf();
 
-        let error = write_selected_to_vec(
+        let out = write_selected_to_vec(
             &mut pdf,
             DecodeLevel::Generalized,
             &StreamDataMode::None,
             &[JsonKey::Pages],
             &[],
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(
-            error,
-            JsonOutputError::Convert(ConvertError::PdfError(_))
-        ));
+        let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(document["pages"], serde_json::json!([]));
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 
     #[test]

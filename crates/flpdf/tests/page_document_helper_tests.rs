@@ -3231,3 +3231,19 @@ fn add_page_invalidates_a_shared_acroform_cache_warmed_before_insertion() {
          on the newly copied page is detected: {warning:?}"
     );
 }
+
+#[test]
+fn get_all_pages_errors_on_a_non_dictionary_root() {
+    // qpdf's QPDF::getAllPages calls getRoot().getKey("/Pages") first and
+    // unconditionally; getRoot() throws "unable to find /Root dictionary"
+    // for a non-dictionary root (QPDF.cc:2355-2360). This is a hard error,
+    // not the warning-tolerant empty-page-list path used for a merely
+    // missing /Pages key.
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Integer(42));
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .expect_err("a scalar /Root must be a hard error, not an empty page list");
+    assert!(matches!(error, flpdf::Error::System(_)), "got {error:?}");
+}

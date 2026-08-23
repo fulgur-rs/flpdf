@@ -154,8 +154,10 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
 /// Returns a [`ConvertError`] if the page tree cannot be traversed or any
 /// object resolution fails.
 pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    let page_refs =
-        crate::pages::page_refs(pdf).map_err(|e| ConvertError::PdfError(e.to_string()))?;
+    let page_refs = {
+        let mut page_document = crate::PageDocumentHelper::new(pdf);
+        page_document.get_all_pages()?
+    };
 
     let mut entries: Vec<Json> = Vec::with_capacity(page_refs.len());
 
@@ -381,7 +383,10 @@ pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json
     // qpdf's doJSONPageLabels obtains the full page list before checking
     // whether /PageLabels exists. Preserve both that validation side effect
     // and the observable everCalledGetAllPages metadata state.
-    let page_count = crate::pages::page_refs(pdf)?.len();
+    let page_count = {
+        let mut page_document = crate::PageDocumentHelper::new(pdf);
+        page_document.get_all_pages()?.len()
+    };
     let entries = {
         let mut helper = crate::page_label_document_helper::PageLabelDocumentHelper::new(pdf);
         // qpdf's doJSONPageLabels gates only on hasPageLabels(): for a
@@ -476,11 +481,15 @@ fn outline_item_to_json<R: Read + Seek>(
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
 pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    let page_numbers = crate::pages::page_refs(pdf)?
-        .into_iter()
-        .enumerate()
-        .map(|(index, reference)| (reference, index as i64 + 1))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let page_numbers = {
+        let mut page_document = crate::PageDocumentHelper::new(pdf);
+        page_document
+            .get_all_pages()?
+            .into_iter()
+            .enumerate()
+            .map(|(index, reference)| (reference, index as i64 + 1))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
     let mut helper = pdf.outline();
     let tree = helper.get_tree()?;
     let mut entries = Vec::with_capacity(tree.roots().len());
