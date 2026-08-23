@@ -64,7 +64,7 @@ use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 #[cfg(test)]
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 #[cfg(test)]
-use crate::{Matrix, Object};
+use crate::Matrix;
 #[cfg(test)]
 use std::collections::BTreeSet;
 
@@ -204,7 +204,7 @@ where
         .collect()
 }
 
-/// Resolve the page's effective box as a raw `Object::Array`, following qpdf's
+/// Resolve the page's effective box as canonical child handles, following qpdf's
 /// `getTrimBox(false)` fallback chain: `/TrimBox` → `/CropBox` → `/MediaBox`.
 ///
 /// The array is returned verbatim (original integer/real element types kept) so
@@ -219,7 +219,7 @@ where
 fn effective_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-) -> Result<Vec<Object>> {
+) -> Result<Vec<ObjectHandle>> {
     // TrimBox: leaf only.
     if let Some(arr) = leaf_box_array(pdf, page_ref, b"TrimBox")? {
         return Ok(arr);
@@ -236,21 +236,29 @@ fn effective_box_array<R: Read + Seek>(
 }
 
 /// Read a box `key` from the leaf page dictionary only (not inheritable), as a
-/// raw rectangle array. Returns `Ok(None)` when absent or null.
+/// handle rectangle array. Returns `Ok(None)` when absent or null.
 #[cfg(test)]
 fn leaf_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     key: &[u8],
-) -> Result<Option<Vec<Object>>> {
-    let page_obj = pdf.resolve_borrowed(page_ref)?;
-    let Some(dict) = page_obj.as_dict() else {
+) -> Result<Option<Vec<ObjectHandle>>> {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page)?;
+    let Some(dict) = page.as_dictionary() else {
         return Ok(None);
     };
-    let val = match dict.get(key).cloned() {
-        None | Some(Object::Null) => return Ok(None),
+    // Dictionary keys carry qpdf's canonical leading `/` (see
+    // ObjectHandle::as_dictionary); `key` is the slash-less name used for
+    // error-message formatting below, so the lookup key is built here.
+    let lookup_key: Vec<u8> = [b"/".as_slice(), key].concat();
+    let val = match dict.get(lookup_key.as_slice()).cloned() {
+        None => return Ok(None),
         Some(v) => v,
     };
+    if val.is_null() {
+        return Ok(None);
+    }
     resolve_rect_array(pdf, val, page_ref, key)
 }
 
@@ -261,7 +269,7 @@ fn inherited_box_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     key: &[u8],
-) -> Result<Option<Vec<Object>>> {
+) -> Result<Option<Vec<ObjectHandle>>> {
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut current = page_ref;
     let mut depth: usize = 0;
@@ -276,24 +284,31 @@ fn inherited_box_array<R: Read + Seek>(
             return Ok(None);
         }
 
-        let node_obj = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node_obj.as_dict() else {
+        let node = pdf.get_object_handle(current);
+        pdf.resolve(&node)?;
+        let Some(dict) = node.as_dictionary() else {
             return Ok(None);
         };
         // Per PDF §7.3.9 a null value is equivalent to the key being absent, so
-        // skip it and climb to /Parent.
-        let val = match dict.get(key).cloned() {
-            Some(v) if !matches!(v, Object::Null) => Some(v),
+        // skip it and climb to /Parent. Dictionary keys carry qpdf's canonical
+        // leading `/` (see ObjectHandle::as_dictionary); `key` is the
+        // slash-less name used for error-message formatting, so the lookup
+        // key is built here.
+        let lookup_key: Vec<u8> = [b"/".as_slice(), key].concat();
+        let val = match dict.get(lookup_key.as_slice()).cloned() {
+            Some(v) if !v.is_null() => Some(v),
             _ => None,
         };
-        let parent_val = dict.get("Parent").cloned();
+        let parent_val = dict.get(b"/Parent".as_slice()).cloned();
 
-        if let Some(arr) = val.and_then(|v| resolve_rect_array(pdf, v, current, key).transpose()) {
-            return Ok(Some(arr?));
+        if let Some(value) = val {
+            if let Some(array) = resolve_rect_array(pdf, value, current, key)? {
+                return Ok(Some(array));
+            }
         }
 
-        match parent_val {
-            Some(Object::Reference(r)) => {
+        match parent_val.and_then(|value| value.object_ref().or_else(|| value.as_reference())) {
+            Some(r) => {
                 current = r;
                 depth += 1;
             }
@@ -302,33 +317,27 @@ fn inherited_box_array<R: Read + Seek>(
     }
 }
 
-/// Coerce a box value (a direct array or a reference to one) into a raw
+/// Coerce a box value (a direct array or a reference to one) into a handle
 /// rectangle array, validating it has at least four elements.
 #[cfg(test)]
 fn resolve_rect_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    val: Object,
+    val: ObjectHandle,
     node: ObjectRef,
     key: &[u8],
-) -> Result<Option<Vec<Object>>> {
-    let arr = match val {
-        Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve_object(r)? {
-            Object::Array(arr) => arr,
-            Object::Null => return Ok(None),
-            _ => {
-                return Err(Error::Unsupported(format!(
-                    "/{} reference {r} on node {node} does not resolve to an array",
-                    String::from_utf8_lossy(key)
-                )));
-            }
-        },
-        _ => {
-            return Err(Error::Unsupported(format!(
-                "/{} entry on node {node} is not a rectangle array",
-                String::from_utf8_lossy(key)
-            )));
+) -> Result<Option<Vec<ObjectHandle>>> {
+    if val.is_indirect() || val.as_reference().is_some() {
+        pdf.resolve(&val)?;
+    }
+    let resolved = val;
+    let Some(arr) = resolved.as_array() else {
+        if resolved.is_null() {
+            return Ok(None);
         }
+        return Err(Error::Unsupported(format!(
+            "/{} value on node {node} does not resolve to an array",
+            String::from_utf8_lossy(key)
+        )));
     };
     if arr.len() < 4 {
         return Err(Error::Unsupported(format!(
@@ -340,6 +349,13 @@ fn resolve_rect_array<R: Read + Seek>(
     Ok(Some(arr))
 }
 
+/// Return the indirect target reference carried by a child handle, including
+/// the private redirect shape used by older mutation fixtures.
+#[cfg(test)]
+fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
+    handle.object_ref().or_else(|| handle.as_reference())
+}
+
 /// Compute the normalized `(width, height)` of a rectangle array, coercing each
 /// numeric element to `f64`. Non-numeric elements contribute 0.0.
 ///
@@ -348,13 +364,12 @@ fn resolve_rect_array<R: Read + Seek>(
 /// a reversed box (`urx < llx` or `ury < lly`): `width = |urx - llx|`,
 /// `height = |ury - lly|`.
 #[cfg(test)]
-fn rectangle_dimensions(arr: &[Object]) -> (f64, f64) {
-    let n = |o: &Object| -> f64 {
-        match o {
-            Object::Integer(i) => *i as f64,
-            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
-            _ => 0.0,
-        }
+fn rectangle_dimensions(arr: &[ObjectHandle]) -> (f64, f64) {
+    let n = |o: &ObjectHandle| -> f64 {
+        o.as_integer()
+            .map(|value| value as f64)
+            .or_else(|| o.as_real())
+            .unwrap_or(0.0)
     };
     let llx = n(&arr[0]);
     let lly = n(&arr[1]);
@@ -425,29 +440,33 @@ fn inherited_rotate_attribute<R: Read + Seek>(
         }
 
         let (rotate_val, parent_val) = {
-            let node_obj = pdf.resolve_borrowed(current)?;
-            let Some(dict) = node_obj.as_dict() else {
+            let node = pdf.get_object_handle(current);
+            pdf.resolve(&node)?;
+            let Some(dict) = node.as_dictionary() else {
                 return Ok((false, 0));
             };
-            (dict.get("Rotate").cloned(), dict.get("Parent").cloned())
+            (
+                dict.get(b"/Rotate".as_slice()).cloned(),
+                dict.get(b"/Parent".as_slice()).cloned(),
+            )
         };
 
         if let Some(val) = rotate_val {
             // /Rotate may be stored as an indirect reference; resolve it first.
-            let resolved = match val {
-                Object::Reference(r) => pdf.resolve_object(r)?,
-                other => other,
-            };
-            match resolved {
-                // Per PDF §7.3.9 a null value is equivalent to absent: climb on.
-                Object::Null => {}
-                Object::Integer(n) => return Ok((true, n as i32)),
-                _ => return Ok((true, 0)),
+            if val.is_indirect() || val.as_reference().is_some() {
+                pdf.resolve(&val)?;
+            }
+            let resolved = val;
+            if let Some(n) = resolved.as_integer() {
+                return Ok((true, n as i32));
+            }
+            if !resolved.is_null() {
+                return Ok((true, 0));
             }
         }
 
-        match parent_val {
-            Some(Object::Reference(r)) => {
+        match parent_val.and_then(|value| handle_reference(&value)) {
+            Some(r) => {
                 current = r;
                 depth += 1;
             }
@@ -461,25 +480,30 @@ fn inherited_rotate_attribute<R: Read + Seek>(
 /// numeric value (1.0 when present-but-not-a-number).
 #[cfg(test)]
 fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<(bool, f64)> {
-    let uu_val = {
-        let page_obj = pdf.resolve_borrowed(page_ref)?;
-        let Some(dict) = page_obj.as_dict() else {
-            return Ok((false, 1.0));
-        };
-        dict.get("UserUnit").cloned()
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page)?;
+    let Some(dict) = page.as_dictionary() else {
+        return Ok((false, 1.0));
     };
+    let uu_val = dict.get(b"/UserUnit".as_slice()).cloned();
     let Some(val) = uu_val else {
         return Ok((false, 1.0));
     };
-    let resolved = match val {
-        Object::Reference(r) => pdf.resolve_object(r)?,
-        other => other,
-    };
-    match resolved {
-        Object::Null => Ok((false, 1.0)),
-        Object::Integer(n) => Ok((true, n as f64)),
-        Object::Real(r) | Object::RealLiteral { value: r, .. } => Ok((true, r)),
-        _ => Ok((true, 1.0)),
+    if val.is_indirect() || val.as_reference().is_some() {
+        pdf.resolve(&val)?;
+    }
+    let resolved = val;
+    if resolved.is_null() {
+        Ok((false, 1.0))
+    } else {
+        Ok((
+            true,
+            resolved
+                .as_integer()
+                .map(|value| value as f64)
+                .or_else(|| resolved.as_real())
+                .unwrap_or(1.0),
+        ))
     }
 }
 
@@ -534,19 +558,29 @@ pub(crate) fn get_matrix_for_transformations(
 /// in the Form XObject (`/Group << ... >>`, no separate object). `/Group` is not
 /// inheritable (ISO 32000-1 Table 30), so only the leaf page is consulted.
 #[cfg(test)]
-fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<Option<Object>> {
-    let group_val = {
-        let page_obj = pdf.resolve_borrowed(page_ref)?;
-        let Some(dict) = page_obj.as_dict() else {
-            return Ok(None);
-        };
-        dict.get("Group").cloned()
+fn page_group<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<Option<ObjectHandle>> {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page)?;
+    let Some(dict) = page.as_dictionary() else {
+        return Ok(None);
     };
+    let group_val = dict.get(b"/Group".as_slice()).cloned();
     match group_val {
-        None | Some(Object::Null) => Ok(None),
-        // shallowCopy: materialize the top level only (ref -> direct dict).
-        Some(Object::Reference(r)) => Ok(Some(pdf.resolve_object(r)?)), // cov:ignore: test-only characterization helper; no fixture gives this page a leaf /Group as an indirect reference
-        Some(direct) => Ok(Some(direct)),
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        // qpdf calls shallowCopy() on the attribute value unconditionally
+        // (libqpdf/QPDFPageObjectHelper.cc:715), not only when it is
+        // indirect: an indirect value is first resolved one level (ref ->
+        // direct dict), then both branches shallow-copy so the returned
+        // handle never shares mutable identity with the page's own /Group.
+        Some(value) if value.is_indirect() || value.as_reference().is_some() => {
+            pdf.resolve(&value)?;
+            Ok(Some(value.shallow_copy()?))
+        }
+        Some(direct) => Ok(Some(direct.shallow_copy()?)),
     }
 }
 
@@ -624,7 +658,56 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Stream;
+    use crate::object_handle::canonical_dictionary_key;
+
+    #[derive(Clone)]
+    struct TestHandle(ObjectHandle);
+
+    impl TestHandle {
+        fn as_dict(&self) -> Option<TestDict> {
+            self.0.as_dictionary().map(TestDict)
+        }
+
+        fn as_array(&self) -> Option<Vec<Self>> {
+            self.0
+                .as_array()
+                .map(|items| items.into_iter().map(Self).collect())
+        }
+
+        fn as_name(&self) -> Option<Vec<u8>> {
+            self.0.as_name()
+        }
+
+        fn as_integer(&self) -> Option<i64> {
+            self.0.as_integer()
+        }
+
+        fn as_real(&self) -> Option<f64> {
+            self.0.as_real()
+        }
+
+        fn object_ref(&self) -> Option<ObjectRef> {
+            self.0.object_ref().or_else(|| self.0.as_reference())
+        }
+    }
+
+    struct TestDict(std::collections::BTreeMap<Vec<u8>, ObjectHandle>);
+
+    impl TestDict {
+        fn get(&self, key: &str) -> Option<TestHandle> {
+            let key = canonical_dictionary_key(key.as_bytes());
+            self.0.get(&key).cloned().map(TestHandle)
+        }
+
+        fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &ObjectHandle)> {
+            self.0.iter()
+        }
+    }
+
+    struct TestStream {
+        dict: TestDict,
+        data: Vec<u8>,
+    }
 
     /// Build a valid single-object-table PDF from `(number, body)` definitions
     /// plus a `/Root` number, computing xref offsets so the bytes parse. Object
@@ -690,20 +773,39 @@ mod tests {
     }
 
     /// Resolve the Form XObject at `xref` and return its stream.
-    fn form_stream<R: Read + Seek>(pdf: &mut Pdf<R>, xref: ObjectRef) -> Stream {
-        pdf.resolve_object(xref)
-            .unwrap()
-            .into_stream()
+    fn form_stream<R: Read + Seek>(pdf: &mut Pdf<R>, xref: ObjectRef) -> TestStream {
+        let stream = pdf.get_object_handle(xref);
+        pdf.resolve(&stream).unwrap();
+        let dict = stream
+            .as_stream_dict()
             .expect("Form XObject must be a stream")
+            .as_dictionary()
+            .expect("Form XObject stream dictionary");
+        let data = stream
+            .as_stream_data()
+            .map(|data| data.as_ref().clone())
+            .or_else(|| {
+                stream
+                    .get_raw_stream_data()
+                    .ok()
+                    .map(|data| data.as_ref().clone())
+            })
+            .expect("Form XObject stream data");
+        TestStream {
+            dict: TestDict(dict),
+            data,
+        }
     }
 
     /// Coerce a rectangle/matrix array's numeric elements to `i64` for whole-
     /// number comparison (each element resolves via the numeric accessors).
-    fn numbers(arr: &[Object]) -> Vec<i64> {
-        arr.iter()
-            .map(|o| {
-                o.as_integer()
-                    .or_else(|| o.as_real().map(|r| r as i64))
+    fn numbers(arr: impl AsRef<[TestHandle]>) -> Vec<i64> {
+        arr.as_ref()
+            .iter()
+            .map(|handle| {
+                handle
+                    .as_integer()
+                    .or_else(|| handle.as_real().map(|r| r as i64))
                     .expect("numeric array element")
             })
             .collect()
@@ -722,7 +824,10 @@ mod tests {
         // Exact key set: BBox, Resources, Subtype, Type. NO FormType, and NO
         // /Matrix because this page carries neither /Rotate nor /UserUnit (qpdf's
         // getFormXObjectForPage omits /Matrix in that case).
-        let keys: BTreeSet<Vec<u8>> = dict.iter().map(|(k, _)| k.to_vec()).collect();
+        let keys: BTreeSet<Vec<u8>> = dict
+            .iter()
+            .map(|(key, _)| key.strip_prefix(b"/").unwrap_or(key).to_vec())
+            .collect();
         let expected: BTreeSet<Vec<u8>> = [
             b"BBox".to_vec(),
             b"Resources".to_vec(),
@@ -744,11 +849,11 @@ mod tests {
         // /Subtype /Form, /Type /XObject.
         assert_eq!(
             dict.get("Subtype").unwrap().as_name(),
-            Some(b"Form".as_slice())
+            Some(b"Form".to_vec())
         );
         assert_eq!(
             dict.get("Type").unwrap().as_name(),
-            Some(b"XObject".as_slice())
+            Some(b"XObject".to_vec())
         );
 
         // /BBox == page TrimBox (== MediaBox via fallback) [0 0 612 792].
@@ -772,10 +877,10 @@ mod tests {
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
         // Verbatim copy: integers stay integers, real stays real.
-        assert!(matches!(bbox[0], Object::Integer(10)));
-        assert!(matches!(bbox[1], Object::Integer(10)));
-        assert!(matches!(bbox[2], Object::Real(v) if (v - 500.5).abs() < 1e-9));
-        assert!(matches!(bbox[3], Object::Integer(600)));
+        assert_eq!(bbox[0].as_integer(), Some(10));
+        assert_eq!(bbox[1].as_integer(), Some(10));
+        assert!((bbox[2].as_real().unwrap() - 500.5).abs() < 1e-9);
+        assert_eq!(bbox[3].as_integer(), Some(600));
     }
 
     #[test]
@@ -874,7 +979,7 @@ mod tests {
         let xref = get_form_xobject_for_page(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         let stream = form_stream(&mut pdf, xref);
         let bbox = stream.dict.get("BBox").unwrap().as_array().unwrap();
-        assert!(matches!(bbox[2], Object::Name(_)));
+        assert!(bbox[2].as_name().is_some());
         // Matrix is identity (rotate 0), so the non-numeric width is irrelevant.
         let matrix = stream.dict.get("Matrix").unwrap().as_array().unwrap();
         assert_eq!(numbers(matrix), vec![1, 0, 0, 1, 0, 0]);
@@ -886,17 +991,17 @@ mod tests {
         // ([612 792 0 0]) yields non-negative width/height; an ordered box is
         // unchanged.
         let swapped = [
-            Object::Integer(612),
-            Object::Integer(792),
-            Object::Integer(0),
-            Object::Integer(0),
+            ObjectHandle::integer(612),
+            ObjectHandle::integer(792),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
         ];
         assert_eq!(rectangle_dimensions(&swapped), (612.0, 792.0));
         let ordered = [
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(612),
-            Object::Integer(792),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(0),
+            ObjectHandle::integer(612),
+            ObjectHandle::integer(792),
         ];
         assert_eq!(rectangle_dimensions(&ordered), (612.0, 792.0));
     }
@@ -1023,15 +1128,15 @@ mod tests {
             .expect("indirect /Group must be shallow-copied to a direct dict");
         assert_eq!(
             group.get("Type").unwrap().as_name(),
-            Some(b"Group".as_slice())
+            Some(b"Group".to_vec())
         );
         assert_eq!(
             group.get("S").unwrap().as_name(),
-            Some(b"Transparency".as_slice())
+            Some(b"Transparency".to_vec())
         );
         assert_eq!(
             group.get("CS").unwrap().as_name(),
-            Some(b"DeviceRGB".as_slice())
+            Some(b"DeviceRGB".to_vec())
         );
     }
 
@@ -1048,7 +1153,7 @@ mod tests {
         let group = stream.dict.get("Group").unwrap().as_dict().unwrap();
         assert_eq!(
             group.get("S").unwrap().as_name(),
-            Some(b"Transparency".as_slice())
+            Some(b"Transparency".to_vec())
         );
     }
 
@@ -1083,7 +1188,7 @@ mod tests {
         let stream = form_stream(&mut dest, imported);
         assert_eq!(
             stream.dict.get("Subtype").unwrap().as_name(),
-            Some(b"Form".as_slice())
+            Some(b"Form".to_vec())
         );
 
         // /Resources/Font/F1 must be a reference into dest that resolves to a
@@ -1091,20 +1196,20 @@ mod tests {
         let res = stream.dict.get("Resources").unwrap().as_dict().unwrap();
         let font_dict = res.get("Font").unwrap().as_dict().unwrap();
         let font_ref = match font_dict.get("F1") {
-            Some(Object::Reference(r)) => *r,
-            other => panic!("F1 should be a reference, got {other:?}"), // cov:ignore: defensive — fixture guarantees a reference
+            Some(handle) => handle
+                .object_ref()
+                .expect("F1 should be an indirect handle"),
+            None => panic!("F1 should be a reference"), // cov:ignore: defensive — fixture guarantees a reference
         };
-        let font_obj = dest.resolve_object(font_ref).unwrap();
-        let font = font_obj
+        let font_obj = dest.get_object_handle(font_ref);
+        dest.resolve(&font_obj).unwrap();
+        let font = TestHandle(font_obj)
             .as_dict()
             .expect("font ref resolves to a dict in dest");
-        assert_eq!(
-            font.get("Type").unwrap().as_name(),
-            Some(b"Font".as_slice())
-        );
+        assert_eq!(font.get("Type").unwrap().as_name(), Some(b"Font".to_vec()));
         assert_eq!(
             font.get("BaseFont").unwrap().as_name(),
-            Some(b"Helvetica".as_slice())
+            Some(b"Helvetica".to_vec())
         );
     }
 
@@ -1158,28 +1263,33 @@ mod tests {
         let stream0 = form_stream(&mut dest, imported[0]);
         let res0 = stream0.dict.get("Resources").unwrap().as_dict().unwrap();
         let font_ref0 = match res0.get("Font").unwrap().as_dict().unwrap().get("F1") {
-            Some(Object::Reference(r)) => *r,
-            other => panic!("F1 should be a reference, got {other:?}"), // cov:ignore: defensive — fixture guarantees a reference
+            Some(handle) => handle
+                .object_ref()
+                .expect("F1 should be an indirect handle"),
+            None => panic!("F1 should be a reference"), // cov:ignore: defensive — fixture guarantees a reference
         };
 
         let stream1 = form_stream(&mut dest, imported[1]);
         let res1 = stream1.dict.get("Resources").unwrap().as_dict().unwrap();
         let font_ref1 = match res1.get("Font").unwrap().as_dict().unwrap().get("F1") {
-            Some(Object::Reference(r)) => *r,
-            other => panic!("F1 should be a reference, got {other:?}"), // cov:ignore: defensive — fixture guarantees a reference
+            Some(handle) => handle
+                .object_ref()
+                .expect("F1 should be an indirect handle"),
+            None => panic!("F1 should be a reference"), // cov:ignore: defensive — fixture guarantees a reference
         };
 
         assert_eq!(
             font_ref0, font_ref1,
             "the shared font must be copied into dest exactly once"
         );
-        let font_obj = dest.resolve_object(font_ref0).unwrap();
-        let font = font_obj
+        let font_obj = dest.get_object_handle(font_ref0);
+        dest.resolve(&font_obj).unwrap();
+        let font = TestHandle(font_obj)
             .as_dict()
             .expect("font ref resolves to a dict in dest");
         assert_eq!(
             font.get("BaseFont").unwrap().as_name(),
-            Some(b"Helvetica".as_slice())
+            Some(b"Helvetica".to_vec())
         );
     }
 
@@ -1309,14 +1419,164 @@ mod tests {
             ],
             1,
         ));
-        let got = resolve_rect_array(
-            &mut pdf,
-            Object::Reference(ObjectRef::new(3, 0)),
-            ObjectRef::new(1, 0),
-            b"TrimBox",
-        )
-        .unwrap();
+        let value = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let got = resolve_rect_array(&mut pdf, value, ObjectRef::new(1, 0), b"TrimBox").unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn resolve_rect_array_errors_on_non_array_non_null_value() {
+        // A reference that resolves to a non-array, non-null value (an
+        // integer here) is malformed input: neither the ref-to-array nor the
+        // ref-to-null arm applies, so this must error rather than silently
+        // treating the box as absent.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+                (3, "42"),
+            ],
+            1,
+        ));
+        let value = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let err = resolve_rect_array(&mut pdf, value, ObjectRef::new(1, 0), b"TrimBox");
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn effective_box_array_prefers_trimbox_over_inherited_boxes() {
+        // qpdf's getTrimBox(false) fallback chain: /TrimBox (leaf-only) wins
+        // even when an inheritable /MediaBox is also present.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R /TrimBox [0 0 50 60] >>"),
+            ],
+            1,
+        ));
+        let got = effective_box_array(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn leaf_box_array_returns_none_for_absent_key() {
+        let mut pdf = open(one_page_doc("", "x", &[]));
+        let got = leaf_box_array(&mut pdf, ObjectRef::new(3, 0), b"TrimBox").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn leaf_box_array_returns_none_for_direct_null() {
+        let mut pdf = open(one_page_doc("/TrimBox null", "x", &[]));
+        let got = leaf_box_array(&mut pdf, ObjectRef::new(3, 0), b"TrimBox").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn leaf_box_array_returns_array_for_present_direct_box() {
+        let mut pdf = open(one_page_doc("/TrimBox [0 0 100 200]", "x", &[]));
+        let got = leaf_box_array(&mut pdf, ObjectRef::new(3, 0), b"TrimBox")
+            .unwrap()
+            .expect("a present direct box array must resolve");
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn inherited_box_array_finds_box_on_ancestor() {
+        // The leaf carries no /MediaBox; its /Pages parent does. The walk
+        // climbs one hop and returns the ancestor's array.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+            1,
+        ));
+        let got = inherited_box_array(&mut pdf, ObjectRef::new(3, 0), b"MediaBox")
+            .unwrap()
+            .expect("ancestor MediaBox must be found");
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn page_group_returns_none_for_absent_group() {
+        let mut pdf = open(one_page_doc("", "x", &[]));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn page_group_returns_none_for_null_group() {
+        let mut pdf = open(one_page_doc("/Group null", "x", &[]));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn page_group_returns_a_direct_dict() {
+        let mut pdf = open(one_page_doc(
+            "/Group << /Type /Group /S /Transparency >>",
+            "x",
+            &[],
+        ));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .expect("a present direct /Group dict must be returned");
+        assert!(got.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn page_group_shallow_copies_a_direct_group() {
+        // qpdf calls getAttribute("/Group", false).shallowCopy()
+        // unconditionally (libqpdf/QPDFPageObjectHelper.cc:715), not only
+        // for an indirect value. Mutating the returned handle must not
+        // perturb the page's own /Group dict -- they must not share
+        // mutable identity.
+        let mut pdf = open(one_page_doc(
+            "/Group << /Type /Group /S /Transparency >>",
+            "x",
+            &[],
+        ));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .expect("a present direct /Group dict must be returned");
+        got.replace_key(b"/S", ObjectHandle::name(b"Mutated".to_vec()))
+            .unwrap();
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        let original_group = page.get_key(b"/Group");
+        let original_s = original_group.get_key(b"/S");
+        assert_eq!(
+            original_s.as_name(),
+            Some(b"Transparency".to_vec()),
+            "mutating the returned handle must not affect the page's own /Group"
+        );
+    }
+
+    #[test]
+    fn page_group_shallow_copies_indirect_group() {
+        // qpdf's getFormXObjectForPage stores getAttribute("/Group", false)
+        // .shallowCopy(): an indirect /Group is resolved one level into a
+        // direct dictionary (libqpdf/QPDFPageObjectHelper.cc:706-733).
+        let mut pdf = open(one_page_doc(
+            "/Group 6 0 R",
+            "x",
+            &[(6, "<< /Type /Group /S /Transparency >>")],
+        ));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .expect("an indirect /Group must shallow-copy to a direct dict");
+        assert!(got.is_direct());
+        assert!(got.as_dictionary().is_some());
     }
 
     #[test]
@@ -1376,6 +1636,17 @@ mod tests {
         assert_eq!(
             inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
             (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_present_non_integer_is_treated_as_present_zero() {
+        // A present, non-null, non-integer /Rotate (a name here) is treated
+        // as present with value 0, not as absent.
+        let mut pdf = open(one_page_doc("/Rotate /Weird", "x", &[]));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 0)
         );
     }
 

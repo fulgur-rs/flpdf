@@ -68,3 +68,19 @@ fn qpdf_cutover_has_no_legacy_handle_aliases() {
         }
     }
 }
+
+#[test]
+fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
+    let source = include_str!("../src/page_form_xobject.rs");
+    for legacy in [
+        "use crate::{Matrix, Object};",
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "page_form_xobject still contains the raw route marker {legacy:?}"
+        );
+    }
+}
