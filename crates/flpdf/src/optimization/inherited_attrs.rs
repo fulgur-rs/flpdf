@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+use crate::object_handle::is_scalar;
 use crate::pages::repair::{PageTreeRoot, PreparedPages};
 use crate::{Error, Pdf, Result};
 use crate::{ObjectHandle, ObjectRef};
@@ -165,10 +166,7 @@ fn push_node_attributes<R: Read + Seek>(
         dict.remove_key(key);
         let value = if value.is_indirect() {
             value
-        } else if value.as_array().is_some()
-            || value.as_dictionary().is_some()
-            || value.as_stream_dict().is_some()
-        {
+        } else if !is_scalar(&value)? {
             pdf.make_indirect_from_object_handle(value)?
         } else {
             value

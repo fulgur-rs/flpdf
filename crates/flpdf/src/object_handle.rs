@@ -6897,7 +6897,7 @@ fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
 // first, then test bool, integer, name, null, real, or string. qpdf performs
 // this dereference for every array item rather than relying on a caller-side
 // resolution precondition.
-fn is_scalar(handle: &ObjectHandle) -> Result<bool> {
+pub(crate) fn is_scalar(handle: &ObjectHandle) -> Result<bool> {
     handle.try_dereference()?;
     Ok(handle.as_boolean().is_some()
         || handle.as_integer().is_some()
