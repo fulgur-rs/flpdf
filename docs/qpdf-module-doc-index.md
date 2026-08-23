@@ -26,7 +26,10 @@
 | `crates/flpdf/src/encryption/state.rs` | correspondence | \`QPDF.hh:899-923\` and \`QPDF_encryption.cc:700-1205\` encryption state, crypt-filter dispatch, object-key cache, and inspection projection |
 | `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\`, \`processFile()\`, and \`processMemoryFile()\`) and their shared construction orchestration |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
-| `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
+| `crates/flpdf/src/filespec_helper/embedded_file_stream.rs` | correspondence | QPDFEFStreamObjectHelper.cc |
+| `crates/flpdf/src/filespec_helper/filespec.rs` | correspondence | QPDFFileSpecObjectHelper.cc |
+| `crates/flpdf/src/filespec_helper/mod.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
+| `crates/flpdf/src/filespec_helper/shared.rs` | correspondence | shared QPDFFileSpecObjectHelper/QPDFEFStreamObjectHelper support primitives |
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |

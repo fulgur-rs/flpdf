@@ -8,14 +8,14 @@
 
 use flpdf::pipeline::Pipeline;
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error,
-    FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
-    StreamDataProvider,
+    add_attachment_from_path, ascii_filename_fallback, encode_utf16be, extract_attachment,
+    format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error, FileParamDates, FileSpec,
+    FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf, StreamDataProvider,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod common;
@@ -1652,6 +1652,58 @@ fn build_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
     );
 
     open(out)
+}
+
+#[test]
+fn attachment_path_facade_rejects_a_path_without_a_basename() {
+    let mut pdf = build_minimal_pdf();
+    let error = add_attachment_from_path(&mut pdf, b"root", Path::new("/"))
+        .expect_err("a root path has no attachment basename");
+    assert!(error.to_string().contains("path has no basename"));
+}
+
+#[cfg(unix)]
+#[test]
+fn attachment_path_facade_rejects_a_non_utf8_basename() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut pdf = build_minimal_pdf();
+    let path = PathBuf::from(OsString::from_vec(vec![b'b', 0xff]));
+    let error = add_attachment_from_path(&mut pdf, b"bad", &path)
+        .expect_err("a non-UTF-8 basename cannot become /UF");
+    assert!(error.to_string().contains("basename is not valid UTF-8"));
+}
+
+#[test]
+fn ascii_filename_fallback_uses_qpdf_attachment_for_punctuation_only_names() {
+    assert_eq!(ascii_filename_fallback("..."), b"attachment");
+    assert_eq!(ascii_filename_fallback(""), b"attachment");
+}
+
+#[test]
+fn extract_attachment_reports_missing_tree_keys_without_available_keys() {
+    let mut pdf = build_minimal_pdf();
+    let error = extract_attachment(&mut pdf, b"missing").expect_err("tree key is absent");
+    assert!(error.to_string().contains("no attachments present"));
+}
+
+#[test]
+fn extract_attachment_reports_a_filespec_without_a_stream() {
+    let mut bytes = build_attachment_pdf("", "", b"payload");
+    let old = b"/F 6 0 R /UF 6 0 R";
+    let new = b"/F 0 0 R /UF 0 0 R";
+    let position = bytes
+        .windows(old.len())
+        .position(|window| window == old)
+        .expect("attachment fixture has both EF references");
+    bytes[position..position + old.len()].copy_from_slice(new);
+    let mut pdf = open(bytes);
+    let error = extract_attachment(&mut pdf, b"attachment.txt")
+        .expect_err("null EF candidates must report a missing stream");
+    assert!(error
+        .to_string()
+        .contains("no resolvable /EmbeddedFile stream"));
 }
 
 // ── helper: encode_utf16be ────────────────────────────────────────────────────

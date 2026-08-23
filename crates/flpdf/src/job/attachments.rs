@@ -5,9 +5,9 @@ use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::filespec_helper::FileSpec;
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::qpdf_time::default_pdf_date;
-use crate::{Error, ObjectHandle, Pdf, Result};
-use std::io::{Read, Seek};
-use std::path::PathBuf;
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 
 struct PipelineHandleSink(PipelineHandle);
 
@@ -341,12 +341,270 @@ impl QPDFJob {
     }
 }
 
+/// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +
+/// [`crate::embedded_files::insert_embedded_file`] that:
+///
+/// 1. Streams the file at `path` through the deferred provider factory.
+/// 2. Derives the name-tree key and `/F`/`/UF` filename from the path's
+///    **basename** (the last component of the path).
+/// 3. Builds a `/Filespec` + `/EmbeddedFile` pair without installing a local
+///    filter. `/Params /Size` and `/Params /CheckSum` reflect the **raw** bytes,
+///    as required by ISO 32000-1 §7.11.4.
+/// 4. Inserts the pair into the catalog's `/Names /EmbeddedFiles` name tree
+///    under the UTF-8 `key` (which may differ from the basename if the caller
+///    wants an explicit tree key).
+///
+/// Returns the [`ObjectRef`] of the newly created `/Filespec` dictionary.
+///
+/// # Parameters
+///
+/// - `pdf` — the target document (must be mutable).
+/// - `key` — the name-tree key used to look up the attachment later (e.g. the
+///   basename encoded as bytes, or any other agreed-upon string).
+/// - `path` — path to the file on disk; its basename is used for `/F`/`/UF`.
+///
+/// # Errors
+///
+/// - [`Error::Io`] if the file cannot be opened or read.
+/// - [`Error::Unsupported`] if the path has no basename or the basename is not
+///   valid UTF-8.
+/// - Any error from [`FileSpec::create_file_spec_from_path`] or
+///   [`crate::embedded_files::insert_embedded_file`].
+///
+/// # Example
+///
+/// ```no_run
+/// use std::io::Cursor;
+/// use flpdf::Pdf;
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf: Pdf<Cursor<Vec<u8>>> = todo!();
+/// let fs_ref = flpdf::add_attachment_from_path(
+///     &mut pdf,
+///     b"README.txt",
+///     "/tmp/README.txt",
+/// )?;
+/// println!("inserted filespec at {fs_ref}");
+/// # Ok(())
+/// # }
+/// ```
+pub fn add_attachment_from_path<R, P>(pdf: &mut Pdf<R>, key: &[u8], path: P) -> Result<ObjectRef>
+where
+    R: Read + Seek,
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+
+    // Derive the basename for /F and /UF.
+    let basename = path
+        .file_name()
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "add_attachment_from_path: path has no basename: {}",
+                path.display()
+            ))
+        })?
+        .to_str()
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "add_attachment_from_path: basename is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+
+    // Build the /Filespec + /EmbeddedFile through qpdf's path-provider route.
+    // `create_file_spec` initially uses the same Unicode name for `/F` and
+    // `/UF`; replace `/F` with the independent ASCII fallback while retaining
+    // the original Unicode `/UF` value, matching FileSpecBuilder's behavior.
+    let filespec_handle = FileSpec::create_file_spec_from_path(pdf, basename.as_bytes(), path)?;
+    let filespec_ref = filespec_handle
+        .object_ref()
+        .expect("create_file_spec_from_path must create an indirect Filespec");
+    let fallback = ascii_filename_fallback(basename);
+    {
+        let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
+        filespec.set_filename(basename.as_bytes(), Some(fallback.as_slice()))?;
+    }
+    crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
+
+    Ok(filespec_ref)
+}
+
+/// Return an ASCII-safe `/F` fallback while preserving readable ASCII filename parts.
+pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
+    let fallback: String = filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if fallback.is_empty() || fallback.bytes().all(|b| b == b'.' || b == b'_') {
+        b"attachment".to_vec()
+    } else {
+        fallback.into_bytes()
+    }
+}
+
+// ── Attachment extraction API ─────────────────────────────────────────────────
+
+/// Extract the decoded payload of an attachment identified by `key`.
+///
+/// Looks up `key` in the catalog's `/Names /EmbeddedFiles` name tree, resolves
+/// the associated `/Filespec` dictionary, and decodes the `/EmbeddedFile` stream
+/// (applying the filter chain, e.g. FlateDecode) to return the original file
+/// contents.
+///
+/// # Note on direct-dict filespecs
+///
+/// Name-tree entries whose value is a direct `/Filespec` dictionary (rather than
+/// an indirect reference) are not surfaced by the underlying
+/// [`crate::embedded_files::list_embedded_files`] enumeration; they are
+/// skipped with the same limitation documented there. Only attachments with
+/// indirect-reference values are extractable by this function.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] when `key` is not present in the name tree.  The
+///   error message includes the missing key name and a sorted list of available
+///   keys so the caller can emit an actionable diagnostic.
+/// - [`Error::Unsupported`] when the filespec at `key` has no resolvable
+///   `/EmbeddedFile` stream (e.g. the `/EF` sub-dictionary is absent or
+///   malformed).
+/// - Any error from [`Pdf::resolve`] or the filter decoder.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::Pdf;
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
+/// let bytes = flpdf::extract_attachment(&mut pdf, b"report.pdf")?;
+/// println!("extracted {} bytes", bytes.len());
+/// # Ok(())
+/// # }
+/// ```
+pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result<Vec<u8>> {
+    // Look up all entries in the name tree.
+    let entries = crate::embedded_files::list_embedded_files(pdf)?;
+
+    // Find the target key.
+    let filespec_ref = match entries.iter().find(|(k, _)| k.as_slice() == key) {
+        Some((_, r)) => *r,
+        None => {
+            // Collect available keys for an actionable error message.
+            // Sorted so the diagnostic is deterministic / reproducible,
+            // independent of name-tree iteration order (CodeRabbit nitpick).
+            let mut available: Vec<String> = entries
+                .iter()
+                .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                .collect();
+            available.sort_unstable();
+            let hint = if available.is_empty() {
+                " (no attachments present)".to_string()
+            } else {
+                format!(" (available keys: {})", available.join(", "))
+            };
+            return Err(Error::Unsupported(format!(
+                "extract_attachment: key {:?} not found{}",
+                String::from_utf8_lossy(key),
+                hint,
+            )));
+        }
+    };
+
+    // Resolve the filespec and decode its embedded file stream.
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
+    let ef = fs.embedded_file()?.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "extract_attachment: key {:?} has no resolvable /EmbeddedFile stream \
+             (the /EF sub-dictionary may be absent or malformed)",
+            String::from_utf8_lossy(key),
+        ))
+    })?;
+    ef.payload()
+}
+
+/// Write the decoded payload of attachment `key` to `out`.
+///
+/// Decodes the embedded file stream via [`extract_attachment`] and writes all
+/// bytes to `out` in a single [`Write::write_all`] call.
+///
+/// # Errors
+///
+/// Propagates all errors from [`extract_attachment`] and from `out.write_all`.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::Pdf;
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
+/// let mut buf = Vec::new();
+/// flpdf::write_attachment(&mut pdf, b"report.pdf", &mut buf)?;
+/// println!("wrote {} bytes", buf.len());
+/// # Ok(())
+/// # }
+/// ```
+pub fn write_attachment<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    key: &[u8],
+    out: &mut W,
+) -> Result<()> {
+    let bytes = extract_attachment(pdf, key)?;
+    out.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Write the decoded payload of attachment `key` to a file at `path`.
+///
+/// Creates (or truncates) the file at `path` and writes the decoded stream
+/// bytes.  This is the library-side counterpart of the CLI `-o` option
+/// (wiring of the `-o` flag is handled by the CLI layer, not here).
+///
+/// # Errors
+///
+/// - Any error from [`extract_attachment`].
+/// - [`Error::Io`] if the file cannot be created or written.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use std::io::BufReader;
+/// use flpdf::Pdf;
+///
+/// # fn main() -> flpdf::Result<()> {
+/// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
+/// flpdf::extract_attachment_to_path(&mut pdf, b"report.pdf", "/tmp/out.pdf")?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn extract_attachment_to_path<R, P>(pdf: &mut Pdf<R>, key: &[u8], path: P) -> Result<()>
+where
+    R: Read + Seek,
+    P: AsRef<Path>,
+{
+    let bytes = extract_attachment(pdf, key)?;
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::super::{JobExitCode, QPDFJob};
+    use super::extract_attachment;
     use super::AttachmentAddOptions;
     use super::PipelineHandleSink;
-    use crate::filespec_helper::extract_attachment;
     use crate::job::attachment_list::list_attachment_info;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};

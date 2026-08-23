@@ -18,7 +18,14 @@ def production_source(path: Path) -> str:
 
 class ObjectHandleConsumerCutoverTests(unittest.TestCase):
     def test_filespec_production_uses_only_the_canonical_handle_route(self):
-        source = production_source(ROOT / "crates/flpdf/src/filespec_helper.rs")
+        source = "\n".join(
+            production_source(ROOT / path)
+            for path in (
+                "crates/flpdf/src/filespec_helper/filespec.rs",
+                "crates/flpdf/src/filespec_helper/embedded_file_stream.rs",
+                "crates/flpdf/src/filespec_helper/shared.rs",
+            )
+        )
 
         for legacy in (
             "crate::object::",
