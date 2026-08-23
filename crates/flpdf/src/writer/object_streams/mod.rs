@@ -939,6 +939,44 @@ mod tests {
         crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap()
     }
 
+    fn classic_pdf_with_free_gap() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = [0usize; 5];
+        let objects = [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>".as_slice(),
+            ),
+        ];
+        for (number, body) in objects {
+            offsets[number as usize] = bytes.len();
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for number in 1..=3 {
+            bytes.extend_from_slice(
+                format!("{:010} 00000 n \n", offsets[number as usize]).as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn planner_config_default_uses_qpdf_preserve_cap() {
+        let config = PlannerConfig::default();
+        assert_eq!(config.mode, ObjectStreamMode::Preserve);
+        assert_eq!(config.batch_size_cap, DEFAULT_BATCH_SIZE_CAP);
+    }
+
     #[test]
     fn planner_disable_mode_yields_empty_plan() {
         let pdf_bytes = one_objstm_pdf_n(&[]);
@@ -1025,6 +1063,25 @@ mod tests {
         for r in batch {
             assert_eq!(r.generation, 0);
         }
+    }
+
+    #[test]
+    fn planner_generate_excludes_nonzero_free_xref_entries() {
+        let mut pdf = open_pdf(classic_pdf_with_free_gap());
+        let config = PlannerConfig {
+            mode: ObjectStreamMode::Generate,
+            batch_size_cap: NonZeroUsize::new(100).unwrap(),
+        };
+
+        let plan = plan_object_streams(&mut pdf, &config).unwrap();
+        assert!(
+            plan.batches
+                .iter()
+                .flatten()
+                .all(|object_ref| object_ref.number != 4),
+            "free xref objects must not become ObjStm members: {:?}",
+            plan.batches
+        );
     }
 
     #[test]

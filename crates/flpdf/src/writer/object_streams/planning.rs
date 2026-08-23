@@ -162,14 +162,12 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
     let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
 
     match config.mode {
-        ObjectStreamMode::Disable => unreachable!(),
-        ObjectStreamMode::Preserve => plan_preserve(
-            pdf,
-            &ctx,
-            &length_exclusions,
-            None,
-            Some(config.batch_size_cap),
-        ),
+        ObjectStreamMode::Disable => {
+            unreachable!() // cov:ignore: the early Disable return makes this arm unreachable
+        }
+        ObjectStreamMode::Preserve => {
+            plan_preserve(pdf, &ctx, &length_exclusions, config.batch_size_cap)
+        }
         ObjectStreamMode::Generate => {
             plan_generate(pdf, config, &ctx, &length_exclusions, reachable)
         }
@@ -300,8 +298,7 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     ctx: &EligibilityContext,
     length_exclusions: &BTreeSet<ObjectRef>,
-    reachable: Option<&BTreeSet<ObjectRef>>,
-    batch_size_cap: Option<NonZeroUsize>,
+    batch_size_cap: NonZeroUsize,
 ) -> crate::Result<PackingPlan> {
     let entries = pdf.source_xref_entries();
 
@@ -325,9 +322,7 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
         // Filter ineligible members.
         let mut eligible: Vec<ObjectRef> = Vec::new();
         for (_idx, obj_ref) in members {
-            if length_exclusions.contains(&obj_ref)
-                || reachable.is_some_and(|reachable| !reachable.contains(&obj_ref))
-            {
+            if length_exclusions.contains(&obj_ref) {
                 continue;
             }
             let eligible_for_objstm = {
@@ -340,14 +335,10 @@ fn plan_preserve<R: std::io::Read + std::io::Seek>(
             eligible.push(obj_ref);
         }
 
-        if let Some(cap) = batch_size_cap {
-            for chunk in eligible.chunks(cap.get()) {
-                if !chunk.is_empty() {
-                    batches.push(chunk.to_vec());
-                }
+        for chunk in eligible.chunks(batch_size_cap.get()) {
+            if !chunk.is_empty() {
+                batches.push(chunk.to_vec());
             }
-        } else if !eligible.is_empty() {
-            batches.push(eligible);
         }
     }
 
