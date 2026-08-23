@@ -54,6 +54,13 @@ fn show_stream_rejects_non_stream_object() {
     .stderr(predicate::str::contains("is not a stream"));
 }
 
+// Object 99 0 is absent; qpdf's own doShowObj never rejects a missing
+// reference (QPDFJob.cc:806-840 unparses the null handle and succeeds),
+// so this hard-stop is flpdf's own pre-existing behavior with no qpdf
+// counterpart to preserve exactly, and the message must stay bare --
+// not routed through Error::Unsupported's "unsupported PDF feature: "
+// prefix, which would misclassify a missing reference as an unsupported
+// feature.
 #[test]
 fn show_stream_unknown_object_reports_clear_error() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
@@ -64,7 +71,8 @@ fn show_stream_unknown_object_reports_clear_error() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("not found"));
+    .stderr(predicate::str::contains("object 99 0 R not found"))
+    .stderr(predicate::str::contains("unsupported PDF feature").not());
 }
 
 #[test]
@@ -77,7 +85,8 @@ fn dump_object_unknown_object_reports_clear_error() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("not found"));
+    .stderr(predicate::str::contains("object 99 0 R not found"))
+    .stderr(predicate::str::contains("unsupported PDF feature").not());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,6 +263,55 @@ fn build_pdf_with_stale_length_stream(stream_data: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
     bytes
+}
+
+/// Like [`build_pdf_with_stale_length_stream`], but the stream dictionary
+/// also carries an explicit empty `/Filter []` array.
+fn build_pdf_with_stale_length_and_empty_filter_array(stream_data: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+
+    let cat_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let stream_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Filter [] /Length 99 >>\nstream\n");
+    bytes.extend_from_slice(stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{cat_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// Regression test: an explicit `/Filter []` (empty array) applies zero
+/// filters, same as a missing `/Filter` (`QPDF_Stream.cc:391-406`: the
+/// per-item loop over an empty array leaves `filter_names` empty). The
+/// recovered source-framing EOL from a stale `/Length` must still be
+/// trimmed from decoded output in this case, exactly as it is for a
+/// stream with no `/Filter` key at all
+/// (`show_stream_surfaces_lazy_recovery_warnings`).
+#[test]
+fn show_stream_trims_recovered_eol_for_empty_filter_array() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        temp.path(),
+        build_pdf_with_stale_length_and_empty_filter_array(b"payload"),
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["show-stream", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stdout(predicate::eq(b"payload".as_slice()));
 }
 
 #[test]

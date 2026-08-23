@@ -162,7 +162,13 @@ impl QPDFJob {
 fn ensure_present(object: &ObjectHandle, object_ref: ObjectRef) -> Result<()> {
     object.type_code()?;
     if object.is_null() {
-        return Err(Error::Unsupported(format!(
+        // A missing object reference has no qpdf counterpart to preserve --
+        // qpdf's own doShowObj (QPDFJob.cc:806-840) never rejects one; it
+        // simply unparses the null object handle and succeeds. This is
+        // flpdf's own pre-existing hard-stop, kept as-is by this migration
+        // (Error::Unsupported would prepend "unsupported PDF feature: ",
+        // changing the diagnostic text this route has always emitted).
+        return Err(Error::System(format!(
             "object {} {} R not found",
             object_ref.number, object_ref.generation
         )));
@@ -217,7 +223,13 @@ fn first_stream_filter_name(stream_dictionary: &ObjectHandle) -> Result<Option<V
 fn stream_is_unfiltered(stream_dictionary: &ObjectHandle) -> Result<bool> {
     let filter = stream_dictionary.get_key(b"/Filter");
     filter.type_code()?;
-    Ok(filter.is_null())
+    if filter.is_null() {
+        return Ok(true);
+    }
+    // An empty `/Filter []` array applies zero filters, same as a missing
+    // `/Filter` (QPDF_Stream.cc:396-406: the per-item loop over an empty
+    // array leaves `filter_names` empty, so decoding is a no-op).
+    Ok(filter.as_array().is_some_and(|items| items.is_empty()))
 }
 
 fn cli_stream_bytes<'a, R: Read + Seek>(
