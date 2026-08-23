@@ -221,7 +221,7 @@ qpdf の識別子に寄せるかで両者が対立するとき、このクレー
   `get_x`/`is_x`/`has_x` に写す**。`page_object_helper.rs`
   （`get_media_box`/`get_crop_box`/`get_resources` 等、いずれも
   `&mut self -> Result<...>` で継承属性 walk 等の実処理を伴う）と
-  `annotation_helper.rs`（`get_subtype`/`get_rect`/`get_flags` 等）が
+  `annotation_object_helper.rs`（`get_subtype`/`get_rect`/`get_flags` 等）が
   確立した支配的な慣行で、Rust API Guidelines の C-GETTER（単純 getter は
   `get_` を省く）とは逆方向だが、それは意図的な選択。理由は「qpdf の
   `getTitle()` を読んだ人が flpdf 側で `grep get_title` すれば一致する」
