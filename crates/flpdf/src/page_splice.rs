@@ -1163,9 +1163,12 @@ mod tests {
 
         let right = dict_handle_of(&mut pdf, ObjectRef::new(6, 0));
         let kids = right.get_key(b"/Kids").as_array().unwrap();
-        let [duplicate] = kids.as_slice() else {
-            panic!("right /Kids should contain one indirect page, got {kids:?}");
-        };
+        assert_eq!(
+            kids.len(),
+            1,
+            "right /Kids should contain one indirect page"
+        );
+        let duplicate = &kids[0];
         let duplicate = duplicate
             .object_ref()
             .expect("right /Kids entry should be indirect");
