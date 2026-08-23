@@ -101,9 +101,12 @@ impl QPDFJob {
         // QPDFJob owns the logger and warning state for every operation. The
         // split source may have been opened outside QPDFJob (the CLI opens an
         // intermediate rewrite), so install the job logger before any page or
-        // AcroForm traversal can emit a lazy warning.
+        // AcroForm traversal can emit a lazy warning. A source opened with
+        // `PdfOpenOptions { suppress_warnings: true, .. }` independently of
+        // this job keeps that suppression rather than being un-suppressed by
+        // this job's own (possibly unconfigured) default.
         source.set_logger(self.logger());
-        source.set_suppress_warnings(self.warnings_suppressed());
+        source.set_suppress_warnings(self.warnings_suppressed() || source.suppress_warnings());
         if options.chunk_size == 0 {
             return Err(Error::Unsupported(
                 "split_pages: chunk_size must be >= 1".to_owned(),
@@ -409,9 +412,10 @@ fn digit_width(n: u32) -> usize {
 mod tests {
     use super::*;
     use crate::pages::page_refs;
-    use crate::{Object, Pdf};
+    use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
+    use crate::{Object, Pdf, PdfOpenOptions, QPDFLogger};
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     // -----------------------------------------------------------------------
     // Pure-function unit tests: naming
@@ -701,6 +705,68 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    struct RecordingWarningSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Pipeline for RecordingWarningSink {
+        fn identifier(&self) -> &str {
+            "split_pages warning recording sink"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn split_pages_retains_a_source_configured_suppress_warnings_setting() {
+        // A source opened independently of the job (e.g. the CLI's
+        // intermediate rewrite) with `PdfOpenOptions { suppress_warnings:
+        // true, .. }` must stay suppressed even when the job itself never
+        // called `set_suppress_warnings`; split_pages must not silently
+        // un-suppress it by overwriting with the job's own unconfigured
+        // default. `split_pages` also installs the job's own logger onto
+        // `source` before any traversal runs (so both must observe the same
+        // sink), which is why the recording sink is attached to the job, not
+        // to the source's own (about-to-be-replaced) open-time logger.
+        let bytes =
+            include_bytes!("../../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf")
+                .to_vec();
+        let mut source = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                suppress_warnings: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("fixture should parse");
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+            &recorded,
+        )))));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.split_pages(
+            &mut source,
+            SplitPageOptions::new(1, temp.path().join("out.pdf")),
+        )
+        .expect("split job should succeed with a recoverable, suppressed warning");
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "a source opened with suppress_warnings:true must stay suppressed \
+             through split_pages: {:?}",
+            String::from_utf8_lossy(&recorded.lock().unwrap())
         );
     }
 

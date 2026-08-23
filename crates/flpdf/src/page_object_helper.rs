@@ -1089,9 +1089,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `QPDFPageObjectHelper::copyAnnotations`: the page insertion has
     /// already copied the source `/Annots`, so the transformed annotations
     /// replace the destination array instead of being appended to it.
-    /// The source job has already performed qpdf's full AcroForm analysis, so
-    /// the per-page copy uses the field-tree-only source boundary and avoids
-    /// repeating the orphan-widget warning scan.
+    /// `Pdf::acroform_cache` memoizes the source's full AcroForm analysis
+    /// per source `Pdf` (`QPDFJob::get_afdh_for_qpdf`, `QPDFJob.cc:1847-1856`),
+    /// so a repeated `AcroFormDocumentHelper::new(source)` across per-page
+    /// copies reuses that warm cache instead of rescanning; the orphan-widget
+    /// page walk that self-associates a widget unreachable from
+    /// `/AcroForm/Fields` therefore still runs exactly once per source.
     pub(crate) fn fix_copied_annotations_from<RS: Read + Seek>(
         &mut self,
         from_page: ObjectHandle,
@@ -1107,11 +1110,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 
         let transformed = {
             let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
-            let transformed = acroform.transform_annotations_from_without_source_orphan_scan(
-                old_annots,
-                Matrix::default(),
-                source,
-            )?; // cov:ignore: LLVM attributes this multiline generic call terminator to the defensive error edge; the direct helper regression covers the success path.
+            let transformed =
+                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?; // cov:ignore: LLVM attributes this multiline generic call terminator to the defensive error edge; the direct helper regression covers the success path.
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
                 &BTreeSet::new(),
@@ -2559,7 +2559,13 @@ mod tests {
     }
 
     #[test]
-    fn fix_copied_annotations_uses_the_field_tree_only_source_boundary() {
+    fn fix_copied_annotations_retains_the_orphan_widget_s_self_association() {
+        // qpdf's `QPDFAcroFormDocumentHelper::analyze` self-associates a page
+        // Widget unreachable from `/AcroForm/Fields` as its own field
+        // (`QPDFAcroFormDocumentHelper.cc`'s orphan-widget fallback). That
+        // association must survive a `fix_copied_annotations_from` copy: the
+        // destination's own `/AcroForm` must end up containing the copied
+        // orphan widget, not merely succeed without error.
         let mut source = Pdf::open_mem_owned(
             include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf")
                 .to_vec(),
@@ -2586,6 +2592,29 @@ mod tests {
         PageObjectHelper::new(new_page, &mut target)
             .fix_copied_annotations_from(source_page, &mut source)
             .expect("copied annotations should be repaired");
+
+        let root_ref = target.root_ref().expect("target has a catalog");
+        let root = target.get_object_handle(root_ref);
+        target.resolve(&root).expect("resolve target catalog");
+        let acroform = target
+            .resolve_to_terminal(&root.try_get_key(b"/AcroForm").expect("read /AcroForm key"))
+            .expect("resolve /AcroForm");
+        assert!(
+            acroform.as_dictionary().is_some(),
+            "the copied orphan widget must produce a destination /AcroForm"
+        );
+        let fields = target
+            .resolve_to_terminal(&acroform.try_get_key(b"/Fields").expect("read /Fields key"))
+            .expect("resolve /Fields");
+        assert_eq!(
+            fields
+                .try_as_array()
+                .expect("resolve /Fields array")
+                .expect("/Fields is an array")
+                .len(),
+            1,
+            "the orphan widget must be registered as its own field"
+        );
     }
 
     #[test]

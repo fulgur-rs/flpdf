@@ -4894,7 +4894,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let (written, split_job) = split_rewritten_pdf(
+        let (written, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
             output,
@@ -4906,6 +4906,17 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
             for path in &written {
                 logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
             }
+        }
+        // The intermediate rewrite may already have repaired the condition
+        // that produced a warning in the original source (e.g. --repair's
+        // xref reconstruction) or the source document `pdf` itself, so the
+        // freshly re-opened split source can look clean even though the
+        // original input was not. Fold both signals into the split job
+        // before completing it, matching what the non-split branch's
+        // `finish_operation_warnings_with_prior` checks below.
+        split_job.record_document_warnings(&pdf);
+        if prior_warnings {
+            split_job.record_warnings();
         }
         return finish_job_exit_status(split_job.complete(true)?);
     } else if let Some(writer) = standard_output.as_mut() {
@@ -5090,7 +5101,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let (written, split_job) = split_rewritten_pdf(
+        let (written, mut split_job) = split_rewritten_pdf(
             bytes,
             n,
             output,
@@ -5105,6 +5116,11 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
                 // cov:ignore-end
             }
         }
+        // The intermediate rewrite may already have repaired the condition
+        // that produced a warning on the original `pdf` (e.g. --repair's
+        // xref reconstruction), so the freshly re-opened split source can
+        // look clean even though the original input was not.
+        split_job.record_document_warnings(&pdf);
         return finish_job_exit_status(split_job.complete(true)?);
     } else if let Some(writer) = standard_output.as_mut() {
         // cov:ignore-start: exercised by binary_rotate_dash subprocess integration test
