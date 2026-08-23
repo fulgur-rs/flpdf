@@ -452,7 +452,7 @@ fn name_tree_new_empty_owns_an_indirect_root() {
     let root = tree.root().clone();
     let root_ref = root.as_ref_id().expect("indirect root");
     assert_eq!(
-        pdf.resolve(root_ref).expect("resolve root"),
+        pdf.resolve_object(root_ref).expect("resolve root"),
         Object::Dictionary({
             let mut dictionary = Dictionary::new();
             dictionary.insert("Names", Object::Array(Vec::new()));
@@ -471,7 +471,7 @@ fn number_tree_new_empty_owns_an_indirect_root() {
     let root = tree.root().clone();
     let root_ref = root.as_ref_id().expect("indirect root");
     assert_eq!(
-        pdf.resolve(root_ref).expect("resolve root"),
+        pdf.resolve_object(root_ref).expect("resolve root"),
         Object::Dictionary({
             let mut dictionary = Dictionary::new();
             dictionary.insert("Nums", Object::Array(Vec::new()));

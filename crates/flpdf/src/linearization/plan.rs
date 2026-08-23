@@ -4683,7 +4683,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("qpdf-style recovery");
         assert!(plan.part4_rest.contains(&ObjectRef::new(4, 0)));
         assert_eq!(
-            pdf.resolve(ObjectRef::new(4, 0))
+            pdf.resolve_object(ObjectRef::new(4, 0))
                 .unwrap()
                 .as_stream()
                 .unwrap()

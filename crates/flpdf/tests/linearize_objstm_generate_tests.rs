@@ -114,7 +114,7 @@ fn three_page_generate_packs_first_half_container_before_e() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -143,7 +143,7 @@ fn three_page_generate_keeps_catalog_standalone() {
 
     // The root must resolve to a /Type /Catalog dict ...
     let root = pdf.root_ref().expect("root ref present");
-    let obj = pdf.resolve(root).expect("catalog resolves");
+    let obj = pdf.resolve_object(root).expect("catalog resolves");
     let dict = obj.as_dict().expect("catalog is a dictionary");
     let is_catalog = dict
         .get("Type")
@@ -215,7 +215,7 @@ fn mixed_generate_emits_part6_and_part7_containers_and_round_trips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -239,7 +239,7 @@ fn threepage_shared_generate_emits_part6_and_part8_containers_and_round_trips() 
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -291,7 +291,7 @@ fn openaction_generate_routes_open_document_container_to_first_half() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -345,7 +345,7 @@ fn outlines_generate_emits_outline_hint_table_and_o_key() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -389,7 +389,7 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
     let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
     let mut js_number = None;
     for r in rt.object_refs() {
-        if let Ok(Object::Stream(s)) = rt.resolve(r) {
+        if let Ok(Object::Stream(s)) = rt.resolve_object(r) {
             if let Ok(decoded) =
                 filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
             {
@@ -423,7 +423,7 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
     let refs = rt.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        rt.resolve(r)
+        rt.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -466,7 +466,7 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     let mut rt = Pdf::open(Cursor::new(bytes.clone())).expect("round-trip open");
     let mut js_number = None;
     for r in rt.object_refs() {
-        if let Ok(Object::Stream(s)) = rt.resolve(r) {
+        if let Ok(Object::Stream(s)) = rt.resolve_object(r) {
             if let Ok(decoded) =
                 filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
             {
@@ -508,7 +508,7 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     let refs = rt.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        rt.resolve(r)
+        rt.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -572,7 +572,7 @@ fn openaction_multi_od_generates_two_od_containers_in_dfs_order() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -600,7 +600,7 @@ fn disc_part7_part8_generate_round_trips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -627,7 +627,7 @@ fn otherpage_others_two_container_generate_round_trips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -666,7 +666,7 @@ fn objstm_bearing_input_drops_source_structural_containers() {
     // The drop must not strand any reference: every object still resolves.
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("Pdf::open round-trip");
     for r in pdf.object_refs() {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve after drop: {e}"));
     }
 }
@@ -684,7 +684,7 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 
@@ -966,7 +966,7 @@ fn thumbnail_private_shared_routes_thumbs_to_part9() {
     let mut pdf_rt = Pdf::open(std::io::Cursor::new(bytes)).expect("Pdf::open round-trip");
     for r in pdf_rt.object_refs() {
         pdf_rt
-            .resolve(r)
+            .resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -1141,7 +1141,7 @@ fn acroform_widget_page1_page2_od_container_excluded_from_part8_soht() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }
@@ -1238,7 +1238,7 @@ fn linearize_generate_force_version_below_1_5_suppresses_object_and_xref_streams
         "suppressed linearized doc must expose objects"
     );
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
     }
 }

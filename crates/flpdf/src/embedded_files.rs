@@ -734,7 +734,7 @@ mod tests {
             "qpdf keeps the retained AF array element"
         );
         assert_eq!(
-            pdf.resolve(filespec_ref)
+            pdf.resolve_object(filespec_ref)
                 .expect("Filespec remains addressable"),
             Object::Null,
             "qpdf replaces the removed Filespec with null"
@@ -1076,7 +1076,8 @@ mod tests {
         let fs_ref = FileSpecBuilder::new("trans.txt", b"payload")
             .build(&mut pdf)
             .expect("build filespec");
-        let Object::Dictionary(mut fs_dict) = pdf.resolve(fs_ref).expect("resolve filespec") else {
+        let Object::Dictionary(mut fs_dict) = pdf.resolve_object(fs_ref).expect("resolve filespec")
+        else {
             panic!("expected filespec dict");
         };
         fs_dict.insert("CI", Object::Reference(sidecar_ref));
@@ -1099,7 +1100,8 @@ mod tests {
         let fs_ref = FileSpecBuilder::new("indirect-ef.txt", b"payload")
             .build(&mut pdf)
             .expect("build filespec");
-        let Object::Dictionary(mut fs_dict) = pdf.resolve(fs_ref).expect("resolve filespec") else {
+        let Object::Dictionary(mut fs_dict) = pdf.resolve_object(fs_ref).expect("resolve filespec")
+        else {
             panic!("expected filespec dict");
         };
         let Object::Dictionary(ef_dict) = fs_dict.get("EF").cloned().expect("/EF") else {
@@ -1211,7 +1213,8 @@ mod tests {
             "catalog /AF must remain in place"
         );
         assert_eq!(
-            pdf.resolve(fs_ref).expect("Filespec remains addressable"),
+            pdf.resolve_object(fs_ref)
+                .expect("Filespec remains addressable"),
             Object::Null,
             "Filespec must be nulled, not removed"
         );
@@ -1298,7 +1301,8 @@ mod tests {
             "page /AF must still point at the surviving shared array"
         );
         assert_eq!(
-            pdf.resolve(fs_ref).expect("Filespec remains addressable"),
+            pdf.resolve_object(fs_ref)
+                .expect("Filespec remains addressable"),
             Object::Null,
             "Filespec must be nulled, not removed"
         );
@@ -1360,7 +1364,8 @@ mod tests {
             "the null Filespec ref remains reachable through /Dests"
         );
         assert_eq!(
-            pdf.resolve(fs_ref).expect("Filespec remains addressable"),
+            pdf.resolve_object(fs_ref)
+                .expect("Filespec remains addressable"),
             Object::Null,
             "qpdf replaces the shared Filespec with null"
         );
@@ -1698,7 +1703,7 @@ mod tests {
         );
 
         assert_eq!(
-            pdf.resolve(fs_ref)
+            pdf.resolve_object(fs_ref)
                 .expect("Filespec must remain addressable"),
             Object::Null,
             "qpdf replaces the removed Filespec with null"
@@ -1841,7 +1846,7 @@ mod tests {
         // chain to exercise multi-hop resolution.
         let catalog_ref = pdf.root_ref().expect("root");
         let mut catalog = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog dict");
@@ -1926,7 +1931,7 @@ mod tests {
         // and add a surviving sibling key.
         let catalog_ref = pdf.root_ref().expect("root");
         let mut catalog = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog dict");
@@ -1959,7 +1964,7 @@ mod tests {
         // qpdf preserves the original holder chain while modifying the terminal
         // names dictionary in place.
         let catalog_after = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog after")
             .into_dict()
             .expect("catalog dict after");
@@ -1971,7 +1976,7 @@ mod tests {
 
         // The terminal retains its sibling and an empty EmbeddedFiles tree.
         let resolved = pdf
-            .resolve(terminal_ref)
+            .resolve_object(terminal_ref)
             .expect("resolve terminal /Names target");
         let names_dict = resolved.into_dict().expect("/Names target is a dict");
         assert!(
@@ -1993,7 +1998,7 @@ mod tests {
         // Seed catalog /Names as a *direct* dict carrying only an unrelated key.
         let catalog_ref = pdf.root_ref().expect("root");
         let mut catalog = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog dict");
@@ -2014,7 +2019,7 @@ mod tests {
 
         // /Names stays direct and retains /Dests.
         let catalog_after = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog after")
             .into_dict()
             .expect("catalog dict after");
@@ -2051,7 +2056,7 @@ mod tests {
         // the catalog reaches /EmbeddedFiles through a *direct* /Names dict.
         let catalog_ref = pdf.root_ref().expect("root");
         let mut catalog = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog dict");
@@ -2071,7 +2076,7 @@ mod tests {
         // /Names stays inline on the catalog; /Dests and the empty
         // /EmbeddedFiles tree are preserved.
         let catalog_after = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog after")
             .into_dict()
             .expect("catalog dict after");

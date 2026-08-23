@@ -278,14 +278,19 @@ fn update_from_json_matches_qpdf_after_a_complete_flpdf_fixture_import() {
 #[test]
 fn update_from_json_replaces_only_named_objects_and_runs_update_flags() {
     let mut pdf = Pdf::empty().expect("empty document");
-    let original_pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages object");
+    let original_pages = pdf
+        .resolve_object(ObjectRef::new(2, 0))
+        .expect("pages object");
 
     pdf.update_from_json(Cursor::new(UPDATE_JSON), "update.json")
         .expect("partial JSON should update the document");
 
     let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
     assert_eq!(catalog.get_key(b"/Marker").as_boolean(), Some(true));
-    assert_eq!(pdf.resolve(ObjectRef::new(2, 0)).unwrap(), original_pages);
+    assert_eq!(
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
+        original_pages
+    );
     assert!(pdf.ever_called_get_all_pages());
 }
 

@@ -551,7 +551,7 @@ fn coalesce_contents_merges_array_to_single_stream() {
     let out_page_ref = out_pages[0];
 
     // Resolve the output page dict and verify /Contents is NOT an array.
-    let out_page_obj = out_pdf.resolve(out_page_ref).unwrap();
+    let out_page_obj = out_pdf.resolve_object(out_page_ref).unwrap();
     let out_page_dict = match &out_page_obj {
         Object::Dictionary(d) => d.clone(),
         other => panic!("page object must be a Dictionary, got {other:?}"),
@@ -756,7 +756,7 @@ fn extract_page_resource_keys(path: &Path, category: &str) -> Vec<Vec<u8>> {
     assert!(!pages.is_empty(), "output PDF must have at least one page");
 
     let page_ref = pages[0];
-    let page_obj = pdf.resolve(page_ref).unwrap();
+    let page_obj = pdf.resolve_object(page_ref).unwrap();
     let page_dict = match page_obj {
         Object::Dictionary(d) => d,
         other => panic!("page must be a Dictionary, got {other:?}"),
@@ -764,7 +764,7 @@ fn extract_page_resource_keys(path: &Path, category: &str) -> Vec<Vec<u8>> {
 
     // Resolve /Resources (may be inline or a reference).
     let resources_obj = match page_dict.get("Resources").cloned() {
-        Some(Object::Reference(r)) => pdf.resolve(r).unwrap(),
+        Some(Object::Reference(r)) => pdf.resolve_object(r).unwrap(),
         Some(obj) => obj,
         None => return vec![],
     };
@@ -775,7 +775,7 @@ fn extract_page_resource_keys(path: &Path, category: &str) -> Vec<Vec<u8>> {
 
     // Resolve the requested category sub-dict (e.g. /Font, /XObject).
     let cat_obj = match resources_dict.get(category).cloned() {
-        Some(Object::Reference(r)) => pdf.resolve(r).unwrap(),
+        Some(Object::Reference(r)) => pdf.resolve_object(r).unwrap(),
         Some(obj) => obj,
         None => return vec![],
     };
@@ -813,7 +813,7 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
     assert!(!pages.is_empty());
 
     for page_ref in &pages {
-        let page_obj = out_pdf.resolve(*page_ref).unwrap();
+        let page_obj = out_pdf.resolve_object(*page_ref).unwrap();
         let page_dict = match &page_obj {
             Object::Dictionary(d) => d.clone(),
             other => panic!("page must be a Dictionary, got {other:?}"),
@@ -825,7 +825,7 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
             None => continue, // empty page
         };
 
-        let content_stream = match out_pdf.resolve(contents_ref).unwrap() {
+        let content_stream = match out_pdf.resolve_object(contents_ref).unwrap() {
             Object::Stream(s) => s,
             other => panic!("expected /Contents to resolve to a Stream, got {other:?}"),
         };
@@ -899,7 +899,7 @@ fn compress_streams_n_preserves_existing_filters_and_roundtrips() {
     assert!(!pages.is_empty());
 
     for page_ref in &pages {
-        let page_obj = out_pdf.resolve(*page_ref).unwrap();
+        let page_obj = out_pdf.resolve_object(*page_ref).unwrap();
         let page_dict = match &page_obj {
             Object::Dictionary(d) => d.clone(),
             other => panic!("page must be a Dictionary, got {other:?}"),
@@ -911,7 +911,7 @@ fn compress_streams_n_preserves_existing_filters_and_roundtrips() {
             None => continue,
         };
 
-        let content_stream = match out_pdf.resolve(contents_ref).unwrap() {
+        let content_stream = match out_pdf.resolve_object(contents_ref).unwrap() {
             Object::Stream(s) => s,
             other => panic!("expected a Stream, got {other:?}"),
         };
@@ -1116,7 +1116,7 @@ fn combination_normalize_coalesce_compress_succeeds() {
     assert_eq!(pages.len(), 1, "combination: output must have 1 page");
 
     // /Contents must be a single reference (coalesce applied).
-    let page_obj = out_pdf.resolve(pages[0]).unwrap();
+    let page_obj = out_pdf.resolve_object(pages[0]).unwrap();
     let page_dict = match page_obj {
         Object::Dictionary(d) => d,
         other => panic!("page must be a Dictionary, got {other:?}"),
@@ -1154,7 +1154,7 @@ fn real_endstream_offsets(
     let mut offsets = Vec::new();
 
     for oref in refs {
-        let obj = out_pdf.resolve(oref).expect("resolve must succeed");
+        let obj = out_pdf.resolve_object(oref).expect("resolve must succeed");
         let stream = match obj {
             Object::Stream(s) => s,
             _ => continue,

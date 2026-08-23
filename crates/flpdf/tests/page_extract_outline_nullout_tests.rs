@@ -178,11 +178,17 @@ fn referenced_removed_pages_nulled_unreferenced_absent() {
     // Referenced removed pages are nulled in place AND stay live (reachable via
     // their dests), matching qpdf's `N 0 obj null`.
     assert!(
-        matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+        matches!(
+            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
+            Object::Null
+        ),
         "removed page 2 (referenced by dp2) must be null"
     );
     assert!(
-        matches!(pdf.resolve(ObjectRef::new(6, 0)).unwrap(), Object::Null),
+        matches!(
+            pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
+            Object::Null
+        ),
         "removed page 4 (referenced by dp4) must be null"
     );
     let live = pdf.live_object_refs();
@@ -207,13 +213,13 @@ fn outline_and_names_retained_all_entries_kept() {
     let mut pdf = run_subset(&[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
 
     // Catalog keeps /Outlines and /Names.
-    let cat = pdf.resolve(pdf.root_ref().unwrap()).unwrap();
+    let cat = pdf.resolve_object(pdf.root_ref().unwrap()).unwrap();
     let cat = cat.as_dict().unwrap();
     assert!(cat.get("Outlines").is_some(), "/Outlines retained");
     assert!(cat.get("Names").is_some(), "/Names retained");
 
     // All four named dests still present; /Limits unchanged.
-    let leaf = pdf.resolve(ObjectRef::new(30, 0)).unwrap();
+    let leaf = pdf.resolve_object(ObjectRef::new(30, 0)).unwrap();
     let leaf = leaf.as_dict().unwrap();
     let names = leaf.get("Names").and_then(Object::as_array).unwrap();
     let keys: Vec<&[u8]> = names
@@ -231,7 +237,7 @@ fn outline_and_names_retained_all_entries_kept() {
     );
 
     // Both outline items kept with their chain intact.
-    let i20 = pdf.resolve(ObjectRef::new(20, 0)).unwrap();
+    let i20 = pdf.resolve_object(ObjectRef::new(20, 0)).unwrap();
     assert_eq!(
         i20.as_dict().unwrap().get_ref("Next"),
         Some(ObjectRef::new(21, 0)),
@@ -250,7 +256,7 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
 
     // Catalog still carries the navigation structures after the round trip.
     let root = re.root_ref().expect("root");
-    let cat = re.resolve(root).unwrap();
+    let cat = re.resolve_object(root).unwrap();
     let cat = cat.as_dict().expect("catalog dict").clone();
     assert!(
         cat.get("Outlines").is_some(),
@@ -260,9 +266,9 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
 
     // The Dests leaf still holds four entries; at least one resolves to null
     // (a removed-but-referenced page emitted as `N 0 obj null`).
-    let names_dict = re.resolve(names_ref).unwrap();
+    let names_dict = re.resolve_object(names_ref).unwrap();
     let dests_ref = names_dict.as_dict().unwrap().get_ref("Dests").unwrap();
-    let leaf = re.resolve(dests_ref).unwrap();
+    let leaf = re.resolve_object(dests_ref).unwrap();
     let pairs = leaf
         .as_dict()
         .unwrap()
@@ -279,7 +285,7 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
     for dest in pairs.iter().skip(1).step_by(2) {
         if let Some(first) = dest.as_array().and_then(|a| a.first()) {
             if let Some(r) = first.as_ref_id() {
-                if matches!(re.resolve(r).unwrap(), Object::Null) {
+                if matches!(re.resolve_object(r).unwrap(), Object::Null) {
                     null_targets += 1;
                 }
             }
@@ -312,7 +318,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
 
     // The signature field object (obj 7) is NOT nulled and stays live — it is
     // reachable through the `evil` named destination.
-    let sig_field = pdf.resolve(ObjectRef::new(7, 0)).unwrap();
+    let sig_field = pdf.resolve_object(ObjectRef::new(7, 0)).unwrap();
     assert_eq!(
         sig_field.as_dict().and_then(|d| d.get("FT")),
         Some(&Object::Name(b"Sig".to_vec())),
@@ -324,7 +330,10 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     );
     // The genuinely removed page (obj 4) IS nulled, matching qpdf.
     assert!(
-        matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+        matches!(
+            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
+            Object::Null
+        ),
         "removed page (obj 4) is nulled"
     );
 
@@ -336,21 +345,21 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     write_default(&mut pdf, &mut out).expect("write");
     let mut re = Pdf::open(Cursor::new(out)).expect("reopen");
     let names_ref = re
-        .resolve(re.root_ref().unwrap())
+        .resolve_object(re.root_ref().unwrap())
         .unwrap()
         .as_dict()
         .unwrap()
         .get_ref("Names")
         .expect("/Names survives");
     let dests_ref = re
-        .resolve(names_ref)
+        .resolve_object(names_ref)
         .unwrap()
         .as_dict()
         .unwrap()
         .get_ref("Dests")
         .expect("/Dests survives");
     let pairs = re
-        .resolve(dests_ref)
+        .resolve_object(dests_ref)
         .unwrap()
         .as_dict()
         .unwrap()
@@ -365,7 +374,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
         .and_then(|a| a.first())
         .and_then(Object::as_ref_id)
         .expect("evil dest first element is a ref");
-    let resolved = re.resolve(evil_target).unwrap();
+    let resolved = re.resolve_object(evil_target).unwrap();
     assert_eq!(
         resolved.as_dict().and_then(|d| d.get("FT")),
         Some(&Object::Name(b"Sig".to_vec())),
@@ -395,7 +404,10 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
 
         // The removed page object (obj 4) is null, regardless of the indirection.
         assert!(
-            matches!(pdf.resolve(ObjectRef::new(4, 0)).unwrap(), Object::Null),
+            matches!(
+                pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
+                Object::Null
+            ),
             "obj40={obj40}: removed page (obj 4) must be null"
         );
 

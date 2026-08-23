@@ -293,7 +293,9 @@ fn preserve_nonmonotonic_source_indices_match_qpdf_source_number_order() {
     );
 
     let mut rewritten = Pdf::open(Cursor::new(actual)).unwrap();
-    let catalog = rewritten.resolve(rewritten.root_ref().unwrap()).unwrap();
+    let catalog = rewritten
+        .resolve_object(rewritten.root_ref().unwrap())
+        .unwrap();
     assert!(matches!(catalog, Object::Dictionary(ref dictionary)
             if dictionary.get("Pages")
                 == Some(&Object::Reference(ObjectRef::new(3, 0)))

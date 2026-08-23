@@ -93,7 +93,7 @@ fn resolves_indirect_object_on_access() {
     let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
-    let root = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let root = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap();
     let Object::Dictionary(dict) = root else {
         panic!("expected catalog dictionary")
     };
@@ -137,7 +137,7 @@ fn resolving_many_eof_running_objects_stays_bounded() {
     // loop must complete without rescanning the file once per object.
     let mut resolved = 0usize;
     for i in 3..3 + N {
-        if pdf.resolve(ObjectRef::new(i, 0)).is_ok() {
+        if pdf.resolve_object(ObjectRef::new(i, 0)).is_ok() {
             resolved += 1;
         }
     }
@@ -587,7 +587,7 @@ fn resolve_decrypts_encrypted_strings_after_authentication() {
         .trailer_dictionary()
         .get_ref("Info")
         .expect("writer fixture has /Info");
-    let Object::Dictionary(dict) = pdf.resolve(info_ref).unwrap() else {
+    let Object::Dictionary(dict) = pdf.resolve_object(info_ref).unwrap() else {
         panic!("expected /Info dictionary");
     };
 
@@ -623,7 +623,7 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
     )
     .unwrap();
 
-    let Object::Dictionary(info) = pdf.resolve(info_ref).unwrap() else {
+    let Object::Dictionary(info) = pdf.resolve_object(info_ref).unwrap() else {
         panic!("expected compressed /Info dictionary");
     };
     assert_eq!(info.get("Value"), Some(&Object::Integer(42)));
@@ -633,7 +633,7 @@ fn resolve_decrypts_object_stream_before_filter_decode() {
 fn v4_uses_separate_stream_and_string_crypt_filters() {
     let mut pdf = Pdf::open(std::io::Cursor::new(encrypted_v4_mixed_cf_reader_fixture())).unwrap();
 
-    let Object::Dictionary(dict) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(dict) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("expected dictionary");
     };
     assert_eq!(
@@ -641,7 +641,7 @@ fn v4_uses_separate_stream_and_string_crypt_filters() {
         Some(&Object::String(b"plain text".to_vec()))
     );
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
     assert_eq!(stream.data, b"stream plain".to_vec());
@@ -654,7 +654,7 @@ fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_first() {
     ))
     .unwrap();
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
 
@@ -680,7 +680,7 @@ fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_last() {
     ))
     .unwrap();
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
 
@@ -723,7 +723,7 @@ fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
     ))
     .unwrap();
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
 
@@ -757,7 +757,7 @@ fn v4_explicit_crypt_filter_before_ascii85_decrypts_at_filter_slot() {
     ))
     .unwrap();
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
 
@@ -786,7 +786,7 @@ fn v4_explicit_crypt_filter_after_ascii85_decrypts_before_filter() {
     ))
     .unwrap();
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
     assert_eq!(
@@ -863,7 +863,7 @@ fn v4_explicit_crypt_filter_failure_retries_unfiltered_like_qpdf() {
     let qpdf_retained = qpdf_retained_raw_stream(&qpdf_output, "/ASCII85Decode");
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
     assert_eq!(
@@ -947,7 +947,7 @@ fn v4_explicit_crypt_filter_flate_failure_retries_unfiltered() {
     let qpdf_retained = qpdf_retained_raw_stream(&qpdf_output, "/FlateDecode");
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
         panic!("expected stream");
     };
     assert_eq!(
@@ -976,7 +976,7 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
         )
         .unwrap();
 
-        let Object::Dictionary(dict) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(dict) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("expected dictionary");
         };
         assert_eq!(
@@ -984,7 +984,7 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
             Some(&Object::String(b"plain text".to_vec()))
         );
 
-        let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
             panic!("expected stream");
         };
         assert_eq!(stream.data, b"stream plain".to_vec());
@@ -1049,7 +1049,7 @@ fn v4_encrypt_metadata_false_leaves_metadata_stream_plaintext() {
     ))
     .unwrap();
 
-    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Stream(stream) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("expected metadata stream");
     };
 
@@ -1076,11 +1076,11 @@ fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
 
     let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
     let root = rewritten.root_ref().expect("root");
-    let Object::Dictionary(catalog) = rewritten.resolve(root).expect("catalog") else {
+    let Object::Dictionary(catalog) = rewritten.resolve_object(root).expect("catalog") else {
         panic!("root must resolve to catalog");
     };
     let stream_ref = catalog.get_ref(catalog_key).expect("stream reference");
-    let Object::Stream(stream) = rewritten.resolve(stream_ref).expect("stream") else {
+    let Object::Stream(stream) = rewritten.resolve_object(stream_ref).expect("stream") else {
         panic!("{catalog_key} must resolve to a stream");
     };
     assert_eq!(
@@ -1186,11 +1186,11 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
 
     let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
     let root = rewritten.root_ref().expect("root");
-    let Object::Dictionary(catalog) = rewritten.resolve(root).expect("catalog") else {
+    let Object::Dictionary(catalog) = rewritten.resolve_object(root).expect("catalog") else {
         panic!("root must resolve to catalog");
     };
     let stream_ref = catalog.get_ref("Data").expect("stream reference");
-    let Object::Stream(stream) = rewritten.resolve(stream_ref).expect("stream") else {
+    let Object::Stream(stream) = rewritten.resolve_object(stream_ref).expect("stream") else {
         panic!("Data must resolve to a stream");
     };
     let decoded =
@@ -1744,7 +1744,9 @@ fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
         .expect("qpdf opens a document with an unknown /CFM");
 
     let secret = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, object_number: u32| {
-        let Object::Dictionary(dict) = pdf.resolve(ObjectRef::new(object_number, 0)).unwrap()
+        let Object::Dictionary(dict) = pdf
+            .resolve_object(ObjectRef::new(object_number, 0))
+            .unwrap()
         else {
             panic!("object {object_number} is a dictionary");
         };
@@ -1757,7 +1759,10 @@ fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
     assert_eq!(secret(&mut pdf, 4), b"second");
 
     for (object_number, plaintext) in [(5u32, b"stream one".as_slice()), (6, b"stream two")] {
-        let Object::Stream(stream) = pdf.resolve(ObjectRef::new(object_number, 0)).unwrap() else {
+        let Object::Stream(stream) = pdf
+            .resolve_object(ObjectRef::new(object_number, 0))
+            .unwrap()
+        else {
             panic!("object {object_number} is a stream");
         };
         assert_eq!(stream.data, plaintext);
@@ -2365,7 +2370,9 @@ fn pre_v4_documents_still_decrypt_their_streams_with_rc4() {
         )
         .unwrap_or_else(|err| panic!("/V {version} fixture must authenticate: {err:?}"));
 
-        let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve stream")
+        let Object::Stream(stream) = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("resolve stream")
         else {
             panic!("object 4 is a stream");
         };
@@ -2418,7 +2425,10 @@ fn missing_reference_resolves_to_null() {
     let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
-    assert_eq!(pdf.resolve(ObjectRef::new(99, 0)).unwrap(), Object::Null);
+    assert_eq!(
+        pdf.resolve_object(ObjectRef::new(99, 0)).unwrap(),
+        Object::Null
+    );
 }
 
 #[test]
@@ -2461,7 +2471,7 @@ fn resolves_compressed_entry_from_xref_stream() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
         Object::Integer(42)
     );
 }
@@ -2514,11 +2524,11 @@ fn resolves_compressed_entry_with_flate_decode_from_xref_stream() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
         parse_object(&member1).unwrap()
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
         parse_object(&member2).unwrap()
     );
 }
@@ -2531,9 +2541,12 @@ fn resolves_compressed_entry_declared_in_extended_object_stream() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
 
-    assert_eq!(pdf.resolve(ObjectRef::new(2, 0)).unwrap(), Object::Null);
     assert_eq!(
-        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
+        Object::Null
+    );
+    assert_eq!(
+        pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
         Object::Integer(99)
     );
 }
@@ -2549,25 +2562,25 @@ fn objstm_direct_container_qpdf_contract() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
         Object::Null,
         "a header object number, not the xref field2, controls materialization"
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(3, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
         Object::Null,
         "a header object number, not the xref field2, controls materialization"
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(10, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(10, 0)).unwrap(),
         parse_object(b"<< /V 100 >>").unwrap()
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(11, 0)).unwrap(),
         parse_object(b"<< /V 200 >>").unwrap()
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(12, 0)).unwrap(),
         parse_object(b"<< /V 300 >>").unwrap(),
         "a child xref entry must resolve against the child container directly"
     );
@@ -2580,7 +2593,7 @@ fn objstm_direct_container_rejects_effective_xref_source_mismatch() {
 
     let mut pdf = Pdf::open(std::io::Cursor::new(fixture)).unwrap();
     assert_eq!(
-        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(12, 0)).unwrap(),
         Object::Null,
         "a child header must not be used when effective xref points at another stream"
     );
@@ -2958,7 +2971,7 @@ fn indirect_length_resolved_via_xref_is_authoritative() {
     );
 
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-    let obj = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let obj = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap();
     let Object::Stream(stream) = obj else {
         panic!("object 1 must be a stream");
     };
@@ -2982,7 +2995,9 @@ fn encrypted_fixture_streams_decrypt_correctly_with_indirect_length_path() {
     // Resolve every object; none must error and no panic.
     let mut stream_seen = false;
     for r in pdf.object_refs() {
-        let obj = pdf.resolve(r).expect("encrypted object must resolve");
+        let obj = pdf
+            .resolve_object(r)
+            .expect("encrypted object must resolve");
         if let Object::Stream(s) = obj {
             stream_seen = true;
             // A correctly decrypted content/metadata stream is decodable and
@@ -3022,7 +3037,7 @@ fn cyclic_indirect_length_holder_terminates() {
     );
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).unwrap();
     // Must terminate (no stack overflow / hang) and yield a stream.
-    let obj = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let obj = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap();
     assert!(
         matches!(obj, Object::Stream(_)),
         "cyclic /Length holder must still resolve to a stream (endstream-scan fallback)"
@@ -3062,7 +3077,7 @@ fn exact_window_indirect_length_pdf(header: &[u8]) -> Vec<u8> {
 fn non_qdf_exact_window_indirect_length_preserves_trailing_newline() {
     let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n");
     let mut pdf = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
-    let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Stream(s) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("object 1 must be a stream");
     };
     assert_eq!(
@@ -3080,7 +3095,7 @@ fn non_qdf_exact_window_indirect_length_preserves_trailing_newline() {
 fn qdf_exact_window_indirect_length_preserves_trailing_newline() {
     let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n");
     let mut pdf = Pdf::open(std::io::Cursor::new(pdf)).unwrap();
-    let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Stream(s) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("object 1 must be a stream");
     };
     assert_eq!(
@@ -3114,7 +3129,7 @@ fn qdf_exact_window_indirect_length_works_through_short_reads() {
 
     let pdf = exact_window_indirect_length_pdf(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n%QDF-1.0\n");
     let mut pdf = Pdf::open(OneByteReader(std::io::Cursor::new(pdf))).unwrap();
-    let Object::Stream(s) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Stream(s) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("object 1 must be a stream");
     };
     assert_eq!(

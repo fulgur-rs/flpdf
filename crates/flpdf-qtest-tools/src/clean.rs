@@ -75,7 +75,7 @@ pub fn clean_encryption<R: Read + Seek>(pdf: &mut Pdf<R>) -> flpdf::Result<()> {
     let Some(encrypt_ref) = pdf.trailer_dictionary().get_ref(b"Encrypt") else {
         return Ok(());
     };
-    let mut enc = pdf.resolve(encrypt_ref)?;
+    let mut enc = pdf.resolve_object(encrypt_ref)?;
     let Some(dict) = enc.as_dict_mut() else {
         return Ok(());
     };
@@ -341,7 +341,9 @@ mod tests {
         // Sanity: before cleanup, all five hash/permission keys the AES-256
         // R=6 Standard security handler emits are present.
         {
-            let enc = pdf.resolve(encrypt_ref).expect("resolve /Encrypt dict");
+            let enc = pdf
+                .resolve_object(encrypt_ref)
+                .expect("resolve /Encrypt dict");
             let dict = enc.as_dict().expect("premise: /Encrypt resolves to a dict");
             for key in [b"O".as_ref(), b"OE", b"U", b"UE", b"Perms"] {
                 assert!(
@@ -357,7 +359,7 @@ mod tests {
         // Re-resolve through the cache: the stripped keys must be gone and
         // structural keys like /Filter and /V must still be there.
         let enc = pdf
-            .resolve(encrypt_ref)
+            .resolve_object(encrypt_ref)
             .expect("re-resolve after clean_encryption");
         let dict = enc.as_dict().expect("still a dict after cleanup");
         for key in [b"O".as_ref(), b"OE", b"U", b"UE", b"Perms"] {

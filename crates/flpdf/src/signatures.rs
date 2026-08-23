@@ -367,14 +367,14 @@ fn resolve_catalog_acroform<R: Read + Seek>(
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };
-    let Object::Dictionary(catalog) = pdf.resolve(root_ref)? else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(root_ref)? else {
         return Ok(None);
     };
     let Some(acroform) = catalog.get("AcroForm").cloned() else {
         return Ok(None);
     };
     match acroform {
-        Object::Reference(acroform_ref) => match pdf.resolve(acroform_ref)? {
+        Object::Reference(acroform_ref) => match pdf.resolve_object(acroform_ref)? {
             Object::Dictionary(dict) => Ok(Some((AcroformHome::Object(acroform_ref), dict))),
             _ => Ok(None),
         },
@@ -418,7 +418,7 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         return Ok(());
     }
 
-    let Object::Dictionary(mut dict) = pdf.resolve(field_ref)? else {
+    let Object::Dictionary(mut dict) = pdf.resolve_object(field_ref)? else {
         return Ok(());
     };
 
@@ -606,7 +606,7 @@ fn resolve_dictionary<R: Read + Seek>(
 fn resolve_array<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Vec<Object>> {
     match value {
         Object::Array(values) => Ok(values),
-        Object::Reference(object_ref) => match pdf.resolve(object_ref)? {
+        Object::Reference(object_ref) => match pdf.resolve_object(object_ref)? {
             Object::Array(values) => Ok(values),
             _ => Ok(Vec::new()),
         },
@@ -676,7 +676,7 @@ fn resolve_entry<R: Read + Seek>(
     key: &str,
 ) -> Result<Option<Object>> {
     match dict.get(key) {
-        Some(Object::Reference(object_ref)) => Ok(Some(pdf.resolve(*object_ref)?)),
+        Some(Object::Reference(object_ref)) => Ok(Some(pdf.resolve_object(*object_ref)?)),
         Some(object) => Ok(Some(object.clone())),
         None => Ok(None),
     }
@@ -718,7 +718,7 @@ fn certificate_entry<R: Read + Seek>(
                 match value {
                     Object::String(bytes) => return Ok(Some(bytes)),
                     Object::Reference(object_ref) => {
-                        if let Object::String(bytes) = pdf.resolve(object_ref)? {
+                        if let Object::String(bytes) = pdf.resolve_object(object_ref)? {
                             return Ok(Some(bytes));
                         }
                     }

@@ -54,7 +54,7 @@ fn push_direct_root<R: Read + Seek>(
     warn_skipped_keys: bool,
 ) -> Result<()> {
     // cov:ignore-start: PreparedPages::Direct is created and consumed without an intervening public mutation
-    let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref)? else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(catalog_ref)? else {
         return Ok(());
     };
     let Some(Object::Dictionary(mut root)) = catalog.get("Pages").cloned() else {
@@ -230,7 +230,7 @@ fn push_child_reference<R: Read + Seek>(
         );
     }
 
-    let Object::Dictionary(mut leaf) = pdf.resolve(kid_ref)? else {
+    let Object::Dictionary(mut leaf) = pdf.resolve_object(kid_ref)? else {
         return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     };
     let mut changed = false;
@@ -288,7 +288,7 @@ fn push_internal<R: Read + Seek>(
         return Ok(()); // cov:ignore: page-tree repair rejects cycles before inherited-attribute push
     }
 
-    let Object::Dictionary(mut dict) = pdf.resolve(node_ref)? else {
+    let Object::Dictionary(mut dict) = pdf.resolve_object(node_ref)? else {
         return Ok(());
     };
     if !matches!(dict.get("Type"), Some(Object::Name(name)) if name == b"Pages") {
@@ -433,12 +433,12 @@ mod tests {
             panic!("fixture has an indirect /Pages root");
             // cov:ignore-end
         };
-        let before = pdf.resolve(root).unwrap();
+        let before = pdf.resolve_object(root).unwrap();
 
         let error = push(&mut pdf, &prepared, false, false).unwrap_err();
 
         assert!(error.to_string().contains("inheritable attribute"));
-        assert_eq!(pdf.resolve(root).unwrap(), before);
+        assert_eq!(pdf.resolve_object(root).unwrap(), before);
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
 
         assert!(
             matches!(
-                pdf.resolve(leaf_ref).unwrap(),
+                pdf.resolve_object(leaf_ref).unwrap(),
                 Object::Dictionary(ref page) if page.get("Rotate") == Some(&Object::Integer(90))
             ),
             "leaf must have actually inherited /Rotate"
@@ -492,7 +492,7 @@ mod tests {
                 && diagnostic.message.contains("/Pages")
         }));
         assert!(matches!(
-            pdf.resolve(prepared.pages[0]).unwrap(),
+            pdf.resolve_object(prepared.pages[0]).unwrap(),
             Object::Dictionary(ref page) if page.get("MediaBox").is_some()
         ));
     }

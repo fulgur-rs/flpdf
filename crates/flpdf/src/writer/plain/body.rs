@@ -1139,7 +1139,7 @@ mod tests {
         let fixture =
             include_bytes!("../../../../../tests/fixtures/compat/null-length-framing-matrix.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        pdf.resolve(ObjectRef::new(5, 0))
+        pdf.resolve_object(ObjectRef::new(5, 0))
             .expect("legacy resolution records the recovered framing EOL");
         assert_eq!(
             pdf.recovered_stream_eol(ObjectRef::new(5, 0)),
@@ -1168,7 +1168,7 @@ mod tests {
         let fixture =
             include_bytes!("../../../../../tests/fixtures/compat/null-length-framing-matrix.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        pdf.resolve(ObjectRef::new(5, 0))
+        pdf.resolve_object(ObjectRef::new(5, 0))
             .expect("legacy resolution records the recovered framing EOL");
         let options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,
@@ -1237,7 +1237,7 @@ mod tests {
                 data: b"abc".to_vec(),
             }),
         );
-        let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+        let mut catalog = pdf.resolve_object(root).unwrap().into_dict().unwrap();
         catalog.insert("RemovedDirect", Object::Reference(removed));
         catalog.insert(
             "RemovedArray",
@@ -1498,7 +1498,7 @@ mod tests {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let root = pdf.root_ref().unwrap();
-        let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+        let mut catalog = pdf.resolve_object(root).unwrap().into_dict().unwrap();
         let source_objstm = ObjectRef::new(1, 0);
         catalog.insert("ReachableStructural", Object::Reference(source_objstm));
         pdf.set_object(root, Object::Dictionary(catalog));

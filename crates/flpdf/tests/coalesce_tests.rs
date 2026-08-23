@@ -139,7 +139,7 @@ fn coalesce_joins_two_streams_with_newline() {
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     // The page's /Contents must now be a single Reference.
-    let page_obj = pdf.resolve(page_ref).expect("page resolves");
+    let page_obj = pdf.resolve_object(page_ref).expect("page resolves");
     let Object::Dictionary(page_dict) = page_obj else {
         panic!("page is not a dict");
     };
@@ -149,7 +149,7 @@ fn coalesce_joins_two_streams_with_newline() {
     let new_ref = *new_ref;
 
     // Resolve and check the coalesced stream.
-    let coalesced = pdf.resolve(new_ref).expect("new stream resolves");
+    let coalesced = pdf.resolve_object(new_ref).expect("new stream resolves");
     let Object::Stream(s) = coalesced else {
         panic!("new /Contents ref does not resolve to a stream");
     };
@@ -195,13 +195,13 @@ fn coalesce_discards_first_stream_non_filter_dict_entries() {
     let page_ref = ObjectRef::new(3, 0);
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
-    let Object::Dictionary(page_dict) = pdf.resolve(page_ref).unwrap() else {
+    let Object::Dictionary(page_dict) = pdf.resolve_object(page_ref).unwrap() else {
         panic!("page not a dict");
     };
     let Object::Reference(new_ref) = page_dict.get("Contents").unwrap() else {
         panic!("/Contents not a Reference");
     };
-    let Object::Stream(s) = pdf.resolve(*new_ref).unwrap() else {
+    let Object::Stream(s) = pdf.resolve_object(*new_ref).unwrap() else {
         panic!("not a stream");
     };
 
@@ -248,14 +248,14 @@ fn coalesce_joins_three_streams_in_order() {
 
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
-    let page_obj = pdf.resolve(page_ref).unwrap();
+    let page_obj = pdf.resolve_object(page_ref).unwrap();
     let Object::Dictionary(page_dict) = page_obj else {
         panic!("page is not a dict");
     };
     let Object::Reference(new_ref) = page_dict.get("Contents").unwrap() else {
         panic!("/Contents is not a Reference");
     };
-    let coalesced = pdf.resolve(*new_ref).unwrap();
+    let coalesced = pdf.resolve_object(*new_ref).unwrap();
     let Object::Stream(s) = coalesced else {
         panic!("not a stream");
     };
@@ -340,14 +340,14 @@ fn coalesce_newline_prevents_token_fusion() {
 
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
-    let page_obj = pdf.resolve(page_ref).unwrap();
+    let page_obj = pdf.resolve_object(page_ref).unwrap();
     let Object::Dictionary(page_dict) = page_obj else {
         panic!("page is not a dict");
     };
     let Object::Reference(new_ref) = page_dict.get("Contents").unwrap() else {
         panic!("/Contents is not a Reference");
     };
-    let coalesced_obj = pdf.resolve(*new_ref).unwrap();
+    let coalesced_obj = pdf.resolve_object(*new_ref).unwrap();
     let Object::Stream(s) = coalesced_obj else {
         panic!("not a stream");
     };
@@ -397,14 +397,14 @@ fn coalesce_reparsed_yields_correct_operators_and_preserves_q_nesting() {
 
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
-    let page_obj = pdf.resolve(page_ref).unwrap();
+    let page_obj = pdf.resolve_object(page_ref).unwrap();
     let Object::Dictionary(page_dict) = page_obj else {
         panic!("page is not a dict");
     };
     let Object::Reference(new_ref) = page_dict.get("Contents").unwrap() else {
         panic!("/Contents is not a Reference");
     };
-    let coalesced_obj = pdf.resolve(*new_ref).unwrap();
+    let coalesced_obj = pdf.resolve_object(*new_ref).unwrap();
     let Object::Stream(s) = coalesced_obj else {
         panic!("not a stream");
     };
@@ -449,7 +449,7 @@ fn coalesce_noop_for_single_stream_reference() {
     let page_ref = ObjectRef::new(3, 0);
 
     // Snapshot the /Contents reference before the call.
-    let before_obj = pdf.resolve(page_ref).expect("page resolves");
+    let before_obj = pdf.resolve_object(page_ref).expect("page resolves");
     let Object::Dictionary(before_dict) = before_obj else {
         panic!("page is not a dict");
     };
@@ -461,7 +461,7 @@ fn coalesce_noop_for_single_stream_reference() {
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
 
     // The page dict must be identical: /Contents still points to the same ref.
-    let after_obj = pdf.resolve(page_ref).expect("page resolves");
+    let after_obj = pdf.resolve_object(page_ref).expect("page resolves");
     let Object::Dictionary(after_dict) = after_obj else {
         panic!("page is not a dict");
     };
@@ -486,7 +486,7 @@ fn coalesce_noop_for_page_without_contents() {
     // Should succeed silently.
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
 
-    let page_obj = pdf.resolve(page_ref).expect("page resolves");
+    let page_obj = pdf.resolve_object(page_ref).expect("page resolves");
     let Object::Dictionary(page_dict) = page_obj else {
         panic!("page is not a dict");
     };
@@ -533,7 +533,9 @@ fn coalesce_noop_for_direct_stream_in_contents() {
     page_dict.insert("Contents", Object::Stream(stream));
     pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page_dict));
 
-    let before_obj = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+    let before_obj = pdf
+        .resolve_object(ObjectRef::new(3, 0))
+        .expect("page resolves");
     let Object::Dictionary(before_dict) = before_obj else {
         panic!();
     };
@@ -544,7 +546,9 @@ fn coalesce_noop_for_direct_stream_in_contents() {
 
     coalesce_page(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed (noop)");
 
-    let after_obj = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+    let after_obj = pdf
+        .resolve_object(ObjectRef::new(3, 0))
+        .expect("page resolves");
     let Object::Dictionary(after_dict) = after_obj else {
         panic!();
     };
@@ -585,13 +589,13 @@ fn coalesce_ignores_non_stream_holder_chain_member() {
     let page_ref = ObjectRef::new(3, 0);
     coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
-    let Object::Dictionary(page_dict) = pdf.resolve(page_ref).expect("page resolves") else {
+    let Object::Dictionary(page_dict) = pdf.resolve_object(page_ref).expect("page resolves") else {
         panic!("page is not a dict");
     };
     let Object::Reference(new_ref) = page_dict.get("Contents").expect("/Contents present") else {
         panic!("/Contents is not a Reference after coalesce");
     };
-    let Object::Stream(s) = pdf.resolve(*new_ref).expect("new stream resolves") else {
+    let Object::Stream(s) = pdf.resolve_object(*new_ref).expect("new stream resolves") else {
         panic!("new /Contents ref does not resolve to a stream");
     };
 

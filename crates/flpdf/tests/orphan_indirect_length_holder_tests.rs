@@ -32,13 +32,13 @@ fn rewrite(opts: &WriterTestSettings) -> Vec<u8> {
 fn js_stream_length(out: &[u8]) -> Object {
     let mut pdf = Pdf::open(Cursor::new(out.to_vec())).expect("re-open output");
     let root = pdf.root_ref().expect("/Root");
-    let catalog = pdf.resolve(root).expect("catalog");
+    let catalog = pdf.resolve_object(root).expect("catalog");
     let open_action = catalog
         .as_dict()
         .and_then(|d| d.get("OpenAction").cloned())
         .expect("/OpenAction");
     let action = match open_action {
-        Object::Reference(r) => pdf.resolve(r).expect("action"),
+        Object::Reference(r) => pdf.resolve_object(r).expect("action"),
         other => other,
     };
     let js_ref = action
@@ -46,7 +46,7 @@ fn js_stream_length(out: &[u8]) -> Object {
         .and_then(|d| d.get("JS").cloned())
         .expect("/JS");
     let js = match js_ref {
-        Object::Reference(r) => pdf.resolve(r).expect("js stream"),
+        Object::Reference(r) => pdf.resolve_object(r).expect("js stream"),
         other => other,
     };
     js.as_stream()
@@ -205,7 +205,7 @@ fn plain_rewrite_keeps_length_holder_referenced_from_direct_trailer_dict() {
     };
     // The reference must resolve to the holder integer in the OUTPUT — i.e. it was
     // renumbered to a live object, not left dangling at a freed/wrong slot.
-    let resolved = re.resolve(held_ref).expect("/Held target resolves");
+    let resolved = re.resolve_object(held_ref).expect("/Held target resolves");
     assert_eq!(
         resolved,
         Object::Integer(16),

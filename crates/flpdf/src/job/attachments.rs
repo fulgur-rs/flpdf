@@ -866,7 +866,8 @@ mod tests {
         .expect("add attachment");
 
         let root_ref = pdf.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         assert_eq!(
@@ -999,7 +1000,8 @@ mod tests {
         job.add_attachment(&mut pdf, options)
             .expect("add attachment");
 
-        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         assert_eq!(
@@ -1185,7 +1187,8 @@ mod tests {
             )
             .expect("open fixture");
         let root_ref = pdf.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         assert_eq!(
@@ -1197,7 +1200,8 @@ mod tests {
         job.add_attachments(&mut pdf, &[])
             .expect("empty batch must be a no-op");
 
-        let Object::Dictionary(root) = pdf.resolve(root_ref).expect("resolve catalog") else {
+        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         assert_eq!(
@@ -1360,7 +1364,8 @@ mod tests {
         .expect("copy attachments");
 
         let root_ref = target.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = target.resolve(root_ref).expect("resolve catalog") else {
+        let Object::Dictionary(root) = target.resolve_object(root_ref).expect("resolve catalog")
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         assert_eq!(
@@ -1454,7 +1459,8 @@ mod tests {
         .expect("empty source copies nothing but still succeeds");
 
         let root_ref = target.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = target.resolve(root_ref).expect("resolve catalog") else {
+        let Object::Dictionary(root) = target.resolve_object(root_ref).expect("resolve catalog")
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         assert_eq!(

@@ -3511,7 +3511,9 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     // spuriously emit a Catalog delta.
     let catalog_snapshot = pdf.root_ref().and_then(|r| {
         let was_dirty = pdf.is_dirty(r);
-        pdf.resolve(r).ok().map(|catalog| (r, catalog, was_dirty))
+        pdf.resolve_object(r)
+            .ok()
+            .map(|catalog| (r, catalog, was_dirty))
     });
 
     // qpdf's full-rewrite writer resolves source streams with its default
@@ -3551,7 +3553,7 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
             Object::Dictionary(dict) => dict.get("Extensions").cloned(),
             _ => None,
         };
-        match pdf.resolve(root_ref) {
+        match pdf.resolve_object(root_ref) {
             Ok(Object::Dictionary(mut current)) => {
                 match original_extensions {
                     Some(extensions) => current.insert("Extensions", extensions),
@@ -3607,7 +3609,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
     for item in &plan.items {
         match *item {
             pclm::Item::Source { source, output } => {
-                let mut object = pdf.resolve(source)?;
+                let mut object = pdf.resolve_object(source)?;
                 // cov:ignore-start: the PCLm plan is built from the same validated
                 // reference graph used for this rewrite; malformed remap input is rejected upstream.
                 crate::writer::rewrite_renumber::renumber_qpdf_refs_in_place(
@@ -7519,12 +7521,14 @@ mod tests {
             .get_ref("Encrypt")
             .expect("trailer must reference /Encrypt");
         let root_ref = reopened.root_ref().expect("root_ref");
-        let root = reopened.resolve(root_ref).expect("resolve /Root");
+        let root = reopened.resolve_object(root_ref).expect("resolve /Root");
         let metadata_ref = root
             .as_dict()
             .and_then(|dict| dict.get_ref("Metadata"))
             .expect("Catalog must reference /Metadata");
-        let metadata = reopened.resolve(metadata_ref).expect("resolve /Metadata");
+        let metadata = reopened
+            .resolve_object(metadata_ref)
+            .expect("resolve /Metadata");
         let length_ref = metadata
             .as_stream()
             .and_then(|stream| stream.dict.get_ref("Length"))
@@ -7549,7 +7553,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("trailer /Info must be a reference, got {other:?}"),
         };
-        let title = match rt.resolve(info_ref).expect("resolve /Info") {
+        let title = match rt.resolve_object(info_ref).expect("resolve /Info") {
             Object::Dictionary(d) => match d.get("Title") {
                 Some(Object::String(s)) => s.clone(),
                 other => panic!("/Title must be a string, got {other:?}"),
@@ -7558,14 +7562,14 @@ mod tests {
         };
 
         let root_ref = rt.root_ref().expect("root_ref");
-        let metadata_ref = match rt.resolve(root_ref).expect("resolve /Root") {
+        let metadata_ref = match rt.resolve_object(root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get("Metadata") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
             },
             other => panic!("/Root must be a dictionary, got {other:?}"),
         };
-        let stream = match rt.resolve(metadata_ref).expect("resolve /Metadata") {
+        let stream = match rt.resolve_object(metadata_ref).expect("resolve /Metadata") {
             Object::Stream(s) => s.data,
             other => panic!("/Metadata must be a stream, got {other:?}"),
         };
@@ -8701,7 +8705,7 @@ mod tests {
         // Seed the legacy cache, then mutate only the canonical handle graph.
         // The writer consumer must not rebuild the Catalog from that stale
         // materialized snapshot.
-        pdf.resolve(root).expect("catalog must resolve");
+        pdf.resolve_object(root).expect("catalog must resolve");
         let catalog = pdf.get_object_handle(root);
         pdf.resolve_object_handle(&catalog)
             .expect("canonical catalog must resolve");
@@ -9158,7 +9162,7 @@ mod tests {
             .get_ref("Root")
             .expect("Root ref");
         let catalog_dict = reopened
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .expect("root is dict");
@@ -9395,7 +9399,7 @@ mod tests {
         // Caller-side mutation: mark Root dirty explicitly by re-storing its
         // current value. set_object always dirties the ref regardless of
         // whether the value actually changed.
-        let catalog = pdf.resolve(root_ref).expect("resolve root");
+        let catalog = pdf.resolve_object(root_ref).expect("resolve root");
         pdf.set_object(root_ref, catalog);
         assert!(pdf.is_dirty(root_ref), "sanity: caller marked Root dirty");
 
@@ -9509,7 +9513,7 @@ mod tests {
             .get_ref("Root")
             .expect("Root ref");
         let catalog = reopened
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .expect("root is dict");
@@ -9564,7 +9568,7 @@ mod tests {
             .get_ref("Root")
             .expect("Root ref");
         let catalog = reopened
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .expect("root is dict");
@@ -9634,7 +9638,7 @@ mod tests {
             .get_ref("Root")
             .expect("Root ref");
         let catalog = reopened
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .expect("root is dict");

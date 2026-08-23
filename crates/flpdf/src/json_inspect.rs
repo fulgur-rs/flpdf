@@ -3323,7 +3323,7 @@ mod tests {
         let mut pdf = empty_pdf();
         let object_ref = ObjectRef::new(2, 0);
         pdf.set_object(object_ref, Object::Array(vec![Object::Integer(1)]));
-        pdf.resolve(object_ref).unwrap();
+        pdf.resolve_object(object_ref).unwrap();
         let handle = pdf.get_object_handle(object_ref);
         let mut bytes = Vec::new();
         let mut output = PlString::new("object-handle-json", None, &mut bytes);
@@ -3886,7 +3886,7 @@ mod tests {
         let mut pdf = empty_pdf();
         let child_ref = ObjectRef::new(2, 0);
         pdf.set_object(child_ref, Object::Array(vec![Object::Integer(1)]));
-        pdf.resolve(child_ref).unwrap();
+        pdf.resolve_object(child_ref).unwrap();
         let child_handle = pdf.get_object_handle(child_ref);
         assert!(
             child_handle.as_array().is_some(),
@@ -3938,7 +3938,7 @@ mod tests {
                 Object::Name(b"Fit".to_vec()),
             ]),
         );
-        pdf.resolve(dest_ref).unwrap();
+        pdf.resolve_object(dest_ref).unwrap();
         let handle = pdf.get_object_handle(dest_ref);
 
         let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
@@ -4577,7 +4577,8 @@ mod tests {
         let mut resources = Dictionary::new();
         resources.insert("XObject", Object::Dictionary(xobjects));
 
-        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
+        else {
             panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
         };
         page.insert("Resources", Object::Dictionary(resources));
@@ -4597,7 +4598,8 @@ mod tests {
         let mut resources = Dictionary::new();
         resources.insert("XObject", Object::Integer(7));
 
-        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
+        else {
             panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
         };
         page.insert("Resources", Object::Dictionary(resources));
@@ -4620,7 +4622,8 @@ mod tests {
         let mut resources = Dictionary::new();
         resources.insert("XObject", Object::Dictionary(xobjects));
 
-        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
+        else {
             panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
         };
         page.insert("Resources", Object::Dictionary(resources));
@@ -4636,7 +4639,8 @@ mod tests {
         let mut pdf = load_one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
 
-        let Object::Dictionary(mut page) = pdf.resolve(page_ref).expect("resolve page") else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).expect("resolve page")
+        else {
             panic!("page must be a dictionary"); // cov:ignore: fixture-shape guard
         };
         page.insert("Resources", Object::Integer(7));
@@ -5303,7 +5307,8 @@ mod tests {
     }
 
     fn direct_dests_root(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Dictionary {
-        let Object::Dictionary(catalog) = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(catalog) = pdf.resolve_object(crate::ObjectRef::new(1, 0)).unwrap()
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
         };
         let Some(Object::Dictionary(names)) = catalog.get("Names") else {
@@ -5318,7 +5323,10 @@ mod tests {
     #[test]
     fn selected_qpdf_skips_outline_repair_and_preserves_raw_objects() {
         let mut pdf = load_repairable_outline_pdf();
-        let before = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap().clone();
+        let before = pdf
+            .resolve_object(crate::ObjectRef::new(1, 0))
+            .unwrap()
+            .clone();
 
         let json = build_test_document_selected(
             &mut pdf,
@@ -5333,7 +5341,10 @@ mod tests {
             ["version", "parameters", "qpdf"]
         );
         assert!(pdf.repair_diagnostics().entries().is_empty());
-        assert_eq!(pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap(), before);
+        assert_eq!(
+            pdf.resolve_object(crate::ObjectRef::new(1, 0)).unwrap(),
+            before
+        );
         assert_eq!(
             qpdf_object_value(&json, "obj:1 0 R"),
             &pdf_object_to_json(&before).unwrap()
@@ -5379,7 +5390,10 @@ mod tests {
             ["version", "parameters", "outlines", "qpdf"]
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
-        let repaired_catalog = pdf.resolve(crate::ObjectRef::new(1, 0)).unwrap().clone();
+        let repaired_catalog = pdf
+            .resolve_object(crate::ObjectRef::new(1, 0))
+            .unwrap()
+            .clone();
         assert_eq!(
             qpdf_object_value(&json, "obj:1 0 R"),
             &pdf_object_to_json(&repaired_catalog).unwrap()
@@ -6073,7 +6087,7 @@ mod tests {
         assert!(prepared.refs.contains(&stream_ref));
         assert!(pdf.object_refs().contains(&stream_ref));
         assert!(!pdf.live_object_refs().contains(&stream_ref));
-        assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
+        assert_eq!(pdf.resolve_object(stream_ref).unwrap(), crate::Object::Null);
     }
 
     #[test]
@@ -6121,7 +6135,7 @@ mod tests {
             qpdf_resolve_top_level_object(&mut pdf, stream_ref).unwrap(),
             crate::Object::Stream(_)
         ));
-        assert_eq!(pdf.resolve(stream_ref).unwrap(), crate::Object::Null);
+        assert_eq!(pdf.resolve_object(stream_ref).unwrap(), crate::Object::Null);
     }
 
     #[test]
@@ -6589,7 +6603,12 @@ mod tests {
         let mut outlines = Dictionary::new();
         outlines.insert("First", Object::Dictionary(first));
         let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = pdf.resolve(catalog_ref).unwrap().as_dict().unwrap().clone();
+        let mut catalog = pdf
+            .resolve_object(catalog_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
         catalog.insert("Outlines", Object::Dictionary(outlines));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
@@ -6711,7 +6730,12 @@ mod tests {
         pdf.set_object(dests_ref, Object::Dictionary(dests));
 
         let catalog_ref = pdf.root_ref().unwrap();
-        let mut catalog = pdf.resolve(catalog_ref).unwrap().as_dict().unwrap().clone();
+        let mut catalog = pdf
+            .resolve_object(catalog_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
         catalog.insert("Dests", Object::Reference(first_holder_ref));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
@@ -7355,7 +7379,7 @@ mod tests {
         let mut pdf = load_fixture_pdf("form-fields-and-annotations.pdf");
         let widget_ref = ObjectRef::new(13, 0);
         let mut widget_dict = pdf
-            .resolve(widget_ref)
+            .resolve_object(widget_ref)
             .expect("resolve widget 13 0")
             .into_dict()
             .expect("widget 13 0 is a dictionary");
@@ -9127,7 +9151,7 @@ mod tests {
         // obj:7 of one-page.pdf is an ASCII85Decode+FlateDecode content stream.
         // resolve() returns the decrypted-but-still-filter-encoded bytes.
         let oref = crate::ObjectRef::new(7, 0);
-        let raw_bytes = match pdf.resolve(oref).expect("resolve obj:7") {
+        let raw_bytes = match pdf.resolve_object(oref).expect("resolve obj:7") {
             Object::Stream(s) => s.data.clone(),
             other => panic!("obj:7 is not a Stream: {other:?}"),
         };

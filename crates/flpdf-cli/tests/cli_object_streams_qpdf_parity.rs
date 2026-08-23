@@ -303,7 +303,7 @@ fn disable_mode_emits_no_objstm() {
     let bytes = std::fs::read(&disabled).unwrap();
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     let has_objstm = pdf.object_refs().into_iter().any(|r| {
-        if let Ok(Object::Stream(s)) = pdf.resolve(r) {
+        if let Ok(Object::Stream(s)) = pdf.resolve_object(r) {
             matches!(s.dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"ObjStm")
         } else {
             false
@@ -350,7 +350,9 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
     let root_ref = pdf
         .root_ref()
         .expect("output PDF must have a /Root reference in trailer");
-    let catalog = pdf.resolve(root_ref).expect("failed to resolve /Root");
+    let catalog = pdf
+        .resolve_object(root_ref)
+        .expect("failed to resolve /Root");
     let catalog_dict = match &catalog {
         Object::Dictionary(d) => d.clone(),
         other => panic!("expected /Root to be a Dictionary, got {other:?}"),
@@ -364,7 +366,9 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
     let pages_ref = catalog_dict
         .get_ref("Pages")
         .expect("/Catalog must contain a /Pages reference");
-    let pages = pdf.resolve(pages_ref).expect("failed to resolve /Pages");
+    let pages = pdf
+        .resolve_object(pages_ref)
+        .expect("failed to resolve /Pages");
     let pages_dict = match pages {
         Object::Dictionary(d) => d,
         other => panic!("expected /Pages to be a Dictionary, got {other:?}"),
@@ -440,7 +444,7 @@ fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32>
             continue;
         }
         let obj_ref = ObjectRef::new(num, generation);
-        let obj = match pdf.resolve(obj_ref) {
+        let obj = match pdf.resolve_object(obj_ref) {
             Ok(o) => o,
             // If we cannot resolve it, skip (e.g. object 0 free).
             Err(_) => continue,

@@ -415,7 +415,7 @@ mod tests {
     }
 
     fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
-        pdf.resolve(ObjectRef::new(num, 0))
+        pdf.resolve_object(ObjectRef::new(num, 0))
             .expect("resolve bead")
             .into_dict()
             .expect("bead object is a dictionary")

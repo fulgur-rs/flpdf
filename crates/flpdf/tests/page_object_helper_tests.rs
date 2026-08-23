@@ -193,7 +193,7 @@ fn flatten_rotation_is_a_live_page_facade_route() {
     page.flatten_rotation()
         .expect("direct /Rotate page should flatten");
 
-    let page_dict = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+    let page_dict = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
     assert!(page_dict.get("Rotate").is_none());
     assert_eq!(
         page_dict.get("MediaBox"),
@@ -210,7 +210,11 @@ fn flatten_rotation_is_a_live_page_facade_route() {
         .and_then(|annots| annots.first())
         .and_then(Object::as_ref_id)
         .expect("flattened annotation must remain on the page");
-    let annotation = pdf.resolve(annotation_ref).unwrap().into_dict().unwrap();
+    let annotation = pdf
+        .resolve_object(annotation_ref)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     assert_eq!(
         annotation.get("Rect"),
         Some(&Object::Array(vec![
@@ -231,7 +235,7 @@ fn flatten_rotation_handles_270_degrees_and_inherited_rotation_masking() {
     PageObjectHelper::new(page_ref, &mut pdf)
         .flatten_rotation()
         .expect("270-degree page should flatten");
-    let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+    let page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
     assert!(page.get("Rotate").is_none());
     let content = pages::page_content_bytes(&mut pdf, page_ref).unwrap();
     assert!(content.starts_with(b"q\n0 1 -1 0 340 0 cm\n"));
@@ -246,7 +250,7 @@ fn flatten_rotation_handles_270_degrees_and_inherited_rotation_masking() {
         .flatten_rotation()
         .expect("direct rotation should mask inherited rotation");
     let page = inherited
-        .resolve(inherited_page)
+        .resolve_object(inherited_page)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -264,7 +268,7 @@ fn flatten_rotation_skips_invalid_media_box_and_non_array_annotations() {
         .flatten_rotation()
         .expect("invalid media box should be a qpdf no-op");
     let page = invalid_media
-        .resolve(invalid_page)
+        .resolve_object(invalid_page)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -280,7 +284,7 @@ fn flatten_rotation_skips_invalid_media_box_and_non_array_annotations() {
         .flatten_rotation()
         .expect("non-array annotations should be ignored");
     let page = non_array_annots
-        .resolve(page_ref)
+        .resolve_object(page_ref)
         .unwrap()
         .into_dict()
         .unwrap();
@@ -298,7 +302,7 @@ fn copy_annotations_uses_same_document_live_handles() {
         .expect("same-document annotation copy should succeed");
 
     let annots = pdf
-        .resolve(page_ref)
+        .resolve_object(page_ref)
         .unwrap()
         .into_dict()
         .unwrap()
@@ -310,7 +314,7 @@ fn copy_annotations_uses_same_document_live_handles() {
     let copied = annots[1]
         .as_ref_id()
         .expect("copied annotation is indirect");
-    let copied = pdf.resolve(copied).unwrap().into_dict().unwrap();
+    let copied = pdf.resolve_object(copied).unwrap().into_dict().unwrap();
     assert_eq!(
         copied.get("Rect"),
         Some(&Object::Array(vec![
@@ -357,7 +361,7 @@ fn copy_annotations_from_validates_the_foreign_source_owner() {
     .expect("foreign annotation copy should succeed");
 
     let annots = destination
-        .resolve(destination_page)
+        .resolve_object(destination_page)
         .unwrap()
         .into_dict()
         .unwrap()
@@ -367,7 +371,11 @@ fn copy_annotations_from_validates_the_foreign_source_owner() {
         .unwrap();
     assert_eq!(annots.len(), 1);
     let copied = annots[0].as_ref_id().expect("foreign copy is indirect");
-    let copied = destination.resolve(copied).unwrap().into_dict().unwrap();
+    let copied = destination
+        .resolve_object(copied)
+        .unwrap()
+        .into_dict()
+        .unwrap();
     assert_eq!(
         copied.get("Rect"),
         Some(&Object::Array(vec![
@@ -2391,7 +2399,7 @@ fn media_box_round_trip_after_mutation() {
     let mut pdf = open(bytes);
 
     // Materialize a different MediaBox directly on the leaf page.
-    let page_obj = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+    let page_obj = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
     let Object::Dictionary(mut page_dict) = page_obj else {
         panic!("expected page dict")
     };

@@ -1988,7 +1988,7 @@ mod tests {
         let bytes = build_pdf_no_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let mut page = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");

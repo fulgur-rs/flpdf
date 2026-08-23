@@ -239,7 +239,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         if !visited.insert(form_ref) {
             continue;
         }
-        let Object::Stream(mut form) = pdf.resolve(form_ref)? else {
+        let Object::Stream(mut form) = pdf.resolve_object(form_ref)? else {
             continue; // cov:ignore: form_xobjects_in_resources queues only terminal Stream objects
         };
         if !is_form_xobject(&form.dict) {
@@ -1159,7 +1159,7 @@ mod tests {
 
     fn assert_form_fonts_pruned(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
         let form = pdf
-            .resolve(ObjectRef::new(4, 0))
+            .resolve_object(ObjectRef::new(4, 0))
             .expect("Form should resolve")
             .into_stream()
             .expect("Form target should remain a stream");
@@ -1209,7 +1209,7 @@ mod tests {
             .expect("malformed declared XObject must be skipped, not abort pruning");
 
         let page = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .expect("page should resolve")
             .into_dict()
             .expect("page should remain a dictionary");
@@ -1258,7 +1258,7 @@ mod tests {
         // dereference, which collapses an unresolvable indirect target to
         // null) to check the value actually stored at the key.
         let page = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .expect("page should resolve")
             .into_dict()
             .expect("page should remain a dictionary");

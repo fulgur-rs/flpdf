@@ -121,7 +121,7 @@ fn dangling_bead_p_dropped_and_page_gced() {
     let mut pdf = run_subset(&[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
 
     // The bead pointing at the removed page loses its /P key entirely.
-    let bead = pdf.resolve(ObjectRef::new(12, 0)).expect("bead 12");
+    let bead = pdf.resolve_object(ObjectRef::new(12, 0)).expect("bead 12");
     let bead = bead.as_dict().expect("bead 12 is a dict");
     assert!(
         bead.get("P").is_none(),
@@ -149,7 +149,7 @@ fn dangling_bead_p_dropped_and_page_gced() {
     );
 
     // Beads on surviving pages keep their /P.
-    let bead = pdf.resolve(ObjectRef::new(11, 0)).expect("bead 11");
+    let bead = pdf.resolve_object(ObjectRef::new(11, 0)).expect("bead 11");
     let bead = bead.as_dict().expect("bead 11 is a dict");
     assert!(
         matches!(bead.get("P"), Some(Object::Reference(r)) if r.number == 3),
@@ -177,7 +177,11 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
 
     // Both copies' /B reference the same bead object (shallow clone shares /B).
     let bead_ref_of = |doc: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef| -> ObjectRef {
-        let page = doc.resolve(r).expect("page").into_dict().expect("dict");
+        let page = doc
+            .resolve_object(r)
+            .expect("page")
+            .into_dict()
+            .expect("dict");
         match page.get("B") {
             Some(Object::Array(a)) => a[0].as_ref_id().expect("/B[0] is an indirect ref"),
             other => panic!("expected /B array, got {other:?}"),
@@ -191,7 +195,11 @@ fn duplicate_selection_shares_bead_and_p_points_at_first_occurrence() {
     );
 
     // The single shared bead's /P targets the FIRST occurrence.
-    let bead = out.resolve(bead0).expect("bead").into_dict().expect("dict");
+    let bead = out
+        .resolve_object(bead0)
+        .expect("bead")
+        .into_dict()
+        .expect("dict");
     assert_eq!(
         bead.get("P"),
         Some(&Object::Reference(page_refs[0])),
@@ -211,7 +219,7 @@ fn dangling_bead_p_dropped_and_page_gced_via_b_array_without_threads() {
         &[ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
     );
 
-    let bead = pdf.resolve(ObjectRef::new(12, 0)).expect("bead 12");
+    let bead = pdf.resolve_object(ObjectRef::new(12, 0)).expect("bead 12");
     let bead = bead.as_dict().expect("bead 12 is a dict");
     assert!(
         bead.get("P").is_none(),

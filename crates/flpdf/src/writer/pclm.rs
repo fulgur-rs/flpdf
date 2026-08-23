@@ -67,7 +67,7 @@ impl Plan {
             let Item::Source { source, .. } = item else {
                 continue;
             };
-            let object = builder.pdf.resolve(source)?;
+            let object = builder.pdf.resolve_object(source)?;
             builder.enqueue_value_with_stream_length_policy(&object)?;
         }
 
@@ -159,7 +159,7 @@ impl<R: Read + Seek + 'static> Builder<'_, R> {
             if !visited.insert(reference) {
                 return Ok(Object::Null);
             }
-            current = self.pdf.resolve(reference)?;
+            current = self.pdf.resolve_object(reference)?;
         }
     }
 
@@ -243,7 +243,7 @@ mod tests {
         })
         .expect("fixture must open");
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
-        let mut page_dict = pdf.resolve(page).unwrap().into_dict().unwrap();
+        let mut page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
         let mut contents = crate::Dictionary::new();
         contents.insert("Broken", Object::Reference(ObjectRef::new(11, 0)));
         page_dict.insert("Contents", Object::Dictionary(contents));
@@ -258,7 +258,7 @@ mod tests {
     fn plan_enqueues_xobject_and_its_synthetic_transform() {
         let mut pdf = fixture_pdf();
         let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
-        let mut page_dict = pdf.resolve(page).unwrap().into_dict().unwrap();
+        let mut page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
         let mut xobjects = crate::Dictionary::new();
         xobjects.insert("Im0", Object::Reference(ObjectRef::new(99, 0)));
         let mut resources = crate::Dictionary::new();

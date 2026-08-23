@@ -53,7 +53,7 @@ fn external_consumer_can_mark_a_direct_child_array_dirty_for_write_back() {
 
     let mut reopened = Pdf::open_mem_owned(output).expect("reopen written PDF");
     let catalog = reopened
-        .resolve(root_ref)
+        .resolve_object(root_ref)
         .expect("resolve the rewritten catalog");
     assert_eq!(
         catalog.as_dict().and_then(|dict| dict.get("DirectValues")),

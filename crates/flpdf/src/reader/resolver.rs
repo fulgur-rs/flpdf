@@ -11880,7 +11880,7 @@ mod tests {
             Pdf::open_mem_owned_with_options(synthetic_mismatch_pdf(true), options).expect("open");
 
         assert_eq!(
-            pdf.resolve(ObjectRef::new(1, 0))
+            pdf.resolve_object(ObjectRef::new(1, 0))
                 .expect("public resolve must use the reconstructed xref"),
             crate::Object::String(b"recovered".to_vec()),
             "the legacy public resolver must not turn a recoverable object into null"
@@ -11916,7 +11916,7 @@ mod tests {
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
         assert_eq!(
-            pdf.resolve(ObjectRef::new(1, 0))
+            pdf.resolve_object(ObjectRef::new(1, 0))
                 .expect("absent recovered object must resolve to null"),
             crate::Object::Null
         );
@@ -11939,7 +11939,7 @@ mod tests {
         .expect("open");
 
         assert_eq!(
-            pdf.resolve(object_ref)
+            pdf.resolve_object(object_ref)
                 .expect("an unindexed packed member must resolve to null"),
             crate::Object::Null
         );
@@ -11964,7 +11964,7 @@ mod tests {
         .expect("open malformed-recovery fixture");
 
         let stream = pdf
-            .resolve(ObjectRef::new(1, 0))
+            .resolve_object(ObjectRef::new(1, 0))
             .expect("qpdf stream recovery must run after xref reconstruction");
         assert_eq!(stream.as_stream().expect("recovered stream").data, b"abc\n");
         assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
@@ -12166,7 +12166,7 @@ mod tests {
             .expect("canonical resolution must recover object 1");
 
         assert_eq!(
-            pdf.resolve(ObjectRef::new(2, 0))
+            pdf.resolve_object(ObjectRef::new(2, 0))
                 .expect("legacy cache must use the rebuilt offset"),
             crate::Object::Integer(22)
         );
@@ -12285,7 +12285,7 @@ mod tests {
         };
         let root_ref = pdf.root_ref().expect("catalog ref");
         let mut root = pdf
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("catalog")
             .into_dict()
             .expect("catalog dictionary");
@@ -12333,7 +12333,7 @@ mod tests {
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen full-rewrite output");
         assert_eq!(
             reopened
-                .resolve(emitted_ref)
+                .resolve_object(emitted_ref)
                 .expect("resolve rewritten object"),
             crate::Object::Integer(42),
             "a recovered standalone object must be emitted outside the obsolete ObjStm"

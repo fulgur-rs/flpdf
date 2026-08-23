@@ -190,7 +190,7 @@ fn qpdf_full_rewrite_emits_touched_object_and_keeps_pages() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&source).unwrap())).unwrap();
     let root = pdf.root_ref().expect("expected /Root in source");
-    let original_root = pdf.resolve(root).unwrap();
+    let original_root = pdf.resolve_object(root).unwrap();
     let Object::Dictionary(mut root_dict) = original_root else {
         panic!("expected root to be a dictionary");
     };
@@ -319,7 +319,7 @@ fn qpdf_full_rewrite_object_stream_member_rewrite_stays_qpdf_compatible() {
     let mut touched = None;
 
     for candidate in candidates.drain(..) {
-        let original = pdf.resolve(candidate).unwrap();
+        let original = pdf.resolve_object(candidate).unwrap();
         if let Some(touched_object) = touch_object_for_regression(original) {
             pdf.set_object(candidate, touched_object);
             touched = Some(candidate);
@@ -337,11 +337,11 @@ fn qpdf_full_rewrite_object_stream_member_rewrite_stays_qpdf_compatible() {
     qpdf_check(&output);
 
     let mut rewritten = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
-    let touched_value = rewritten.resolve(touched).unwrap();
+    let touched_value = rewritten.resolve_object(touched).unwrap();
     assert_ne!(touched_value, Object::Null);
 
     let mut original = Pdf::open(BufReader::new(File::open(&source).unwrap())).unwrap();
-    let original_value = original.resolve(touched).unwrap();
+    let original_value = original.resolve_object(touched).unwrap();
     assert_ne!(touched_value, original_value);
 }
 

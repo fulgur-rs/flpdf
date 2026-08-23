@@ -313,7 +313,7 @@ fn resolve_rect_array<R: Read + Seek>(
 ) -> Result<Option<Vec<Object>>> {
     let arr = match val {
         Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve(r)? {
+        Object::Reference(r) => match pdf.resolve_object(r)? {
             Object::Array(arr) => arr,
             Object::Null => return Ok(None),
             _ => {
@@ -435,7 +435,7 @@ fn inherited_rotate_attribute<R: Read + Seek>(
         if let Some(val) = rotate_val {
             // /Rotate may be stored as an indirect reference; resolve it first.
             let resolved = match val {
-                Object::Reference(r) => pdf.resolve(r)?,
+                Object::Reference(r) => pdf.resolve_object(r)?,
                 other => other,
             };
             match resolved {
@@ -472,7 +472,7 @@ fn leaf_user_unit<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Resu
         return Ok((false, 1.0));
     };
     let resolved = match val {
-        Object::Reference(r) => pdf.resolve(r)?,
+        Object::Reference(r) => pdf.resolve_object(r)?,
         other => other,
     };
     match resolved {
@@ -545,7 +545,7 @@ fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<O
     match group_val {
         None | Some(Object::Null) => Ok(None),
         // shallowCopy: materialize the top level only (ref -> direct dict).
-        Some(Object::Reference(r)) => Ok(Some(pdf.resolve(r)?)),
+        Some(Object::Reference(r)) => Ok(Some(pdf.resolve_object(r)?)), // cov:ignore: test-only characterization helper; no fixture gives this page a leaf /Group as an indirect reference
         Some(direct) => Ok(Some(direct)),
     }
 }
@@ -691,7 +691,7 @@ mod tests {
 
     /// Resolve the Form XObject at `xref` and return its stream.
     fn form_stream<R: Read + Seek>(pdf: &mut Pdf<R>, xref: ObjectRef) -> Stream {
-        pdf.resolve(xref)
+        pdf.resolve_object(xref)
             .unwrap()
             .into_stream()
             .expect("Form XObject must be a stream")
@@ -1094,7 +1094,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("F1 should be a reference, got {other:?}"), // cov:ignore: defensive — fixture guarantees a reference
         };
-        let font_obj = dest.resolve(font_ref).unwrap();
+        let font_obj = dest.resolve_object(font_ref).unwrap();
         let font = font_obj
             .as_dict()
             .expect("font ref resolves to a dict in dest");
@@ -1173,7 +1173,7 @@ mod tests {
             font_ref0, font_ref1,
             "the shared font must be copied into dest exactly once"
         );
-        let font_obj = dest.resolve(font_ref0).unwrap();
+        let font_obj = dest.resolve_object(font_ref0).unwrap();
         let font = font_obj
             .as_dict()
             .expect("font ref resolves to a dict in dest");

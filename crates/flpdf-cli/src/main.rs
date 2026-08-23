@@ -6811,7 +6811,7 @@ mod tests {
         let holder_ref = ObjectRef::new(100, 0);
         let stream_ref = ObjectRef::new(101, 0);
 
-        let mut page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        let mut page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
         page.insert("Contents", Object::Reference(holder_ref));
         pdf.set_object(page_ref, Object::Dictionary(page));
         pdf.set_object(holder_ref, Object::Reference(stream_ref));
@@ -6828,7 +6828,11 @@ mod tests {
 
         assert_eq!(warnings, vec![true]);
         assert_eq!(seen, HashSet::from([stream_ref]));
-        let stream = pdf.resolve(stream_ref).unwrap().into_stream().unwrap();
+        let stream = pdf
+            .resolve_object(stream_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
         assert_eq!(stream.data, b"\n<0g");
     }
 
@@ -6840,7 +6844,7 @@ mod tests {
         .unwrap();
         let page_ref = pages::page_refs(&mut pdf).unwrap()[0];
         let direct_stream = Stream::new(Dictionary::new(), b"\r<0g".to_vec());
-        let mut page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        let mut page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
         page.insert("Contents", Object::Stream(direct_stream));
         pdf.set_object(page_ref, Object::Dictionary(page));
 
@@ -6849,7 +6853,7 @@ mod tests {
 
         assert!(warnings.is_empty());
         assert!(seen.is_empty());
-        let page = pdf.resolve(page_ref).unwrap().into_dict().unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap().into_dict().unwrap();
         assert_eq!(
             page.get("Contents")
                 .and_then(Object::as_stream)

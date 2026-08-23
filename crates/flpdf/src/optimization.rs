@@ -109,7 +109,7 @@ impl Optimization {
         allow_changes: bool,
     ) -> crate::Result<Option<crate::pages::repair::PreparedPages>> {
         if let Some(root_ref) = pdf.root_ref() {
-            if let Object::Dictionary(mut root) = pdf.resolve(root_ref)? {
+            if let Object::Dictionary(mut root) = pdf.resolve_object(root_ref)? {
                 if let Some(Object::Dictionary(outlines)) = root.get("Outlines").cloned() {
                     let outlines_ref = next_object_ref(pdf)?;
                     pdf.set_object(outlines_ref, Object::Dictionary(outlines));
@@ -194,7 +194,7 @@ impl Optimization {
         }
 
         if let Some(root_ref) = pdf.root_ref() {
-            if let Object::Dictionary(root) = pdf.resolve(root_ref)? {
+            if let Object::Dictionary(root) = pdf.resolve_object(root_ref)? {
                 let root_entries = crate::qpdf_null::snapshot_entries(&root, false);
                 for (key, value) in crate::qpdf_null::visible_entries(pdf, root_entries)? {
                     let update = maps.update_object_maps(
@@ -253,7 +253,7 @@ impl Optimization {
                         continue;
                     }
 
-                    let resolved = pdf.resolve(object_ref)?;
+                    let resolved = pdf.resolve_object(object_ref)?;
                     if is_page(&resolved) && !pending.top {
                         continue;
                     }
@@ -478,7 +478,7 @@ mod tests {
                 .len(),
             1
         );
-        let catalog = pdf.resolve(pdf.root_ref().unwrap()).unwrap();
+        let catalog = pdf.resolve_object(pdf.root_ref().unwrap()).unwrap();
         assert!(matches!(
             catalog,
             Object::Dictionary(ref dict)
@@ -494,7 +494,7 @@ mod tests {
         Optimization::optimize(&mut pdf, &BTreeMap::new(), false, |_, _| 1).unwrap();
 
         assert!(matches!(
-            pdf.resolve(root).unwrap(),
+            pdf.resolve_object(root).unwrap(),
             Object::Dictionary(ref dict)
                 if matches!(dict.get("Outlines"), Some(Object::Reference(_)))
         ));
@@ -508,7 +508,7 @@ mod tests {
         let maps = Optimization::optimize(&mut pdf, &BTreeMap::new(), true, |_, _| 1).unwrap();
 
         assert!(maps.users_for(root).contains(&ObjectUser::Root));
-        assert!(matches!(pdf.resolve(root).unwrap(), Object::Null));
+        assert!(matches!(pdf.resolve_object(root).unwrap(), Object::Null));
     }
 
     #[test]
@@ -904,7 +904,7 @@ mod tests {
         Optimization::prepare_for_linearized_write(&mut pdf).unwrap();
         let pages = crate::pages::page_refs(&mut pdf).unwrap();
         let mut page = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .unwrap()
             .into_dict()
             .expect("page should be a dictionary");

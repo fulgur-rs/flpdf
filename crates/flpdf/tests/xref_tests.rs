@@ -1937,7 +1937,11 @@ fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
     )
     .expect("open with qpdf header origin");
     let root = pdf.root_ref().expect("root reference");
-    assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
+    assert!(pdf
+        .resolve_object(root)
+        .expect("resolve root")
+        .as_dict()
+        .is_some());
 
     pdf.set_object(root, Object::Boolean(false));
     let mut writer = PdfWriter::new(&mut pdf);
@@ -1966,7 +1970,7 @@ fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
     );
     assert_eq!(
         reopened
-            .resolve(output_root)
+            .resolve_object(output_root)
             .expect("resolve rewritten root")
             .as_bool(),
         Some(false)
@@ -3290,7 +3294,7 @@ fn classic_xref_table_reads_entries_from_its_xrefstm() {
 
     let mut pdf = Pdf::open_mem_owned(bytes).expect("the reader sees the hybrid-only object");
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0))
+        pdf.resolve_object(ObjectRef::new(2, 0))
             .expect("resolve hybrid-only object")
             .as_dict()
             .and_then(|dict| dict.get("HybridOnly"))
@@ -3698,7 +3702,7 @@ fn ignore_xref_streams_falls_back_to_reconstruction() {
         .expect("root reference recovered from trailer");
     assert_eq!(root, ObjectRef::new(1, 0));
     assert_eq!(
-        pdf.resolve(root)
+        pdf.resolve_object(root)
             .expect("resolve root")
             .as_dict()
             .and_then(|dict| dict.get("Type"))
@@ -4023,7 +4027,11 @@ fn ignore_xref_streams_leaves_classic_xref_tables_untouched() {
         "no reconstruction is triggered for a classic table"
     );
     let root = pdf.root_ref().expect("root reference");
-    assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
+    assert!(pdf
+        .resolve_object(root)
+        .expect("resolve root")
+        .as_dict()
+        .is_some());
 }
 
 // The "succeeded but with accumulated parse errors" warning path in

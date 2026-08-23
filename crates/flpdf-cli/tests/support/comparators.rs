@@ -706,10 +706,10 @@ fn compare_objects(
             }
             visited.insert(pair);
             let resolved_q = pdf_q
-                .resolve(*r_q)
+                .resolve_object(*r_q)
                 .map_err(|e| format!("{path}: failed to resolve {r_q}: {e}"))?;
             let resolved_f = pdf_f
-                .resolve(*r_f)
+                .resolve_object(*r_f)
                 .map_err(|e| format!("{path}: failed to resolve {r_f}: {e}"))?;
             compare_objects(
                 &format!("{path}[{r_q}]"),

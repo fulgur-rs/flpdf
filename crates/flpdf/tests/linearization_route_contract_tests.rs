@@ -74,7 +74,7 @@ fn linearization_objstm_route_uses_live_handles() {
     );
     for forbidden in [
         "Vec<(ObjectRef, Object)>",
-        "pdf.resolve(orig)",
+        "pdf.resolve_object(orig)",
         "emit_objstm_body_from_resolved",
         "renumber_object_with_removed",
     ] {

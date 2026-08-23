@@ -59,14 +59,14 @@ fn make_filespec(pdf: &mut Pdf<Cursor<Vec<u8>>>, filename: &[u8]) -> ObjectHandl
 fn embedded_names_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Dictionary {
     let catalog_ref = pdf.root_ref().expect("root");
     let catalog = pdf
-        .resolve(catalog_ref)
+        .resolve_object(catalog_ref)
         .expect("catalog")
         .into_dict()
         .expect("catalog dictionary");
     match catalog.get("Names").cloned() {
         Some(Object::Dictionary(names)) => names,
         Some(Object::Reference(names_ref)) => pdf
-            .resolve(names_ref)
+            .resolve_object(names_ref)
             .expect("names")
             .into_dict()
             .expect("names dictionary"),
@@ -416,13 +416,13 @@ fn insert_does_not_allocate_for_direct_names_dictionary() {
     let mut pdf = open(build_single_level_pdf());
     let catalog_ref = pdf.root_ref().expect("catalog");
     let mut catalog = pdf
-        .resolve(catalog_ref)
+        .resolve_object(catalog_ref)
         .expect("resolve catalog")
         .into_dict()
         .expect("catalog dict");
     let names_ref = catalog.get_ref("Names").expect("Names ref");
     let names = pdf
-        .resolve(names_ref)
+        .resolve_object(names_ref)
         .expect("resolve Names")
         .into_dict()
         .expect("Names dict");
@@ -472,7 +472,7 @@ fn inserting_into_direct_embedded_files_root_preserves_it() {
 
     let catalog_ref = pdf.root_ref().expect("catalog");
     let catalog = pdf
-        .resolve(catalog_ref)
+        .resolve_object(catalog_ref)
         .expect("resolve catalog")
         .into_dict()
         .expect("catalog dict");
@@ -737,7 +737,7 @@ fn writer_large_insert_produces_kids() {
     // indirect root created by `QPDFNameTreeObjectHelper::newEmpty`.
     let names_dict = embedded_names_dict(&mut pdf);
     let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
-    let ef_root = match pdf.resolve(ef_root_ref).expect("resolve EF root") {
+    let ef_root = match pdf.resolve_object(ef_root_ref).expect("resolve EF root") {
         Object::Dictionary(d) => d,
         other => panic!("EF root not a dict: {other:?}"),
     };
@@ -760,7 +760,7 @@ fn writer_large_insert_produces_kids() {
         Object::Reference(r) => *r,
         other => panic!("first kid not a reference: {other:?}"),
     };
-    let first_leaf = match pdf.resolve(first_leaf_ref).expect("resolve leaf") {
+    let first_leaf = match pdf.resolve_object(first_leaf_ref).expect("resolve leaf") {
         Object::Dictionary(d) => d,
         other => panic!("leaf not a dict: {other:?}"),
     };
@@ -816,7 +816,7 @@ fn writer_single_insert_root_omits_limits() {
 
     let names_dict = embedded_names_dict(&mut pdf);
     let ef_root_ref = names_dict.get_ref("EmbeddedFiles").expect("/EmbeddedFiles");
-    let ef_root = match pdf.resolve(ef_root_ref).expect("resolve EF root") {
+    let ef_root = match pdf.resolve_object(ef_root_ref).expect("resolve EF root") {
         Object::Dictionary(d) => d,
         other => panic!("EF root not a dict: {other:?}"),
     };
@@ -949,12 +949,12 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
     // Walk the rebuilt tree by hand and collect the raw /Names pairs across
     // all leaves (the rebuilt root may be a single leaf or carry /Kids).
     let catalog_ref = pdf.root_ref().expect("root");
-    let catalog = match pdf.resolve(catalog_ref).expect("resolve catalog") {
+    let catalog = match pdf.resolve_object(catalog_ref).expect("resolve catalog") {
         Object::Dictionary(d) => d,
         other => panic!("catalog not a dict: {other:?}"),
     };
     let names_ref = catalog.get_ref("Names").expect("catalog /Names");
-    let names_dict = match pdf.resolve(names_ref).expect("resolve /Names") {
+    let names_dict = match pdf.resolve_object(names_ref).expect("resolve /Names") {
         Object::Dictionary(d) => d,
         other => panic!("/Names not a dict: {other:?}"),
     };
@@ -964,7 +964,7 @@ fn writer_preserves_direct_dict_filespec_on_insert() {
     let mut pairs: Vec<(Vec<u8>, Object)> = Vec::new();
     let mut stack = vec![ef_root_ref];
     while let Some(node_ref) = stack.pop() {
-        let node = match pdf.resolve(node_ref).expect("resolve node") {
+        let node = match pdf.resolve_object(node_ref).expect("resolve node") {
             Object::Dictionary(d) => d,
             other => panic!("node not a dict: {other:?}"),
         };
@@ -1091,7 +1091,8 @@ fn insert_through_two_hop_names_preserves_sibling_and_existing() {
 
     // Add a sibling key to the terminal /Names dict (object 3) so we can detect
     // whether the rebuild operated on the real terminal dict or a fresh one.
-    let Object::Dictionary(mut names_dict) = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve 3")
+    let Object::Dictionary(mut names_dict) =
+        pdf.resolve_object(ObjectRef::new(3, 0)).expect("resolve 3")
     else {
         panic!("object 3 must be the /Names dict");
     };
@@ -1115,7 +1116,10 @@ fn insert_through_two_hop_names_preserves_sibling_and_existing() {
 
     // The sibling /Dests key in the terminal names dict must be preserved: the
     // rebuild must operate on the real terminal dict, not a fresh one.
-    let catalog = match pdf.resolve(pdf.root_ref().expect("root")).expect("catalog") {
+    let catalog = match pdf
+        .resolve_object(pdf.root_ref().expect("root"))
+        .expect("catalog")
+    {
         Object::Dictionary(d) => d,
         other => panic!("catalog not a dict: {other:?}"),
     };
@@ -1123,9 +1127,12 @@ fn insert_through_two_hop_names_preserves_sibling_and_existing() {
     // The rewritten /Names points (possibly through the chain) at the dict that
     // now carries /EmbeddedFiles; resolve follows one hop, and the terminal
     // must still hold /Dests.
-    let names_dict = match pdf.resolve(names_ref).expect("resolve /Names terminal") {
+    let names_dict = match pdf
+        .resolve_object(names_ref)
+        .expect("resolve /Names terminal")
+    {
         Object::Dictionary(d) => d,
-        Object::Reference(r) => match pdf.resolve(r).expect("resolve /Names hop2") {
+        Object::Reference(r) => match pdf.resolve_object(r).expect("resolve /Names hop2") {
             Object::Dictionary(d) => d,
             other => panic!("/Names hop2 not a dict: {other:?}"),
         },
@@ -1153,7 +1160,8 @@ fn delete_last_entry_through_two_hop_names() {
     // Add a sibling /Dests key so the terminal /Names dict is non-empty after
     // /EmbeddedFiles is dropped — exercises the non-empty set_object branch of
     // the empty-rebuild path on the terminal ref.
-    let Object::Dictionary(mut names_dict) = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve 3")
+    let Object::Dictionary(mut names_dict) =
+        pdf.resolve_object(ObjectRef::new(3, 0)).expect("resolve 3")
     else {
         panic!("object 3 must be the /Names dict");
     };
@@ -1167,7 +1175,9 @@ fn delete_last_entry_through_two_hop_names() {
     );
 
     // qpdf retains an empty /EmbeddedFiles tree while preserving /Dests.
-    let Object::Dictionary(terminal) = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve terminal")
+    let Object::Dictionary(terminal) = pdf
+        .resolve_object(ObjectRef::new(3, 0))
+        .expect("resolve terminal")
     else {
         panic!("object 3 must still be the terminal /Names dict");
     };
@@ -1245,7 +1255,7 @@ fn remove_attachment_preserves_two_hop_af_array_and_nulls_filespec() {
     // The terminal /AF array (object 7) retains both object references, while
     // the removed Filespec object is replaced with null.
     let Object::Array(af) = pdf
-        .resolve(ObjectRef::new(7, 0))
+        .resolve_object(ObjectRef::new(7, 0))
         .expect("terminal /AF array must still resolve (carrier not orphaned)")
     else {
         panic!("object 7 must be the terminal /AF array");
@@ -1259,7 +1269,7 @@ fn remove_attachment_preserves_two_hop_af_array_and_nulls_filespec() {
         "unrelated kept ref must remain in the terminal /AF array, got {af:?}"
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(4, 0))
+        pdf.resolve_object(ObjectRef::new(4, 0))
             .expect("Filespec remains addressable"),
         Object::Null,
         "qpdf replaces the removed Filespec with null"
@@ -1987,7 +1997,7 @@ fn helper_remove_persists_indirect_root_repair_before_find_false() {
         .expect("qpdf resolves the malformed child to a null tree node"));
 
     let root = pdf
-        .resolve(ObjectRef::new(3, 0))
+        .resolve_object(ObjectRef::new(3, 0))
         .expect("root")
         .into_dict()
         .expect("root dictionary");

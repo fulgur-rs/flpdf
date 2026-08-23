@@ -992,7 +992,7 @@ fn fo_bbox_and_matrix<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     xobject_ref: ObjectRef,
 ) -> Result<(Rectangle, Matrix)> {
-    let obj = pdf.resolve(xobject_ref)?;
+    let obj = pdf.resolve_object(xobject_ref)?;
     let dict = match &obj {
         Object::Stream(s) => &s.dict,
         Object::Dictionary(d) => d,
@@ -1009,7 +1009,7 @@ fn fo_bbox_and_matrix<R: Read + Seek>(
         Error::Unsupported(format!("Form XObject {xobject_ref} has no /BBox array"))
     })?;
     let resolved_bbox = match bbox_entry {
-        Object::Reference(r) => pdf.resolve(*r)?,
+        Object::Reference(r) => pdf.resolve_object(*r)?,
         other => other.clone(),
     };
     let arr = resolved_bbox.as_array().ok_or_else(|| {
@@ -1033,7 +1033,7 @@ fn fo_bbox_and_matrix<R: Read + Seek>(
 /// Resolve `page_ref` to an owned page `Dictionary`, erroring when it is not a
 /// dictionary.
 fn page_dictionary<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<Dictionary> {
-    match pdf.resolve(page_ref)? {
+    match pdf.resolve_object(page_ref)? {
         Object::Dictionary(d) => Ok(d),
         _ => Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
@@ -1917,7 +1917,7 @@ mod byte_gate {
     fn overlay_hidden_collision_fixture_uses_initialized_empty_flate_stream() {
         let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
         let stream = dest
-            .resolve(ObjectRef::new(8, 0))
+            .resolve_object(ObjectRef::new(8, 0))
             .unwrap()
             .into_stream()
             .unwrap();
@@ -2591,7 +2591,7 @@ mod tests {
         .unwrap();
 
         // Page /Resources == { /XObject { /Fx0, /Fx1 } } only.
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let page_dict = page.as_dict().unwrap();
         let res = page_dict.get("Resources").unwrap().as_dict().unwrap();
         let keys: Vec<&[u8]> = res.iter().map(|(k, _)| k).collect();
@@ -2611,7 +2611,7 @@ mod tests {
             other => panic!("Contents should be a reference, got {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
         let stream = pdf
-            .resolve(contents_ref)
+            .resolve_object(contents_ref)
             .unwrap()
             .into_stream()
             .expect("Contents must be a stream");
@@ -2635,7 +2635,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Fx0 should be a reference, got {other:?}"), // cov:ignore: defensive — apply always inserts /Fx0 as a reference
         };
-        let fx0 = pdf.resolve(fx0_ref).unwrap().into_stream().unwrap();
+        let fx0 = pdf.resolve_object(fx0_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             fx0.dict.get("Subtype").unwrap().as_name(),
             Some(b"Form".as_slice())
@@ -2717,7 +2717,7 @@ mod tests {
         )
         .unwrap();
 
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let page_dict = page.as_dict().unwrap();
         let res = page_dict.get("Resources").unwrap().as_dict().unwrap();
         let xobj = res.get("XObject").unwrap().as_dict().unwrap();
@@ -2739,7 +2739,11 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf.resolve(contents_ref).unwrap().into_stream().unwrap();
+        let stream = pdf
+            .resolve_object(contents_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
         let text = String::from_utf8(stream.data).unwrap();
         let fx1_pos = text.find("/Fx1 Do").unwrap();
         let fx0_pos = text.find("/Fx0 Do").unwrap();
@@ -2793,12 +2797,16 @@ mod tests {
         )
         .unwrap();
 
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let contents_ref = match page.as_dict().unwrap().get("Contents") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf.resolve(contents_ref).unwrap().into_stream().unwrap();
+        let stream = pdf
+            .resolve_object(contents_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
         let text = String::from_utf8(stream.data).unwrap();
         assert!(
             text.contains("q\n1 0 0 1 51 91 cm\n/Fx0 Do\nQ\n"),
@@ -2843,7 +2851,7 @@ mod tests {
         )
         .unwrap();
         let contents_ref = match pdf
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .unwrap()
             .as_dict()
             .unwrap()
@@ -2852,7 +2860,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        pdf.resolve(contents_ref)
+        pdf.resolve_object(contents_ref)
             .unwrap()
             .into_stream()
             .unwrap()
@@ -3292,7 +3300,7 @@ mod tests {
 
     /// The imported overlay XObject ref (`/Fx1`) referenced by a patched page.
     fn fx1_ref<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> ObjectRef {
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let res = page
             .as_dict()
             .unwrap()
@@ -3310,7 +3318,7 @@ mod tests {
     /// Whether a page has been patched into an overlay page (its /Resources is
     /// just `<< /XObject << /Fx0 ... >> >>`, so /Font is gone and /XObject present).
     fn is_patched<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> bool {
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let res = page
             .as_dict()
             .unwrap()
@@ -3376,7 +3384,7 @@ mod tests {
 
         // /Fx0 (the page itself) differs per page (each page's own content).
         let fx0 = |pdf: &mut Pdf<_>, page_ref: ObjectRef| -> ObjectRef {
-            let page = pdf.resolve(page_ref).unwrap();
+            let page = pdf.resolve_object(page_ref).unwrap();
             let xobj = page
                 .as_dict()
                 .unwrap()
@@ -3437,12 +3445,16 @@ mod tests {
         )
         .unwrap();
 
-        let page = dest.resolve(dest_pages[0]).unwrap();
+        let page = dest.resolve_object(dest_pages[0]).unwrap();
         let contents_ref = match page.as_dict().unwrap().get("Contents") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = dest.resolve(contents_ref).unwrap().into_stream().unwrap();
+        let stream = dest
+            .resolve_object(contents_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
         let text = String::from_utf8(stream.data).unwrap();
         let fx1 = text.find("/Fx1 Do").unwrap();
         let fx0 = text.find("/Fx0 Do").unwrap();
@@ -3619,7 +3631,7 @@ mod tests {
         pdf: &mut Pdf<R>,
         page_ref: ObjectRef,
     ) -> (BTreeMap<String, ObjectRef>, String) {
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let page_dict = page.as_dict().unwrap();
         let xobj = page_dict
             .get("Resources")
@@ -3640,7 +3652,11 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("Contents ref: {other:?}"), // cov:ignore: defensive — apply always writes /Contents as a reference
         };
-        let stream = pdf.resolve(contents_ref).unwrap().into_stream().unwrap();
+        let stream = pdf
+            .resolve_object(contents_ref)
+            .unwrap()
+            .into_stream()
+            .unwrap();
         (names, String::from_utf8(stream.data).unwrap())
     }
 
@@ -3791,7 +3807,7 @@ mod tests {
             number: 3,
             generation: 0,
         };
-        let page_dict = dest.resolve(page_ref).unwrap().into_dict().unwrap();
+        let page_dict = dest.resolve_object(page_ref).unwrap().into_dict().unwrap();
         assert!(
             page_dict.get("MediaBox").is_none(),
             "empty specs must not trigger the page-tree repair pass"

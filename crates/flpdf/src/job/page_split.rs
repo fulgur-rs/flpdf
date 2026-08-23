@@ -609,7 +609,7 @@ mod tests {
 
     fn catalog(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> crate::Dictionary {
         let root = pdf.root_ref().expect("fixture has /Root");
-        pdf.resolve(root)
+        pdf.resolve_object(root)
             .expect("catalog resolves")
             .into_dict()
             .expect("catalog is a dictionary")
@@ -621,7 +621,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("fixture has a page");
-        let Object::Dictionary(page) = pdf.resolve(page_ref).expect("page resolves") else {
+        let Object::Dictionary(page) = pdf.resolve_object(page_ref).expect("page resolves") else {
             panic!("page is not a dictionary"); // cov:ignore: fixture pages are dictionaries
         };
         match page.get("Annots") {
@@ -954,7 +954,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("should parse");
         let catalog_ref = pdf.root_ref().expect("/Root");
         let catalog = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog is a dict");
@@ -1167,7 +1167,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(chunk)).expect("should parse");
         let catalog_ref = pdf.root_ref().unwrap();
         let catalog = pdf
-            .resolve(catalog_ref)
+            .resolve_object(catalog_ref)
             .unwrap()
             .into_dict()
             .expect("catalog is a dict");

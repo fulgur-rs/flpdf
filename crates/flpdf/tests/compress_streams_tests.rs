@@ -396,14 +396,14 @@ fn build_minimal_pdf_with_empty_stream() -> Vec<u8> {
 fn resolve_metadata_stream<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pdf<R>) -> Stream {
     use flpdf::Object;
     let root = pdf.root_ref().expect("output must have a /Root");
-    let metadata_ref = match pdf.resolve(root).expect("resolve /Root") {
+    let metadata_ref = match pdf.resolve_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
         },
         other => panic!("/Root must be a dictionary, got {other:?}"),
     };
-    match pdf.resolve(metadata_ref).expect("resolve /Metadata") {
+    match pdf.resolve_object(metadata_ref).expect("resolve /Metadata") {
         Object::Stream(s) => s,
         other => panic!("/Metadata must be a stream, got {other:?}"),
     }

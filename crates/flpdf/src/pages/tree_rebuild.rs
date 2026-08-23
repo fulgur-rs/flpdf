@@ -842,7 +842,8 @@ mod tests {
     fn direct_catalog_root_stays_direct_after_rebuild_and_round_trips() {
         let mut pdf = open(build_nested_pdf());
         let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
-        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap()
+        else {
             panic!("catalog must be a dictionary"); // cov:ignore: build_nested_pdf fixes object 1 as the catalog dictionary
         };
         catalog.insert("Pages", Object::Dictionary(root));
@@ -852,7 +853,7 @@ mod tests {
             rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(4, 0)]).unwrap();
         assert_eq!(result.new_kids.len(), 2);
 
-        let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
             panic!("catalog must remain a dictionary"); // cov:ignore: only this test writes object 1 as a catalog dictionary
         };
         let Some(Object::Dictionary(root)) = catalog.get("Pages") else {
@@ -1092,7 +1093,7 @@ mod tests {
             // cov:ignore-end
         };
         assert_eq!(
-            pdf.resolve(*media_box_ref).unwrap(),
+            pdf.resolve_object(*media_box_ref).unwrap(),
             Object::Array(vec![
                 Object::Integer(0),
                 Object::Integer(0),
@@ -1275,7 +1276,7 @@ mod tests {
         second.insert("Count", Object::Integer(1));
         pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(second));
 
-        let Object::Dictionary(mut leaf) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+        let Object::Dictionary(mut leaf) = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap() else {
             panic!("selected object must be a page"); // cov:ignore: build_nested_pdf fixes object 4 as a page dictionary
         };
         leaf.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
