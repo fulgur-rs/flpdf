@@ -5651,6 +5651,41 @@ fn split_pages_produces_chunked_outputs() {
 }
 
 #[test]
+fn split_pages_propagates_orphan_widget_warning_to_job_exit_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("split.pdf");
+    let input = "../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf";
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--split-pages=1", input])
+        .arg(&output)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let warning = "this widget annotation is not reachable from /AcroForm in the document catalog";
+
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "split-pages warnings must use qpdf's warning exit status; stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "one source warning must be emitted once; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("acroform-sig-orphan-widget.pdf"),
+        "warning must retain the input description; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("operation succeeded with warnings"),
+        "split job must emit qpdf's warning summary; stderr={stderr}"
+    );
+}
+
+#[test]
 fn collate_without_pages_is_accepted_noop() {
     // qpdf 11.9.0 accepts --collate without --pages (exit 0); flpdf matches.
     let temp = tempfile::tempdir().unwrap();

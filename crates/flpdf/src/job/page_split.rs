@@ -98,6 +98,12 @@ impl QPDFJob {
         source: &mut Pdf<R>,
         options: SplitPageOptions,
     ) -> Result<Vec<PathBuf>> {
+        // QPDFJob owns the logger and warning state for every operation. The
+        // split source may have been opened outside QPDFJob (the CLI opens an
+        // intermediate rewrite), so install the job logger before any page or
+        // AcroForm traversal can emit a lazy warning.
+        source.set_logger(self.logger());
+        source.set_suppress_warnings(self.warnings_suppressed());
         if options.chunk_size == 0 {
             return Err(Error::Unsupported(
                 "split_pages: chunk_size must be >= 1".to_owned(),

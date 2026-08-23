@@ -4894,7 +4894,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_rewritten_pdf(
+        let (written, split_job) = split_rewritten_pdf(
             bytes,
             n,
             output,
@@ -4907,6 +4907,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
                 logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
             }
         }
+        return finish_job_exit_status(split_job.complete(true)?);
     } else if let Some(writer) = standard_output.as_mut() {
         writer.write_all(&bytes)?;
     } else {
@@ -5012,16 +5013,18 @@ fn split_rewritten_pdf(
     input_path: &Path,
     deterministic_id: bool,
     writer_configuration: WriterConfiguration,
-) -> CliResult<Vec<PathBuf>> {
-    let mut pdf = Pdf::open_mem_owned(bytes)?;
+) -> CliResult<(Vec<PathBuf>, QPDFJob)> {
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    let input_name = input_path.to_string_lossy().into_owned();
+    let mut pdf = job.open(Cursor::new(bytes), input_name, PdfOpenOptions::default())?;
     let options = SplitPageOptions::new(chunk_size, output)
         .with_input_path(input_path)
         .with_deterministic_id(deterministic_id)
         .with_writer_configuration(writer_configuration);
-    Ok(job.split_pages(&mut pdf, options)?)
+    let written = job.split_pages(&mut pdf, options)?;
+    Ok((written, job))
 }
 
 /// Apply `--rotate` / `--split-pages` to a plain (no `--pages`) rewrite.
@@ -5087,7 +5090,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_rewritten_pdf(
+        let (written, split_job) = split_rewritten_pdf(
             bytes,
             n,
             output,
@@ -5102,6 +5105,7 @@ fn run_rewrite_with_page_ops_opened<R: Read + Seek + 'static>(
                 // cov:ignore-end
             }
         }
+        return finish_job_exit_status(split_job.complete(true)?);
     } else if let Some(writer) = standard_output.as_mut() {
         // cov:ignore-start: exercised by binary_rotate_dash subprocess integration test
         writer.write_all(&bytes)?;

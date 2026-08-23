@@ -1089,6 +1089,9 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `QPDFPageObjectHelper::copyAnnotations`: the page insertion has
     /// already copied the source `/Annots`, so the transformed annotations
     /// replace the destination array instead of being appended to it.
+    /// The source job has already performed qpdf's full AcroForm analysis, so
+    /// the per-page copy uses the field-tree-only source boundary and avoids
+    /// repeating the orphan-widget warning scan.
     pub(crate) fn fix_copied_annotations_from<RS: Read + Seek>(
         &mut self,
         from_page: ObjectHandle,
@@ -1104,8 +1107,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 
         let transformed = {
             let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
-            let transformed =
-                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?;
+            let transformed = acroform.transform_annotations_from_without_source_orphan_scan(
+                old_annots,
+                Matrix::default(),
+                source,
+            )?;
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
                 &BTreeSet::new(),
