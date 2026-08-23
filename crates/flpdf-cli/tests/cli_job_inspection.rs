@@ -160,3 +160,59 @@ fn ordinary_show_npages_matches_qpdf_without_weak_crypto_advisory() {
     );
     assert!(!String::from_utf8_lossy(&flpdf.stderr).contains("encrypted PDF uses weak crypto"));
 }
+
+/// `--show-pages`'s per-page attribute lines resolve inheritance through
+/// `PageObjectHelper::get_attribute` (a faithful port of
+/// `QPDFPageObjectHelper::getAttribute`,
+/// `libqpdf/QPDFPageObjectHelper.cc:224-260`), not just the page's own
+/// dictionary keys. This intentionally deviates from real qpdf's own
+/// `--show-pages`, which does not print these fields at all (there is no
+/// qpdf oracle either way for their presence/shape); this test pins flpdf's
+/// own chosen "effective attribute" behavior so a future refactor cannot
+/// silently narrow it back to direct-dictionary-only reads.
+#[test]
+fn ordinary_show_pages_resolves_inherited_attributes() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 \
+          /MediaBox [0 0 612 792] /Rotate 90 \
+          /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+    );
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), &bytes).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--show-pages"])
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("media-box: [ 0 0 612 792 ]"))
+        .stdout(predicates::str::contains("rotate: 90"))
+        .stdout(predicates::str::contains("resources: << /Font"));
+}

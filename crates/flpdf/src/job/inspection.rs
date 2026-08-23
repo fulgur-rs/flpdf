@@ -90,13 +90,10 @@ impl QPDFJob {
                 )));
             };
 
-            let raw = object.get_raw_stream_data()?;
-            let unfiltered = stream_is_unfiltered(&stream_dictionary)?;
             if raw_stream_data {
-                return write_to_standard_output(
-                    &logger,
-                    cli_stream_bytes(pdf, object_ref, raw.as_ref(), true),
-                );
+                let raw = object.get_raw_stream_data()?;
+                let bytes = cli_stream_bytes(pdf, object_ref, &object, raw.as_ref(), true)?;
+                return write_to_standard_output(&logger, bytes);
             }
 
             // Preserve the existing CLI marker for the specialized codecs that
@@ -105,20 +102,18 @@ impl QPDFJob {
             if let Some(filter_name) = first_stream_filter_name(&stream_dictionary)? {
                 if !crate::filters::is_decoded_filter(&filter_name) {
                     if let Some(label) = crate::filters::passthrough_codec_label(&filter_name) {
-                        return logger.info(format!(
-                            "<binary, {} bytes, codec {}>\n",
-                            cli_stream_bytes(pdf, object_ref, raw.as_ref(), true).len(),
-                            label
-                        ));
+                        let raw = object.get_raw_stream_data()?;
+                        let len =
+                            cli_stream_bytes(pdf, object_ref, &object, raw.as_ref(), true)?.len();
+                        return logger.info(format!("<binary, {len} bytes, codec {label}>\n"));
                     }
                 }
             }
 
+            let unfiltered = stream_is_unfiltered(&stream_dictionary)?;
             let decoded = object.get_stream_data(DecodeLevel::All)?;
-            write_to_standard_output(
-                &logger,
-                cli_stream_bytes(pdf, object_ref, decoded.as_ref(), unfiltered),
-            )
+            let bytes = cli_stream_bytes(pdf, object_ref, &object, decoded.as_ref(), unfiltered)?;
+            write_to_standard_output(&logger, bytes)
         })
     }
 
@@ -185,7 +180,7 @@ fn unparse_object_with_stream_data<R: Read + Seek>(
         let mut output = dictionary.unparse_resolved();
         output.extend_from_slice(b"\nstream\n");
         let data = data.as_ref();
-        let recovered_eol = pdf.canonical_recovered_stream_eol(object_ref);
+        let recovered_eol = pdf.canonical_recovered_stream_eol(object_ref, object)?;
         let data = if let Some(eol) = recovered_eol.filter(|eol| data.ends_with(eol)) {
             &data[..data.len() - eol.len()]
         } else {
@@ -228,17 +223,18 @@ fn stream_is_unfiltered(stream_dictionary: &ObjectHandle) -> Result<bool> {
 fn cli_stream_bytes<'a, R: Read + Seek>(
     pdf: &Pdf<R>,
     object_ref: ObjectRef,
+    stream: &ObjectHandle,
     data: &'a [u8],
     trim_recovered_eol: bool,
-) -> &'a [u8] {
-    let Some(eol) = pdf.canonical_recovered_stream_eol(object_ref) else {
-        return data;
+) -> Result<&'a [u8]> {
+    let Some(eol) = pdf.canonical_recovered_stream_eol(object_ref, stream)? else {
+        return Ok(data);
     };
-    if trim_recovered_eol && data.ends_with(eol) {
+    Ok(if trim_recovered_eol && data.ends_with(eol) {
         &data[..data.len() - eol.len()]
     } else {
         data
-    }
+    })
 }
 
 fn write_to_standard_output(logger: &crate::QPDFLogger, data: &[u8]) -> Result<()> {
@@ -390,7 +386,10 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         handle.get_raw_stream_data().unwrap();
         let data = b"decoded\n";
-        assert_eq!(cli_stream_bytes(&pdf, object_ref, data, false), data);
+        assert_eq!(
+            cli_stream_bytes(&pdf, object_ref, &handle, data, false).unwrap(),
+            data
+        );
     }
 
     #[test]

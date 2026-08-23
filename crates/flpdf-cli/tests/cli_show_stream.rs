@@ -290,6 +290,53 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
         ));
 }
 
+/// Regression test: `show-stream --raw-stream-data` must agree byte-for-byte
+/// with `--show-object --raw-stream-data` on an encrypted stream whose
+/// length required recovery. Both routes read the same source bytes through
+/// the same canonical `ObjectHandle`; only `show-stream` additionally trims
+/// a recovered end-of-line marker via
+/// [`crate::job::inspection`]'s `canonical_recovered_stream_eol` gate.
+///
+/// This previously double-trimmed: `canonical_recovered_stream_eol` fell
+/// back to the legacy `transformed_stream_refs` set, which pure canonical
+/// `ObjectHandle` reads (this command's own route) never populate, so the
+/// stream's own decrypted-content trailing newline was mistaken for
+/// recovery-scan ciphertext framing and stripped, losing one real content
+/// byte (12344 instead of 12345).
+#[test]
+fn show_stream_raw_matches_show_object_for_encrypted_recovered_length_stream() {
+    let mut show_stream = Command::cargo_bin("flpdf").unwrap();
+    let show_stream_out = show_stream
+        .args([
+            "show-stream",
+            "--raw-stream-data",
+            "4 0",
+            "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("recovered stream length"))
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut show_object = Command::cargo_bin("flpdf").unwrap();
+    let show_object_out = show_object
+        .args([
+            "--show-object=4",
+            "--raw-stream-data",
+            "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(show_stream_out.len(), 12345);
+    assert_eq!(show_stream_out, show_object_out);
+}
+
 /// A single-element filter array `/Filter [/CCITTFaxDecode]` is equivalent to
 /// the direct name form and must also produce the passthrough marker.
 /// CCITTFaxDecode (unlike DCTDecode) has no decode factory, so it still

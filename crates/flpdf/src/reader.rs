@@ -218,16 +218,35 @@ impl<R: Read + Seek> Pdf<R> {
     /// from [`Self::recovered_stream_eol`], whose map is synchronized only for
     /// legacy `Object` compatibility reads. Job-level stream inspection needs
     /// the qpdf-shaped metadata without entering that compatibility route.
+    ///
+    /// `transformed_stream_refs` is populated only by the legacy
+    /// `resolve_to_cache` decrypt path, which pure canonical `ObjectHandle`
+    /// callers never reach, so it cannot gate this method. Instead this
+    /// mirrors the same encryption-transform classification
+    /// [`Self::synchronize_canonical_recovered_stream_eol`] uses: a recovered
+    /// EOL is ciphertext framing (not real content) when the stream's own
+    /// bytes were replaced, it has a data provider, or qpdf's `decryptStream`
+    /// route would transform this stream.
     pub(crate) fn canonical_recovered_stream_eol(
         &self,
         object_ref: ObjectRef,
-    ) -> Option<&'static [u8]> {
-        if self.transformed_stream_refs.contains(&object_ref) {
-            return None;
+        stream: &ObjectHandle,
+    ) -> Result<Option<&'static [u8]>> {
+        if stream.as_stream_data().is_some() || stream.has_stream_data_provider() {
+            return Ok(None);
         }
-        self.resolver
+        if let Some(stream_dict) = stream.as_stream_dict() {
+            if self
+                .resolver
+                .recovered_stream_eol_is_transformed(&stream_dict)?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(self
+            .resolver
             .recovered_stream_eol(object_ref)
-            .map(crate::parser::RecoveredStreamEol::as_bytes)
+            .map(crate::parser::RecoveredStreamEol::as_bytes))
     }
 
     /// Whether this document authenticated an `/Encrypt` dictionary while opening.
@@ -4206,12 +4225,52 @@ mod tests {
     }
 
     #[test]
-    fn canonical_recovered_stream_eol_ignores_transformed_streams() {
+    fn canonical_recovered_stream_eol_ignores_legacy_transformed_stream_refs() {
+        // `transformed_stream_refs` is populated only by the legacy
+        // `resolve_to_cache` decrypt path; pure canonical `ObjectHandle`
+        // callers (job-level inspection) never reach it. Membership in that
+        // set must have no bearing on the canonical accessor -- proven here
+        // by inserting object 1 (the non-stream Catalog, which never has a
+        // recorded EOL either way) and confirming the result is unaffected.
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF");
         let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
         pdf.transformed_stream_refs.insert(object_ref);
 
-        assert_eq!(pdf.canonical_recovered_stream_eol(object_ref), None);
+        assert_eq!(
+            pdf.canonical_recovered_stream_eol(object_ref, &handle)
+                .expect("non-stream handle never queries encryption"),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_recovered_stream_eol_treats_encrypted_recovery_as_ciphertext_framing() {
+        // Regression test for job/inspection.rs's `show-stream`/`dump-object`
+        // double-trimming real decrypted content as recovery-scan framing
+        // (flpdf-egzr.3.2.7 review). `tests/fixtures/compat/
+        // encrypted-recovered-eol.pdf` object 4 0 is an AESv2-encrypted
+        // stream missing `/Length`; qpdf's `decryptStream` (and this
+        // predicate's port of its classification) treats the recovered
+        // trailing byte as ciphertext framing, so nothing here is eligible
+        // to be trimmed as source-scan padding.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/encrypted-recovered-eol.pdf");
+        let file = std::fs::File::open(path).expect("encrypted-recovered-eol fixture");
+        let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
+        let object_ref = ObjectRef::new(4, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve object 4 0");
+        handle
+            .get_raw_stream_data()
+            .expect("read raw stream data (triggers length recovery)");
+
+        assert_eq!(
+            pdf.canonical_recovered_stream_eol(object_ref, &handle)
+                .expect("classify encrypted stream's recovered EOL"),
+            None
+        );
     }
 
     #[test]
