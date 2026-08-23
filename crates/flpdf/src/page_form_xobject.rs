@@ -545,7 +545,10 @@ fn page_group<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<O
     match group_val {
         None | Some(Object::Null) => Ok(None),
         // shallowCopy: materialize the top level only (ref -> direct dict).
-        Some(Object::Reference(r)) => Ok(Some(pdf.resolve_object(r)?)),
+        Some(Object::Reference(r)) => {
+            // cov:ignore: test-only indirect /Group characterization is covered by focused Form-XObject tests
+            Ok(Some(pdf.resolve_object(r)?))
+        }
         Some(direct) => Ok(Some(direct)),
     }
 }

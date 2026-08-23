@@ -57,7 +57,7 @@ fn signed_acroform_pdf_with_indirect_signature_entries() -> Vec<u8> {
             3,
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
         ),
-        (4, b"<< /Fields [5 0 R] >>"),
+        (4, b"<< /Fields 18 0 R >>"),
         (
             5,
             b"<< /FT 8 0 R /T 9 0 R /V 6 0 R /Kids [7 0 R] >>",
@@ -77,6 +77,7 @@ fn signed_acroform_pdf_with_indirect_signature_entries() -> Vec<u8> {
         (15, b"(Tokyo)"),
         (16, b"(alice@example.test)"),
         (17, b"<010203>"),
+        (18, b"[5 0 R]"),
     ])
 }
 

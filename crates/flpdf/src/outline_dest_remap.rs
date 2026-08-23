@@ -897,6 +897,7 @@ fn dest_page_ref_resolved_depth<R: Read + Seek>(
 // Tests
 // ---------------------------------------------------------------------------
 
+// cov:ignore-start: test-only legacy-route characterization calls are covered by focused outline tests, not the workspace zlib coverage run
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3293,3 +3294,4 @@ mod tests {
         );
     }
 }
+// cov:ignore-end

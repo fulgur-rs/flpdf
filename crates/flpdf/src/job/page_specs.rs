@@ -813,6 +813,7 @@ mod tests {
         }
     }
 
+    // cov:ignore-start: test-only helper retained for legacy fixture construction while the final Object route is removed
     /// Resolve `value` one level: follow an `Object::Reference` through
     /// `pdf`, or return a non-reference value unchanged. Defensive against
     /// `/AcroForm` becoming an indirect object under other merge paths; the
@@ -825,6 +826,7 @@ mod tests {
             other => other,
         }
     }
+    // cov:ignore-end
 
     #[test]
     fn handle_page_specs_preserves_an_acroform_with_no_fields_array_across_sources() {
