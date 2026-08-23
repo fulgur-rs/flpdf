@@ -608,6 +608,9 @@ mod tests {
             "objstm-lin-acroform-widget-page1-page2.pdf" => include_bytes!(
                 "../../../../tests/fixtures/compat/objstm-lin-acroform-widget-page1-page2.pdf"
             ),
+            "acroform-sig-orphan-widget.pdf" => {
+                include_bytes!("../../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf")
+            }
             _ => panic!("fixture is not registered: {name}"),
         };
         Pdf::open_mem_owned(bytes.to_vec()).expect("fixture must parse")
@@ -670,6 +673,35 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn split_pages_records_an_orphan_widget_warning_once() {
+        let mut source = open_fixture("acroform-sig-orphan-widget.pdf");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut job = QPDFJob::new();
+        let written = job
+            .split_pages(
+                &mut source,
+                SplitPageOptions::new(1, temp.path().join("out.pdf")),
+            )
+            .expect("split job should succeed with a recoverable warning");
+
+        assert_eq!(written.len(), 1);
+        assert!(job.has_warnings());
+        assert_eq!(
+            source
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .message
+                        .contains("this widget annotation is not reachable from /AcroForm")
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
