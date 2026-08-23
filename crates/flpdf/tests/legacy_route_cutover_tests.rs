@@ -93,9 +93,19 @@ fn thread_bead_production_uses_the_canonical_handle_route() {
     // line above every production function, so stopping there would leave
     // `production` covering just the module doc and imports.
     let (before_tests, _) = source
-        .split_once("\nmod tests {")
+        .split_once("mod tests {")
         .expect("thread_bead_p has a test module");
-    let production = before_tests.replace("#[cfg(test)]\nuse crate::{Dictionary, Object};\n", "");
+    // Filter by trimmed line content, not a literal multi-line `\n`-joined
+    // substring: `include_str!` reflects the file's on-disk line endings, and
+    // a `\r\n` checkout (Windows) would otherwise silently fail to match.
+    let production: String = before_tests
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed != "#[cfg(test)]" && trimmed != "use crate::{Dictionary, Object};"
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     for legacy in [
         "resolve_borrowed",
         "resolve_object(",
