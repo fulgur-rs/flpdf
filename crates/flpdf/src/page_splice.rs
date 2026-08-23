@@ -1141,7 +1141,14 @@ mod tests {
             ]
         );
         let inserted = dict_handle_of(&mut pdf, ObjectRef::new(5, 0));
-        assert!(!inserted.has_key(b"/Parent"));
+        assert!(
+            !inserted
+                .as_dictionary()
+                .expect("resolved dictionary")
+                .contains_key(b"/Parent".as_slice()),
+            "/Parent must be genuinely absent, not present as an explicit null \
+             (has_key alone can't distinguish the two)"
+        );
     }
 
     #[test]
