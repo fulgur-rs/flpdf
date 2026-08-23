@@ -7,7 +7,7 @@ use std::rc::Rc;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use flpdf::pipeline::{Pipeline, PipelineResult};
+use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult};
 use flpdf::{
     apply_stream_compress_policy, pages, CompressStreams, CopyEncryptionSource, DecodeLevel,
     Dictionary, EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf,
@@ -35,6 +35,22 @@ struct RecordingPipeline {
     bytes: Rc<RefCell<Vec<u8>>>,
     writes: Rc<RefCell<usize>>,
     finishes: Rc<RefCell<usize>>,
+}
+
+struct FailingPipeline;
+
+impl Pipeline for FailingPipeline {
+    fn identifier(&self) -> &str {
+        "qpdf-writer-failing-contract"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Err(PipelineError::runtime("pipeline write failure"))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 impl Pipeline for RecordingPipeline {
@@ -2694,6 +2710,22 @@ fn set_output_pipeline_writes_and_finishes_once() -> flpdf::Result<()> {
 }
 
 #[test]
+fn set_output_pipeline_preserves_downstream_write_error() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_pipeline(FailingPipeline)?;
+
+    let error = writer
+        .write()
+        .expect_err("downstream pipeline failure must propagate");
+    assert!(matches!(
+        error,
+        flpdf::Error::System(message) if message == "pipeline write failure"
+    ));
+    Ok(())
+}
+
+#[test]
 fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()> {
     for (setter, expected) in [("minimum", "%PDF-1.7"), ("force", "%PDF-1.5")] {
         let mut pdf = open_minimal_pdf()?;
@@ -3022,6 +3054,36 @@ fn pdf_writer_failure_does_not_report_success() -> flpdf::Result<()> {
 
     assert!(writer.write().is_err());
     assert!(!events.borrow().contains(&100));
+    Ok(())
+}
+
+struct RawOsErrorWriter(i32);
+
+impl Write for RawOsErrorWriter {
+    fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(self.0))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The `WriterOutputSink::write` `Writer` arm must propagate the sink's
+/// original `io::Error` unchanged, not a lossy `io::Error::new(kind,
+/// to_string())` reconstruction: `raw_os_error()` (and any other data
+/// `Display` does not render) would otherwise be lost.
+#[test]
+fn pdf_writer_output_writer_failure_preserves_raw_os_error() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_writer(RawOsErrorWriter(28))?;
+
+    let error = writer.write().expect_err("sink failure must propagate");
+    let flpdf::Error::Io(io_error) = error else {
+        panic!("writer-sink failure must surface as Error::Io, got {error:?}");
+    };
+    assert_eq!(io_error.raw_os_error(), Some(28));
     Ok(())
 }
 
