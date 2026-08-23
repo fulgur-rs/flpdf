@@ -33,7 +33,8 @@ class ObjectHandleConsumerCutoverTests(unittest.TestCase):
             "Dictionary",
             ".materialize()",
             "decode_stream_data(",
-            "pdf.resolve(",
+            "pdf.resolve_object(",
+            "pdf.resolve_borrowed(",
             "pdf.set_object(",
         ):
             self.assertNotIn(legacy, source, f"filespec production still uses {legacy}")
