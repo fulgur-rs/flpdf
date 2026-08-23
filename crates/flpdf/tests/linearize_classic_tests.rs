@@ -269,3 +269,67 @@ fn od_live_arr_null_lands_in_od_section() {
          (before /E={e_offset}); found at byte {null_pos}"
     );
 }
+
+/// One-page PDF with a `/Contents` stream and an unrelated Image XObject
+/// resource sibling, used to exercise the linearized writer's per-stream
+/// content-normalization gate end to end.
+fn content_and_xobject_pdf_bytes() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.4\n");
+    let mut offs = [0u64; 6];
+    let mut push = |pdf: &mut Vec<u8>, n: usize, body: &str| {
+        offs[n] = pdf.len() as u64;
+        pdf.extend_from_slice(format!("{n} 0 obj\n{body}\nendobj\n").as_bytes());
+    };
+    push(&mut pdf, 1, "<< /Type /Catalog /Pages 2 0 R >>");
+    push(&mut pdf, 2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>");
+    push(
+        &mut pdf,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+         /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    push(&mut pdf, 4, "<< /Length 5 >>\nstream\nBT\nET\nendstream");
+    push(
+        &mut pdf,
+        5,
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\nA\nendstream",
+    );
+    let xref_start = pdf.len() as u64;
+    let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+    for off in offs.iter().skip(1) {
+        xref.push_str(&format!("{off:010} 00000 n \n"));
+    }
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+/// `--linearize --normalize-content=y` must scope normalization to the page
+/// content stream (obj 4) only, matching qpdf's per-stream
+/// `m->normalized_streams` identity (`QPDFWriter.cc:1277`), and must not
+/// attempt to treat the sibling Image XObject (obj 5) as a normalization
+/// candidate. Exercises the linearized writer's body-emission path
+/// (`append_body_object`) with `content_normalization: true`, which no other
+/// linearization test in this crate covers.
+#[test]
+fn linearize_content_normalization_scopes_to_page_content_only() {
+    let mut pdf = Pdf::open(Cursor::new(content_and_xobject_pdf_bytes())).unwrap();
+    let opts = WriterTestSettings {
+        content_normalization: true,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+    let bytes = write_linearized_with_settings(&mut pdf, &opts)
+        .expect("linearized write with content normalization must succeed");
+
+    let mut written = Pdf::open(Cursor::new(bytes)).expect("output must reopen");
+    for r in written.object_refs() {
+        written
+            .resolve(r)
+            .unwrap_or_else(|e| panic!("object {r} did not resolve: {e}"));
+    }
+}
