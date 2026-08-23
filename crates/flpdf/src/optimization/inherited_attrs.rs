@@ -225,7 +225,20 @@ fn push_child_reference<R: Read + Seek>(
         return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     }
     for (&key, values) in key_ancestors.iter() {
-        let present = child.has_key(key);
+        // qpdf's hasKey resolves the ordinary parsed child once. The existing
+        // flpdf mutation fixture can additionally store a reference-to-reference
+        // redirect, which has no qpdf counterpart; follow that explicit chain so
+        // a terminal null remains absent just as the previous chain owner did.
+        let present = match child
+            .as_dictionary()
+            .and_then(|entries| entries.get(key).cloned())
+        {
+            None => false,
+            Some(value) => {
+                let (resolved, _) = resolve_handle_chain(pdf, &value)?;
+                !resolved.is_null()
+            }
+        };
         if !present {
             if let Some(value) = values.last() {
                 child.replace_key(key, value.clone())?;
