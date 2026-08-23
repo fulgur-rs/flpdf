@@ -561,11 +561,13 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     };
     let page = pdf.get_object_handle(page_ref);
     pdf.resolve_object_handle(&page)?;
+    // cov:ignore-start: public page traversal guarantees a page dictionary at this boundary
     if page.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a page dictionary"
         ))); // cov:ignore: repaired page snapshot is always a dictionary
     }
+    // cov:ignore-end
     page.replace_key(b"/Resources", resources)?;
     pdf.mark_object_handle_dirty(&page)?;
     Ok(())
@@ -851,9 +853,11 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     };
     let root = pdf.get_object_handle(root_ref);
     pdf.resolve_object_handle(&root)?;
+    // cov:ignore-start: parsed Pdf catalogs are dictionaries at this boundary
     if root.as_dictionary().is_none() {
         return Ok(()); // cov:ignore: parsed catalog root is a dictionary
     }
+    // cov:ignore-end
     root.remove_key(b"/AcroForm");
     pdf.mark_object_handle_dirty(&root)?;
     Ok(())
