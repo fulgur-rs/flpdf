@@ -5,14 +5,22 @@
 //! and prunes only its `/Font` and `/XObject` dictionaries. Document-level
 //! callers own the page iteration; the `Auto` decision is the separate qpdf
 //! job-level `shouldRemoveUnreferencedResources` heuristic below.
+//!
+//! Deviation: locating a Form XObject in a `/XObject` category chases
+//! through a [`Pdf::set_object`] bare-reference redirect to its terminal via
+//! [`Pdf::resolve_to_terminal`], which has no qpdf counterpart (qpdf's own
+//! object graph can never hold a stored "this object's value is another
+//! reference" redirect the way `Pdf::set_object` permits). See
+//! `optimization/inherited_attrs.rs`'s own module doc for the same
+//! compensation elsewhere in the crate, and the inline deviation-marker
+//! comments below for the exact call sites.
 
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::object_handle::ObjectHandleIdentity;
 use crate::page_object_helper::PageObjectHelper;
-use crate::ref_chain::resolve_ref_chain;
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
-use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek};
 
@@ -227,9 +235,16 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<(BTreeSet<Vec<u8>>, bool)> {
-    let Some(page_resources) = crate::pages::resolve_inherited_resources(pdf, page_ref)? else {
-        return Ok((BTreeSet::new(), false));
+    let page_resources = {
+        let mut helper = PageObjectHelper::new(page_ref, pdf);
+        // qpdf's forEachFormXObject uses getAttribute("/Resources", false)
+        // while discovering nested Forms; the later per-Form pruning helper
+        // is the first boundary that copies an indirect Resources dictionary.
+        helper.get_resources(false)?
     };
+    if page_resources.is_null() {
+        return Ok((BTreeSet::new(), false));
+    }
     let mut pending = VecDeque::from(form_xobjects_in_resources(pdf, &page_resources)?);
     let mut visited = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
@@ -239,22 +254,24 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         if !visited.insert(form_ref) {
             continue;
         }
-        let Object::Stream(mut form) = pdf.resolve_object(form_ref)? else {
-            continue; // cov:ignore: form_xobjects_in_resources queues only terminal Stream objects
-        };
-        if !is_form_xobject(&form.dict) {
-            continue; // cov:ignore: form_xobjects_in_resources queues only /Subtype /Form streams
+        let holder_handle = pdf.get_object_handle(form_ref);
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_to_terminal_ref).
+        let form_handle = pdf.resolve_to_terminal(&holder_handle)?;
+        if !form_handle.is_form_xobject()? {
+            continue; // cov:ignore: form_xobjects_in_resources already terminal-chase-filters to Form XObjects
         }
-        let mut resources = match form.dict.get("Resources") {
-            Some(Object::Dictionary(resources)) => Some(resources.clone()),
-            Some(reference @ Object::Reference(_)) => resolve_resource_reference(pdf, reference)?
-                .and_then(|(object, _)| object.into_dict()),
-            _ => None,
-        };
-        let form_handle = pdf.get_object_handle(form_ref);
+        let stream_dict = form_stream_dict(&form_handle)?;
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_to_terminal_ref).
+        let resources = pdf.resolve_to_terminal(&stream_dict.try_get_key(b"/Resources")?)?;
+        let resources = resources
+            .try_as_dictionary()?
+            .map(|_| resources)
+            .filter(|handle| !handle.is_null());
         let decoded = (|| -> Result<Vec<u8>> {
-            pdf.resolve(&form_handle)?;
-            let stream_dict = form_stream_dict(&form_handle)?;
             let stream_data = form_handle.get_raw_stream_data()?;
             decode_stream_data_from_handle(
                 &stream_dict,
@@ -276,7 +293,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
             continue; // cov:ignore: malformed Form regression exercises this path; llvm maps the parser failure to collect_used_names_for_form
         };
-        let local_unresolved = unresolved_resource_names(pdf, resources.as_ref(), &used)?;
+        let local_unresolved = unresolved_resource_names(resources.as_ref(), &used)?;
         unresolved.extend(local_unresolved.iter().cloned());
         // qpdf's forEachFormXObject retains the original child object handle
         // while its action prunes the parent. Capture those children before
@@ -288,11 +305,20 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
 
         if !local_unresolved.is_empty() && resources.is_some() {
             any_failures = true;
-        } else if let Some(resources) = &mut resources {
-            prune_font_and_xobject_dictionaries(pdf, resources, &used)?;
-            form.dict
-                .insert("Resources", Object::Dictionary(resources.clone()));
-            pdf.set_object(form_ref, Object::Stream(form));
+        } else if let Some(resources) = &resources {
+            // Only shallow-copy the shared indirect Resources dictionary once
+            // pruning is actually going to happen: qpdf's contract (mirrored
+            // by prune_canonical_resource_target's own parse-then-copy order)
+            // leaves a Form whose content failed to parse untouched.
+            let resources = if resources.is_indirect() {
+                let copy = resources.shallow_copy()?;
+                stream_dict.replace_key(b"/Resources", copy.clone())?;
+                pdf.mark_object_handle_dirty(&stream_dict)?;
+                copy
+            } else {
+                resources.clone()
+            };
+            prune_font_and_xobject_dictionaries(pdf, &resources, &used)?;
         }
 
         pending.extend(child_forms);
@@ -303,23 +329,26 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
 /// Return `/Font` and `/XObject` names used by `used` but absent from the
 /// current Form resource scope. qpdf deliberately compares the categories as
 /// one name set before deciding whether a Form may be pruned.
-fn unresolved_resource_names<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    resources: Option<&Dictionary>,
+fn unresolved_resource_names(
+    resources: Option<&ObjectHandle>,
     used: &UsedNames,
 ) -> Result<BTreeSet<Vec<u8>>> {
     let mut known_names: BTreeSet<Vec<u8>> = BTreeSet::new();
     if let Some(resources) = resources {
         for category in [b"Font".as_slice(), b"XObject".as_slice()] {
-            let Some(value) = resources.get(category).cloned() else {
+            let mut key = Vec::with_capacity(category.len() + 1);
+            key.push(b'/');
+            key.extend_from_slice(category);
+            let value = resources.try_get_key(&key)?;
+            value.try_dereference()?;
+            let Some(dictionary) = value.try_as_dictionary()? else {
                 continue;
             };
-            let Some(dictionary) =
-                resolve_resource_reference(pdf, &value)?.and_then(|(object, _)| object.into_dict())
-            else {
-                continue;
-            };
-            known_names.extend(dictionary.iter().map(|(name, _)| name.to_vec()));
+            known_names.extend(
+                dictionary
+                    .keys()
+                    .map(|name| name.strip_prefix(b"/").unwrap_or(name.as_slice()).to_vec()),
+            );
         }
     }
 
@@ -338,60 +367,29 @@ fn unresolved_resource_names<R: Read + Seek>(
     Ok(unresolved)
 }
 
-/// Resolve a resource reference with qpdf's `getKey`/`isFormXObject` recovery
-/// behavior. A malformed resource target is warned about and treated as null;
-/// unrelated I/O and internal failures still abort the operation.
-fn resolve_resource_reference<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: &Object,
-) -> Result<Option<(Object, Option<ObjectRef>)>> {
-    match resolve_ref_chain(pdf, value) {
-        Ok(resolved) => Ok(Some(resolved)),
-        Err(error @ (Error::Parse { .. } | Error::Unsupported(_))) => {
-            // `error.to_string()`, not the bare `message` field, matches the
-            // canonical resolve-time catch boundary
-            // (`xref.rs`'s `resolve_indirect`, `self.push_warning(error.to_string(), offset)`):
-            // a `Parse` offset and the `Unsupported` "unsupported PDF
-            // feature:" classification are both embedded in the `Display`
-            // text (`error.rs`'s `#[error(...)]` formats), so destructuring
-            // straight to `message` silently drops them.
-            pdf.push_warning(error.to_string())?;
-            Ok(None)
-        }
-        Err(error) => Err(error), // cov:ignore: I/O and other non-recoverable resolver errors must remain visible to callers
-    }
-}
-
 /// Return direct indirect Form XObjects listed in a resource dictionary.
 fn form_xobjects_in_resources<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    resources: &Dictionary,
+    resources: &ObjectHandle,
 ) -> Result<Vec<ObjectRef>> {
-    let xobjects = match resources.get("XObject") {
-        Some(Object::Dictionary(dict)) => Some(dict.clone()),
-        Some(reference @ Object::Reference(_)) => {
-            resolve_resource_reference(pdf, reference)?.and_then(|(object, _)| object.into_dict())
-        }
-        _ => None,
-    };
-    let Some(xobjects) = xobjects else {
+    let xobjects = resources.try_get_key(b"/XObject")?;
+    xobjects.try_dereference()?;
+    let Some(xobjects) = xobjects.try_as_dictionary()? else {
         return Ok(Vec::new());
     };
     let mut forms = Vec::new();
-    for (_, value) in xobjects.iter() {
-        let Object::Reference(reference) = value else {
+    for value in xobjects.values() {
+        if !value.is_indirect() {
             continue;
-        };
-        let Some((resolved, terminal)) =
-            resolve_resource_reference(pdf, &Object::Reference(*reference))?
-        else {
+        }
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_to_terminal_ref).
+        if !pdf.resolve_to_terminal(value)?.is_form_xobject()? {
             continue;
-        };
-        let Object::Stream(stream) = resolved else {
-            continue;
-        };
-        if is_form_xobject(&stream.dict) {
-            forms.push(terminal.unwrap_or(*reference));
+        }
+        if let Some(reference) = value.object_ref() {
+            forms.push(reference);
         }
     }
     Ok(forms)
@@ -427,30 +425,37 @@ fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
 /// present, matching qpdf's `removeKey` loop on the category contents.
 fn prune_font_and_xobject_dictionaries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    resources: &mut Dictionary,
+    resources: &ObjectHandle,
     used: &UsedNames,
 ) -> Result<()> {
     for category in [b"Font".as_slice(), b"XObject".as_slice()] {
-        let Some(value) = resources.get(category).cloned() else {
-            continue;
-        };
-        let Some(mut dictionary) =
-            resolve_resource_reference(pdf, &value)?.and_then(|(object, _)| object.into_dict())
-        else {
+        let mut key = Vec::with_capacity(category.len() + 1);
+        key.push(b'/');
+        key.extend_from_slice(category);
+        let value = resources.try_get_key(&key)?;
+        value.try_dereference()?;
+        if value.try_as_dictionary()?.is_none() {
             // qpdf leaves a malformed /Font or /XObject category untouched;
             // see the matching comment in remove_unreferenced_resources_on_page.
             continue;
+        }
+        let dictionary = if value.is_indirect() {
+            let copy = value.shallow_copy()?;
+            resources.replace_key(&key, copy.clone())?;
+            copy
+        } else {
+            value
         };
         let names = used.get(category).cloned().unwrap_or_default();
         let remove = dictionary
-            .iter()
-            .filter(|(name, _)| !names.contains(*name))
-            .map(|(name, _)| name.to_vec())
+            .try_get_keys()?
+            .into_iter()
+            .filter(|name| !names.contains(name.strip_prefix(b"/").unwrap_or(name.as_slice())))
             .collect::<Vec<_>>();
         for name in remove {
-            dictionary.remove(&name);
+            dictionary.remove_key(&name);
         }
-        resources.insert(category, Object::Dictionary(dictionary));
+        pdf.mark_object_handle_dirty(&dictionary)?;
     }
     Ok(())
 }
@@ -737,12 +742,6 @@ fn record_direct_names(used: &mut UsedNames, names: &ResourceNamesByType, record
     }
 }
 
-/// Whether an (already resource-resolved) XObject stream dict is a Form XObject
-/// (`/Subtype /Form`).
-fn is_form_xobject(dict: &Dictionary) -> bool {
-    matches!(dict.get("Subtype"), Some(Object::Name(n)) if n.as_slice() == b"Form")
-}
-
 fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
     handle.as_stream_dict().ok_or_else(|| {
         Error::Internal("Form XObject handle did not resolve to a stream".to_owned())
@@ -752,7 +751,7 @@ fn form_stream_dict(handle: &ObjectHandle) -> Result<ObjectHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Stream;
+    use crate::{Dictionary, Object, Stream};
     use std::io::Cursor;
 
     /// Build a minimal one-page PDF with a caller-supplied page dictionary and
@@ -1187,6 +1186,84 @@ mod tests {
     }
 
     #[test]
+    fn remove_unreferenced_resources_chases_a_multi_hop_form_resources_redirect() {
+        let mut pdf = build_page_with_indirect_form_filter_pdf();
+        // Redirect object 9 (the Form's /Resources) through a two-hop
+        // Pdf::set_object bare-reference chain to a fresh dictionary, instead
+        // of holding the resource dictionary directly.
+        let mut fonts = Dictionary::new();
+        fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+        fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+        let mut form_resources = Dictionary::new();
+        form_resources.insert("Font", Object::Dictionary(fonts));
+        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(form_resources));
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Reference(ObjectRef::new(10, 0)),
+        );
+
+        remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
+            .expect("resource pruning should succeed");
+
+        let form = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should remain a stream");
+        let resources = form
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("pruned Form resources reached through the redirect should be inline");
+        let fonts = resources
+            .get("Font")
+            .and_then(Object::as_dict)
+            .expect("Form resources should retain /Font");
+        assert!(fonts.get("F1").is_some(), "used /F1 must remain");
+        assert!(
+            fonts.get("F2").is_none(),
+            "pruning must reach the terminal Resources dictionary through a \
+             two-hop Pdf::set_object redirect (9 0 R -> 10 0 R), not skip it"
+        );
+    }
+
+    #[test]
+    fn remove_unreferenced_resources_leaves_shared_resources_untouched_on_parse_failure() {
+        let mut pdf = build_page_with_indirect_form_filter_pdf();
+        // Replace the Form's well-formed content stream with an unencoded,
+        // syntactically malformed one (matching the `<0g>` fixture pattern
+        // used elsewhere in this module), matching qpdf's contract of
+        // leaving a Form whose content cannot be parsed entirely untouched.
+        let form = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should be a stream");
+        let mut malformed_dict = form.dict;
+        malformed_dict.remove("Filter");
+        malformed_dict.remove("DecodeParms");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Stream(Stream::new(malformed_dict, b"<0g>".to_vec())),
+        );
+
+        remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
+            .expect("resource pruning must tolerate an unparsable Form, not abort");
+
+        let form = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should remain a stream");
+        assert_eq!(
+            form.dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(9, 0))),
+            "a Form whose content failed to parse must keep its original \
+             shared indirect /Resources reference, not a fresh shallow copy"
+        );
+    }
+
+    #[test]
     fn form_stream_dict_rejects_non_stream_handle() {
         assert!(form_stream_dict(&ObjectHandle::integer(1)).is_err());
     }
@@ -1224,10 +1301,9 @@ mod tests {
         // The page has no /Contents, so ResourceFinder records no used names;
         // "Fm" is removed by ordinary unreferenced-name pruning
         // (`QPDFPageObjectHelper.cc:596-604`), not because its target (object
-        // 4, malformed) fails to resolve. `resolve_resource_reference` only
-        // has to keep pruning from aborting when it walks that target during
-        // the Form pre-pass; qpdf itself never dereferences a declared
-        // XObject's target here (removal is name-based).
+        // 4, malformed) fails to resolve. The Form pre-pass keeps walking
+        // other declared XObjects when one target is malformed; qpdf itself
+        // never dereferences a declared XObject's target for name removal.
         assert!(
             xobjects.get("Fm").is_none(),
             "an unreferenced declared XObject name is pruned regardless of \
@@ -1295,13 +1371,13 @@ mod tests {
     #[test]
     fn form_resource_pruning_preserves_non_dictionary_xobject_category() {
         let mut pdf = Pdf::empty().expect("empty PDF should be constructible");
-        let mut resources = Dictionary::new();
-        resources.insert("XObject", Object::Integer(42));
+        let resources =
+            ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), ObjectHandle::integer(42))]);
 
-        prune_font_and_xobject_dictionaries(&mut pdf, &mut resources, &BTreeMap::new())
+        prune_font_and_xobject_dictionaries(&mut pdf, &resources, &BTreeMap::new())
             .expect("malformed resource categories should be recoverable");
 
-        assert_eq!(resources.get("XObject"), Some(&Object::Integer(42)));
+        assert_eq!(resources.get_key(b"/XObject").as_integer(), Some(42));
     }
 
     // ISO 32000-1 §8.6.8: only /DeviceGray, /DeviceRGB, /DeviceCMYK, /Pattern

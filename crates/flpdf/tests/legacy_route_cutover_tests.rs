@@ -223,3 +223,26 @@ fn optimization_production_uses_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn resources_form_pruning_production_uses_the_handle_route() {
+    let source = include_str!("../src/resources.rs");
+    let prepass = source
+        .split("fn collect_used_names_for_form")
+        .next()
+        .expect("resources has a Form pruning pre-pass");
+    for legacy in [
+        "resolve_ref_chain",
+        "resolve_resource_reference",
+        "resolve_object(",
+        "let Object::Stream",
+        "Object::Dictionary(resources)",
+        "Object::Reference(reference)",
+        "pdf.set_object(form_ref",
+    ] {
+        assert!(
+            !prepass.contains(legacy),
+            "resources Form pruning pre-pass still contains raw route marker {legacy:?}"
+        );
+    }
+}

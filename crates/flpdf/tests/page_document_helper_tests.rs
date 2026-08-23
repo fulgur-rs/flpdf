@@ -2629,7 +2629,11 @@ fn helper_prunes_unused_resources_inside_a_holder_chained_form_xobject() {
         panic!("Form must retain font resources");
     };
     assert!(fonts.get("F1").is_some());
-    assert!(fonts.get("F2").is_none());
+    assert!(
+        fonts.get("F2").is_none(),
+        "pruning must reach the terminal Form through a Pdf::set_object \
+         holder-chain redirect (Fm0 -> 7 0 R -> 6 0 R), not skip it"
+    );
 }
 
 #[test]
