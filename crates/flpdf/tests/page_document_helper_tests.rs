@@ -2579,6 +2579,64 @@ fn helper_prunes_declared_child_form_before_pruning_parent_xobjects() {
 }
 
 #[test]
+fn helper_prunes_unused_resources_inside_a_holder_chained_form_xobject() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"/Fm0 Do".to_vec())),
+    );
+
+    let mut fonts = Dictionary::new();
+    fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut form_resources = Dictionary::new();
+    form_resources.insert("Font", Object::Dictionary(fonts));
+    let mut form_dict = Dictionary::new();
+    form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    form_dict.insert("Resources", Object::Dictionary(form_resources));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(form_dict, b"BT /F1 12 Tf ET".to_vec())),
+    );
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Reference(ObjectRef::new(6, 0)),
+    );
+
+    let mut xobjects = Dictionary::new();
+    xobjects.insert("Fm0", Object::Reference(ObjectRef::new(7, 0)));
+    let mut resources = Dictionary::new();
+    resources.insert("XObject", Object::Dictionary(xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Stream(form) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("terminal Form must remain a stream");
+    };
+    let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
+        panic!("Form must retain resources");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("Form must retain font resources");
+    };
+    assert!(fonts.get("F1").is_some());
+    assert!(
+        fonts.get("F2").is_none(),
+        "pruning must reach the terminal Form through a Pdf::set_object \
+         holder-chain redirect (Fm0 -> 7 0 R -> 6 0 R), not skip it"
+    );
+}
+
+#[test]
 fn helper_prunes_parent_form_resources_not_directly_used_by_resource_less_nested_form() {
     let mut pdf = open(build_n_page_pdf(1));
     pdf.set_object(
