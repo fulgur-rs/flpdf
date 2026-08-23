@@ -93,7 +93,7 @@ fn push_direct_node<R: Read + Seek>(
     // cov:ignore-end
 
     // cov:ignore-start: all production callers pass warn_skipped_keys=false
-    if warn_skipped_keys && dict.has_key(b"/Parent") {
+    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
         for key in dict.try_get_keys()? {
             if !INHERITABLE_KEYS.contains(&key.as_slice())
                 && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
@@ -152,7 +152,7 @@ fn push_node_attributes<R: Read + Seek>(
         else {
             continue;
         };
-        let (resolved, _) = resolve_handle_chain(pdf, &value)?;
+        let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
         if resolved.is_null() {
             continue;
         }
@@ -235,7 +235,7 @@ fn push_child_reference<R: Read + Seek>(
         {
             None => false,
             Some(value) => {
-                let (resolved, _) = resolve_handle_chain(pdf, &value)?;
+                let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
                 !resolved.is_null()
             }
         };
@@ -276,7 +276,7 @@ fn push_internal<R: Read + Seek>(
         return Ok(());
     }
 
-    if warn_skipped_keys && dict.has_key(b"/Parent") {
+    if warn_skipped_keys && dict.try_has_key(b"/Parent")? {
         for key in dict.try_get_keys()? {
             if !INHERITABLE_KEYS.contains(&key.as_slice())
                 && ![b"/Type".as_slice(), b"/Parent", b"/Kids", b"/Count"].contains(&key.as_slice())
@@ -324,23 +324,6 @@ fn is_pages_dictionary(handle: &ObjectHandle) -> bool {
 
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
     handle.object_ref().or_else(|| handle.as_reference())
-}
-
-fn resolve_handle_chain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: &ObjectHandle,
-) -> Result<(ObjectHandle, Option<ObjectRef>)> {
-    let mut current = start.clone();
-    let mut last_ref = current.object_ref();
-    for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
-        pdf.resolve(&current)?;
-        let Some(next) = current.as_reference() else {
-            return Ok((current, last_ref));
-        };
-        last_ref = Some(next);
-        current = pdf.get_object_handle(next);
-    }
-    Ok((current, last_ref))
 }
 
 #[cfg(test)]
@@ -560,35 +543,5 @@ mod tests {
 
         assert!(matches!(error, Error::Unsupported(ref message)
                 if message.contains("page tree depth exceeds maximum")));
-    }
-
-    #[test]
-    fn canonical_inherited_attribute_chain_bounds_a_reference_cycle() {
-        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
-            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
-            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
-        ]))
-        .unwrap();
-        pdf.set_object(
-            ObjectRef::new(20, 0),
-            Object::Reference(ObjectRef::new(21, 0)),
-        );
-        pdf.set_object(
-            ObjectRef::new(21, 0),
-            Object::Reference(ObjectRef::new(20, 0)),
-        );
-        let start = pdf.get_object_handle(ObjectRef::new(20, 0));
-
-        let (terminal, terminal_ref) =
-            resolve_handle_chain(&mut pdf, &start).expect("reference cycle is bounded");
-        assert!(terminal.as_reference().is_some());
-        assert!(matches!(
-            terminal_ref,
-            Some(ObjectRef {
-                number: 20 | 21,
-                generation: 0
-            })
-        ));
     }
 }
