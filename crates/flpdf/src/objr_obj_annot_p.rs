@@ -532,7 +532,6 @@ mod tests {
         let mut pdf = open(&objs);
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("stream target skipped without error");
-        // cov:ignore-start: test-only stream-target characterization is exercised by the focused OBJR suite, not the zlib coverage corpus
         assert!(
             matches!(
                 pdf.resolve_object(ObjectRef::new(30, 0)),
@@ -540,6 +539,5 @@ mod tests {
             ),
             "a stream OBJR /Obj target must be left unchanged",
         );
-        // cov:ignore-end
     }
 }

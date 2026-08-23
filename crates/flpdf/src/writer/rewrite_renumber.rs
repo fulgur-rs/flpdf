@@ -1449,7 +1449,6 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    // cov:ignore-start: test-only type-tag characterization uses the legacy fixture resolver and is covered by focused writer tests
     /// Classify a resolved object into the oracle's tag vocabulary.
     ///
     /// Streams are always `"stream"`. A dictionary whose `/Type` resolves to a
@@ -1470,7 +1469,6 @@ mod tests {
             _ => "other".to_string(),
         }
     }
-    // cov:ignore-end
 
     fn tag_sequence<R: Read + Seek>(pdf: &mut Pdf<R>, map: &CatalogFirstRenumber) -> Vec<String> {
         let olds: Vec<ObjectRef> = map.pairs().map(|(_new, old)| old).collect();
