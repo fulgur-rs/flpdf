@@ -151,6 +151,8 @@ fn inherited_attributes_production_uses_the_canonical_handle_route() {
         "resolve_borrowed",
         "resolve_object(",
         "terminal_ref_of_chain",
+        "resolve_handle_chain",
+        "as_reference()",
         "Object::",
         "Dictionary",
         "pdf.set_object(",
@@ -158,6 +160,25 @@ fn inherited_attributes_production_uses_the_canonical_handle_route() {
         assert!(
             !production.contains(legacy),
             "inherited_attrs production still contains raw route marker {legacy:?}"
+        );
+    }
+}
+
+#[test]
+fn inherited_attributes_module_has_no_raw_snapshot_or_redirect_route() {
+    let source = include_str!("../src/optimization/inherited_attrs.rs");
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_handle_chain",
+        "as_reference()",
+        "Object::",
+        "use crate::{Dictionary",
+        "pdf.set_object(",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "inherited_attrs still contains the raw or redirect marker {legacy:?}"
         );
     }
 }

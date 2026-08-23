@@ -1,4 +1,13 @@
 //! qpdf correspondence: QPDF_optimization.cc inherited-page-attribute push.
+//!
+//! Deviation: null checks on an inheritable key's value chase through a
+//! [`Pdf::set_object`] bare-reference redirect to its terminal via
+//! [`Pdf::resolve_to_terminal`], which has no qpdf counterpart (qpdf's own
+//! object graph can never hold a stored "this object's value is another
+//! reference" redirect the way `Pdf::set_object` permits). See
+//! `pages.rs`'s `resolve_inherited_handle_with_max_depth` for the same
+//! compensation in the sibling bottom-up attribute climb, and the inline
+//! deviation-marker comments below for the exact call sites.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -153,8 +162,10 @@ fn push_node_attributes<R: Read + Seek>(
         else {
             continue;
         };
-        let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
-        if resolved.is_null() {
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_to_terminal_ref).
+        if pdf.resolve_to_terminal(&value)?.is_null() {
             continue;
         }
         if !allow_changes {
@@ -223,19 +234,15 @@ fn push_child_reference<R: Read + Seek>(
         return Ok(()); // cov:ignore: page-tree repair guarantees indirect children are dictionaries
     }
     for (&key, values) in key_ancestors.iter() {
-        // qpdf's hasKey resolves the ordinary parsed child once. The existing
-        // flpdf mutation fixture can additionally store a reference-to-reference
-        // redirect, which has no qpdf counterpart; follow that explicit chain so
-        // a terminal null remains absent just as the previous chain owner did.
         let present = match child
             .as_dictionary()
             .and_then(|entries| entries.get(key).cloned())
         {
             None => false,
-            Some(value) => {
-                let (resolved, _) = pdf.resolve_to_terminal_ref(&value)?;
-                !resolved.is_null()
-            }
+            // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+            // bare-reference redirect that has no qpdf counterpart (see
+            // reader.rs::resolve_to_terminal_ref).
+            Some(value) => !pdf.resolve_to_terminal(&value)?.is_null(),
         };
         if !present {
             if let Some(value) = values.last() {
@@ -321,7 +328,7 @@ fn is_pages_dictionary(handle: &ObjectHandle) -> bool {
 }
 
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
-    handle.object_ref().or_else(|| handle.as_reference())
+    handle.object_ref()
 }
 
 #[cfg(test)]
@@ -329,7 +336,7 @@ mod tests {
     use super::*;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
-    use crate::{Dictionary, Object, Pdf};
+    use crate::{ObjectHandle, Pdf};
 
     fn pdf_bytes(bodies: &[(u32, &[u8])]) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
@@ -382,6 +389,23 @@ mod tests {
         ])
     }
 
+    /// Installs a two-hop `Pdf::set_object` bare-reference redirect
+    /// (`holder 0 R` -> `target 0 R` -> null) at `holder_ref`, where
+    /// `target_ref` is a fresh object whose value resolves to null.
+    fn install_multi_hop_null_redirect<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        holder_ref: ObjectRef,
+        target_ref: ObjectRef,
+    ) {
+        pdf.set_object_handle(target_ref, ObjectHandle::null())
+            .unwrap();
+        pdf.set_object_handle(
+            holder_ref,
+            ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(target_ref)),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn no_change_mode_rejects_inheritable_key_before_mutation() {
         let mut pdf = Pdf::open_mem_owned(pdf_with_inherited_scalar_rotate()).unwrap();
@@ -393,12 +417,14 @@ mod tests {
             panic!("fixture has an indirect /Pages root");
             // cov:ignore-end
         };
-        let before = pdf.resolve_object(root).unwrap();
+        let root_handle = pdf.get_object_handle(root);
+        pdf.resolve(&root_handle).unwrap();
+        let before = root_handle.get_key(b"/Rotate").as_integer();
 
         let error = push(&mut pdf, &prepared, false, false).unwrap_err();
 
         assert!(error.to_string().contains("inheritable attribute"));
-        assert_eq!(pdf.resolve_object(root).unwrap(), before);
+        assert_eq!(root_handle.get_key(b"/Rotate").as_integer(), before);
     }
 
     #[test]
@@ -424,17 +450,103 @@ mod tests {
             .unwrap();
         push(&mut pdf, &prepared, true, false).unwrap();
 
-        assert!(
-            matches!(
-                pdf.resolve_object(leaf_ref).unwrap(),
-                Object::Dictionary(ref page) if page.get("Rotate") == Some(&Object::Integer(90))
-            ),
+        let leaf = pdf.get_object_handle(leaf_ref);
+        pdf.resolve(&leaf).unwrap();
+        assert_eq!(
+            leaf.get_key(b"/Rotate").as_integer(),
+            Some(90),
             "leaf must have actually inherited /Rotate"
         );
         assert_eq!(
             pdf.get_object_handle(leaf_ref).end_offsets(),
             before,
             "inheriting a key must not clear the leaf's source extent"
+        );
+    }
+
+    #[test]
+    fn leaf_multi_hop_null_reference_chain_is_treated_as_absent() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>",
+            ),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                  /Resources 6 0 R >>",
+            ),
+            (4, b"<< /Font << /F1 5 0 R >> >>"),
+            (5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (6, b"null"),
+            (7, b"null"),
+        ]))
+        .unwrap();
+        install_multi_hop_null_redirect(&mut pdf, ObjectRef::new(6, 0), ObjectRef::new(7, 0));
+
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+        push(&mut pdf, &prepared, true, false).unwrap();
+
+        let leaf = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&leaf).unwrap();
+        assert_eq!(
+            leaf.get_key(b"/Resources").object_ref(),
+            Some(ObjectRef::new(4, 0)),
+            "a /Resources reaching null through a two-hop reference chain \
+             (6 0 R -> 7 0 R -> null) must be treated as absent and replaced \
+             by the inherited value, not just a single-hop null"
+        );
+    }
+
+    #[test]
+    fn ancestor_multi_hop_null_reference_chain_does_not_shadow_grandparent() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 5 0 R >>",
+            ),
+            (
+                3,
+                b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 \
+                  /Resources 7 0 R >>",
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (5, b"<< /Font << /F1 6 0 R >> >>"),
+            (6, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (7, b"null"),
+            (8, b"null"),
+        ]))
+        .unwrap();
+        install_multi_hop_null_redirect(&mut pdf, ObjectRef::new(7, 0), ObjectRef::new(8, 0));
+
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+        push(&mut pdf, &prepared, true, false).unwrap();
+
+        let child = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&child).unwrap();
+        assert_eq!(
+            child.get_key(b"/Resources").object_ref(),
+            Some(ObjectRef::new(7, 0)),
+            "a /Resources reaching null through a two-hop reference chain on \
+             the child /Pages node must be left in place, not erased"
+        );
+
+        let leaf = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve(&leaf).unwrap();
+        assert_eq!(
+            leaf.get_key(b"/Resources").object_ref(),
+            Some(ObjectRef::new(5, 0)),
+            "the leaf must inherit the GRANDPARENT's real /Resources, not be \
+             shadowed by the child's two-hop null reference chain"
         );
     }
 
@@ -478,10 +590,9 @@ mod tests {
             diagnostic.message.contains("Unknown key /Unknown")
                 && diagnostic.message.contains("/Pages")
         }));
-        assert!(matches!(
-            pdf.resolve_object(prepared.pages[0]).unwrap(),
-            Object::Dictionary(ref page) if page.get("MediaBox").is_some()
-        ));
+        let page = pdf.get_object_handle(prepared.pages[0]);
+        pdf.resolve(&page).unwrap();
+        assert!(page.has_key(b"/MediaBox"));
     }
 
     #[test]
@@ -515,23 +626,24 @@ mod tests {
         for depth in 0..MAX_DEPTH {
             let number = 2 + depth as u32;
             let child = number + 1;
-            let mut node = Dictionary::new();
-            node.insert("Type", Object::Name(b"Pages".to_vec()));
-            node.insert(
-                "Kids",
-                Object::Array(vec![Object::Reference(ObjectRef::new(child, 0))]),
-            );
-            node.insert("Count", Object::Integer(0));
-            pdf.set_object(ObjectRef::new(number, 0), Object::Dictionary(node));
+            let node = ObjectHandle::dictionary(vec![
+                (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+                (
+                    b"/Kids".to_vec(),
+                    ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(child, 0))]),
+                ),
+                (b"/Count".to_vec(), ObjectHandle::integer(0)),
+            ]);
+            pdf.set_object_handle(ObjectRef::new(number, 0), node)
+                .unwrap();
         }
-        let mut boundary = Dictionary::new();
-        boundary.insert("Type", Object::Name(b"Pages".to_vec()));
-        boundary.insert("Kids", Object::Array(Vec::new()));
-        boundary.insert("Count", Object::Integer(0));
-        pdf.set_object(
-            ObjectRef::new(2 + MAX_DEPTH as u32, 0),
-            Object::Dictionary(boundary),
-        );
+        let boundary = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"/Kids".to_vec(), ObjectHandle::array(Vec::new())),
+            (b"/Count".to_vec(), ObjectHandle::integer(0)),
+        ]);
+        pdf.set_object_handle(ObjectRef::new(2 + MAX_DEPTH as u32, 0), boundary)
+            .unwrap();
         let prepared = PreparedPages {
             root: PageTreeRoot::Indirect(ObjectRef::new(2, 0)),
             pages: Vec::new(),
