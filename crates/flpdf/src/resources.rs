@@ -263,14 +263,10 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             continue; // cov:ignore: form_xobjects_in_resources already terminal-chase-filters to Form XObjects
         }
         let stream_dict = form_stream_dict(&form_handle)?;
-        let mut resources = stream_dict.try_get_key(b"/Resources")?;
-        resources.try_dereference()?;
-        if resources.is_indirect() && resources.as_dictionary().is_some() {
-            let copy = resources.shallow_copy()?;
-            stream_dict.replace_key(b"/Resources", copy.clone())?;
-            pdf.mark_object_handle_dirty(&stream_dict)?;
-            resources = copy;
-        }
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_to_terminal_ref).
+        let resources = pdf.resolve_to_terminal(&stream_dict.try_get_key(b"/Resources")?)?;
         let resources = resources
             .try_as_dictionary()?
             .map(|_| resources)
@@ -310,7 +306,19 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         if !local_unresolved.is_empty() && resources.is_some() {
             any_failures = true;
         } else if let Some(resources) = &resources {
-            prune_font_and_xobject_dictionaries(pdf, resources, &used)?;
+            // Only shallow-copy the shared indirect Resources dictionary once
+            // pruning is actually going to happen: qpdf's contract (mirrored
+            // by prune_canonical_resource_target's own parse-then-copy order)
+            // leaves a Form whose content failed to parse untouched.
+            let resources = if resources.is_indirect() {
+                let copy = resources.shallow_copy()?;
+                stream_dict.replace_key(b"/Resources", copy.clone())?;
+                pdf.mark_object_handle_dirty(&stream_dict)?;
+                copy
+            } else {
+                resources.clone()
+            };
+            prune_font_and_xobject_dictionaries(pdf, &resources, &used)?;
         }
 
         pending.extend(child_forms);
@@ -1175,6 +1183,84 @@ mod tests {
             .expect("resource pruning should succeed");
 
         assert_form_fonts_pruned(&mut pdf);
+    }
+
+    #[test]
+    fn remove_unreferenced_resources_chases_a_multi_hop_form_resources_redirect() {
+        let mut pdf = build_page_with_indirect_form_filter_pdf();
+        // Redirect object 9 (the Form's /Resources) through a two-hop
+        // Pdf::set_object bare-reference chain to a fresh dictionary, instead
+        // of holding the resource dictionary directly.
+        let mut fonts = Dictionary::new();
+        fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+        fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+        let mut form_resources = Dictionary::new();
+        form_resources.insert("Font", Object::Dictionary(fonts));
+        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(form_resources));
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Reference(ObjectRef::new(10, 0)),
+        );
+
+        remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
+            .expect("resource pruning should succeed");
+
+        let form = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should remain a stream");
+        let resources = form
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("pruned Form resources reached through the redirect should be inline");
+        let fonts = resources
+            .get("Font")
+            .and_then(Object::as_dict)
+            .expect("Form resources should retain /Font");
+        assert!(fonts.get("F1").is_some(), "used /F1 must remain");
+        assert!(
+            fonts.get("F2").is_none(),
+            "pruning must reach the terminal Resources dictionary through a \
+             two-hop Pdf::set_object redirect (9 0 R -> 10 0 R), not skip it"
+        );
+    }
+
+    #[test]
+    fn remove_unreferenced_resources_leaves_shared_resources_untouched_on_parse_failure() {
+        let mut pdf = build_page_with_indirect_form_filter_pdf();
+        // Replace the Form's well-formed content stream with an unencoded,
+        // syntactically malformed one (matching the `<0g>` fixture pattern
+        // used elsewhere in this module), matching qpdf's contract of
+        // leaving a Form whose content cannot be parsed entirely untouched.
+        let form = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should be a stream");
+        let mut malformed_dict = form.dict;
+        malformed_dict.remove("Filter");
+        malformed_dict.remove("DecodeParms");
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Stream(Stream::new(malformed_dict, b"<0g>".to_vec())),
+        );
+
+        remove_unreferenced_resources_on_page(&mut pdf, ObjectRef::new(3, 0))
+            .expect("resource pruning must tolerate an unparsable Form, not abort");
+
+        let form = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("Form should resolve")
+            .into_stream()
+            .expect("Form target should remain a stream");
+        assert_eq!(
+            form.dict.get("Resources"),
+            Some(&Object::Reference(ObjectRef::new(9, 0))),
+            "a Form whose content failed to parse must keep its original \
+             shared indirect /Resources reference, not a fresh shallow copy"
+        );
     }
 
     #[test]
