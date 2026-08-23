@@ -198,6 +198,13 @@ fn lookup_appearance_font<R: Read + Seek>(
     let Some(font) = font_from_resources(pdf, resources, resource_name)? else {
         return Ok(None);
     };
+    // qpdf merges a document-level fallback font only when the resolved
+    // resource is a dictionary (`QPDFFormFieldObjectHelper.cc:817-832`).
+    // A malformed scalar `/DR` entry is treated as no usable font rather
+    // than being copied into the appearance resource dictionary.
+    if font.try_as_dictionary()?.is_none() {
+        return Ok(None);
+    }
     let encoding = appearance_font_encoding(pdf, &font)?;
     Ok(Some(AppearanceFont {
         resource_name: resource_name.to_vec(),
@@ -858,6 +865,16 @@ mod tests {
         ])
     }
 
+    fn malformed_dr_font_tx_pdf() -> Vec<u8> {
+        pdf_with_objects(&[
+            "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /DR << /Font << /F1 5 0 R >> >> /DA (/F1 12 Tf 0 g) >> >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Widget /FT /Tx /V (Hello) /Rect [10 10 200 30] >>".to_string(),
+            "42".to_string(),
+        ])
+    }
+
     fn generated_stream<R: Read + Seek>(pdf: &mut Pdf<R>, reference: ObjectRef) -> ObjectHandle {
         let stream = pdf.get_object_handle(reference);
         pdf.resolve(&stream).expect("resolve appearance");
@@ -1011,6 +1028,22 @@ mod tests {
             fonts.get_key(b"/F1").object_ref(),
             Some(ObjectRef::new(5, 0))
         );
+    }
+
+    #[test]
+    fn canonical_tx_ignores_a_non_dictionary_dr_font_resource() {
+        let mut pdf = Pdf::open(Cursor::new(malformed_dr_font_tx_pdf())).expect("parse");
+        let reference =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("generate")
+                .expect("Tx handled");
+        let stream = generated_stream(&mut pdf, reference);
+        let resources = stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .get_key(b"/Resources");
+        pdf.resolve(&resources).expect("resolve resources");
+        assert!(resources.get_key(b"/Font").is_null());
     }
 
     #[test]
