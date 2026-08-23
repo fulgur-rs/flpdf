@@ -2082,17 +2082,6 @@ impl<R: Read + Seek> Pdf<R> {
             .collect())
     }
 
-    /// Compatibility name for the canonical qpdf object enumeration.
-    ///
-    /// New consumers should use [`Self::get_all_objects`]. This forwarding
-    /// name remains only while the remaining consumer-cutover slices move off
-    /// the pre-qpdf naming; it has exactly the same preparation and ordering
-    /// contract.
-    ///
-    pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
-        self.get_all_objects()
-    }
-
     /// Resolve `handle` in place if it is an unresolved indirect handle.
     ///
     /// A direct handle, or an indirect handle that has already been resolved,
@@ -9641,7 +9630,7 @@ mod tests {
         assert!(!pdf.is_dirty(object_ref));
 
         let all = pdf
-            .get_all_object_handles()
+            .get_all_objects()
             .expect("enumerate the canonical allocation");
         let enumerated = all
             .iter()
@@ -10139,7 +10128,7 @@ mod tests {
     }
 
     #[test]
-    fn get_all_object_handles_returns_indirect_handles_in_object_ref_order() {
+    fn get_all_objects_returns_indirect_handles_in_object_ref_order() {
         // `minimal_pdf_bytes` has three live objects (1 0, 2 0, 3 0) and one
         // free entry: the `0 65535 f` free-list head that every classic xref
         // table carries. The exact expected list below therefore also pins
@@ -10147,9 +10136,7 @@ mod tests {
         // `getAllObjects()` (whose backing `xref_table` never contains free
         // entries in the first place).
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let handles = pdf
-            .get_all_object_handles()
-            .expect("get all object handles");
+        let handles = pdf.get_all_objects().expect("get all object handles");
         assert!(handles.iter().all(ObjectHandle::is_indirect));
         let refs: Vec<_> = handles.iter().map(|h| h.object_ref().unwrap()).collect();
         let mut sorted = refs.clone();
@@ -10166,14 +10153,12 @@ mod tests {
     }
 
     #[test]
-    fn get_all_object_handles_reuses_the_canonical_handle_for_an_already_registered_ref() {
+    fn get_all_objects_reuses_the_canonical_handle_for_an_already_registered_ref() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(2, 0);
         let pre_registered = pdf.get_object_handle(object_ref);
 
-        let handles = pdf
-            .get_all_object_handles()
-            .expect("get all object handles");
+        let handles = pdf.get_all_objects().expect("get all object handles");
 
         let found = handles
             .iter()
@@ -10186,16 +10171,14 @@ mod tests {
     }
 
     #[test]
-    fn get_all_object_handles_includes_a_ref_registered_only_via_handle_registry() {
+    fn get_all_objects_includes_a_ref_registered_only_via_handle_registry() {
         // Register a ref that never appears in the source xref table at all
         // (the dangling case): the union must not drop registry-only refs.
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let dangling_ref = ObjectRef::new(99, 0);
         pdf.get_object_handle(dangling_ref);
 
-        let handles = pdf
-            .get_all_object_handles()
-            .expect("get all object handles");
+        let handles = pdf.get_all_objects().expect("get all object handles");
 
         assert!(handles
             .iter()

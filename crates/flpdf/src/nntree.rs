@@ -3546,7 +3546,7 @@ mod tests {
         assert!(kids[0].is_indirect(), "direct kid must be indirectized");
         assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(2, 0)));
         assert!(pdf
-            .get_all_object_handles()
+            .get_all_objects()
             .expect("enumerate repaired objects")
             .iter()
             .any(|handle| handle.is_same_object_as(&kids[0])));

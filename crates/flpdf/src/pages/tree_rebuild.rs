@@ -1005,7 +1005,7 @@ mod tests {
             .expect("page-tree rebuild must succeed");
 
         let promoted = pdf
-            .get_all_object_handles()
+            .get_all_objects()
             .expect("canonical object enumeration must succeed")
             .into_iter()
             .filter_map(|handle| handle.as_array())
