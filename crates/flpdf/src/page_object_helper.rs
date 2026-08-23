@@ -2559,6 +2559,36 @@ mod tests {
     }
 
     #[test]
+    fn fix_copied_annotations_uses_the_field_tree_only_source_boundary() {
+        let mut source = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf")
+                .to_vec(),
+        )
+        .expect("source fixture should parse");
+        let source_page_ref = crate::pages::page_refs(&mut source)
+            .expect("source pages should resolve")
+            .into_iter()
+            .next()
+            .expect("source should have one page");
+        let source_page = source.get_object_handle(source_page_ref);
+        let mut target = Pdf::empty().expect("target should be constructible");
+        let new_page = crate::PageDocumentHelper::new(&mut target)
+            .add_page(
+                crate::PageInput::foreign(&mut source, source_page_ref),
+                false,
+            )
+            .expect("foreign page should copy")
+            .new_kids
+            .into_iter()
+            .next()
+            .expect("target should contain the copied page");
+
+        PageObjectHelper::new(new_page, &mut target)
+            .fix_copied_annotations_from(source_page, &mut source)
+            .expect("copied annotations should be repaired");
+    }
+
+    #[test]
     fn inline_image_dictionary_expands_qpdf_abbreviations() {
         let mut externalizer = InlineImageExternalizer::new(
             0,
