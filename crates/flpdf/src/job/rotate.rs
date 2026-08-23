@@ -24,13 +24,14 @@
 //! every direct page box, and delegates annotation/field/AP transformation to
 //! [`crate::AcroFormDocumentHelper`].
 
-use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageObjectHelper;
-use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+#[cfg(test)]
+use crate::page_object_helper::{
+    resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth,
+};
 #[cfg(test)]
 use crate::Object;
 use crate::{Error, ObjectRef, Pdf, Result};
-use std::collections::HashSet;
 use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
@@ -58,155 +59,6 @@ pub struct RotateOp {
     /// convention). May be negative or exceed 360; the final `/Rotate` is
     /// normalized to one of `{0, 90, 180, 270}`.
     pub degrees: i32,
-}
-
-// ---------------------------------------------------------------------------
-// Pure helper functions
-// ---------------------------------------------------------------------------
-
-/// Normalize any integer degrees value to one of `{0, 90, 180, 270}`.
-///
-/// The algorithm:
-/// 1. Add 45 to bias toward the *nearest* 90° boundary.
-/// 2. Integer-divide by 90 with `div_euclid` (its remainder is always in
-///    `[0, 90)`) to obtain the nearest-multiple index. The quotient itself may
-///    be negative for sufficiently negative inputs (e.g. `-46 → -1`); it is the
-///    final `rem_euclid(360)` in step 4 — not this division — that guarantees a
-///    non-negative result.
-/// 3. Multiply back by 90 to recover the snapped angle.
-/// 4. Take `rem_euclid(360)` to wrap into `[0, 360)`.
-///
-/// **Non-multiples-of-90 inputs**: ISO 32000-1 §7.7.3.3 Table 30 restricts
-/// `/Rotate` to `{0, 90, 180, 270}`, but malformed PDFs sometimes carry other
-/// values.  Our policy is to snap to the nearest valid boundary rather than
-/// rejecting them, so a malformed `/Rotate` never aborts a page operation.
-///
-/// Takes `i64` — the widest type among its callers ([`compose_rotate`]'s
-/// composed sums and raw PDF `/Rotate` integers, which are `i64`) — so no
-/// caller needs a narrowing cast that could truncate or overflow before
-/// normalization.
-///
-/// Examples:
-/// - `  0` → `  0`
-/// - ` 90` → ` 90`
-/// - `180` → `180`
-/// - `270` → `270`
-/// - `360` → `  0`
-/// - `450` → ` 90`
-/// - `-90` → `270`
-/// - ` 45` → ` 90`  (rounded up — nearest boundary)
-/// - ` 44` → `  0`  (rounded down — nearest boundary)
-fn normalize_rotate_i64(deg: i64) -> i32 {
-    // Round `deg` to the nearest 90° boundary, then keep within [0, 360).
-    // Widen to i128: `deg + 45` would overflow i64 for inputs near
-    // `i64::MAX`/`i64::MIN`.
-    // `div_euclid`'s remainder is always in `[0, 90)`, but its quotient can be
-    // negative for sufficiently negative `deg` (e.g. `deg + 45 == -1` → `-1`).
-    // The final `rem_euclid(360)` is what guarantees a non-negative result in
-    // `[0, 360)`, even when `(deg + 45).div_euclid(90) * 90` is negative.
-    let snapped = (deg as i128 + 45).div_euclid(90) * 90;
-    snapped.rem_euclid(360) as i32
-}
-
-/// Compute the final `/Rotate` value for a page given `existing` (the resolved,
-/// inherited current value) and `op`.
-///
-/// The returned value is always normalized to `{0, 90, 180, 270}`.
-pub fn compose_rotate(existing: i32, op: &RotateOp) -> i32 {
-    let raw: i64 = match op.mode {
-        RotateMode::Assign => op.degrees as i64,
-        RotateMode::Add => existing as i64 + op.degrees as i64,
-    };
-    normalize_rotate_i64(raw)
-}
-
-// ---------------------------------------------------------------------------
-// Inheritance resolution
-// ---------------------------------------------------------------------------
-
-/// Return the effective `/Rotate` value for `page_ref`, walking up the `/Parent`
-/// chain until a node carries a `/Rotate` entry.
-///
-/// Returns `0` (the PDF-spec default, ISO 32000-1 §7.7.3.3 Table 30) if no
-/// node in the chain has a `/Rotate` entry.
-///
-/// Uses [`DEFAULT_MAX_PAGE_TREE_DEPTH`] as the depth limit.
-///
-/// # Errors
-///
-/// Propagates any error from [`resolve_inherited_rotate_with_max_depth`].
-pub fn resolve_inherited_rotate<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<i32> {
-    resolve_inherited_rotate_with_max_depth(pdf, page_ref, DEFAULT_MAX_PAGE_TREE_DEPTH)
-}
-
-/// Like [`resolve_inherited_rotate`] but with a caller-supplied recursion limit.
-///
-/// # Errors
-///
-/// - [`Error::Unsupported`] if walking the `/Parent` chain reaches `max_depth`
-///   before finding a `/Rotate` entry.
-/// - [`Error::Unsupported`] if a `/Rotate` entry is an indirect reference that
-///   does not resolve to an integer, or has an otherwise unexpected type.
-/// - Any error from resolving objects in the page-tree chain.
-pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-    max_depth: usize,
-) -> Result<i32> {
-    // qpdf's page helpers walk live QPDFObjectHandle values. Keep the same
-    // canonical identity while following /Parent so cycles are detected by
-    // object identity rather than by materialized ObjectRef snapshots.
-    let mut current = pdf.get_object_handle(page_ref);
-    let mut depth: usize = 0;
-    #[allow(
-        clippy::mutable_key_type,
-        reason = "qpdf identity keys intentionally retain the live handle allocation"
-    )]
-    let mut seen = HashSet::new();
-
-    loop {
-        if depth >= max_depth {
-            return Err(Error::Unsupported(format!(
-                "page tree depth exceeds maximum of {max_depth} at {}",
-                current_description(&current)
-            )));
-        }
-
-        if !seen.insert(current.identity_key()) {
-            // We hit a cycle before finding /Rotate — default to 0.
-            return Ok(0);
-        }
-
-        let rotate = current.try_get_key(b"/Rotate")?;
-        // Per ISO 32000-1 §7.3.9, a null value is equivalent to absent.
-        if let Some(value) = rotate.try_as_integer()? {
-            return Ok(normalize_rotate_i64(value));
-        }
-        if !rotate.is_null() {
-            return Err(Error::Unsupported(format!(
-                "/Rotate entry on node {} has unexpected type",
-                current_description(&current)
-            )));
-        }
-
-        let parent = current.try_get_key(b"/Parent")?;
-        parent.try_dereference()?;
-        if parent.as_dictionary().is_none() {
-            return Ok(0);
-        }
-        current = parent;
-        depth += 1;
-    }
-}
-
-fn current_description(current: &ObjectHandle) -> String {
-    current
-        .object_ref()
-        .map(|reference| reference.to_string())
-        .unwrap_or_else(|| "direct page-tree dictionary".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -353,132 +205,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pure function tests: normalize_rotate_i64
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn normalize_standard_values() {
-        assert_eq!(normalize_rotate_i64(0), 0);
-        assert_eq!(normalize_rotate_i64(90), 90);
-        assert_eq!(normalize_rotate_i64(180), 180);
-        assert_eq!(normalize_rotate_i64(270), 270);
-    }
-
-    #[test]
-    fn normalize_wraparound() {
-        assert_eq!(normalize_rotate_i64(360), 0);
-        assert_eq!(normalize_rotate_i64(450), 90);
-        assert_eq!(normalize_rotate_i64(540), 180);
-        assert_eq!(normalize_rotate_i64(720), 0);
-    }
-
-    #[test]
-    fn normalize_negative() {
-        assert_eq!(normalize_rotate_i64(-90), 270);
-        assert_eq!(normalize_rotate_i64(-180), 180);
-        assert_eq!(normalize_rotate_i64(-270), 90);
-        assert_eq!(normalize_rotate_i64(-360), 0);
-        assert_eq!(normalize_rotate_i64(-450), 270);
-    }
-
-    #[test]
-    fn normalize_non_multiple_of_90_rounds_to_nearest() {
-        // 44 → closest multiple is 0 (44 < 45)
-        assert_eq!(normalize_rotate_i64(44), 0);
-        // 45 → rounds up to 90
-        assert_eq!(normalize_rotate_i64(45), 90);
-        // 89 → rounds up to 90
-        assert_eq!(normalize_rotate_i64(89), 90);
-        // 91 → rounds down to 90
-        assert_eq!(normalize_rotate_i64(91), 90);
-        // 134 → rounds down to 90 (134 - 90 = 44 < 45)
-        assert_eq!(normalize_rotate_i64(134), 90);
-        // 135 → rounds up to 180
-        assert_eq!(normalize_rotate_i64(135), 180);
-    }
-
-    #[test]
-    fn normalize_extreme_i64_inputs_do_not_overflow() {
-        // `deg + 45` must not overflow i64 near the bounds; widening to i128
-        // keeps these well-defined instead of panicking (debug) / wrapping.
-        let max = normalize_rotate_i64(i64::MAX);
-        let min = normalize_rotate_i64(i64::MIN);
-        assert!(matches!(max, 0 | 90 | 180 | 270));
-        assert!(matches!(min, 0 | 90 | 180 | 270));
-    }
-
-    // -----------------------------------------------------------------------
-    // Pure function tests: compose_rotate
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn compose_assign_overwrites_existing() {
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 90,
-        };
-        assert_eq!(compose_rotate(270, &op), 90);
-        assert_eq!(compose_rotate(0, &op), 90);
-        assert_eq!(compose_rotate(90, &op), 90);
-    }
-
-    #[test]
-    fn compose_add_accumulates() {
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 90,
-        };
-        assert_eq!(compose_rotate(0, &op), 90);
-        assert_eq!(compose_rotate(90, &op), 180);
-        assert_eq!(compose_rotate(270, &op), 0); // wrap-around
-    }
-
-    #[test]
-    fn compose_add_negative() {
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: -90,
-        };
-        assert_eq!(compose_rotate(0, &op), 270);
-        assert_eq!(compose_rotate(90, &op), 0);
-    }
-
-    #[test]
-    fn compose_add_large() {
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: 450,
-        };
-        // 90 + 450 = 540 → normalize → 180
-        assert_eq!(compose_rotate(90, &op), 180);
-    }
-
-    #[test]
-    fn compose_assign_normalizes() {
-        let op = RotateOp {
-            mode: RotateMode::Assign,
-            degrees: 450,
-        };
-        assert_eq!(compose_rotate(0, &op), 90);
-    }
-
-    #[test]
-    fn compose_add_extreme_degrees_do_not_overflow() {
-        // `existing + op.degrees` is widened to i64 before normalization, so
-        // an i32::MAX additive angle no longer panics (debug) / wraps (release).
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: i32::MAX,
-        };
-        assert!(matches!(compose_rotate(270, &op), 0 | 90 | 180 | 270));
-        let op = RotateOp {
-            mode: RotateMode::Add,
-            degrees: i32::MIN,
-        };
-        assert!(matches!(compose_rotate(90, &op), 0 | 90 | 180 | 270));
-    }
-
-    // -----------------------------------------------------------------------
     // PDF builder helpers (shared with several tests below)
     // -----------------------------------------------------------------------
 
@@ -593,12 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_normalizes_non_standard_value() {
-        // /Rotate 45 on page — invalid per spec, but we normalize.
+    fn resolve_preserves_non_standard_value() {
+        // The getter observes the effective page attribute; only a relative
+        // rotate operation treats an invalid existing value as zero.
         let bytes = build_single_page_pdf(Some(45), None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
-        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 90);
+        assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 45);
     }
 
     #[test]
@@ -649,6 +376,24 @@ mod tests {
     // -----------------------------------------------------------------------
     // apply_rotate_to_pages tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_rejects_a_non_multiple_angle_like_qpdf() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let op = RotateOp {
+            mode: RotateMode::Assign,
+            degrees: 45,
+        };
+
+        let error = apply_rotate_to_pages(&mut pdf, &[ObjectRef::new(3, 0)], &op)
+            .expect_err("qpdf rejects direct rotation angles that are not multiples of 90");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message.contains("angle that is not a multiple of 90")
+        ));
+    }
 
     #[test]
     fn assign_replaces_existing_rotate() {

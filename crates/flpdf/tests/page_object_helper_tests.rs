@@ -5,11 +5,12 @@
 //! rotate, get_annotations, and all bounding-box variants) including
 //! inheritance resolution and per-page mutation round-trips.
 
+use flpdf::job::{apply_rotate_to_pages, RotateMode, RotateOp};
 use flpdf::pipeline::PlString;
 use flpdf::{
-    apply_rotate_to_pages, pages, ContentToken, DecodeLevel, Error, Matrix, Object, ObjectHandle,
-    ObjectParserCallbacks, ObjectRef, PageBox, PageObjectHelper, ParseControl, Pdf, PipelineResult,
-    Rectangle, RotateMode, RotateOp, TokenFilter, TokenFilterOutput,
+    pages, ContentToken, DecodeLevel, Error, Matrix, Object, ObjectHandle, ObjectParserCallbacks,
+    ObjectRef, PageBox, PageObjectHelper, ParseControl, Pdf, PipelineResult, Rectangle,
+    TokenFilter, TokenFilterOutput,
 };
 use std::cell::RefCell;
 use std::io::Cursor;

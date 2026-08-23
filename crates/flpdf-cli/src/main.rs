@@ -4,9 +4,9 @@ use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, Value
 use flpdf::disable_digital_signatures;
 use flpdf::fix_qdf;
 use flpdf::job::{
-    AttachmentAddOptions, AttachmentCopyOptions, CheckError, JobExitCode, JsonJobError,
-    JsonJobOptions, JsonJobOutput, JsonStreamData, PageSpecInput, QPDFJob, SplitPageOptions,
-    UsageError,
+    apply_rotate_to_pages, flatten_rotation_on_pages, AttachmentAddOptions, AttachmentCopyOptions,
+    CheckError, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData,
+    PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
@@ -14,7 +14,6 @@ use flpdf::{
     collate,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p,
     outline_dest_remap::remap_outline_and_dests,
-    page_rotate::apply_rotate_to_pages,
     pages::tree_rebuild::{rebuild_page_tree, RebuildResult},
     should_remove_unreferenced_resources,
     struct_tree_pg::drop_struct_elem_dangling_pg,
@@ -23,7 +22,7 @@ use flpdf::{
     CombinedPage, CombinedPlan, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    filters, flatten_rotation_on_pages,
+    filters,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path_with_warnings, LinearizationCheckError,

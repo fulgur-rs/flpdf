@@ -7,7 +7,8 @@
 //! `QPDFJob::handlePageSpecs`, the attachment inspection consumers, the
 //! `--overlay`/`--underlay` (`handleUnderOverlay`) and `--collate` orchestration,
 //! the post-subset AcroForm field pruning (`prune_acroform_after_subset`),
-//! attachment listing/formatting, `--rotate` spec parsing, and the `--check`
+//! attachment listing/formatting, the `--rotate` spec and page-operation route,
+//! and the `--check`
 //! document-check consumer (`QPDFJob::doCheck`/`doInspection`).
 
 mod acroform_field_prune;
@@ -25,6 +26,7 @@ mod page_plan;
 mod page_range;
 mod page_specs;
 mod page_split;
+mod rotate;
 mod rotate_spec;
 
 pub use acroform_field_prune::{
@@ -73,4 +75,5 @@ pub use page_plan::{PagePlan, SelectedPage};
 pub use page_range::{Endpoint, PageRange, PageRangeEntry, Parity};
 pub use page_specs::PageSpecInput;
 pub use page_split::SplitPageOptions;
+pub use rotate::{apply_rotate_to_pages, flatten_rotation_on_pages, RotateMode, RotateOp};
 pub use rotate_spec::RotateSpec;
