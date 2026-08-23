@@ -113,7 +113,7 @@ impl Write for WriterOutputSink<'_> {
                     let failure: Error = error.into();
                     let message = failure.to_string();
                     self.failure = Some(failure);
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, message))
+                    Err(std::io::Error::other(message))
                 }
             },
         }
@@ -644,14 +644,13 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                     .as_mut()
                     .expect("output was checked before writing");
                 let mut sink = WriterOutputSink::new(output);
-                let result = match emit_canonical_pdf(self.pdf, &mut sink, &options) {
+                match emit_canonical_pdf(self.pdf, &mut sink, &options) {
                     Ok(result) => {
                         sink.finish_output()?;
                         result
                     }
                     Err(error) => return Err(sink.take_failure().unwrap_or(error)),
-                };
-                result
+                }
             }
         };
 
