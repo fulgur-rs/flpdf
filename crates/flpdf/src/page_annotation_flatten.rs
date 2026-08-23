@@ -552,7 +552,8 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
             Ok(resources) if resources.as_dictionary().is_some() => resources,
             Ok(_) => ObjectHandle::dictionary(Vec::new()),
             Err(Error::Unsupported(message)) if message.contains("/Resources") => {
-                ObjectHandle::dictionary(Vec::new())
+                // cov:ignore: malformed inherited page-tree errors are rejected by the public page-document walk before this local fallback
+                ObjectHandle::dictionary(Vec::new()) // cov:ignore: same defensive fallback branch
             }
             Err(error) => return Err(error), // cov:ignore: non-Resources page-walk failures propagate unchanged
         }
@@ -990,6 +991,19 @@ mod tests {
         assert_eq!(items.len(), 4);
         assert_eq!(items[1].object_ref(), Some(ObjectRef::new(8, 0)));
         assert_eq!(items[2].object_ref(), Some(ObjectRef::new(9, 0)));
+    }
+
+    #[test]
+    fn build_pruned_annots_array_treats_a_non_array_as_empty() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&page).unwrap();
+        page.replace_key(b"/Annots", ObjectHandle::integer(7))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&page).unwrap();
+
+        let pruned = build_pruned_annots_array(&mut pdf, ObjectRef::new(3, 0), &[]).unwrap();
+        assert!(pruned.as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2287,14 +2301,14 @@ mod tests {
         let page_obj = pdf.resolve_borrowed(page_ref).unwrap();
         let page_dict = page_obj.as_dict().unwrap();
 
-        let resources = match page_dict.get("Resources").unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("Resources should be a dict"),
-        };
-        let xobj_dict = match resources.get("XObject").unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("XObject should be a dict"),
-        };
+        let resources = page_dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should be a dict");
+        let xobj_dict = resources
+            .get("XObject")
+            .and_then(Object::as_dict)
+            .expect("XObject should be a dict");
         assert_eq!(xobj_dict.iter().count(), 1, "exactly one XObject entry");
         // The value should reference obj 5.
         let xobj_val = xobj_dict.iter().next().unwrap().1;
