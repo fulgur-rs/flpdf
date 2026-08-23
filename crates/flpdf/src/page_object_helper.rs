@@ -1467,8 +1467,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// through the `/Parent` chain.
     ///
     /// Returns `0` (the PDF default, ISO 32000-1 §7.7.3.3 Table 30) when no
-    /// node in the chain carries a `/Rotate` entry. The returned value is
-    /// always normalized to one of `{0, 90, 180, 270}`.
+    /// node in the chain carries a `/Rotate` entry. A present value is
+    /// returned as-is, including one that is not a multiple of 90, matching
+    /// qpdf's raw `getAttribute("/Rotate", false)` passthrough
+    /// (`QPDFPageObjectHelper.cc:670`) -- normalization to
+    /// `{0, 90, 180, 270}` only happens as part of a *mutation* via
+    /// [`crate::job::apply_rotate_to_pages`].
     ///
     /// This is a **getter** — it does not mutate the document. To rotate pages,
     /// use [`crate::job::apply_rotate_to_pages`].
