@@ -75,21 +75,6 @@ pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-#[derive(Default)]
-pub(crate) struct AppearanceContentOverrides {
-    geometry: Option<(Rectangle, Matrix)>,
-    flags: Option<i64>,
-}
-
-impl AppearanceContentOverrides {
-    pub(crate) fn with_geometry(bbox: Rectangle, matrix: Matrix, flags: i64) -> Self {
-        Self {
-            geometry: Some((bbox, matrix)),
-            flags: Some(flags),
-        }
-    }
-}
-
 /// qpdf's `QPDFObjectHandle::getName` dummy-name sentinel
 /// (`libqpdf/QPDFObjectHandle.cc:634-643`), returned in place of an error
 /// when a name accessor runs on a non-name value. The crate's own name
@@ -379,32 +364,6 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
             rotate,
             required_flags,
             forbidden_flags,
-            AppearanceContentOverrides::default(),
-        )
-    }
-
-    /// Compatibility fallback for a bridge-selected stream whose `/BBox`,
-    /// `/Matrix`, or `/F` value is itself a `Pdf::set_object` redirect. The
-    /// bridge supplies those already-normalized values; all qpdf placement,
-    /// flag gating, stream mutation, and emitted content remain here.
-    pub(crate) fn get_page_content_for_selected_appearance_with_geometry(
-        &mut self,
-        name: &str,
-        appearance_ref: ObjectRef,
-        rotate: i32,
-        required_flags: i64,
-        forbidden_flags: i64,
-        overrides: AppearanceContentOverrides,
-    ) -> Result<Vec<u8>> {
-        let appearance = self.pdf.get_object_handle(appearance_ref);
-        self.pdf.resolve_object_handle(&appearance)?;
-        self.build_page_content_for_appearance(
-            name,
-            appearance,
-            rotate,
-            required_flags,
-            forbidden_flags,
-            overrides,
         )
     }
 
@@ -415,16 +374,12 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         rotate: i32,
         required_flags: i64,
         forbidden_flags: i64,
-        overrides: AppearanceContentOverrides,
     ) -> Result<Vec<u8>> {
         let Some(appearance_dict) = appearance.as_stream_dict() else {
             return Ok(Vec::new());
         };
 
-        let flags = match overrides.flags {
-            Some(flags) => flags,
-            None => self.get_flags()?,
-        };
+        let flags = self.get_flags()?;
         if (flags & forbidden_flags) != 0 {
             return Ok(Vec::new());
         }
@@ -435,29 +390,16 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         // qpdf's `if (!(bbox_obj.isRectangle() && rect_obj.isRectangle()))`
         // (`QPDFAnnotationObjectHelper.cc:161-163`) short-circuits: `/BBox`
         // is dereferenced first, and a malformed `/BBox` means `/Rect` is
-        // never touched at all. `overrides.geometry` has no qpdf
-        // counterpart (a flpdf-only legacy-bridge fallback supplying
-        // already-normalized values), so it resolves `/Rect` on its own.
-        let (rect, bbox, matrix) = match overrides.geometry {
-            Some((bbox, matrix)) => {
-                let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
-                    return Ok(Vec::new());
-                };
-                (rect, bbox, matrix)
-            }
-            None => {
-                let bbox_handle = appearance_dict.get_key(b"/BBox");
-                let Some(bbox) = self.rectangle_from_handle(&bbox_handle)? else {
-                    return Ok(Vec::new());
-                };
-                let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
-                    return Ok(Vec::new());
-                };
-                let matrix_handle = appearance_dict.get_key(b"/Matrix");
-                let matrix = self.matrix_from_handle(&matrix_handle)?.unwrap_or_default();
-                (rect, bbox, matrix)
-            }
+        // never touched at all.
+        let bbox_handle = appearance_dict.get_key(b"/BBox");
+        let Some(bbox) = self.rectangle_from_handle(&bbox_handle)? else {
+            return Ok(Vec::new());
         };
+        let Some(rect) = self.rectangle_for_key(b"/Rect")? else {
+            return Ok(Vec::new());
+        };
+        let matrix_handle = appearance_dict.get_key(b"/Matrix");
+        let matrix = self.matrix_from_handle(&matrix_handle)?.unwrap_or_default();
 
         let do_rotate = rotate != 0 && (flags & 0x10) != 0;
         let (rect, matrix) = if do_rotate {
