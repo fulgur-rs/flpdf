@@ -125,7 +125,6 @@ pub mod page_extract;
 pub(crate) mod page_form_xobject;
 pub mod page_label_document_helper;
 pub mod page_object_helper;
-pub mod page_rotate;
 pub mod page_splice;
 pub mod pages;
 pub mod parser;
@@ -220,10 +219,6 @@ pub use page_label_document_helper::{
     PageLabelDocumentHelper,
 };
 pub use page_object_helper::{PageBox, PageObjectHelper};
-pub use page_rotate::{
-    apply_rotate_to_pages, compose_rotate, flatten_rotation_on_pages, resolve_inherited_rotate,
-    resolve_inherited_rotate_with_max_depth, RotateMode, RotateOp,
-};
 pub use page_splice::{splice_pages, splice_pages_with_max_depth};
 pub use pages::tree_rebuild::{rebuild_page_tree, rebuild_page_tree_with_max_depth, RebuildResult};
 pub use parser::parse_object;

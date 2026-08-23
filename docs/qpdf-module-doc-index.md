@@ -49,6 +49,7 @@
 | `crates/flpdf/src/job/page_range.rs` | correspondence | QPDFJob.cc page-range parsing split from page-operation orchestration |
 | `crates/flpdf/src/job/page_specs.rs` | correspondence | \`QPDFJob::handlePageSpecs\` page-selection boundary |
 | `crates/flpdf/src/job/page_split.rs` | correspondence | \`QPDFJob::doSplitPages\` (\`QPDFJob.cc:2940-3027\`) |
+| `crates/flpdf/src/job/rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/job/rotate_spec.rs` | correspondence | QPDFJob.cc rotate-spec parsing split from page rotation |
 | `crates/flpdf/src/json/document.rs` | correspondence | QPDF_json.cc document input boundary for \`createFromJSON\`, \`updateFromJSON\`, and \`importJSON\` (\`libqpdf/QPDF_json.cc:54-63,795-832\`) |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
@@ -95,7 +96,6 @@
 | `crates/flpdf/src/page_form_xobject.rs` | correspondence | QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper |
 | `crates/flpdf/src/page_label_document_helper.rs` | correspondence | \`QPDFPageLabelDocumentHelper.cc\` canonical page-label access and reconstruction |
 | `crates/flpdf/src/page_object_helper.rs` | correspondence | QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules |
-| `crates/flpdf/src/page_rotate.rs` | correspondence | QPDFJob.cc page rotation plus QPDFPageObjectHelper.cc matrix responsibilities |
 | `crates/flpdf/src/page_splice.rs` | correspondence | \`QPDFPageDocumentHelper.cc:37-52\` delegates page insertion/removal to the page-tree owner |
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
 | `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |

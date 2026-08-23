@@ -11,17 +11,11 @@
 //!
 //! ## Sign semantics
 //!
-//! NOTE: This implementation intentionally diverges from one interpretation of
-//! qpdf where "no sign = Assign". This implementation uses the following
-//! sign semantics:
+//! The sign semantics match qpdf 11.9.0:
 //!
-//! - `+angle` or `angle` (no sign) → additive rotation (`RotateMode::Add`, positive degrees)
-//! - `-angle`                       → additive rotation (`RotateMode::Add`, **negative** degrees)
-//!
-//! `RotateMode::Assign` is not used here; it is reserved for a future issue.
-//! The additive sign-encoded form is the natural representation because
-//! `compose_rotate` accepts signed `degrees` and normalizes negatives
-//! correctly (e.g. `Add(-90)` on existing=0 gives 270).
+//! - `angle` (no sign) → absolute assignment (`RotateMode::Assign`)
+//! - `+angle`           → additive rotation (`RotateMode::Add`, positive degrees)
+//! - `-angle`           → additive rotation (`RotateMode::Add`, **negative** degrees)
 //!
 //! ## Page-range
 //!
@@ -36,7 +30,7 @@
 //! applied in order (responsibility of the CLI layer).
 
 use super::page_range::PageRange;
-use crate::page_rotate::{RotateMode, RotateOp};
+use super::rotate::{RotateMode, RotateOp};
 use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -47,9 +41,9 @@ use crate::{Error, Result};
 /// page-range selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RotateSpec {
-    /// The rotation operation (mode + degrees).  `mode` is always
-    /// [`RotateMode::Add`] in this parser; `degrees` may be negative to
-    /// represent counter-clockwise rotation.
+    /// The rotation operation (mode + degrees). The mode follows qpdf's sign
+    /// semantics; `degrees` may be negative for additive counter-clockwise
+    /// rotation.
     pub op: RotateOp,
     /// The page range to which the rotation applies.  A [`PageRange`] parsed
     /// from an empty string means "all pages".
@@ -63,7 +57,7 @@ impl RotateSpec {
     ///
     /// | Input       | `op.degrees` | `op.mode`       | `range`     |
     /// |-------------|-------------|-----------------|-------------|
-    /// | `90`        | `90`        | `Add`           | all pages   |
+    /// | `90`        | `90`        | `Assign`        | all pages   |
     /// | `+90`       | `90`        | `Add`           | all pages   |
     /// | `-90`       | `-90`       | `Add`           | all pages   |
     /// | `+90:1-3`   | `90`        | `Add`           | pages 1-3   |
@@ -91,16 +85,16 @@ impl RotateSpec {
         // ----------------------------------------------------------------
         // 1. Optional sign.
         // ----------------------------------------------------------------
-        let negative = match bytes.get(pos) {
+        let (mode, negative) = match bytes.get(pos) {
             Some(b'+') => {
                 pos += 1;
-                false
+                (RotateMode::Add, false)
             }
             Some(b'-') => {
                 pos += 1;
-                true
+                (RotateMode::Add, true)
             }
-            _ => false,
+            _ => (RotateMode::Assign, false),
         };
 
         // After a sign there must be digits.
@@ -190,10 +184,7 @@ impl RotateSpec {
         };
 
         Ok(RotateSpec {
-            op: RotateOp {
-                mode: RotateMode::Add,
-                degrees,
-            },
+            op: RotateOp { mode, degrees },
             range,
         })
     }
@@ -206,7 +197,6 @@ impl RotateSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page_rotate::compose_rotate;
     use crate::{Endpoint, PageRangeEntry};
 
     // -----------------------------------------------------------------------
@@ -250,9 +240,9 @@ mod tests {
 
     #[test]
     fn bare_180_colon_r1() {
-        // "180:r1" → Add(+180), last page
+        // "180:r1" → Assign(180), last page
         let spec = parse_ok("180:r1");
-        assert_eq!(spec.op.mode, RotateMode::Add);
+        assert_eq!(spec.op.mode, RotateMode::Assign);
         assert_eq!(spec.op.degrees, 180);
         let entries = spec.range.entries.as_ref().unwrap();
         assert_eq!(entries.len(), 1);
@@ -261,9 +251,9 @@ mod tests {
 
     #[test]
     fn bare_90_no_range_means_all_pages() {
-        // "90" (no colon) → Add(+90), all pages
+        // "90" (no colon) → Assign(90), all pages
         let spec = parse_ok("90");
-        assert_eq!(spec.op.mode, RotateMode::Add);
+        assert_eq!(spec.op.mode, RotateMode::Assign);
         assert_eq!(spec.op.degrees, 90);
         assert!(spec.range.entries.is_none(), "expected all-pages sentinel");
         let pages = spec.range.resolve(3).unwrap();
@@ -315,28 +305,11 @@ mod tests {
     }
 
     #[test]
-    fn no_sign_treated_as_add() {
-        // NOTE: no-sign is Add (not Assign) per flpdf-9hc.8.5 specification.
+    fn no_sign_treated_as_assign() {
+        // qpdf treats an unsigned angle as an absolute assignment.
         let spec = parse_ok("270");
-        assert_eq!(spec.op.mode, RotateMode::Add);
+        assert_eq!(spec.op.mode, RotateMode::Assign);
         assert_eq!(spec.op.degrees, 270);
-    }
-
-    // -----------------------------------------------------------------------
-    // Compose sanity: negative degrees produce correct final values
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn compose_negative_90_from_zero_gives_270() {
-        // existing=0, op=Add(-90) → 270
-        let spec = parse_ok("-90");
-        assert_eq!(compose_rotate(0, &spec.op), 270);
-    }
-
-    #[test]
-    fn compose_plus_90_from_270_wraps_to_zero() {
-        let spec = parse_ok("+90");
-        assert_eq!(compose_rotate(270, &spec.op), 0);
     }
 
     // -----------------------------------------------------------------------

@@ -231,7 +231,7 @@ D2 の対象: `[f64; 6]` 生配列が散在し、`IDENTITY` 定数・行列積�
 |---|---|
 | `overlay.rs` | `IDENTITY_MATRIX`(82), `qpdf_concat`(87), `qpdf_scale`(101), `qpdf_translate`(106), `matrix_unparse`(123), `matrix_or_identity`(996), `transform_bbox`(1013) |
 | `overlay_annotations.rs` | `matrix_to_object`(1256), `qpdf_real`(1272), `concat_matrices`(1284), `IDENTITY`(1297), `transform_rect_by_cm`(1338), `apply_matrix_to_point`(1365) — doc に `QPDFMatrix` 相当と明記されている |
-| `page_rotate.rs` | `type Mat`(306), `apply_matrix`(309), `mat_mul`(314), `translate`(326), `rotate_origin`(333), `rotation_matrix`(345), `transform_box`(355), `wrap_content_with_matrix`(463) |
+| `job/rotate.rs` | `type Mat`(306), `apply_matrix`(309), `mat_mul`(314), `translate`(326), `rotate_origin`(333), `rotation_matrix`(345), `transform_box`(355), `wrap_content_with_matrix`(463) |
 | `page_form_xobject.rs` | `get_matrix_for_transformations`(513), `matrix_objects`(533) |
 | `page_annotation_flatten.rs` | `apply_matrix`(306), `read_xobj_bbox_and_matrix`(454) |
 
@@ -239,7 +239,7 @@ D2 の対象: `[f64; 6]` 生配列が散在し、`IDENTITY` 定数・行列積�
 **5 モジュールに 4〜7 重に実装されている**。関数単位で漏れなく移行しないと、
 5 ファイルすべてに触れても D2 未達になる。
 
-`overlay.rs` / `overlay_annotations.rs` / `page_rotate.rs` を落とすと重複実装が残り、D2 を満たさない。
+`overlay.rs` / `overlay_annotations.rs` / `job/rotate.rs` を落とすと重複実装が残り、D2 を満たさない。
 **5 モジュールすべてとその呼び出し元**を移行対象に含めること。
 
 #### T0-3 `json/` ← `JSON.cc`(1,401) + `JSONHandler.cc`(189) — `flpdf-qxba.6`

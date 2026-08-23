@@ -611,7 +611,7 @@ fn pages_cross_document_collate_matches_qpdf() {
 }
 
 // ===========================================================================
-// --rotate : rotation parity + documented sign-semantics divergence
+// --rotate : rotation parity and qpdf sign semantics
 // ===========================================================================
 
 #[test]
@@ -681,17 +681,9 @@ fn rotate_plus_delta_accumulates_on_nonzero_base_like_qpdf() {
 }
 
 #[test]
-fn rotate_no_sign_is_delta_in_flpdf_expected_divergence() {
-    // EXPECTED divergence (intentional, layer-documented in
-    // crates/flpdf/src/rotate_spec.rs lines ~14-19): qpdf's no-sign `angle`
-    // is an ABSOLUTE assignment ("--help=--rotate": "you almost always want
-    // +angle or -angle rather than just angle"). flpdf-9hc.8.5 deliberately
-    // treats no-sign `angle` as additive (RotateMode::Add) and reserves
-    // RotateMode::Assign for a future issue. So on a base of /Rotate 90:
-    //   qpdf  `--rotate=90` → 90  (assign)
-    //   flpdf `--rotate=90` → 180 (delta: 90 + 90)
-    // This is asserted as the EXPECTED, documented difference (NOT a bug, NOT
-    // ignored): flpdf == delta, qpdf == assign.
+fn rotate_no_sign_is_absolute_like_qpdf() {
+    // qpdf's unsigned angle is an absolute assignment. Both tools must keep
+    // the existing /Rotate 90 at 90 when applying --rotate=90.
     if !qpdf_available() {
         return;
     }
@@ -711,17 +703,15 @@ fn rotate_no_sign_is_delta_in_flpdf_expected_divergence() {
     run_qpdf(&[base.to_str().unwrap(), "--rotate=90", q.to_str().unwrap()]);
     flpdf_ok(&[base.to_str().unwrap(), f.to_str().unwrap(), "--rotate=90"]);
 
-    // qpdf: no-sign = assign → stays 90.
     assert_eq!(
         rotates_of(&q),
         vec![90, 90, 90],
         "qpdf no-sign rotate is absolute assignment"
     );
-    // flpdf: no-sign = additive (8.5 intentional) → 90 + 90 = 180.
     assert_eq!(
         rotates_of(&f),
-        vec![180, 180, 180],
-        "flpdf 8.5 treats no-sign rotate as delta; Assign mode deferred (EXPECTED divergence)"
+        rotates_of(&q),
+        "flpdf no-sign rotate must match qpdf absolute assignment"
     );
 }
 
@@ -768,9 +758,8 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
         "--rotate=180:3",
     ]);
 
-    // page3 uses no-sign 180 on a base of 0: assign(180) == delta(+180) here,
-    // so this cell is parity (the sign-semantics divergence is invisible at
-    // base 0; it is isolated in rotate_no_sign_is_delta_*).
+    // page3 uses unsigned 180 on a base of 0, so the absolute assignment is
+    // also numerically equal to an additive +180 here.
     assert_eq!(rotates_of(&q), vec![90, 0, 180]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
 }

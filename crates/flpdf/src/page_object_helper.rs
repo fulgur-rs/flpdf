@@ -18,8 +18,8 @@
 //!   qpdf-shaped [`Object`] events.
 //! - [`resources`](PageObjectHelper::resources) — delegates to
 //!   [`crate::pages::resolve_inherited_resources`] (walks `/Parent` chain).
-//! - [`rotate`](PageObjectHelper::rotate) — **getter** that delegates to
-//!   [`crate::page_rotate::resolve_inherited_rotate`].
+//! - [`rotate`](PageObjectHelper::rotate) — **getter** that uses the page-local
+//!   inherited `/Rotate` lookup.
 //! - [`get_annotations`](PageObjectHelper::get_annotations) — reads the leaf's
 //!   `/Annots` array (not inheritable per PDF spec).
 //! - [`media_box`](PageObjectHelper::media_box) — inheritable; walks `/Parent`
@@ -123,7 +123,6 @@
 
 use crate::content_stream::{ObjectHandleParserCallbacks, ParseControl};
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
-use crate::page_rotate::resolve_inherited_rotate;
 use crate::pages::{
     is_inheritable_page_attribute, next_page_parent,
     resolve_inherited_handle_from_node_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
@@ -909,7 +908,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Rotate the page in the live object graph.
     ///
     /// Mirrors `QPDFPageObjectHelper::rotatePage`
-    /// (`libqpdf/QPDFPageObjectHelper.cc:455-458`).
+    /// (`libqpdf/QPDFPageObjectHelper.cc:468-470`).
     pub fn rotate_page(&mut self, angle: i32, relative: bool) -> Result<()> {
         let (target, _) = self.resolved_attribute_target()?;
         target.rotate_page(angle, relative)?;
@@ -1468,11 +1467,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// through the `/Parent` chain.
     ///
     /// Returns `0` (the PDF default, ISO 32000-1 §7.7.3.3 Table 30) when no
-    /// node in the chain carries a `/Rotate` entry. The returned value is
-    /// always normalized to one of `{0, 90, 180, 270}`.
+    /// node in the chain carries a `/Rotate` entry. A present value is
+    /// returned as-is, including one that is not a multiple of 90, matching
+    /// qpdf's raw `getAttribute("/Rotate", false)` passthrough
+    /// (`QPDFPageObjectHelper.cc:670`) -- normalization to
+    /// `{0, 90, 180, 270}` only happens as part of a *mutation* via
+    /// [`crate::job::apply_rotate_to_pages`].
     ///
     /// This is a **getter** — it does not mutate the document. To rotate pages,
-    /// use [`crate::page_rotate::apply_rotate_to_pages`].
+    /// use [`crate::job::apply_rotate_to_pages`].
     ///
     /// # Errors
     ///
@@ -2257,6 +2260,69 @@ fn get_attribute_for_target<R: Read + Seek>(
         result = copy;
     }
     Ok(result)
+}
+
+/// Return the effective `/Rotate` value for a page, keeping the inherited
+/// lookup beside the other page-local attribute accessors.
+pub(crate) fn resolve_inherited_rotate<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<i32> {
+    resolve_inherited_rotate_with_max_depth(pdf, page_ref, DEFAULT_MAX_PAGE_TREE_DEPTH)
+}
+
+/// Test-supporting form of [`resolve_inherited_rotate`] with an explicit
+/// page-tree depth bound.
+pub(crate) fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    max_depth: usize,
+) -> Result<i32> {
+    let mut current = pdf.get_object_handle(page_ref);
+    let mut depth: usize = 0;
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "qpdf identity keys intentionally retain the live handle allocation"
+    )]
+    let mut seen = HashSet::new();
+
+    loop {
+        if depth >= max_depth {
+            return Err(Error::Unsupported(format!(
+                "page tree depth exceeds maximum of {max_depth} at {}",
+                current_description(&current)
+            )));
+        }
+        if !seen.insert(current.identity_key()) {
+            return Ok(0);
+        }
+
+        let rotate = current.try_get_key(b"/Rotate")?;
+        if rotate.try_as_integer()?.is_some() {
+            return rotate.try_get_int_value_as_int();
+        }
+        if !rotate.is_null() {
+            return Err(Error::Unsupported(format!(
+                "/Rotate entry on node {} has unexpected type",
+                current_description(&current)
+            )));
+        }
+
+        let parent = current.try_get_key(b"/Parent")?;
+        parent.try_dereference()?;
+        if parent.as_dictionary().is_none() {
+            return Ok(0);
+        }
+        current = parent;
+        depth += 1;
+    }
+}
+
+fn current_description(current: &ObjectHandle) -> String {
+    current
+        .object_ref()
+        .map(|reference| reference.to_string())
+        .unwrap_or_else(|| "direct page-tree dictionary".to_owned())
 }
 
 fn object_type_name(obj: &Object) -> &'static str {

@@ -1296,7 +1296,7 @@ fn annotation_is_marked_for_removal(annotation: &ObjectHandle, to_remove: &[Obje
 
 /// Allocate the next unused indirect-object reference.
 ///
-/// Uses the same idiom as `page_rotate::next_object_ref`: one past the current
+/// Uses the same one-past-the-current-object idiom as the page-operation helpers:
 /// highest object number in the cache.
 fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     let n = pdf
