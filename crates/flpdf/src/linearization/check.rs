@@ -333,7 +333,7 @@ fn first_page_source_extent<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(i64, i6
     // qpdf's checkLinearizationInternal calls `optimize(object_stream_data,
     // false)` with no `skip_stream_parameters` override, i.e. it always
     // preserves every stream dictionary key while traversing.
-    let optimization = Optimization::optimize(pdf, &object_stream_data, false, |_stream| 0u8)?;
+    let optimization = Optimization::optimize(pdf, &object_stream_data, false, |_, _stream| 0u8)?;
 
     let outlines_in_first_page = {
         let mut use_outlines_with_outlines = false;
@@ -463,7 +463,7 @@ fn compute_hint_data<R: Read + Seek>(
             object_stream_data.insert(object_ref.number, *stream);
         }
     }
-    let optimization = Optimization::optimize(pdf, &object_stream_data, false, |_| 0u8)?;
+    let optimization = Optimization::optimize(pdf, &object_stream_data, false, |_, _| 0u8)?;
 
     let mut first_page_private = BTreeSet::new();
     let mut first_page_shared = BTreeSet::new();

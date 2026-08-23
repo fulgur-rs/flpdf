@@ -591,21 +591,15 @@ fn collect_qpdf_enqueue_refs_with_stream_parameters<R: Read + Seek>(
     Ok(())
 }
 
-fn object_has_dropped_stream_parameter_ref(
+fn object_stream_should_skip_parameters(
+    object_ref: ObjectRef,
     object: &Object,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> bool {
-    let Object::Stream(stream) = object else {
-        return false;
-    };
-    ["Filter", "DecodeParms"].into_iter().any(|key| {
-        stream
-            .dict
-            .get(key)
-            .is_some_and(|value| object_contains_reference(value, dropped_stream_parameter_refs))
-    })
+    matches!(object, Object::Stream(_)) && skipped_stream_parameter_streams.contains(&object_ref)
 }
 
+#[cfg(test)]
 fn object_contains_reference(object: &Object, references: &BTreeSet<ObjectRef>) -> bool {
     match object {
         Object::Reference(reference) => references.contains(reference),
@@ -659,7 +653,7 @@ pub(crate) fn reachable_object_set<R: Read + Seek>(
 pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     skip_length: bool,
-    dropped_stream_parameter_refs: &BTreeSet<ObjectRef>,
+    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
 ) -> crate::Result<BTreeSet<ObjectRef>> {
     let root = pdf
         .root_ref()
@@ -694,7 +688,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
             0,
             skip_length,
             &mut found,
-            object_has_dropped_stream_parameter_ref(&obj, dropped_stream_parameter_refs),
+            object_stream_should_skip_parameters(cur, &obj, skipped_stream_parameter_streams),
         )?; // cov:ignore: LLVM maps this covered reachability call terminator to a zero-count continuation region
         for r in found {
             if reachable.insert(r) {
@@ -1719,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_stream_parameter_detection_descends_through_containers() {
+    fn stream_parameter_reference_detection_descends_through_containers() {
         let dropped = ObjectRef::new(42, 0);
         let mut stream_dict = Dictionary::new();
         stream_dict.insert("Nested", Object::Reference(dropped));

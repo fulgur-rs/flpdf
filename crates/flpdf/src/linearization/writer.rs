@@ -612,6 +612,7 @@ fn append_body_object(
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<ObjectRef>,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let map = |object_ref| {
         renumber.new_for_original(object_ref).ok_or_else(|| {
@@ -633,7 +634,11 @@ fn append_body_object(
     }
 
     let (dict, data, mut refiltered) =
-        crate::writer::plain::body::canonical_stream_output_for_linearization(object, options)?;
+        crate::writer::plain::body::canonical_stream_output_for_linearization(
+            object,
+            options,
+            options.content_normalization && content_normalize_refs.contains(&original_ref),
+        )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
     let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
     let cleartext_metadata = payload_ctx
@@ -701,6 +706,7 @@ fn append_body_object_for_ref<R: Read + Seek>(
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<ObjectRef>,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let object = pdf.get_object_handle(original_ref);
     pdf.resolve_object_handle(&object)?;
@@ -714,6 +720,7 @@ fn append_body_object_for_ref<R: Read + Seek>(
         encrypted_string_emitter,
         renumber,
         removed_refs,
+        content_normalize_refs,
     )
 }
 
@@ -2287,6 +2294,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
         report_progress_event(options);
@@ -2325,6 +2333,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced open-document references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options);
@@ -2438,6 +2447,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Part-2 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options);
@@ -2476,6 +2486,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Part-3 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options);
@@ -2534,6 +2545,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced outline references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2606,6 +2618,7 @@ fn do_write_pass<R: Read + Seek>(
                     encrypted_string_emitter.as_deref_mut(),
                     renumber,
                     &plan.removed_refs,
+                    &plan.content_normalize_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options);
@@ -8739,26 +8752,15 @@ mod tests {
             + 1
     }
 
-    /// Code-quality follow-up to Task 8: `--cleartext-metadata` interacts
-    /// with the crate-wide default `CompressStreams::Yes` re-filtering
-    /// policy. `append_body_object` computes `refiltered` — the flag
-    /// deciding whether `/Filter` may collapse to a bare `/FlateDecode` —
-    /// from `s.dict.get("Filter")` AFTER `prepend_crypt_filter_to_stream_dict`
-    /// has already mutated it. For a `/Metadata` source with no `/Filter`,
-    /// the default policy re-encodes it to a bare `/Filter /FlateDecode`
-    /// (`apply_stream_compress_policy`'s `CompressStreams::Yes` arm) BEFORE
-    /// the exemption prepends `/Crypt`, turning `/Filter` into the array
-    /// `[/Crypt /FlateDecode]`; `is_lone_flate` then correctly reads that as
-    /// NOT a lone `/FlateDecode`, so `refiltered` is `false` and the real
-    /// `/Crypt`-bearing chain survives instead of being collapsed to a bare
-    /// `/Filter /FlateDecode` (which would tell a reader to inflate bytes
-    /// that were never run through the normal encryption cipher). Both
-    /// other cleartext-metadata tests force `StreamDataMode::Uncompress`,
-    /// which bypasses re-encoding entirely and never reaches this
-    /// interaction — this test uses the default `CompressStreams::Yes`
-    /// policy specifically to exercise it.
+    /// `--cleartext-metadata` must use qpdf's metadata policy even when the
+    /// general stream option requests compression. `QPDFWriter::willFilterStream`
+    /// takes the metadata branch before the normal compression branch
+    /// (`QPDFWriter.cc:1274-1284`), decodes the stream fully, and emits the
+    /// cleartext payload with the explicit `/Crypt /Identity` stage added by
+    /// the linearized writer. The old compatibility route compressed this
+    /// stream first and produced `[/Crypt /FlateDecode]`; qpdf does not.
     #[test]
-    fn linearize_with_encrypt_cleartext_metadata_keeps_crypt_filter_after_refilter() {
+    fn linearize_with_encrypt_cleartext_metadata_uses_qpdf_uncompressed_policy() {
         let metadata_marker: &[u8] = b"<?xpacket flpdf-refilter-metadata-marker?>";
         let src = tiny_pdf_with_metadata_content_and_producer(
             metadata_marker,
@@ -8766,14 +8768,8 @@ mod tests {
             b"flpdf refilter producer marker",
         );
 
-        // Default compression policy (CompressStreams::Yes; StreamDataMode
-        // set explicitly to Compress rather than left at the default None,
-        // so the intent is self-evident here without relying on
-        // WriterOptions::default()'s fallback chain). The /Metadata stream's
-        // source has no /Filter, so it gets decoded (a no-op) and
-        // RE-ENCODED to a bare /Filter /FlateDecode inside
-        // reencode_stream_for_compress, BEFORE the cleartext-metadata
-        // exemption mutates that same dict.
+        // Keep the general compression request explicit. qpdf's metadata
+        // branch must override it and emit the cleartext payload uncompressed.
         let out = linearize_with(&src, |o| {
             o.stream_data = Some(crate::writer::StreamDataMode::Compress);
             o.static_aes_iv = true;
@@ -8801,53 +8797,32 @@ mod tests {
 
         let object_bytes = find_object_bytes(&out, metadata_ref.number);
 
-        // The re-filtered stream's dict must keep /Crypt ahead of
-        // /FlateDecode: prepend_crypt_filter_to_stream_dict's
-        // Object::Name(n) branch, given a source /Filter /FlateDecode with
-        // no /DecodeParms (apply_stream_compress_policy's
-        // CompressStreams::Yes arm never sets /DecodeParms), produces
-        // exactly this array shape (Object::Array::write_pdf's
-        // "[ elem elem ]" form, confirmed by reading both functions).
-        let filter_needle: &[u8] = b"/Filter [ /Crypt /FlateDecode ]";
+        // The metadata stream must carry the explicit identity Crypt stage,
+        // but qpdf does not retain a Flate stage after its uncompress branch.
+        let filter_needle: &[u8] = b"/Filter /Crypt";
         assert!(
             object_bytes
                 .windows(filter_needle.len())
                 .any(|w| w == filter_needle),
-            "re-filtered /Metadata stream must keep /Crypt ahead of /FlateDecode in \
-             its /Filter array, got {:?}",
+            "cleartext /Metadata stream must carry /Crypt /Identity in \
+             its filter dictionary, got {:?}",
             String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
         );
 
-        // Negative check: the reviewed concern in concrete terms — the
-        // stream must not have collapsed to append_body_object's
-        // refiltered-stream shortcut (a bare `/Filter /FlateDecode`), which
-        // would silently drop the /Crypt tag and tell a reader to run
-        // FlateDecode directly over bytes that were never processed by the
-        // normal encryption cipher.
+        // Negative check: the metadata policy must not retain a Flate stage.
         let bare_flate_needle: &[u8] = b"/Filter /FlateDecode";
         assert!(
             !object_bytes
                 .windows(bare_flate_needle.len())
                 .any(|w| w == bare_flate_needle),
-            "re-filtered /Metadata stream must not collapse to a bare /Filter /FlateDecode, \
+            "cleartext /Metadata stream must not retain /FlateDecode, \
              got {:?}",
             String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
         );
 
         // Reader round-trip. `decrypt_resolved_object` (reader.rs) has its
-        // OWN `/Type /Metadata` + `!encrypt_metadata` fast path
-        // (`is_metadata_stream`) that returns the stream entirely untouched
-        // for ANY metadata stream once the /Encrypt dict declares
-        // `/EncryptMetadata false` — it never even inspects the /Crypt tag,
-        // so `apply_explicit_crypt_filters`'s /Crypt-stripping never runs
-        // here and `s.dict`'s /Filter stays the raw on-disk
-        // `[/Crypt /FlateDecode]`. Confirm that object-model shape
-        // independently of the byte-scan above, then strip /Crypt ourselves
-        // (mirroring what `apply_explicit_crypt_filters` does for a
-        // non-metadata /Crypt-tagged stream) before decoding the surviving
-        // /FlateDecode filter, proving the payload really is readable
-        // end to end — not merely missing the plaintext marker by
-        // coincidence.
+        // own `/Type /Metadata` + `!encrypt_metadata` fast path, so it keeps
+        // the raw on-disk `/Crypt` identity filter and plaintext bytes.
         let resolved = reopened
             .resolve(metadata_ref)
             .expect("resolve /Metadata (reader's metadata fast path leaves it untouched)");
@@ -8860,22 +8835,14 @@ mod tests {
         };
         assert_eq!(
             s.dict.get("Filter"),
-            Some(&Object::Array(vec![
-                Object::Name(b"Crypt".to_vec()),
-                Object::Name(b"FlateDecode".to_vec()),
-            ])),
+            Some(&Object::Name(b"Crypt".to_vec())),
             "resolved /Metadata dict must still carry the raw on-disk \
-             [/Crypt /FlateDecode] chain (the reader's metadata fast path \
+             /Crypt identity filter (the reader's metadata fast path \
              skips /Crypt stripping entirely)"
         );
-        let mut decode_dict = Dictionary::new();
-        decode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        let inflated = crate::filters::decode_stream_data(&decode_dict, &s.data)
-            .expect("the surviving /FlateDecode filter must still decode");
         assert_eq!(
-            inflated, metadata_marker,
-            "/Metadata stream must decode back to its original plaintext through \
-             /FlateDecode once /Crypt has been stripped"
+            s.data, metadata_marker,
+            "/Metadata stream must retain its original plaintext bytes"
         );
     }
 
@@ -8928,6 +8895,7 @@ mod tests {
             Some(&context),
             Some(&mut emitter),
             &renumber,
+            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .expect("linearized encrypted body stream");
@@ -9083,6 +9051,7 @@ mod tests {
             None,
             &renumber,
             &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .expect("linearized plain body stream");
 
@@ -9119,6 +9088,7 @@ mod tests {
             None,
             None,
             &renumber,
+            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .expect_err("missing reference must not be silently emitted");

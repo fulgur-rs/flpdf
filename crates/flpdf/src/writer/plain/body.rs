@@ -612,25 +612,31 @@ fn push_spaces(out: &mut Vec<u8>, count: usize) {
 
 /// Canonical stream output for qpdf's linearized body route.
 ///
-/// `QPDFWriter::writeLinearized` applies the stream compression decision before
-/// its encryption-stage cleartext-metadata exemption. The full-rewrite route's
-/// metadata suppression therefore must not run here: a metadata stream can be
-/// re-filtered to `/FlateDecode` first, after which the linearization writer
-/// prepends `/Crypt /Identity` (`QPDFWriter.cc:1234-1314`).
+/// `QPDFWriter::writeLinearized` uses the same metadata decision in its
+/// `willFilterStream` probe and its final emission (`QPDFWriter.cc:1234-1314`),
+/// so planning and writing must share the full-rewrite metadata policy here.
+///
+/// `normalize_content` must be the caller's own per-stream identity
+/// decision (matching qpdf's `m->normalize_content &&
+/// m->normalized_streams.count(old_og)` gate, `QPDFWriter.cc:1277`), not a
+/// blanket `options.content_normalization` -- normalization applies only to
+/// actual page-content streams, never document-wide.
 pub(crate) fn canonical_stream_output_for_linearization(
     handle: &ObjectHandle,
     options: &WriterOptions,
+    normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
     let (dict, data, refiltered, _) =
-        canonical_stream_output_for_linearization_with_status(handle, options)?;
+        canonical_stream_output_for_linearization_with_status(handle, options, normalize_content)?;
     Ok((dict, data, refiltered))
 }
 
 pub(crate) fn canonical_stream_output_for_linearization_with_status(
     handle: &ObjectHandle,
     options: &WriterOptions,
+    normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
-    canonical_stream_output_with_status(handle, options, false, false)
+    canonical_stream_output_with_status(handle, options, true, normalize_content)
 }
 
 /// Return whether the qpdf-shaped stream pipeline will replace the source
@@ -648,6 +654,23 @@ pub(crate) fn canonical_stream_will_be_refiltered(
     handle: &ObjectHandle,
     options: &WriterOptions,
 ) -> crate::Result<bool> {
+    canonical_stream_will_be_refiltered_with_policy(handle, options, true, false)
+}
+
+/// Probe whether a writer-owned stream will replace its source filter
+/// parameters under a specific qpdf writer policy.
+///
+/// `QPDFWriter::willFilterStream` is called with the state of the writer that
+/// will emit the stream. Planning callers must therefore pass the same
+/// metadata and content-normalization policy as their emission route; a
+/// document-wide default is not equivalent when linearization and full
+/// rewrite have different metadata handling.
+pub(crate) fn canonical_stream_will_be_refiltered_with_policy(
+    handle: &ObjectHandle,
+    options: &WriterOptions,
+    apply_full_rewrite_metadata_policy: bool,
+    normalize_content: bool,
+) -> crate::Result<bool> {
     // Token filters are stateful qpdf ValueSetter-style consumers. The plain
     // planner caches their complete output before walking references; callers
     // that cannot retain that output must leave the stream edge intact rather
@@ -655,8 +678,12 @@ pub(crate) fn canonical_stream_will_be_refiltered(
     if handle.is_data_modified() {
         return Ok(false);
     }
-    let Some((encode_flags, decode_level)) =
-        canonical_stream_filter_plan(handle, options, true, false)?
+    let Some((encode_flags, decode_level)) = canonical_stream_filter_plan(
+        handle,
+        options,
+        apply_full_rewrite_metadata_policy,
+        normalize_content,
+    )?
     else {
         return Ok(false);
     };
@@ -1299,6 +1326,20 @@ mod tests {
         };
 
         assert!(!canonical_stream_will_be_refiltered(&stream, &options).unwrap());
+    }
+
+    #[test]
+    fn refilter_probe_rejects_a_non_stream_handle() {
+        let error = canonical_stream_will_be_refiltered_with_policy(
+            &ObjectHandle::integer(1),
+            &WriterOptions::default(),
+            true,
+            false,
+        )
+        .expect_err("refilter probing requires a stream handle");
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message.contains("stream dictionary"))
+        );
     }
 
     #[test]
