@@ -711,22 +711,25 @@ mod tests {
     struct RecordingWarningSink(Arc<Mutex<Vec<u8>>>);
 
     impl Pipeline for RecordingWarningSink {
+        // cov:ignore-start: QPDFLogger::warn only ever calls
+        // PipelineHandle::write, never identifier (used only for a
+        // misconfigured-pipeline error context this test never triggers).
         fn identifier(&self) -> &str {
-            // cov:ignore-start: QPDFLogger::warn only ever calls
-            // PipelineHandle::write, never identifier (used only for a
-            // misconfigured-pipeline error context this test never triggers).
             "split_pages warning recording sink"
-            // cov:ignore-end
         }
+        // cov:ignore-end
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
             self.0.lock().unwrap().extend_from_slice(data);
             Ok(())
         }
 
+        // cov:ignore-start: QPDFLogger::warn only ever calls
+        // PipelineHandle::write, never finish.
         fn finish(&mut self) -> PipelineResult<()> {
-            Ok(()) // cov:ignore: QPDFLogger::warn only ever calls PipelineHandle::write, never finish
+            Ok(())
         }
+        // cov:ignore-end
     }
 
     #[test]
