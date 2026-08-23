@@ -6,12 +6,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 use crate::pdf_version::{parse_pdf_version, PDF_1_5};
-use crate::rewrite_renumber::{
-    CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber, StreamParametersRemoved,
-};
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::body;
 use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
+use crate::writer::rewrite_renumber::{
+    CanonicalCatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber, StreamParametersRemoved,
+};
 use crate::writer::{ObjectWriterEmission, WriterOptions};
 use crate::{CompressStreams, ObjectRef, Pdf, XrefEntry, XrefForm};
 

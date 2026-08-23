@@ -11,6 +11,8 @@ pub(crate) mod object_streams;
 pub(crate) mod pclm;
 #[path = "writer/plain/mod.rs"]
 pub(crate) mod plain;
+#[path = "writer/rewrite_renumber.rs"]
+pub(crate) mod rewrite_renumber;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
 mod settings;
@@ -2082,7 +2084,7 @@ fn strip_writer_trailer_history_keys(trailer: &mut Dictionary) {
 /// always seeds) is rewritten through `map`; a value absent from the map is an
 /// error rather than a stale number leaking into the output.
 #[cfg(test)]
-fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
+fn remap_trailer_refs<M: crate::writer::rewrite_renumber::NewNumberLookup>(
     trailer: &mut Dictionary,
     map: &M,
     deleted: &[ObjectRef],
@@ -2129,7 +2131,7 @@ fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
     // dangling trailer reference.
     for value in trailer.values_mut() {
         if matches!(value, Object::Dictionary(_) | Object::Array(_)) {
-            crate::rewrite_renumber::renumber_refs_in_place(value, map)?;
+            crate::writer::rewrite_renumber::renumber_refs_in_place(value, map)?;
         }
     }
     Ok(())
@@ -2137,7 +2139,7 @@ fn remap_trailer_refs<M: crate::rewrite_renumber::NewNumberLookup>(
 
 fn remap_qpdf_trailer_refs_with_removed<
     R: Read + Seek,
-    M: crate::rewrite_renumber::NewNumberLookup,
+    M: crate::writer::rewrite_renumber::NewNumberLookup,
 >(
     pdf: &mut Pdf<R>,
     trailer: &mut Dictionary,
@@ -2145,7 +2147,7 @@ fn remap_qpdf_trailer_refs_with_removed<
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let mut object = Object::Dictionary(trailer.clone());
-    crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed(
+    crate::writer::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed(
         pdf,
         &mut object,
         map,
@@ -3604,7 +3606,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 let mut object = pdf.resolve(source)?;
                 // cov:ignore-start: the PCLm plan is built from the same validated
                 // reference graph used for this rewrite; malformed remap input is rejected upstream.
-                crate::rewrite_renumber::renumber_qpdf_refs_in_place(
+                crate::writer::rewrite_renumber::renumber_qpdf_refs_in_place(
                     pdf,
                     &mut object,
                     &plan.old_to_new,
@@ -3858,7 +3860,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // reused from the source), so a prior-QDF-pass holder reachable only via a
     // /Length edge is NOT numbered here and disappears cleanly from `renumbered`.
     // In non-QDF mode this is the same behaviour as before.
-    use crate::rewrite_renumber::CanonicalCatalogFirstRenumber;
+    use crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber;
     // The unencrypted/non-QDF case can reach this legacy path only when a
     // requested Preserve or Generate mode was suppressed to Disable by
     // force-version < 1.5. Keep its qpdf null-visibility behavior byte-stable.
@@ -5587,7 +5589,7 @@ fn write_qdf_trailer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rewrite_renumber::CatalogFirstRenumber;
+    use crate::writer::rewrite_renumber::CatalogFirstRenumber;
     use std::io::Cursor;
     use std::sync::Arc;
 

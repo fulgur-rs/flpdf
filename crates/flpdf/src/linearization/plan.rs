@@ -1105,7 +1105,7 @@ impl LinearizationPlan {
         // the other direction.
         if pdf.root_ref().is_some() {
             pdf.with_writer_stream_recovery(|pdf| {
-                crate::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
+                crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
                     pdf,
                     true,
                     false,
@@ -1167,11 +1167,12 @@ impl LinearizationPlan {
         // dangling reference — so a stream's indirect `/Length` edge is dead in the
         // output regardless of object-stream mode. Not following it drops a holder
         // reachable only through it, matching qpdf's reachability GC.
-        let reachable = crate::rewrite_renumber::reachable_object_set_with_stream_parameters(
-            pdf,
-            true,
-            &skipped_stream_parameter_streams,
-        )?;
+        let reachable =
+            crate::writer::rewrite_renumber::reachable_object_set_with_stream_parameters(
+                pdf,
+                true,
+                &skipped_stream_parameter_streams,
+            )?;
         let object_refs = pdf.object_refs();
         let mut all_refs: Vec<ObjectRef> = Vec::with_capacity(object_refs.len());
         for r in object_refs {
@@ -1236,7 +1237,7 @@ impl LinearizationPlan {
         };
         all_refs.retain(|reference| !removed_refs.contains(reference));
         let resurrectable =
-            crate::rewrite_renumber::resurrectable_null_refs_excluding(pdf, &removed_refs)?;
+            crate::writer::rewrite_renumber::resurrectable_null_refs_excluding(pdf, &removed_refs)?;
         let mut resurrected: Vec<ObjectRef> = resurrectable
             .iter()
             .filter(|r| all_refs.binary_search(r).is_err())
