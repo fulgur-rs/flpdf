@@ -94,16 +94,7 @@ impl Write for WriterOutputSink<'_> {
                 buffer.get_or_insert_with(Vec::new).extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            WriterOutput::Writer(writer) => match writer.write(bytes) {
-                Ok(written) => Ok(written),
-                Err(error) => {
-                    self.failure = Some(Error::Io(std::io::Error::new(
-                        error.kind(),
-                        error.to_string(),
-                    )));
-                    Err(error)
-                }
-            },
+            WriterOutput::Writer(writer) => writer.write(bytes),
             WriterOutput::Pipeline(pipeline) => match pipeline.write(bytes) {
                 Ok(()) => Ok(bytes.len()),
                 Err(error) => {

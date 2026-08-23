@@ -3057,6 +3057,36 @@ fn pdf_writer_failure_does_not_report_success() -> flpdf::Result<()> {
     Ok(())
 }
 
+struct RawOsErrorWriter(i32);
+
+impl Write for RawOsErrorWriter {
+    fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(self.0))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The `WriterOutputSink::write` `Writer` arm must propagate the sink's
+/// original `io::Error` unchanged, not a lossy `io::Error::new(kind,
+/// to_string())` reconstruction: `raw_os_error()` (and any other data
+/// `Display` does not render) would otherwise be lost.
+#[test]
+fn pdf_writer_output_writer_failure_preserves_raw_os_error() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_writer(RawOsErrorWriter(28))?;
+
+    let error = writer.write().expect_err("sink failure must propagate");
+    let flpdf::Error::Io(io_error) = error else {
+        panic!("writer-sink failure must surface as Error::Io, got {error:?}");
+    };
+    assert_eq!(io_error.raw_os_error(), Some(28));
+    Ok(())
+}
+
 #[test]
 fn pdf_writer_re_registration_uses_the_latest_reporter() -> flpdf::Result<()> {
     let old_events = Rc::new(RefCell::new(Vec::<u8>::new()));
