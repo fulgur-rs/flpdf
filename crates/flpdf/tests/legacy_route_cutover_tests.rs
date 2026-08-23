@@ -161,3 +161,25 @@ fn inherited_attributes_production_uses_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn optimization_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/optimization.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("optimization has a production section");
+    for legacy in [
+        "use crate::{Object,",
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+        "pdf.set_object(",
+        "materialize(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "optimization production still contains raw route marker {legacy:?}"
+        );
+    }
+}
