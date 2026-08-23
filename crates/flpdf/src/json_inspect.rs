@@ -631,7 +631,7 @@ pub fn qpdf_raw_stream_payload<R: Read + Seek>(
     };
     let stream_handle = pdf.lift_object_to_handle(&Object::Stream(stream))?;
     Ok(Some(
-        stream_payload_with_decode_status(&stream_handle, decode_level)
+        stream_payload_with_decode_status(&stream_handle, decode_level)?
             .bytes
             .into_owned(),
     ))
@@ -788,11 +788,21 @@ impl DecodeLevel {
 /// The returned [`Cow`] retains the historical API shape. A handle owns its
 /// payload behind an `Rc`, so raw fallback paths clone that payload rather than
 /// returning a borrow whose owner would be dropped at this function boundary.
+///
+/// # Errors
+///
+/// Returns an error when the stream's raw bytes cannot be fetched at all
+/// (non-stream handle, or original-source I/O/parse failure) — this mirrors
+/// qpdf's `QPDF_Stream::writeStreamJSON`, which throws `std::logic_error`
+/// when even the undecoded raw-bytes retry attempt fails
+/// (`libqpdf/QPDF_Stream.cc:250-269`). A *filter decode* failure is not an
+/// error here: it falls back to the raw bytes, matching that same qpdf
+/// function's retry-with-`qpdf_dl_none` behavior for a filtered attempt.
 pub fn stream_payload_for_decode_level(
     stream: &ObjectHandle,
     decode_level: DecodeLevel,
-) -> Cow<'_, [u8]> {
-    stream_payload_with_decode_status(stream, decode_level).bytes
+) -> crate::Result<Cow<'_, [u8]>> {
+    Ok(stream_payload_with_decode_status(stream, decode_level)?.bytes)
 }
 
 pub(crate) struct StreamPayload<'a> {
@@ -804,28 +814,33 @@ pub(crate) struct StreamPayload<'a> {
 pub(crate) fn stream_payload_with_decode_status(
     stream: &ObjectHandle,
     decode_level: DecodeLevel,
-) -> StreamPayload<'_> {
-    let raw_data = stream
-        .as_stream_data()
-        .unwrap_or_else(|| std::rc::Rc::new(Vec::new()));
+) -> crate::Result<StreamPayload<'_>> {
+    // qpdf `QPDF_Stream::getRawStreamData` (`libqpdf/QPDF_Stream.cc:362-376`):
+    // replaced data is returned directly, and original data is read lazily
+    // through the owning document at the parsed offset. Unlike
+    // `ObjectHandle::as_stream_data`, this also covers the lazy-original
+    // case rather than only the replaced-data case, so a freshly parsed
+    // stream that was never `replaceStreamData`-d still yields its real
+    // content instead of an empty payload.
+    let raw_data = stream.get_raw_stream_data()?;
     if matches!(decode_level, DecodeLevel::None) {
-        return StreamPayload {
+        return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
             decode_succeeded: false,
-        };
+        });
     }
 
     let Some(stream_dict) = stream.as_stream_dict() else {
-        return StreamPayload {
+        return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
             decode_succeeded: false,
-        };
+        });
     };
     let Some(capabilities) = crate::filters::stream_filter_capabilities(&stream_dict) else {
-        return StreamPayload {
+        return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
             decode_succeeded: false,
-        };
+        });
     };
     let can_filter = if decode_level == DecodeLevel::Generalized {
         !capabilities.specialized_compression && !capabilities.lossy_compression
@@ -837,21 +852,21 @@ pub(crate) fn stream_payload_with_decode_status(
     };
 
     if !can_filter {
-        return StreamPayload {
+        return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
             decode_succeeded: false,
-        };
+        });
     }
 
     match crate::filters::decode_stream_data(&stream_dict, raw_data.as_ref()) {
-        Ok(decoded) => StreamPayload {
+        Ok(decoded) => Ok(StreamPayload {
             bytes: Cow::Owned(decoded),
             decode_succeeded: true,
-        },
-        Err(_) => StreamPayload {
+        }),
+        Err(_) => Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
             decode_succeeded: false,
-        },
+        }),
     }
 }
 
@@ -9361,7 +9376,8 @@ mod tests {
             .expect("encode");
         let stream = Stream::new(dict, encoded.clone());
         let stream_handle = direct_stream_handle(stream);
-        let payload = stream_payload_for_decode_level(&stream_handle, DecodeLevel::None);
+        let payload = stream_payload_for_decode_level(&stream_handle, DecodeLevel::None)
+            .expect("decode-level-none payload");
         assert!(
             matches!(payload, Cow::Owned(_)),
             "ObjectHandle payload access owns the raw fallback bytes"
@@ -9374,11 +9390,75 @@ mod tests {
     }
 
     #[test]
-    fn stream_payload_non_stream_handle_falls_back_to_empty_raw_payload() {
+    fn stream_payload_non_stream_handle_returns_error() {
+        // qpdf `QPDFObjectHandle::asStreamWithAssert` throws when the wrong
+        // accessor is called on a non-stream value
+        // (`libqpdf/QPDFObjectHandle.cc:318-323`); `get_raw_stream_data`
+        // surfaces the same contract as `Err` rather than silently
+        // substituting an empty payload.
         let handle = ObjectHandle::integer(7);
-        let payload = stream_payload_with_decode_status(&handle, DecodeLevel::Generalized);
-        assert!(!payload.decode_succeeded);
-        assert!(payload.bytes.is_empty());
+        match stream_payload_with_decode_status(&handle, DecodeLevel::Generalized) {
+            Err(crate::Error::Internal(_)) => {}
+            other => panic!(
+                "expected Error::Internal for a non-stream handle, got {}",
+                match other {
+                    Ok(_) => "Ok(..)".to_owned(),
+                    Err(e) => e.to_string(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn stream_payload_reads_canonically_resolved_original_source_data() {
+        // Regression test: a stream reached through the canonical
+        // `get_object_handle` + `resolve_object_handle` path (never
+        // `replaceStreamData`-d, so its bytes live only in the parsed
+        // original source) must still yield its real content.
+        // `ObjectHandle::as_stream_data` returns `None` for exactly this
+        // case (it only reports already-*replaced* data,
+        // `libqpdf/QPDF_Stream.cc:606-620` / this crate's own
+        // `object_handle.rs:4460-4470`), so a payload helper built on it
+        // silently produced an empty payload for every freshly parsed
+        // stream instead of erroring or reading the original bytes.
+        let raw_payload = b"canonical original source stream data";
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(
+            format!("3 0 obj\n<< /Length {} >>\nstream\n", raw_payload.len()).as_bytes(),
+        );
+        bytes.extend_from_slice(raw_payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let start_xref = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("open canonical fixture");
+        let stream = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve_object_handle(&stream)
+            .expect("resolve stream lazily from its original source");
+        assert!(
+            stream.as_stream_data().is_none(),
+            "a never-replaced stream must not carry replacement data"
+        );
+
+        let payload = stream_payload_for_decode_level(&stream, DecodeLevel::None)
+            .expect("canonical raw payload");
+        assert_eq!(
+            &*payload, raw_payload,
+            "the raw payload must come from the original source, not an empty fallback"
+        );
     }
 
     #[test]
@@ -9391,7 +9471,8 @@ mod tests {
         let stream = Stream::new(dict, encoded);
         let stream = direct_stream_handle(stream);
         assert_eq!(
-            &*stream_payload_for_decode_level(&stream, DecodeLevel::Generalized),
+            &*stream_payload_for_decode_level(&stream, DecodeLevel::Generalized)
+                .expect("generalized payload"),
             raw_payload,
             "DecodeLevel::Generalized must return filter-decoded content"
         );
@@ -9407,7 +9488,8 @@ mod tests {
         let raw_payload = b"\xff\xd8\xff\xe0 not really a jpeg";
         let stream = Stream::new(dict, raw_payload.to_vec());
         let stream_handle = direct_stream_handle(stream);
-        let payload = stream_payload_for_decode_level(&stream_handle, DecodeLevel::Generalized);
+        let payload = stream_payload_for_decode_level(&stream_handle, DecodeLevel::Generalized)
+            .expect("undecodable-filter payload");
         assert!(
             matches!(payload, Cow::Owned(_)),
             "an undecodable filter must own the raw fallback bytes"
@@ -9428,7 +9510,8 @@ mod tests {
         let stream = Stream::new(dict, encoded.clone());
         let stream = direct_stream_handle(stream);
 
-        let generalized = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        let generalized = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized)
+            .expect("generalized status");
         assert!(
             matches!(generalized.bytes, Cow::Owned(_)),
             "generalized decoding must own raw bytes from the handle"
@@ -9436,7 +9519,8 @@ mod tests {
         assert!(!generalized.decode_succeeded);
         assert_eq!(&*generalized.bytes, encoded.as_slice());
 
-        let specialized = stream_payload_with_decode_status(&stream, DecodeLevel::Specialized);
+        let specialized = stream_payload_with_decode_status(&stream, DecodeLevel::Specialized)
+            .expect("specialized status");
         assert!(
             matches!(specialized.bytes, Cow::Owned(_)),
             "specialized decoding must decode RunLengthDecode"
@@ -9444,7 +9528,7 @@ mod tests {
         assert!(specialized.decode_succeeded);
         assert_eq!(&*specialized.bytes, raw_payload);
 
-        let all = stream_payload_with_decode_status(&stream, DecodeLevel::All);
+        let all = stream_payload_with_decode_status(&stream, DecodeLevel::All).expect("all status");
         assert!(
             matches!(all.bytes, Cow::Owned(_)),
             "all decoding must include specialized filters"
@@ -9461,7 +9545,8 @@ mod tests {
         let stream = Stream::new(dict, raw_payload.to_vec());
         let stream = direct_stream_handle(stream);
 
-        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized)
+            .expect("decode-error status");
         assert!(
             matches!(payload.bytes, Cow::Owned(_)),
             "a registered filter decode error must own raw bytes from the handle"
@@ -9481,7 +9566,8 @@ mod tests {
         let stream = Stream::new(dict, raw_payload.to_vec());
         let stream = direct_stream_handle(stream);
 
-        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized)
+            .expect("invalid-decode-params status");
         assert!(
             matches!(payload.bytes, Cow::Owned(_)),
             "an unfilterable decode-parameter set must own raw bytes from the handle"
