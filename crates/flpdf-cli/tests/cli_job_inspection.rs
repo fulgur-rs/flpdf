@@ -310,6 +310,10 @@ fn assert_show_npages_matches_qpdf(path: &std::path::Path) {
 
 #[test]
 fn show_npages_reads_the_present_pages_count_without_walking_kids() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
     let file = pdf_with_catalog_and_optional_pages(Some(
         b"2 0 obj\n<< /Type /Pages /Kids [] /Count 99 >>\nendobj\n",
     ));
@@ -319,7 +323,37 @@ fn show_npages_reads_the_present_pages_count_without_walking_kids() {
 
 #[test]
 fn show_npages_preserves_qpdf_missing_pages_warning_and_status() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
     let file = pdf_with_catalog_and_optional_pages(None);
+
+    assert_show_npages_matches_qpdf(file.path());
+}
+
+#[test]
+fn show_npages_reports_negative_count_verbatim_like_qpdf() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let file = pdf_with_catalog_and_optional_pages(Some(
+        b"2 0 obj\n<< /Type /Pages /Kids [] /Count -5 >>\nendobj\n",
+    ));
+
+    assert_show_npages_matches_qpdf(file.path());
+}
+
+#[test]
+fn show_npages_matches_qpdf_on_non_integer_count() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let file = pdf_with_catalog_and_optional_pages(Some(
+        b"2 0 obj\n<< /Type /Pages /Kids [] /Count (bad) >>\nendobj\n",
+    ));
 
     assert_show_npages_matches_qpdf(file.path());
 }
