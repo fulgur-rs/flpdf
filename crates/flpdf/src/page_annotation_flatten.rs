@@ -551,10 +551,11 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
         match helper.get_attribute(b"/Resources", true) {
             Ok(resources) if resources.as_dictionary().is_some() => resources,
             Ok(_) => ObjectHandle::dictionary(Vec::new()),
+            // cov:ignore-start: public page walk rejects malformed inherited-resource errors first
             Err(Error::Unsupported(message)) if message.contains("/Resources") => {
-                // cov:ignore: public page walk rejects malformed inherited-resource errors first
-                ObjectHandle::dictionary(Vec::new()) // cov:ignore: same defensive fallback branch
+                ObjectHandle::dictionary(Vec::new())
             }
+            // cov:ignore-end
             Err(error) => return Err(error), // cov:ignore: non-Resources page-walk failures propagate unchanged
         }
     };
