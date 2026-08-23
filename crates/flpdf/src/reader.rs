@@ -2088,6 +2088,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// is a no-op. Resolution is delegated directly to the canonical
     /// `ResolverHandle` cache; it never materializes a legacy [`Object`].
     ///
+    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily
+    /// and retain the same shared object identity: resolving the same
+    /// indirect reference more than once yields handles that alias the same
+    /// cached value rather than independent copies. [`Pdf::resolve_object`]
+    /// is the owned raw-`Object` resolver, kept under its own explicit name
+    /// only for the next legacy-route removal slice.
+    ///
     /// This does not chase through an already-resolved
     /// [`Pdf::set_object`]-driven bare-reference redirect to its terminal
     /// value — see [`Pdf::resolve_to_terminal`] for that.
@@ -2526,25 +2533,6 @@ impl<R: Read + Seek> Pdf<R> {
                 Ok(self.resolver.direct_object_handle(value))
             }
         }
-    }
-
-    /// Resolve `handle` in place through the canonical qpdf object graph.
-    ///
-    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily and
-    /// retain the same shared object identity: resolving the same indirect
-    /// reference more than once yields handles that alias the same cached
-    /// value rather than independent copies. [`Pdf::resolve_object`] is the
-    /// owned raw-`Object` resolver kept under its own explicit name only for
-    /// the next legacy-route removal slice.
-    ///
-    /// # Errors
-    ///
-    /// Has the same error behavior as [`Pdf::resolve_object_handle`]:
-    /// I/O, parse, filter, or decryption failures propagate. A free, absent,
-    /// or overridden reference resolves to the canonical null fallback rather
-    /// than erroring.
-    pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
-        self.resolve_object_handle(handle)
     }
 
     // qpdf-cutover-delete: owned raw-`Object` resolver. Delete after its
