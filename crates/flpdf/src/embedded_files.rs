@@ -104,7 +104,7 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     };
     // cov:ignore-end
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve_object_handle(&catalog)?;
+    pdf.resolve(&catalog)?;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
@@ -114,12 +114,12 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     // move name-tree repair diagnostics before the tree walker sees the
     // malformed child.
     let names_seed = catalog.try_get_key(b"/Names")?;
-    let names = pdf.resolve_object_handle_to_terminal(&names_seed)?;
+    let names = pdf.resolve_to_terminal(&names_seed)?;
     if names.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
     let root_seed = names.try_get_key(b"/EmbeddedFiles")?;
-    let root = pdf.resolve_object_handle_to_terminal(&root_seed)?;
+    let root = pdf.resolve_to_terminal(&root_seed)?;
     if root.try_as_dictionary()?.is_none() {
         return Ok(None);
     }
@@ -152,14 +152,14 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         // cov:ignore-end
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.pdf.resolve_object_handle(&catalog)?;
+        self.pdf.resolve(&catalog)?;
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
 
         let names = if catalog.has_key(b"/Names") {
             let candidate = catalog.get_key(b"/Names");
-            let names = self.pdf.resolve_object_handle_to_terminal(&candidate)?;
+            let names = self.pdf.resolve_to_terminal(&candidate)?;
             if names.try_as_dictionary()?.is_some() {
                 names
             } else {
@@ -668,10 +668,9 @@ mod tests {
         let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
         let catalog_ref = pdf.root_ref().expect("root");
         let catalog = pdf.get_object_handle(catalog_ref);
-        pdf.resolve_object_handle(&catalog)
-            .expect("resolve catalog");
+        pdf.resolve(&catalog).expect("resolve catalog");
         let retained_root = catalog.get_key(b"/Names").get_key(b"/EmbeddedFiles");
-        pdf.resolve_object_handle(&retained_root)
+        pdf.resolve(&retained_root)
             .expect("resolve embedded-files root");
 
         let filespec_ref = ObjectRef::new(90, 0);
@@ -720,8 +719,7 @@ mod tests {
         pdf.set_object(page_ref, Object::Dictionary(page));
 
         let retained_af = pdf.get_object_handle(af_ref);
-        pdf.resolve_object_handle(&retained_af)
-            .expect("resolve AF array");
+        pdf.resolve(&retained_af).expect("resolve AF array");
 
         assert!(
             remove_attachment(&mut pdf, b"retained-af.txt").expect("remove"),
@@ -759,8 +757,7 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve_object_handle(&catalog_handle)
-            .expect("resolve catalog");
+        pdf.resolve(&catalog_handle).expect("resolve catalog");
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
         let retained_pairs = retained_root.get_key(b"/Names");
 
@@ -847,10 +844,9 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve_object_handle(&catalog_handle)
-            .expect("resolve catalog");
+        pdf.resolve(&catalog_handle).expect("resolve catalog");
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
-        pdf.resolve_object_handle(&retained_root)
+        pdf.resolve(&retained_root)
             .expect("resolve embedded-files root");
         let retained_filespec = retained_root
             .get_key(b"/Names")
@@ -921,7 +917,7 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let terminal_handle = pdf.get_object_handle(terminal_ref);
-        pdf.resolve_object_handle(&terminal_handle)
+        pdf.resolve(&terminal_handle)
             .expect("resolve terminal names dictionary");
         let retained_root = terminal_handle.get_key(b"/EmbeddedFiles");
 
@@ -971,8 +967,7 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve_object_handle(&catalog_handle)
-            .expect("resolve catalog");
+        pdf.resolve(&catalog_handle).expect("resolve catalog");
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
 
         let filespec_ref = ObjectRef::new(90, 0);
@@ -1019,8 +1014,7 @@ mod tests {
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
         let catalog_handle = pdf.get_object_handle(catalog_ref);
-        pdf.resolve_object_handle(&catalog_handle)
-            .expect("resolve catalog");
+        pdf.resolve(&catalog_handle).expect("resolve catalog");
         let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
         let retained_filespec = retained_root
             .get_key(b"/Names")

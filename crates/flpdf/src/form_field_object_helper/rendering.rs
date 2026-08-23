@@ -35,7 +35,7 @@ fn resolve_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: ObjectHandle,
 ) -> Result<ObjectHandle> {
-    pdf.resolve_object_handle(&handle)?;
+    pdf.resolve(&handle)?;
     Ok(handle)
 }
 
@@ -363,7 +363,7 @@ fn install_normal_appearance_canonical_handles<R: Read + Seek>(
     bbox_h: f64,
     font_resource: Option<AppearanceFont>,
 ) -> Result<Option<ObjectRef>> {
-    pdf.resolve_object_handle(&widget)?;
+    pdf.resolve(&widget)?;
     let normal = resolve_normal_appearance_canonical(pdf, &widget)?;
 
     // qpdf keeps an existing normal appearance stream and installs a
@@ -471,7 +471,7 @@ pub(crate) fn render_text_field_canonical_handles<R: Read + Seek>(
     }
 
     let value = FormFieldObjectHelper::from_object_handle(field.clone(), pdf).value_as_string()?;
-    pdf.resolve_object_handle(&widget)?;
+    pdf.resolve(&widget)?;
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
@@ -527,7 +527,7 @@ pub(crate) fn render_choice_field_canonical_handles<R: Read + Seek>(
         return Ok(None);
     }
 
-    pdf.resolve_object_handle(&widget)?;
+    pdf.resolve(&widget)?;
     let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
@@ -860,8 +860,7 @@ mod tests {
 
     fn generated_stream<R: Read + Seek>(pdf: &mut Pdf<R>, reference: ObjectRef) -> ObjectHandle {
         let stream = pdf.get_object_handle(reference);
-        pdf.resolve_object_handle(&stream)
-            .expect("resolve appearance");
+        pdf.resolve(&stream).expect("resolve appearance");
         stream
     }
 
@@ -906,10 +905,9 @@ mod tests {
                 .as_stream_dict()
                 .expect("stream dictionary")
                 .get_key(b"/Resources");
-            pdf.resolve_object_handle(&resources)
-                .expect("resolve resources");
+            pdf.resolve(&resources).expect("resolve resources");
             let fonts = resources.get_key(b"/Font");
-            pdf.resolve_object_handle(&fonts).expect("resolve fonts");
+            pdf.resolve(&fonts).expect("resolve fonts");
             assert_eq!(
                 fonts.get_key(b"/F1").object_ref(),
                 Some(ObjectRef::new(6, 0))
@@ -988,8 +986,7 @@ mod tests {
         let stream = generated_stream(&mut pdf, reference);
         let dict = stream.as_stream_dict().expect("stream dictionary");
         let resources = dict.get_key(b"/Resources");
-        pdf.resolve_object_handle(&resources)
-            .expect("resolve resources");
+        pdf.resolve(&resources).expect("resolve resources");
         assert!(resources.get_key(b"/Font").is_null());
         assert!(dict.get_key(b"/FormType").is_null());
     }
@@ -1007,10 +1004,9 @@ mod tests {
             .as_stream_dict()
             .expect("stream dictionary")
             .get_key(b"/Resources");
-        pdf.resolve_object_handle(&resources)
-            .expect("resolve resources");
+        pdf.resolve(&resources).expect("resolve resources");
         let fonts = resources.get_key(b"/Font");
-        pdf.resolve_object_handle(&fonts).expect("resolve fonts");
+        pdf.resolve(&fonts).expect("resolve fonts");
         assert_eq!(
             fonts.get_key(b"/F1").object_ref(),
             Some(ObjectRef::new(5, 0))

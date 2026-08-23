@@ -316,7 +316,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     let mut members: Vec<(ObjectRef, ObjectHandle)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
         let handle = pdf.get_object_handle(orig);
-        pdf.resolve_object_handle(&handle)?;
+        pdf.resolve(&handle)?;
         // qpdf warns and writes null when a malformed source stream is routed
         // into an object stream (`QPDFWriter.cc:1714-1721`). Keep that edge at
         // the canonical handle boundary rather than materializing a legacy
@@ -709,7 +709,7 @@ fn append_body_object_for_ref<R: Read + Seek>(
     content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let object = pdf.get_object_handle(original_ref);
-    pdf.resolve_object_handle(&object)?;
+    pdf.resolve(&object)?;
     append_body_object(
         bytes,
         new_ref,

@@ -43,9 +43,9 @@ fn chase_key<R: Read + Seek>(
     handle: &ObjectHandle,
     key: &[u8],
 ) -> flpdf::Result<ObjectHandle> {
-    let (chased, _) = pdf.resolve_object_handle_to_terminal_ref(handle)?;
+    let (chased, _) = pdf.resolve_to_terminal_ref(handle)?;
     let child = chased.get_key(key);
-    Ok(pdf.resolve_object_handle_to_terminal_ref(&child)?.0)
+    Ok(pdf.resolve_to_terminal_ref(&child)?.0)
 }
 
 /// `handle.getArrayItem(index)` plus the same implicit dereference as
@@ -60,12 +60,12 @@ fn chase_array_item<R: Read + Seek>(
     handle: &ObjectHandle,
     index: usize,
 ) -> flpdf::Result<ObjectHandle> {
-    let (chased, _) = pdf.resolve_object_handle_to_terminal_ref(handle)?;
+    let (chased, _) = pdf.resolve_to_terminal_ref(handle)?;
     let item = chased
         .as_array()
         .and_then(|items| items.get(index).cloned())
         .unwrap_or_else(ObjectHandle::null);
-    Ok(pdf.resolve_object_handle_to_terminal_ref(&item)?.0)
+    Ok(pdf.resolve_to_terminal_ref(&item)?.0)
 }
 
 /// `QUtil::hex_encode` (`libqpdf/QUtil.cc:720-731`): lowercase hex, two
@@ -261,13 +261,13 @@ pub(crate) fn run_test_73<R: Read + Seek>(
     // its ability to *not* error is exercised, which the real call below
     // still exercises against the still-open reader.
     let root_seed = pdf.trailer_key_handle(b"Root");
-    let root = pdf.resolve_object_handle_to_terminal(&root_seed)?;
+    let root = pdf.resolve_to_terminal(&root_seed)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     if root.as_dictionary().is_none() {
         return Err(Error::System("unable to find /Root dictionary".to_string()));
     }
     let pages_seed = root.get_key(b"/Pages");
-    let pages = pdf.resolve_object_handle_to_terminal(&pages_seed)?;
+    let pages = pdf.resolve_to_terminal(&pages_seed)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let _ = pages.unparse_resolved();
     Ok(())
@@ -450,8 +450,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     let kid1 = chase_array_item(pdf, &kids, 1)?;
     let limits1 = chase_key(pdf, &kid1, b"/Limits")?;
     let limits1_items = limits1.as_array().unwrap_or_default();
-    let limit1_low = pdf.resolve_object_handle_to_terminal(&limits1_items[0])?;
-    let limit1_high = pdf.resolve_object_handle_to_terminal(&limits1_items[1])?;
+    let limit1_low = pdf.resolve_to_terminal(&limits1_items[0])?;
+    let limit1_high = pdf.resolve_to_terminal(&limits1_items[1])?;
     assert_eq!(limit1_low.as_integer(), Some(230));
     assert_eq!(limit1_high.as_integer(), Some(240));
 
@@ -468,8 +468,8 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     let kid0 = chase_array_item(pdf, &kids, 0)?;
     let limits0 = chase_key(pdf, &kid0, b"/Limits")?;
     let limits0_items = limits0.as_array().unwrap_or_default();
-    let limit0_low = pdf.resolve_object_handle_to_terminal(&limits0_items[0])?;
-    let limit0_high = pdf.resolve_object_handle_to_terminal(&limits0_items[1])?;
+    let limit0_low = pdf.resolve_to_terminal(&limits0_items[0])?;
+    let limit0_high = pdf.resolve_to_terminal(&limits0_items[1])?;
     assert_eq!(limit0_low.as_integer(), Some(220));
     assert_eq!(limit0_high.as_integer(), Some(220));
     let kid0_kids = chase_key(pdf, &kid0, b"/Kids")?;

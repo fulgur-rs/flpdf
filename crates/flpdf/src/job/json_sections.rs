@@ -61,7 +61,7 @@ pub(crate) fn collect_content_refs<R: Read + Seek>(
         // Resolve to see whether the indirect object is a Stream (in which
         // case this ref itself is the content) or an Array of Stream refs
         // (in which case its elements are the content).
-        pdf.resolve_object_handle(content_handle)?;
+        pdf.resolve(content_handle)?;
         if content_handle.as_stream_dict().is_some() {
             return Ok(vec![ref_string(r)]);
         }
@@ -107,7 +107,7 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
     let Some(xobject_handle) = resources_dict.get(b"/XObject".as_slice()) else {
         return Ok(vec![]);
     };
-    pdf.resolve_object_handle(xobject_handle)?;
+    pdf.resolve(xobject_handle)?;
     let Some(xobject_dict) = xobject_handle.as_dictionary() else {
         return Ok(vec![]);
     };
@@ -120,13 +120,13 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
             // Direct inline stream — no ref string available, skip.
             continue;
         };
-        pdf.resolve_object_handle(value)?;
+        pdf.resolve(value)?;
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
         let is_image = match stream_dict.get(b"/Subtype".as_slice()) {
             Some(subtype_handle) => {
-                pdf.resolve_object_handle(subtype_handle)?;
+                pdf.resolve(subtype_handle)?;
                 subtype_handle
                     .as_name()
                     .is_some_and(|subtype| subtype.as_slice() == b"Image")
@@ -165,7 +165,7 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
 
         // Resolve the page dict to extract /Contents.
         let page_handle = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page_handle)?;
+        pdf.resolve(&page_handle)?;
         let page_dict = page_handle.as_dictionary().unwrap_or_default();
         let contents_handle = page_dict.get(b"/Contents".as_slice());
         let contents: Vec<Json> = match contents_handle {
@@ -646,7 +646,7 @@ fn filespec_to_json<R: Read + Seek>(
     let filespec_str = format!("{} {} R", filespec_ref.number, filespec_ref.generation);
 
     let filespec_handle = pdf.get_object_handle(filespec_ref);
-    pdf.resolve_object_handle(&filespec_handle)?;
+    pdf.resolve(&filespec_handle)?;
     let Some(filespec_dict) = filespec_handle.as_dictionary() else {
         // Malformed filespec — return a minimal entry
         return json_dictionary([
@@ -680,7 +680,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
     let description = match filespec_dict.get(b"/Desc".as_slice()) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            pdf.resolve(handle)?;
             handle
                 .as_string()
                 .map(|bytes| {
@@ -702,7 +702,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
         let Some(handle) = filespec_dict.get(&key) else {
             continue;
         };
-        pdf.resolve_object_handle(handle)?;
+        pdf.resolve(handle)?;
         if let Some(bytes) = handle.as_string() {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
@@ -724,7 +724,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
         let Some(handle) = filespec_dict.get(&key) else {
             continue;
         };
-        pdf.resolve_object_handle(handle)?;
+        pdf.resolve(handle)?;
         if let Some(bytes) = handle.as_string() {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
@@ -737,7 +737,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let ef_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
         match filespec_dict.get(b"/EF".as_slice()) {
             Some(handle) => {
-                pdf.resolve_object_handle(handle)?;
+                pdf.resolve(handle)?;
                 handle.as_dictionary()
             }
             None => None,
@@ -758,7 +758,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             let Some(r) = handle.object_ref() else {
                 continue;
             };
-            pdf.resolve_object_handle(handle)?;
+            pdf.resolve(handle)?;
             if handle.as_stream_dict().is_some() {
                 preferredcontents = Json::make_string(format!("{} {} R", r.number, r.generation));
                 break;
@@ -779,7 +779,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             let stream_handle = pdf.get_object_handle(stream_ref);
-            pdf.resolve_object_handle(&stream_handle)?;
+            pdf.resolve(&stream_handle)?;
             let Some(stream_dict) = stream_handle
                 .as_stream_dict()
                 .and_then(|d| d.as_dictionary())
@@ -790,7 +790,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
             let mimetype = match stream_dict.get(b"/Subtype".as_slice()) {
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle
                         .as_name()
                         .map(|bytes| {
@@ -805,7 +805,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             let params_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
                 match stream_dict.get(b"/Params".as_slice()) {
                     Some(handle) => {
-                        pdf.resolve_object_handle(handle)?;
+                        pdf.resolve(handle)?;
                         handle.as_dictionary()
                     }
                     None => None,
@@ -817,7 +817,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
                 .and_then(|p| p.get(b"/CheckSum".as_slice()))
             {
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle
                         .as_string()
                         .map(|bytes| Json::make_string(checksum_to_hex(&bytes)))
@@ -832,7 +832,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
                 .and_then(|p| p.get(b"/CreationDate".as_slice()))
             {
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle
                         .as_string()
                         .and_then(|bytes| parse_pdf_date(&bytes))
@@ -1006,7 +1006,7 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
     ) -> Result<&'static str, ConvertError> {
         let r = match encrypt.get(b"/R".as_slice()) {
             Some(handle) => {
-                pdf.resolve_object_handle(handle)?;
+                pdf.resolve(handle)?;
                 handle.as_integer()
             }
             None => None,
@@ -1027,7 +1027,7 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
     // Look up the CFM entry inside /CF/<selector>
     let cf = match encrypt.get(b"/CF".as_slice()) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            pdf.resolve(handle)?;
             handle.as_dictionary()
         }
         None => None,
@@ -1038,7 +1038,7 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
     let selector = crate::object_handle::canonical_dictionary_key(selector.as_bytes());
     let filter = match cf.get(&selector) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            pdf.resolve(handle)?;
             handle.as_dictionary()
         }
         None => None,
@@ -1048,7 +1048,7 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
     };
     let cfm = match filter.get(b"/CFM".as_slice()) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            pdf.resolve(handle)?;
             handle.as_name()
         }
         None => None,
@@ -1079,7 +1079,7 @@ fn dict_name_str<R: Read + Seek>(
     let Some(handle) = dict.get(&key) else {
         return Ok(None);
     };
-    pdf.resolve_object_handle(handle)?;
+    pdf.resolve(handle)?;
     Ok(handle
         .as_name()
         .and_then(|bytes| String::from_utf8(bytes).ok()))
@@ -1160,14 +1160,14 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
     // inline-object bound, which would incorrectly report an otherwise-valid
     // /Encrypt entry as absent (plaintext). `trailer_key_handle` lifts only
     // this key's own value, so a deeply-nested sibling can't erase it.
-    // `resolve_object_handle` is a no-op for a direct (inline) dictionary and
+    // `resolve` is a no-op for a direct (inline) dictionary and
     // resolves an indirect reference in place, so a single call covers both
     // shapes; a present but non-dictionary value (any type, including an
     // unresolved reference) falls out of `as_dictionary()` as `None`,
     // matching the prior explicit `Object::Dictionary`/`Object::Reference`/
     // catch-all arms.
     let encrypt_handle = pdf.trailer_key_handle(b"Encrypt");
-    pdf.resolve_object_handle(&encrypt_handle)?;
+    pdf.resolve(&encrypt_handle)?;
     let encrypt_dict = encrypt_handle.as_dictionary();
 
     let is_encrypted = pdf.is_encrypted();
@@ -1203,21 +1203,21 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             // lookups resolve too rather than guarding against it.
             let v = match enc.get(b"/V".as_slice()) {
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle.as_integer().unwrap_or(0)
                 }
                 None => 0,
             };
             let r = match enc.get(b"/R".as_slice()) {
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle.as_integer().unwrap_or(0)
                 }
                 None => 0,
             };
             let p_raw = match enc.get(b"/P".as_slice()) {
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle.as_integer().map(|n| n as i32).unwrap_or(0)
                 }
                 None => 0,
@@ -1227,7 +1227,7 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
                 None => 40,
                 // Present: an integer value, or 0 for anything malformed.
                 Some(handle) => {
-                    pdf.resolve_object_handle(handle)?;
+                    pdf.resolve(handle)?;
                     handle.as_integer().unwrap_or(0)
                 }
             };

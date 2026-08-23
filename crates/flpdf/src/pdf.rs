@@ -371,7 +371,7 @@ impl<R: Read + Seek> Pdf<R> {
         // `MAX_PARSE_DEPTH` bound, so a value nested between the two would
         // otherwise degrade to null *here* while the legacy `resolve_chain`/
         // `resolve_borrowed` path (`MAX_PARSE_DEPTH`-bounded) still returns
-        // it — the same divergence `resolve_object_handle`'s own call to
+        // it — the same divergence `resolve`'s own call to
         // `lift_bounded` documents and avoids for the analogous
         // compressed-member case.
         self.lift_to_handle_bounded(&value, 0, crate::parser::MAX_PARSE_DEPTH)
@@ -409,7 +409,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `/Root` is a document-level error rather than a missing-key fallback.
     pub fn root_handle(&mut self) -> Result<ObjectHandle> {
         let candidate = self.trailer_key_handle(b"Root");
-        let root = self.resolve_object_handle_to_terminal(&candidate)?;
+        let root = self.resolve_to_terminal(&candidate)?;
         if root.as_dictionary().is_none() {
             return Err(Error::System("unable to find /Root dictionary".into()));
         }

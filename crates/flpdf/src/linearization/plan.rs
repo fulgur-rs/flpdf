@@ -200,7 +200,7 @@ fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
     let mut skipped_streams = BTreeSet::new();
     for object_ref in pdf.object_refs() {
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)?;
+        pdf.resolve(&handle)?;
         let Some(stream_dict) = handle.as_stream_dict() else {
             continue;
         };
@@ -581,7 +581,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
         order.push(current);
 
         let current_handle = pdf.get_object_handle(current);
-        pdf.resolve_object_handle(&current_handle)?;
+        pdf.resolve(&current_handle)?;
 
         // Determine whether this is a Pages node (intermediate page-tree node)
         // or a Page leaf node.
@@ -641,7 +641,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                                 continue;
                             }
                             let child_handle = pdf.get_object_handle(r);
-                            pdf.resolve_object_handle(&child_handle)?;
+                            pdf.resolve(&child_handle)?;
                             // Stop at a page-tree boundary BEFORE adding `r` to
                             // the closure: a resource that malformedly cross-links
                             // to a sibling `/Page` or the `/Pages` node must be
@@ -724,7 +724,7 @@ fn compute_closure_with_stream_parameters<R: Read + Seek>(
                             // of silently degrading the closure — mirroring
                             // the main BFS loop's `pdf.resolve_borrowed(current)?`.
                             let parent_handle = pdf.get_object_handle(parent_ref);
-                            pdf.resolve_object_handle(&parent_handle)?;
+                            pdf.resolve(&parent_handle)?;
                             // A /Parent that indirects through a plain
                             // reference object: follow the chain so the
                             // real ancestor still joins the closure. The
@@ -1180,7 +1180,7 @@ impl LinearizationPlan {
                 continue;
             }
             let object_handle = pdf.get_object_handle(r);
-            pdf.resolve_object_handle(&object_handle)?;
+            pdf.resolve(&object_handle)?;
             // Both `/Type /XRef` and `/Type /ObjStm` objects are required to
             // carry stream data (ISO 32000-1 §7.5.7/§7.5.8), so the genuine
             // article is always `ObjectValue::Stream`, never a plain
@@ -1258,7 +1258,7 @@ impl LinearizationPlan {
             .or_else(|| info_handle.as_reference());
         let pages_tree_ref = if let Some(root_ref) = root_ref {
             let root_handle = pdf.get_object_handle(root_ref);
-            pdf.resolve_object_handle(&root_handle)?;
+            pdf.resolve(&root_handle)?;
             let pages_handle = root_handle.try_get_key(b"/Pages")?;
             pages_handle
                 .object_ref()
@@ -1760,7 +1760,7 @@ impl LinearizationPlan {
         // compute_outline_hint_info's first_object).
         let outline_root_ref: Option<ObjectRef> = if let Some(root_ref) = pdf.root_ref() {
             let root_handle = pdf.get_object_handle(root_ref);
-            pdf.resolve_object_handle(&root_handle)?;
+            pdf.resolve(&root_handle)?;
             let outlines = root_handle.try_get_key(b"/Outlines")?;
             outlines.object_ref().or_else(|| outlines.as_reference())
         } else {
@@ -2866,7 +2866,7 @@ fn outlines_in_first_page_predicate<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::
         return Ok(false); // cov:ignore: root_ref None ⇒ from_pdf fails earlier via catalog()?
     };
     let root_handle = pdf.get_object_handle(root);
-    pdf.resolve_object_handle(&root_handle)?;
+    pdf.resolve(&root_handle)?;
     if !root_handle.try_has_key(b"/Outlines")? {
         return Ok(false);
     }

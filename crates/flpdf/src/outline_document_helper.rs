@@ -156,7 +156,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(outlines) = self.catalog_outlines()? else {
             return Ok(false);
         };
-        self.pdf.resolve_object_handle(&outlines)?;
+        self.pdf.resolve(&outlines)?;
         if outlines.try_as_dictionary()?.is_none() {
             return Ok(false);
         }
@@ -181,7 +181,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// indirection off an already-obtained `/Title`/`/Count` value the same
     /// way qpdf's `QPDFObjectHandle` transparently dereferences on access.
     pub(crate) fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
-        self.pdf.resolve_object_handle(handle)
+        self.pdf.resolve(handle)
     }
 
     /// Follow the temporary bare-reference redirect that `Pdf::set_object`
@@ -194,7 +194,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     // has no qpdf counterpart (QPDF::replaceObject rejects indirect
     // replacement, libqpdf/QPDF.cc:1986-1991).
     pub(crate) fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        self.pdf.resolve_object_handle_to_terminal(&handle)
+        self.pdf.resolve_to_terminal(&handle)
     }
 
     /// Chase `cursor` to its terminal target (see [`Self::resolve_value_handle`])
@@ -414,7 +414,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         // (`get_tree`'s loop and `build_item`'s frame loop) already chase
         // `cursor` through `chase_and_mark_seen` before calling here, so
         // this re-chase is normally a redundant no-op —
-        // `resolve_object_handle_to_terminal` returns an already-terminal
+        // `resolve_to_terminal` returns an already-terminal
         // handle unchanged — kept so this function's own `source_ref`
         // capture stays correct standalone, independent of caller
         // discipline. `object_ref()` is captured AFTER chasing so cycle

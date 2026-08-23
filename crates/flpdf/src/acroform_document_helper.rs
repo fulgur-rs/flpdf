@@ -474,7 +474,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         page.get_annotation_handles(Some(b"/Widget"))?
                     };
                     for annotation in widgets {
-                        let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
+                        let annotation = self.pdf.resolve_to_terminal(&annotation)?;
                         let identity = annotation.identity_key();
                         if !cache.annotation_to_field.contains_key(&identity) {
                             annotation.warn_if_possible(
@@ -512,7 +512,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let fields = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
         if let Some(fields) = fields.as_array() {
             let mut visited = BTreeSet::new();
             for field in fields {
@@ -654,7 +654,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         let fields = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
         let Some(items) = fields.as_array() else {
             return Ok(false);
         };
@@ -703,7 +703,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
 
         for annotation in annotations {
-            let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
+            let annotation = self.pdf.resolve_to_terminal(&annotation)?;
             if annotation.as_stream_dict().is_some() {
                 annotation.warn_if_possible("ignoring annotation that's a stream")?;
                 continue;
@@ -764,9 +764,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut transformed = AnnotationTransformResult::default();
         let mut source_helper = AcroFormDocumentHelper::new(source)?;
         let source_defaults = source_helper.canonical_acroform_defaults()?;
-        let old_annots = source_helper
-            .pdf
-            .resolve_object_handle_to_terminal(&old_annots)?;
+        let old_annots = source_helper.pdf.resolve_to_terminal(&old_annots)?;
         let Some(annotations) = old_annots.try_as_array()? else {
             return Ok(transformed);
         };
@@ -802,9 +800,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut copied_field_trees = HashSet::<ObjectHandleIdentity>::new();
         let mut added_new_fields = BTreeSet::new();
         for annotation in annotations {
-            let source_annotation = source_helper
-                .pdf
-                .resolve_object_handle_to_terminal(&annotation)?;
+            let source_annotation = source_helper.pdf.resolve_to_terminal(&annotation)?;
             if source_annotation.as_stream_dict().is_some() {
                 source_annotation.warn_if_possible("ignoring annotation that's a stream")?;
                 continue;
@@ -872,7 +868,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         source: &ObjectHandle,
         orig_to_copy: &mut HashMap<ObjectHandleIdentity, ObjectHandle>,
     ) -> Result<Option<ObjectHandle>> {
-        let source = self.pdf.resolve_object_handle_to_terminal(source)?;
+        let source = self.pdf.resolve_to_terminal(source)?;
         let identity = source.identity_key();
         if let Some(copied) = orig_to_copy.get(&identity) {
             return Ok(Some(copied.clone()));
@@ -886,7 +882,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     #[allow(dead_code, clippy::mutable_key_type)]
     fn canonical_top_level_field(&mut self, start: ObjectHandle) -> Result<ObjectHandle> {
-        let mut current = self.pdf.resolve_object_handle_to_terminal(&start)?;
+        let mut current = self.pdf.resolve_to_terminal(&start)?;
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(current.identity_key()) {
@@ -894,7 +890,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let parent = self
                 .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+                .resolve_to_terminal(&current.try_get_key(b"/Parent")?)?;
             if parent.is_null() {
                 return Ok(current);
             }
@@ -934,14 +930,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut seen = HashSet::new();
 
         while let Some((source, copied)) = queue.pop_front() {
-            let source = self.pdf.resolve_object_handle_to_terminal(&source)?;
+            let source = self.pdf.resolve_to_terminal(&source)?;
             if !seen.insert(source.identity_key()) {
                 continue;
             }
 
             let parent = self
                 .pdf
-                .resolve_object_handle_to_terminal(&copied.try_get_key(b"/Parent")?)?;
+                .resolve_to_terminal(&copied.try_get_key(b"/Parent")?)?;
             if !parent.is_null() {
                 if let Some(parent_copy) = orig_to_copy.get(&parent.identity_key()) {
                     copied.replace_key(b"/Parent", parent_copy.clone())?;
@@ -955,14 +951,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
             let kids_holder = self
                 .pdf
-                .resolve_object_handle_to_terminal(&copied.try_get_key(b"/Kids")?)?;
+                .resolve_to_terminal(&copied.try_get_key(b"/Kids")?)?;
             // qpdf's `if (kids.isArray()) { ... }` (`QPDFAcroFormDocumentHelper.cc:900-909`)
             // is a plain conditional, not an early exit: a terminal field with
             // no `/Kids` still falls through to the unconditional
             // `adjustInheritedFields` call below (`:914-917`).
             if let Some(kids) = kids_holder.try_as_array()? {
                 for (index, kid) in kids.into_iter().enumerate() {
-                    let kid = self.pdf.resolve_object_handle_to_terminal(&kid)?;
+                    let kid = self.pdf.resolve_to_terminal(&kid)?;
                     let Some(copied_kid) = self.copy_transform_object(&kid, orig_to_copy)? else {
                         continue; // cov:ignore: defensive compatibility arm; stream copies now propagate qpdf's clone error
                     };
@@ -992,9 +988,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             field.replace_key(b"/DR", resources.destination_resources.clone())?;
             self.pdf.mark_object_handle_dirty(field)?;
         }
-        let default_appearance = self
-            .pdf
-            .resolve_object_handle_to_terminal(&field.try_get_key(b"/DA")?)?;
+        let default_appearance = self.pdf.resolve_to_terminal(&field.try_get_key(b"/DA")?)?;
         let Some(default_appearance) = default_appearance.as_string() else {
             return Ok(());
         };
@@ -1056,7 +1050,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     #[allow(clippy::mutable_key_type)]
     fn field_has_explicit_value(&mut self, start: &ObjectHandle, key: &[u8]) -> Result<bool> {
-        let mut current = self.pdf.resolve_object_handle_to_terminal(start)?;
+        let mut current = self.pdf.resolve_to_terminal(start)?;
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(current.identity_key()) {
@@ -1067,7 +1061,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let parent = self
                 .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+                .resolve_to_terminal(&current.try_get_key(b"/Parent")?)?;
             if parent.is_null() || parent.as_dictionary().is_none() {
                 return Ok(false);
             }
@@ -1077,7 +1071,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     #[allow(clippy::mutable_key_type)]
     fn effective_field_appearance(&mut self, start: &ObjectHandle) -> Result<Vec<u8>> {
-        let mut current = self.pdf.resolve_object_handle_to_terminal(start)?;
+        let mut current = self.pdf.resolve_to_terminal(start)?;
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(current.identity_key()) {
@@ -1085,7 +1079,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let appearance = self
                 .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/DA")?)?;
+                .resolve_to_terminal(&current.try_get_key(b"/DA")?)?;
             if let Some(value) = appearance.as_string() {
                 return Ok(decode_field_name(&value).into_bytes());
             }
@@ -1094,7 +1088,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let parent = self
                 .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+                .resolve_to_terminal(&current.try_get_key(b"/Parent")?)?;
             if parent.is_null() || parent.as_dictionary().is_none() {
                 break;
             }
@@ -1105,15 +1099,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     #[allow(clippy::mutable_key_type)]
     fn effective_field_quadding(&mut self, start: &ObjectHandle) -> Result<i64> {
-        let mut current = self.pdf.resolve_object_handle_to_terminal(start)?;
+        let mut current = self.pdf.resolve_to_terminal(start)?;
         let mut seen = HashSet::new();
         loop {
             if !seen.insert(current.identity_key()) {
                 break;
             }
-            let quadding = self
-                .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Q")?)?;
+            let quadding = self.pdf.resolve_to_terminal(&current.try_get_key(b"/Q")?)?;
             if let Some(value) = quadding.as_integer() {
                 return Ok(value);
             }
@@ -1122,7 +1114,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
             let parent = self
                 .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+                .resolve_to_terminal(&current.try_get_key(b"/Parent")?)?;
             if parent.is_null() || parent.as_dictionary().is_none() {
                 break;
             }
@@ -1173,14 +1165,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut queue: VecDeque<ObjectHandle> = fields.iter().cloned().collect();
 
         while let Some(field) = queue.pop_front() {
-            let field = self.pdf.resolve_object_handle_to_terminal(&field)?;
+            let field = self.pdf.resolve_to_terminal(&field)?;
             if !seen.insert(field.identity_key()) {
                 continue;
             }
 
             let kids = self
                 .pdf
-                .resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
+                .resolve_to_terminal(&field.try_get_key(b"/Kids")?)?;
             if let Some(kids) = kids.try_as_array()? {
                 queue.extend(kids);
             }
@@ -1210,9 +1202,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             };
 
             if !append.is_empty() {
-                let current_name = self
-                    .pdf
-                    .resolve_object_handle_to_terminal(&field.try_get_key(b"/T")?)?;
+                let current_name = self.pdf.resolve_to_terminal(&field.try_get_key(b"/T")?)?;
                 // qpdf appends to the *decoded* name (`getUTF8Value() + append`,
                 // `QPDFAcroFormDocumentHelper.cc:99-103`), not the raw stored
                 // bytes -- a `/T` stored as UTF-16BE or PDFDocEncoded would
@@ -1233,7 +1223,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let acroform = self.canonical_get_or_create_acroform()?;
         let fields_array = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
         let fields_array = if fields_array.as_array().is_some() {
             fields_array
         } else {
@@ -1267,7 +1257,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let acroform = self.canonical_get_or_create_acroform()?;
         let fields_array = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
         let fields_array = if fields_array.as_array().is_some() {
             fields_array
         } else {
@@ -1300,10 +1290,10 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     pub(crate) fn canonical_get_or_create_acroform(&mut self) -> Result<ObjectHandle> {
         let root_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let root = self.pdf.get_object_handle(root_ref);
-        let root = self.pdf.resolve_object_handle_to_terminal(&root)?;
+        let root = self.pdf.resolve_to_terminal(&root)?;
         let acroform = self
             .pdf
-            .resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+            .resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
         if acroform.as_dictionary().is_some() {
             return Ok(acroform);
         }
@@ -1348,7 +1338,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let acroform = self.canonical_get_or_create_acroform()?;
         let resources = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/DR")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/DR")?)?;
         if resources.as_dictionary().is_some() {
             if resources.object_ref().is_some() {
                 return Ok(resources);
@@ -1375,13 +1365,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         let appearance = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/DA")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/DA")?)?;
         let quadding = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Q")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/Q")?)?;
         let resources = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/DR")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/DR")?)?;
         Ok(AcroFormDefaults {
             default_appearance: appearance
                 .as_string()
@@ -1394,22 +1384,20 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
     #[allow(dead_code, clippy::mutable_key_type)]
     fn canonical_fully_qualified_name(&mut self, start: ObjectHandle) -> Result<String> {
-        let mut current = self.pdf.resolve_object_handle_to_terminal(&start)?;
+        let mut current = self.pdf.resolve_to_terminal(&start)?;
         let mut seen = HashSet::new();
         let mut parts = Vec::new();
         loop {
             if !seen.insert(current.identity_key()) {
                 break;
             }
-            let partial = self
-                .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/T")?)?;
+            let partial = self.pdf.resolve_to_terminal(&current.try_get_key(b"/T")?)?;
             if let Some(name) = partial.as_string() {
                 parts.push(decode_field_name(&name));
             }
             let parent = self
                 .pdf
-                .resolve_object_handle_to_terminal(&current.try_get_key(b"/Parent")?)?;
+                .resolve_to_terminal(&current.try_get_key(b"/Parent")?)?;
             if parent.is_null() || parent.as_dictionary().is_none() {
                 break;
             }
@@ -1426,7 +1414,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         &mut self,
         annotation: ObjectHandle,
     ) -> Result<Option<ObjectHandle>> {
-        let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
+        let annotation = self.pdf.resolve_to_terminal(&annotation)?;
         if !annotation.try_is_dictionary_of_type(b"", b"Widget")? {
             return Ok(None);
         }
@@ -1445,13 +1433,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(None);
         };
         let root = self.pdf.get_object_handle(root_ref);
-        let root = self.pdf.resolve_object_handle_to_terminal(&root)?;
+        let root = self.pdf.resolve_to_terminal(&root)?;
         if root.as_dictionary().is_none() {
             return Ok(None);
         }
         let acroform = self
             .pdf
-            .resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+            .resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
         Ok(acroform.as_dictionary().is_some().then_some(acroform))
     }
 
@@ -1467,7 +1455,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(());
         }
 
-        let field = self.pdf.resolve_object_handle_to_terminal(&field)?;
+        let field = self.pdf.resolve_to_terminal(&field)?;
         let Some(field_ref) = field.object_ref() else {
             field.warn_if_possible(
                 "encountered a direct object as a field or annotation while traversing /AcroForm; ignoring field or annotation",
@@ -1487,7 +1475,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         let kids = self
             .pdf
-            .resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
+            .resolve_to_terminal(&field.try_get_key(b"/Kids")?)?;
         let mut is_field = depth == 0;
         let is_annotation;
         if let Some(kids) = kids.as_array() {
@@ -1606,7 +1594,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         let value = self
             .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/NeedAppearances")?)?;
+            .resolve_to_terminal(&acroform.try_get_key(b"/NeedAppearances")?)?;
         Ok(value.as_boolean() == Some(true))
     }
 
@@ -2116,13 +2104,13 @@ fn transformed_annotation_rectangle<R: Read + Seek>(
     annotation: &ObjectHandle,
     cm: Matrix,
 ) -> Result<ObjectHandle> {
-    let rect = pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
+    let rect = pdf.resolve_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
     let rectangle = match rect.try_as_array()? {
         Some(items) if items.len() == 4 => {
             let mut numbers = [0.0; 4];
             let mut valid = true;
             for (index, item) in items.iter().enumerate() {
-                let item = pdf.resolve_object_handle_to_terminal(item)?;
+                let item = pdf.resolve_to_terminal(item)?;
                 if let Some(number) = item
                     .as_integer()
                     .map(|value| value as f64)
@@ -4960,10 +4948,7 @@ mod tests {
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .unwrap();
         let root_seed = helper.pdf.get_object_handle(ObjectRef::new(1, 0));
-        let root = helper
-            .pdf
-            .resolve_object_handle_to_terminal(&root_seed)
-            .unwrap();
+        let root = helper.pdf.resolve_to_terminal(&root_seed).unwrap();
         root.replace_key(
             b"/AcroForm",
             ObjectHandle::dictionary(vec![(b"/DR".to_vec(), indirect_dr.clone())]),

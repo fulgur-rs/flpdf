@@ -142,8 +142,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
             helper.get_appearance_dictionary()?
         };
-        let appearance_dictionary =
-            pdf.resolve_object_handle_to_terminal(&appearance_dictionary)?;
+        let appearance_dictionary = pdf.resolve_to_terminal(&appearance_dictionary)?;
         let appearance = {
             let mut helper = AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
             helper.get_appearance_stream(b"N", None)?
@@ -208,8 +207,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // behavior. The qpdf-shaped helper owns the rectangle and appearance
         // geometry calculation for both paths.
         if !qpdf_flag_contract {
-            let rect_value =
-                pdf.resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
+            let rect_value = pdf.resolve_to_terminal(&annotation.try_get_key(b"/Rect")?)?;
             let has_rect = !rect_value.is_null();
             if !has_rect {
                 continue;
@@ -243,7 +241,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     if candidates.is_empty() {
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page)?;
+        pdf.resolve(&page)?;
         if page.as_dictionary().is_none() {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
             return Err(Error::Unsupported(format!(
@@ -282,7 +280,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     let mut page_helper = PageObjectHelper::new(page_ref, pdf);
     let resources = page_helper.get_attribute(b"/Resources", true)?;
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     let resources = if resources.as_dictionary().is_some() {
         resources
     } else {
@@ -310,7 +308,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // below, once content is known to be non-empty), so peek at it
         // read-only here without creating it.
         let existing_xobj = resources.try_get_key(b"/XObject")?;
-        let existing_xobj = pdf.resolve_object_handle_to_terminal(&existing_xobj)?;
+        let existing_xobj = pdf.resolve_to_terminal(&existing_xobj)?;
         let xobj_name = loop {
             let candidate = format!("Fxo{xobj_counter}");
             let candidate_key = format!("/{candidate}");
@@ -355,7 +353,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&resources)?;
         resources.merge_resources(&empty_xobject_placeholder, None)?;
         let xobj_dict = resources.try_get_key(b"/XObject")?;
-        pdf.resolve_object_handle(&xobj_dict)?;
+        pdf.resolve(&xobj_dict)?;
 
         let xobject = if data.appearance.is_indirect() {
             data.appearance.clone()
@@ -373,7 +371,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     if flattened_count == 0 {
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page)?;
+        pdf.resolve(&page)?;
         if page.as_dictionary().is_none() {
             // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
             return Err(Error::Unsupported(format!(
@@ -390,7 +388,7 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     // ── Step 6: Add qpdf-shaped page-content wrappers ─────────────────────
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     if page.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary after flatten"
@@ -425,7 +423,7 @@ fn replace_pruned_annots<R: Read + Seek>(
     preserve_indirect_holder: bool,
 ) -> Result<()> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     let old_annots = page.try_get_key(b"/Annots")?;
     let new_annots = build_pruned_annots_array(pdf, page_ref, to_remove)?;
     if new_annots.as_array().is_some_and(|items| items.is_empty()) {
@@ -455,7 +453,7 @@ fn add_qpdf_flatten_contents<R: Read + Seek>(
     after.extend_from_slice(&append_bytes);
     let after = add_content_stream(pdf, after)?;
     let old = page.try_get_key(b"/Contents")?;
-    let old = pdf.resolve_object_handle_to_terminal(&old)?;
+    let old = pdf.resolve_to_terminal(&old)?;
     let mut contents = vec![before];
     if let Some(items) = old.as_array() {
         contents.extend(items);
@@ -550,11 +548,11 @@ pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
 
 fn direct_page_rotate<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<i32> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     if page.as_dictionary().is_none() {
         return Ok(0); // cov:ignore: repaired page snapshot is always a dictionary
     }
-    let rotate = pdf.resolve_object_handle_to_terminal(&page.try_get_key(b"/Rotate")?)?;
+    let rotate = pdf.resolve_to_terminal(&page.try_get_key(b"/Rotate")?)?;
     Ok(rotate
         .as_integer()
         .and_then(|value| i32::try_from(value).ok())
@@ -579,7 +577,7 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
         }
     };
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     // cov:ignore-start: public page traversal guarantees a page dictionary at this boundary
     if page.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
@@ -625,11 +623,11 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
         return Ok(None); // cov:ignore: a parsed Pdf always has a root reference
     };
     let root = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&root)?;
+    pdf.resolve(&root)?;
     if root.as_dictionary().is_none() {
         return Ok(None); // cov:ignore: parsed catalog root is a dictionary
     }
-    let acroform = pdf.resolve_object_handle_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
+    let acroform = pdf.resolve_to_terminal(&root.try_get_key(b"/AcroForm")?)?;
     if acroform.as_dictionary().is_none() {
         return Ok(None); // cov:ignore: malformed AcroForm is ignored like qpdf
     }
@@ -652,7 +650,7 @@ fn resolve_array_item_handles<R: Read + Seek>(
 ) -> Result<()> {
     let mut changed = false;
     for (index, item) in array.as_array().unwrap_or_default().into_iter().enumerate() {
-        let terminal = pdf.resolve_object_handle_to_terminal(&item)?;
+        let terminal = pdf.resolve_to_terminal(&item)?;
         if !terminal.is_same_object_as(&item) {
             array.set_array_item(index, terminal)?;
             changed = true;
@@ -706,7 +704,7 @@ fn resolve_matched_category_handles<R: Read + Seek>(
     let mut dirty_arrays = Vec::new();
     let dest_entries = resources.as_dictionary().unwrap_or_default();
     for (category, source_value) in default_resources.as_dictionary().unwrap_or_default() {
-        let source_terminal = pdf.resolve_object_handle_to_terminal(&source_value)?;
+        let source_terminal = pdf.resolve_to_terminal(&source_value)?;
         if !source_terminal.is_same_object_as(&source_value) {
             default_resources.replace_key(&category, source_terminal.clone())?;
         }
@@ -714,7 +712,7 @@ fn resolve_matched_category_handles<R: Read + Seek>(
             continue; // cov:ignore: qpdf's merge never inspects a destination-only category
         };
         let dest_was_indirect = dest_value.is_indirect();
-        let dest_terminal = pdf.resolve_object_handle_to_terminal(dest_value)?;
+        let dest_terminal = pdf.resolve_to_terminal(dest_value)?;
         if !dest_terminal.is_same_object_as(dest_value) {
             resources.replace_key(&category, dest_terminal.clone())?;
         }
@@ -798,7 +796,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
             // `/AcroForm/Fields` is absent; only the `/DR` merge is gated.
             continue;
         }
-        pdf.resolve_object_handle(&appearance)?;
+        pdf.resolve(&appearance)?;
         let Some(appearance_dict) = appearance.as_stream_dict() else {
             continue; // cov:ignore: selected appearance must be a stream
         };
@@ -819,7 +817,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // whatever value is already resolved and does not fetch on its own,
         // so the handle must be resolved to its terminal value first.
         let was_indirect = resources.is_indirect();
-        let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
+        let resources = pdf.resolve_to_terminal(&resources)?;
         let resources = if was_indirect {
             let privatized = resources.shallow_copy()?;
             appearance_dict.replace_key(b"/Resources", privatized.clone())?;
@@ -838,7 +836,7 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
         // Lazy: qpdf only ever reads /DR from inside this same per-widget
         // merge path (see acroform_default_resources's doc), so resolving
         // it earlier than this would touch a value flattening may not need.
-        let default_resources = pdf.resolve_object_handle_to_terminal(default_resources)?;
+        let default_resources = pdf.resolve_to_terminal(default_resources)?;
         if default_resources.as_dictionary().is_none() {
             continue; // cov:ignore: malformed AcroForm DR is ignored like qpdf
         }
@@ -871,7 +869,7 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
         return Ok(()); // cov:ignore: parsed Pdf always has a root reference
     };
     let root = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&root)?;
+    pdf.resolve(&root)?;
     // cov:ignore-start: parsed Pdf catalogs are dictionaries at this boundary
     if root.as_dictionary().is_none() {
         return Ok(()); // cov:ignore: parsed catalog root is a dictionary
@@ -899,8 +897,8 @@ fn build_pruned_annots_array<R: Read + Seek>(
     to_remove: &[ObjectHandle],
 ) -> Result<ObjectHandle> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
-    let annots = pdf.resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+    pdf.resolve(&page)?;
+    let annots = pdf.resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
     let Some(annots_arr) = annots.as_array() else {
         return Ok(ObjectHandle::array(Vec::new()));
     };
@@ -1005,11 +1003,11 @@ mod tests {
         );
 
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve_object_handle(&page).unwrap();
+        pdf.resolve(&page).unwrap();
         add_qpdf_flatten_contents(&mut pdf, &page, Vec::new()).unwrap();
 
         let contents = pdf
-            .resolve_object_handle_to_terminal(&page.try_get_key(b"/Contents").unwrap())
+            .resolve_to_terminal(&page.try_get_key(b"/Contents").unwrap())
             .unwrap();
         let items = contents.as_array().unwrap();
         assert_eq!(items.len(), 4);
@@ -1021,7 +1019,7 @@ mod tests {
     fn build_pruned_annots_array_treats_a_non_array_as_empty() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve_object_handle(&page).unwrap();
+        pdf.resolve(&page).unwrap();
         page.replace_key(b"/Annots", ObjectHandle::integer(7))
             .unwrap();
         pdf.mark_object_handle_dirty(&page).unwrap();
@@ -1423,7 +1421,7 @@ mod tests {
         // A `Pdf::set_object` bare-reference holder redirect (an entry
         // whose own resolved value is itself another reference, never
         // produced by a real parser) on both a DR category and an array
-        // item inside it: resolve_object_handle_to_terminal must chase
+        // item inside it: resolve_to_terminal must chase
         // past the redirect, and the terminal must differ in identity from
         // the original holder, exercising the replace_key/set_array_item
         // rewrite path in both resolve_matched_category_handles and
@@ -2993,11 +2991,11 @@ mod tests {
         assert_eq!(count, 0, "the zero-area annotation must produce no output");
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page).unwrap();
+        pdf.resolve(&page).unwrap();
         let resources = page.try_get_key(b"/Resources").unwrap();
-        pdf.resolve_object_handle(&resources).unwrap();
+        pdf.resolve(&resources).unwrap();
         let xobject = resources.try_get_key(b"/XObject").unwrap();
-        pdf.resolve_object_handle(&xobject).unwrap();
+        pdf.resolve(&xobject).unwrap();
         assert!(
             xobject.is_null(),
             "no candidate produced content, so /Resources/XObject must not be created"
@@ -3099,11 +3097,11 @@ mod tests {
         // Page 1's /Resources/XObject must now be a privatized (direct)
         // dictionary carrying the new Fxo entry.
         let page1 = pdf.get_object_handle(page1_ref);
-        pdf.resolve_object_handle(&page1).unwrap();
+        pdf.resolve(&page1).unwrap();
         let resources1 = page1.try_get_key(b"/Resources").unwrap();
-        pdf.resolve_object_handle(&resources1).unwrap();
+        pdf.resolve(&resources1).unwrap();
         let xobject1 = resources1.try_get_key(b"/XObject").unwrap();
-        pdf.resolve_object_handle(&xobject1).unwrap();
+        pdf.resolve(&xobject1).unwrap();
         assert!(
             !xobject1.is_indirect(),
             "flattening must privatize a shared indirect /XObject dict"
@@ -3114,7 +3112,7 @@ mod tests {
         // /Im1, no leaked /Fxo1 -- this is what page 2 (still pointing at the
         // original indirect ref) would see.
         let original = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve_object_handle(&original).unwrap();
+        pdf.resolve(&original).unwrap();
         assert!(
             original.try_has_key(b"/Im1").unwrap(),
             "original shared dict must retain its own entry"
@@ -3127,9 +3125,9 @@ mod tests {
         // Page 2's /Resources/XObject must still be the original, untouched
         // indirect reference.
         let page2 = pdf.get_object_handle(page2_ref);
-        pdf.resolve_object_handle(&page2).unwrap();
+        pdf.resolve(&page2).unwrap();
         let resources2 = page2.try_get_key(b"/Resources").unwrap();
-        pdf.resolve_object_handle(&resources2).unwrap();
+        pdf.resolve(&resources2).unwrap();
         let xobject2 = resources2.try_get_key(b"/XObject").unwrap();
         assert_eq!(xobject2.object_ref(), Some(ObjectRef::new(7, 0)));
     }

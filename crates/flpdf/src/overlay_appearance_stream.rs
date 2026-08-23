@@ -88,7 +88,7 @@ pub(crate) fn adjust_appearance_stream_handle<R: Read + Seek>(
     if resources_value.try_is_null()? {
         return Ok(()); // cov:ignore: caller gates on an existing /Resources entry
     }
-    let resources_terminal = pdf.resolve_object_handle_to_terminal(&resources_value)?;
+    let resources_terminal = pdf.resolve_to_terminal(&resources_value)?;
     if resources_terminal.as_dictionary().is_none() {
         // qpdf's caller only invokes adjustAppearanceStream when
         // `resources.isDictionary()` (QPDFAcroFormDocumentHelper.cc:1006-1008).
@@ -458,7 +458,7 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -466,7 +466,7 @@ mod tests {
             .as_stream_dict()
             .expect("expected live stream dictionary");
         let resources = pdf
-            .resolve_object_handle_to_terminal(&stream_dict.try_get_key(b"/Resources").unwrap())
+            .resolve_to_terminal(&stream_dict.try_get_key(b"/Resources").unwrap())
             .unwrap();
         let font = resources
             .try_get_key(b"/Font")
@@ -484,7 +484,7 @@ mod tests {
 
         let original = pdf.get_object_handle(resources_ref);
         let original_font = pdf
-            .resolve_object_handle_to_terminal(&original)
+            .resolve_to_terminal(&original)
             .unwrap()
             .try_get_key(b"/Font")
             .unwrap()
@@ -498,7 +498,7 @@ mod tests {
         let mut pdf = open_minimal();
         let ap_ref = set_stream(&mut pdf, 4, &[], b"/F1 18 Tf");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &DrMap::new()).unwrap();
 
@@ -526,7 +526,7 @@ mod tests {
         let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf");
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -552,7 +552,7 @@ mod tests {
         let ap_ref = set_stream(&mut pdf, 4, &[("Resources", resources)], b"/F1 18 Tf");
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -582,7 +582,7 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
@@ -624,14 +624,14 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
         assert_eq!(ap.as_stream_data().unwrap().as_slice(), raw);
         let stream_dict = ap.as_stream_dict().unwrap();
         let resources = pdf
-            .resolve_object_handle_to_terminal(&stream_dict.try_get_key(b"/Resources").unwrap())
+            .resolve_to_terminal(&stream_dict.try_get_key(b"/Resources").unwrap())
             .unwrap();
         assert!(!resources
             .try_get_key(b"/Font")
@@ -675,13 +675,13 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 
         let stream_dict = ap.as_stream_dict().unwrap();
         let resources = pdf
-            .resolve_object_handle_to_terminal(&stream_dict.try_get_key(b"/Resources").unwrap())
+            .resolve_to_terminal(&stream_dict.try_get_key(b"/Resources").unwrap())
             .unwrap();
         let fonts = resources.try_get_key(b"/Font").unwrap();
         assert_eq!(
@@ -716,7 +716,7 @@ mod tests {
         );
         let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
         let ap = pdf.get_object_handle(ap_ref);
-        pdf.resolve_object_handle(&ap).unwrap();
+        pdf.resolve(&ap).unwrap();
 
         super::adjust_appearance_stream_handle(&mut pdf, &ap, &dr_map).unwrap();
 

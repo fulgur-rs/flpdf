@@ -841,14 +841,10 @@ fn generate_appearances_if_needed_handles_a_direct_orphan_widget() {
             .pop()
             .expect("direct orphan widget")
     };
-    let widget = pdf.resolve_object_handle_to_terminal(&widget).unwrap();
-    let ap = pdf
-        .resolve_object_handle_to_terminal(&widget.get_key(b"/AP"))
-        .unwrap();
+    let widget = pdf.resolve_to_terminal(&widget).unwrap();
+    let ap = pdf.resolve_to_terminal(&widget.get_key(b"/AP")).unwrap();
     assert!(ap.as_dictionary().is_some());
-    let normal = pdf
-        .resolve_object_handle_to_terminal(&ap.get_key(b"/N"))
-        .unwrap();
+    let normal = pdf.resolve_to_terminal(&ap.get_key(b"/N")).unwrap();
     assert!(normal.as_stream_dict().is_some());
 }
 

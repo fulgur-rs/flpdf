@@ -107,17 +107,17 @@ impl LabelRange {
         pdf: &mut Pdf<R>,
         handle: &ObjectHandle,
     ) -> Result<Option<Self>> {
-        let handle = pdf.resolve_object_handle_to_terminal(handle)?;
+        let handle = pdf.resolve_to_terminal(handle)?;
         if handle.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
         let style = pdf
-            .resolve_object_handle_to_terminal(&handle.try_get_key(b"/S")?)?
+            .resolve_to_terminal(&handle.try_get_key(b"/S")?)?
             .try_as_name()?
             .map(|name| LabelStyle::from_name(&name))
             .unwrap_or(LabelStyle::None);
         let prefix = pdf
-            .resolve_object_handle_to_terminal(&handle.try_get_key(b"/P")?)?
+            .resolve_to_terminal(&handle.try_get_key(b"/P")?)?
             .as_string()
             .map(|bytes| {
                 crate::json_inspect::decode_pdf_text_string(&bytes)
@@ -355,7 +355,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             return Ok(None);
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        let catalog = self.pdf.resolve_object_handle_to_terminal(&catalog)?;
+        let catalog = self.pdf.resolve_to_terminal(&catalog)?;
         if catalog.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -571,7 +571,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some((label, offset)) = tree.find_object_at_or_below(self.pdf, page_idx)? else {
             return Ok(None);
         };
-        let label = self.pdf.resolve_object_handle_to_terminal(&label)?;
+        let label = self.pdf.resolve_to_terminal(&label)?;
         if label.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
@@ -761,7 +761,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(label) = self.get_label_for_page_from_tree(&tree, page_idx)? else {
             return Ok(false);
         };
-        let label = self.pdf.resolve_object_handle_to_terminal(&label)?;
+        let label = self.pdf.resolve_to_terminal(&label)?;
         label.try_has_key(b"/P")
     }
 
@@ -1024,7 +1024,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(label));
 
         let source = pdf.get_object_handle(ObjectRef::new(11, 0));
-        pdf.resolve_object_handle(&source).unwrap();
+        pdf.resolve(&source).unwrap();
         let source_style = source.try_get_key(b"/S").unwrap();
         let source_prefix = source.try_get_key(b"/P").unwrap();
 

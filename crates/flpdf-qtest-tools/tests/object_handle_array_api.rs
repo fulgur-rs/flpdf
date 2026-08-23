@@ -29,7 +29,7 @@ fn external_consumer_can_mark_a_direct_child_array_dirty_for_write_back() {
     let mut pdf = Pdf::empty().expect("create an empty PDF");
     let root_ref = pdf.root_ref().expect("empty PDF has a catalog root");
     let root = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&root)
+    pdf.resolve(&root)
         .expect("resolve the catalog before mutating it");
 
     root.replace_key(

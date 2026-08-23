@@ -1142,7 +1142,7 @@ fn helper_flatten_annotations_defers_widget_rect_validation_past_resource_merge(
     pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
 
     let annotation = pdf.get_object_handle(ObjectRef::new(5, 0));
-    pdf.resolve_object_handle(&annotation).unwrap();
+    pdf.resolve(&annotation).unwrap();
     let rect = annotation.get_key(b"/Rect");
     assert!(!rect.is_resolved());
 
@@ -2787,7 +2787,7 @@ fn helper_keeps_nested_form_resource_scopes_isolated() {
 fn remove_page_allows_an_empty_document() {
     let mut pdf = open(build_n_page_pdf(1));
     let pages_handle = pdf.get_object_handle(ObjectRef::new(2, 0));
-    pdf.resolve_object_handle(&pages_handle).unwrap();
+    pdf.resolve(&pages_handle).unwrap();
 
     PageDocumentHelper::new(&mut pdf)
         .remove_page(ObjectRef::new(3, 0))
@@ -2835,7 +2835,7 @@ fn remove_page_allows_an_empty_direct_catalog_pages_root() {
     catalog.insert("Pages", Object::Dictionary(pages));
     pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
     let catalog_handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-    pdf.resolve_object_handle(&catalog_handle).unwrap();
+    pdf.resolve(&catalog_handle).unwrap();
     let pages_handle = catalog_handle
         .as_dictionary()
         .and_then(|dict| dict.get(b"/Pages".as_slice()).cloned())

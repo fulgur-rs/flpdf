@@ -137,7 +137,7 @@ pub fn splice_pages_with_max_depth<R: Read + Seek>(
 fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
     let catalog = pdf.get_object_handle(catalog_ref);
-    pdf.resolve_object_handle(&catalog)?;
+    pdf.resolve(&catalog)?;
     if catalog.as_dictionary().is_none() {
         return Err(Error::Missing("/Catalog dict"));
     }
@@ -145,7 +145,7 @@ fn pages_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     if let Some(pages_ref) = pages.object_ref() {
         return Ok(pages_ref);
     }
-    pdf.resolve_object_handle(&pages)?;
+    pdf.resolve(&pages)?;
     if pages.as_dictionary().is_none() {
         return Err(Error::Missing("/Pages"));
     }
@@ -234,7 +234,7 @@ fn collect_page_refs<R: Read + Seek>(
         )));
     }
 
-    pdf.resolve_object_handle(&node)?;
+    pdf.resolve(&node)?;
     if node.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "node {node_label} is not a dictionary"
@@ -242,7 +242,7 @@ fn collect_page_refs<R: Read + Seek>(
     }
 
     let node_type = node.try_get_key(b"/Type")?;
-    pdf.resolve_object_handle(&node_type)?;
+    pdf.resolve(&node_type)?;
     let has_kids = is_root || node.try_has_key(b"/Kids")?;
     if !has_kids {
         if node_type.as_name().as_deref() != Some(b"Page") {
@@ -266,7 +266,7 @@ fn collect_page_refs<R: Read + Seek>(
     }
 
     let kids_value = node.try_get_key(b"/Kids")?;
-    pdf.resolve_object_handle(&kids_value)?;
+    pdf.resolve(&kids_value)?;
     let kids_handle = if kids_value.as_array().is_some() {
         Some(kids_value.clone())
     } else {
@@ -279,7 +279,7 @@ fn collect_page_refs<R: Read + Seek>(
         .into_iter()
         .enumerate()
     {
-        pdf.resolve_object_handle(&child)?;
+        pdf.resolve(&child)?;
         let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
         if !child_is_pages && child.is_direct() {
             let indirect = pdf.make_indirect_object_handle(child)?;
@@ -315,7 +315,7 @@ fn collect_page_refs<R: Read + Seek>(
     }
 
     let count_value = node.try_get_key(b"/Count")?;
-    pdf.resolve_object_handle(&count_value)?;
+    pdf.resolve(&count_value)?;
     let declared_count = match count_value.as_integer() {
         Some(n) if n >= 0 => n as usize,
         Some(n) => {
@@ -384,7 +384,7 @@ fn normalize_insert_pages<R: Read + Seek>(
         }
 
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page)?;
+        pdf.resolve(&page)?;
         let copy = page.shallow_copy()?;
         let indirect = pdf.make_indirect_object_handle(copy)?;
         // cov:ignore-start: make_indirect_object_handle guarantees a fresh indirect identity
@@ -403,7 +403,7 @@ fn normalize_insert_pages<R: Read + Seek>(
 /// - another dictionary type → 1
 fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node: &ObjectHandle) -> Result<usize> {
     let node_label = node_label(node);
-    pdf.resolve_object_handle(node)?;
+    pdf.resolve(node)?;
     if node.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "node {node_label} is not a dictionary"
@@ -415,7 +415,7 @@ fn leaf_count_of<R: Read + Seek>(pdf: &mut Pdf<R>, node: &ObjectHandle) -> Resul
     }
 
     let count = node.try_get_key(b"/Count")?;
-    pdf.resolve_object_handle(&count)?;
+    pdf.resolve(&count)?;
     match count.as_integer() {
         Some(n) if n >= 0 => Ok(n as usize),
         Some(n) => Err(Error::Unsupported(format!(
@@ -440,7 +440,7 @@ fn set_page_parent_for_node<R: Read + Seek>(
     parent: &ObjectHandle,
 ) -> Result<()> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     if page.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
@@ -482,7 +482,7 @@ fn splice_subtree<R: Read + Seek>(
     // Snapshot the node's kids and count *before* any mutation so that the
     // canonical node handle remains stable while we recurse.
     let (kids, old_count, kids_handle) = {
-        pdf.resolve_object_handle(&node)?;
+        pdf.resolve(&node)?;
         if node.as_dictionary().is_none() {
             return Err(Error::Unsupported(format!(
                 "{node_label} is not a /Pages dictionary"
@@ -490,10 +490,10 @@ fn splice_subtree<R: Read + Seek>(
         }
 
         let kids_value = node.try_get_key(b"/Kids")?;
-        pdf.resolve_object_handle(&kids_value)?;
+        pdf.resolve(&kids_value)?;
         let kids = kids_value.as_array().unwrap_or_default();
         for child in &kids {
-            pdf.resolve_object_handle(child)?;
+            pdf.resolve(child)?;
             let child_is_pages = child.as_dictionary().is_some() && child.try_has_key(b"/Kids")?;
             if child.is_direct() && !child_is_pages {
                 return Err(Error::Unsupported(format!(
@@ -508,7 +508,7 @@ fn splice_subtree<R: Read + Seek>(
         };
 
         let count_value = node.try_get_key(b"/Count")?;
-        pdf.resolve_object_handle(&count_value)?;
+        pdf.resolve(&count_value)?;
         let old_count_raw = count_value
             .as_integer()
             .ok_or_else(|| Error::Unsupported(format!("/Pages node {node_label} has no /Count")))?;
@@ -558,7 +558,7 @@ fn splice_subtree<R: Read + Seek>(
         let overlaps_remove = kid_end > remove.start && kid_start < remove.end;
         if overlaps_remove {
             // Determine kid type (Page vs Pages) through the live child handle.
-            pdf.resolve_object_handle(&kid)?;
+            pdf.resolve(&kid)?;
             let kid_is_pages = kid.as_dictionary().is_some() && kid.try_has_key(b"/Kids")?;
 
             if kid_is_pages {
@@ -1041,11 +1041,11 @@ mod tests {
         splice_pages(&mut pdf, 1..2, &[]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&root).unwrap();
+        pdf.resolve(&root).unwrap();
         let kids_ref = root.try_get_key(b"/Kids").unwrap().object_ref();
         assert_eq!(kids_ref, Some(ObjectRef::new(9, 0)));
         let kids = pdf.get_object_handle(ObjectRef::new(9, 0));
-        pdf.resolve_object_handle(&kids).unwrap();
+        pdf.resolve(&kids).unwrap();
         let kids = kids
             .as_array()
             .expect("indirect /Kids array remains canonical");
@@ -1055,7 +1055,7 @@ mod tests {
             .collect();
         assert_eq!(kids_refs, vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
         let count = root.try_get_key(b"/Count").unwrap();
-        pdf.resolve_object_handle(&count).unwrap();
+        pdf.resolve(&count).unwrap();
         assert_eq!(count.as_integer(), Some(2));
     }
 
@@ -1088,9 +1088,9 @@ mod tests {
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(4, 0)]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&root).unwrap();
+        pdf.resolve(&root).unwrap();
         let kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve_object_handle(&kids).unwrap();
+        pdf.resolve(&kids).unwrap();
         let kids = kids.as_array().expect("root /Kids array");
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
@@ -1104,9 +1104,9 @@ mod tests {
         splice_pages(&mut pdf, 1..1, &[ObjectRef::new(5, 0)]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&root).unwrap();
+        pdf.resolve(&root).unwrap();
         let kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve_object_handle(&kids).unwrap();
+        pdf.resolve(&kids).unwrap();
         let kids = kids.as_array().expect("root /Kids array");
         assert_eq!(kids.len(), 3);
         assert!(kids[0].is_direct());
@@ -1120,9 +1120,9 @@ mod tests {
         splice_pages(&mut pdf, 0..1, &[]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&root).unwrap();
+        pdf.resolve(&root).unwrap();
         let kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve_object_handle(&kids).unwrap();
+        pdf.resolve(&kids).unwrap();
         let root_kids = kids.as_array().expect("root /Kids array");
         assert_eq!(
             root_kids.len(),
@@ -1132,10 +1132,10 @@ mod tests {
         let intermediate = &root_kids[0];
         assert!(intermediate.is_direct());
         let count = intermediate.try_get_key(b"/Count").unwrap();
-        pdf.resolve_object_handle(&count).unwrap();
+        pdf.resolve(&count).unwrap();
         assert_eq!(count.as_integer(), Some(1));
         let child_kids = intermediate.try_get_key(b"/Kids").unwrap();
-        pdf.resolve_object_handle(&child_kids).unwrap();
+        pdf.resolve(&child_kids).unwrap();
         let child_kids = child_kids.as_array().expect("intermediate /Kids array");
         assert_eq!(child_kids.len(), 1);
         assert_eq!(child_kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
@@ -1147,15 +1147,15 @@ mod tests {
         splice_pages(&mut pdf, 1..1, &[ObjectRef::new(5, 0)]).unwrap();
 
         let root = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&root).unwrap();
+        pdf.resolve(&root).unwrap();
         let root_kids = root.try_get_key(b"/Kids").unwrap();
-        pdf.resolve_object_handle(&root_kids).unwrap();
+        pdf.resolve(&root_kids).unwrap();
         let root_kids = root_kids.as_array().expect("root /Kids array");
         assert_eq!(root_kids.len(), 1);
         let intermediate = &root_kids[0];
         assert!(intermediate.is_direct());
         let child_kids = intermediate.try_get_key(b"/Kids").unwrap();
-        pdf.resolve_object_handle(&child_kids).unwrap();
+        pdf.resolve(&child_kids).unwrap();
         let child_kids = child_kids.as_array().expect("intermediate /Kids array");
         let child_refs: Vec<_> = child_kids
             .iter()
@@ -1261,7 +1261,7 @@ mod tests {
         let mut pdf = open(build_direct_pages_root_pdf());
         splice_pages(&mut pdf, 0..0, &[ObjectRef::new(4, 0)]).unwrap();
         let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve_object_handle(&catalog).unwrap();
+        pdf.resolve(&catalog).unwrap();
         let pages = catalog.try_get_key(b"/Pages").unwrap();
         assert!(pages.object_ref().is_some());
         assert_eq!(page_list(&mut pdf).len(), 2);

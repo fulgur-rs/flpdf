@@ -1973,7 +1973,7 @@ fn writer_catalog_copy<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(ObjectRef, O
         return Err(crate::Error::Missing("/Root"));
     };
     let source = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&source)?;
+    pdf.resolve(&source)?;
     let entries = source
         .try_as_dictionary()?
         .ok_or_else(|| crate::Error::Unsupported("Catalog is not a dictionary".to_string()))?;
@@ -2006,7 +2006,7 @@ fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool>
     };
     // cov:ignore-end
     let catalog = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&catalog)?;
+    pdf.resolve(&catalog)?;
     if !catalog.try_has_key(b"/Extensions")? {
         return Ok(false);
     }
@@ -2336,7 +2336,7 @@ pub(crate) struct EncryptionContext {
 pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
     let root_handle = pdf.get_object_handle(root);
-    pdf.resolve_object_handle(&root_handle).ok()?;
+    pdf.resolve(&root_handle).ok()?;
     let metadata = root_handle.try_get_key(b"/Metadata").ok()?;
     metadata.object_ref().or_else(|| metadata.as_reference())
 }
@@ -4217,7 +4217,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // a non-stream object (no holder), or a structural stream that the
             // main loop skips (XRef / ObjStm).
             let object_handle = pdf.get_object_handle(*old_ref);
-            pdf.resolve_object_handle(&object_handle)?;
+            pdf.resolve(&object_handle)?;
             let is_real_stream = if object_handle.as_stream_dict().is_some() {
                 let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
                     || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
@@ -4450,7 +4450,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // unparsing; it does not materialize the whole object graph before
         // emission.
         let object_handle = pdf.get_object_handle(*old_ref);
-        pdf.resolve_object_handle(&object_handle)?;
+        pdf.resolve(&object_handle)?;
         let is_stream = object_handle.as_stream_dict().is_some();
 
         // Direct `/Contents` streams have no terminal ObjectRef to put in
@@ -4746,7 +4746,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let mut handles = Vec::with_capacity(batch.len());
         for &old in batch {
             let handle = pdf.get_object_handle(old);
-            pdf.resolve_object_handle(&handle)?;
+            pdf.resolve(&handle)?;
             let new = renumber.new_for_original(old).ok_or_else(|| {
                 crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
             })?;
@@ -5382,7 +5382,7 @@ fn collect_content_container_refs<R: Read + Seek>(
         Indirect(ObjectRef),
     }
     let page_handle = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page_handle)?;
+    pdf.resolve(&page_handle)?;
     let contents_handle = page_handle.try_get_key(b"/Contents")?;
     let contents = if let Some(reference) = contents_handle
         .object_ref()
@@ -5432,9 +5432,9 @@ pub(crate) fn collect_content_stream_refs_tolerant<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Vec<ObjectRef>> {
     let page_handle = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page_handle)?;
+    pdf.resolve(&page_handle)?;
     let contents_handle = page_handle.try_get_key(b"/Contents")?;
-    let (contents, contents_ref) = pdf.resolve_object_handle_to_terminal_ref(&contents_handle)?;
+    let (contents, contents_ref) = pdf.resolve_to_terminal_ref(&contents_handle)?;
 
     if contents.try_is_null()? {
         return Ok(Vec::new());
@@ -5448,7 +5448,7 @@ pub(crate) fn collect_content_stream_refs_tolerant<R: Read + Seek>(
     };
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
-        let (item, item_ref) = pdf.resolve_object_handle_to_terminal_ref(&item)?;
+        let (item, item_ref) = pdf.resolve_to_terminal_ref(&item)?;
         if item.as_stream_dict().is_some() {
             if let Some(item_ref) = item_ref {
                 refs.push(item_ref);
@@ -5475,7 +5475,7 @@ fn collect_content_array_holder_refs<R: Read + Seek>(
             continue;
         }
         let handle = pdf.get_object_handle(current);
-        pdf.resolve_object_handle(&handle)?;
+        pdf.resolve(&handle)?;
         if let Some(next) = handle.as_reference() {
             pending.push_back((next, depth + 1));
         } else if let Some(items) = handle.try_as_array()? {
@@ -8707,7 +8707,7 @@ mod tests {
         // materialized snapshot.
         pdf.resolve_object(root).expect("catalog must resolve");
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve_object_handle(&catalog)
+        pdf.resolve(&catalog)
             .expect("canonical catalog must resolve");
         catalog
             .replace_key(
@@ -8730,8 +8730,7 @@ mod tests {
         inject_adbe_extension(&mut pdf, "1.7", 8).expect("injection must succeed");
 
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve_object_handle(&catalog)
-            .expect("mutated Catalog must resolve");
+        pdf.resolve(&catalog).expect("mutated Catalog must resolve");
         let extensions = catalog
             .try_get_key(b"/Extensions")
             .expect("Extensions lookup must succeed");
@@ -8748,7 +8747,7 @@ mod tests {
             .expect("fixture must open");
         let root = pdf.root_ref().expect("fixture must have a root");
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve_object_handle(&catalog)
+        pdf.resolve(&catalog)
             .expect("canonical catalog must resolve");
         catalog
             .replace_key(
@@ -8769,8 +8768,7 @@ mod tests {
             .expect("a direct stream sibling must not block Catalog mutation");
 
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve_object_handle(&catalog)
-            .expect("mutated Catalog must resolve");
+        pdf.resolve(&catalog).expect("mutated Catalog must resolve");
         assert_eq!(
             catalog
                 .try_get_key(b"/Metadata")
@@ -8799,7 +8797,7 @@ mod tests {
             .expect("fixture must open");
         let root = pdf.root_ref().expect("fixture must have a root");
         let catalog = pdf.get_object_handle(root);
-        pdf.resolve_object_handle(&catalog)
+        pdf.resolve(&catalog)
             .expect("canonical catalog must resolve");
         catalog
             .replace_key(b"/Extensions", ObjectHandle::integer(7))

@@ -192,7 +192,7 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve_object_handle(&field).unwrap();
+    pdf.resolve(&field).unwrap();
     let direct_a = field.get_key(b"/Parent");
     let direct_b =
         ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
@@ -219,7 +219,7 @@ fn inherited_value_lookup_terminates_on_a_reciprocal_direct_parent_cycle() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve_object_handle(&field).unwrap();
+    pdf.resolve(&field).unwrap();
     let direct_a = field.get_key(b"/Parent");
     let direct_b =
         ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
@@ -245,7 +245,7 @@ fn fully_qualified_name_resolves_a_long_acyclic_direct_parent_chain() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve_object_handle(&field).unwrap();
+    pdf.resolve(&field).unwrap();
 
     let mut parent = ObjectHandle::dictionary(vec![(
         b"/T".to_vec(),
@@ -281,7 +281,7 @@ fn field_value_resolves_a_long_acyclic_direct_parent_chain() {
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
     let field = pdf.get_object_handle(field_ref);
-    pdf.resolve_object_handle(&field).unwrap();
+    pdf.resolve(&field).unwrap();
 
     let mut parent = ObjectHandle::dictionary(vec![(
         b"/V".to_vec(),
@@ -855,10 +855,9 @@ fn set_value_marks_the_live_catalog_acroform_and_writer_observes_it() {
     let mut pdf = open(bytes);
     let root_ref = pdf.root_ref().expect("catalog reference");
     let root = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&root).expect("catalog handle");
+    pdf.resolve(&root).expect("catalog handle");
     let acroform = root.get_key(b"/AcroForm");
-    pdf.resolve_object_handle(&acroform)
-        .expect("AcroForm handle");
+    pdf.resolve(&acroform).expect("AcroForm handle");
     assert!(acroform.as_dictionary().is_some());
     let same_acroform = pdf.get_object_handle(ObjectRef::new(20, 0));
     assert!(acroform.is_same_object_as(&same_acroform));
@@ -877,11 +876,11 @@ fn set_value_marks_the_live_catalog_acroform_and_writer_observes_it() {
     let reopened_root_ref = reopened.root_ref().expect("rewritten catalog");
     let reopened_root = reopened.get_object_handle(reopened_root_ref);
     reopened
-        .resolve_object_handle(&reopened_root)
+        .resolve(&reopened_root)
         .expect("rewritten catalog handle");
     let reopened_acroform = reopened_root.get_key(b"/AcroForm");
     reopened
-        .resolve_object_handle(&reopened_acroform)
+        .resolve(&reopened_acroform)
         .expect("rewritten AcroForm handle");
     assert_eq!(
         reopened_acroform.get_key(b"/NeedAppearances").as_boolean(),

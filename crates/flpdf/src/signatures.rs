@@ -156,7 +156,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         return Ok(false);
     };
     let root = pdf.get_object_handle(root_ref);
-    let catalog = pdf.resolve_object_handle_to_terminal(&root)?;
+    let catalog = pdf.resolve_to_terminal(&root)?;
     if catalog.as_dictionary().is_none() {
         return Ok(false);
     }
@@ -173,7 +173,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         changed = true;
     }
 
-    let acroform = pdf.resolve_object_handle_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
+    let acroform = pdf.resolve_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
     if acroform.as_dictionary().is_some() && acroform.try_has_key(b"/SigFlags")? {
         // QPDF::removeSecurityRestrictions replaces the key whenever qpdf's
         // visible hasKey test succeeds, including an already-zero integer.
@@ -188,7 +188,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         // QPDF::removeSecurityRestrictions is void, so nothing classifies
         // the prior /SigFlags value.
         let previous = acroform.try_get_key(b"/SigFlags")?;
-        let previous_resolved = pdf.resolve_object_handle_to_terminal(&previous)?;
+        let previous_resolved = pdf.resolve_to_terminal(&previous)?;
         let already_zero =
             previous.object_ref().is_none() && previous_resolved.as_integer() == Some(0);
         // qpdf-deviation-end
@@ -562,7 +562,7 @@ fn signature_info_for_field<R: Read + Seek>(
         return Ok(None);
     };
     let signature_ref = value.object_ref().or_else(|| value.as_reference());
-    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    let value = pdf.resolve_to_terminal(&value)?;
     let value = value.materialize()?; // cov:ignore: field-value helper classifies only signature dictionaries
                                       // cov:ignore-start: pre-existing non-dictionary fallback, unchanged by Result propagation
     let Object::Dictionary(signature_dict) = value else {

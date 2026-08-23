@@ -2607,7 +2607,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// identity used for the returned handle.  Keep that distinction on the
     /// canonical resolver rather than routing the caller through
     /// `resolve(ObjectRef)` and trusting a possibly stale xref row.
-    pub(crate) fn resolve_object_handle_at_offset(
+    pub(crate) fn resolve_at_offset(
         &self,
         offset: u64,
         expected: ObjectRef,

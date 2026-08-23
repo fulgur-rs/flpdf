@@ -1658,7 +1658,7 @@ fn helper_replace_rejects_foreign_direct_filespec_without_mutation() {
     owner_dict.insert("FS", Object::Dictionary(filespec));
     source.set_object(owner_ref, Object::Dictionary(owner_dict));
     let owner = source.get_object_handle(owner_ref);
-    source.resolve_object_handle(&owner).expect("resolve owner");
+    source.resolve(&owner).expect("resolve owner");
     let foreign = owner.get_key(b"/FS");
 
     let mut destination = open(build_no_names_pdf());
