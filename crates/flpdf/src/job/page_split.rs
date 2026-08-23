@@ -93,11 +93,18 @@ impl SplitPageOptions {
 
 impl QPDFJob {
     /// Execute qpdf's fresh-document split-pages job.
+    ///
+    /// `source`'s suppress-warnings setting is only overridden for the
+    /// duration of this call: the value in effect when this method was
+    /// entered is restored before returning, on every path (success or
+    /// error), so a `source` reused across multiple jobs is never left with
+    /// a stale suppression state from an earlier call.
     pub fn split_pages<R: std::io::Read + std::io::Seek + 'static>(
         &mut self,
         source: &mut Pdf<R>,
         options: SplitPageOptions,
     ) -> Result<Vec<PathBuf>> {
+        let original_suppress_warnings = source.suppress_warnings();
         // QPDFJob owns the logger and warning state for every operation. The
         // split source may have been opened outside QPDFJob (the CLI opens an
         // intermediate rewrite), so install the job logger before any page or
@@ -106,7 +113,17 @@ impl QPDFJob {
         // this job keeps that suppression rather than being un-suppressed by
         // this job's own (possibly unconfigured) default.
         source.set_logger(self.logger());
-        source.set_suppress_warnings(self.warnings_suppressed() || source.suppress_warnings());
+        source.set_suppress_warnings(self.warnings_suppressed() || original_suppress_warnings);
+        let result = self.split_pages_with_suppression_installed(source, options);
+        source.set_suppress_warnings(original_suppress_warnings);
+        result
+    }
+
+    fn split_pages_with_suppression_installed<R: std::io::Read + std::io::Seek + 'static>(
+        &mut self,
+        source: &mut Pdf<R>,
+        options: SplitPageOptions,
+    ) -> Result<Vec<PathBuf>> {
         if options.chunk_size == 0 {
             return Err(Error::Unsupported(
                 "split_pages: chunk_size must be >= 1".to_owned(),
@@ -1259,6 +1276,47 @@ mod tests {
         let template = tmpdir.path().join("out.pdf");
         let result = split(src, 0, &template, false);
         assert!(result.is_err(), "chunk_size=0 should return an error");
+    }
+
+    #[test]
+    fn split_pages_does_not_leave_suppression_sticky_across_jobs() {
+        // A job's own suppress_warnings setting must only apply for the
+        // duration of its own split_pages call, even when that call errors
+        // out (e.g. chunk_size=0) before completing: it must not leak into
+        // a later, unrelated job's call on the same reused source.
+        let mut source = open_fixture("acroform-sig-orphan-widget.pdf");
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let mut suppressing_job = QPDFJob::new();
+        suppressing_job.set_suppress_warnings(true);
+        let error = suppressing_job
+            .split_pages(
+                &mut source,
+                SplitPageOptions::new(0, temp.path().join("a.pdf")),
+            )
+            .expect_err("chunk_size=0 must still error");
+        assert!(matches!(error, Error::Unsupported(_)));
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+            &recorded,
+        )))));
+        let mut plain_job = QPDFJob::new();
+        plain_job.set_logger(logger);
+        plain_job
+            .split_pages(
+                &mut source,
+                SplitPageOptions::new(1, temp.path().join("b.pdf")),
+            )
+            .expect("split job should succeed with a recoverable warning");
+
+        assert!(
+            String::from_utf8_lossy(&recorded.lock().unwrap())
+                .contains("this widget annotation is not reachable from /AcroForm"),
+            "a later unsuppressed job must still observe the source's warning, not inherit \
+             suppression left over from an earlier, unrelated job's failed call"
+        );
     }
 
     #[test]
