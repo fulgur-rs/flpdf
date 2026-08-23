@@ -22,7 +22,6 @@ use flpdf::{
     CombinedPage, CombinedPlan, InputSpec, PageRange, RotateSpec,
 };
 use flpdf::{
-    filters,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path_with_warnings, LinearizationCheckError,
@@ -31,9 +30,9 @@ use flpdf::{
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
     parse_pdf_version, AcroFormDocumentHelper, CompressStreams, CopyEncryptionSource,
-    EncryptMethod, EncryptParams, NewlineBeforeEndstream, Object, ObjectHandle, ObjectKeyAlg,
-    ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf,
-    PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
+    EncryptMethod, EncryptParams, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg, ObjectRef,
+    ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf, PdfOpenOptions,
+    PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
 };
 use std::collections::{BTreeMap, HashSet};
@@ -2229,12 +2228,10 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
         return finish_check_job(job.check(pdf));
     }
     if cli.show_npages {
-        let logger = job.logger();
-        return finish_job_exit_status(job.inspect(pdf, |pdf| show_npages_from_pdf(pdf, &logger))?);
+        return finish_job_exit_status(job.show_npages(pdf)?);
     }
     if cli.show_pages {
-        let logger = job.logger();
-        return finish_job_exit_status(job.inspect(pdf, |pdf| show_pages_from_pdf(pdf, &logger))?);
+        return finish_job_exit_status(job.show_pages(pdf)?);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
 }
@@ -2702,59 +2699,15 @@ fn build_copy_encryption_source(
         )
     })?;
 
-    // Extract the /Encrypt ObjectRef from the donor trailer, then resolve it.
-    // Pull the ref while holding the trailer borrow, then drop that borrow
-    // before calling resolve() which needs &mut self.
-    let encrypt_ref = donor.trailer().get_ref("Encrypt").ok_or_else(|| {
-        format!(
-            "--copy-encryption: donor {:?} has no /Encrypt in trailer",
-            path
-        )
-    })?;
-
-    let encrypt_obj = donor.resolve_borrowed(encrypt_ref).map_err(|e| {
-        format!(
-            "--copy-encryption: failed to resolve /Encrypt in {:?}: {e}",
-            path
-        )
-    })?;
-
-    let encrypt_dict = match encrypt_obj {
-        Object::Dictionary(d) => d.clone(),
-        other => {
-            return Err(format!(
-                "--copy-encryption: /Encrypt in {:?} is not a dictionary (got {:?})",
-                path, other
-            )
-            .into())
-        }
-    };
-
-    // Extract /ID[0] from the donor trailer.
-    let id0: Vec<u8> = match donor.trailer().get("ID") {
-        Some(Object::Array(arr)) => match arr.first() {
-            Some(Object::String(bytes)) => bytes.clone(),
-            _ => {
-                return Err(
-                    format!("--copy-encryption: donor {:?} /ID[0] is not a string", path).into(),
-                )
-            }
-        },
-        _ => {
-            return Err(format!(
-                "--copy-encryption: donor {:?} has no /ID array in trailer",
-                path
-            )
-            .into())
-        }
-    };
-
-    Ok(CopyEncryptionSource {
-        encrypt_dict,
-        file_key,
-        id0,
-        object_key_alg: ObjectKeyAlg::Aes,
-    })
+    // The reader owns the authenticated qpdf copy-encryption boundary. It
+    // snapshots the live /Encrypt and /ID[0] handles without exposing the
+    // legacy Object route to this external CLI crate.
+    let mut source = donor
+        .writer_copy_encryption_source()?
+        .ok_or_else(|| format!("--copy-encryption: donor {:?} is not encrypted", path))?;
+    source.file_key = file_key;
+    source.object_key_alg = ObjectKeyAlg::Aes;
+    Ok(source)
 }
 
 /// Parse the qpdf-shaped `--encrypt USER-PW OWNER-PW KEY-LEN [sub-flags]`
@@ -5454,24 +5407,10 @@ fn run_dump_object(
     let object_ref = ObjectRef::parse(object_ref)?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
-    {
-        let object = pdf.resolve_borrowed(object_ref)?;
-
-        if matches!(object, Object::Null) {
-            return Err(format!(
-                "object {} {} R not found",
-                object_ref.number, object_ref.generation
-            )
-            .into());
-        }
-
-        let mut out = Vec::new();
-        object.write_pdf(&mut out);
-        out.push(b'\n');
-        logger_info(out)?;
-    }
-
-    finish_operation_warnings(&pdf, false)
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    finish_job_exit_status(job.dump_object(&mut pdf, object_ref)?)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5564,196 +5503,57 @@ fn run_show_object(
     let selector = parse_show_object_selector(selector)?;
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
     let object = match selector {
         ShowObjectSelector::Trailer => pdf.trailer_handle(),
         ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
-        ShowObjectSelector::NoObject => return finish_operation_warnings(&pdf, false),
+        ShowObjectSelector::NoObject => {
+            return finish_job_exit_status(
+                job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
+            );
+        }
         ShowObjectSelector::Null => {
             logger_info(b"null\n")?;
-            return finish_operation_warnings(&pdf, false);
+            return finish_job_exit_status(
+                job.inspect(&mut pdf, |_pdf| Ok::<(), flpdf::Error>(()))?,
+            );
         }
     };
-
-    // qpdf's doShowObj starts with isStream(), which dereferences the selected
-    // handle. The canonical type query has the same ownership boundary.
-    let _ = object.type_code()?;
-    if object.as_stream_dict().is_some() {
-        if raw_stream_data || filtered_stream_data {
-            let warning_count = pdf.repair_diagnostics().entries().len();
-            let data = if filtered_stream_data {
-                object.get_stream_data(StreamDecodeLevel::All)
-            } else {
-                object.get_raw_stream_data()
-            };
-            let data = match data {
-                Ok(data) => data,
-                Err(_error) if pdf.repair_diagnostics().entries().len() > warning_count => {
-                    return finish_operation_warnings(&pdf, false);
-                }
-                Err(error) => return Err(error.into()),
-            };
-            standard_save_writer()?.write_all(&data)?;
-        } else {
-            let dictionary = object
-                .as_stream_dict()
-                .expect("stream type code guarantees a stream dictionary");
-            let mut output = b"Object is stream.  Dictionary:\n".to_vec();
-            output.extend_from_slice(&dictionary.unparse_resolved());
-            output.push(b'\n');
-            logger_info(output)?;
-        }
-    } else {
-        let mut output = object.unparse_resolved();
-        output.push(b'\n');
-        logger_info(output)?;
-    }
-
-    finish_operation_warnings(&pdf, false)
+    finish_job_exit_status(job.show_object(
+        &mut pdf,
+        object,
+        raw_stream_data,
+        filtered_stream_data,
+    )?)
 }
 
 fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
     let object_ref = ObjectRef::parse(&cmd.object_ref)?;
     let mut pdf = open_pdf(&cmd.input, cmd.repair, &cmd.password)?;
-    let operation = (|| -> CliResult<()> {
-        let object = pdf.resolve_borrowed(object_ref)?;
-
-        if matches!(object, Object::Null) {
-            return Err(format!(
-                "object {} {} R not found",
-                object_ref.number, object_ref.generation
-            )
-            .into());
-        }
-
-        let Object::Stream(stream) = object else {
-            return Err(format!(
-                "object {} {} R is not a stream",
-                object_ref.number, object_ref.generation
-            )
-            .into());
-        };
-
-        if cmd.raw_stream_data {
-            standard_save_writer()?.write_all(&stream.data)?;
-            return Ok(());
-        }
-
-        // For a single passthrough codec that flpdf's decode path cannot
-        // decode (currently JBIG2Decode, JPXDecode, CCITTFaxDecode) emit a
-        // human-readable marker instead of dumping binary. DCTDecode is a
-        // passthrough codec on the *write* side (the writer never
-        // re-encodes JPEG data) but is decodable, so it falls through to the
-        // decode path below like any other decodable filter. The codec may
-        // be stored either as a direct name (`/Filter /JBIG2Decode`) or as a
-        // single-element array (`/Filter [/JBIG2Decode]`); both are
-        // equivalent per PDF spec. Multi-element filter chains fall through
-        // to the decode path (scope: flpdf-9hc.7.5).
-        let passthrough_label = stream.dict.get("Filter").and_then(|filter| {
-            let name = filter.as_name().or_else(|| match filter.as_array() {
-                Some([single]) => single.as_name(),
-                _ => None,
-            })?;
-            if filters::is_decoded_filter(name) {
-                None
-            } else {
-                filters::passthrough_codec_label(name)
-            }
-        });
-        if let Some(label) = passthrough_label {
-            // This codec is not decodable, so print a marker instead of
-            // dumping binary data to the terminal.
-            println!("<binary, {} bytes, codec {}>", stream.data.len(), label);
-            return Ok(());
-        }
-
-        let bytes = filters::decode_stream_data(&stream.dict, &stream.data)?;
-        standard_save_writer()?.write_all(&bytes)?;
-        Ok(())
-    })();
-    operation?;
-    finish_operation_warnings(&pdf, false)
-}
-
-fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    run_ordinary_job_inspection(input, repair, password, |pdf, logger| {
-        show_npages_from_pdf(pdf, logger)
-    })
-}
-
-fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
-    run_ordinary_job_inspection(input, repair, password, |pdf, logger| {
-        show_pages_from_pdf(pdf, logger)
-    })
-}
-
-/// Run one ordinary page inspection through the shared qpdf-shaped job
-/// lifecycle. `QPDFJob::createQPDF` installs the document logger before input
-/// processing, and `writeQPDF` completes read-only inspection after the
-/// consumer (`libqpdf/QPDFJob.cc:429-516,1646-1693`).
-fn run_ordinary_job_inspection<F>(
-    input: Option<PathBuf>,
-    repair: bool,
-    password: &PasswordArgs,
-    inspection: F,
-) -> CliResult<()>
-where
-    F: FnOnce(&mut Pdf<BufReader<File>>, &QPDFLogger) -> CliResult<()>,
-{
-    let input = input.ok_or("missing input file")?;
-    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
-    let options = pdf_open_options(repair, password)?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
-    let mut pdf = job
-        .open(BufReader::new(file), input.display().to_string(), options)
-        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
-
-    let logger = job.logger();
-    let status = job.inspect(&mut pdf, |pdf| inspection(pdf, &logger))?;
-    finish_job_exit_status(status)
+    finish_job_exit_status(job.show_stream(&mut pdf, object_ref, cmd.raw_stream_data)?)
 }
 
-fn show_npages_from_pdf<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    logger: &QPDFLogger,
-) -> CliResult<()> {
-    let pages = pages::page_refs(pdf)?;
-    logger.info(format!("{}\n", pages.len()))?;
-    Ok(())
+fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    finish_job_exit_status(job.show_npages(&mut pdf)?)
 }
 
-fn show_pages_from_pdf<R: Read + Seek + 'static>(
-    pdf: &mut Pdf<R>,
-    logger: &QPDFLogger,
-) -> CliResult<()> {
-    write_page_descriptions(pdf, logger)
-}
-
-fn write_page_descriptions<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &QPDFLogger) -> CliResult<()> {
-    let page_refs = pages::page_refs(&mut *pdf)?;
-    for (index, page_ref) in page_refs.iter().enumerate() {
-        let page = pdf.resolve_borrowed(*page_ref)?;
-        let Object::Dictionary(dict) = page else {
-            continue;
-        };
-
-        logger.info(format!("page {}: {}\n", index + 1, page_ref))?;
-        if let Some(media_box) = dict.get("MediaBox") {
-            logger.info(format!("  media-box: {}\n", object_to_pdf(media_box)))?;
-        }
-        if let Some(resources) = dict.get("Resources") {
-            logger.info(format!("  resources: {}\n", object_to_pdf(resources)))?;
-        }
-        if let Some(contents) = dict.get("Contents") {
-            logger.info(format!("  contents: {}\n", object_to_pdf(contents)))?;
-        }
-        if let Some(rotate) = dict.get("Rotate") {
-            logger.info(format!("  rotate: {}\n", object_to_pdf(rotate)))?;
-        }
-    }
-
-    Ok(())
+fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    finish_job_exit_status(job.show_pages(&mut pdf)?)
 }
 
 fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
@@ -6464,12 +6264,6 @@ fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> 
     error.into()
 }
 
-fn object_to_pdf(object: &Object) -> String {
-    let mut out = Vec::new();
-    object.write_pdf(&mut out);
-    String::from_utf8_lossy(&out).to_string()
-}
-
 // ── Attachment helpers (flpdf-9hc.10.9) ──────────────────────────────────────
 
 /// Parse and retain the PDF timestamp syntax accepted by qpdf's
@@ -6870,7 +6664,7 @@ fn run_copy_attachments_from(
 mod tests {
     use super::*;
     use flpdf::pipeline::{Pipeline, PipelineResult};
-    use flpdf::{Dictionary, Stream};
+    use flpdf::{Dictionary, Object, Stream};
     use std::sync::{Arc, Mutex};
 
     struct ChunkRecordingSink {
@@ -6951,7 +6745,9 @@ mod tests {
         )
         .unwrap();
 
-        write_page_descriptions(&mut pdf, &logger).unwrap();
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        assert_eq!(job.show_pages(&mut pdf).unwrap(), JobExitCode::Success);
 
         let chunks = chunks.lock().unwrap();
         assert_eq!(chunks.len(), 5);

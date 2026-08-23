@@ -15,6 +15,7 @@ mod acroform_field_prune;
 mod attachment_list;
 mod attachments;
 mod check;
+mod inspection;
 mod json;
 mod json_sections;
 mod lifecycle;

@@ -51,9 +51,17 @@ fn show_stream_rejects_non_stream_object() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("is not a stream"));
+    .stderr(predicate::str::contains("is not a stream"))
+    .stderr(predicate::str::contains("unsupported PDF feature").not());
 }
 
+// Object 99 0 is absent; qpdf's own doShowObj never rejects a missing
+// reference (QPDFJob.cc:806-840 unparses the null handle and succeeds),
+// so this hard-stop is flpdf's own pre-existing behavior with no qpdf
+// counterpart to preserve exactly, and the message must stay bare --
+// not routed through Error::Unsupported's "unsupported PDF feature: "
+// prefix, which would misclassify a missing reference as an unsupported
+// feature.
 #[test]
 fn show_stream_unknown_object_reports_clear_error() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
@@ -64,7 +72,8 @@ fn show_stream_unknown_object_reports_clear_error() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("not found"));
+    .stderr(predicate::str::contains("object 99 0 R not found"))
+    .stderr(predicate::str::contains("unsupported PDF feature").not());
 }
 
 #[test]
@@ -77,7 +86,8 @@ fn dump_object_unknown_object_reports_clear_error() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("not found"));
+    .stderr(predicate::str::contains("object 99 0 R not found"))
+    .stderr(predicate::str::contains("unsupported PDF feature").not());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +266,55 @@ fn build_pdf_with_stale_length_stream(stream_data: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// Like [`build_pdf_with_stale_length_stream`], but the stream dictionary
+/// also carries an explicit empty `/Filter []` array.
+fn build_pdf_with_stale_length_and_empty_filter_array(stream_data: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+
+    let cat_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let stream_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n<< /Filter [] /Length 99 >>\nstream\n");
+    bytes.extend_from_slice(stream_data);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{cat_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// Regression test: an explicit `/Filter []` (empty array) applies zero
+/// filters, same as a missing `/Filter` (`QPDF_Stream.cc:391-406`: the
+/// per-item loop over an empty array leaves `filter_names` empty). The
+/// recovered source-framing EOL from a stale `/Length` must still be
+/// trimmed from decoded output in this case, exactly as it is for a
+/// stream with no `/Filter` key at all
+/// (`show_stream_surfaces_lazy_recovery_warnings`).
+#[test]
+fn show_stream_trims_recovered_eol_for_empty_filter_array() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        temp.path(),
+        build_pdf_with_stale_length_and_empty_filter_array(b"payload"),
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["show-stream", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stdout(predicate::eq(b"payload".as_slice()));
+}
+
 #[test]
 fn show_stream_surfaces_lazy_recovery_warnings() {
     let temp = tempfile::NamedTempFile::new().unwrap();
@@ -288,6 +347,104 @@ fn dump_object_surfaces_lazy_recovery_warnings() {
         .stderr(predicate::str::contains(
             "flpdf: operation succeeded with warnings",
         ));
+}
+
+/// Regression test: `show-stream --raw-stream-data` must agree byte-for-byte
+/// with `--show-object --raw-stream-data` on an encrypted stream whose
+/// length required recovery. Both routes read the same source bytes through
+/// the same canonical `ObjectHandle`; only `show-stream` additionally trims
+/// a recovered end-of-line marker via
+/// [`crate::job::inspection`]'s `canonical_recovered_stream_eol` gate.
+///
+/// This previously double-trimmed: `canonical_recovered_stream_eol` fell
+/// back to the legacy `transformed_stream_refs` set, which pure canonical
+/// `ObjectHandle` reads (this command's own route) never populate, so the
+/// stream's own decrypted-content trailing newline was mistaken for
+/// recovery-scan ciphertext framing and stripped, losing one real content
+/// byte (12344 instead of 12345).
+#[test]
+fn show_stream_raw_matches_show_object_for_encrypted_recovered_length_stream() {
+    let mut show_stream = Command::cargo_bin("flpdf").unwrap();
+    let show_stream_out = show_stream
+        .args([
+            "show-stream",
+            "--raw-stream-data",
+            "4 0",
+            "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+        ])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("recovered stream length"))
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut show_object = Command::cargo_bin("flpdf").unwrap();
+    let show_object_out = show_object
+        .args([
+            "--show-object=4",
+            "--raw-stream-data",
+            "../../tests/fixtures/compat/encrypted-recovered-eol.pdf",
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(show_stream_out.len(), 12345);
+    assert_eq!(show_stream_out, show_object_out);
+}
+
+/// Regression test: after qpdf-style xref reconstruction, a recovered
+/// stream-length EOL must not be trimmed a second time by `show-stream`/
+/// `dump-object` -- `synchronize_canonical_recovered_stream_eol` already
+/// skips this classification once the source has been reconstructed
+/// (`resolver.reconstructed_xref()`), and `canonical_recovered_stream_eol`
+/// must mirror that same guard. Builds a PDF with no valid xref table
+/// (forcing full reconstruction) whose one stream's `/Length` is an
+/// indirect reference to a non-integer object (forcing length recovery),
+/// content `abc\n`.
+#[test]
+fn show_stream_raw_matches_show_object_after_xref_reconstruction() {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    bytes.extend_from_slice(b"3 0 obj\n<< /Length 9 0 R >>\nstream\nabc\nendstream\nendobj\n");
+    bytes.extend_from_slice(b"9 0 obj\n/Broken\nendobj\n");
+    bytes.extend_from_slice(b"trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), &bytes).unwrap();
+
+    let mut show_stream = Command::cargo_bin("flpdf").unwrap();
+    let show_stream_out = show_stream
+        .args(["show-stream", "--raw-stream-data", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table",
+        ))
+        .stderr(predicate::str::contains(
+            "attempting to recover stream length",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut show_object = Command::cargo_bin("flpdf").unwrap();
+    let show_object_out = show_object
+        .args(["--show-object=3", "--raw-stream-data"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(show_stream_out, b"abc\n".as_slice());
+    assert_eq!(show_stream_out, show_object_out);
 }
 
 /// A single-element filter array `/Filter [/CCITTFaxDecode]` is equivalent to
