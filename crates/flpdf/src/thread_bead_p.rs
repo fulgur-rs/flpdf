@@ -30,7 +30,7 @@
 //! A removed page kept alive only through a sibling bead reachable via a
 //! surviving page's `/B` (with no usable `/Threads`) must still have that
 //! bead's `/P` dropped, or the prune cannot collect the page. Indirection is
-//! normalized through an internal reference-chain resolver at every
+//! normalized through [`Pdf::resolve_to_terminal_ref`] at every
 //! link (`/Threads`, the thread entry, `/F`, `/N`, `/V`, `/B`, and `/P`), so a
 //! reference-to-reference chain, a direct (inline) thread dictionary, or a
 //! chained `/P` is handled the same way the page extraction path
@@ -98,16 +98,16 @@ use crate::{Dictionary, Object};
 /// target page was dropped, so that a removed page referenced by nothing else
 /// is garbage-collected by the subsequent subset sweep
 /// ([`crate::subset_prune::prune_after_subset`]). Reference-to-reference chains
-/// at every link are normalized through an internal reference-chain resolver
+/// at every link are normalized through [`Pdf::resolve_to_terminal_ref`]
 /// before each step is inspected. The function mutates `pdf`
 /// in place (same convention as `rebuild_page_tree`) and succeeds silently when
 /// the document has no article beads.
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`] while
-/// resolving the catalog, the `/Threads` array, the threads, the surviving
-/// pages, or the beads.
+/// Any error propagated from [`Pdf::resolve`] or
+/// [`Pdf::resolve_to_terminal_ref`] while resolving the catalog, the
+/// `/Threads` array, the threads, the surviving pages, or the beads.
 pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     result: &RebuildResult,
@@ -124,13 +124,13 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     seed_from_threads(pdf, &mut queue)?;
     seed_from_surviving_pages(pdf, result, &mut queue)?;
 
-    // Walk the ring(s). The handle chain normalizer keeps the visited key and
+    // Walk the ring(s). Pdf::resolve_to_terminal_ref keeps the visited key and
     // the write-back target at the terminal bead ref (never an intermediate
     // reference holder).
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     while let Some(start_ref) = queue.pop() {
         let start = pdf.get_object_handle(start_ref);
-        let (concrete, terminal) = resolve_handle_chain(pdf, &start)?;
+        let (concrete, terminal) = pdf.resolve_to_terminal_ref(&start)?;
         let bead_ref = terminal.unwrap_or(start_ref);
         if !visited.insert(bead_ref) {
             continue;
@@ -167,7 +167,7 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
     }
     let threads_val = catalog.get_key(b"/Threads");
     // /Threads may be an indirect (possibly multi-hop) reference to the array.
-    let (threads_concrete, _) = resolve_handle_chain(pdf, &threads_val)?;
+    let (threads_concrete, _) = pdf.resolve_to_terminal_ref(&threads_val)?;
     let Some(threads) = threads_concrete.as_array() else {
         return Ok(());
     };
@@ -188,14 +188,14 @@ fn thread_first_bead<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     thread: &ObjectHandle,
 ) -> Result<Option<ObjectRef>> {
-    let (concrete, _) = resolve_handle_chain(pdf, thread)?;
+    let (concrete, _) = pdf.resolve_to_terminal_ref(thread)?;
     let Some(dict) = concrete.as_dictionary() else {
         return Ok(None);
     };
     let Some(f_val) = dict.get(b"/F".as_slice()) else {
         return Ok(None);
     };
-    let (_, terminal) = resolve_handle_chain(pdf, f_val)?;
+    let (_, terminal) = pdf.resolve_to_terminal_ref(f_val)?;
     Ok(terminal)
 }
 
@@ -221,7 +221,7 @@ fn seed_from_surviving_pages<R: Read + Seek>(
             continue;
         }
         let b_val = page.get_key(b"/B");
-        let (b_concrete, _) = resolve_handle_chain(pdf, &b_val)?;
+        let (b_concrete, _) = pdf.resolve_to_terminal_ref(&b_val)?;
         if let Some(beads) = b_concrete.as_array() {
             for bead in beads {
                 if let Some(r) = handle_reference(&bead) {
@@ -255,7 +255,7 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     else {
         return Ok(());
     };
-    let (p_concrete, p_terminal) = resolve_handle_chain(pdf, &p_val)?;
+    let (p_concrete, p_terminal) = pdf.resolve_to_terminal_ref(&p_val)?;
     let Some(page_ref) = p_terminal else {
         return Ok(()); // Non-reference /P: malformed, left unchanged.
     };
@@ -298,30 +298,6 @@ fn is_page_dict(obj: &ObjectHandle) -> bool {
 /// mutation-only bare-reference value uses `as_reference`.
 fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
     handle.object_ref().or_else(|| handle.as_reference())
-}
-
-/// Follow canonical indirect handles and the private bare-reference mutation
-/// shape until the terminal value, retaining the last indirect reference.
-///
-/// The ordinary first dereference is qpdf's `QPDFObjectHandle::dereference` /
-/// `QPDF::resolve` path. The additional `as_reference` hops are only for the
-/// existing mutation-only redirect shape; qpdf's `replaceObject` rejects
-/// an indirect replacement (`QPDF.cc:1980-1991`).
-fn resolve_handle_chain<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: &ObjectHandle,
-) -> Result<(ObjectHandle, Option<ObjectRef>)> {
-    let mut current = start.clone();
-    let mut last_ref = current.object_ref();
-    for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
-        pdf.resolve(&current)?;
-        let Some(next) = current.as_reference() else {
-            return Ok((current, last_ref));
-        };
-        last_ref = Some(next);
-        current = pdf.get_object_handle(next);
-    }
-    Ok((current, last_ref))
 }
 
 #[cfg(test)]
@@ -453,26 +429,6 @@ mod tests {
             .expect("materialize bead snapshot")
             .into_dict()
             .expect("bead object is a dictionary")
-    }
-
-    #[test]
-    fn canonical_handle_chain_bounds_a_reference_cycle() {
-        let mut objs = base_objs();
-        objs.insert(20, "21 0 R".into());
-        objs.insert(21, "20 0 R".into());
-        let mut pdf = open(&objs);
-        let start = pdf.get_object_handle(ObjectRef::new(20, 0));
-
-        let (terminal, terminal_ref) =
-            resolve_handle_chain(&mut pdf, &start).expect("cycle must be bounded");
-        assert!(terminal.as_reference().is_some());
-        assert!(matches!(
-            terminal_ref,
-            Some(ObjectRef {
-                number: 20 | 21,
-                generation: 0
-            })
-        ));
     }
 
     #[test]
