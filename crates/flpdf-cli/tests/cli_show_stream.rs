@@ -51,7 +51,8 @@ fn show_stream_rejects_non_stream_object() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("is not a stream"));
+    .stderr(predicate::str::contains("is not a stream"))
+    .stderr(predicate::str::contains("unsupported PDF feature").not());
 }
 
 // Object 99 0 is absent; qpdf's own doShowObj never rejects a missing

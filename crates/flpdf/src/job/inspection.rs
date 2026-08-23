@@ -84,7 +84,11 @@ impl QPDFJob {
             ensure_present(&object, object_ref)?;
             object.type_code()?;
             let Some(stream_dictionary) = object.as_stream_dict() else {
-                return Err(Error::Unsupported(format!(
+                // Same reclassification concern as ensure_present above: a
+                // present-but-non-stream object is malformed selection, not
+                // an unsupported feature, and this diagnostic predates the
+                // migration -- keep it bare via Error::System.
+                return Err(Error::System(format!(
                     "object {} {} R is not a stream",
                     object_ref.number, object_ref.generation
                 )));
@@ -138,12 +142,19 @@ impl QPDFJob {
         self.inspect(pdf, |pdf| {
             let page_refs = PageDocumentHelper::new(pdf).get_all_pages()?;
             for (index, page_ref) in page_refs.iter().enumerate() {
-                let (media_box, resources, contents, rotate) = {
+                // `/Contents` is not an inheritable page attribute and only
+                // its reference syntax is printed below (unparse, not
+                // unparse_resolved), so read it as a raw dictionary entry
+                // rather than through get_attribute: that helper always
+                // resolves the target to its terminal value, which would
+                // trigger a stream-length repair scan on the content stream
+                // merely to list pages.
+                let contents = pdf.get_object_handle(*page_ref).try_get_key(b"/Contents")?;
+                let (media_box, resources, rotate) = {
                     let mut page = PageObjectHelper::new(*page_ref, pdf);
                     (
                         page.get_attribute(b"/MediaBox", false)?,
                         page.get_attribute(b"/Resources", false)?,
-                        page.get_attribute(b"/Contents", false)?,
                         page.get_attribute(b"/Rotate", false)?,
                     )
                 };

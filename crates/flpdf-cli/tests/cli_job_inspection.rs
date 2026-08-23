@@ -216,3 +216,31 @@ fn ordinary_show_pages_resolves_inherited_attributes() {
         .stdout(predicates::str::contains("rotate: 90"))
         .stdout(predicates::str::contains("resources: << /Font"));
 }
+
+/// `--show-pages`'s `contents:` line only ever prints `/Contents`'s
+/// reference syntax (`write_page_attribute` calls `unparse()`, not
+/// `unparse_resolved()`), so listing pages must not resolve the content
+/// stream target at all -- qpdf's own `unparse()` for an indirect handle
+/// never dereferences it either
+/// (`libqpdf/QPDFObjectHandle.cc:1573-1582`; ported at
+/// `ObjectHandle::unparse`'s own doc). `chained-indirect-contents.pdf`'s
+/// page 1 content stream needs a stream-length repair scan to resolve
+/// cleanly (`expected endobj`); reading `/Contents` through the same
+/// resolving `get_attribute` used for inheritable attributes triggered
+/// that scan just to print the reference, turning a clean `--show-pages`
+/// (exit 0) into a warning exit (3).
+#[test]
+fn ordinary_show_pages_does_not_resolve_contents_reference() {
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-pages",
+            "../../tests/fixtures/compat/chained-indirect-contents.pdf",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&flpdf.stderr).is_empty());
+    assert!(String::from_utf8_lossy(&flpdf.stdout).contains("contents: 5 0 R"));
+}
