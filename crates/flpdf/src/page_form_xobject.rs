@@ -248,7 +248,11 @@ fn leaf_box_array<R: Read + Seek>(
     let Some(dict) = page.as_dictionary() else {
         return Ok(None);
     };
-    let val = match dict.get(key).cloned() {
+    // Dictionary keys carry qpdf's canonical leading `/` (see
+    // ObjectHandle::as_dictionary); `key` is the slash-less name used for
+    // error-message formatting below, so the lookup key is built here.
+    let lookup_key: Vec<u8> = [b"/".as_slice(), key].concat();
+    let val = match dict.get(lookup_key.as_slice()).cloned() {
         None => return Ok(None),
         Some(v) => v,
     };
@@ -286,8 +290,12 @@ fn inherited_box_array<R: Read + Seek>(
             return Ok(None);
         };
         // Per PDF §7.3.9 a null value is equivalent to the key being absent, so
-        // skip it and climb to /Parent.
-        let val = match dict.get(key).cloned() {
+        // skip it and climb to /Parent. Dictionary keys carry qpdf's canonical
+        // leading `/` (see ObjectHandle::as_dictionary); `key` is the
+        // slash-less name used for error-message formatting, so the lookup
+        // key is built here.
+        let lookup_key: Vec<u8> = [b"/".as_slice(), key].concat();
+        let val = match dict.get(lookup_key.as_slice()).cloned() {
             Some(v) if !v.is_null() => Some(v),
             _ => None,
         };
@@ -1418,6 +1426,115 @@ mod tests {
     }
 
     #[test]
+    fn resolve_rect_array_errors_on_non_array_non_null_value() {
+        // A reference that resolves to a non-array, non-null value (an
+        // integer here) is malformed input: neither the ref-to-array nor the
+        // ref-to-null arm applies, so this must error rather than silently
+        // treating the box as absent.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+                (3, "42"),
+            ],
+            1,
+        ));
+        let value = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let err = resolve_rect_array(&mut pdf, value, ObjectRef::new(1, 0), b"TrimBox");
+        assert!(matches!(err, Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn effective_box_array_prefers_trimbox_over_inherited_boxes() {
+        // qpdf's getTrimBox(false) fallback chain: /TrimBox (leaf-only) wins
+        // even when an inheritable /MediaBox is also present.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R /TrimBox [0 0 50 60] >>"),
+            ],
+            1,
+        ));
+        let got = effective_box_array(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn leaf_box_array_returns_none_for_absent_key() {
+        let mut pdf = open(one_page_doc("", "x", &[]));
+        let got = leaf_box_array(&mut pdf, ObjectRef::new(3, 0), b"TrimBox").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn leaf_box_array_returns_none_for_direct_null() {
+        let mut pdf = open(one_page_doc("/TrimBox null", "x", &[]));
+        let got = leaf_box_array(&mut pdf, ObjectRef::new(3, 0), b"TrimBox").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn leaf_box_array_returns_array_for_present_direct_box() {
+        let mut pdf = open(one_page_doc("/TrimBox [0 0 100 200]", "x", &[]));
+        let got = leaf_box_array(&mut pdf, ObjectRef::new(3, 0), b"TrimBox")
+            .unwrap()
+            .expect("a present direct box array must resolve");
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn inherited_box_array_finds_box_on_ancestor() {
+        // The leaf carries no /MediaBox; its /Pages parent does. The walk
+        // climbs one hop and returns the ancestor's array.
+        let mut pdf = open(build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (
+                    2,
+                    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+                ),
+                (3, "<< /Type /Page /Parent 2 0 R >>"),
+            ],
+            1,
+        ));
+        let got = inherited_box_array(&mut pdf, ObjectRef::new(3, 0), b"MediaBox")
+            .unwrap()
+            .expect("ancestor MediaBox must be found");
+        assert_eq!(got.len(), 4);
+    }
+
+    #[test]
+    fn page_group_returns_none_for_absent_group() {
+        let mut pdf = open(one_page_doc("", "x", &[]));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn page_group_returns_none_for_null_group() {
+        let mut pdf = open(one_page_doc("/Group null", "x", &[]));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn page_group_returns_direct_dict_as_is() {
+        let mut pdf = open(one_page_doc(
+            "/Group << /Type /Group /S /Transparency >>",
+            "x",
+            &[],
+        ));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .expect("a present direct /Group dict must be returned");
+        assert!(got.as_dictionary().is_some());
+    }
+
+    #[test]
     fn xobject_object_closure_accepts_long_acyclic_ref_chain() {
         // A linear indirect-reference chain may be deeper than the page-tree
         // depth guard. qpdf's copyForeignObject has no fixed reference-hop
@@ -1474,6 +1591,17 @@ mod tests {
         assert_eq!(
             inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
             (false, 0)
+        );
+    }
+
+    #[test]
+    fn inherited_rotate_attribute_present_non_integer_is_treated_as_present_zero() {
+        // A present, non-null, non-integer /Rotate (a name here) is treated
+        // as present with value 0, not as absent.
+        let mut pdf = open(one_page_doc("/Rotate /Weird", "x", &[]));
+        assert_eq!(
+            inherited_rotate_attribute(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            (true, 0)
         );
     }
 
