@@ -304,6 +304,11 @@ impl QPDFJob {
         self.suppress_warnings = value;
     }
 
+    /// Return whether warning delivery is suppressed for job-owned documents.
+    pub(crate) fn warnings_suppressed(&self) -> bool {
+        self.suppress_warnings
+    }
+
     /// Configure qpdf's `warnings-exit-0` behavior.
     pub fn set_warnings_exit_zero(&mut self, value: bool) {
         self.warnings_exit_zero = value;

@@ -5651,6 +5651,115 @@ fn split_pages_produces_chunked_outputs() {
 }
 
 #[test]
+fn split_pages_propagates_orphan_widget_warning_to_job_exit_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("split.pdf");
+    let input = "../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf";
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--split-pages=1", input])
+        .arg(&output)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let warning = "this widget annotation is not reachable from /AcroForm in the document catalog";
+
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "split-pages warnings must use qpdf's warning exit status; stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "one source warning must be emitted once; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("acroform-sig-orphan-widget.pdf"),
+        "warning must retain the input description; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("operation succeeded with warnings"),
+        "split job must emit qpdf's warning summary; stderr={stderr}"
+    );
+}
+
+#[test]
+fn split_pages_preserves_a_repair_warning_from_the_original_input() {
+    // The intermediate full-rewrite that feeds the split job can already
+    // have repaired the condition that produced the original warning (here,
+    // --repair's xref reconstruction), so the freshly re-opened split
+    // source looks clean on its own. The original input's warning must
+    // still surface in the overall exit status and summary.
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_pdf()).unwrap();
+    let output = temp.path().join("split.pdf");
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair", "--split-pages=1"])
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "a repaired original input must still exit with qpdf's warning status; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("operation succeeded with warnings"),
+        "the split job must still emit qpdf's warning summary; stderr={stderr}"
+    );
+    assert!(
+        std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(
+                |entry| entry.path().extension().is_some_and(|ext| ext == "pdf")
+                    && entry.path() != input
+            ),
+        "a split output file must still be written"
+    );
+}
+
+#[test]
+fn pages_split_pages_preserves_a_repair_warning_from_the_original_input() {
+    // Same regression as `split_pages_preserves_a_repair_warning_from_the_original_input`,
+    // through the `--pages` selection branch instead of the plain-rewrite
+    // branch (both call `split_rewritten_pdf` and must fold prior_warnings
+    // into the split job before completing it).
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("corrupt.pdf");
+    std::fs::write(&input, corrupt_xref_pdf()).unwrap();
+    let output = temp.path().join("split.pdf");
+
+    let result = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--repair", "--split-pages=1"])
+        .arg(&input)
+        .args(["--pages", ".", "1", "--"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+
+    assert_eq!(
+        result.status.code(),
+        Some(3),
+        "a repaired original input must still exit with qpdf's warning status; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("operation succeeded with warnings"),
+        "the split job must still emit qpdf's warning summary; stderr={stderr}"
+    );
+}
+
+#[test]
 fn collate_without_pages_is_accepted_noop() {
     // qpdf 11.9.0 accepts --collate without --pages (exit 0); flpdf matches.
     let temp = tempfile::tempdir().unwrap();

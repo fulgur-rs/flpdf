@@ -1089,6 +1089,12 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `QPDFPageObjectHelper::copyAnnotations`: the page insertion has
     /// already copied the source `/Annots`, so the transformed annotations
     /// replace the destination array instead of being appended to it.
+    /// `Pdf::acroform_cache` memoizes the source's full AcroForm analysis
+    /// per source `Pdf` (`QPDFJob::get_afdh_for_qpdf`, `QPDFJob.cc:1847-1856`),
+    /// so a repeated `AcroFormDocumentHelper::new(source)` across per-page
+    /// copies reuses that warm cache instead of rescanning; the orphan-widget
+    /// page walk that self-associates a widget unreachable from
+    /// `/AcroForm/Fields` therefore still runs exactly once per source.
     pub(crate) fn fix_copied_annotations_from<RS: Read + Seek>(
         &mut self,
         from_page: ObjectHandle,
@@ -1105,7 +1111,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let transformed = {
             let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
             let transformed =
-                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?;
+                acroform.transform_annotations_from(old_annots, Matrix::default(), source)?; // cov:ignore: LLVM attributes this multiline generic call terminator to the defensive error edge; the direct helper regression covers the success path.
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
                 &BTreeSet::new(),
@@ -2549,6 +2555,65 @@ mod tests {
             resolve_resource_dictionary(&mut pdf, &dictionary, b"/ColorSpace")
                 .expect("dictionary resource category should resolve")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn fix_copied_annotations_retains_the_orphan_widget_s_self_association() {
+        // qpdf's `QPDFAcroFormDocumentHelper::analyze` self-associates a page
+        // Widget unreachable from `/AcroForm/Fields` as its own field
+        // (`QPDFAcroFormDocumentHelper.cc`'s orphan-widget fallback). That
+        // association must survive a `fix_copied_annotations_from` copy: the
+        // destination's own `/AcroForm` must end up containing the copied
+        // orphan widget, not merely succeed without error.
+        let mut source = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf")
+                .to_vec(),
+        )
+        .expect("source fixture should parse");
+        let source_page_ref = crate::pages::page_refs(&mut source)
+            .expect("source pages should resolve")
+            .into_iter()
+            .next()
+            .expect("source should have one page");
+        let source_page = source.get_object_handle(source_page_ref);
+        let mut target = Pdf::empty().expect("target should be constructible");
+        let new_page = crate::PageDocumentHelper::new(&mut target)
+            .add_page(
+                crate::PageInput::foreign(&mut source, source_page_ref),
+                false,
+            )
+            .expect("foreign page should copy")
+            .new_kids
+            .into_iter()
+            .next()
+            .expect("target should contain the copied page");
+
+        PageObjectHelper::new(new_page, &mut target)
+            .fix_copied_annotations_from(source_page, &mut source)
+            .expect("copied annotations should be repaired");
+
+        let root_ref = target.root_ref().expect("target has a catalog");
+        let root = target.get_object_handle(root_ref);
+        target.resolve(&root).expect("resolve target catalog");
+        let acroform = target
+            .resolve_to_terminal(&root.try_get_key(b"/AcroForm").expect("read /AcroForm key"))
+            .expect("resolve /AcroForm");
+        assert!(
+            acroform.as_dictionary().is_some(),
+            "the copied orphan widget must produce a destination /AcroForm"
+        );
+        let fields = target
+            .resolve_to_terminal(&acroform.try_get_key(b"/Fields").expect("read /Fields key"))
+            .expect("resolve /Fields");
+        assert_eq!(
+            fields
+                .try_as_array()
+                .expect("resolve /Fields array")
+                .expect("/Fields is an array")
+                .len(),
+            1,
+            "the orphan widget must be registered as its own field"
         );
     }
 

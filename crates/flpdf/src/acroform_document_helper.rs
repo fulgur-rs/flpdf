@@ -768,8 +768,18 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         cm: Matrix,
         source: &mut Pdf<RS>,
     ) -> Result<AnnotationTransformResult> {
-        let mut transformed = AnnotationTransformResult::default();
         let mut source_helper = AcroFormDocumentHelper::new(source)?;
+        self.transform_annotations_from_with_source_helper(old_annots, cm, &mut source_helper)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    fn transform_annotations_from_with_source_helper<RS: Read + Seek>(
+        &mut self,
+        old_annots: ObjectHandle,
+        cm: Matrix,
+        source_helper: &mut AcroFormDocumentHelper<'_, RS>,
+    ) -> Result<AnnotationTransformResult> {
+        let mut transformed = AnnotationTransformResult::default();
         let source_defaults = source_helper.canonical_acroform_defaults()?;
         let old_annots = source_helper.pdf.resolve_to_terminal(&old_annots)?;
         let Some(annotations) = old_annots.try_as_array()? else {
