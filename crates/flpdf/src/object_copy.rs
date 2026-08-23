@@ -559,10 +559,10 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 ///
 /// # Errors
 ///
-/// Returns [`Err`] only if [`Pdf::resolve`] itself fails for a ref in `refs`
+/// Returns [`Err`] only if [`Pdf::resolve_object`] itself fails for a ref in `refs`
 /// (an I/O or parse error), or if the target object-number space would overflow
 /// `u32`.  Refs that are unknown, freed, or otherwise unresolvable do **not**
-/// error: [`Pdf::resolve`] yields [`Object::Null`] for them, so they are simply
+/// error: [`Pdf::resolve_object`] yields [`Object::Null`] for them, so they are simply
 /// copied as `Null`.
 ///
 /// Callers normally obtain `refs` from

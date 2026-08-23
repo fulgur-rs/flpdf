@@ -1191,7 +1191,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// - `Deleted` — explicit `delete_object()` calls,
     /// - `Missing` — referenced but never present in any xref,
     /// - `Reserved` — forward-reference placeholders that
-    ///   [`Pdf::resolve`] returns as `Object::Null` (no real indirect
+    ///   [`Pdf::resolve_object`] returns as `Object::Null` (no real indirect
     ///   object behind them).
     ///
     /// A `live_object_refs()` entry may still resolve to `Object::Null`; that
@@ -2088,6 +2088,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// is a no-op. Resolution is delegated directly to the canonical
     /// `ResolverHandle` cache; it never materializes a legacy [`Object`].
     ///
+    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily
+    /// and retain the same shared object identity: resolving the same
+    /// indirect reference more than once yields handles that alias the same
+    /// cached value rather than independent copies. [`Pdf::resolve_object`]
+    /// is the owned raw-`Object` resolver, kept under its own explicit name
+    /// only for the next legacy-route removal slice.
+    ///
     /// This does not chase through an already-resolved
     /// [`Pdf::set_object`]-driven bare-reference redirect to its terminal
     /// value — see [`Pdf::resolve_to_terminal`] for that.
@@ -2528,6 +2535,9 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
+    // qpdf-cutover-delete: owned raw-`Object` resolver. Delete after its
+    // callers use canonical handle accessors; do not use it from the new
+    // resolver path.
     /// Resolve `object_ref` to its concrete value, parsing on demand.
     ///
     /// Resolution caches the result so subsequent calls are constant-time. Unknown,
@@ -2548,16 +2558,15 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(self.resolve_borrowed(object_ref)?.clone())
     }
 
-    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: borrowed raw-`Object` resolver
-    /// and its materialization memo are legacy-only. Delete after callers
-    /// migrate; do not preserve this signature as a new design constraint.
-    ///
+    // qpdf-cutover-delete: borrowed raw-`Object` resolver and its
+    // materialization memo are legacy-only. Delete after callers migrate; do
+    // not preserve this signature as a new design constraint.
     /// Resolve `object_ref` and borrow the cached concrete value.
     ///
-    /// This has the same resolution behavior as [`Pdf::resolve`] but avoids cloning
-    /// the resolved [`Object`]. The returned reference is tied to the mutable borrow
-    /// of this [`Pdf`], so callers must finish using it before resolving or mutating
-    /// other objects through the same reader.
+    /// This has the same resolution behavior as [`Pdf::resolve_object`] but avoids
+    /// cloning the resolved [`Object`]. The returned reference is tied to the mutable
+    /// borrow of this [`Pdf`], so callers must finish using it before resolving or
+    /// mutating other objects through the same reader.
     ///
     /// # Errors
     ///
@@ -6830,6 +6839,42 @@ mod tests {
         assert!(
             pdf.cache.entry(object_ref).is_none(),
             "on-demand borrowing must not populate the legacy cache"
+        );
+    }
+
+    #[test]
+    fn qpdf_json_mutated_cache_paths_reenter_canonical_resolution() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                b"2 0 obj\n42\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+
+        // A raw cache entry can already be resolved while its canonical handle
+        // remains unresolved. The qpdf-JSON path must resolve that handle before
+        // materializing the value, rather than trusting the stale raw snapshot.
+        let first_ref = ObjectRef::new(1, 0);
+        pdf.handle_mutated_object_refs.insert(first_ref);
+        pdf.cache.set_resolved(first_ref, Object::Null);
+        let mut expected_catalog = Dictionary::new();
+        expected_catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(first_ref)
+                .expect("canonical JSON resolution"),
+            Object::Dictionary(expected_catalog)
+        );
+
+        // The borrowed path reaches the same canonical re-entry after its raw
+        // cache read installs a fresh resolved entry.
+        let second_ref = ObjectRef::new(2, 0);
+        pdf.handle_mutated_object_refs.insert(second_ref);
+        assert_eq!(
+            pdf.resolve_qpdf_json_object_borrowed(second_ref)
+                .expect("borrowed canonical JSON resolution"),
+            &Object::Integer(42)
         );
     }
 

@@ -897,7 +897,6 @@ fn dest_page_ref_resolved_depth<R: Read + Seek>(
 // Tests
 // ---------------------------------------------------------------------------
 
-// cov:ignore-start: test-only legacy-route characterization calls are covered by focused outline tests, not the workspace zlib coverage run
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,14 +1196,18 @@ mod tests {
 
         // Removed-page targets nulled in place.
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
             "removed page 2 (obj4) nulled"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
                 Object::Null
             ),
@@ -1282,7 +1285,9 @@ mod tests {
         // Every target page object nulled in place.
         for n in [3u32, 4, 5, 6] {
             assert!(
+                // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
                 matches!(
+                    // cov:ignore-end
                     pdf.resolve_object(ObjectRef::new(n, 0)).unwrap(),
                     Object::Null
                 ),
@@ -1358,14 +1363,18 @@ mod tests {
             "dest_named_p4 keeps its removed-page ref"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
             "page 2 (obj4) nulled"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
                 Object::Null
             ),
@@ -1409,7 +1418,9 @@ mod tests {
         );
         // The named dest's target page (obj6) is nulled.
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
                 Object::Null
             ),
@@ -1509,7 +1520,9 @@ mod tests {
         // Every target page object nulled.
         for n in [3u32, 4, 5, 6] {
             assert!(
+                // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
                 matches!(
+                    // cov:ignore-end
                     pdf.resolve_object(ObjectRef::new(n, 0)).unwrap(),
                     Object::Null
                 ),
@@ -1556,7 +1569,9 @@ mod tests {
 
         // The removed target page (obj5) is nulled.
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(5, 0)).unwrap(),
                 Object::Null
             ),
@@ -1653,7 +1668,9 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(4, 0)))
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -1696,7 +1713,9 @@ mod tests {
         assert_eq!(sig_field.get("FT"), Some(&Object::Name(b"Sig".to_vec())));
         // The genuinely removed page (obj4) is still nulled.
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -1739,7 +1758,9 @@ mod tests {
         let sig_field = dict_of(&mut pdf, ObjectRef::new(7, 0));
         assert_eq!(sig_field.get("FT"), Some(&Object::Name(b"Sig".to_vec())));
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -1778,7 +1799,9 @@ mod tests {
         assert_eq!(forged.get("FT"), Some(&Object::Name(b"Sig".to_vec())));
         // The genuine removed page (obj4, an actual tree leaf) is still nulled.
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -1813,7 +1836,9 @@ mod tests {
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         remap_outline_and_dests(&mut pdf, &result).unwrap();
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -1847,7 +1872,9 @@ mod tests {
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         remap_outline_and_dests(&mut pdf, &result).unwrap();
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -1934,7 +1961,9 @@ mod tests {
         let item21 = dict_of(&mut pdf, ObjectRef::new(21, 0));
         assert!(item21.get("Title").is_some(), "child 21 kept");
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2042,7 +2071,9 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(4, 0)))
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2108,7 +2139,9 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(4, 0)))
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2200,7 +2233,9 @@ mod tests {
         };
         assert_eq!(arr2.first(), Some(&Object::Reference(ObjectRef::new(4, 0))));
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2267,7 +2302,9 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(4, 0)))
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2341,7 +2378,9 @@ mod tests {
         };
         assert_eq!(arr2.first(), Some(&Object::Reference(ObjectRef::new(4, 0))));
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2579,14 +2618,18 @@ mod tests {
             "removed-page dest keeps its original ref"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
             "removed page 2 (obj4) nulled"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
                 Object::Null
             ),
@@ -2721,7 +2764,9 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2748,7 +2793,9 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2785,7 +2832,9 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2806,7 +2855,9 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -2854,7 +2905,9 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -3194,7 +3247,9 @@ mod tests {
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(7, 0)).unwrap(),
                 Object::Null
             ),
@@ -3253,7 +3308,9 @@ mod tests {
             "d1 dest should be remapped to the new page1 ref"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -3286,7 +3343,9 @@ mod tests {
             "legacy /Dests d1 should be remapped to the new page1 ref"
         );
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
                 Object::Null
             ),
@@ -3294,4 +3353,3 @@ mod tests {
         );
     }
 }
-// cov:ignore-end

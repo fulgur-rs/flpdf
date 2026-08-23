@@ -1449,7 +1449,6 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    // cov:ignore-start: test-only type-tag characterization uses the legacy fixture resolver and is covered by focused writer tests
     /// Classify a resolved object into the oracle's tag vocabulary.
     ///
     /// Streams are always `"stream"`. A dictionary whose `/Type` resolves to a
@@ -1461,16 +1460,17 @@ mod tests {
             Object::Stream(_) => "stream".to_string(),
             Object::Dictionary(dict) => match dict.get("Type") {
                 Some(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(name)),
+                // cov:ignore-start: test-only type-tag oracle; no writer-renumber fixture gives an object an indirect /Type
                 Some(Object::Reference(tref)) => match pdf.resolve_object(*tref) {
                     Ok(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(&name)),
                     _ => "dict".to_string(),
                 },
+                // cov:ignore-end
                 _ => "dict".to_string(),
             },
             _ => "other".to_string(),
         }
     }
-    // cov:ignore-end
 
     fn tag_sequence<R: Read + Seek>(pdf: &mut Pdf<R>, map: &CatalogFirstRenumber) -> Vec<String> {
         let olds: Vec<ObjectRef> = map.pairs().map(|(_new, old)| old).collect();

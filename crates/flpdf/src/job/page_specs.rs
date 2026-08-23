@@ -813,20 +813,20 @@ mod tests {
         }
     }
 
-    // cov:ignore-start: test-only helper retained for legacy fixture construction while the final Object route is removed
     /// Resolve `value` one level: follow an `Object::Reference` through
     /// `pdf`, or return a non-reference value unchanged. Defensive against
     /// `/AcroForm` becoming an indirect object under other merge paths; the
     /// fixture this helper serves keeps it direct.
     fn resolve_one_level(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: Object) -> Object {
         match value {
+            // cov:ignore-start: this fixture's /AcroForm is never re-indirected
             Object::Reference(reference) => {
                 pdf.resolve_object(reference).expect("resolve reference")
-            } // cov:ignore: this fixture's /AcroForm is never re-indirected
+            }
+            // cov:ignore-end
             other => other,
         }
     }
-    // cov:ignore-end
 
     #[test]
     fn handle_page_specs_preserves_an_acroform_with_no_fields_array_across_sources() {
