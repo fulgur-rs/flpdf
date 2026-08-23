@@ -688,7 +688,9 @@ fresh merged document に明示的に伝播する。primary と全 secondary の
 `.50qd.3` では `QPDFJob.cc:2462-2472` の「primary QPDF をページ操作の
 base として in-place 更新する」責務と、`QPDFJob.cc:2590-2632` の
 `/Pages`・`/PageLabels`・AcroForm の選択ページ側更新を分離した。`job/page_merge.rs`
-は primary Catalog/trailer の全 graph を foreign-copy closure に含め、
+は選択 page graph を `QPDFPageDocumentHelper::addPage` 相当の canonical
+`copyForeignObject` route で先にコピーし、primary Catalog/trailer の全 graph を
+残る merge-specific metadata closure に含め、
 `/Pages` と writer/xref-owned trailer keys だけを target 側で再構築する。
 その結果 `/Info`、`/ID[0]`、未知の trailer entries、`/ViewerPreferences` や
 その他の Catalog siblings は primary の値と indirect-reference identity を
@@ -720,9 +722,11 @@ destination-owned indirect null slot で表現する。
 `page_extract.rs::extract_pages` はこの canonical foreign-copy route へ切り替え済みで、
 qpdf の source-side inherited-attribute preparation と destination-side page-tree
 mutation を組み合わせる。`job/page_merge.rs` も `pushInheritedAttributesToPage` 相当の
-source preparation と live-handle による destination `/Parent` replacement を使うが、
-primary の document-level / AcroForm / PageLabels merge を一つの map で処理するため、
-その merge-specific union copy と共有 raw closure は別の consumer cutover として残る。
+source preparation と live-handle による destination `/Parent` replacement を使い、
+選択 page graph の legacy pre-closed copy は削除した。primary の document-level /
+AcroForm / PageLabels merge と `--preserve-unreferenced` 用の primary orphan 保持には
+なお bounded raw metadata bridge が残るが、これは canonical page insertion の責務ではなく、
+次の consumer cutover で解消すべき技術的負債として扱う。
 
 ⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
 相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を
