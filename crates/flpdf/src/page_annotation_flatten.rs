@@ -877,6 +877,15 @@ fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     // cov:ignore-end
     root.remove_key(b"/AcroForm");
     pdf.mark_object_handle_dirty(&root)?;
+    // qpdf's own `flattenAnnotations` (`QPDFPageDocumentHelper.cc:56-77`)
+    // analyzes through a scope-local `QPDFAcroFormDocumentHelper` that goes
+    // out of scope on return, so a later step (e.g. `flattenRotation`'s
+    // `make_afdh()`, `QPDFJob.cc:2185-2193`) always constructs a fresh
+    // helper that observes this removal. `Pdf::acroform_cache` is shared
+    // across every `AcroFormDocumentHelper::new()` call for this source, so
+    // it must be invalidated here to reproduce that same "no stale analysis
+    // survives /AcroForm removal" guarantee.
+    *pdf.acroform_cache.borrow_mut() = None;
     Ok(())
 }
 
@@ -3251,5 +3260,62 @@ mod tests {
 
         let content = page_content_bytes(&mut pdf, page_ref).unwrap();
         assert!(content.windows(2).any(|w| w == b"Do"));
+    }
+
+    #[test]
+    fn flatten_rotation_reanalyzes_after_flatten_annotations_removes_acroform() {
+        // qpdf's `flattenAnnotations` (`QPDFPageDocumentHelper.cc:56-77`)
+        // analyzes through a scope-local `QPDFAcroFormDocumentHelper` that is
+        // discarded on return, so a later `flattenRotation` step
+        // (`make_afdh()`, `QPDFJob.cc:2185-2193`) always constructs a fresh
+        // helper that observes the current (post-removal) state. flpdf's
+        // shared `Pdf::acroform_cache` must reproduce that guarantee: a
+        // widget that survives flatten-annotations (no /AP at all) must not
+        // cause /AcroForm to be recreated when flatten-rotation later
+        // constructs another `AcroFormDocumentHelper` for the same source.
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
+
+        // obj 4: Print bit set (0x04) -> flattened by Print mode.
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /F 4 /FT /Btn /T (a) /AP << /N 5 0 R >> >>",
+        );
+        // obj 7: no /AP at all -> qpdf never removes/flattens it, it stays
+        // in /Annots verbatim (QPDFPageDocumentHelper.cc:127-135's final
+        // `else { new_annots.push_back(...) }` branch).
+        let (n7, obj7_bytes) = obj_dict(
+            7,
+            "<< /Type /Annot /Subtype /Widget /Rect [100 0 200 20] /F 0 /FT /Btn /T (b) >>",
+        );
+
+        let bytes = build_pdf(
+            "/Annots [4 0 R 7 0 R] /Rotate 90",
+            &[(n4, obj4_bytes), (n5, obj5_bytes), (n7, obj7_bytes)],
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        register_acroform_fields(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(7, 0)]);
+
+        let page_ref = ObjectRef::new(3, 0);
+        // Print mode: required=0x4, forbidden=0x3 (matches CliFlattenMode::Print).
+        flatten_annotations_qpdf(&mut pdf, &[page_ref], 0x4, 0x3).unwrap();
+
+        let root_ref = pdf.root_ref().unwrap();
+        let root_after_flatten = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root_after_flatten).unwrap();
+        assert!(
+            !root_after_flatten.has_key(b"/AcroForm"),
+            "/AcroForm must be removed once every widget lacks /NeedAppearances"
+        );
+
+        crate::job::flatten_rotation_on_pages(&mut pdf, &[page_ref]).unwrap();
+
+        let root_after_rotation = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root_after_rotation).unwrap();
+        assert!(
+            !root_after_rotation.has_key(b"/AcroForm"),
+            "flatten_rotation must not resurrect /AcroForm from a stale \
+             pre-removal AcroForm association cache"
+        );
     }
 }
