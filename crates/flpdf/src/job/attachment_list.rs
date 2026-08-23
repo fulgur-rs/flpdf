@@ -803,7 +803,7 @@ mod tests {
         let mut pdf = open_minimal();
         let root = pdf.root_ref().expect("catalog");
         let mut catalog = pdf
-            .resolve(root)
+            .resolve_object(root)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog dictionary");
@@ -826,7 +826,7 @@ mod tests {
     fn attach_raw_tree_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: Object) {
         let root = pdf.root_ref().expect("catalog");
         let mut catalog = pdf
-            .resolve(root)
+            .resolve_object(root)
             .expect("resolve catalog")
             .into_dict()
             .expect("catalog dictionary");

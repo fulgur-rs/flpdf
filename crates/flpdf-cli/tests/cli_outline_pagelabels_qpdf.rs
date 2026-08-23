@@ -126,7 +126,7 @@ fn outline_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> 
 fn terminal_object(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, mut value: Object) -> Object {
     for _ in 0..64 {
         match value {
-            Object::Reference(reference) => value = pdf.resolve(reference).unwrap(),
+            Object::Reference(reference) => value = pdf.resolve_object(reference).unwrap(),
             other => return other,
         }
     }
@@ -138,7 +138,7 @@ fn terminal_object(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>, mut value: 
 /// so the test reads that leaf directly without a normalized destination API.
 fn named_dest_page_index(pdf: &mut Pdf<std::io::BufReader<std::fs::File>>) -> usize {
     let catalog_ref = pdf.root_ref().expect("catalog ref");
-    let Object::Dictionary(catalog) = pdf.resolve(catalog_ref).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(catalog_ref).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     let Object::Dictionary(names) =

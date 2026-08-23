@@ -655,7 +655,7 @@ pub(crate) fn copy_objects_with_seed<RS: Read + Seek, RT: Read + Seek>(
         if seed.contains_key(&src_ref) {
             continue;
         }
-        let mut obj = source.resolve(src_ref)?;
+        let mut obj = source.resolve_object(src_ref)?;
         rewrite_refs(&mut obj, 0, &map)?;
         target.set_object(map[&src_ref], obj);
     }
@@ -1457,7 +1457,7 @@ mod tests {
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         assert!(reopened.object_refs().contains(&written_ref));
         assert!(reopened
-            .resolve(written_ref)
+            .resolve_object(written_ref)
             .expect("resolve written placeholder")
             .is_null());
     }

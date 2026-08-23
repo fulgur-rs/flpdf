@@ -24,3 +24,15 @@ fn qpdf_named_trailer_surface_returns_a_live_handle() {
     assert!(pdf.trailer().is_direct());
     assert!(pdf.trailer().get_key(b"/Root").is_indirect());
 }
+
+#[test]
+fn qpdf_named_resolve_surface_resolves_a_handle_in_place() {
+    let mut pdf = Pdf::open(Cursor::new(
+        include_bytes!("../../../tests/fixtures/minimal.pdf").as_slice(),
+    ))
+    .unwrap();
+    let root = pdf.root_handle().unwrap();
+
+    pdf.resolve(&root).unwrap();
+    assert!(root.get_key(b"/Pages").is_indirect());
+}

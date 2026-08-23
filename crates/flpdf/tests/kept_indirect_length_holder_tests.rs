@@ -83,12 +83,12 @@ const IMAGE_DATA_LEN: i64 = 10;
 fn image_length(out: &[u8]) -> Object {
     let mut pdf = Pdf::open(Cursor::new(out.to_vec())).expect("re-open output");
     let root = pdf.root_ref().expect("/Root");
-    let catalog = pdf.resolve(root).expect("catalog");
+    let catalog = pdf.resolve_object(root).expect("catalog");
     let pages_ref = match catalog.as_dict().and_then(|d| d.get("Pages").cloned()) {
         Some(Object::Reference(r)) => r,
         other => panic!("/Pages = {other:?}"),
     };
-    let pages = pdf.resolve(pages_ref).expect("pages");
+    let pages = pdf.resolve_object(pages_ref).expect("pages");
     let page_ref = match pages.as_dict().and_then(|d| d.get("Kids").cloned()) {
         Some(Object::Array(a)) => match a.first() {
             Some(Object::Reference(r)) => *r,
@@ -96,13 +96,13 @@ fn image_length(out: &[u8]) -> Object {
         },
         other => panic!("/Kids = {other:?}"),
     };
-    let page = pdf.resolve(page_ref).expect("page");
+    let page = pdf.resolve_object(page_ref).expect("page");
     let resources = page
         .as_dict()
         .and_then(|d| d.get("Resources").cloned())
         .expect("/Resources");
     let resources = match resources {
-        Object::Reference(r) => pdf.resolve(r).expect("resources"),
+        Object::Reference(r) => pdf.resolve_object(r).expect("resources"),
         other => other,
     };
     let xobject = resources
@@ -110,14 +110,14 @@ fn image_length(out: &[u8]) -> Object {
         .and_then(|d| d.get("XObject").cloned())
         .expect("/XObject");
     let xobject = match xobject {
-        Object::Reference(r) => pdf.resolve(r).expect("xobject dict"),
+        Object::Reference(r) => pdf.resolve_object(r).expect("xobject dict"),
         other => other,
     };
     let image_ref = match xobject.as_dict().and_then(|d| d.get("Im0").cloned()) {
         Some(Object::Reference(r)) => r,
         other => panic!("/Im0 = {other:?}"),
     };
-    let image = pdf.resolve(image_ref).expect("image");
+    let image = pdf.resolve_object(image_ref).expect("image");
     image
         .as_stream()
         .expect("image is a stream")
@@ -133,12 +133,12 @@ fn image_length(out: &[u8]) -> Object {
 fn keep_holder_is_live_integer(out: &[u8]) -> bool {
     let mut pdf = Pdf::open(Cursor::new(out.to_vec())).expect("re-open output");
     let root = pdf.root_ref().expect("/Root");
-    let catalog = pdf.resolve(root).expect("catalog");
+    let catalog = pdf.resolve_object(root).expect("catalog");
     let holder_ref = match catalog.as_dict().and_then(|d| d.get("KeepHolder").cloned()) {
         Some(Object::Reference(r)) => r,
         other => panic!("/KeepHolder = {other:?}"),
     };
-    matches!(pdf.resolve(holder_ref), Ok(Object::Integer(_)))
+    matches!(pdf.resolve_object(holder_ref), Ok(Object::Integer(_)))
 }
 
 #[test]

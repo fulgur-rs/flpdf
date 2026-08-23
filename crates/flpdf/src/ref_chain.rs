@@ -39,7 +39,7 @@ pub fn resolve_ref_chain<R: Read + Seek>(
     };
     let mut last_ref = Some(*first);
     // This first hop is ordinary, qpdf-matching single-indirection resolution.
-    let mut cur = pdf.resolve(*first)?;
+    let mut cur = pdf.resolve_object(*first)?;
     // qpdf-deviation-start: chasing a stored reference-to-reference
     // (Object::Reference resolving to another Object::Reference) has no qpdf
     // counterpart -- QPDFParser::parse's top-level tt_integer case
@@ -52,7 +52,7 @@ pub fn resolve_ref_chain<R: Read + Seek>(
         match cur {
             Object::Reference(r) => {
                 last_ref = Some(r);
-                cur = pdf.resolve(r)?;
+                cur = pdf.resolve_object(r)?;
             }
             _ => break,
         }

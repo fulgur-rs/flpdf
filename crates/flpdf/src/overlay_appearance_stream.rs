@@ -347,7 +347,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &DrMap::new()).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1 18 Tf");
         assert_eq!(
             stream.dict.get("Resources"),
@@ -363,7 +363,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1 18 Tf");
         assert!(stream.dict.get("Resources").is_none());
     }
@@ -395,7 +395,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let new_resources_ref = stream
             .dict
@@ -409,7 +409,7 @@ mod tests {
         // The private copy has ONLY the renamed key, pointing at the same
         // font object as before.
         let new_font = pdf
-            .resolve(new_resources_ref)
+            .resolve_object(new_resources_ref)
             .unwrap()
             .into_dict()
             .unwrap()
@@ -422,7 +422,7 @@ mod tests {
 
         // The ORIGINAL shared /DR-copy object is untouched.
         let orig_font = pdf
-            .resolve(resources_ref)
+            .resolve_object(resources_ref)
             .unwrap()
             .into_dict()
             .unwrap()
@@ -751,7 +751,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 12 Tf BI ID ");
         let font = stream
             .dict
@@ -783,7 +783,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let resources = stream
             .dict
@@ -814,7 +814,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         let resources = stream
             .dict
             .get("Resources")
@@ -863,7 +863,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let resources = stream
             .dict
@@ -908,7 +908,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1_1 18 Tf");
         let resources = stream
             .dict
@@ -957,7 +957,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data,
             b"/F1_1 18 Tf /F1_1_1 18 Tf /F2_1 18 Tf /F2_1_1 18 Tf"
@@ -998,7 +998,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         // `/F1` is renamed to `/F1_1`; the second `/F1_1` token is untouched
         // (no local rename was ever recorded for it), so both tokens end up
         // saying `/F1_1`.
@@ -1056,7 +1056,7 @@ mod tests {
             "an undecodable AP stream content must not fail the whole call"
         );
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, b"\x00\x01opaque-ccitt-bytes",
             "content bytes must be left exactly as read when they cannot be decoded"
@@ -1116,7 +1116,7 @@ mod tests {
             "an undecodable AP stream content must not fail the whole call"
         );
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, b"\x00\x01/F1 opaque-ccitt-bytes",
             "content bytes must be left exactly as read — qpdf does not roll \
@@ -1174,7 +1174,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map)
             .expect("a lossy-filtered AP stream must not fail the whole call");
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, jpeg_like_bytes,
             "lossy/specialized-filtered content must stay byte-identical, \
@@ -1245,7 +1245,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf /F1_1_1 18 Tf");
         let resources = stream
             .dict
@@ -1300,7 +1300,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, b"/F2 18 Tf /F1 18 Tf",
             "F3 (now under F2) rewrites to /F2; the original /F2 token must \
@@ -1399,7 +1399,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, b"/F1_1 12 Tf",
             "the /F4 token must follow shared_ref to wherever it actually \
@@ -1475,7 +1475,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, b"/C_1 12 Tf",
             "the later fresh conflict must use the pool captured by the first conflict"
@@ -1559,7 +1559,7 @@ mod tests {
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map)
             .expect("a malformed object two levels below the touched category must not fail");
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(
             stream.data, b"/F1_1 18 Tf",
             "the rename must actually apply to the stream content"
@@ -1620,7 +1620,7 @@ mod tests {
         )
         .unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
         assert_eq!(stream.data, b"/F1_1 18 Tf");
         let resources = stream
             .dict
@@ -1695,7 +1695,7 @@ mod tests {
 
         adjust_appearance_stream_via_handle(&mut pdf, ap_ref, &dr_map).unwrap();
 
-        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        let stream = pdf.resolve_object(ap_ref).unwrap().into_stream().unwrap();
 
         // Dict-level rename (steps 1-4) applied, as always.
         let resources = stream

@@ -93,7 +93,7 @@ fn dangling_pg_dropped_and_page_gced() {
     let mut pdf = run_subset(&[ObjectRef::new(3, 0), ObjectRef::new(5, 0)]);
 
     // The StructElem pointing at the removed page loses its /Pg key entirely.
-    let elem = pdf.resolve(ObjectRef::new(21, 0)).expect("elem 21");
+    let elem = pdf.resolve_object(ObjectRef::new(21, 0)).expect("elem 21");
     let elem = elem.as_dict().expect("elem 21 is a dict");
     assert!(
         elem.get("Pg").is_none(),
@@ -110,7 +110,7 @@ fn dangling_pg_dropped_and_page_gced() {
     );
 
     // The StructElem pointing at a surviving page keeps its /Pg.
-    let elem = pdf.resolve(ObjectRef::new(22, 0)).expect("elem 22");
+    let elem = pdf.resolve_object(ObjectRef::new(22, 0)).expect("elem 22");
     let elem = elem.as_dict().expect("elem 22 is a dict");
     assert!(
         matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 3),

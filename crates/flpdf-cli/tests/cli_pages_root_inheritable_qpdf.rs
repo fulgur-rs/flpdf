@@ -68,7 +68,7 @@ fn resolve_to_terminal(pdf: &mut Pdf<BufReader<File>>, mut value: Object) -> Obj
         match value {
             Object::Reference(reference) => {
                 value = pdf
-                    .resolve(reference)
+                    .resolve_object(reference)
                     .expect("referenced value must resolve");
             }
             other => return other,
@@ -120,7 +120,9 @@ fn page_tree_snapshot(path: &Path) -> PageTreeSnapshot {
     let file = File::open(path).expect("output PDF must be readable");
     let mut pdf = Pdf::open(BufReader::new(file)).expect("output PDF must parse");
     let catalog_ref = pdf.root_ref().expect("output PDF must have a catalog");
-    let catalog = pdf.resolve(catalog_ref).expect("catalog must resolve");
+    let catalog = pdf
+        .resolve_object(catalog_ref)
+        .expect("catalog must resolve");
     let Object::Dictionary(catalog) = catalog else {
         panic!("catalog must be a dictionary: {catalog:?}");
     };

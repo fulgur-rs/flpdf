@@ -1317,7 +1317,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             // (`getCompressibleObjGens`, `QPDFWriter.cc:1955-2003`) --- it
             // never writes a source container's raw bytes verbatim. Each
             // compressed member's own ref still resolves to its correct
-            // logical value via `source.resolve()` regardless of
+            // logical value via `source.resolve_object()` regardless of
             // compression, so excluding only the container here does not
             // lose any member; flpdf's own writer
             // (`writer/object_streams/{planning,emission}.rs`) already owns (re)compressing the
@@ -1355,7 +1355,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             copy_seed.insert(primary_catalog_ref, target_catalog_ref);
             let primary_pages_ref = input
                 .source
-                .resolve(primary_catalog_ref)?
+                .resolve_object(primary_catalog_ref)?
                 .as_dict()
                 .and_then(|dict| dict.get_ref("Pages"))
                 .expect("page_refs above already required an indirect primary /Pages");
@@ -1806,12 +1806,16 @@ mod tests {
         }];
         let mut merged = merge_documents(&mut inputs).unwrap();
         let catalog_ref = merged.root_ref().unwrap();
-        let catalog = merged.resolve(catalog_ref).unwrap().into_dict().unwrap();
+        let catalog = merged
+            .resolve_object(catalog_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let open_action_ref = catalog
             .get_ref("OpenAction")
             .expect("indirect /OpenAction carrier is retained");
         assert_eq!(
-            merged.resolve(open_action_ref).unwrap(),
+            merged.resolve_object(open_action_ref).unwrap(),
             Object::Null,
             "the unselected page root is copied and nulled"
         );
@@ -1903,9 +1907,17 @@ mod tests {
         let mut merged = merge_documents(&mut inputs).unwrap();
 
         let catalog_ref = merged.root_ref().unwrap();
-        let catalog = merged.resolve(catalog_ref).unwrap().into_dict().unwrap();
+        let catalog = merged
+            .resolve_object(catalog_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let acroform_ref = catalog.get_ref("AcroForm").expect("/AcroForm");
-        let acroform = merged.resolve(acroform_ref).unwrap().into_dict().unwrap();
+        let acroform = merged
+            .resolve_object(acroform_ref)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         let fields = acroform
             .get("Fields")
             .and_then(Object::as_array)
@@ -1914,7 +1926,11 @@ mod tests {
             .iter()
             .map(|field| {
                 let field_ref = field.as_ref_id().expect("field is an indirect ref");
-                let field_dict = merged.resolve(field_ref).unwrap().into_dict().unwrap();
+                let field_dict = merged
+                    .resolve_object(field_ref)
+                    .unwrap()
+                    .into_dict()
+                    .unwrap();
                 field_dict
                     .get("T")
                     .and_then(Object::as_string)

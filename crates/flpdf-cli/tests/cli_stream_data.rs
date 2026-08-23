@@ -100,7 +100,10 @@ fn rewrite_with_args(src: &[u8], extra_args: &[&str]) -> Vec<u8> {
 
 fn extract_obj4(pdf_bytes: &[u8]) -> Stream {
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes.to_vec())).expect("open output PDF");
-    match pdf.resolve(ObjectRef::new(4, 0)).expect("resolve 4 0 R") {
+    match pdf
+        .resolve_object(ObjectRef::new(4, 0))
+        .expect("resolve 4 0 R")
+    {
         Object::Stream(s) => s,
         other => panic!("expected stream, got {other:?}"),
     }

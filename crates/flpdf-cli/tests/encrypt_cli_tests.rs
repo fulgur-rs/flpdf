@@ -124,7 +124,7 @@ fn assert_qdf_encrypted_output(output: &Path, password: &str) {
     );
     let root_ref = reopened.root_ref().expect("encrypted QDF output has /Root");
     reopened
-        .resolve(root_ref)
+        .resolve_object(root_ref)
         .expect("authenticated reader resolves the QDF root");
 }
 

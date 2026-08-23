@@ -723,7 +723,7 @@ mod tests {
             .expect("an empty survivor list removes /AcroForm");
         let root_ref = merged.root_ref().expect("root");
         let root = merged
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .expect("root dictionary");
@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(page_refs.len(), 2);
         for page_ref in page_refs {
             let page = merged
-                .resolve(page_ref)
+                .resolve_object(page_ref)
                 .expect("resolve merged page")
                 .into_dict()
                 .expect("merged page dictionary");
@@ -819,7 +819,9 @@ mod tests {
     /// fixture this helper serves keeps it direct.
     fn resolve_one_level(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: Object) -> Object {
         match value {
-            Object::Reference(reference) => pdf.resolve(reference).expect("resolve reference"), // cov:ignore: this fixture's /AcroForm is never re-indirected
+            Object::Reference(reference) => {
+                pdf.resolve_object(reference).expect("resolve reference")
+            } // cov:ignore: this fixture's /AcroForm is never re-indirected
             other => other,
         }
     }
@@ -843,7 +845,7 @@ mod tests {
         .expect("merge across a fields-less-AcroForm primary and a secondary source");
         let root_ref = merged.root_ref().expect("merged root");
         let root = merged
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve merged root")
             .into_dict()
             .expect("merged root dictionary");
@@ -884,7 +886,7 @@ mod tests {
         .expect("merge with the only AcroForm field on an unselected page");
         let root_ref = merged.root_ref().expect("merged root");
         let root = merged
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve merged root")
             .into_dict()
             .expect("merged root dictionary");
@@ -906,7 +908,7 @@ mod tests {
 
         let root_ref = pdf.root_ref().expect("root");
         let root = pdf
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .expect("root dictionary");

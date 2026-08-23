@@ -84,14 +84,14 @@ fn metadata_stream_result<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<Object> {
     let root = pdf.root_ref().expect("output must have a /Root");
-    let metadata_ref = match pdf.resolve(root).expect("resolve /Root") {
+    let metadata_ref = match pdf.resolve_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
         },
         other => panic!("/Root must be a dictionary, got {other:?}"),
     };
-    pdf.resolve(metadata_ref)
+    pdf.resolve_object(metadata_ref)
 }
 
 fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
@@ -413,7 +413,7 @@ fn objstm_with_indirect_length_adjacent_endstream_reads_members() {
     // Object 2 lives inside the ObjStm; resolving it forces the container's
     // indirect /Length to be recovered (adjacent endstream → holder 5 0 R).
     let pages_obj = pdf
-        .resolve(ObjectRef::new(2, 0))
+        .resolve_object(ObjectRef::new(2, 0))
         .expect("compressed member must resolve through the indirect-length ObjStm");
     match pages_obj {
         Object::Dictionary(d) => assert_eq!(
@@ -434,7 +434,7 @@ fn objstm_with_unusable_indirect_length_recovers_members_with_warnings() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
     let pages_obj = pdf
-        .resolve(ObjectRef::new(2, 0))
+        .resolve_object(ObjectRef::new(2, 0))
         .expect("bounded recovery must preserve the compressed member");
     assert_eq!(
         pages_obj.as_dict().and_then(|dict| dict.get("Type")),

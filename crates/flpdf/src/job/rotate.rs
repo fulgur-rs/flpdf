@@ -287,7 +287,7 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let mut parent = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .unwrap()
             .into_dict()
             .expect("parent must be a dictionary");
@@ -305,7 +305,7 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let mut page = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");
@@ -334,7 +334,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let mut page = pdf
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");
@@ -358,7 +358,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let mut page = pdf
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");
@@ -486,7 +486,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let mut page = pdf
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");
@@ -516,7 +516,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let mut page = pdf
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");
@@ -546,7 +546,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         let mut page = pdf
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .unwrap()
             .into_dict()
             .expect("page must be a dictionary");
@@ -918,7 +918,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
             panic!("not a dict")
         };
         assert!(d.get("Rotate").is_none());
@@ -934,7 +934,7 @@ mod tests {
         let buf = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut pdf2 = Pdf::open(Cursor::new(buf)).unwrap();
         let p2 = pages::page_refs(&mut pdf2).unwrap()[0];
-        let Object::Dictionary(d2) = pdf2.resolve(p2).unwrap() else {
+        let Object::Dictionary(d2) = pdf2.resolve_object(p2).unwrap() else {
             panic!("not a dict")
         };
         assert!(d2.get("Rotate").is_none());
@@ -949,7 +949,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
         let after = pages::page_content_bytes(&mut pdf, page).unwrap();
         assert_eq!(before, after, "content must be untouched when rotate==0");
-        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
             panic!("not a dict")
         };
         let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
@@ -963,7 +963,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
             panic!("not a dict")
         };
         assert!(d.get("Rotate").is_none());
@@ -988,7 +988,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
             panic!("not a dict")
         };
         // 90deg map (x,y)->(y, 200 - x): corners (10,10),(190,290) ->
@@ -1049,14 +1049,14 @@ mod tests {
 
         // 90deg map (x,y)->(y, 200 - x): corners (10,20),(60,40) ->
         // (20,190),(40,140) -> bbox [20 140 40 190].
-        let page_dict = pdf.resolve(page).unwrap().into_dict().unwrap();
+        let page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
         let annot = page_dict
             .get("Annots")
             .and_then(Object::as_array)
             .and_then(|annots| annots.first())
             .and_then(Object::as_ref_id)
             .expect("flattened annotation must remain on the page");
-        let Object::Dictionary(ad) = pdf.resolve(annot).unwrap() else {
+        let Object::Dictionary(ad) = pdf.resolve_object(annot).unwrap() else {
             panic!("not a dict")
         };
         let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
@@ -1072,7 +1072,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         let page_dict = pdf
-            .resolve(page)
+            .resolve_object(page)
             .unwrap()
             .into_dict()
             .expect("not a page dict");
@@ -1084,7 +1084,7 @@ mod tests {
             .iter()
             .map(|annotation| {
                 let annotation = match annotation {
-                    Object::Reference(reference) => pdf.resolve(*reference).unwrap(),
+                    Object::Reference(reference) => pdf.resolve_object(*reference).unwrap(),
                     direct => direct.clone(), // cov:ignore: qpdf transformAnnotations materializes every transformed annotation as an indirect object; retain this malformed-fixture fallback.
                 };
                 let annotation = annotation.into_dict().expect("annotation dictionary");
@@ -1097,7 +1097,11 @@ mod tests {
             rects,
             vec![(20.0, 140.0, 40.0, 190.0), (30.0, 130.0, 50.0, 180.0)]
         );
-        let original = pdf.resolve(indirect_annot).unwrap().into_dict().unwrap();
+        let original = pdf
+            .resolve_object(indirect_annot)
+            .unwrap()
+            .into_dict()
+            .unwrap();
         assert_eq!(
             object_to_pagebox(original.get("Rect").unwrap()),
             Some(PageBox::new(20.0, 30.0, 70.0, 50.0))
@@ -1128,14 +1132,14 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         // Same mapping as the direct-array case: [10 20 60 40] -> [20 140 40 190].
-        let page_dict = pdf.resolve(page).unwrap().into_dict().unwrap();
+        let page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
         let annot = page_dict
             .get("Annots")
             .and_then(Object::as_array)
             .and_then(|annots| annots.first())
             .and_then(Object::as_ref_id)
             .expect("flattened annotation must be indirect");
-        let Object::Dictionary(ad) = pdf.resolve(annot).unwrap() else {
+        let Object::Dictionary(ad) = pdf.resolve_object(annot).unwrap() else {
             panic!("not a dict")
         };
         let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
@@ -1163,7 +1167,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         let before = pages::page_content_bytes(&mut pdf, page).unwrap();
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
-        let Object::Dictionary(d) = pdf.resolve(page).unwrap() else {
+        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
             panic!("not a dict")
         };
         assert!(d.get("Rotate").is_none());

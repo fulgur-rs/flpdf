@@ -942,7 +942,7 @@ mod tests {
     fn qpdf_document_flatten_empty_page_exercises_public_contract() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
-        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("fixture page must remain a dictionary"); // cov:ignore: fixture invariant
         };
         assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
@@ -951,7 +951,7 @@ mod tests {
     #[test]
     fn direct_page_rotate_resolves_an_indirect_integer() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
         };
         page.insert("Rotate", Object::Reference(ObjectRef::new(4, 0)));
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn qpdf_flatten_expands_a_multihop_contents_array() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
         };
         page.insert("Contents", Object::Reference(ObjectRef::new(6, 0)));
@@ -1061,7 +1061,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1113,7 +1113,8 @@ mod tests {
         // qpdf shape where `analyze()` skips the orphan-widget fallback.
         let mut acroform = Dictionary::new();
         acroform.insert("DR", Object::Reference(ObjectRef::new(6, 0)));
-        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap()
+        else {
             panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
         };
         catalog.insert("AcroForm", Object::Dictionary(acroform));
@@ -1122,7 +1123,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1197,7 +1198,8 @@ mod tests {
         let mut acroform = Dictionary::new();
         acroform.insert("Fields", Object::Array(Vec::new()));
         acroform.insert("DR", Object::Dictionary(default_resources));
-        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap()
+        else {
             panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
         };
         catalog.insert("AcroForm", Object::Dictionary(acroform));
@@ -1269,7 +1271,7 @@ mod tests {
             .unwrap();
 
         for appearance_ref in [ObjectRef::new(5, 0), ObjectRef::new(7, 0)] {
-            let Object::Stream(appearance) = pdf.resolve(appearance_ref).unwrap() else {
+            let Object::Stream(appearance) = pdf.resolve_object(appearance_ref).unwrap() else {
                 panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
             };
             let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1282,7 +1284,8 @@ mod tests {
             assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
         }
 
-        let Object::Dictionary(original_resources) = pdf.resolve(ObjectRef::new(9, 0)).unwrap()
+        let Object::Dictionary(original_resources) =
+            pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
         else {
             panic!("original shared resources must remain a dictionary"); // cov:ignore: fixture invariant
         };
@@ -1291,7 +1294,8 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(20, 0))),
             "shared resources object must keep its own indirect Font reference, unmerged"
         );
-        let Object::Dictionary(original_font) = pdf.resolve(ObjectRef::new(20, 0)).unwrap() else {
+        let Object::Dictionary(original_font) = pdf.resolve_object(ObjectRef::new(20, 0)).unwrap()
+        else {
             panic!("original shared font dictionary must remain a dictionary"); // cov:ignore: fixture invariant
         };
         let mut expected_original_font = Dictionary::new();
@@ -1340,7 +1344,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .expect("an unrelated destination-only category must never be touched");
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1395,7 +1399,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1467,7 +1471,8 @@ mod tests {
         // The appearance's own /ProcSet must already have an array category
         // for the array-merge branch (and thus resolve_array_item_handles)
         // to run at all -- reuse the destination-array-category shape.
-        let Object::Stream(mut appearance_obj) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(mut appearance_obj) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap()
+        else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Object::Dictionary(mut resources) = appearance_obj.dict.remove("Resources").unwrap()
@@ -1483,7 +1488,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1538,7 +1543,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Array(proc_set) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+        let Object::Array(proc_set) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap() else {
             panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
         };
         assert_eq!(
@@ -1563,7 +1568,7 @@ mod tests {
         //
         // mark_object_handle_mutated (reader.rs) evicts the object's
         // legacy_materialized_memo entry as its cache-invalidation step; a
-        // prior pdf.resolve() populates that cache, so this test warms it
+        // prior pdf.resolve_object() populates that cache, so this test warms it
         // *before* the merge and re-resolves *after* -- if the /ProcSet
         // mutation that ran before the /XObject failure was never marked
         // dirty, the second resolve would still return the pre-merge
@@ -1603,7 +1608,8 @@ mod tests {
             .unwrap();
 
         // Warm pdf.resolve's cache with the pre-merge snapshot.
-        let Object::Array(proc_set_before) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+        let Object::Array(proc_set_before) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
+        else {
             panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
         };
         assert_eq!(proc_set_before, vec![Object::Name(b"PDF".to_vec())]);
@@ -1619,7 +1625,8 @@ mod tests {
             Error::System(message) if message == "stream objects cannot be cloned"
         ));
 
-        let Object::Array(proc_set_after) = pdf.resolve(ObjectRef::new(9, 0)).unwrap() else {
+        let Object::Array(proc_set_after) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
+        else {
             panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
         };
         assert_eq!(
@@ -1629,7 +1636,7 @@ mod tests {
                 Object::Name(b"Text".to_vec())
             ],
             "the /ProcSet merge that ran before the /XObject failure must invalidate the \
-             pre-merge pdf.resolve() snapshot, not return it stale"
+             pre-merge pdf.resolve_object() snapshot, not return it stale"
         );
     }
 
@@ -1676,7 +1683,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1730,7 +1737,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1780,7 +1787,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1826,7 +1833,7 @@ mod tests {
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1867,7 +1874,12 @@ mod tests {
         widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
         widget.insert("AP", Object::Dictionary(appearance));
 
-        let mut page = pdf.resolve(page_ref).unwrap().as_dict().unwrap().clone();
+        let mut page = pdf
+            .resolve_object(page_ref)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone();
         page.insert("Annots", Object::Array(vec![Object::Dictionary(widget)]));
         pdf.set_object(page_ref, Object::Dictionary(page));
 
@@ -1876,7 +1888,7 @@ mod tests {
             .unwrap();
         merge_widget_default_resources_on_page(&mut pdf, page_ref, &default_resources).unwrap();
 
-        let page = pdf.resolve(page_ref).unwrap();
+        let page = pdf.resolve_object(page_ref).unwrap();
         let annots = page
             .as_dict()
             .unwrap()
@@ -1913,7 +1925,7 @@ mod tests {
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
 
-        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("fixture page must remain a dictionary"); // cov:ignore: fixture invariant
         };
         assert!(page.get("Annots").is_none());
@@ -1992,14 +2004,14 @@ mod tests {
         );
         acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
         pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
-        let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
             panic!("fixture root must be a dictionary"); // cov:ignore: fixture invariant
         };
         root.insert("AcroForm", Object::Reference(ObjectRef::new(9, 0)));
         pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(root));
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
-        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(12, 0)).unwrap() else {
+        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(12, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
         };
         let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -2009,7 +2021,7 @@ mod tests {
             panic!("appearance must retain Font resources"); // cov:ignore: fixture invariant
         };
         assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
-        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
         };
         assert_eq!(
@@ -2019,7 +2031,7 @@ mod tests {
             ))]))
         );
         assert!(page.get("Contents").is_some());
-        let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
             panic!("fixture root must be a dictionary"); // cov:ignore: fixture invariant
         };
         assert!(root.get("AcroForm").is_none());
@@ -2292,7 +2304,7 @@ mod tests {
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
             1
         );
-        let page_object = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+        let page_object = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
         let page = page_object.as_dict().unwrap();
         assert!(page.get("Annots").is_none());
         assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))

@@ -252,7 +252,7 @@ fn walk_kid_ref<R: Read + Seek>(
     if !state.visited.insert(r) {
         return Ok(());
     }
-    match pdf.resolve(r)? {
+    match pdf.resolve_object(r)? {
         Object::Dictionary(dict) => {
             let (dict, changed) = process_elem_dict(pdf, dict, surviving, depth, max_depth, state)?;
             if changed {
@@ -465,7 +465,10 @@ mod tests {
     }
 
     fn elem_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
-        match pdf.resolve(ObjectRef::new(num, 0)).expect("resolve elem") {
+        match pdf
+            .resolve_object(ObjectRef::new(num, 0))
+            .expect("resolve elem")
+        {
             Object::Dictionary(d) => d,
             other => panic!("object {num} is not a dictionary: {other:?}"),
         }
@@ -844,7 +847,7 @@ mod tests {
 
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("pg drop");
 
-        let arr = match pdf.resolve(ObjectRef::new(25, 0)).expect("array") {
+        let arr = match pdf.resolve_object(ObjectRef::new(25, 0)).expect("array") {
             Object::Array(items) => items,
             other => panic!("object 25 is not an array: {other:?}"),
         };

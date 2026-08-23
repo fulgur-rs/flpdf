@@ -504,7 +504,7 @@ fn missing_default_appearance_is_noop_but_fields_still_walk() {
         vec![ObjectRef::new(5, 0)]
     );
 
-    let field = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
+    let field = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
     let Object::Dictionary(field_dict) = field else {
         panic!("field should be a dictionary");
     };
@@ -564,14 +564,14 @@ fn default_appearance_materializes_direct_catalog_acroform() {
         .set_default_appearance(da.clone())
         .unwrap();
 
-    let catalog = pdf.resolve(ObjectRef::new(1, 0)).unwrap();
+    let catalog = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap();
     let Object::Dictionary(catalog_dict) = catalog else {
         panic!("catalog should be a dictionary");
     };
     let acroform_ref = catalog_dict
         .get_ref("AcroForm")
         .expect("direct AcroForm should be materialized as an indirect object");
-    let acroform = pdf.resolve(acroform_ref).unwrap();
+    let acroform = pdf.resolve_object(acroform_ref).unwrap();
     let Object::Dictionary(acroform_dict) = acroform else {
         panic!("AcroForm should be a dictionary");
     };
@@ -593,7 +593,7 @@ fn default_appearance_is_read_as_inherited_without_materializing_fields() {
         .set_default_appearance(da.clone())
         .unwrap();
 
-    let acroform = pdf.resolve(ObjectRef::new(4, 0)).unwrap();
+    let acroform = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap();
     let Object::Dictionary(acroform_dict) = acroform else {
         panic!("AcroForm should be a dictionary");
     };
@@ -603,7 +603,7 @@ fn default_appearance_is_read_as_inherited_without_materializing_fields() {
     assert_eq!(fields[1].object_ref, ObjectRef::new(6, 0));
     assert_eq!(fields[1].default_appearance, Some(Object::String(da)));
 
-    let child = pdf.resolve(ObjectRef::new(6, 0)).unwrap();
+    let child = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap();
     let Object::Dictionary(child_dict) = child else {
         panic!("child field should be a dictionary");
     };
@@ -625,7 +625,7 @@ fn parent_field_appearance_is_read_as_inherited_without_materialization() {
         Some(Object::String(b"/Parent 11 Tf 1 0 0 rg".to_vec()))
     );
 
-    let child = pdf.resolve(ObjectRef::new(6, 0)).unwrap();
+    let child = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap();
     let Object::Dictionary(child_dict) = child else {
         panic!("child field should be a dictionary");
     };
@@ -728,7 +728,7 @@ fn set_need_appearances_replaces_true_and_removes_false() {
 
     pdf.acroform().unwrap().set_need_appearances(false).unwrap();
     assert!(!pdf.acroform().unwrap().get_need_appearances().unwrap());
-    let acroform = pdf.resolve(ObjectRef::new(4, 0)).unwrap();
+    let acroform = pdf.resolve_object(ObjectRef::new(4, 0)).unwrap();
     assert_eq!(acroform.as_dict().unwrap().get("NeedAppearances"), None);
 
     // qpdf's removeKey is also a no-op when the key is already absent.
@@ -766,7 +766,7 @@ fn generate_appearances_if_needed_updates_widgets_and_clears_marker() {
         .unwrap();
 
     assert!(!pdf.acroform().unwrap().get_need_appearances().unwrap());
-    let widget = pdf.resolve(ObjectRef::new(6, 0)).unwrap();
+    let widget = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap();
     let normal = widget
         .as_dict()
         .and_then(|dict| dict.get("AP"))
@@ -774,7 +774,7 @@ fn generate_appearances_if_needed_updates_widgets_and_clears_marker() {
         .and_then(|dict| dict.get("N"))
         .and_then(Object::as_ref_id)
         .expect("generated widget normal appearance");
-    assert!(pdf.resolve(normal).unwrap().as_stream().is_some());
+    assert!(pdf.resolve_object(normal).unwrap().as_stream().is_some());
 }
 
 #[test]
@@ -803,7 +803,7 @@ fn generate_appearances_if_needed_synchronizes_checkbox_value() {
         .unwrap();
 
     assert!(!pdf.acroform().unwrap().get_need_appearances().unwrap());
-    let widget = pdf.resolve(ObjectRef::new(5, 0)).unwrap();
+    let widget = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();
     let widget = widget.as_dict().unwrap();
     assert!(matches!(widget.get("V"), Some(Object::Name(name)) if name == b"Yes"));
     assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));

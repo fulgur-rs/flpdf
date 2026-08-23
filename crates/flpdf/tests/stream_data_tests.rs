@@ -91,7 +91,9 @@ fn make_pdf_with_stream(raw: &[u8], filter: Option<&[u8]>) -> Vec<u8> {
 /// Decode stream data from `object 4 0 R` in the given PDF bytes.
 fn extract_stream_obj(pdf_bytes: &[u8]) -> Stream {
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes.to_vec())).expect("open");
-    let obj = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve 4 0 R");
+    let obj = pdf
+        .resolve_object(ObjectRef::new(4, 0))
+        .expect("resolve 4 0 R");
     match obj {
         Object::Stream(s) => s,
         other => panic!("expected stream, got {other:?}"),

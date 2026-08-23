@@ -254,7 +254,7 @@ mod tests {
     }
 
     fn annot(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
-        pdf.resolve(ObjectRef::new(num, 0))
+        pdf.resolve_object(ObjectRef::new(num, 0))
             .expect("resolve annot")
             .into_dict()
             .expect("annot object is a dictionary")
@@ -452,7 +452,7 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("non-dict target skipped");
         assert_eq!(
-            pdf.resolve(ObjectRef::new(30, 0)).expect("resolve"),
+            pdf.resolve_object(ObjectRef::new(30, 0)).expect("resolve"),
             Object::Integer(42),
             "a non-dict OBJR /Obj target must be left unchanged",
         );
@@ -533,7 +533,10 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("stream target skipped without error");
         assert!(
-            matches!(pdf.resolve(ObjectRef::new(30, 0)), Ok(Object::Stream(_))),
+            matches!(
+                pdf.resolve_object(ObjectRef::new(30, 0)),
+                Ok(Object::Stream(_))
+            ),
             "a stream OBJR /Obj target must be left unchanged",
         );
     }

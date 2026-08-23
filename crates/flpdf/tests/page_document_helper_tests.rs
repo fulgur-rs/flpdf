@@ -118,10 +118,10 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
 
 /// Embed the existing page-tree root directly in the catalog, as qpdf permits.
 fn make_catalog_pages_root_direct(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
-    let Object::Dictionary(pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(pages));
@@ -129,7 +129,7 @@ fn make_catalog_pages_root_direct(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
 }
 
 fn assert_direct_catalog_pages_root(pdf: &mut Pdf<Cursor<Vec<u8>>>, expected_count: i64) {
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     let Some(Object::Dictionary(pages)) = catalog.get("Pages") else {
@@ -143,7 +143,7 @@ fn assert_direct_catalog_pages_root(pdf: &mut Pdf<Cursor<Vec<u8>>>, expected_cou
     let expected_parent = Object::Dictionary(pages.clone());
 
     for page in PageDocumentHelper::new(pdf).get_all_pages().unwrap() {
-        let Object::Dictionary(page) = pdf.resolve(page).unwrap() else {
+        let Object::Dictionary(page) = pdf.resolve_object(page).unwrap() else {
             panic!("page must remain a dictionary");
         };
         assert_eq!(
@@ -305,7 +305,7 @@ fn add_page_indirects_a_direct_page_input() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_eq!(pages.len(), 2);
     assert_ne!(pages[1], ObjectRef::new(3, 0));
-    let Object::Dictionary(page) = pdf.resolve(pages[1]).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(pages[1]).unwrap() else {
         panic!("direct input must become an indirect page dictionary");
     };
     assert_eq!(
@@ -330,7 +330,7 @@ fn add_page_duplicate_does_not_overwrite_a_handle_only_object() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_ne!(pages[1], reserved_ref);
     assert_eq!(
-        pdf.resolve(reserved_ref).unwrap(),
+        pdf.resolve_object(reserved_ref).unwrap(),
         Object::Integer(42),
         "duplicating a page must not reuse a handle-registry object number"
     );
@@ -339,10 +339,12 @@ fn add_page_duplicate_does_not_overwrite_a_handle_only_object() {
 #[test]
 fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
     let mut source = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut source_root) = source.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut source_root) = source.resolve_object(ObjectRef::new(2, 0)).unwrap()
+    else {
         panic!("source /Pages must be a dictionary");
     };
-    let Object::Dictionary(mut source_page) = source.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut source_page) = source.resolve_object(ObjectRef::new(3, 0)).unwrap()
+    else {
         panic!("source page must be a dictionary");
     };
     let media_box = source_page.remove("MediaBox").unwrap();
@@ -356,7 +358,7 @@ fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
         .unwrap();
 
     let Object::Dictionary(materialized_source_page) =
-        source.resolve(ObjectRef::new(3, 0)).unwrap()
+        source.resolve_object(ObjectRef::new(3, 0)).unwrap()
     else {
         panic!("source page must remain a dictionary");
     };
@@ -369,7 +371,7 @@ fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
         .get_all_pages()
         .unwrap();
     assert_eq!(target_pages.len(), 2);
-    let Object::Dictionary(copied_page) = target.resolve(target_pages[1]).unwrap() else {
+    let Object::Dictionary(copied_page) = target.resolve_object(target_pages[1]).unwrap() else {
         panic!("foreign input must produce a target page dictionary");
     };
     assert!(
@@ -384,7 +386,7 @@ fn add_page_uses_qpdf_copy_foreign_object_null_key_filtering() {
     let mut source = open(build_n_page_pdf(1));
     let indirect_null = ObjectRef::new(10, 0);
     source.set_object(indirect_null, Object::Null);
-    let Object::Dictionary(mut page) = source.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = source.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("source page must be a dictionary");
     };
     page.insert("IndirectNull", Object::Reference(indirect_null));
@@ -398,7 +400,7 @@ fn add_page_uses_qpdf_copy_foreign_object_null_key_filtering() {
     let pages = PageDocumentHelper::new(&mut target)
         .get_all_pages()
         .expect("target pages");
-    let Object::Dictionary(copied_page) = target.resolve(pages[1]).unwrap() else {
+    let Object::Dictionary(copied_page) = target.resolve_object(pages[1]).unwrap() else {
         panic!("foreign input must produce a target page dictionary");
     };
     assert!(
@@ -438,7 +440,7 @@ fn add_page_recopies_a_page_left_as_a_nested_boundary_placeholder() {
         .get_all_pages()
         .unwrap();
     assert_eq!(pages.len(), 2);
-    let Object::Dictionary(copied_page) = target.resolve(pages[1]).unwrap() else {
+    let Object::Dictionary(copied_page) = target.resolve_object(pages[1]).unwrap() else {
         panic!(
             "foreign input must produce a real target page dictionary, not the \
              leftover null placeholder left by the canonical port's nested-page \
@@ -459,7 +461,7 @@ fn add_page_reuses_foreign_resources_from_the_same_source() {
     resources.insert("Font", Object::Dictionary(Dictionary::new()));
     source.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
     for page_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
-        let Object::Dictionary(mut page) = source.resolve(page_ref).unwrap() else {
+        let Object::Dictionary(mut page) = source.resolve_object(page_ref).unwrap() else {
             panic!("source page must be a dictionary");
         };
         page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
@@ -476,10 +478,10 @@ fn add_page_reuses_foreign_resources_from_the_same_source() {
     let pages = PageDocumentHelper::new(&mut target)
         .get_all_pages()
         .unwrap();
-    let Object::Dictionary(first) = target.resolve(pages[1]).unwrap() else {
+    let Object::Dictionary(first) = target.resolve_object(pages[1]).unwrap() else {
         panic!("first imported page must be a dictionary");
     };
-    let Object::Dictionary(second) = target.resolve(pages[2]).unwrap() else {
+    let Object::Dictionary(second) = target.resolve_object(pages[2]).unwrap() else {
         panic!("second imported page must be a dictionary");
     };
     assert_eq!(
@@ -492,7 +494,8 @@ fn add_page_reuses_foreign_resources_from_the_same_source() {
 #[test]
 fn add_page_does_not_copy_a_second_page_referenced_by_a_foreign_page() {
     let mut source = open(build_n_page_pdf(2));
-    let Object::Dictionary(mut source_page) = source.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut source_page) = source.resolve_object(ObjectRef::new(3, 0)).unwrap()
+    else {
         panic!("source page must be a dictionary");
     };
     source_page.insert("Peer", Object::Reference(ObjectRef::new(4, 0)));
@@ -506,14 +509,14 @@ fn add_page_does_not_copy_a_second_page_referenced_by_a_foreign_page() {
     let pages = PageDocumentHelper::new(&mut target)
         .get_all_pages()
         .unwrap();
-    let Object::Dictionary(copied_page) = target.resolve(pages[1]).unwrap() else {
+    let Object::Dictionary(copied_page) = target.resolve_object(pages[1]).unwrap() else {
         panic!("foreign input must produce a target page dictionary");
     };
     let peer = copied_page
         .get_ref("Peer")
         .expect("qpdf reserves a target identity for the non-top-level Page");
     assert_eq!(
-        target.resolve(peer).unwrap(),
+        target.resolve_object(peer).unwrap(),
         Object::Null,
         "qpdf copyForeignObject leaves the non-top-level Page reservation null"
     );
@@ -526,7 +529,7 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
 
     assert_eq!(pages, vec![ObjectRef::new(3, 0)]);
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     assert_eq!(
@@ -540,8 +543,8 @@ fn get_all_pages_repairs_catalog_pages_pointer() {
 #[test]
 fn get_all_pages_follows_parent_from_direct_catalog_page_value() {
     let mut pdf = open(build_n_page_pdf(2));
-    let direct_page = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let direct_page = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", direct_page);
@@ -550,7 +553,7 @@ fn get_all_pages_follows_parent_from_direct_catalog_page_value() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_eq!(pages, vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
 
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     assert_eq!(
@@ -562,10 +565,10 @@ fn get_all_pages_follows_parent_from_direct_catalog_page_value() {
 #[test]
 fn get_all_pages_traverses_a_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(pages));
@@ -577,7 +580,7 @@ fn get_all_pages_traverses_a_direct_catalog_pages_root() {
         "qpdf traverses a direct catalog /Pages dictionary without materializing it"
     );
 
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     assert!(
@@ -617,7 +620,7 @@ fn push_inherited_attributes_marks_qpdf_json_observation() {
 #[test]
 fn get_all_pages_returns_empty_when_catalog_has_no_pages() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.remove("Pages");
@@ -635,7 +638,7 @@ fn get_all_pages_returns_empty_when_catalog_has_no_pages() {
 #[test]
 fn get_all_pages_returns_empty_when_catalog_pages_is_not_a_dictionary() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Integer(42));
@@ -650,7 +653,7 @@ fn get_all_pages_returns_empty_when_catalog_pages_is_not_a_dictionary() {
 #[test]
 fn helper_flatten_annotations_repairs_page_tree_before_enumerating() {
     let mut pdf = open(build_n_page_pdf(2));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Reference(ObjectRef::new(3, 0)));
@@ -660,7 +663,7 @@ fn helper_flatten_annotations_repairs_page_tree_before_enumerating() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     assert_eq!(
@@ -714,7 +717,7 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
         annot.insert("AP", Object::Dictionary(ap));
         pdf.set_object(object_ref, Object::Dictionary(annot));
     }
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -736,7 +739,7 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
         ]),
     );
     pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("AcroForm", Object::Reference(ObjectRef::new(9, 0)));
@@ -775,7 +778,8 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
             .get_annotations_filtered(None)
             .unwrap();
         assert!(qpdf_annots.is_empty());
-        let Object::Dictionary(qpdf_catalog) = qpdf_output.resolve(ObjectRef::new(1, 0)).unwrap()
+        let Object::Dictionary(qpdf_catalog) =
+            qpdf_output.resolve_object(ObjectRef::new(1, 0)).unwrap()
         else {
             panic!("qpdf output catalog must be a dictionary");
         };
@@ -786,11 +790,11 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
         .flatten_annotations(0x4, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(page.get("Annots").is_none());
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     assert!(catalog.get("AcroForm").is_none());
@@ -832,7 +836,7 @@ fn helper_flatten_annotations_keeps_widgets_when_need_appearances_is_true() {
     );
     widget.insert("AP", Object::Dictionary(ap));
     pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert(
@@ -852,7 +856,7 @@ fn helper_flatten_annotations_keeps_widgets_when_need_appearances_is_true() {
         Object::Reference(ObjectRef::new(9, 0)),
     );
     pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("AcroForm", Object::Reference(ObjectRef::new(6, 0)));
@@ -862,11 +866,11 @@ fn helper_flatten_annotations_keeps_widgets_when_need_appearances_is_true() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(page.get("Annots").is_some());
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     assert!(catalog.get("AcroForm").is_some());
@@ -924,7 +928,7 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     );
     widget.insert("AP", Object::Dictionary(ap));
     pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert(
@@ -950,7 +954,7 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
         Object::Reference(ObjectRef::new(9, 0)),
     );
     pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("AcroForm", Object::Reference(ObjectRef::new(6, 0)));
@@ -964,7 +968,7 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     // (`QPDFPageDocumentHelper.cc:108-113`): the merge target becomes a
     // direct, private copy embedded in the appearance's own dict, so the
     // merge never mutates the original (possibly shared) indirect object.
-    let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
         panic!("appearance must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -979,7 +983,8 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     // The original indirect resources object (and its indirect Font
     // sub-dictionary) must be untouched: privatization means the merge
     // writes into the copy, never the shared original.
-    let Object::Dictionary(original_resources) = pdf.resolve(ObjectRef::new(13, 0)).unwrap() else {
+    let Object::Dictionary(original_resources) = pdf.resolve_object(ObjectRef::new(13, 0)).unwrap()
+    else {
         panic!("original referenced resources must remain a dictionary");
     };
     assert_eq!(
@@ -987,7 +992,8 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
         Some(&Object::Reference(ObjectRef::new(7, 0))),
         "original resources object must keep its own indirect Font reference, unmerged"
     );
-    let Object::Dictionary(original_fonts) = pdf.resolve(ObjectRef::new(8, 0)).unwrap() else {
+    let Object::Dictionary(original_fonts) = pdf.resolve_object(ObjectRef::new(8, 0)).unwrap()
+    else {
         panic!("original font dictionary must remain a dictionary");
     };
     let mut expected_original_fonts = Dictionary::new();
@@ -1006,7 +1012,7 @@ fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(
@@ -1090,7 +1096,7 @@ fn helper_flatten_annotations_resolves_widget_appearance_before_need_appearances
     PageDocumentHelper::new(&mut pdf)
         .flatten_annotations(0, 0x3)
         .expect("qpdf resolves the selected appearance before skipping a Widget");
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(
@@ -1129,7 +1135,7 @@ fn helper_flatten_annotations_defers_widget_rect_validation_past_resource_merge(
 
     let mut acroform = Dictionary::new();
     acroform.insert("DR", Object::Reference(ObjectRef::new(6, 0)));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("AcroForm", Object::Dictionary(acroform));
@@ -1149,7 +1155,7 @@ fn helper_flatten_annotations_defers_widget_rect_validation_past_resource_merge(
         "qpdf's resource merge must not materialize /Rect before the flags gate"
     );
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(page.get("Annots").is_none());
@@ -1188,7 +1194,7 @@ fn helper_flatten_annotations_reuses_a_materialized_inline_appearance() {
     );
     widget.insert("AP", Object::Dictionary(ap));
     pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert(
@@ -1205,7 +1211,7 @@ fn helper_flatten_annotations_reuses_a_materialized_inline_appearance() {
     acroform.insert("Fields", Object::Array(Vec::new()));
     acroform.insert("DR", Object::Dictionary(dr));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(acroform));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("AcroForm", Object::Reference(ObjectRef::new(5, 0)));
@@ -1215,7 +1221,7 @@ fn helper_flatten_annotations_reuses_a_materialized_inline_appearance() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     let Some(Object::Dictionary(resources)) = page.get("Resources") else {
@@ -1227,7 +1233,7 @@ fn helper_flatten_annotations_reuses_a_materialized_inline_appearance() {
     let Some(Object::Reference(xobject_ref)) = xobjects.get("Fxo1") else {
         panic!("flattened appearance must use an indirect XObject");
     };
-    let Object::Stream(appearance) = pdf.resolve(*xobject_ref).unwrap() else {
+    let Object::Stream(appearance) = pdf.resolve_object(*xobject_ref).unwrap() else {
         panic!("registered XObject must be the materialized appearance");
     };
     let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
@@ -1247,7 +1253,7 @@ fn helper_flatten_annotations_materializes_indirect_page_resources_without_annot
     let mut resources = Dictionary::new();
     resources.insert("Font", Object::Dictionary(fonts));
     pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Resources", Object::Reference(ObjectRef::new(4, 0)));
@@ -1257,7 +1263,7 @@ fn helper_flatten_annotations_materializes_indirect_page_resources_without_annot
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     let Some(Object::Dictionary(resources)) = page.get("Resources") else {
@@ -1269,7 +1275,7 @@ fn helper_flatten_annotations_materializes_indirect_page_resources_without_annot
 #[test]
 fn helper_flatten_annotations_replaces_invalid_page_resources() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Resources", Object::Integer(42));
@@ -1279,7 +1285,7 @@ fn helper_flatten_annotations_replaces_invalid_page_resources() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
@@ -1329,7 +1335,7 @@ fn helper_flatten_annotations_preserves_indirect_annots_holder_when_an_annotatio
             Object::Reference(ObjectRef::new(6, 0)),
         ]),
     );
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Annots", Object::Reference(ObjectRef::new(7, 0)));
@@ -1339,7 +1345,7 @@ fn helper_flatten_annotations_preserves_indirect_annots_holder_when_an_annotatio
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert_eq!(
@@ -1347,7 +1353,7 @@ fn helper_flatten_annotations_preserves_indirect_annots_holder_when_an_annotatio
         Some(&Object::Reference(ObjectRef::new(7, 0)))
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(7, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(7, 0)).unwrap(),
         Object::Array(vec![Object::Reference(ObjectRef::new(6, 0))])
     );
 }
@@ -1392,7 +1398,7 @@ fn helper_flatten_annotations_expands_indirect_contents_and_wraps_empty_output()
     );
     annot.insert("AP", Object::Dictionary(ap));
     pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(annot));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(6, 0)));
@@ -1406,7 +1412,7 @@ fn helper_flatten_annotations_expands_indirect_contents_and_wraps_empty_output()
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(page.get("Annots").is_none());
@@ -1436,7 +1442,7 @@ fn helper_flatten_annotations_wraps_when_non_null_ap_has_no_normal_stream() {
     let mut annot = Dictionary::new();
     annot.insert("AP", Object::Integer(1));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(annot));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -1450,7 +1456,7 @@ fn helper_flatten_annotations_wraps_when_non_null_ap_has_no_normal_stream() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert!(page.get("Annots").is_none());
@@ -1476,7 +1482,7 @@ fn helper_flatten_annotations_keeps_an_indirect_null_appearance() {
     let mut annot = Dictionary::new();
     annot.insert("AP", Object::Reference(ObjectRef::new(6, 0)));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(annot));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert(
@@ -1489,7 +1495,7 @@ fn helper_flatten_annotations_keeps_an_indirect_null_appearance() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert_eq!(
@@ -1519,7 +1525,7 @@ fn helper_flatten_annotations_prunes_a_chained_annots_holder() {
             Object::Reference(ObjectRef::new(5, 0)),
         ]),
     );
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Annots", Object::Reference(ObjectRef::new(6, 0)));
@@ -1529,7 +1535,7 @@ fn helper_flatten_annotations_prunes_a_chained_annots_holder() {
         .flatten_annotations(0, 0x3)
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert_eq!(
@@ -1537,7 +1543,7 @@ fn helper_flatten_annotations_prunes_a_chained_annots_holder() {
         Some(&Object::Reference(ObjectRef::new(6, 0)))
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(6, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(6, 0)).unwrap(),
         Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
         "qpdf replaces the outer /Annots holder with the retained annotations"
     );
@@ -1576,7 +1582,7 @@ fn helper_flatten_annotations_looks_up_non_utf8_appearance_state_bytes() {
         ]),
     );
     pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annot));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert(
@@ -1631,7 +1637,7 @@ fn helper_flatten_annotations_applies_no_rotate_using_leaf_rotate() {
     );
     annot.insert("AP", Object::Dictionary(ap));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(annot));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Rotate", Object::Integer(90));
@@ -1655,7 +1661,7 @@ fn helper_flatten_annotations_applies_no_rotate_using_leaf_rotate() {
 #[test]
 fn get_all_pages_rejects_a_pages_tree_cycle() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     pages.insert(
@@ -1686,7 +1692,7 @@ fn get_all_pages_rejects_a_revisited_pages_subtree_like_qpdf() {
     interior.insert("Count", Object::Integer(1));
     pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(interior));
 
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     root.insert(
@@ -1721,7 +1727,7 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(indirect_interior));
     pdf.set_object(ObjectRef::new(12, 0), Object::Integer(12));
 
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     let mut direct_leaf = Dictionary::new();
@@ -1764,7 +1770,7 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
         "qpdf traverses direct nodes in place, promotes direct leaves, retains indirect scalar leaves, and clones duplicate leaves"
     );
 
-    let Object::Dictionary(minted_leaf) = pdf.resolve(ObjectRef::new(13, 0)).unwrap() else {
+    let Object::Dictionary(minted_leaf) = pdf.resolve_object(ObjectRef::new(13, 0)).unwrap() else {
         panic!("direct leaf must be made indirect");
     };
     assert_eq!(
@@ -1783,16 +1789,16 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     );
 
     assert_eq!(
-        pdf.resolve(ObjectRef::new(14, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(14, 0)).unwrap(),
         Object::Integer(42),
         "qpdf promotes a direct scalar kid without changing its value"
     );
     assert_eq!(
-        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(12, 0)).unwrap(),
         Object::Integer(12),
         "qpdf includes an indirect scalar kid in the flattened page order"
     );
-    let Object::Dictionary(cloned_leaf) = pdf.resolve(ObjectRef::new(15, 0)).unwrap() else {
+    let Object::Dictionary(cloned_leaf) = pdf.resolve_object(ObjectRef::new(15, 0)).unwrap() else {
         panic!("duplicate page must be copied as a dictionary");
     };
     assert_eq!(
@@ -1801,7 +1807,7 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
         "qpdf repairs the duplicate copy as a page"
     );
 
-    let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must remain a dictionary");
     };
     let Some(Object::Array(kids)) = root.get("Kids") else {
@@ -1855,7 +1861,7 @@ fn get_all_pages_rejects_an_overdeep_direct_pages_tree() {
         direct_interior.insert("Kids", Object::Array(vec![child]));
         child = Object::Dictionary(direct_interior);
     }
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     root.insert("Kids", Object::Array(vec![child]));
@@ -1873,7 +1879,7 @@ fn get_all_pages_rejects_an_overdeep_direct_pages_tree() {
 #[test]
 fn get_all_pages_ignores_a_direct_pages_node_with_non_array_kids() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     let mut direct_interior = Dictionary::new();
@@ -1897,7 +1903,7 @@ fn get_all_pages_ignores_a_direct_pages_node_with_non_array_kids() {
 #[test]
 fn push_inherited_attributes_materializes_rotate_on_leaf() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     pages.insert("Rotate", Object::Integer(90));
@@ -1907,7 +1913,7 @@ fn push_inherited_attributes_materializes_rotate_on_leaf() {
         .push_inherited_attributes_to_pages()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
@@ -1916,11 +1922,11 @@ fn push_inherited_attributes_materializes_rotate_on_leaf() {
 #[test]
 fn push_inherited_attributes_traverses_a_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     pages.insert("Rotate", Object::Integer(90));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(pages));
@@ -1930,11 +1936,11 @@ fn push_inherited_attributes_traverses_a_direct_catalog_pages_root() {
         .push_inherited_attributes_to_pages()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     assert!(matches!(catalog.get("Pages"), Some(Object::Dictionary(_))));
@@ -1943,7 +1949,7 @@ fn push_inherited_attributes_traverses_a_direct_catalog_pages_root() {
 #[test]
 fn push_inherited_attributes_traverses_direct_pages_descendants() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     let mut child = Dictionary::new();
@@ -1956,7 +1962,7 @@ fn push_inherited_attributes_traverses_direct_pages_descendants() {
     child.insert("Rotate", Object::Integer(90));
     root.insert("Kids", Object::Array(vec![Object::Dictionary(child)]));
     root.insert("Count", Object::Integer(1));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(root));
@@ -1966,7 +1972,7 @@ fn push_inherited_attributes_traverses_direct_pages_descendants() {
         .push_inherited_attributes_to_pages()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
@@ -1975,12 +1981,12 @@ fn push_inherited_attributes_traverses_direct_pages_descendants() {
 #[test]
 fn push_inherited_attributes_ignores_non_dictionary_direct_kids() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     root.insert("Kids", Object::Array(vec![Object::Integer(42)]));
     root.insert("Count", Object::Integer(0));
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(root));
@@ -2004,7 +2010,7 @@ fn remove_unreferenced_resources_prunes_unused_font_on_page() {
     let mut resources = Dictionary::new();
     resources.insert("Font", Object::Dictionary(fonts));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2015,7 +2021,7 @@ fn remove_unreferenced_resources_prunes_unused_font_on_page() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     let Object::Dictionary(resources) = page.get("Resources").cloned().unwrap() else {
@@ -2037,7 +2043,7 @@ fn remove_unreferenced_resources_preserves_non_dictionary_category() {
     );
     let mut resources = Dictionary::new();
     resources.insert("Font", Object::Integer(42));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2048,7 +2054,7 @@ fn remove_unreferenced_resources_preserves_non_dictionary_category() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must remain a dictionary");
     };
     let Some(Object::Dictionary(resources)) = page.get("Resources") else {
@@ -2069,7 +2075,8 @@ fn helper_resource_pruning_accepts_pages_without_content_or_resources() {
         ObjectRef::new(4, 0),
         Object::Stream(Stream::new(Dictionary::new(), b"q Q".to_vec())),
     );
-    let Object::Dictionary(mut page) = no_resources.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = no_resources.resolve_object(ObjectRef::new(3, 0)).unwrap()
+    else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2143,7 +2150,7 @@ fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
     resources.insert("Font", Object::Integer(99));
     resources.insert("XObject", Object::Dictionary(xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2154,14 +2161,14 @@ fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must remain a dictionary");
     };
     assert_eq!(
         page.get("Resources"),
         Some(&Object::Reference(ObjectRef::new(5, 0)))
     );
-    let Object::Dictionary(resources) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(resources) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
         panic!("page resources must remain an indirect dictionary");
     };
     assert_eq!(resources.get("Font"), Some(&Object::Integer(99)));
@@ -2176,7 +2183,7 @@ fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
     assert!(xobjects.get("Good").is_some());
     assert!(xobjects.get("Bad").is_some());
 
-    let Object::Stream(child) = pdf.resolve(ObjectRef::new(11, 0)).unwrap() else {
+    let Object::Stream(child) = pdf.resolve_object(ObjectRef::new(11, 0)).unwrap() else {
         panic!("child Form must remain a stream");
     };
     let Some(Object::Dictionary(child_resources)) = child.dict.get("Resources") else {
@@ -2228,7 +2235,7 @@ fn helper_resource_pruning_keeps_a_form_resources_after_a_content_parse_error() 
     let mut page_resources = Dictionary::new();
     page_resources.insert("XObject", Object::Dictionary(xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2239,7 +2246,7 @@ fn helper_resource_pruning_keeps_a_form_resources_after_a_content_parse_error() 
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(form) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("form must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
@@ -2251,7 +2258,7 @@ fn helper_resource_pruning_keeps_a_form_resources_after_a_content_parse_error() 
     assert!(fonts.get("F1").is_some());
     assert!(fonts.get("F2").is_some());
 
-    let Object::Stream(child) = pdf.resolve(ObjectRef::new(7, 0)).unwrap() else {
+    let Object::Stream(child) = pdf.resolve_object(ObjectRef::new(7, 0)).unwrap() else {
         panic!("child Form must remain a stream");
     };
     let Some(Object::Dictionary(child_resources)) = child.dict.get("Resources") else {
@@ -2297,7 +2304,7 @@ fn helper_resource_pruning_keeps_form_and_page_resources_for_unresolved_form_nam
     page_resources.insert("Font", Object::Dictionary(page_fonts));
     page_resources.insert("XObject", Object::Dictionary(page_xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2335,7 +2342,7 @@ fn helper_resource_pruning_keeps_form_and_page_resources_for_unresolved_form_nam
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(form) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("form must remain a stream");
     };
     let Some(Object::Dictionary(form_resources)) = form.dict.get("Resources") else {
@@ -2347,14 +2354,15 @@ fn helper_resource_pruning_keeps_form_and_page_resources_for_unresolved_form_nam
     assert!(form_fonts.get("F1").is_some());
     assert!(form_fonts.get("F2").is_some());
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must remain a dictionary");
     };
     assert_eq!(
         page.get("Resources"),
         Some(&Object::Reference(ObjectRef::new(5, 0)))
     );
-    let Object::Dictionary(page_resources) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+    let Object::Dictionary(page_resources) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap()
+    else {
         panic!("page resources must remain an indirect dictionary");
     };
     let Some(Object::Dictionary(page_fonts)) = page_resources.get("Font") else {
@@ -2428,7 +2436,7 @@ fn helper_resource_pruning_handles_form_local_resource_variants() {
     let mut page_resources = Dictionary::new();
     page_resources.insert("XObject", Object::Dictionary(page_xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2439,7 +2447,7 @@ fn helper_resource_pruning_handles_form_local_resource_variants() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(form) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("referenced Form must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
@@ -2478,7 +2486,7 @@ fn helper_prunes_unused_resources_inside_form_xobjects() {
     let mut page_resources = Dictionary::new();
     page_resources.insert("XObject", Object::Dictionary(xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2489,7 +2497,7 @@ fn helper_prunes_unused_resources_inside_form_xobjects() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(form) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("form must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
@@ -2543,7 +2551,7 @@ fn helper_prunes_declared_child_form_before_pruning_parent_xobjects() {
     let mut page_resources = Dictionary::new();
     page_resources.insert("XObject", Object::Dictionary(page_xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2554,7 +2562,7 @@ fn helper_prunes_declared_child_form_before_pruning_parent_xobjects() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(child) = pdf.resolve(ObjectRef::new(7, 0)).unwrap() else {
+    let Object::Stream(child) = pdf.resolve_object(ObjectRef::new(7, 0)).unwrap() else {
         panic!("declared child Form must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = child.dict.get("Resources") else {
@@ -2600,7 +2608,7 @@ fn helper_prunes_unused_resources_inside_a_holder_chained_form_xobject() {
     let mut resources = Dictionary::new();
     resources.insert("XObject", Object::Dictionary(xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2611,7 +2619,7 @@ fn helper_prunes_unused_resources_inside_a_holder_chained_form_xobject() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(form) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("terminal Form must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = form.dict.get("Resources") else {
@@ -2659,7 +2667,7 @@ fn helper_prunes_parent_form_resources_not_directly_used_by_resource_less_nested
     let mut page_resources = Dictionary::new();
     page_resources.insert("XObject", Object::Dictionary(page_xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2670,7 +2678,7 @@ fn helper_prunes_parent_form_resources_not_directly_used_by_resource_less_nested
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(parent) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(parent) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("parent Form must remain a stream");
     };
     let Some(Object::Dictionary(resources)) = parent.dict.get("Resources") else {
@@ -2735,7 +2743,7 @@ fn helper_keeps_nested_form_resource_scopes_isolated() {
     let mut page_resources = Dictionary::new();
     page_resources.insert("XObject", Object::Dictionary(page_xobjects));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
@@ -2746,7 +2754,7 @@ fn helper_keeps_nested_form_resource_scopes_isolated() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Stream(outer) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+    let Object::Stream(outer) = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap() else {
         panic!("outer Form must remain a stream");
     };
     let Some(Object::Dictionary(outer_resources)) = outer.dict.get("Resources") else {
@@ -2758,7 +2766,7 @@ fn helper_keeps_nested_form_resource_scopes_isolated() {
     assert!(outer_fonts.get("F1").is_none());
     assert!(outer_fonts.get("F2").is_none());
 
-    let Object::Stream(inner) = pdf.resolve(ObjectRef::new(7, 0)).unwrap() else {
+    let Object::Stream(inner) = pdf.resolve_object(ObjectRef::new(7, 0)).unwrap() else {
         panic!("inner Form must remain a stream");
     };
     let Some(Object::Dictionary(inner_resources)) = inner.dict.get("Resources") else {
@@ -2808,7 +2816,7 @@ fn remove_page_allows_an_empty_document() {
         .get_all_pages()
         .unwrap()
         .is_empty());
-    let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     assert_eq!(root.get("Kids"), Some(&Object::Array(Vec::new())));
@@ -2818,10 +2826,10 @@ fn remove_page_allows_an_empty_document() {
 #[test]
 fn remove_page_allows_an_empty_direct_catalog_pages_root() {
     let mut pdf = open(build_n_page_pdf(1));
-    let Object::Dictionary(pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(pages));
@@ -2856,7 +2864,7 @@ fn remove_page_allows_an_empty_direct_catalog_pages_root() {
         "canonical direct /Count must be zero before legacy resolution"
     );
 
-    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must remain a dictionary");
     };
     let Some(Object::Dictionary(pages)) = catalog.get("Pages") else {
@@ -2957,7 +2965,7 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
     let mut resources = Dictionary::new();
     resources.insert("Font", Object::Dictionary(fonts));
 
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     root.insert("Resources", Object::Dictionary(resources.clone()));
@@ -2981,14 +2989,14 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
         ]),
     );
     let direct_parent = Object::Dictionary(root.clone());
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", direct_parent.clone());
     pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
 
     for page_ref in [ObjectRef::new(3, 0), ObjectRef::new(4, 0)] {
-        let Object::Dictionary(mut page) = pdf.resolve(page_ref).unwrap() else {
+        let Object::Dictionary(mut page) = pdf.resolve_object(page_ref).unwrap() else {
             panic!("page must be a dictionary");
         };
         page.remove("MediaBox");
@@ -3013,14 +3021,14 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
         Object::Integer(150),
     ]);
     for page_ref in PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap() {
-        let Object::Dictionary(page) = pdf.resolve(page_ref).unwrap() else {
+        let Object::Dictionary(page) = pdf.resolve_object(page_ref).unwrap() else {
             panic!("page must be a dictionary");
         };
         let Some(Object::Reference(resources_ref)) = page.get("Resources") else {
             panic!("qpdf promotes direct inherited /Resources to an indirect handle");
         };
         assert_eq!(
-            pdf.resolve(*resources_ref).unwrap(),
+            pdf.resolve_object(*resources_ref).unwrap(),
             Object::Dictionary(resources.clone())
         );
         assert_eq!(page.get("Rotate"), Some(&Object::Integer(90)));
@@ -3028,14 +3036,14 @@ fn add_page_materializes_attributes_from_a_direct_parent() {
             panic!("qpdf promotes direct inherited /MediaBox to an indirect handle");
         };
         assert_eq!(
-            pdf.resolve(*media_box_ref).unwrap(),
+            pdf.resolve_object(*media_box_ref).unwrap(),
             expected_media_box.clone()
         );
         let Some(Object::Reference(crop_box_ref)) = page.get("CropBox") else {
             panic!("qpdf promotes direct inherited /CropBox to an indirect handle");
         };
         assert_eq!(
-            pdf.resolve(*crop_box_ref).unwrap(),
+            pdf.resolve_object(*crop_box_ref).unwrap(),
             expected_crop_box.clone()
         );
     }
@@ -3055,18 +3063,18 @@ fn helper_prunes_resources_inherited_from_a_direct_parent() {
     let mut resources = Dictionary::new();
     resources.insert("Font", Object::Dictionary(fonts));
 
-    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
     root.insert("Resources", Object::Dictionary(resources));
     let direct_parent = Object::Dictionary(root.clone());
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", direct_parent.clone());
     pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
 
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     page.insert("Parent", direct_parent);
@@ -3077,7 +3085,7 @@ fn helper_prunes_resources_inherited_from_a_direct_parent() {
         .remove_unreferenced_resources()
         .unwrap();
 
-    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+    let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
     let Some(Object::Dictionary(resources)) = page.get("Resources") else {

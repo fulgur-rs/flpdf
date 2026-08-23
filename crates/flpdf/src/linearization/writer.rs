@@ -5166,7 +5166,9 @@ mod tests {
         let mut output =
             Pdf::open(Cursor::new(document.bytes)).expect("linearized output should parse");
         let root_ref = output.root_ref().expect("output has /Root");
-        let root = output.resolve(root_ref).expect("output catalog resolves");
+        let root = output
+            .resolve_object(root_ref)
+            .expect("output catalog resolves");
         let root = root.into_dict().expect("output root must be a dictionary");
         assert!(matches!(root.get("Outlines"), Some(Object::Reference(_))));
     }
@@ -6552,7 +6554,7 @@ mod tests {
         let refs = reopened.live_object_refs();
         let decoded_any_match = refs.into_iter().any(|r| {
             reopened
-                .resolve(r)
+                .resolve_object(r)
                 .ok()
                 .and_then(|o| o.into_stream())
                 .and_then(|stream| {
@@ -6719,7 +6721,7 @@ mod tests {
         let stream = refs
             .into_iter()
             .find_map(|r| {
-                let stream = reopened.resolve(r).ok()?.into_stream()?;
+                let stream = reopened.resolve_object(r).ok()?.into_stream()?;
                 let decoded = crate::filters::test_dictionary_api::decode_stream_data(
                     &stream.dict,
                     &stream.data,
@@ -7645,14 +7647,14 @@ mod tests {
         let mut reopened = Pdf::open(Cursor::new(out.to_vec()))
             .expect("encrypted output must reopen with the empty user password");
         let root_ref = reopened.root_ref().expect("root_ref");
-        let pages_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+        let pages_ref = match reopened.resolve_object(root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get("Pages") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: fixture invariant
             },
             other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
         };
-        let page_ref = match reopened.resolve(pages_ref).expect("resolve /Pages") {
+        let page_ref = match reopened.resolve_object(pages_ref).expect("resolve /Pages") {
             Object::Dictionary(d) => match d.get("Kids") {
                 Some(Object::Array(kids)) => match kids.first() {
                     Some(Object::Reference(r)) => *r,
@@ -7662,7 +7664,7 @@ mod tests {
             },
             other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
         };
-        let contents_ref = match reopened.resolve(page_ref).expect("resolve page") {
+        let contents_ref = match reopened.resolve_object(page_ref).expect("resolve page") {
             Object::Dictionary(d) => match d.get("Contents") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: fixture invariant
@@ -7687,7 +7689,7 @@ mod tests {
         );
 
         let decrypted_label = match reopened
-            .resolve(contents_ref)
+            .resolve_object(contents_ref)
             .expect("resolve encrypted /Contents")
         {
             Object::Stream(stream) => match stream.dict.get("Label") {
@@ -7711,7 +7713,7 @@ mod tests {
             Some(Object::Reference(r)) => *r,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let producer = match rt.resolve(info_ref).expect("resolve /Info") {
+        let producer = match rt.resolve_object(info_ref).expect("resolve /Info") {
             Object::Dictionary(d) => match d.get("Producer") {
                 Some(Object::String(s)) => s.clone(),
                 other => panic!("/Producer must be a string, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
@@ -7720,14 +7722,14 @@ mod tests {
         };
 
         let root_ref = rt.root_ref().expect("root_ref");
-        let pages_ref = match rt.resolve(root_ref).expect("resolve /Root") {
+        let pages_ref = match rt.resolve_object(root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get("Pages") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
             other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let page_ref = match rt.resolve(pages_ref).expect("resolve /Pages") {
+        let page_ref = match rt.resolve_object(pages_ref).expect("resolve /Pages") {
             Object::Dictionary(d) => match d.get("Kids") {
                 Some(Object::Array(kids)) => match kids.first() {
                     Some(Object::Reference(r)) => *r,
@@ -7737,14 +7739,14 @@ mod tests {
             },
             other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let contents_ref = match rt.resolve(page_ref).expect("resolve page") {
+        let contents_ref = match rt.resolve_object(page_ref).expect("resolve page") {
             Object::Dictionary(d) => match d.get("Contents") {
                 Some(Object::Reference(r)) => *r,
                 other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
             other => panic!("page must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
-        let content = match rt.resolve(contents_ref).expect("resolve /Contents") {
+        let content = match rt.resolve_object(contents_ref).expect("resolve /Contents") {
             Object::Stream(s) => s.data,
             other => panic!("/Contents must be a stream, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
@@ -8703,14 +8705,17 @@ mod tests {
         );
 
         let root_ref = reopened.root_ref().expect("root_ref");
-        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+        let metadata_ref = match reopened.resolve_object(root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get_ref("Metadata") {
                 Some(r) => r,
                 None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
             },
             other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
         };
-        let metadata_bytes = match reopened.resolve(metadata_ref).expect("resolve /Metadata") {
+        let metadata_bytes = match reopened
+            .resolve_object(metadata_ref)
+            .expect("resolve /Metadata")
+        {
             Object::Stream(s) => s.data,
             other => panic!("/Metadata must be a stream, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
         };
@@ -8795,7 +8800,7 @@ mod tests {
             Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
                 .expect("re-open with the empty user password");
         let root_ref = reopened.root_ref().expect("root_ref");
-        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+        let metadata_ref = match reopened.resolve_object(root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get_ref("Metadata") {
                 Some(r) => r,
                 None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
@@ -8832,7 +8837,7 @@ mod tests {
         // own `/Type /Metadata` + `!encrypt_metadata` fast path, so it keeps
         // the raw on-disk `/Crypt` identity filter and plaintext bytes.
         let resolved = reopened
-            .resolve(metadata_ref)
+            .resolve_object(metadata_ref)
             .expect("resolve /Metadata (reader's metadata fast path leaves it untouched)");
         let Object::Stream(s) = resolved else {
             // cov:ignore-start: only reached if the assertion below would

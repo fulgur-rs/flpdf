@@ -183,7 +183,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// navigate to it by reference rather than hardcoding a number.
 fn metadata_stream_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
     let root = pdf.root_ref().expect("output must have a /Root");
-    match pdf.resolve(root).expect("resolve /Root") {
+    match pdf.resolve_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Metadata") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Metadata must be a reference, got {other:?}"),
@@ -194,7 +194,7 @@ fn metadata_stream_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> Ob
 
 fn probe_stream_ref<R: std::io::Read + std::io::Seek>(pdf: &mut Pdf<R>) -> ObjectRef {
     let root = pdf.root_ref().expect("output must have a /Root");
-    match pdf.resolve(root).expect("resolve /Root") {
+    match pdf.resolve_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => match d.get("Probe") {
             Some(Object::Reference(r)) => *r,
             other => panic!("Catalog /Probe must be a reference, got {other:?}"),
@@ -420,7 +420,10 @@ fn pdf_writer_rewrites_flate_object_stream_member_and_recomputes_first() {
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    assert_eq!(pdf.resolve(ObjectRef::new(2, 0)).unwrap(), member_2_source);
+    assert_eq!(
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
+        member_2_source
+    );
     pdf.set_object(ObjectRef::new(2, 0), member_2_rewritten.clone());
 
     let settings = WriterTestSettings {
@@ -444,7 +447,8 @@ fn pdf_writer_rewrites_flate_object_stream_member_and_recomputes_first() {
     let mapped_obj_stream = mapping[&ObjectRef::new(4, 0)];
 
     let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
-    let Object::Stream(rewritten_obj_stream) = rewritten.resolve(mapped_obj_stream).unwrap() else {
+    let Object::Stream(rewritten_obj_stream) = rewritten.resolve_object(mapped_obj_stream).unwrap()
+    else {
         panic!("expected object stream object");
     };
 
@@ -612,11 +616,11 @@ fn pdf_writer_rewrites_two_members_in_one_object_stream() {
 
     let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
     assert_eq!(
-        rewritten.resolve(mapped_member_2).unwrap(),
+        rewritten.resolve_object(mapped_member_2).unwrap(),
         member_2_rewritten
     );
     assert_eq!(
-        rewritten.resolve(mapped_member_4).unwrap(),
+        rewritten.resolve_object(mapped_member_4).unwrap(),
         member_4_rewritten
     );
     let (decoded, first) = decoded_objstm(&mut rewritten, mapped_obj_stream.number);
@@ -687,13 +691,13 @@ fn pdf_writer_rewrites_member_declared_in_extended_object_stream() {
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
         Object::Null,
         "qpdf does not materialize a child-stream member whose header names another object"
     );
     pdf.set_object(ObjectRef::new(2, 0), Object::Integer(43));
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
         Object::Integer(43)
     );
 
@@ -740,7 +744,7 @@ fn pdf_writer_rewrites_member_declared_in_extended_object_stream() {
         Object::Integer(99)
     );
     assert!(matches!(
-        rewritten.resolve(mapped_extension_stream).unwrap(),
+        rewritten.resolve_object(mapped_extension_stream).unwrap(),
         Object::Stream(_)
     ));
 }
@@ -752,7 +756,7 @@ fn pdf_writer_rewrites_unresolved_member_declared_in_extended_object_stream() {
 
     pdf.set_object(ObjectRef::new(2, 0), Object::Integer(43));
     assert_eq!(
-        pdf.resolve(ObjectRef::new(2, 0)).unwrap(),
+        pdf.resolve_object(ObjectRef::new(2, 0)).unwrap(),
         Object::Integer(43)
     );
 
@@ -824,7 +828,8 @@ fn pdf_writer_preserves_extends_when_rewriting_extension_stream_member() {
     let mapped_member_3 = mapping[&ObjectRef::new(3, 0)];
 
     let mut rewritten = Pdf::open(Cursor::new(output)).unwrap();
-    let Object::Stream(extension_stream) = rewritten.resolve(mapped_extension_stream).unwrap()
+    let Object::Stream(extension_stream) =
+        rewritten.resolve_object(mapped_extension_stream).unwrap()
     else {
         panic!("expected rewritten extension object stream");
     };
@@ -882,7 +887,7 @@ fn pdf_writer_rewrites_null_object_revision() {
 
     let source = bytes;
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let null_object = pdf.resolve(ObjectRef::new(2, 0)).unwrap();
+    let null_object = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap();
     assert_eq!(null_object, Object::Null);
     pdf.set_object(ObjectRef::new(2, 0), null_object);
 
@@ -958,7 +963,7 @@ fn rewrites_pdf_with_real_number_fixture() {
     let file = File::open("../../tests/fixtures/real-numbers-regression.pdf").unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
-    let page = pdf.resolve(ObjectRef::new(3, 0)).unwrap();
+    let page = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
     let Object::Dictionary(page_dict) = page else {
         panic!("expected page dictionary")
     };
@@ -1205,7 +1210,7 @@ fn writes_qdf_normalizes_object_generations() {
         root.generation, 0,
         "full rewrite must normalize the /Root generation to 0 (was 3)"
     );
-    match reopened.resolve(root).expect("resolve /Root") {
+    match reopened.resolve_object(root).expect("resolve /Root") {
         Object::Dictionary(d) => assert_eq!(
             d.get("Type"),
             Some(&Object::Name(b"Catalog".to_vec())),
@@ -1337,10 +1342,10 @@ fn write_qdf_traverses_direct_catalog_pages_root() {
     );
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-    let Object::Dictionary(pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+    let Object::Dictionary(pages) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
         panic!("pages root must be a dictionary");
     };
-    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
     catalog.insert("Pages", Object::Dictionary(pages));
@@ -2078,7 +2083,9 @@ fn three_member_flate_objstm_pdf(members: [&Object; 3]) -> Vec<u8> {
 }
 
 fn decoded_objstm(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_number: u32) -> (Vec<u8>, usize) {
-    let Object::Stream(object_stream) = pdf.resolve(ObjectRef::new(object_number, 0)).unwrap()
+    let Object::Stream(object_stream) = pdf
+        .resolve_object(ObjectRef::new(object_number, 0))
+        .unwrap()
     else {
         panic!("expected object stream object");
     };
@@ -2472,7 +2479,7 @@ fn pdf_writer_reencodes_single_flatedecode_filter() {
     // Re-open and inspect stream 3's filter.
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let metadata_ref = metadata_stream_ref(&mut reopened);
-    let stream_obj = reopened.resolve(metadata_ref).unwrap();
+    let stream_obj = reopened.resolve_object(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
         panic!("/Metadata must resolve to a stream");
     };
@@ -2521,7 +2528,7 @@ fn pdf_writer_drops_indirect_stream_parameters_after_refiltering() {
     assert!(!object_refs.contains(&ObjectRef::new(5, 0)));
 
     let stream_ref = probe_stream_ref(&mut reopened);
-    let Object::Stream(stream) = reopened.resolve(stream_ref).unwrap() else {
+    let Object::Stream(stream) = reopened.resolve_object(stream_ref).unwrap() else {
         panic!("/Probe must resolve to a stream");
     };
     assert_eq!(
@@ -2553,7 +2560,7 @@ fn pdf_writer_drops_refiltered_stream_parameters_before_objstm_packing() {
 
         let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
         let stream_ref = probe_stream_ref(&mut reopened);
-        let Object::Stream(stream) = reopened.resolve(stream_ref).unwrap() else {
+        let Object::Stream(stream) = reopened.resolve_object(stream_ref).unwrap() else {
             panic!("/Probe must resolve to a stream");
         };
         assert_eq!(
@@ -2583,7 +2590,7 @@ fn pdf_writer_decodes_and_reencodes_multi_filter_stream() {
     // Stream 3 should now have a single FlateDecode filter (not ASCII85+Flate).
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let metadata_ref = metadata_stream_ref(&mut reopened);
-    let stream_obj = reopened.resolve(metadata_ref).unwrap();
+    let stream_obj = reopened.resolve_object(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
         panic!("/Metadata must resolve to a stream");
     };
@@ -2956,7 +2963,7 @@ fn pdf_writer_strips_external_file_ref_from_reencoded_stream() {
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let metadata_ref = metadata_stream_ref(&mut reopened);
-    let stream_obj = reopened.resolve(metadata_ref).unwrap();
+    let stream_obj = reopened.resolve_object(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
         panic!("/Metadata must resolve to a stream");
     };
@@ -3102,7 +3109,7 @@ fn pdf_writer_preserves_catalog_version_verbatim_under_force_version() {
     );
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
-    let Object::Dictionary(catalog) = reopened.resolve(ObjectRef::new(1, 0)).unwrap() else {
+    let Object::Dictionary(catalog) = reopened.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
         panic!("object 1 should be the Catalog dictionary");
     };
     match catalog.get("Version") {

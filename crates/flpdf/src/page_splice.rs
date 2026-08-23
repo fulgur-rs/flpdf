@@ -878,7 +878,7 @@ mod tests {
     }
 
     fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap()
             .into_dict()
             .expect("not a dictionary")

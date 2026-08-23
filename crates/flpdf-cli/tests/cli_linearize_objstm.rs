@@ -89,7 +89,7 @@ fn count_objstm_containers(bytes: &[u8]) -> usize {
     let refs = pdf.object_refs();
     let mut n = 0;
     for r in refs {
-        if let Ok(flpdf::Object::Stream(s)) = pdf.resolve(r) {
+        if let Ok(flpdf::Object::Stream(s)) = pdf.resolve_object(r) {
             if matches!(s.dict.get("Type"), Some(flpdf::Object::Name(t)) if t.as_slice() == b"ObjStm")
             {
                 n += 1;
@@ -156,7 +156,7 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve after round-trip: {e}"));
     }
 
@@ -472,7 +472,7 @@ fn assert_acceptance_invariants(mode: &str, out: &Path, input_page_count: usize)
         "mode={mode}: round-tripped doc exposes objects"
     );
     for r in refs {
-        pdf.resolve(r)
+        pdf.resolve_object(r)
             .unwrap_or_else(|e| panic!("mode={mode}: object {r} did not resolve: {e}"));
     }
     let mut pdf2 = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open for page count");

@@ -3275,7 +3275,7 @@ mod tests {
 
     fn number_tree_shape(pdf: &mut TestPdf, object: &Object) -> String {
         let resolved = match object {
-            Object::Reference(object_ref) => pdf.resolve(*object_ref).expect("resolve node"),
+            Object::Reference(object_ref) => pdf.resolve_object(*object_ref).expect("resolve node"),
             object => object.clone(),
         };
         let Object::Dictionary(dictionary) = resolved else {
@@ -3806,7 +3806,7 @@ mod tests {
         tree.store_node(&mut pdf, &node, changed.clone()).unwrap();
 
         assert_eq!(
-            pdf.resolve(terminal).unwrap(),
+            pdf.resolve_object(terminal).unwrap(),
             changed.handle.materialize().unwrap()
         );
         assert_eq!(tree.root(), &Object::Reference(holder));
@@ -3863,7 +3863,7 @@ mod tests {
             ]
         );
         assert!(matches!(
-            pdf.resolve(leaf_ref).unwrap(),
+            pdf.resolve_object(leaf_ref).unwrap(),
             Object::Dictionary(leaf)
                 if leaf.get("Nums") == Some(&Object::Reference(items_ref))
                     && leaf.get("Limits") == Some(&Object::Array(vec![
@@ -4225,7 +4225,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            pdf.resolve(items_ref).unwrap(),
+            pdf.resolve_object(items_ref).unwrap(),
             Object::Array(vec![
                 Object::Integer(10),
                 Object::String(b"ten".to_vec()),
@@ -5423,10 +5423,10 @@ mod tests {
                 Object::Reference(ObjectRef::new(3, 0)),
             ]
         );
-        let Object::Dictionary(first) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        let Object::Dictionary(first) = pdf.resolve_object(ObjectRef::new(2, 0)).unwrap() else {
             panic!("first leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
-        let Object::Dictionary(second) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        let Object::Dictionary(second) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
             panic!("second leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(
@@ -5731,8 +5731,11 @@ mod tests {
             found.current().map(|(key, _)| key.as_slice()),
             Some(b"beta".as_slice())
         );
-        assert_eq!(pdf.resolve(holder).unwrap(), Object::Reference(terminal));
-        let Object::Dictionary(repaired) = pdf.resolve(terminal).unwrap() else {
+        assert_eq!(
+            pdf.resolve_object(holder).unwrap(),
+            Object::Reference(terminal)
+        );
+        let Object::Dictionary(repaired) = pdf.resolve_object(terminal).unwrap() else {
             panic!("terminal root must remain a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(repaired.get("Keep"), Some(&Object::Integer(7)));
@@ -5864,10 +5867,10 @@ mod tests {
                 Object::Reference(ObjectRef::new(12, 0)),
             ]
         );
-        let Object::Dictionary(first) = pdf.resolve(ObjectRef::new(11, 0)).unwrap() else {
+        let Object::Dictionary(first) = pdf.resolve_object(ObjectRef::new(11, 0)).unwrap() else {
             panic!("first repaired leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
-        let Object::Dictionary(second) = pdf.resolve(ObjectRef::new(12, 0)).unwrap() else {
+        let Object::Dictionary(second) = pdf.resolve_object(ObjectRef::new(12, 0)).unwrap() else {
             panic!("second repaired leaf must be a dictionary"); // cov:ignore: test-shape guard
         };
         assert_eq!(
@@ -6111,10 +6114,10 @@ mod tests {
         let Object::Reference(last_ref) = kids[1] else {
             panic!("last split node must be indirect"); // cov:ignore: test-shape guard
         };
-        let Object::Dictionary(first) = pdf.resolve(first_ref).unwrap() else {
+        let Object::Dictionary(first) = pdf.resolve_object(first_ref).unwrap() else {
             panic!("first split node must be a dictionary"); // cov:ignore: test-shape guard
         };
-        let Object::Dictionary(last) = pdf.resolve(last_ref).unwrap() else {
+        let Object::Dictionary(last) = pdf.resolve_object(last_ref).unwrap() else {
             panic!("last split node must be a dictionary"); // cov:ignore: test-shape guard
         };
         let Some(Object::Array(first_names)) = first.get("Names") else {

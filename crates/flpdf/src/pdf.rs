@@ -43,7 +43,7 @@ pub(crate) struct CompressedMemberProvenance {
 ///
 /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
 /// println!("version {}", pdf.version());
-/// let catalog = pdf.resolve(pdf.root_ref().expect("root"))?;
+/// let catalog = pdf.resolve_object(pdf.root_ref().expect("root"))?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
@@ -269,7 +269,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// its `max_input_version`.
     pub fn adobe_extension_level(&mut self) -> Option<i64> {
         let root_ref = self.root_ref()?;
-        let catalog = self.resolve(root_ref).ok()?;
+        let catalog = self.resolve_object(root_ref).ok()?;
         let extensions = resolve_object_value(self, catalog.as_dict()?.get("Extensions")?.clone())?;
         let adbe = resolve_object_value(self, extensions.as_dict()?.get("ADBE")?.clone())?;
         let level = resolve_object_value(self, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
@@ -421,7 +421,7 @@ impl<R: Read + Seek> Pdf<R> {
 // or return a non-reference value unchanged.
 fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
     match value {
-        Object::Reference(reference) => pdf.resolve(reference).ok(),
+        Object::Reference(reference) => pdf.resolve_object(reference).ok(),
         other => Some(other),
     }
 }

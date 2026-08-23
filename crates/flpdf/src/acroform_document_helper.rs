@@ -2070,7 +2070,7 @@ fn ensure_foreign_indirect<R: Read + Seek>(
 /// PDFs.
 fn deref_leaf<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Option<Object>> {
     match value {
-        Some(Object::Reference(object_ref)) => match pdf.resolve(object_ref)? {
+        Some(Object::Reference(object_ref)) => match pdf.resolve_object(object_ref)? {
             Object::Null => Ok(None),
             resolved => Ok(Some(resolved)),
         },
@@ -2278,7 +2278,7 @@ pub(crate) fn collect_reachable_refs<R: Read + Seek>(
     }
     out.insert(object_ref);
 
-    let obj = pdf.resolve(object_ref)?;
+    let obj = pdf.resolve_object(object_ref)?;
     collect_refs_in_object(pdf, &obj, out, seen, depth, 0, skip_parent_key)
 }
 

@@ -96,7 +96,7 @@ fn only_leaf(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> flpdf::Dictionary {
 
 fn resolve_indirect_value(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, mut value: Object) -> Object {
     while let Object::Reference(reference) = value {
-        value = doc.resolve(reference).unwrap();
+        value = doc.resolve_object(reference).unwrap();
     }
     value
 }
@@ -121,7 +121,7 @@ fn assert_destination_page_is_null(
 ) {
     let page_ref = destination_page_ref(doc, value);
     assert!(
-        matches!(doc.resolve(page_ref).unwrap(), Object::Null),
+        matches!(doc.resolve_object(page_ref).unwrap(), Object::Null),
         "{context}"
     );
 }
@@ -133,7 +133,7 @@ fn assert_reference_target_is_null(
 ) {
     let reference = value.as_ref_id().expect("page reference");
     assert!(
-        matches!(doc.resolve(reference).unwrap(), Object::Null),
+        matches!(doc.resolve_object(reference).unwrap(), Object::Null),
         "{context}"
     );
 }
@@ -424,7 +424,7 @@ fn remaps_indirect_inherited_mediabox() {
     // dangling source ref).
     let mb = leaf.get("MediaBox").expect("/MediaBox present");
     let arr = match mb {
-        Object::Reference(r) => out.resolve(*r).unwrap(),
+        Object::Reference(r) => out.resolve_object(*r).unwrap(),
         other => other.clone(),
     };
     assert_eq!(
@@ -489,7 +489,7 @@ fn shared_resource_pdf() -> Vec<u8> {
 fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usize {
     let mut n = 0;
     for r in doc.live_object_refs() {
-        if let Ok(obj) = doc.resolve(r) {
+        if let Ok(obj) = doc.resolve_object(r) {
             let dict = match &obj {
                 Object::Dictionary(d) => Some(d.clone()),
                 Object::Stream(s) => Some(s.dict.clone()),
@@ -509,7 +509,7 @@ fn count_subtype(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, subtype: &[u8]) -> usi
 fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usize {
     let mut n = 0;
     for r in doc.live_object_refs() {
-        if let Ok(obj) = doc.resolve(r) {
+        if let Ok(obj) = doc.resolve_object(r) {
             let dict = match &obj {
                 Object::Dictionary(d) => Some(d.clone()),
                 Object::Stream(s) => Some(s.dict.clone()),
@@ -587,7 +587,7 @@ fn extracted_contents_match_source_page() {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /Contents ref, got {other:?}"),
     };
-    let src_stream = match source.resolve(src_contents_ref).unwrap() {
+    let src_stream = match source.resolve_object(src_contents_ref).unwrap() {
         Object::Stream(s) => s,
         other => panic!("expected stream, got {other:?}"),
     };
@@ -598,7 +598,7 @@ fn extracted_contents_match_source_page() {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /Contents ref, got {other:?}"),
     };
-    let out_stream = match out.resolve(out_contents_ref).unwrap() {
+    let out_stream = match out.resolve_object(out_contents_ref).unwrap() {
         Object::Stream(s) => s,
         other => panic!("expected stream, got {other:?}"),
     };
@@ -716,7 +716,7 @@ fn cross_page_link_keeps_dest_and_nulls_removed_page() {
         Some(Object::Reference(r)) => *r,
         other => panic!("expected /Contents ref, got {other:?}"),
     };
-    let stream = match out.resolve(contents_ref).unwrap() {
+    let stream = match out.resolve_object(contents_ref).unwrap() {
         Object::Stream(s) => s,
         other => panic!("expected content stream, got {other:?}"),
     };
@@ -1429,7 +1429,7 @@ fn indirect_next_array_goto_keeps_d_and_nulls_removed_page() {
         .and_then(|annots| annots.first())
         .and_then(Object::as_ref_id)
         .unwrap();
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     let action = annot.get("A").and_then(Object::as_dict).unwrap();
     let next = resolve_indirect_value(
         &mut out,
@@ -1487,7 +1487,7 @@ fn action_after_71_array_holders(
 ) -> flpdf::Dictionary {
     for _ in 0..=70 {
         let concrete = match value {
-            Object::Reference(reference) => doc.resolve(reference).unwrap(),
+            Object::Reference(reference) => doc.resolve_object(reference).unwrap(),
             direct => direct,
         };
         let mut items = concrete.into_array().expect("singleton action array");
@@ -1511,7 +1511,7 @@ fn long_indirect_next_array_keeps_carrier_and_nulls_removed_page() {
         .and_then(|items| items.first())
         .and_then(Object::as_ref_id)
         .unwrap();
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     let action = annot.get("A").and_then(Object::as_dict).unwrap();
     let terminal = action_after_71_array_holders(
         &mut out,
@@ -1523,7 +1523,10 @@ fn long_indirect_next_array_keeps_carrier_and_nulls_removed_page() {
         .and_then(|items| items.first())
         .and_then(Object::as_ref_id)
         .unwrap();
-    assert!(matches!(out.resolve(removed_page).unwrap(), Object::Null));
+    assert!(matches!(
+        out.resolve_object(removed_page).unwrap(),
+        Object::Null
+    ));
 }
 
 // --- Additional coverage for indirect carrier shapes ---
@@ -1566,7 +1569,7 @@ fn indirect_annots_array_keeps_dest_and_nulls_removed_page() {
     .into_array()
     .unwrap();
     let annot_ref = annots[0].as_ref_id().unwrap();
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     assert_destination_page_is_null(
         &mut out,
         annot.get("Dest").cloned().expect("/Dest retained"),
@@ -1659,7 +1662,7 @@ fn indirect_next_cycle_is_preserved_and_removed_page_is_null() {
         .and_then(|annots| annots.first())
         .and_then(Object::as_ref_id)
         .unwrap();
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     let first = resolve_indirect_value(
         &mut out,
         annot.get("A").cloned().expect("indirect /A retained"),
@@ -1793,7 +1796,7 @@ fn action_goto_sd_keeps_carrier_and_nulls_removed_page() {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /Annots array, got {other:?}"),
     };
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     let action = annot.get("A").unwrap().as_dict().unwrap();
     assert_eq!(
         action.get("S"),
@@ -1802,7 +1805,7 @@ fn action_goto_sd_keeps_carrier_and_nulls_removed_page() {
     );
     let struct_ref =
         destination_page_ref(&mut out, action.get("SD").cloned().expect("/SD retained"));
-    let struct_elem = out.resolve(struct_ref).unwrap().into_dict().unwrap();
+    let struct_elem = out.resolve_object(struct_ref).unwrap().into_dict().unwrap();
     assert_reference_target_is_null(
         &mut out,
         struct_elem.get("Pg").expect("StructElem /Pg retained"),
@@ -1830,7 +1833,7 @@ fn action_goto_sd_self_page_is_preserved() {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /Annots array, got {other:?}"),
     };
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     let action = annot.get("A").unwrap().as_dict().unwrap();
     assert!(
         action.get("SD").is_some(),
@@ -1859,7 +1862,7 @@ fn action_goto_sd_named_dest_is_preserved() {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /Annots array, got {other:?}"),
     };
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     let action = annot.get("A").unwrap().as_dict().unwrap();
     assert!(
         action.get("SD").is_some(),
@@ -1899,7 +1902,7 @@ fn annot_p_is_preserved_and_removed_page_is_null() {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /Annots array, got {other:?}"),
     };
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     assert_reference_target_is_null(
         &mut out,
         annot.get("P").expect("annotation /P retained"),
@@ -1933,7 +1936,7 @@ fn annot_p_self_page_is_preserved() {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /Annots array, got {other:?}"),
     };
-    let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+    let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
     assert!(annot.get("P").is_some(), "self-page /P must be preserved");
 }
 
@@ -1981,12 +1984,12 @@ fn bead_p_carrier_is_preserved_and_removed_page_is_null() {
         Some(flpdf::Object::Array(a)) => a[0].as_ref_id().unwrap(),
         other => panic!("expected /B array, got {other:?}"),
     };
-    let bead = out.resolve(bead_ref).unwrap().into_dict().unwrap();
+    let bead = out.resolve_object(bead_ref).unwrap().into_dict().unwrap();
     let p_ref = bead
         .get("P")
         .and_then(flpdf::Object::as_ref_id)
         .expect("kept bead /P must be preserved as a page reference");
-    let p_page = out.resolve(p_ref).unwrap().into_dict().unwrap();
+    let p_page = out.resolve_object(p_ref).unwrap().into_dict().unwrap();
     assert_eq!(
         p_page.get("Type"),
         Some(&flpdf::Object::Name(b"Page".to_vec())),
@@ -2027,7 +2030,7 @@ fn three_page_shared_font_pdf() -> Vec<u8> {
 fn count_font_objects(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, base: &[u8]) -> usize {
     let mut n = 0;
     for r in doc.object_refs() {
-        if let Ok(obj) = doc.resolve(r) {
+        if let Ok(obj) = doc.resolve_object(r) {
             if let Some(d) = obj.as_dict() {
                 if d.get("Type").and_then(|o| o.as_name()) == Some(&b"Font"[..])
                     && d.get("BaseFont").and_then(|o| o.as_name()) == Some(base)
@@ -2057,7 +2060,7 @@ fn leaf_font_basefont(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, leaf: flpdf::Obje
         .and_then(|f| f.iter().next().map(|(_, v)| v.clone()))
         .and_then(|v| v.as_ref_id())
         .expect("leaf /Resources /Font first entry must be an indirect ref");
-    let font = doc.resolve(font_ref).unwrap().into_dict().unwrap();
+    let font = doc.resolve_object(font_ref).unwrap().into_dict().unwrap();
     font.get("BaseFont")
         .and_then(|o| o.as_name())
         .expect("/BaseFont")
@@ -2235,7 +2238,11 @@ fn extract_pages_keeps_dest_between_selected_pages() {
     assert_eq!(page_refs.len(), 2, "two selected pages enumerated");
     let second_page_ref = page_refs[1];
 
-    let leaf = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
+    let leaf = out
+        .resolve_object(page_refs[0])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     let annot_refs: Vec<flpdf::ObjectRef> = match leaf.get("Annots") {
         Some(Object::Array(a)) => a.iter().filter_map(Object::as_ref_id).collect(),
         other => panic!("expected /Annots array, got {other:?}"),
@@ -2245,7 +2252,7 @@ fn extract_pages_keeps_dest_between_selected_pages() {
     let mut kept = 0;
     let mut nulled = 0;
     for annot_ref in annot_refs {
-        let annot = out.resolve(annot_ref).unwrap().into_dict().unwrap();
+        let annot = out.resolve_object(annot_ref).unwrap().into_dict().unwrap();
         let target_ref = destination_page_ref(
             &mut out,
             annot.get("Dest").cloned().expect("/Dest retained"),
@@ -2254,7 +2261,7 @@ fn extract_pages_keeps_dest_between_selected_pages() {
             kept += 1;
         } else {
             assert!(
-                matches!(out.resolve(target_ref).unwrap(), Object::Null),
+                matches!(out.resolve_object(target_ref).unwrap(), Object::Null),
                 "non-selected /Dest target must resolve to null"
             );
             nulled += 1;
@@ -2298,7 +2305,11 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
     let page_refs = pages::page_refs(&mut out).unwrap();
     assert_eq!(page_refs.len(), 2);
 
-    let leaf0 = out.resolve(page_refs[0]).unwrap().into_dict().unwrap();
+    let leaf0 = out
+        .resolve_object(page_refs[0])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     assert_eq!(
         resolve_indirect_value(&mut out, leaf0.get("MediaBox").unwrap().clone()),
         Object::Array(vec![
@@ -2315,7 +2326,11 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
         "leaf 0 inherits /Rotate 90 from its own parent (obj 3)"
     );
 
-    let leaf1 = out.resolve(page_refs[1]).unwrap().into_dict().unwrap();
+    let leaf1 = out
+        .resolve_object(page_refs[1])
+        .unwrap()
+        .into_dict()
+        .unwrap();
     assert_eq!(
         resolve_indirect_value(&mut out, leaf1.get("MediaBox").unwrap().clone()),
         Object::Array(vec![

@@ -338,7 +338,7 @@ pub(crate) fn resolve_dict(
     r: ObjectRef,
     ctx: &'static str,
 ) -> Result<Dictionary> {
-    match target.resolve(r)? {
+    match target.resolve_object(r)? {
         Object::Dictionary(d) => Ok(d),
         _ => Err(Error::Missing(ctx)),
     }

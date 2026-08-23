@@ -189,7 +189,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     // Re-open and confirm no object has /Type /ObjStm.
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for obj_ref in reopened.object_refs() {
-        if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
+        if let Ok(Object::Stream(s)) = reopened.resolve_object(obj_ref) {
             let is_objstm = matches!(
                 s.dict.get("Type"),
                 Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
@@ -204,7 +204,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
 
     // Original objects still resolve correctly.
     let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
-    let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
+    let pages = reopened2.resolve_object(ObjectRef::new(2, 0)).unwrap();
     match &pages {
         Object::Dictionary(d) => {
             assert_eq!(
@@ -235,7 +235,7 @@ fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut containers = Vec::new();
     for reference in reopened.object_refs() {
-        if let Ok(Object::Stream(stream)) = reopened.resolve(reference) {
+        if let Ok(Object::Stream(stream)) = reopened.resolve_object(reference) {
             if matches!(
                 stream.dict.get("Type"),
                 Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
@@ -333,7 +333,7 @@ fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
     for reference in reopened.object_refs() {
         assert!(
             !matches!(
-                reopened.resolve(reference),
+                reopened.resolve_object(reference),
                 Ok(Object::Stream(ref stream))
                     if matches!(stream.dict.get("Type"), Some(Object::Name(name))
                         if name.as_slice() == b"ObjStm")
@@ -341,7 +341,9 @@ fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
             "an empty source container must not be emitted"
         );
     }
-    let catalog = reopened.resolve(reopened.root_ref().unwrap()).unwrap();
+    let catalog = reopened
+        .resolve_object(reopened.root_ref().unwrap())
+        .unwrap();
     assert!(
         matches!(catalog, Object::Dictionary(ref dictionary)
             if dictionary.get("Pages").is_none()),
@@ -370,7 +372,9 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
         report.diagnostics.entries()
     );
     let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
-    let catalog = reopened.resolve(reopened.root_ref().unwrap()).unwrap();
+    let catalog = reopened
+        .resolve_object(reopened.root_ref().unwrap())
+        .unwrap();
     let pages_ref = match catalog {
         Object::Dictionary(dictionary) => match dictionary.get("Pages") {
             Some(Object::Reference(reference)) => *reference,
@@ -378,7 +382,7 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
         },
         other => panic!("catalog must be a dictionary, got {other:?}"),
     };
-    let pages = reopened.resolve(pages_ref).unwrap();
+    let pages = reopened.resolve_object(pages_ref).unwrap();
     assert!(
         matches!(pages, Object::Dictionary(ref dictionary)
             if matches!(dictionary.get("Kids"), Some(Object::Array(kids))
@@ -388,7 +392,7 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
     let mut found_objstm = false;
     for reference in reopened.object_refs() {
         let object = reopened
-            .resolve(reference)
+            .resolve_object(reference)
             .unwrap_or_else(|error| panic!("xref entry {reference} must resolve: {error}"));
         if matches!(
             object,
@@ -408,7 +412,7 @@ fn preserve_deleted_source_container_rebuilds_its_surviving_members() {
         .join("../../tests/fixtures/compat/three-page-objstm.pdf");
     let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
     for number in 2..=9 {
-        pdf.resolve(ObjectRef::new(number, 0)).unwrap();
+        pdf.resolve_object(ObjectRef::new(number, 0)).unwrap();
     }
     pdf.delete_object(ObjectRef::new(1, 0));
 
@@ -439,7 +443,7 @@ fn preserve_deleted_source_container_rebuilds_its_surviving_members() {
     let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
     for reference in reopened.object_refs() {
         reopened
-            .resolve(reference)
+            .resolve_object(reference)
             .unwrap_or_else(|error| panic!("object {reference} did not resolve: {error}"));
     }
 }
@@ -450,7 +454,7 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
         .join("../../tests/fixtures/compat/three-page-objstm.pdf");
     let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
     for number in 2..=9 {
-        pdf.resolve(ObjectRef::new(number, 0)).unwrap();
+        pdf.resolve_object(ObjectRef::new(number, 0)).unwrap();
     }
     pdf.set_object(ObjectRef::new(1, 0), Object::Null);
 
@@ -481,7 +485,7 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
     let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
     for reference in reopened.object_refs() {
         reopened
-            .resolve(reference)
+            .resolve_object(reference)
             .unwrap_or_else(|error| panic!("object {reference} did not resolve: {error}"));
     }
 }
@@ -536,7 +540,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut objstm_n: Option<i64> = None;
     for obj_ref in reopened.object_refs() {
-        if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
+        if let Ok(Object::Stream(s)) = reopened.resolve_object(obj_ref) {
             if matches!(
                 s.dict.get("Type"),
                 Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
@@ -569,7 +573,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
         ObjectRef::new(2, 0),
         "container-first numbering: /Root must be 2 0 R (obj 1 is the ObjStm container)"
     );
-    let catalog = reopened2.resolve(root_ref).unwrap();
+    let catalog = reopened2.resolve_object(root_ref).unwrap();
     let pages_ref = match &catalog {
         Object::Dictionary(d) => {
             assert_eq!(
@@ -584,7 +588,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
         }
         other => panic!("/Root should resolve to a Dictionary, got {:?}", other),
     };
-    let pages = reopened2.resolve(pages_ref).unwrap();
+    let pages = reopened2.resolve_object(pages_ref).unwrap();
     match &pages {
         Object::Dictionary(d) => {
             assert_eq!(
@@ -630,7 +634,7 @@ fn generate_mode_on_xref_table_form_upgrades_to_xref_stream() {
 
     let mut found_objstm = false;
     for r in roundtrip.object_refs() {
-        if let Object::Stream(s) = roundtrip.resolve(r).unwrap() {
+        if let Object::Stream(s) = roundtrip.resolve_object(r).unwrap() {
             if let Some(Object::Name(n)) = s.dict.get("Type") {
                 if n.as_slice() == b"ObjStm" {
                     found_objstm = true;
@@ -732,7 +736,7 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
     // exercise the renumbered-member path at all).
     let mut found_objstm = false;
     for r in reopened.object_refs() {
-        if let Ok(Object::Stream(s)) = reopened.resolve(r) {
+        if let Ok(Object::Stream(s)) = reopened.resolve_object(r) {
             if matches!(s.dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"ObjStm") {
                 found_objstm = true;
                 break;
@@ -748,7 +752,7 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
     let root_ref = reopened
         .root_ref()
         .unwrap_or_else(|| panic!("{fixture_path}: trailer must have a resolvable /Root"));
-    let catalog = reopened.resolve(root_ref).unwrap();
+    let catalog = reopened.resolve_object(root_ref).unwrap();
     let catalog_dict = match &catalog {
         Object::Dictionary(d) => d,
         other => panic!("{fixture_path}: /Root must resolve to a dict, got {other:?}"),
@@ -765,7 +769,7 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
         Some(Object::Reference(r)) => *r,
         other => panic!("{fixture_path}: Catalog /Pages must be an indirect ref, got {other:?}"),
     };
-    let pages = reopened.resolve(pages_ref).unwrap();
+    let pages = reopened.resolve_object(pages_ref).unwrap();
     let pages_dict = match &pages {
         Object::Dictionary(d) => d,
         other => panic!(
@@ -794,7 +798,7 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
             Object::Reference(r) => *r,
             other => panic!("{fixture_path}: /Kids entry must be an indirect ref, got {other:?}"),
         };
-        let page = reopened.resolve(kid_ref).unwrap();
+        let page = reopened.resolve_object(kid_ref).unwrap();
         match &page {
             Object::Dictionary(d) => assert_eq!(
                 d.get("Type"),
@@ -895,7 +899,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
     let root_ref = reopened
         .root_ref()
         .expect("trailer must have a resolvable /Root");
-    let catalog = reopened.resolve(root_ref).unwrap();
+    let catalog = reopened.resolve_object(root_ref).unwrap();
     let catalog_dict = match &catalog {
         Object::Dictionary(d) => d,
         other => panic!("/Root must resolve to a dict, got {other:?}"),
@@ -908,7 +912,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
         Some(Object::Reference(r)) => *r,
         other => panic!("Catalog /Pages must be an indirect ref, got {other:?}"),
     };
-    let pages = reopened.resolve(pages_ref).unwrap();
+    let pages = reopened.resolve_object(pages_ref).unwrap();
     let pages_dict = match &pages {
         Object::Dictionary(d) => d,
         other => panic!("Catalog /Pages must resolve to a /Pages dict, got {other:?}"),
@@ -926,7 +930,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
         Object::Reference(r) => *r,
         other => panic!("/Kids entry must be an indirect ref, got {other:?}"),
     };
-    let page = reopened.resolve(kid_ref).unwrap();
+    let page = reopened.resolve_object(kid_ref).unwrap();
     match &page {
         Object::Dictionary(d) => {
             assert_eq!(d.get("Type"), Some(&Object::Name(b"Page".to_vec())))
@@ -936,7 +940,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
 
     // (c) The orphan is GONE: no live object carries /Type /Orphan.
     for r in reopened.object_refs() {
-        if let Ok(obj) = reopened.resolve(r) {
+        if let Ok(obj) = reopened.resolve_object(r) {
             if let Some(dict) = obj.as_dict() {
                 assert_ne!(
                     dict.get("Type"),
@@ -991,7 +995,7 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for r in reopened.object_refs() {
         reopened
-            .resolve(r)
+            .resolve_object(r)
             .unwrap_or_else(|e| panic!("object {r} did not resolve after rewrite: {e}"));
     }
 }
@@ -1335,7 +1339,7 @@ fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
         if obj_ref.number == 0 {
             continue;
         }
-        match reopened.resolve(obj_ref).unwrap() {
+        match reopened.resolve_object(obj_ref).unwrap() {
             Object::Stream(s) => {
                 if matches!(
                     s.dict.get("Type"),
@@ -1428,7 +1432,7 @@ fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
         let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
         let root = reopened.root_ref().expect("trailer must have /Root");
         assert!(
-            matches!(reopened.resolve(root), Ok(Object::Dictionary(_))),
+            matches!(reopened.resolve_object(root), Ok(Object::Dictionary(_))),
             "dangling ref ({name}): output Catalog must still resolve"
         );
     }

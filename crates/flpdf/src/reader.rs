@@ -2551,7 +2551,17 @@ impl<R: Read + Seek> Pdf<R> {
     /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: owned raw-`Object` resolver.
     /// Delete after its callers use canonical handle accessors; do not use it
     /// from the new resolver path.
-    pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
+    /// Resolve `handle` in place through the canonical qpdf object graph.
+    ///
+    /// qpdf's typed QPDFObjectHandle accessors call QPDF::resolve lazily and
+    /// retain the same shared object identity. The old raw-value resolver is
+    /// kept under the explicit `resolve_object` name only for the next
+    /// legacy-route removal slice.
+    pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
+        self.resolve_object_handle(handle)
+    }
+
+    pub fn resolve_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         Ok(self.resolve_borrowed(object_ref)?.clone())
     }
 
@@ -6147,7 +6157,9 @@ mod tests {
         pdf.extend_from_slice(trailer.as_bytes());
 
         let mut pdf = Pdf::open_mem(Arc::from(&pdf[..])).expect("open_mem");
-        let value = pdf.resolve(ObjectRef::new(3, 0)).expect("resolve object 3");
+        let value = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("resolve object 3");
         let dict = value.as_dict().expect("dictionary");
         assert_eq!(
             dict.get("Foo"),
@@ -6487,7 +6499,7 @@ mod tests {
 
         let root_ref = ObjectRef::new(1, 0);
         let mut root_dict = pdf
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root")
             .into_dict()
             .unwrap();
@@ -6505,7 +6517,7 @@ mod tests {
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let resolved_root = reopened
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve root in reopened output");
         let extra_ref = resolved_root
             .into_dict()
@@ -6513,7 +6525,9 @@ mod tests {
             .expect("root has /Extra");
         assert_eq!(extra_ref, Object::Reference(emitted_ref));
         assert_eq!(
-            reopened.resolve(emitted_ref).expect("resolve new object"),
+            reopened
+                .resolve_object(emitted_ref)
+                .expect("resolve new object"),
             Object::Integer(777),
             "new object must not be dangling after a full rewrite"
         );
@@ -6550,7 +6564,7 @@ mod tests {
         );
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let extra_ref = reopened
-            .resolve(ObjectRef::new(1, 0))
+            .resolve_object(ObjectRef::new(1, 0))
             .expect("resolve rewritten root")
             .into_dict()
             .and_then(|dict| dict.get("Extra").cloned())
@@ -6559,7 +6573,7 @@ mod tests {
         assert_eq!(extra_ref, emitted_ref);
         assert_eq!(
             reopened
-                .resolve(emitted_ref)
+                .resolve_object(emitted_ref)
                 .expect("resolve rewritten stream")
                 .as_stream()
                 .expect("stream remains a stream")
@@ -6666,7 +6680,7 @@ mod tests {
 
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen over-depth output");
         let mut leaf = reopened
-            .resolve(emitted_ref)
+            .resolve_object(emitted_ref)
             .expect("resolve over-depth replacement");
         for _ in 0..depth {
             leaf = match leaf {
@@ -6677,7 +6691,7 @@ mod tests {
         assert_eq!(leaf, Object::Reference(emitted_target_ref));
         assert_eq!(
             reopened
-                .resolve(emitted_target_ref)
+                .resolve_object(emitted_target_ref)
                 .expect("resolve nested target"),
             Object::Integer(42)
         );
@@ -6711,7 +6725,7 @@ mod tests {
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         assert_eq!(
             reopened
-                .resolve(emitted_ref)
+                .resolve_object(emitted_ref)
                 .expect("resolve replacement")
                 .into_dict()
                 .and_then(|dict| dict.get("Marker").cloned())
@@ -6745,7 +6759,7 @@ mod tests {
         );
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let rewritten_pages = reopened
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .expect("resolve rewritten pages")
             .into_dict()
             .expect("pages is a dictionary");
@@ -6756,7 +6770,7 @@ mod tests {
         assert_eq!(kids, &[Object::Null]);
         assert_eq!(
             reopened
-                .resolve(ObjectRef::new(3, 0))
+                .resolve_object(ObjectRef::new(3, 0))
                 .expect("removed page resolves as qpdf null"),
             Object::Null,
             "removed page must not be emitted as an indirect body"
@@ -6872,7 +6886,7 @@ mod tests {
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let resolved_page = reopened
-            .resolve(page_ref)
+            .resolve_object(page_ref)
             .expect("resolve page in reopened output")
             .into_dict()
             .expect("page is a dictionary");
@@ -6990,7 +7004,9 @@ mod tests {
                 let bytes = recovered_stream_fixture(length_entry, eol, None);
                 let mut pdf = Pdf::open_mem_owned(bytes).expect("open direct-length fixture");
                 let object_ref = ObjectRef::new(1, 0);
-                let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+                let stream = pdf
+                    .resolve_object(object_ref)
+                    .expect("resolve recovered stream");
                 assert_eq!(stream.as_stream().unwrap().data, b"abc");
                 assert_eq!(pdf.recovered_stream_eol(object_ref), Some(expected));
             }
@@ -7027,7 +7043,9 @@ mod tests {
                 pdf.delete_object(ObjectRef::new(2, 0));
             }
             let object_ref = ObjectRef::new(1, 0);
-            let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+            let stream = pdf
+                .resolve_object(object_ref)
+                .expect("resolve recovered stream");
             assert_eq!(stream.as_stream().unwrap().data, b"abc");
             assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
         }
@@ -7046,7 +7064,7 @@ mod tests {
         .expect("open strict malformed-holder fixture");
         let object_ref = ObjectRef::new(1, 0);
         assert_eq!(
-            pdf.resolve(object_ref)
+            pdf.resolve_object(object_ref)
                 .expect("recover target stream")
                 .as_stream()
                 .unwrap()
@@ -7067,7 +7085,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            pdf.resolve(object_ref).unwrap().as_stream().unwrap().data,
+            pdf.resolve_object(object_ref)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
             b"abc"
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
@@ -7080,7 +7102,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
 
         assert_eq!(
-            pdf.resolve(object_ref).expect("recover stray name"),
+            pdf.resolve_object(object_ref).expect("recover stray name"),
             Object::Name(b"a\0\x31x".to_vec())
         );
         assert_eq!(
@@ -7093,7 +7115,7 @@ mod tests {
         );
 
         assert_eq!(
-            pdf.resolve(object_ref).unwrap(),
+            pdf.resolve_object(object_ref).unwrap(),
             Object::Name(b"a\0\x31x".to_vec())
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -7110,7 +7132,7 @@ mod tests {
         pdf.cache.set_compressed(object_ref, 1, 0);
 
         assert_eq!(
-            pdf.resolve(object_ref)
+            pdf.resolve_object(object_ref)
                 .expect("recover compressed stray name"),
             Object::Name(b"a\0\x31x".to_vec())
         );
@@ -7127,7 +7149,7 @@ mod tests {
         );
 
         assert_eq!(
-            pdf.resolve(object_ref).unwrap(),
+            pdf.resolve_object(object_ref).unwrap(),
             Object::Name(b"a\0\x31x".to_vec())
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -7145,7 +7167,7 @@ mod tests {
         fail_warning_delivery(&mut pdf);
 
         assert!(matches!(
-            pdf.resolve(object_ref),
+            pdf.resolve_object(object_ref),
             Err(crate::Error::System(ref message)) if message == "sink write failure 1"
         ));
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -7183,7 +7205,9 @@ mod tests {
             recovered_stream_fixture(b"/Length 2 0 R", b"\n", Some(b"2 0 obj\n3\nendobj\n"));
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open valid indirect-length fixture");
         let object_ref = ObjectRef::new(1, 0);
-        let stream = pdf.resolve(object_ref).expect("resolve recovered stream");
+        let stream = pdf
+            .resolve_object(object_ref)
+            .expect("resolve recovered stream");
         assert_eq!(stream.as_stream().unwrap().data, b"abc");
         assert_eq!(pdf.recovered_stream_eol(object_ref), None);
     }
@@ -7194,7 +7218,11 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
         let object_ref = ObjectRef::new(1, 0);
         assert_eq!(
-            pdf.resolve(object_ref).unwrap().as_stream().unwrap().data,
+            pdf.resolve_object(object_ref)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .data,
             b"abc"
         );
         assert!(pdf
@@ -7208,7 +7236,7 @@ mod tests {
     fn qpdf_reader_registers_file_object_diagnostics_once_after_cache_commit() {
         let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).unwrap();
         let object_ref = ObjectRef::new(4, 0);
-        assert_eq!(pdf.resolve(object_ref).unwrap(), Object::Integer(3));
+        assert_eq!(pdf.resolve_object(object_ref).unwrap(), Object::Integer(3));
         assert_eq!(
             pdf.resolve_qpdf_json_object(object_ref).unwrap(),
             Object::Integer(3)
@@ -7246,7 +7274,7 @@ mod tests {
         for bytes in cases {
             let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
             assert_eq!(
-                pdf.resolve(ObjectRef::new(1, 0))
+                pdf.resolve_object(ObjectRef::new(1, 0))
                     .unwrap()
                     .as_stream()
                     .unwrap()
@@ -7522,7 +7550,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open false-next-offset PDF");
 
         assert!(matches!(
-            pdf.resolve(ObjectRef::new(1, 0))
+            pdf.resolve_object(ObjectRef::new(1, 0))
                 .expect("ordinary bounded fallback"),
             Object::Stream(_)
         ));
@@ -8164,7 +8192,7 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
         assert_eq!(
-            pdf.resolve(object_ref)
+            pdf.resolve_object(object_ref)
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -8181,7 +8209,7 @@ mod tests {
         pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
-            pdf.resolve(object_ref)
+            pdf.resolve_object(object_ref)
                 .unwrap()
                 .as_dict()
                 .unwrap()
@@ -8458,7 +8486,7 @@ mod tests {
         let mut normal_first =
             Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
         assert_eq!(
-            normal_first.resolve(object_ref).unwrap(),
+            normal_first.resolve_object(object_ref).unwrap(),
             Object::Integer(3)
         );
         assert_eq!(
@@ -8476,7 +8504,10 @@ mod tests {
             json_first.resolve_qpdf_json_object(object_ref).unwrap(),
             Object::Integer(3)
         );
-        assert_eq!(json_first.resolve(object_ref).unwrap(), Object::Integer(3));
+        assert_eq!(
+            json_first.resolve_object(object_ref).unwrap(),
+            Object::Integer(3)
+        );
         assert_eq!(json_first.repair_diagnostics().entries().len(), 1);
     }
 
@@ -8506,7 +8537,7 @@ mod tests {
         let initial_budget = pdf.resolution_fallbacks_remaining;
 
         let object = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .expect("bounded stream must retry against EOF");
         assert_eq!(
             object.as_stream().map(|stream| stream.data.as_slice()),
@@ -8530,8 +8561,14 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
 
-        assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
-        assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
+        assert_eq!(
+            pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
+            Object::Null
+        );
+        assert_eq!(
+            pdf.resolve_object(ObjectRef::new(3, 0)).unwrap(),
+            Object::Null
+        );
         let snapshot = pdf.repair_diagnostics();
         let diagnostics = snapshot.entries();
         assert_eq!(diagnostics.len(), 1);
@@ -8565,7 +8602,7 @@ mod tests {
         )
         .expect("linear-scan xref repair");
         assert_eq!(
-            pdf.resolve(ObjectRef::new(4, 0)).unwrap(),
+            pdf.resolve_object(ObjectRef::new(4, 0)).unwrap(),
             Object::Integer(3)
         );
         assert_eq!(
@@ -8626,7 +8663,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 1, 0);
         assert_eq!(
-            pdf.resolve(ObjectRef::new(7, 0)).unwrap(),
+            pdf.resolve_object(ObjectRef::new(7, 0)).unwrap(),
             Object::Integer(6)
         );
         assert_eq!(
@@ -9590,7 +9627,7 @@ mod tests {
 
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen output");
         let emitted_stream_ref = reopened
-            .resolve(root_ref)
+            .resolve_object(root_ref)
             .expect("resolve rewritten root")
             .into_dict()
             .and_then(|dict| dict.get("Extra").cloned())
@@ -9599,7 +9636,7 @@ mod tests {
         assert_eq!(emitted_stream_ref, emitted_ref);
         assert_eq!(
             reopened
-                .resolve(emitted_ref)
+                .resolve_object(emitted_ref)
                 .expect("resolve rewritten stream")
                 .as_stream()
                 .expect("rewritten object remains a stream")
@@ -9814,7 +9851,9 @@ mod tests {
             let mut legacy = Pdf::open_mem_owned(source.clone()).expect("open legacy");
             let mut canonical = Pdf::open_mem_owned(source.clone()).expect("open canonical");
 
-            let original_object = legacy.resolve(object_ref).expect("resolve legacy catalog");
+            let original_object = legacy
+                .resolve_object(object_ref)
+                .expect("resolve legacy catalog");
             let mut legacy_modified = original_object.clone();
             legacy_modified
                 .as_dict_mut()
@@ -9843,7 +9882,7 @@ mod tests {
             assert!(canonical.is_dirty(object_ref));
             assert_eq!(
                 legacy
-                    .resolve(object_ref)
+                    .resolve_object(object_ref)
                     .expect("resolve modified legacy catalog")
                     .as_dict()
                     .and_then(|dict| dict.get("Marker"))
@@ -9868,7 +9907,7 @@ mod tests {
                 )
                 .expect("restore canonical catalog");
             assert!(legacy
-                .resolve(object_ref)
+                .resolve_object(object_ref)
                 .expect("resolve restored catalog")
                 .as_dict()
                 .unwrap()
@@ -10292,7 +10331,7 @@ mod tests {
         }
         pdf.set_object(object_ref, replacement.clone());
         assert_eq!(
-            pdf.resolve(object_ref).expect("resolve replacement"),
+            pdf.resolve_object(object_ref).expect("resolve replacement"),
             replacement
         );
 
@@ -11253,7 +11292,7 @@ mod tests {
             "ot_unresolved, unchanged by this method"
         );
         assert_eq!(
-            pdf.resolve(redirect_ref).expect("legacy resolve"),
+            pdf.resolve_object(redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
         );
     }
@@ -11300,7 +11339,7 @@ mod tests {
         assert_eq!(handle.unparse(), b"200 0 R");
         assert_eq!(handle.as_reference(), Some(target_ref));
         assert_eq!(
-            pdf.resolve(redirect_ref).expect("legacy resolve"),
+            pdf.resolve_object(redirect_ref).expect("legacy resolve"),
             Object::Reference(target_ref)
         );
 
@@ -11420,7 +11459,7 @@ mod tests {
         let middle_handle = pdf.get_object_handle(middle_ref);
         assert_eq!(middle_handle.as_reference(), Some(terminal_ref));
         assert_eq!(
-            pdf.resolve(outer_ref).expect("legacy resolve"),
+            pdf.resolve_object(outer_ref).expect("legacy resolve"),
             Object::Reference(middle_ref)
         );
     }
@@ -11628,7 +11667,7 @@ mod tests {
             .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
 
         let legacy = pdf
-            .resolve(ObjectRef::new(7, 0))
+            .resolve_object(ObjectRef::new(7, 0))
             .expect("resolve_borrowed must also accept it");
         assert!(legacy.as_array().is_some());
         assert!(handle.as_array().is_some());
@@ -11733,7 +11772,7 @@ mod tests {
             .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
 
         let legacy = pdf
-            .resolve(object_ref)
+            .resolve_object(object_ref)
             .expect("resolve_borrowed must also accept it");
         assert!(legacy.as_array().is_some());
         assert!(handle.as_array().is_some());
@@ -12007,7 +12046,8 @@ mod tests {
         // qpdf's cached compressed object before QPDF::removeObject erases
         // only the requested ObjStm cache entry (QPDF.cc:1996-2004).
         assert!(matches!(
-            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            pdf.resolve_object(member_ref)
+                .expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12034,7 +12074,8 @@ mod tests {
         let member_ref = ObjectRef::new(7, 0);
 
         assert!(matches!(
-            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            pdf.resolve_object(member_ref)
+                .expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12084,7 +12125,8 @@ mod tests {
         let member_ref = ObjectRef::new(7, 0);
 
         assert!(matches!(
-            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            pdf.resolve_object(member_ref)
+                .expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 
@@ -12119,7 +12161,8 @@ mod tests {
         let member_ref = ObjectRef::new(7, 0);
 
         assert!(matches!(
-            pdf.resolve(member_ref).expect("resolve ObjStm member"),
+            pdf.resolve_object(member_ref)
+                .expect("resolve ObjStm member"),
             Object::Dictionary(_)
         ));
 

@@ -188,7 +188,7 @@ mod tests {
         drop(helper);
 
         let filespec = pdf
-            .resolve(filespec_ref)
+            .resolve_object(filespec_ref)
             .unwrap()
             .into_dict()
             .expect("terminal object must be a Filespec dictionary");

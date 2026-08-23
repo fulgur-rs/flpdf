@@ -110,7 +110,9 @@ fn signatures_follow_terminal_value_holder_without_losing_field_value_reference(
     let original_ref = ObjectRef::new(6, 0);
     let intermediate_ref = ObjectRef::new(20, 0);
     let terminal_ref = ObjectRef::new(21, 0);
-    let signature_dictionary = pdf.resolve(original_ref).expect("signature dictionary");
+    let signature_dictionary = pdf
+        .resolve_object(original_ref)
+        .expect("signature dictionary");
     pdf.set_object(terminal_ref, signature_dictionary);
     pdf.set_object(intermediate_ref, Object::Reference(terminal_ref));
     pdf.set_object(original_ref, Object::Reference(intermediate_ref));

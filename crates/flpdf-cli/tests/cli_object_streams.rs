@@ -76,7 +76,7 @@ fn object_streams_generate_is_accepted_and_emits_objstm() {
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     let mut found_objstm = false;
     for r in pdf.object_refs() {
-        if let Ok(Object::Stream(s)) = pdf.resolve(r) {
+        if let Ok(Object::Stream(s)) = pdf.resolve_object(r) {
             if let Some(Object::Name(n)) = s.dict.get("Type") {
                 if n.as_slice() == b"ObjStm" {
                     found_objstm = true;

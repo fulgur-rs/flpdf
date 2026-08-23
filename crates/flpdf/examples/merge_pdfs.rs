@@ -27,7 +27,7 @@ fn font_ref_of_page<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page: ObjectRef,
 ) -> Option<ObjectRef> {
-    let page_obj = pdf.resolve(page).ok()?;
+    let page_obj = pdf.resolve_object(page).ok()?;
     let resources = page_obj.as_dict()?.get("Resources")?;
     let fonts = resources.as_dict()?.get("Font")?;
     fonts.as_dict()?.get("F1")?.as_ref_id()

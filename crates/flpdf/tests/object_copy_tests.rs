@@ -107,7 +107,7 @@ fn copies_chain_with_fresh_numbers() {
 
     // A's copy resolves identically to the source view modulo renumber:
     // non-reference content (/Type, /Foo) preserved, references remapped.
-    let a = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
+    let a = target.resolve_object(map[&ObjectRef::new(4, 0)]).unwrap();
     let Object::Dictionary(a_dict) = &a else {
         panic!("expected dictionary, got {a:?}");
     };
@@ -118,7 +118,7 @@ fn copies_chain_with_fresh_numbers() {
         Some(&Object::Reference(map[&ObjectRef::new(5, 0)])),
         "A's copy must reference the remapped B"
     );
-    let b = target.resolve(map[&ObjectRef::new(5, 0)]).unwrap();
+    let b = target.resolve_object(map[&ObjectRef::new(5, 0)]).unwrap();
     assert!(
         object_contains(&b, &Object::Reference(map[&ObjectRef::new(6, 0)])),
         "B's copy must reference the remapped C"
@@ -154,7 +154,7 @@ fn remaps_references_inside_arrays() {
     ]);
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();
 
-    let a = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
+    let a = target.resolve_object(map[&ObjectRef::new(4, 0)]).unwrap();
     let Object::Dictionary(a_dict) = &a else {
         panic!("expected dictionary, got {a:?}");
     };
@@ -193,8 +193,8 @@ fn preserves_reference_cycle() {
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();
 
     assert_eq!(map.len(), 2);
-    let a = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
-    let b = target.resolve(map[&ObjectRef::new(5, 0)]).unwrap();
+    let a = target.resolve_object(map[&ObjectRef::new(4, 0)]).unwrap();
+    let b = target.resolve_object(map[&ObjectRef::new(5, 0)]).unwrap();
     assert!(
         object_contains(&a, &Object::Reference(map[&ObjectRef::new(5, 0)])),
         "A's copy points to remapped B"
@@ -236,8 +236,8 @@ fn shares_child_within_a_single_call() {
 
     assert_eq!(map.len(), 3, "G copied once, not duplicated");
     let g = map[&ObjectRef::new(6, 0)];
-    let e = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
-    let f = target.resolve(map[&ObjectRef::new(5, 0)]).unwrap();
+    let e = target.resolve_object(map[&ObjectRef::new(4, 0)]).unwrap();
+    let f = target.resolve_object(map[&ObjectRef::new(5, 0)]).unwrap();
     assert!(object_contains(&e, &Object::Reference(g)));
     assert!(object_contains(&f, &Object::Reference(g)));
 }
@@ -267,7 +267,7 @@ fn nulls_out_of_set_references() {
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();
 
     assert_eq!(map.len(), 1, "only the in-set object is copied");
-    let h = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
+    let h = target.resolve_object(map[&ObjectRef::new(4, 0)]).unwrap();
     // The out-of-set link must now be Null, not a dangling/colliding ref.
     assert!(
         object_contains(&h, &Object::Null),
@@ -339,7 +339,7 @@ fn copies_stream_payload() {
     let refs = refset(&[ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();
 
-    let copied = target.resolve(map[&ObjectRef::new(4, 0)]).unwrap();
+    let copied = target.resolve_object(map[&ObjectRef::new(4, 0)]).unwrap();
     match copied {
         Object::Stream(s) => {
             assert_eq!(s.data, b"hello stream", "stream bytes copied verbatim");

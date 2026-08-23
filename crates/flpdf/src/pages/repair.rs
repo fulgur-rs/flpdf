@@ -441,7 +441,9 @@ mod tests {
             before_count,
             "no inheritable keys present anywhere: no object should be minted"
         );
-        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let page = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
             panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -496,7 +498,9 @@ mod tests {
             "a scalar inherited value must never mint a new object"
         );
 
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -505,7 +509,9 @@ mod tests {
             "/Rotate must be stripped from the interior /Pages node"
         );
 
-        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let page = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
             panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -568,7 +574,9 @@ mod tests {
             "a direct non-scalar inherited value must mint exactly one new object"
         );
 
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -577,7 +585,9 @@ mod tests {
             "/Resources must be stripped from the interior /Pages node"
         );
 
-        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let page = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
             panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -590,7 +600,9 @@ mod tests {
             resources_ref.number, 5,
             "the minted object must be the next free object number (4 was already in use)"
         );
-        let minted = pdf.resolve(*resources_ref).expect("minted object resolves");
+        let minted = pdf
+            .resolve_object(*resources_ref)
+            .expect("minted object resolves");
         let Object::Dictionary(minted_dict) = minted else {
             panic!("minted object is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -639,7 +651,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -721,7 +735,7 @@ mod tests {
 
         for page_num in [3u32, 5] {
             let page = pdf
-                .resolve(ObjectRef::new(page_num, 0))
+                .resolve_object(ObjectRef::new(page_num, 0))
                 .unwrap_or_else(|e| panic!("page {page_num} resolves: {e}"));
             let Object::Dictionary(page_dict) = page else {
                 panic!("page {page_num} is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -787,7 +801,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let page = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
             panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -861,7 +877,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(6, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(6, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -874,14 +892,16 @@ mod tests {
 
         // Both interior nodes must have /Resources stripped.
         let grandparent = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .expect("grandparent resolves");
         let Object::Dictionary(gp_dict) = grandparent else {
             panic!("grandparent is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert!(gp_dict.get("Resources").is_none());
 
-        let parent = pdf.resolve(ObjectRef::new(3, 0)).expect("parent resolves");
+        let parent = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("parent resolves");
         let Object::Dictionary(parent_dict) = parent else {
             panic!("parent is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1103,7 +1123,9 @@ mod tests {
             "a /Pages node without /Kids must be a no-op, not an error: {result:?}"
         );
 
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         assert!(
             matches!(&pages, Object::Dictionary(d) if d.get("Rotate").is_none()),
             "/Rotate must still be stripped from the /Pages node even with no \
@@ -1155,7 +1177,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1274,7 +1298,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1337,7 +1363,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1404,7 +1432,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1479,7 +1509,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1533,7 +1565,7 @@ mod tests {
             "no object should be minted when the root itself is not a /Pages node"
         );
         let root_page = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .expect("root page resolves");
         let Object::Dictionary(root_page_dict) = root_page else {
             panic!("root page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -1610,7 +1642,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
+        let child = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("child resolves");
         let Object::Dictionary(child_dict) = child else {
             panic!("child is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1622,7 +1656,9 @@ mod tests {
              qpdf's loop never touches it"
         );
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1694,7 +1730,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
+        let child = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("child resolves");
         let Object::Dictionary(child_dict) = child else {
             panic!("child is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1705,7 +1743,9 @@ mod tests {
              /Pages node must be left in place, not erased"
         );
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1785,7 +1825,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let child = pdf.resolve(ObjectRef::new(3, 0)).expect("child resolves");
+        let child = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("child resolves");
         let Object::Dictionary(child_dict) = child else {
             panic!("child is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1796,7 +1838,9 @@ mod tests {
              the child /Pages node must be left in place, not erased"
         );
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1874,7 +1918,9 @@ mod tests {
         );
 
         // Parent A keeps the original leaf; parent B now points at the clone.
-        let a = pdf.resolve(ObjectRef::new(3, 0)).expect("A resolves");
+        let a = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("A resolves");
         let Object::Dictionary(a_dict) = a else {
             panic!("A not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1885,7 +1931,9 @@ mod tests {
             ))])),
             "parent A must keep the original leaf 5 in its /Kids"
         );
-        let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
+        let b = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("B resolves");
         let Object::Dictionary(b_dict) = b else {
             panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1898,12 +1946,16 @@ mod tests {
         );
 
         // Original leaf inherits A's /Rotate 90; clone inherits B's /Rotate 180.
-        let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(5, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(leaf_dict.get("Rotate"), Some(&Object::Integer(90)));
-        let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
+        let clone = pdf
+            .resolve_object(ObjectRef::new(7, 0))
+            .expect("clone resolves");
         let Object::Dictionary(clone_dict) = clone else {
             panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -1935,7 +1987,7 @@ mod tests {
 
         // The root /Count is untouched (clone arm never flattens).
         let root_pages = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .expect("root pages resolves");
         let Object::Dictionary(rp) = root_pages else {
             panic!("root pages not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -1986,7 +2038,9 @@ mod tests {
             before_count + 1,
             "one clone minted"
         );
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2039,7 +2093,9 @@ mod tests {
             before_count + 2,
             "two clones minted"
         );
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2170,7 +2226,9 @@ mod tests {
         );
 
         // Parent A keeps the original leaf 5; parent B is rewritten to the clone 7.
-        let a = pdf.resolve(ObjectRef::new(3, 0)).expect("A resolves");
+        let a = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("A resolves");
         let Object::Dictionary(a_dict) = a else {
             panic!("A not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2181,7 +2239,9 @@ mod tests {
             ))])),
             "parent A must keep the original leaf 5 in its /Kids"
         );
-        let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
+        let b = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("B resolves");
         let Object::Dictionary(b_dict) = b else {
             panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2195,12 +2255,16 @@ mod tests {
 
         // Original leaf inherits A's /Rotate 90; the clone inherits B's /Rotate
         // 180 independently — a naive skip would drop the 180 entirely.
-        let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(5, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
         assert_eq!(leaf_dict.get("Rotate"), Some(&Object::Integer(90)));
-        let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
+        let clone = pdf
+            .resolve_object(ObjectRef::new(7, 0))
+            .expect("clone resolves");
         let Object::Dictionary(clone_dict) = clone else {
             panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2229,7 +2293,7 @@ mod tests {
         // unconditionally (QPDF_pages.cc:89-92, no reconstruction gate), so the
         // override runs for a reconstructed input too.
         let interior = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .expect("interior resolves");
         let Object::Dictionary(interior_dict) = interior else {
             panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -2267,7 +2331,9 @@ mod tests {
             before_count,
             "a clean reconstructed input must not mint any object (repairs are no-ops)"
         );
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2275,7 +2341,9 @@ mod tests {
             pages_dict.get("Rotate").is_none(),
             "/Rotate must still be stripped from the interior /Pages node"
         );
-        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let page = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
             panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2338,7 +2406,7 @@ mod tests {
         push_for_test(&mut pdf).expect("push must succeed");
 
         let interior = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .expect("interior resolves");
         let Object::Dictionary(interior_dict) = interior else {
             panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -2353,7 +2421,9 @@ mod tests {
             "/Rotate must be stripped from the now-correctly-typed interior /Pages node"
         );
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2406,7 +2476,7 @@ mod tests {
 
         assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
         assert!(matches!(
-            pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves"),
+            pdf.resolve_object(ObjectRef::new(3, 0)).expect("leaf resolves"),
             Object::Dictionary(ref dict)
                 if matches!(dict.get("Type"), Some(Object::Name(name)) if name == b"Page")
         ));
@@ -2419,7 +2489,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2440,7 +2512,7 @@ mod tests {
                 Pdf::open(Cursor::new(pdf_with_no_inheritable_keys())).expect("valid PDF");
             pdf.set_object(ObjectRef::new(4, 0), Object::Null);
             let mut leaf = pdf
-                .resolve(ObjectRef::new(3, 0))
+                .resolve_object(ObjectRef::new(3, 0))
                 .expect("leaf resolves")
                 .into_dict()
                 .expect("leaf is a dictionary");
@@ -2474,7 +2546,9 @@ mod tests {
             before_count,
             "a correctly-typed tree must not mint any object"
         );
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2483,7 +2557,9 @@ mod tests {
             Some(&Object::Name(b"Pages".to_vec())),
             "an already-correct interior /Type must be left untouched"
         );
-        let page = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
+        let page = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("page resolves");
         let Object::Dictionary(page_dict) = page else {
             panic!("page is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2535,7 +2611,7 @@ mod tests {
         push_for_test(&mut pdf).expect("push must succeed");
 
         let interior = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .expect("interior resolves");
         let Object::Dictionary(interior_dict) = interior else {
             panic!("interior is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -2546,7 +2622,9 @@ mod tests {
             "an interior node with no /Type must have /Type set to /Pages"
         );
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2598,7 +2676,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2662,7 +2742,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(4, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2671,7 +2753,7 @@ mod tests {
         let mb_ref = leaf_dict
             .get_ref("MediaBox")
             .expect("leaf must inherit the ancestor /MediaBox as an indirect reference");
-        let media_box = pdf.resolve(mb_ref).expect("/MediaBox ref resolves");
+        let media_box = pdf.resolve_object(mb_ref).expect("/MediaBox ref resolves");
         assert_eq!(
             media_box,
             Object::Array(vec![
@@ -2723,7 +2805,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2778,7 +2862,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2838,7 +2924,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2895,7 +2983,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -2955,7 +3045,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3041,7 +3133,9 @@ mod tests {
         // /Kids entry is rewritten to it. (The push separately mints A's direct
         // /MediaBox into an indirect object, object 8, so the total object count
         // grows by two — the clone is specifically 7.)
-        let b = pdf.resolve(ObjectRef::new(4, 0)).expect("B resolves");
+        let b = pdf
+            .resolve_object(ObjectRef::new(4, 0))
+            .expect("B resolves");
         let Object::Dictionary(b_dict) = b else {
             panic!("B not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3063,7 +3157,9 @@ mod tests {
             Object::Integer(612),
             Object::Integer(792),
         ]));
-        let leaf = pdf.resolve(ObjectRef::new(5, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(5, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3073,7 +3169,9 @@ mod tests {
             "the shared original (A's page) must be defaulted to [0 0 612 792] on \
              the B visit, not keep A's inherited [0 0 200 300] (default-before-clone)"
         );
-        let clone = pdf.resolve(ObjectRef::new(7, 0)).expect("clone resolves");
+        let clone = pdf
+            .resolve_object(ObjectRef::new(7, 0))
+            .expect("clone resolves");
         let Object::Dictionary(clone_dict) = clone else {
             panic!("clone not a dict") // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3129,7 +3227,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3184,7 +3284,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3249,7 +3351,9 @@ mod tests {
         let bytes = pdf_with_indirect_real_literal_mediabox_elem();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
         push_for_test(&mut pdf).expect("push must succeed");
-        let leaf = pdf.resolve(ObjectRef::new(3, 0)).expect("leaf resolves");
+        let leaf = pdf
+            .resolve_object(ObjectRef::new(3, 0))
+            .expect("leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3328,7 +3432,9 @@ mod tests {
 
         // The /Pages node's /Kids[0] must be rewritten from the inline dict to a
         // reference to the minted leaf (the next free number, 4).
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3342,7 +3448,7 @@ mod tests {
 
         // Resolving the minted reference yields the leaf dict unchanged.
         let leaf = pdf
-            .resolve(ObjectRef::new(4, 0))
+            .resolve_object(ObjectRef::new(4, 0))
             .expect("minted leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("minted leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -3428,7 +3534,7 @@ mod tests {
             let mut pdf = Pdf::open(Cursor::new(pdf_with_direct_leaf_kid())).expect("valid PDF");
             pdf.set_object(ObjectRef::new(4, 0), Object::Null);
             let mut pages = pdf
-                .resolve(ObjectRef::new(2, 0))
+                .resolve_object(ObjectRef::new(2, 0))
                 .expect("pages resolves")
                 .into_dict()
                 .expect("pages is a dictionary");
@@ -3506,7 +3612,7 @@ mod tests {
 
         // The minted leaf takes the next free object number (4).
         let leaf = pdf
-            .resolve(ObjectRef::new(4, 0))
+            .resolve_object(ObjectRef::new(4, 0))
             .expect("minted leaf resolves");
         let Object::Dictionary(leaf_dict) = leaf else {
             panic!("minted leaf is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
@@ -3581,7 +3687,9 @@ mod tests {
         assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
 
         // The direct interior /Kids entry is left direct (not converted to a ref).
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3600,7 +3708,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(4, 0), Object::Null);
 
         let mut indirect_leaf = pdf
-            .resolve(ObjectRef::new(3, 0))
+            .resolve_object(ObjectRef::new(3, 0))
             .expect("leaf resolves")
             .into_dict()
             .expect("leaf is a dictionary");
@@ -3608,7 +3716,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(indirect_leaf));
 
         let mut pages = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .expect("pages resolves")
             .into_dict()
             .expect("pages is a dictionary");
@@ -3690,7 +3798,9 @@ mod tests {
             "a direct non-dictionary /Kids entry must be promoted without error: {result:?}"
         );
 
-        let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
+        let pages = pdf
+            .resolve_object(ObjectRef::new(2, 0))
+            .expect("pages resolves");
         let Object::Dictionary(pages_dict) = pages else {
             panic!("pages is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3766,7 +3876,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let catalog = pdf
+            .resolve_object(ObjectRef::new(1, 0))
+            .expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
             panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3836,7 +3948,9 @@ mod tests {
 
         // The walk must climb BOTH hops (4 -> 3 -> 2) to the true root, not stop at
         // the first parent (3). A "stop after one hop" bug would leave /Pages at 3.
-        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let catalog = pdf
+            .resolve_object(ObjectRef::new(1, 0))
+            .expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
             panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3858,7 +3972,9 @@ mod tests {
 
         push_for_test(&mut pdf).expect("push must succeed");
 
-        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let catalog = pdf
+            .resolve_object(ObjectRef::new(1, 0))
+            .expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
             panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -3879,7 +3995,7 @@ mod tests {
                 Pdf::open(Cursor::new(pdf_with_no_inheritable_keys())).expect("valid PDF");
             pdf.set_object(ObjectRef::new(4, 0), Object::Null);
             let mut pages = pdf
-                .resolve(ObjectRef::new(2, 0))
+                .resolve_object(ObjectRef::new(2, 0))
                 .expect("pages resolves")
                 .into_dict()
                 .expect("pages is a dictionary");
@@ -3897,7 +4013,7 @@ mod tests {
             );
             assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)], "{label}");
             let catalog = pdf
-                .resolve(ObjectRef::new(1, 0))
+                .resolve_object(ObjectRef::new(1, 0))
                 .expect("catalog resolves")
                 .into_dict()
                 .expect("catalog is a dictionary");
@@ -3971,7 +4087,9 @@ mod tests {
         // qpdf's walk breaks when it re-visits A: pages = A(2) -> B(3) -> A(2)
         // (already seen) -> break, leaving pages = A(2), which it then writes back.
         // flpdf lands on the same node, so /Pages stays 2 0 R.
-        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let catalog = pdf
+            .resolve_object(ObjectRef::new(1, 0))
+            .expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
             panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -4159,7 +4277,9 @@ mod tests {
 
         // qpdf's dictionary handle follows a direct /Parent and replaces the
         // catalog root with that direct parent (QPDF_pages.cc:50-67).
-        let catalog = pdf.resolve(ObjectRef::new(1, 0)).expect("catalog resolves");
+        let catalog = pdf
+            .resolve_object(ObjectRef::new(1, 0))
+            .expect("catalog resolves");
         let Object::Dictionary(catalog_dict) = catalog else {
             panic!("catalog is not a dictionary"); // cov:ignore: unreachable — fixture always resolves to the expected type
         };
@@ -4175,7 +4295,7 @@ mod tests {
         let mut pdf =
             Pdf::open(Cursor::new(pdf_with_root_pages_non_reference_parent())).expect("valid PDF");
         let mut root = pdf
-            .resolve(ObjectRef::new(2, 0))
+            .resolve_object(ObjectRef::new(2, 0))
             .unwrap()
             .into_dict()
             .expect("pages root must be a dictionary");
@@ -4187,7 +4307,7 @@ mod tests {
             "a scalar parent leaves qpdf with no dictionary page tree to enumerate"
         );
         let catalog = pdf
-            .resolve(ObjectRef::new(1, 0))
+            .resolve_object(ObjectRef::new(1, 0))
             .unwrap()
             .into_dict()
             .expect("catalog must be a dictionary");

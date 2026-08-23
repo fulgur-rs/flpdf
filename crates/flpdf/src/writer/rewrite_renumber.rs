@@ -211,7 +211,7 @@ impl CatalogFirstRenumber {
 
         while let Some(cur) = queue.pop_front() {
             if qpdf_visibility {
-                let obj = pdf.resolve(cur)?;
+                let obj = pdf.resolve_object(cur)?;
                 let mut found = Vec::new();
                 collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
                 for reference in found {
@@ -680,7 +680,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         }
     }
     while let Some(cur) = queue.pop_front() {
-        let obj = pdf.resolve(cur)?;
+        let obj = pdf.resolve_object(cur)?;
         let mut found = Vec::new();
         collect_qpdf_enqueue_refs_with_stream_parameters(
             pdf,
@@ -763,7 +763,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
         if !visited.insert(cur) {
             continue;
         }
-        let obj = pdf.resolve(cur)?;
+        let obj = pdf.resolve_object(cur)?;
         let mut follow: Vec<ObjectRef> = Vec::new();
         walk_surviving(pdf, &obj, 0, false, &mut follow, &mut result, removed_refs)?;
         for r in follow {
@@ -1455,12 +1455,12 @@ mod tests {
     /// Name is tagged with that name (e.g. `/Catalog`); any other dictionary is
     /// `"dict"`.
     fn type_tag<R: Read + Seek>(pdf: &mut Pdf<R>, r: ObjectRef) -> String {
-        let obj = pdf.resolve(r).expect("resolve");
+        let obj = pdf.resolve_object(r).expect("resolve");
         match &obj {
             Object::Stream(_) => "stream".to_string(),
             Object::Dictionary(dict) => match dict.get("Type") {
                 Some(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(name)),
-                Some(Object::Reference(tref)) => match pdf.resolve(*tref) {
+                Some(Object::Reference(tref)) => match pdf.resolve_object(*tref) {
                     Ok(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(&name)),
                     _ => "dict".to_string(),
                 },
@@ -1937,7 +1937,7 @@ mod tests {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/null-visible-matrix.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let root = pdf.root_ref().expect("root");
-        let original_root = pdf.resolve(root).expect("resolve root");
+        let original_root = pdf.resolve_object(root).expect("resolve root");
 
         let map = CatalogFirstRenumber::build_qpdf(&mut pdf, true).expect("build");
 
@@ -1956,7 +1956,7 @@ mod tests {
             "source order must match qpdf 11.9.0's standard object queue"
         );
         assert_eq!(
-            pdf.resolve(root).unwrap(),
+            pdf.resolve_object(root).unwrap(),
             original_root,
             "visibility analysis must not mutate the source graph"
         );
