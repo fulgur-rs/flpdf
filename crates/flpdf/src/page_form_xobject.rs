@@ -571,12 +571,16 @@ fn page_group<R: Read + Seek>(
     match group_val {
         None => Ok(None),
         Some(value) if value.is_null() => Ok(None),
-        // shallowCopy: materialize the top level only (ref -> direct dict).
+        // qpdf calls shallowCopy() on the attribute value unconditionally
+        // (libqpdf/QPDFPageObjectHelper.cc:715), not only when it is
+        // indirect: an indirect value is first resolved one level (ref ->
+        // direct dict), then both branches shallow-copy so the returned
+        // handle never shares mutable identity with the page's own /Group.
         Some(value) if value.is_indirect() || value.as_reference().is_some() => {
             pdf.resolve(&value)?;
             Ok(Some(value.shallow_copy()?))
         }
-        Some(direct) => Ok(Some(direct)),
+        Some(direct) => Ok(Some(direct.shallow_copy()?)),
     }
 }
 
@@ -1517,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn page_group_returns_direct_dict_as_is() {
+    fn page_group_returns_a_direct_dict() {
         let mut pdf = open(one_page_doc(
             "/Group << /Type /Group /S /Transparency >>",
             "x",
@@ -1527,6 +1531,35 @@ mod tests {
             .unwrap()
             .expect("a present direct /Group dict must be returned");
         assert!(got.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn page_group_shallow_copies_a_direct_group() {
+        // qpdf calls getAttribute("/Group", false).shallowCopy()
+        // unconditionally (libqpdf/QPDFPageObjectHelper.cc:715), not only
+        // for an indirect value. Mutating the returned handle must not
+        // perturb the page's own /Group dict -- they must not share
+        // mutable identity.
+        let mut pdf = open(one_page_doc(
+            "/Group << /Type /Group /S /Transparency >>",
+            "x",
+            &[],
+        ));
+        let got = page_group(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .expect("a present direct /Group dict must be returned");
+        got.replace_key(b"/S", ObjectHandle::name(b"Mutated".to_vec()))
+            .unwrap();
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        let original_group = page.get_key(b"/Group");
+        let original_s = original_group.get_key(b"/S");
+        assert_eq!(
+            original_s.as_name(),
+            Some(b"Transparency".to_vec()),
+            "mutating the returned handle must not affect the page's own /Group"
+        );
     }
 
     #[test]
