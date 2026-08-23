@@ -4,7 +4,7 @@ use crate::encryption::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncr
 use crate::object::{write_hex_string, write_name_escaped, write_string_value};
 use crate::object_handle::ObjectHandle;
 use crate::writer::encryption_state::WriterEncryptionState;
-use crate::writer::{EncryptionContext, WriteCipher, WriterOptions};
+use crate::writer::{EncryptionContext, ObjectWriterEmission, WriteCipher, WriterOptions};
 use crate::{Dictionary, Object, ObjectRef};
 
 type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
@@ -133,9 +133,9 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if qdf {
-                    object.unparse_object_qdf_with_string_writer(out, 0, &mut write_string)
+                    object.write_object_qdf_with_string_writer(out, 0, &mut write_string)
                 } else {
-                    object.unparse_object_with_string_writer(out, &mut write_string)
+                    object.write_object_with_string_writer(out, &mut write_string)
                 }
             })
     }
@@ -174,7 +174,7 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if qdf {
-                    object.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                    object.write_object_qdf_with_ref_map_and_removed_with_string_writer(
                         out,
                         0,
                         map,
@@ -182,7 +182,7 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 } else {
-                    object.unparse_object_with_ref_map_and_removed_with_string_writer(
+                    object.write_object_with_ref_map_and_removed_with_string_writer(
                         out,
                         map,
                         removed_refs,
@@ -298,9 +298,9 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         if !options.encrypt_strings {
             if options.qdf {
-                return dict.unparse_stream_body_qdf(out, 0);
+                return dict.write_stream_body_qdf(out, 0);
             }
-            return dict.unparse_stream_body(out, options.refiltered);
+            return dict.write_stream_body(out, options.refiltered);
         }
 
         let cipher = self.cipher;
@@ -319,9 +319,9 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if options.qdf {
-                    dict.unparse_stream_body_qdf_with_string_writer(out, 0, &mut write_string)
+                    dict.write_stream_body_qdf_with_string_writer(out, 0, &mut write_string)
                 } else {
-                    dict.unparse_stream_body_with_string_writer(
+                    dict.write_stream_body_with_string_writer(
                         out,
                         options.refiltered,
                         &mut write_string,
@@ -347,7 +347,7 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         if !options.encrypt_strings {
             if options.qdf {
-                return dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+                return dict.write_stream_body_qdf_with_ref_map_and_removed_and_length(
                     out,
                     0,
                     map,
@@ -355,7 +355,7 @@ impl EncryptedStringEmitter {
                     length_ref,
                 );
             }
-            return dict.unparse_stream_body_with_ref_map_and_removed(
+            return dict.write_stream_body_with_ref_map_and_removed(
                 out,
                 options.refiltered,
                 map,
@@ -379,7 +379,7 @@ impl EncryptedStringEmitter {
                     )
                 };
                 if options.qdf {
-                    dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
+                    dict.write_stream_body_qdf_with_ref_map_and_removed_and_length_with_string_writer(
                         out,
                         0,
                         map,
@@ -388,7 +388,7 @@ impl EncryptedStringEmitter {
                         &mut write_string,
                     )
                 } else {
-                    dict.unparse_stream_body_with_ref_map_and_removed_with_string_writer(
+                    dict.write_stream_body_with_ref_map_and_removed_with_string_writer(
                         out,
                         options.refiltered,
                         map,
@@ -572,7 +572,7 @@ pub(crate) fn write_encryption_dictionary_handle(
                 continue;
             }
         }
-        value.unparse_object(out)?;
+        value.write_object(out)?;
     }
     out.extend_from_slice(b" >>");
     Ok(())
@@ -589,8 +589,8 @@ mod tests {
     };
     use crate::encryption::{CopyEncryptionSource, EncryptMethod, EncryptParams};
     use crate::writer::{
-        build_copy_encryption_context, build_encryption_context, EncryptionContext, WriteCipher,
-        WriterOptions,
+        build_copy_encryption_context, build_encryption_context, EncryptionContext,
+        ObjectWriterEmission, WriteCipher, WriterOptions,
     };
     use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Stream};
 
@@ -821,7 +821,7 @@ mod tests {
             let handle = super::object_to_handle(&object);
             let mut out = Vec::new();
             handle
-                .unparse_object(&mut out)
+                .write_object(&mut out)
                 .expect("converted object handle must unparse");
             assert_eq!(out, expected, "unexpected conversion for {object:?}");
         }

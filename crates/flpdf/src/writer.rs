@@ -3,6 +3,8 @@
 pub(crate) mod encrypted_strings;
 #[path = "writer/encryption_state.rs"]
 pub(crate) mod encryption_state;
+#[path = "writer/object.rs"]
+pub(crate) mod object;
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
 #[path = "writer/pclm.rs"]
@@ -12,6 +14,7 @@ pub(crate) mod plain;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
 mod settings;
+pub(crate) use object::ObjectWriterEmission;
 pub use object_streams::ObjectStreamMode;
 use serialize::write_stream_payload;
 pub use serialize::write_stream_to_buf;
@@ -4621,7 +4624,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     holder_ref,
                 )?; // cov:ignore: handle-native stream dictionary route; LLVM maps the call continuation here
             } else if options.qdf {
-                stream_dict.unparse_stream_body_qdf_with_ref_map_and_removed_and_length(
+                stream_dict.write_stream_body_qdf_with_ref_map_and_removed_and_length(
                     &mut bytes,
                     0,
                     &map,
@@ -4629,7 +4632,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     holder_ref,
                 )?; // cov:ignore: handle-native QDF stream dictionary route; LLVM maps the call continuation here
             } else {
-                stream_dict.unparse_stream_body_with_ref_map_and_removed(
+                stream_dict.write_stream_body_with_ref_map_and_removed(
                     &mut bytes,
                     refiltered,
                     &map,
@@ -4680,14 +4683,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     &removed_refs,
                 )?; // cov:ignore: encrypted handle-object route; LLVM maps the call continuation here
             } else if options.qdf {
-                object_handle.unparse_object_qdf_with_ref_map_and_removed(
+                object_handle.write_object_qdf_with_ref_map_and_removed(
                     &mut bytes,
                     0,
                     &map,
                     &removed_refs,
                 )?; // cov:ignore: QDF handle-object route; LLVM maps the call continuation here
             } else {
-                object_handle.unparse_object_with_ref_map_and_removed(
+                object_handle.write_object_with_ref_map_and_removed(
                     &mut bytes,
                     &map,
                     &removed_refs,
@@ -4755,8 +4758,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         let body = object_streams::emit_objstm_body_from_handles_with_writer(
             &handles,
             &mut |out, _member_index, _member_ref, handle| {
-                let result =
-                    handle.unparse_object_with_ref_map_and_removed(out, &map, &removed_refs);
+                let result = handle.write_object_with_ref_map_and_removed(out, &map, &removed_refs);
                 if result.is_ok() {
                     report_progress_event(options);
                 }
@@ -4806,7 +4808,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 )?; // cov:ignore: encrypted ObjStm dictionary route; LLVM maps the call continuation here
             } else {
                 // cov:ignore-start: encrypted output always constructs the handle-aware emitter
-                stream_dict.unparse_stream_body_with_ref_map_and_removed(
+                stream_dict.write_stream_body_with_ref_map_and_removed(
                     &mut bytes,
                     false,
                     &identity_map,
@@ -4824,7 +4826,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 None,
             )?; // cov:ignore: the encrypted ObjStm route executes; this call continuation has no counter.
         } else {
-            stream_dict.unparse_stream_body_with_ref_map_and_removed(
+            stream_dict.write_stream_body_with_ref_map_and_removed(
                 &mut bytes,
                 false,
                 &identity_map,
@@ -4964,7 +4966,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         )
                     };
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.unparse_trailer_with_ref_map(
+                    trailer.write_trailer_with_ref_map(
                         &mut bytes,
                         false,
                         true,
@@ -4976,7 +4978,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     // cov:ignore-end
                 } else {
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.unparse_trailer_with_ref_map(
+                    trailer.write_trailer_with_ref_map(
                         &mut bytes,
                         false,
                         true,
@@ -5002,7 +5004,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         )
                     };
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.unparse_trailer_with_ref_map(
+                    trailer.write_trailer_with_ref_map(
                         &mut bytes,
                         false,
                         false,
@@ -5014,7 +5016,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     // cov:ignore-end
                 } else {
                     // cov:ignore-start: multiline handle-native trailer call; branch selection is covered by the writer fixtures
-                    trailer.unparse_trailer_with_ref_map(
+                    trailer.write_trailer_with_ref_map(
                         &mut bytes,
                         false,
                         false,

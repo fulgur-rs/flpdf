@@ -12,7 +12,7 @@ use crate::rewrite_renumber::{
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::body;
 use crate::writer::plain::xref::{materialized_id_handle, IdPlan, TrailerPlan};
-use crate::writer::WriterOptions;
+use crate::writer::{ObjectWriterEmission, WriterOptions};
 use crate::{CompressStreams, ObjectRef, Pdf, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -535,7 +535,7 @@ pub(crate) fn canonical_trailer_entries_with_visibility(
                     ))
                 })
             };
-            value.unparse_object_with_ref_map_and_removed(
+            value.write_object_with_ref_map_and_removed(
                 &mut value_bytes,
                 &map_ref,
                 removed_refs,

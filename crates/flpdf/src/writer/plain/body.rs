@@ -7,7 +7,7 @@ use crate::writer::object_streams;
 use crate::writer::plain::plan::{PlainWritePlan, PlannedIndirectObject};
 use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
 use crate::writer::WriterOptions;
-use crate::writer::{serialize, CompressStreams, QPDF_BINARY_MARKER};
+use crate::writer::{serialize, CompressStreams, ObjectWriterEmission, QPDF_BINARY_MARKER};
 use crate::{ObjectHandle, ObjectRef, Pdf};
 
 /// Emit every body placement already chosen by `plan`.
@@ -63,7 +63,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 let body = object_streams::emit_objstm_body_from_handles_with_writer(
                     &handles,
                     &mut |out, _member_index, _member_ref, handle| {
-                        let result = handle.unparse_object_with_ref_map_and_removed(
+                        let result = handle.write_object_with_ref_map_and_removed(
                             out,
                             &map,
                             &plan.removed_refs,
@@ -162,7 +162,7 @@ fn emit_source_from_handle<R: Read + Seek>(
         } else {
             canonical_stream_output(&handle, options)?
         };
-        dict.unparse_stream_body_with_ref_map_and_removed(
+        dict.write_stream_body_with_ref_map_and_removed(
             bytes,
             refiltered,
             &map,
@@ -170,7 +170,7 @@ fn emit_source_from_handle<R: Read + Seek>(
         )?; // cov:ignore: LLVM attributes the validated success continuation to the call lines above
         serialize::write_stream_payload(bytes, &data, options.newline_before_endstream);
     } else {
-        handle.unparse_object_with_ref_map_and_removed(bytes, &map, &plan.removed_refs)?;
+        handle.write_object_with_ref_map_and_removed(bytes, &map, &plan.removed_refs)?;
     }
     Ok(())
 }
@@ -386,7 +386,7 @@ where
     // ([`Self::emit_direct_stream`]) wherever it is reached while walking
     // this container -- not only nested under `/Contents` -- because the
     // ordinary per-object `ObjectHandle` serializer this call falls back to
-    // otherwise (`unparse_object_with_ref_map_and_removed_with_string_writer`
+    // otherwise (`write_object_with_ref_map_and_removed_with_string_writer`
     // and its QDF sibling) deliberately inlines only a stream's dictionary
     // at a child position (`unparse_container`'s own doc,
     // `crate::object_handle`). The pre-existing materialized-`Object`
@@ -448,7 +448,7 @@ where
                 }
 
                 if self.qdf {
-                    value.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+                    value.write_object_qdf_with_ref_map_and_removed_with_string_writer(
                         self.out,
                         indent,
                         self.map,
@@ -456,7 +456,7 @@ where
                         self.write_string,
                     )
                 } else {
-                    value.unparse_object_with_ref_map_and_removed_with_string_writer(
+                    value.write_object_with_ref_map_and_removed_with_string_writer(
                         self.out,
                         self.map,
                         self.removed_refs,
@@ -532,7 +532,7 @@ where
             // cov:ignore-end
         })?; // cov:ignore: the preceding stream shape probe makes this defensive error unreachable
         if self.qdf {
-            dict.unparse_object_qdf_with_ref_map_and_removed_with_string_writer(
+            dict.write_object_qdf_with_ref_map_and_removed_with_string_writer(
                 self.out,
                 indent,
                 self.map,
@@ -540,7 +540,7 @@ where
                 self.write_string,
             )?; // cov:ignore: LLVM does not attribute the successful QDF dictionary continuation
         } else {
-            dict.unparse_object_with_ref_map_and_removed_with_string_writer(
+            dict.write_object_with_ref_map_and_removed_with_string_writer(
                 self.out,
                 self.map,
                 self.removed_refs,

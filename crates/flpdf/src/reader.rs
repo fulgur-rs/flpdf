@@ -4146,6 +4146,7 @@ mod tests {
     use crate::pages::page_refs;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
+    use crate::writer::ObjectWriterEmission;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
     use std::process::Command;
@@ -8990,7 +8991,7 @@ mod tests {
         let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), direct_copy)]);
         let mut out = Vec::new();
         let error = containing
-            .unparse_object_with_ref_map_and_removed(&mut out, &|object_ref| Ok(object_ref), &BTreeSet::new())
+            .write_object_with_ref_map_and_removed(&mut out, &|object_ref| Ok(object_ref), &BTreeSet::new())
             .expect_err(
                 "a direct reserved child must be rejected, matching QPDF_Reserved::unparse()'s throw",
             );
@@ -9009,7 +9010,7 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(
             reserved
-                .unparse_object(&mut out)
+                .write_object(&mut out)
                 .expect_err("plain writer must reject reserved objects")
                 .to_string(),
             expected
@@ -9017,7 +9018,7 @@ mod tests {
         out.clear();
         assert_eq!(
             reserved
-                .unparse_object_qdf(&mut out, 0)
+                .write_object_qdf(&mut out, 0)
                 .expect_err("QDF writer must reject reserved objects")
                 .to_string(),
             expected
@@ -9025,7 +9026,11 @@ mod tests {
         out.clear();
         assert_eq!(
             reserved
-                .unparse_object_with_ref_map(&mut out, &|object_ref| Ok(object_ref))
+                .write_object_with_ref_map_and_removed(
+                    &mut out,
+                    &|object_ref| Ok(object_ref), // cov:ignore: reserved handles fail before the mapping callback runs
+                    &BTreeSet::new(),
+                )
                 .expect_err("mapped writer must reject reserved objects")
                 .to_string(),
             expected
@@ -9049,7 +9054,7 @@ mod tests {
         let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved.clone())]);
         out.clear();
         containing
-            .unparse_object(&mut out)
+            .write_object(&mut out)
             .expect("an indirect reserved child must serialize as a bare reference");
         assert_eq!(
             out,
@@ -9071,7 +9076,7 @@ mod tests {
         out.clear();
         let qdf_containing =
             ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved.clone())]);
-        qdf_containing.unparse_object_qdf(&mut out, 0).expect(
+        qdf_containing.write_object_qdf(&mut out, 0).expect(
             "an indirect reserved child must serialize as a bare reference in QDF mode too",
         );
         assert_eq!(
@@ -9082,7 +9087,7 @@ mod tests {
         out.clear();
         assert_eq!(
             reserved
-                .unparse_stream_body(&mut out, false)
+                .write_stream_body(&mut out, false)
                 .expect_err("stream-body writer must reject reserved objects")
                 .to_string(),
             expected
@@ -9090,7 +9095,7 @@ mod tests {
         out.clear();
         assert_eq!(
             reserved
-                .unparse_stream_body_qdf(&mut out, 0)
+                .write_stream_body_qdf(&mut out, 0)
                 .expect_err("QDF stream-body writer must reject reserved objects")
                 .to_string(),
             expected
@@ -9103,7 +9108,7 @@ mod tests {
         );
         assert_eq!(
             reserved
-                .unparse_stream_body_with_ref_map_and_removed(
+                .write_stream_body_with_ref_map_and_removed(
                     &mut out,
                     false,
                     &identity,
@@ -9116,7 +9121,7 @@ mod tests {
         out.clear();
         assert_eq!(
             reserved
-                .unparse_trailer(&mut out, false, None)
+                .write_trailer(&mut out, false, None)
                 .expect_err("trailer writer must reject reserved objects")
                 .to_string(),
             expected
@@ -9142,10 +9147,10 @@ mod tests {
 
     #[test]
     fn an_indirect_reserved_child_writes_as_a_bare_reference_through_the_ref_map_family() {
-        // `unparse_object_with_ref_map_and_removed`/`write_child_with_ref_map`
+        // `write_object_with_ref_map_and_removed`/`write_child_with_ref_map`
         // are the primitives `writer/plain/body.rs`/`writer/plain/plan.rs`
         // actually call in production, unlike the still-`#[allow(dead_code)]`
-        // `unparse_object`/`write_child` family exercised by
+        // `write_object`/`write_child` family exercised by
         // `reserved_objects_are_rejected_by_object_writer_entrypoints` above
         // -- so this pins the identical child-position fix against the code
         // path real document writes use today.
@@ -9158,7 +9163,7 @@ mod tests {
 
         let mut out = Vec::new();
         containing
-            .unparse_object_with_ref_map_and_removed(
+            .write_object_with_ref_map_and_removed(
                 &mut out,
                 &|object_ref| Ok(object_ref),
                 &BTreeSet::new(),
