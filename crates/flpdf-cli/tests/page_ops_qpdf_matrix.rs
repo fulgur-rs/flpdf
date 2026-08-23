@@ -165,6 +165,101 @@ fn media_boxes_of(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Return page object references in output order. The page refs are read from
+/// the common flpdf inspection surface, but the objects themselves are then
+/// inspected without resolving inherited attributes.
+fn page_refs_of(path: &Path) -> Vec<String> {
+    let out = flpdf_ok(&["--show-pages", path.to_str().unwrap()]);
+    out.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("page ")
+                .and_then(|rest| rest.split_once(": "))
+                .map(|(_, object)| object.trim().to_owned())
+        })
+        .collect()
+}
+
+/// Return whether each page dictionary owns `/MediaBox` and `/Rotate`.
+///
+/// qpdf's `QPDFPageObjectHelper::getAttribute` (`QPDFPageObjectHelper.cc:
+/// 218-262`) deliberately resolves inherited values for page operations, so
+/// `--show-pages` cannot establish where a key is stored. `--show-object`
+/// prints the page dictionary itself and therefore preserves this structural
+/// distinction for the matrix.
+fn own_page_attributes_of(path: &Path) -> Vec<(bool, bool)> {
+    page_refs_of(path)
+        .into_iter()
+        .map(|object| {
+            let selector = format!("--show-object={object}");
+            let output = flpdf_ok(&[&selector, path.to_str().unwrap()]);
+            let has_media_box = output.split_whitespace().any(|token| token == "/MediaBox");
+            let has_rotate = output.split_whitespace().any(|token| token == "/Rotate");
+            (has_media_box, has_rotate)
+        })
+        .collect()
+}
+
+fn assert_own_page_attributes_match(qpdf_output: &Path, flpdf_output: &Path) {
+    assert_eq!(
+        own_page_attributes_of(flpdf_output),
+        own_page_attributes_of(qpdf_output),
+        "flpdf and qpdf must agree on page-dictionary own-key presence"
+    );
+}
+
+/// Build one page whose effective MediaBox/Rotate values are inherited when
+/// `materialize` is false and written directly on the page when it is true.
+fn page_attribute_presence_pdf(materialize: bool) -> tempfile::NamedTempFile {
+    use std::io::Write;
+
+    let page_attributes = if materialize {
+        " /MediaBox [0 0 612 792] /Rotate 90"
+    } else {
+        ""
+    };
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Rotate 90 >>".to_owned(),
+        format!("<< /Type /Page /Parent 2 0 R /Resources << >>{page_attributes} >>"),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", number + 1).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    let mut output = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+    output.write_all(&bytes).unwrap();
+    output.flush().unwrap();
+    output
+}
+
+#[test]
+fn matrix_own_page_keys_do_not_use_inherited_show_pages_values() {
+    let inherited = page_attribute_presence_pdf(false);
+    let direct = page_attribute_presence_pdf(true);
+
+    assert_eq!(
+        media_boxes_of(inherited.path()),
+        media_boxes_of(direct.path())
+    );
+    assert_eq!(rotates_of(inherited.path()), rotates_of(direct.path()));
+    assert_eq!(
+        own_page_attributes_of(inherited.path()),
+        vec![(false, false)]
+    );
+    assert_eq!(own_page_attributes_of(direct.path()), vec![(true, true)]);
+}
+
 /// Write a structurally valid `n`-page PDF whose pages have *distinct*
 /// MediaBox widths (page `i` → `[0 0 (i*100) 200]`). The width uniquely
 /// identifies each source page, so a reordering op's output page sequence
@@ -447,6 +542,7 @@ fn pages_reverse_range_matches_qpdf() {
         q_boxes,
         "flpdf z-1 page order must match qpdf"
     );
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -529,6 +625,7 @@ fn pages_multi_input_same_file_repeated_matches_qpdf() {
         q_boxes,
         "flpdf repeated-same-file selection order must match qpdf"
     );
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -573,6 +670,7 @@ fn pages_cross_document_merge_matches_qpdf() {
     ]);
 
     assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -608,6 +706,7 @@ fn pages_cross_document_collate_matches_qpdf() {
     assert!(ok, "qpdf is expected to accept cross-document collate");
     flpdf_ok(&f_args);
     assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 // ===========================================================================
@@ -631,6 +730,7 @@ fn rotate_plus_delta_matches_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![90, 90, 90]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -649,6 +749,7 @@ fn rotate_minus_delta_matches_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![270, 270, 270]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -678,6 +779,7 @@ fn rotate_plus_delta_accumulates_on_nonzero_base_like_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![180, 180, 180]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -731,6 +833,7 @@ fn rotate_with_range_matches_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![0, 90, 0]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -762,6 +865,7 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
     // also numerically equal to an additive +180 here.
     assert_eq!(rotates_of(&q), vec![90, 0, 180]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 // ===========================================================================
@@ -1149,6 +1253,7 @@ fn pages_then_rotate_uses_output_page_numbering_like_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![90, 0]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
