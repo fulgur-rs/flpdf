@@ -152,7 +152,10 @@
 | `crates/flpdf/src/writer/encrypted_strings.rs` | correspondence | QPDFWriter.cc:785-803 encryption-dictionary binary-key hex selection, QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities |
 | `crates/flpdf/src/writer/encryption_state.rs` | correspondence | QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state |
 | `crates/flpdf/src/writer/object.rs` | correspondence | \`QPDFWriter::unparseObject\`, \`unparseChild\`, \`writeTrailer\`, and the writer-owned live-handle emission boundary |
-| `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |
+| `crates/flpdf/src/writer/object_streams/eligibility.rs` | correspondence | QPDF.cc getCompressibleObjGens eligibility traversal and predicate |
+| `crates/flpdf/src/writer/object_streams/emission.rs` | correspondence | QPDFWriter.cc object-stream body and container emission |
+| `crates/flpdf/src/writer/object_streams/mod.rs` | correspondence | QPDF.cc getCompressibleObjGens and QPDFWriter.cc ObjStm planning and emission |
+| `crates/flpdf/src/writer/object_streams/planning.rs` | correspondence | QPDFWriter.cc object-stream planning and source-container preservation |
 | `crates/flpdf/src/writer/pclm.rs` | correspondence | \`QPDFWriter::enqueueObjectsPCLm\` |
 | `crates/flpdf/src/writer/plain/body.rs` | correspondence | QPDFWriter.cc plain object-body emission split from planning and xref output |
 | `crates/flpdf/src/writer/plain/mod.rs` | correspondence | QPDFWriter.cc standard write pipeline split across plain writer modules |

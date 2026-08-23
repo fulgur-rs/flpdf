@@ -5289,7 +5289,7 @@ mod tests {
 
     /// Build a zlib-compressed ObjStm payload from (object-number, raw-bytes) pairs.
     /// Returns (compressed_bytes, first_offset_in_body).
-    /// Mirrors the private helper in `writer/object_streams.rs`.
+    /// Mirrors the private helper in `writer/object_streams/emission.rs`.
     fn build_objstm_payload_plan(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
