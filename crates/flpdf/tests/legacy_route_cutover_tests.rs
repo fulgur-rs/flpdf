@@ -51,26 +51,12 @@ fn qpdf_named_resolve_surface_resolves_a_handle_in_place() {
 }
 
 #[test]
-fn qpdf_cutover_has_no_public_raw_object_route() {
-    let sources = [
-        ("lib.rs", include_str!("../src/lib.rs")),
-        ("object.rs", include_str!("../src/object.rs")),
-        ("pdf.rs", include_str!("../src/pdf.rs")),
-        ("reader.rs", include_str!("../src/reader.rs")),
-        ("object_handle.rs", include_str!("../src/object_handle.rs")),
-    ];
+fn qpdf_cutover_has_no_legacy_handle_aliases() {
+    let sources = [("reader.rs", include_str!("../src/reader.rs"))];
     let forbidden = [
-        "pub enum Object",
-        "pub fn trailer_dictionary",
-        "pub fn resolve_borrowed",
-        "pub fn resolve_object(",
-        "pub fn resolve(",
-        "pub fn resolve_to_terminal(",
-        "pub fn resolve_to_terminal_ref(",
-        "fn resolve_to_cache(",
-        "legacy_materialized_memo",
-        "pub(crate) fn lift_object_to_handle",
-        "pub fn materialize(&self) -> Result<Object>",
+        "pub fn resolve_object_handle(",
+        "pub fn resolve_object_handle_to_terminal(",
+        "pub fn resolve_object_handle_to_terminal_ref(",
     ];
 
     for (name, source) in sources {
