@@ -1,17 +1,21 @@
-//! Tests for `flpdf::pages::coalesce_page_contents` (flpdf-9hc.12.3).
+//! Tests for the qpdf-shaped page-content coalesce route (flpdf-qynx.7).
 //!
 //! Acceptance criteria verified here:
-//!   (a) 2+ stream array is decoded, newline-joined, stored as single stream.
+//!   (a) Every `/Contents` array is replaced with a provider-backed stream;
+//!       valid members are decoded and newline-joined.
 //!   (b) Segment boundary: tokens do not merge across the '\n' separator.
 //!   (c) Re-parsing the coalesced result yields all operators in order, q/Q
 //!       nesting is preserved.
-//!   (d) Single-stream /Contents is left unchanged (no mutation).
+//!   (d) Single-stream /Contents and missing `/Contents` are left unchanged;
+//!       single-element and empty arrays are still replaced, as in qpdf.
 
+use flate2::{write::ZlibEncoder, Compression};
 use flpdf::{
-    pages, parse_content_operations, Dictionary, Object, ObjectRef, ParseControl, Pdf, Stream,
+    parse_content_operations, Dictionary, Object, ObjectRef, PageObjectHelper, ParseControl, Pdf,
+    Stream,
 };
 use std::cell::Cell;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::rc::Rc;
 
 // ── Minimal PDF builder helpers ───────────────────────────────────────────────
@@ -82,6 +86,27 @@ fn stream_obj(num: u32, body: &[u8]) -> Vec<u8> {
     out
 }
 
+fn filtered_stream_obj(
+    num: u32,
+    encoded: &[u8],
+    filter_ref: ObjectRef,
+    decode_params_ref: ObjectRef,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!(
+            "{num} 0 obj\n<< /Length {} /Filter {} 0 R /DecodeParms {} 0 R >>\nstream\n",
+            encoded.len(),
+            filter_ref.number,
+            decode_params_ref.number
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(encoded);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out
+}
+
 /// Collect all operators from a content stream in order.
 fn operators(stream: &[u8]) -> Vec<Vec<u8>> {
     let mut operators = Vec::new();
@@ -91,6 +116,10 @@ fn operators(stream: &[u8]) -> Vec<Vec<u8>> {
     })
     .expect("content operations should parse");
     operators
+}
+
+fn coalesce_page(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> flpdf::Result<()> {
+    PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()
 }
 
 // ── (a) 2+ stream array → single newline-joined stream ───────────────────────
@@ -107,7 +136,7 @@ fn coalesce_joins_two_streams_with_newline() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let page_ref = ObjectRef::new(3, 0);
 
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     // The page's /Contents must now be a single Reference.
     let page_obj = pdf.resolve(page_ref).expect("page resolves");
@@ -164,7 +193,7 @@ fn coalesce_discards_first_stream_non_filter_dict_entries() {
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let page_ref = ObjectRef::new(3, 0);
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     let Object::Dictionary(page_dict) = pdf.resolve(page_ref).unwrap() else {
         panic!("page not a dict");
@@ -217,7 +246,7 @@ fn coalesce_joins_three_streams_in_order() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let page_ref = ObjectRef::new(3, 0);
 
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     let page_obj = pdf.resolve(page_ref).unwrap();
     let Object::Dictionary(page_dict) = page_obj else {
@@ -237,6 +266,42 @@ fn coalesce_joins_three_streams_in_order() {
     expected.push(b'\n');
     expected.extend_from_slice(seg3);
     assert_eq!(s.data, expected);
+}
+
+#[test]
+fn coalesce_decodes_indirect_filter_and_decode_params_through_the_provider() {
+    let body1 = b"q Q";
+    let body2 = b"Q";
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body1).unwrap();
+    let encoded = encoder.finish().unwrap();
+    let bytes = build_pdf(
+        "[4 0 R 5 0 R]",
+        &[
+            (
+                4,
+                filtered_stream_obj(4, &encoded, ObjectRef::new(6, 0), ObjectRef::new(7, 0)),
+            ),
+            (5, stream_obj(5, body2)),
+            (6, b"6 0 obj\n/FlateDecode\nendobj\n".to_vec()),
+            (7, b"7 0 obj\n<< >>\nendobj\n".to_vec()),
+        ],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+
+    coalesce_page(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed");
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve_object_handle(&page).unwrap();
+    let contents = page.get_key(b"/Contents");
+    pdf.resolve_object_handle(&contents).unwrap();
+
+    let mut expected = body1.to_vec();
+    expected.push(b'\n');
+    expected.extend_from_slice(body2);
+    assert_eq!(
+        contents.get_raw_stream_data().unwrap().as_ref(),
+        expected.as_slice()
+    );
 }
 
 // ── (b) Segment boundary: tokens do not merge ────────────────────────────────
@@ -273,7 +338,7 @@ fn coalesce_newline_prevents_token_fusion() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let page_ref = ObjectRef::new(3, 0);
 
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     let page_obj = pdf.resolve(page_ref).unwrap();
     let Object::Dictionary(page_dict) = page_obj else {
@@ -330,7 +395,7 @@ fn coalesce_reparsed_yields_correct_operators_and_preserves_q_nesting() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let page_ref = ObjectRef::new(3, 0);
 
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     let page_obj = pdf.resolve(page_ref).unwrap();
     let Object::Dictionary(page_dict) = page_obj else {
@@ -372,8 +437,8 @@ fn coalesce_reparsed_yields_correct_operators_and_preserves_q_nesting() {
 
 // ── (d) Single-stream /Contents → unchanged ───────────────────────────────────
 
-/// When /Contents is a single indirect Reference, coalesce_page_contents must
-/// return Ok(()) without modifying the page dict at all.
+/// When /Contents is a single indirect Reference, coalescing must return
+/// `Ok(())` without modifying the page dict at all.
 #[test]
 fn coalesce_noop_for_single_stream_reference() {
     let body = b"BT /F1 12 Tf (Hello) Tj ET";
@@ -393,7 +458,7 @@ fn coalesce_noop_for_single_stream_reference() {
         .cloned()
         .expect("/Contents present");
 
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
 
     // The page dict must be identical: /Contents still points to the same ref.
     let after_obj = pdf.resolve(page_ref).expect("page resolves");
@@ -411,7 +476,7 @@ fn coalesce_noop_for_single_stream_reference() {
     );
 }
 
-/// When /Contents is absent (empty page), coalesce_page_contents is a no-op.
+/// When /Contents is absent (empty page), coalescing is a no-op.
 #[test]
 fn coalesce_noop_for_page_without_contents() {
     let bytes = build_pdf("", &[]);
@@ -419,7 +484,7 @@ fn coalesce_noop_for_page_without_contents() {
     let page_ref = ObjectRef::new(3, 0);
 
     // Should succeed silently.
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
 
     let page_obj = pdf.resolve(page_ref).expect("page resolves");
     let Object::Dictionary(page_dict) = page_obj else {
@@ -431,10 +496,9 @@ fn coalesce_noop_for_page_without_contents() {
     );
 }
 
-/// When /Contents is a single-element Array, it is treated as a single stream
-/// and the page dict is left unchanged.
+/// qpdf replaces a single-element array with a provider-backed stream too.
 #[test]
-fn coalesce_noop_for_single_element_array() {
+fn coalesce_replaces_single_element_array() {
     let body = b"q 0.5 g Q";
     let s1 = stream_obj(4, body);
     let bytes = build_pdf("[4 0 R]", &[(4, s1)]);
@@ -442,36 +506,20 @@ fn coalesce_noop_for_single_element_array() {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let page_ref = ObjectRef::new(3, 0);
 
-    let before_obj = pdf.resolve(page_ref).expect("page resolves");
-    let Object::Dictionary(before_dict) = before_obj else {
-        panic!();
-    };
-    let before_contents = before_dict
-        .get("Contents")
-        .cloned()
-        .expect("/Contents present");
+    coalesce_page(&mut pdf, page_ref).expect("qpdf coalesce must replace a single-element array");
 
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed (noop)");
-
-    let after_obj = pdf.resolve(page_ref).expect("page resolves");
-    let Object::Dictionary(after_dict) = after_obj else {
-        panic!();
-    };
-    let after_contents = after_dict
-        .get("Contents")
-        .cloned()
-        .expect("/Contents present");
-
-    assert_eq!(
-        before_contents, after_contents,
-        "/Contents must be unchanged for single-element array"
-    );
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page).unwrap();
+    let contents = page.get_key(b"/Contents");
+    pdf.resolve_object_handle(&contents).unwrap();
+    assert_eq!(contents.type_code().unwrap(), 10);
+    assert_eq!(contents.get_raw_stream_data().unwrap().as_ref(), body);
 }
 
 // ── Additional: direct Stream in /Contents (edge case) ───────────────────────
 
 /// When /Contents holds a direct Object::Stream (non-standard but valid in
-/// test PDFs), coalesce_page_contents must leave it unchanged.
+/// test PDFs), coalescing must leave it unchanged.
 #[test]
 fn coalesce_noop_for_direct_stream_in_contents() {
     let base_bytes = build_pdf("", &[]);
@@ -494,8 +542,7 @@ fn coalesce_noop_for_direct_stream_in_contents() {
         .cloned()
         .expect("/Contents present");
 
-    pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0))
-        .expect("coalesce should succeed (noop)");
+    coalesce_page(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed (noop)");
 
     let after_obj = pdf.resolve(ObjectRef::new(3, 0)).expect("page resolves");
     let Object::Dictionary(after_dict) = after_obj else {
@@ -517,10 +564,10 @@ fn ref_carrier(num: u32, target: u32) -> Vec<u8> {
     format!("{num} 0 obj\n{target} 0 R\nendobj\n").into_bytes()
 }
 
-/// Site 3: a /Contents array element reached via a 2-hop chain
-/// (`ref → ref → stream`) must be coalesced, not dropped.
+/// qpdf's array normalization does not follow a non-stream array member to a
+/// second indirect stream; it warns and ignores that member.
 #[test]
-fn coalesce_follows_array_element_holder_chain() {
+fn coalesce_ignores_non_stream_holder_chain_member() {
     let seg1 = b"q 1 0 0 1 0 0 cm";
     let seg2 = b"BT /F1 12 Tf (Hello) Tj ET";
 
@@ -536,7 +583,7 @@ fn coalesce_follows_array_element_holder_chain() {
         Object::Reference(ObjectRef::new(6, 0)),
     );
     let page_ref = ObjectRef::new(3, 0);
-    pages::coalesce_page_contents(&mut pdf, page_ref).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, page_ref).expect("coalesce should succeed");
 
     let Object::Dictionary(page_dict) = pdf.resolve(page_ref).expect("page resolves") else {
         panic!("page is not a dict");
@@ -548,19 +595,55 @@ fn coalesce_follows_array_element_holder_chain() {
         panic!("new /Contents ref does not resolve to a stream");
     };
 
-    let mut expected = seg1.to_vec();
-    expected.push(b'\n');
-    expected.extend_from_slice(seg2);
-    assert_eq!(
-        s.data, expected,
-        "chained array element must be coalesced into the joined stream"
-    );
+    let expected = seg1.to_vec();
+    assert_eq!(s.data, expected, "non-stream array members must be ignored");
 }
 
-/// Site 3 error arm: a chained array element terminating at a non-stream is
-/// rejected with an Unsupported error.
 #[test]
-fn coalesce_array_element_chain_to_non_stream_errors() {
+fn coalesce_empty_array_replaces_contents_with_an_empty_provider_stream() {
+    let bytes = build_pdf("[]", &[]);
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    let page_ref = ObjectRef::new(3, 0);
+
+    coalesce_page(&mut pdf, page_ref).expect("qpdf coalesce must replace an empty array");
+
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page).unwrap();
+    let contents = page.get_key(b"/Contents");
+    pdf.resolve_object_handle(&contents).unwrap();
+    assert_eq!(contents.type_code().unwrap(), 10);
+    assert!(contents.get_raw_stream_data().unwrap().is_empty());
+    let stream_dict = contents.as_stream_dict().unwrap();
+    assert!(!stream_dict.has_key(b"/Filter"));
+    assert!(!stream_dict.has_key(b"/DecodeParms"));
+    assert_eq!(stream_dict.get_key(b"/Length").as_integer(), Some(0));
+}
+
+#[test]
+fn coalesce_ignores_non_stream_array_members_after_warning() {
+    let body = b"q Q";
+    let non_stream = b"5 0 obj\n42\nendobj\n".to_vec();
+    let bytes = build_pdf(
+        "[4 0 R 5 0 R]",
+        &[(4, stream_obj(4, body)), (5, non_stream)],
+    );
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
+    let page_ref = ObjectRef::new(3, 0);
+
+    coalesce_page(&mut pdf, page_ref).expect("qpdf coalesce must ignore a non-stream array member");
+
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page).unwrap();
+    let contents = page.get_key(b"/Contents");
+    pdf.resolve_object_handle(&contents).unwrap();
+    assert_eq!(contents.type_code().unwrap(), 10);
+    assert_eq!(contents.get_raw_stream_data().unwrap().as_ref(), body);
+}
+
+/// A chained array element terminating at a non-stream is warned about and
+/// ignored by qpdf's array normalization.
+#[test]
+fn coalesce_ignores_array_element_chain_to_non_stream() {
     let s1 = stream_obj(4, b"q Q");
     let carrier = ref_carrier(5, 6);
     let non_stream = b"6 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
@@ -571,16 +654,17 @@ fn coalesce_array_element_chain_to_non_stream_errors() {
         ObjectRef::new(5, 0),
         Object::Reference(ObjectRef::new(6, 0)),
     );
-    let err = pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
-    assert!(
-        matches!(&err, flpdf::Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
-        "expected Unsupported(\"…does not resolve to a stream\"), got {err:?}"
-    );
+    coalesce_page(&mut pdf, ObjectRef::new(3, 0))
+        .expect("qpdf coalesce must ignore a non-stream chain target");
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve_object_handle(&page).unwrap();
+    let contents = page.get_key(b"/Contents");
+    pdf.resolve_object_handle(&contents).unwrap();
+    assert_eq!(contents.get_raw_stream_data().unwrap().as_ref(), b"q Q");
 }
 
-/// The first stream's dictionary and payload must come from the same
-/// ObjectHandle route. A legacy materialization followed by the canonical raw
-/// payload read would invoke a deferred provider twice.
+/// Coalescing is lazy: registering the replacement provider does not read the
+/// source stream, and the first subsequent read invokes it once.
 #[test]
 fn coalesce_reads_provider_backed_first_stream_once_for_metadata_and_payload() {
     let bytes = build_pdf(
@@ -606,11 +690,17 @@ fn coalesce_reads_provider_backed_first_stream_once_for_metadata_and_payload() {
         )
         .expect("provider should be registered on the indirect stream");
 
-    pages::coalesce_page_contents(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed");
+    coalesce_page(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed");
 
+    assert_eq!(calls.get(), 0, "provider registration must remain lazy");
+
+    let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+    pdf.resolve_object_handle(&page).unwrap();
+    let contents = page.get_key(b"/Contents");
+    pdf.resolve_object_handle(&contents).unwrap();
     assert_eq!(
-        calls.get(),
-        1,
-        "coalescing must not materialize the provider-backed stream before the canonical raw read"
+        contents.get_raw_stream_data().unwrap().as_ref(),
+        b"q Q\nBT ET"
     );
+    assert_eq!(calls.get(), 1, "the source provider must be read once");
 }

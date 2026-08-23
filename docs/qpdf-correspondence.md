@@ -877,11 +877,14 @@ CLI probes.
 
 qpdf の `QPDFPageObjectHelper::coalesceContentStreams`（`QPDFPageObjectHelper.cc:474-476`）から
 `QPDFObjectHandle::coalesceContentStreams`（`QPDFObjectHandle.cc:1550-1572`）へ委譲される
-coalesce は、`QPDF.cc:1912-1917` の `newStream()` で空の stream dictionary を新規作成する。
-したがって入力の先頭 stream にだけある非 filter metadata もコピーしない。flpdf の
-`pages.rs::coalesce_page_contents` も `Dictionary::new()` で結果 stream を生成する。
-canonical provider-backed pipeline と content-tree の全面 cutover は
-`flpdf-qynx.7` の責務であり、この対応は dictionary shape の差だけを固定する。
+coalesce は、`QPDF.cc:1912-1917` の `newStream()` と
+`QPDF_Stream::replaceStreamData`（`QPDF_Stream.cc:651-685`）で、空の dictionary を持つ
+provider-backed stream を登録する。`arrayOrStreamToStreamArray`
+（`QPDFObjectHandle.cc:1438-1485`）が非 stream 要素を警告して無視し、
+`pipeContentStreams`（同 `:1710-1737`）が specialized decode と条件付き LF を実行する。
+flpdf は `PageObjectHelper::coalesce_content_streams` /
+`ObjectHandle::coalesce_content_streams` を唯一の production route とする。手動 `Vec` 結合、
+入力 metadata のコピー、legacy stream write-back は削除済みである。
 
 ## 集計
 

@@ -18,7 +18,7 @@
 //! its caller-supplied required and forbidden annotation-flag masks.
 
 use crate::object_handle::ObjectHandleIdentity;
-use crate::pages::{coalesce_page_contents, page_content_bytes};
+use crate::pages::page_content_bytes;
 use crate::{
     AcroFormDocumentHelper, AnnotationObjectHelper, Error, ObjectHandle, ObjectRef,
     PageObjectHelper, Pdf, Result,
@@ -260,10 +260,12 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         return Ok(0);
     }
 
-    // qpdf's document helper appends wrapper streams around the original
-    // contents. The legacy page-level API still coalesces its input.
+    // The test-only legacy flatten modes still append to a single content
+    // stream, but coalescing itself must use the canonical provider-backed
+    // page route. Production `Flags` mode uses `add_qpdf_flatten_contents`
+    // below and does not need this compatibility-only branch.
     if !qpdf_flag_contract {
-        coalesce_page_contents(pdf, page_ref)?;
+        PageObjectHelper::new(page_ref, pdf).coalesce_content_streams()?;
     }
 
     // ── Step 4: Materialize /Resources on the leaf page ────────────────────

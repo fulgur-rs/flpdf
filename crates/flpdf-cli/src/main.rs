@@ -27,12 +27,10 @@ use flpdf::{
         check_linearization_path, show_linearization_path_with_warnings, LinearizationCheckError,
         ShowLinearizationError,
     },
-    normalize_content_stream, pages,
-    pages::coalesce_page_contents,
-    parse_pdf_version, AcroFormDocumentHelper, CompressStreams, CopyEncryptionSource,
-    EncryptMethod, EncryptParams, NewlineBeforeEndstream, ObjectHandle, ObjectKeyAlg, ObjectRef,
-    ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode, Pdf, PdfOpenOptions,
-    PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
+    normalize_content_stream, pages, parse_pdf_version, AcroFormDocumentHelper, CompressStreams,
+    CopyEncryptionSource, EncryptMethod, EncryptParams, NewlineBeforeEndstream, ObjectHandle,
+    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode,
+    Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
 };
 use std::collections::{BTreeMap, HashSet};
@@ -3219,13 +3217,14 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // The mutations below operate on the in-memory Pdf model (via set_object).
         // They are all visible in the canonical writer output.
         //
-        // Application order (semantically motivated):
-        //   1. coalesce_page_contents  — merge /Contents arrays so subsequent
-        //      passes always see a single stream per page.
-        //   2. normalize_content_stream — re-tokenize the (now-unified) stream
-        //      to canonical whitespace form.
-        //   3. write (compress_streams / newline_before_endstream) — byte-emission
-        //      policies applied by the writer, not the pre-processing step.
+        // Application order follows QPDFJob::handleTransformations:
+        //   1. generate appearances;
+        //   2. flatten annotations;
+        //   3. coalesce page contents;
+        //   4. flatten rotation and apply page stacking;
+        //   5. normalize content immediately before the writer consumes it.
+        // The coalesce operation is the provider-backed PageObjectHelper
+        // route; it must not materialize a legacy page byte buffer.
         //
         // NOTE: a plain `rewrite` does NOT prune unreferenced /Resources entries.
         // qpdf only prunes resource-dict entries during page-copy operations
@@ -3243,30 +3242,11 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // `--compress-streams=y`; the canonical writer applies those defaults
         // for every rewrite. Version setters therefore always affect the
         // emitted header, including with `--remove-unreferenced-resources=no`.
-        // Step 1: coalesce per-page /Contents arrays into a single stream.
-        if coalesce_contents {
-            let page_refs = pages::page_refs(&mut pdf)?;
-            for page_ref in page_refs {
-                coalesce_page_contents(&mut pdf, page_ref)?;
-            }
-        }
-
-        // Step 2: normalize each page's content stream(s).
-        // normalize_content_stream operates on raw decoded bytes → returns
-        // normalized bytes. We fetch each page's /Contents reference(s), decode
-        // the stored stream data, normalize, and write the result back via
-        // set_object (same pattern as coalesce_page_contents).
-        let normalization_last_bad = if normalize_content {
-            pdf.with_writer_stream_recovery(normalize_page_contents)?
-        } else {
-            Vec::new()
-        };
-
         // (No resource-entry pruning on the plain rewrite path — see the
         // "Content mutation pass" note above. qpdf prunes /Resources entries only
         // during page operations, which flpdf handles in run_page_extraction.)
 
-        // Step 4: generate missing form-field appearance streams
+        // Step 1: generate missing form-field appearance streams
         // (--generate-appearances). MUST run before --flatten-annotations so
         // value-only fields (e.g. a filled text field with no /AP) are baked
         // into page content instead of being dropped (acceptance ordering:
@@ -3275,20 +3255,30 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             generate_missing_appearances(&mut pdf)?;
         }
 
-        // Step 5: flatten annotations into page content (--flatten-annotations).
+        // Step 2: flatten annotations into page content (--flatten-annotations).
         if let Some(mode) = flatten_annotations_mode {
             let (required_flags, forbidden_flags) = mode.flags();
             PageDocumentHelper::new(&mut pdf)
                 .flatten_annotations(required_flags, forbidden_flags)?;
         }
 
-        // Step 6: flatten page rotation into content (--flatten-rotation).
+        // Step 3: coalesce per-page /Contents arrays into provider-backed
+        // streams. This intentionally follows annotation flattening, matching
+        // QPDFJob.cc:2183-2187 for the combined flags.
+        if coalesce_contents {
+            let page_refs = pages::page_refs(&mut pdf)?;
+            for page_ref in page_refs {
+                PageObjectHelper::new(page_ref, &mut pdf).coalesce_content_streams()?;
+            }
+        }
+
+        // Step 4: flatten page rotation into content (--flatten-rotation).
         if flatten_rotation {
             let page_refs = pages::page_refs(&mut pdf)?;
             flatten_rotation_on_pages(&mut pdf, &page_refs)?;
         }
 
-        // Step 7: overlay/underlay page stacking (--overlay / --underlay).
+        // Step 5: overlay/underlay page stacking (--overlay / --underlay).
         // qpdf applies this as its page-stacking step, after page selection and
         // the other content transforms and before writing; mirror that ordering
         // so the output graph (and thus the bytes) matches qpdf. Each source is
@@ -3368,6 +3358,15 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
             Some(built)
         } else {
             None
+        };
+
+        // Step 6: normalize after all page transformations. The stream
+        // normalizer consumes the provider-backed coalesced route and writes
+        // the normalized bytes through ObjectHandle.
+        let normalization_last_bad = if normalize_content {
+            pdf.with_writer_stream_recovery(normalize_page_contents)?
+        } else {
+            Vec::new()
         };
 
         let announce_file = standard_output.is_none();
