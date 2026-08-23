@@ -837,6 +837,34 @@ fn generate_appearances_if_needed_handles_a_direct_orphan_widget() {
 }
 
 #[test]
+fn eager_analyze_warns_for_an_orphan_page_widget() {
+    let bytes = include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
+    let logger = QPDFLogger::create();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+        &output,
+    )))));
+
+    let mut pdf = Pdf::open_mem_with_options(
+        Arc::from(bytes.as_slice()),
+        PdfOpenOptions {
+            logger: Some(logger),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(pdf.acroform().unwrap().has_acro_form().unwrap());
+
+    let warning = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        warning.contains(
+            "this widget annotation is not reachable from /AcroForm in the document catalog"
+        ),
+        "expected qpdf orphan-widget warning, got {warning:?}"
+    );
+}
+
+#[test]
 fn direct_non_indirect_pages_does_not_fail_eager_analyze() {
     // A catalog that embeds /Pages as a direct (non-indirect) dictionary is
     // malformed-but-readable: qpdf's getAllPages tolerates it, but flpdf's

@@ -477,6 +477,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
                         let identity = annotation.identity_key();
                         if !cache.annotation_to_field.contains_key(&identity) {
+                            annotation.warn_if_possible(
+                                "this widget annotation is not reachable from /AcroForm in the document catalog",
+                            )?;
                             record_association(&mut cache, annotation.clone(), annotation);
                         }
                     }
