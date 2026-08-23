@@ -111,7 +111,7 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
     // from the live trailer handle (it is still traversed for any child
     // references, like a stream or signature dictionary).
     // qpdf seeds the stack with the trailer dictionary itself (a direct object).
-    let trailer_handle = pdf.trailer_handle();
+    let trailer_handle = pdf.trailer();
     let encrypt_ref = trailer_handle.try_get_key(b"/Encrypt")?.object_ref();
     let mut stack: Vec<ObjectHandle> = vec![trailer_handle];
 

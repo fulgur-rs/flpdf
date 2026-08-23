@@ -336,7 +336,7 @@ impl<R: Read + Seek> Pdf<R> {
         let encrypt_dict = self.encrypt_dictionary()?.ok_or_else(|| {
             Error::Unsupported("authenticated input has no /Encrypt dictionary".into())
         })?;
-        let id0 = crate::encryption::state::first_file_id(self.trailer())?.to_vec();
+        let id0 = crate::encryption::state::first_file_id(self.trailer_dictionary())?.to_vec();
 
         Ok(Some(CopyEncryptionSource {
             encrypt_dict,
@@ -484,13 +484,13 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn authenticate_if_encrypted_once(&mut self, options: &PdfOpenOptions) -> Result<()> {
-        let encrypt_ref = self.trailer().get_ref("Encrypt");
+        let encrypt_ref = self.trailer_dictionary().get_ref("Encrypt");
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(());
         };
         let authenticated = crate::encryption::state::authenticate(
             &encrypt,
-            self.trailer(),
+            self.trailer_dictionary(),
             encrypt_ref,
             &options.password,
             options.password_mode,
@@ -504,7 +504,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn encrypt_dictionary(&mut self) -> Result<Option<Dictionary>> {
-        match self.trailer().get("Encrypt").cloned() {
+        match self.trailer_dictionary().get("Encrypt").cloned() {
             None => Ok(None),
             Some(Object::Dictionary(dict)) => Ok(Some(dict)),
             Some(Object::Reference(object_ref)) => match self.resolve_borrowed(object_ref)? {
@@ -4430,7 +4430,7 @@ mod tests {
         )
         .expect("re-open of V=4 output with user-pw");
 
-        let info_ref = match rt.trailer().get("Info") {
+        let info_ref = match rt.trailer_dictionary().get("Info") {
             Some(Object::Reference(r)) => *r,
             // Defensive-only: this test's own fixture always writes /Info
             // as a reference (the writer's Catalog-first renumber keeps it
@@ -10908,7 +10908,7 @@ mod tests {
     #[test]
     fn trailer_handle_is_direct_with_a_canonical_indirect_root_child() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let handle = pdf.trailer_handle();
+        let handle = pdf.trailer();
         assert!(handle.is_direct());
         let dict = handle
             .as_dictionary()
@@ -10937,8 +10937,8 @@ mod tests {
             ]),
         );
 
-        let first = pdf.trailer_handle();
-        let second = pdf.trailer_handle();
+        let first = pdf.trailer();
+        let second = pdf.trailer();
 
         assert!(
             first.is_same_object_as(&second),
@@ -10956,7 +10956,7 @@ mod tests {
         }
         pdf.trailer.insert("DeeplyNested", nested);
 
-        let handle = pdf.trailer_handle();
+        let handle = pdf.trailer();
 
         assert!(handle.is_null());
     }
@@ -10977,7 +10977,7 @@ mod tests {
         pdf.trailer.insert("Deep", nested);
 
         assert!(
-            pdf.trailer_handle().is_null(),
+            pdf.trailer().is_null(),
             "sanity: the whole-trailer walk does degrade here"
         );
         let handle = pdf.trailer_key_handle(b"QTest");
@@ -11002,7 +11002,7 @@ mod tests {
         pdf.trailer.insert("Deep", nested);
 
         assert!(
-            pdf.trailer_handle().is_null(),
+            pdf.trailer().is_null(),
             "sanity: the whole-trailer walk does degrade here"
         );
         assert_eq!(pdf.root_ref(), root);

@@ -841,7 +841,7 @@ fn attach_plain_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> Obje
 
 fn copy_encryption_source_from_donor(donor: &mut Pdf<Cursor<Vec<u8>>>) -> CopyEncryptionSource {
     let encrypt_ref = donor
-        .trailer()
+        .trailer_dictionary()
         .get_ref("Encrypt")
         .expect("encrypted donor must have /Encrypt");
     let encrypt_dict = donor
@@ -851,7 +851,7 @@ fn copy_encryption_source_from_donor(donor: &mut Pdf<Cursor<Vec<u8>>>) -> CopyEn
         .expect("donor /Encrypt must be a dictionary")
         .clone();
     let id0 = donor
-        .trailer()
+        .trailer_dictionary()
         .get("ID")
         .and_then(Object::as_array)
         .and_then(|ids| ids.first())

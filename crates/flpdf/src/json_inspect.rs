@@ -2319,7 +2319,7 @@ mod tests {
     #[test]
     fn ordered_qpdf_trailer_dictionary_keys_use_qpdf_write_chunks() {
         let mut pdf = empty_pdf();
-        let trailer_dictionary = pdf.trailer().clone();
+        let trailer_dictionary = pdf.trailer_dictionary().clone();
         let trailer = super::ordered_qpdf_dict(&mut pdf, &trailer_dictionary).unwrap();
         let mut out = FailOnExactChunk {
             bytes: Vec::new(),
@@ -5999,7 +5999,7 @@ mod tests {
     fn qpdf_preparation_collects_refs_from_an_older_omitted_trailer() {
         let mut pdf = crate::Pdf::open_mem_owned(two_revision_historical_trailer_pdf())
             .expect("open two-revision fixture");
-        assert!(pdf.trailer().get("Info").is_none());
+        assert!(pdf.trailer_dictionary().get("Info").is_none());
 
         let prepared = pdf
             .prepare_qpdf_json_objects()
@@ -6016,9 +6016,9 @@ mod tests {
     fn qpdf_preparation_unions_replaced_multigeneration_trailer_refs() {
         let mut pdf = crate::Pdf::open_mem_owned(three_revision_historical_trailer_pdf())
             .expect("open three-revision fixture");
-        assert!(pdf.trailer().get("Info").is_none());
+        assert!(pdf.trailer_dictionary().get("Info").is_none());
         assert_eq!(
-            pdf.trailer().get_ref("Newest"),
+            pdf.trailer_dictionary().get_ref("Newest"),
             Some(crate::ObjectRef::new(50, 2))
         );
 
@@ -6060,7 +6060,7 @@ mod tests {
             },
         )
         .expect("open strict mixed xref fixture");
-        assert!(pdf.trailer().get("Info").is_none());
+        assert!(pdf.trailer_dictionary().get("Info").is_none());
 
         let prepared = pdf
             .prepare_qpdf_json_objects()
@@ -6262,7 +6262,7 @@ mod tests {
             },
         )
         .expect("repair circular /Prev fixture");
-        assert!(pdf.trailer().get("Info").is_none());
+        assert!(pdf.trailer_dictionary().get("Info").is_none());
 
         let prepared = pdf
             .prepare_qpdf_json_objects()
@@ -8843,7 +8843,7 @@ mod tests {
     #[test]
     fn encrypt_section_legacy_v2_uses_rc4_methods() {
         let mut pdf = load_encrypted_r4_pdf();
-        let encrypt_ref = match pdf.trailer().get("Encrypt") {
+        let encrypt_ref = match pdf.trailer_dictionary().get("Encrypt") {
             Some(Object::Reference(reference)) => *reference,
             other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"), // cov:ignore: fixture-shape guard
         };
@@ -8882,7 +8882,7 @@ mod tests {
         // must default to 0 rather than erroring, matching /Length's
         // existing "absent -> default" behavior.
         let mut pdf = load_encrypted_r4_pdf();
-        let encrypt_ref = match pdf.trailer().get("Encrypt") {
+        let encrypt_ref = match pdf.trailer_dictionary().get("Encrypt") {
             Some(Object::Reference(r)) => *r,
             other => panic!("expected /Encrypt to be an indirect reference, got {other:?}"), // cov:ignore: fixture-shape guard
         };

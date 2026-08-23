@@ -63,7 +63,7 @@ pub(crate) fn run_test_2<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
 
     let info = dict_key(pdf, &trailer, b"/Info")?;
     let creation_date = dict_key(pdf, &info, b"/CreationDate")?;
@@ -127,7 +127,7 @@ pub(crate) fn run_test_3<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let streams = dict_key(pdf, &trailer, b"/QStreams")?;
     resolve_handle(pdf, &streams)?;
     let items = streams.as_array().unwrap_or_default();
@@ -216,7 +216,7 @@ pub(crate) fn run_test_5<R: Read + Seek>(
         writeln!(stdout, "end page {pageno}")?;
     }
 
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let root = dict_key(pdf, &trailer, b"/Root")?;
 
     let qstrings = dict_key(pdf, &root, b"/QStrings")?;
@@ -299,7 +299,7 @@ pub(crate) fn run_test_6<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let root = dict_key(pdf, &trailer, b"/Root")?;
     let metadata = dict_key(pdf, &root, b"/Metadata")?;
     resolve_handle(pdf, &metadata)?;
@@ -348,7 +348,7 @@ pub(crate) fn run_test_7<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let root = dict_key(pdf, &trailer, b"/Root")?;
     let qstream = dict_key(pdf, &root, b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
@@ -424,7 +424,7 @@ pub(crate) fn run_test_8<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let root = dict_key(pdf, &trailer, b"/Root")?;
     let qstream = dict_key(pdf, &root, b"/QStream")?;
     resolve_handle(pdf, &qstream)?;
@@ -482,7 +482,7 @@ pub(crate) fn run_test_9<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let root = dict_key(pdf, &trailer, b"/Root")?;
     resolve_handle(pdf, &root)?;
 

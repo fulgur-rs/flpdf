@@ -471,9 +471,12 @@ mod tests {
         assert_eq!(pages_dict.get("Kids"), Some(&Object::Array(vec![])));
         assert_eq!(pages_dict.get("Count"), Some(&Object::Integer(0)));
 
-        assert_eq!(pdf.trailer().get("Size"), Some(&Object::Integer(3)));
         assert_eq!(
-            pdf.trailer().get("Root"),
+            pdf.trailer_dictionary().get("Size"),
+            Some(&Object::Integer(3))
+        );
+        assert_eq!(
+            pdf.trailer_dictionary().get("Root"),
             Some(&Object::Reference(root_ref))
         );
     }

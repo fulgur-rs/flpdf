@@ -264,7 +264,7 @@ fn generate_direct_trailer_array_rewrites_removed_generation_to_null() {
     let rewritten = Pdf::open(Cursor::new(output)).expect("generated output must reopen");
 
     assert!(matches!(
-        rewritten.trailer().get("Extra"),
+        rewritten.trailer_dictionary().get("Extra"),
         Some(Object::Array(values))
             if matches!(
                 values.as_slice(),
@@ -883,7 +883,7 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
     let output = preserve_fixture(&fixture, |_| {}).unwrap();
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
 
-    let held = match reopened.trailer().get("Foo") {
+    let held = match reopened.trailer_dictionary().get("Foo") {
         Some(Object::Dictionary(dict)) => match dict.get("Held") {
             Some(Object::Reference(reference)) => *reference,
             other => panic!("direct /Foo /Held must remain an indirect reference, got {other:?}"),
@@ -908,7 +908,7 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
     );
     assert!(
         matches!(
-            reopened.trailer().get("Info"),
+            reopened.trailer_dictionary().get("Info"),
             Some(Object::Dictionary(dict))
                 if matches!(
                     dict.get("Producer"),

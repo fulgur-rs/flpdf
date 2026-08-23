@@ -3367,8 +3367,8 @@ fn write_linearized_impl<R: Read + Seek>(
     // preserved permanent identifier and the `/Info`-derived suffix feeds the
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    let source_trailer = pdf.trailer().clone();
-    let source_trailer_handle = pdf.trailer_handle().shallow_copy()?;
+    let source_trailer = pdf.trailer_dictionary().clone();
+    let source_trailer_handle = pdf.trailer().shallow_copy()?;
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
             let id0 = crate::writer::source_permanent_id(&source_trailer);
@@ -3924,7 +3924,7 @@ fn write_linearized_impl<R: Read + Seek>(
         })?;
 
     let info_new_ref: Option<ObjectRef> = pdf
-        .trailer()
+        .trailer_dictionary()
         .get_ref("Info")
         .and_then(|orig| renumber.new_for_original(orig));
 
@@ -7055,7 +7055,7 @@ mod tests {
         // points at), so the deterministic /ID must be visible there.
         let reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
         let trailer_id = reopened
-            .trailer()
+            .trailer_dictionary()
             .get("ID")
             .expect("main trailer must carry /ID after linearize --deterministic-id");
         // Serialize the resolved trailer /ID and confirm it matches the
@@ -7131,7 +7131,7 @@ mod tests {
         let out = linearize_with(&tiny_pdf_bytes(), |o| o.static_id = true);
         let reopened = Pdf::open(Cursor::new(out.clone())).expect("output must reparse");
         assert!(
-            reopened.trailer().get("ID").is_some(),
+            reopened.trailer_dictionary().get("ID").is_some(),
             "static-id linearized output must carry /ID in the reader-visible main trailer"
         );
         crate::linearization::check_linearization_bytes(&out)
@@ -7190,7 +7190,7 @@ mod tests {
         let reopened =
             Pdf::open_with_options(Cursor::new(output), crate::PdfOpenOptions::default())
                 .expect("encrypted output must reopen with the empty user password");
-        assert!(reopened.trailer().get("Encrypt").is_some());
+        assert!(reopened.trailer_dictionary().get("Encrypt").is_some());
     }
 
     /// `--deterministic-id` combined with encryption is rejected up front:
@@ -7586,7 +7586,7 @@ mod tests {
     fn assert_encrypted_body_strings_are_hex(out: &[u8]) {
         let reopened = Pdf::open(Cursor::new(out.to_vec()))
             .expect("encrypted output must reopen with the empty user password");
-        let info_ref = match reopened.trailer().get("Info") {
+        let info_ref = match reopened.trailer_dictionary().get("Info") {
             Some(Object::Reference(r)) => *r,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: fixture invariant
         };
@@ -7707,7 +7707,7 @@ mod tests {
     /// plants, read back through the ordinary `Pdf` reader API (which
     /// transparently decrypts when opened with the right password).
     fn resolve_producer_and_content<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
-        let info_ref = match rt.trailer().get("Info") {
+        let info_ref = match rt.trailer_dictionary().get("Info") {
             Some(Object::Reference(r)) => *r,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
@@ -9264,7 +9264,7 @@ mod tests {
     #[test]
     fn canonical_linearization_trailer_entries_preserves_indirect_stream_reference() {
         let mut pdf = open_tiny_pdf_with_custom_trailer_stream();
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         let map = |object_ref: ObjectRef| {
             Ok(ObjectRef::new(
                 object_ref.number + 100,

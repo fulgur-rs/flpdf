@@ -2825,7 +2825,7 @@ pub(crate) fn generate_id_handle(source_id0: Option<&[u8]>, static_id: bool) -> 
 /// indirect, ISO 32000-1 §7.3.10). The returned bytes are appended after
 /// `" QPDF "` to form the seed.
 pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let info = match trailer.try_get_key(b"/Info") {
         Ok(info) => info,
         Err(_) => return Vec::new(), // cov:ignore: defensive resolver-error fallback
@@ -3020,7 +3020,7 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     deterministic_id: bool,
     generated_id: Option<&ObjectHandle>,
 ) -> Result<ObjectHandle> {
-    let trailer = pdf.trailer_handle().shallow_copy()?;
+    let trailer = pdf.trailer().shallow_copy()?;
     for key in [b"/ID".as_slice(), b"/Encrypt", b"/Prev"] {
         trailer.remove_key(key);
     }
@@ -3701,7 +3701,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
         }
     }
 
-    let mut trailer = pdf.trailer().clone();
+    let mut trailer = pdf.trailer_dictionary().clone();
     strip_writer_trailer_history_keys(&mut trailer);
     trailer.remove("Encrypt");
     let removed: BTreeSet<_> = pdf.deleted_object_refs().into_iter().collect();
@@ -3712,7 +3712,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
         None
     } else {
         Some(generate_id_array(
-            pdf.trailer().get("ID"),
+            pdf.trailer_dictionary().get("ID"),
             options.static_id,
         ))
     };
@@ -3724,7 +3724,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
 
     bytes.extend_from_slice(b"trailer ");
     if options.deterministic_id {
-        let source_id0 = source_permanent_id(pdf.trailer());
+        let source_id0 = source_permanent_id(pdf.trailer_dictionary());
         let info_suffix = deterministic_id_info_suffix(pdf);
         let mut id_writer = |out: &mut Vec<u8>| {
             write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
@@ -3980,7 +3980,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // trailer, so both are gathered here while `pdf` is free.
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
-            let id0 = source_permanent_id(pdf.trailer());
+            let id0 = source_permanent_id(pdf.trailer_dictionary());
             let suffix = deterministic_id_info_suffix(pdf);
             (id0, suffix)
         } else {
@@ -4260,7 +4260,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         None
     } else {
         Some(generate_id_array(
-            pdf.trailer().get("ID"),
+            pdf.trailer_dictionary().get("ID"),
             options.static_id,
         ))
     };
@@ -6040,7 +6040,7 @@ mod tests {
     fn trailer_id_pair(output: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let pdf = crate::Pdf::open_mem(Arc::from(output)).expect("output must re-open");
         let id = pdf
-            .trailer()
+            .trailer_dictionary()
             .get("ID")
             .and_then(Object::as_array)
             .expect("trailer /ID must be an array");
@@ -6170,7 +6170,7 @@ mod tests {
             },
         )
         .expect("encrypted output must reopen with the empty user password");
-        assert!(reopened.trailer().get("Encrypt").is_some());
+        assert!(reopened.trailer_dictionary().get("Encrypt").is_some());
     }
 
     #[test]
@@ -6705,7 +6705,7 @@ mod tests {
         // End-to-end regression for the decoy-collision bug: a preserved (unknown)
         // trailer key `/Probe` whose value serializes to the EXACT 70-byte /ID
         // placeholder `[<0x32><0x32>]`. The full-rewrite trailer keeps unknown
-        // keys (`trailer = pdf.trailer().clone()`) and forces /ID last, so the
+        // keys (`trailer = pdf.trailer_dictionary().clone()`) and forces /ID last, so the
         // serialized output is `... /Probe [<0..0><0..0>] ... /ID [<0..0><0..0>]`.
         // The direct-write path must emit the genuine /ID's digest (keyed on the
         // `/ID` name) and leave /Probe untouched.
@@ -6716,7 +6716,7 @@ mod tests {
         // The decoy /Probe must survive as the original all-zero 16-byte array.
         let reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must re-open");
         let probe = reopened
-            .trailer()
+            .trailer_dictionary()
             .get("Probe")
             .and_then(Object::as_array)
             .expect("/Probe must be preserved as an array");
@@ -6751,7 +6751,7 @@ mod tests {
         // preserved (unknown) trailer key `/Decoy` whose STRING value's bytes
         // literally contain the `/ID ` token followed by the exact 70-byte
         // all-zero placeholder array. The full-rewrite classic trailer keeps
-        // unknown keys (`trailer = pdf.trailer().clone()`) and forces the real
+        // unknown keys (`trailer = pdf.trailer_dictionary().clone()`) and forces the real
         // `/ID` last, so `/Decoy` sorts before it: a byte-search patch anchored
         // on the first `/ID ` occurrence would clobber the decoy and leave the
         // real `/ID` zeroed. The direct-write path never emits a placeholder and
@@ -6780,7 +6780,7 @@ mod tests {
         // And the reopened /Decoy value is exactly the original literal string.
         let reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must re-open");
         let decoy = reopened
-            .trailer()
+            .trailer_dictionary()
             .get("Decoy")
             .and_then(Object::as_string)
             .expect("/Decoy must be preserved as a string");
@@ -6932,7 +6932,7 @@ mod tests {
         // The decoy /Decoy must survive as the original literal string, untouched.
         let reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must re-open");
         let decoy = reopened
-            .trailer()
+            .trailer_dictionary()
             .get("Decoy")
             .and_then(Object::as_string)
             .expect("/Decoy must be preserved as a string");
@@ -7515,7 +7515,7 @@ mod tests {
         )
         .expect("QDF copy-encryption output must reopen with donor password");
         let encrypt_ref = reopened
-            .trailer()
+            .trailer_dictionary()
             .get_ref("Encrypt")
             .expect("trailer must reference /Encrypt");
         let root_ref = reopened.root_ref().expect("root_ref");
@@ -7545,7 +7545,7 @@ mod tests {
     /// numbers, so navigate by reference (trailer `/Info` for the `/Title`
     /// dict, Catalog `/Metadata` for the stream) rather than hardcoding numbers.
     fn resolve_title_and_stream<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
-        let info_ref = match rt.trailer().get("Info") {
+        let info_ref = match rt.trailer_dictionary().get("Info") {
             Some(Object::Reference(r)) => *r,
             other => panic!("trailer /Info must be a reference, got {other:?}"),
         };
@@ -9153,7 +9153,10 @@ mod tests {
         // access it directly without an extra resolve step. Extract owned
         // Catalog dict via resolve+into_dict so the mutable borrow on
         // `reopened` used by resolve() is released before subsequent asserts.
-        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let root_ref = reopened
+            .trailer_dictionary()
+            .get_ref("Root")
+            .expect("Root ref");
         let catalog_dict = reopened
             .resolve(root_ref)
             .expect("resolve root")
@@ -9501,7 +9504,10 @@ mod tests {
         let out = write_full_rewrite_with(&src, &options);
         let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
         // The whole /Extensions dict must be gone from the output Catalog.
-        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let root_ref = reopened
+            .trailer_dictionary()
+            .get_ref("Root")
+            .expect("Root ref");
         let catalog = reopened
             .resolve(root_ref)
             .expect("resolve root")
@@ -9553,7 +9559,10 @@ mod tests {
         };
         let out = write_full_rewrite_with(&src, &options);
         let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
-        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let root_ref = reopened
+            .trailer_dictionary()
+            .get_ref("Root")
+            .expect("Root ref");
         let catalog = reopened
             .resolve(root_ref)
             .expect("resolve root")
@@ -9620,7 +9629,10 @@ mod tests {
         };
         let out = write_full_rewrite_with(&src, &options);
         let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
-        let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
+        let root_ref = reopened
+            .trailer_dictionary()
+            .get_ref("Root")
+            .expect("Root ref");
         let catalog = reopened
             .resolve(root_ref)
             .expect("resolve root")

@@ -577,7 +577,7 @@ fn json_reactor_builds_canonical_objects_trailer_and_deferred_stream() {
         .description()
         .contains("input.json, obj:3 0 R at offset"));
 
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     trailer.try_dereference().expect("trailer resolves");
     assert_eq!(
         trailer.get_key(b"/Root").object_ref(),

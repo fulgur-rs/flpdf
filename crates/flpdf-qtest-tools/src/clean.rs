@@ -72,7 +72,7 @@ pub fn clean_trailer(trailer: &mut Dictionary) {
 /// Returns any error produced by [`Pdf::resolve`] when following the
 /// `/Encrypt` indirect reference (e.g. a corrupt object stream).
 pub fn clean_encryption<R: Read + Seek>(pdf: &mut Pdf<R>) -> flpdf::Result<()> {
-    let Some(encrypt_ref) = pdf.trailer().get_ref(b"Encrypt") else {
+    let Some(encrypt_ref) = pdf.trailer_dictionary().get_ref(b"Encrypt") else {
         return Ok(());
     };
     let mut enc = pdf.resolve(encrypt_ref)?;
@@ -320,12 +320,12 @@ mod tests {
         let bytes = fixture_bytes("tests/fixtures/minimal.pdf");
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open minimal.pdf");
         assert!(
-            pdf.trailer().get(b"Encrypt").is_none(),
+            pdf.trailer_dictionary().get(b"Encrypt").is_none(),
             "premise: minimal.pdf is unencrypted"
         );
         clean_encryption(&mut pdf).expect("no error on unencrypted PDF");
         assert!(
-            pdf.trailer().get(b"Encrypt").is_none(),
+            pdf.trailer_dictionary().get(b"Encrypt").is_none(),
             "trailer's /Encrypt still absent"
         );
     }
@@ -334,7 +334,7 @@ mod tests {
     fn clean_encryption_strips_hashes_from_indirect_encrypt_dict() {
         let mut pdf = open_v5_r6_fixture();
         let encrypt_ref = pdf
-            .trailer()
+            .trailer_dictionary()
             .get_ref(b"Encrypt")
             .expect("premise: /Encrypt is an indirect reference");
 
@@ -389,7 +389,7 @@ mod tests {
         let mut pdf =
             Pdf::open_mem_owned(fixture_bytes("tests/fixtures/minimal.pdf")).expect("open");
         // Sanity: trailer has no /Encrypt, so `get_ref` is None → no-op path.
-        assert!(pdf.trailer().get_ref(b"Encrypt").is_none());
+        assert!(pdf.trailer_dictionary().get_ref(b"Encrypt").is_none());
         clean_encryption(&mut pdf).expect("no-op when /Encrypt has no ref target");
     }
 
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn clean_encryption_handle_strips_hashes_from_canonical_dictionary() {
         let mut pdf = open_v5_r6_fixture();
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
 
         clean_encryption_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
 

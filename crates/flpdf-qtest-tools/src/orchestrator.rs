@@ -55,8 +55,8 @@ pub fn compare_files(
     // qpdf's getTrailer() returns a live ObjectHandle. Build that canonical
     // view before cleaning so trailer masking and the later object walk share
     // the same identity graph rather than cloning a legacy Dictionary.
-    let act_trailer = actual.trailer_handle();
-    let exp_trailer = expected.trailer_handle();
+    let act_trailer = actual.trailer();
+    let exp_trailer = expected.trailer();
     clean_trailer_handle(&mut actual, &act_trailer)?;
     clean_trailer_handle(&mut expected, &exp_trailer)?;
     let trailer_diff = compare_objects(

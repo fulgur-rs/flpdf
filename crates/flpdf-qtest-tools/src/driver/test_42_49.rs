@@ -224,7 +224,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     // `iterator`: advancing an end cursor selects the first entry and
     // moving one backward selects the last, matching qpdf's own wrap
     // behavior (`NumberTreeCursor::next`/`::previous` doc comments).
-    let qtest = pdf.trailer().get(b"QTest").cloned().unwrap_or(Object::Null);
+    let qtest = pdf
+        .trailer_dictionary()
+        .get(b"QTest")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut ntoh = NumberTree::new(qtest, true);
 
     let mut cursor = ntoh.begin(pdf)?;
@@ -312,7 +316,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad1")?;
-    let bad1_object = pdf.trailer().get(b"Bad1").cloned().unwrap_or(Object::Null);
+    let bad1_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad1")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad1 = NumberTree::new(bad1_object, true);
     let bad1_begin = bad1.begin(pdf)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -320,7 +328,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(bad1.last(pdf)? == bad1.end());
 
     writeln!(stdout, "/Bad2")?;
-    let bad2_object = pdf.trailer().get(b"Bad2").cloned().unwrap_or(Object::Null);
+    let bad2_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad2")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad2 = NumberTree::new(bad2_object, true);
     let mut cursor = bad2.begin(pdf)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -335,7 +347,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
         write!(stdout, "/")?;
         write_bytes(stdout, key)?;
         writeln!(stdout)?;
-        let object = pdf.trailer().get(key).cloned().unwrap_or(Object::Null);
+        let object = pdf
+            .trailer_dictionary()
+            .get(key)
+            .cloned()
+            .unwrap_or(Object::Null);
         let mut empty = NumberTree::new(object, true);
         let empty_begin = empty.begin(pdf)?;
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -380,7 +396,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     let _ = invalid1.insert(pdf, 1, Object::Null);
 
     writeln!(stdout, "/Bad3, no repair")?;
-    let bad3_object = pdf.trailer().get(b"Bad3").cloned().unwrap_or(Object::Null);
+    let bad3_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad3")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad3 = NumberTree::new(bad3_object.clone(), false);
     let mut cursor = bad3.begin(pdf)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -405,7 +425,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     assert!(kids_item_0_is_indirect(pdf, &bad3_object)?);
 
     writeln!(stdout, "/Bad4 -- missing limits")?;
-    let bad4_object = pdf.trailer().get(b"Bad4").cloned().unwrap_or(Object::Null);
+    let bad4_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad4")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad4 = NumberTree::new(bad4_object, true);
     bad4.insert(pdf, 5, Object::String(b"5".to_vec()))?;
     let mut cursor = bad4.begin(pdf)?;
@@ -418,7 +442,11 @@ pub(crate) fn run_test_46<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad5 -- limit errors")?;
-    let bad5_object = pdf.trailer().get(b"Bad5").cloned().unwrap_or(Object::Null);
+    let bad5_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad5")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad5 = NumberTree::new(bad5_object, true);
     let found = bad5.find(pdf, 10, false)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -493,7 +521,11 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     // for `QPDFNumberTreeObjectHelper` in test_46 -- see that function's
     // header comment for the shared iterator-wrap and value-aliasing notes,
     // which apply identically here.
-    let qtest = pdf.trailer().get(b"QTest").cloned().unwrap_or(Object::Null);
+    let qtest = pdf
+        .trailer_dictionary()
+        .get(b"QTest")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut ntoh = NameTree::new(qtest, true);
 
     let mut cursor = ntoh.begin(pdf)?;
@@ -585,7 +617,11 @@ pub(crate) fn run_test_48<R: Read + Seek>(
         write!(stdout, "/")?;
         write_bytes(stdout, key)?;
         writeln!(stdout)?;
-        let object = pdf.trailer().get(key).cloned().unwrap_or(Object::Null);
+        let object = pdf
+            .trailer_dictionary()
+            .get(key)
+            .cloned()
+            .unwrap_or(Object::Null);
         let mut empty = NameTree::new(object, true);
         let empty_begin = empty.begin(pdf)?;
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -623,7 +659,11 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad1 -- wrong key type")?;
-    let bad1_object = pdf.trailer().get(b"Bad1").cloned().unwrap_or(Object::Null);
+    let bad1_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad1")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad1 = NameTree::new(bad1_object, true);
     let found = bad1.find(pdf, "G", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -636,7 +676,11 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad2 -- invalid kid")?;
-    let bad2_object = pdf.trailer().get(b"Bad2").cloned().unwrap_or(Object::Null);
+    let bad2_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad2")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad2 = NameTree::new(bad2_object, true);
     let found = bad2.find(pdf, "G", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -649,14 +693,22 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad3 -- invalid kid")?;
-    let bad3_object = pdf.trailer().get(b"Bad3").cloned().unwrap_or(Object::Null);
+    let bad3_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad3")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad3 = NameTree::new(bad3_object, true);
     let found = bad3.find(pdf, "G", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert!(found == bad3.end());
 
     writeln!(stdout, "/Bad4 -- invalid kid")?;
-    let bad4_object = pdf.trailer().get(b"Bad4").cloned().unwrap_or(Object::Null);
+    let bad4_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad4")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad4 = NameTree::new(bad4_object, true);
     let found = bad4.find(pdf, "F", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
@@ -669,14 +721,22 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad5 -- loop in find")?;
-    let bad5_object = pdf.trailer().get(b"Bad5").cloned().unwrap_or(Object::Null);
+    let bad5_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad5")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad5 = NameTree::new(bad5_object, true);
     let found = bad5.find(pdf, "F", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(found.current().expect("closest key below F").0, b"D");
 
     writeln!(stdout, "/Bad6 -- bad limits")?;
-    let bad6_object = pdf.trailer().get(b"Bad6").cloned().unwrap_or(Object::Null);
+    let bad6_object = pdf
+        .trailer_dictionary()
+        .get(b"Bad6")
+        .cloned()
+        .unwrap_or(Object::Null);
     let mut bad6 = NameTree::new(bad6_object, true);
     let inserted = bad6.insert(pdf, "H", Object::Null)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;

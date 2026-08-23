@@ -349,9 +349,9 @@ pub(crate) fn run_test_61<R: Read + Seek>(
 /// `getUIntValueAsUInt`.
 ///
 /// `t.replaceKey(...)` here is real, unlike the `run_test_26`/`run_test_60`
-/// GAP: `Pdf::trailer_handle()` is memoized (`pdf.rs:286-296`, "Repeated
+/// GAP: `Pdf::trailer()` is memoized (`pdf.rs:286-296`, "Repeated
 /// calls return the same shared handle"), so `ObjectHandle::replace_key` on
-/// it mutates the one shared handle every later `trailer_handle()`/
+/// it mutates the one shared handle every later `trailer()`/
 /// `get_key` call observes — the missing piece in the other tests'
 /// GAP is specifically that `PdfWriter` never reads that bridge back, which
 /// is irrelevant here since this test never writes a file.
@@ -373,7 +373,7 @@ pub(crate) fn run_test_62<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     let _ = (filename, stdout, stderr, diagnostics_written); // test_62 prints nothing and triggers no new diagnostics.
 
-    let t = pdf.trailer_handle();
+    let t = pdf.trailer();
     // `QIntC::to_ulonglong(INT_MAX)`/`to_longlong(INT_MIN)`/`to_longlong(UINT_MAX)`
     // (test_driver.cc:2268-2273) are lossless casts here: every product below fits
     // comfortably inside i64/u64, so no `QIntC` narrowing check can fire.

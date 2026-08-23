@@ -1252,7 +1252,7 @@ impl LinearizationPlan {
 
         let total_object_count = all_refs.len() as u32;
         let root_ref = pdf.root_ref();
-        let info_handle = pdf.trailer_handle().try_get_key(b"/Info")?;
+        let info_handle = pdf.trailer().try_get_key(b"/Info")?;
         let info_ref = info_handle
             .object_ref()
             .or_else(|| info_handle.as_reference());
@@ -6831,7 +6831,7 @@ mod tests {
         // DFS-early and co-located with first-page objects), but the routing is
         // exercised directly here.
         let mut pdf = Pdf::open(Cursor::new(mixed_shared_pdf_bytes(60, 70))).unwrap();
-        let info_ref = pdf.trailer().get_ref("Info").unwrap();
+        let info_ref = pdf.trailer_dictionary().get_ref("Info").unwrap();
         let synthetic = vec![vec![info_ref]];
         let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
         let routes = route_with_plan(&plan, &synthetic);

@@ -7,11 +7,11 @@
 //! Two tests here (`run_test_78`, `run_test_79`) hit the same trailer-write
 //! primitive gap already established in `driver/test_18_25.rs` (see that
 //! file's own module doc and `run_test_20`'s `GAP` comment):
-//! `Pdf::trailer_handle().replace_key(...)` compiles and returns `Ok`, but
+//! `Pdf::trailer().replace_key(...)` compiles and returns `Ok`, but
 //! `PdfWriter::write` reads `Pdf::trailer()` (a plain `&Dictionary` set once
 //! at construction, confirmed by `crates/flpdf/src/writer.rs:2865` reading
-//! `pdf.trailer().clone()` directly), never the disconnected
-//! `trailer_handle()` clone graph -- so a *new* trailer entry installed that
+//! `pdf.trailer_dictionary().clone()` directly), never the disconnected
+//! `trailer()` clone graph -- so a *new* trailer entry installed that
 //! way never reaches the written file. Each affected function's own `GAP`
 //! comment marks the precise call this blocks; qpdf statements that do not
 //! read the blocked trailer entry are still translated normally on either
@@ -287,7 +287,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     writeln!(stdout, "/Split1")?;
     let split1_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Split1")
         .cloned()
         .unwrap_or(Object::Null);
@@ -313,7 +313,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
 
     writeln!(stdout, "/Split2")?;
     let split2_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Split2")
         .cloned()
         .unwrap_or(Object::Null);
@@ -339,7 +339,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
 
     writeln!(stdout, "/Split3")?;
     let split3_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Split3")
         .cloned()
         .unwrap_or(Object::Null);
@@ -395,7 +395,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     // qpdf's own function has no `std::cout` calls at all -- its entire
     // observable surface is assertions plus the closing `QPDFWriter` write.
     let erase1_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Erase1")
         .cloned()
         .unwrap_or(Object::Null);
@@ -429,7 +429,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
 
     let erase2_handle = pdf.trailer_key_handle(b"Erase2");
     let erase2_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Erase2")
         .cloned()
         .unwrap_or(Object::Null);
@@ -476,7 +476,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert_eq!(kid0_kids.as_array().unwrap_or_default().len(), 1);
 
     let erase3_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Erase3")
         .cloned()
         .unwrap_or(Object::Null);
@@ -489,7 +489,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert!(erase3.begin(pdf)? == erase3.end());
 
     let erase4_root = pdf
-        .trailer()
+        .trailer_dictionary()
         .get(b"Erase4")
         .cloned()
         .unwrap_or(Object::Null);
@@ -728,7 +728,7 @@ pub(crate) fn run_test_78<R: Read + Seek>(
     // `/Streams [s1 s2]` here as a *new* trailer entry so the closing
     // `QPDFWriter` serializes both streams. Per the established gap (see
     // this file's own module doc and `driver/test_18_25.rs`'s
-    // `run_test_20`): `Pdf::trailer_handle().replace_key(...)` has no
+    // `run_test_20`): `Pdf::trailer().replace_key(...)` has no
     // effect on what `PdfWriter::write` emits, so this installation is not
     // performed. `s1`/`s2` and their providers above are still real,
     // faithful translation -- only their reachability from the eventual
@@ -776,7 +776,7 @@ pub(crate) fn run_test_79<R: Read + Seek>(
     // `/Originals` the same way (`test_driver.cc:2738`). Per the
     // established gap (see this file's own module doc and
     // `driver/test_18_25.rs`'s `run_test_20`): neither
-    // `Pdf::trailer_handle().replace_key(...)` call has any effect on what
+    // `Pdf::trailer().replace_key(...)` call has any effect on what
     // `PdfWriter::write` emits, so neither installation (nor a closing
     // `QPDFWriter` write, which qpdf's own test_79 does not even reach
     // without them) is performed below. `copies` itself is still built and

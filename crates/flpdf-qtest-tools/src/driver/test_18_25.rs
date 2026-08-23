@@ -10,11 +10,11 @@
 // `Pdf::trailer` returns `&Dictionary` with no setter; `Pdf::trailer_handle`
 // lifts a *clone* of that dictionary into a separate `ObjectHandle` graph
 // (`trailer_handle_memo`, `crates/flpdf/src/pdf.rs:263-296`) that is never
-// written back; and every `PdfWriter` output path reads `pdf.trailer()`
+// written back; and every `PdfWriter` output path reads `pdf.trailer_dictionary()`
 // directly (e.g. `crates/flpdf/src/writer.rs:2725`, `:3774`), never the
 // handle graph. `self.trailer` itself is set once at construction and never
 // reassigned anywhere in the crate (`pdf.rs:270-271`'s own doc). Concretely:
-// `pdf.trailer_handle().replace_key(...)` compiles and returns `Ok`, but has
+// `pdf.trailer().replace_key(...)` compiles and returns `Ok`, but has
 // no effect whatsoever on what `PdfWriter::write` emits. See each function's
 // own `GAP` comment for the exact stop point.
 //
@@ -146,7 +146,7 @@ pub(crate) fn run_test_20<R: Read + Seek>(
     // directly onto `ObjectHandle::get_key`/`shallow_copy`/
     // `append_array_item`, none of which resolve or repair anything (their
     // own docs), so no new diagnostics can appear here.
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let qtest = trailer.get_key(b"/QTest");
     let copy = qtest.shallow_copy()?;
     let size = trailer.get_key(b"/Size").shallow_copy()?;
@@ -157,7 +157,7 @@ pub(crate) fn run_test_20<R: Read + Seek>(
     // trailer entry that the subsequent `QPDFWriter` then serializes. See
     // this file's module doc for why flpdf has no equivalent: there is no
     // public mutator for `Pdf`'s own trailer that a `PdfWriter` output
-    // actually observes. `pdf.trailer_handle().replace_key(b"/QTest2",
+    // actually observes. `pdf.trailer().replace_key(b"/QTest2",
     // copy)` would compile and return `Ok` while writing nothing through to
     // the output, so it is not called here rather than being called and
     // silently doing nothing. The remainder of qpdf's test_20 -- that
@@ -267,7 +267,7 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     // called.
     let res1 = pdf.new_reserved()?;
     let res2 = pdf.new_reserved()?;
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     // qpdf's own literal keys omit the leading `/` here ("Array1"/"Array2",
     // unlike "/QTest2" in `run_test_20`) -- `QPDF_Dictionary` stores
     // whatever literal string it is given with no normalization
@@ -387,7 +387,7 @@ pub(crate) fn run_test_25<R: Read + Seek>(
 
     // qpdf's `oldpdf.getTrailer().getKey("/QTest")`; `Pdf::trailer_handle`
     // is the direct equivalent of `QPDF::getTrailer` (both own docs).
-    let oldpdf_trailer = oldpdf.trailer_handle();
+    let oldpdf_trailer = oldpdf.trailer();
     let qtest = oldpdf_trailer.get_key(b"/QTest");
     let copied = pdf.copy_foreign_object(&qtest)?;
 
@@ -399,7 +399,7 @@ pub(crate) fn run_test_25<R: Read + Seek>(
     // installs `copied` as the trailer's own `/QTest` entry, which the
     // subsequent `QPDFWriter` then serializes; flpdf has no public mutator
     // for `Pdf`'s own trailer that a `PdfWriter` output actually observes.
-    // `pdf.trailer_handle().replace_key(b"/QTest", copied)` would compile
+    // `pdf.trailer().replace_key(b"/QTest", copied)` would compile
     // and return `Ok` while writing nothing through to the output, so it is
     // not called here. The remainder of qpdf's test_25 -- the
     // `copyForeignObject(oldpdf.getRoot().getKey("/Pages")).isNull()`

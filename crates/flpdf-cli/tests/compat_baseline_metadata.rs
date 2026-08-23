@@ -69,7 +69,7 @@ fn extract_info_dict_bytes(path: &Path) -> Option<Vec<u8>> {
     let mut pdf =
         Pdf::open(reader).unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
 
-    let info_ref = pdf.trailer().get_ref("Info")?;
+    let info_ref = pdf.trailer_dictionary().get_ref("Info")?;
     let info_obj = pdf
         .resolve(info_ref)
         .unwrap_or_else(|e| panic!("failed to resolve Info in {}: {e}", path.display()));
