@@ -138,7 +138,7 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
 
     let mut doc = PrimaryDocLevel {
         catalog: Some(catalog.clone()),
-        trailer: Some(source.trailer().clone()),
+        trailer: Some(source.trailer_dictionary().clone()),
         ..Default::default()
     };
     // /Outlines — an indirect root ref, or a direct (inline) root dict on the
@@ -405,7 +405,7 @@ fn wire_primary_trailer<RTgt: Read + Seek>(
     let Some(root_ref) = target.root_ref() else {
         return; // cov:ignore: Pdf::empty always supplies the target catalog root
     };
-    let current_size = target.trailer().get("Size").cloned();
+    let current_size = target.trailer_dictionary().get("Size").cloned();
     let mut trailer = primary_trailer.clone();
     for key in [
         "Root",

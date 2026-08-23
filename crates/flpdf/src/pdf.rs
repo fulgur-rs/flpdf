@@ -285,7 +285,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`Pdf::update_from_json`]. Use [`Pdf::root_ref`] or
     /// [`Pdf::trailer_key_handle`] for `/Root`- and key-level reads that stay
     /// current after those calls.
-    pub fn trailer(&self) -> &Dictionary {
+    pub fn trailer_dictionary(&self) -> &Dictionary {
         &self.trailer
     }
 
@@ -312,7 +312,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// key and cannot tolerate an unrelated sibling entry's nesting erasing it
     /// should use [`Pdf::trailer_key_handle`] instead. Repeated calls return
     /// the same shared handle.
-    pub fn trailer_handle(&mut self) -> ObjectHandle {
+    pub fn trailer(&mut self) -> ObjectHandle {
         if let Some(handle) = &self.trailer_handle_memo {
             return handle.clone();
         }
@@ -325,7 +325,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// `key`'s value in the trailer dictionary, as an [`ObjectHandle`] —
-    /// unlike `Pdf::trailer_handle().get_key(key)`, this lifts only `key`'s
+    /// unlike `Pdf::trailer().get_key(key)`, this lifts only `key`'s
     /// own value, so an unrelated sibling trailer entry whose literal nesting
     /// exceeds the crate's inline-object-nesting bound cannot degrade this
     /// result to null the way it degrades [`Pdf::trailer_handle`]'s whole-

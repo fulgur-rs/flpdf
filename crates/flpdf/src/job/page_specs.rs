@@ -696,7 +696,7 @@ mod tests {
 
     fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
         let mut pdf = Pdf::empty().expect("empty PDF");
-        pdf.trailer_handle().remove_key(b"/Root");
+        pdf.trailer().remove_key(b"/Root");
         assert!(pdf.root_ref().is_none());
         pdf
     }

@@ -2456,7 +2456,7 @@ fn pdf_writer_output_has_no_prev_in_trailer() {
     // Trailer must not contain /Prev.
     let reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     assert!(
-        reopened.trailer().get("Prev").is_none(),
+        reopened.trailer_dictionary().get("Prev").is_none(),
         "full-rewrite output must not have /Prev in trailer"
     );
 }
@@ -2809,7 +2809,7 @@ fn build_minimal_pdf_with_flate_xref_stream() -> Vec<u8> {
 fn pdf_writer_xref_stream_compress_yes_produces_valid_flate_xref() {
     // Regression / policy test: when the source PDF's xref stream declares
     // `/Filter /FlateDecode` the full-rewrite path used to inherit that key
-    // from `pdf.trailer().clone()` while emitting **raw** entry bytes,
+    // from `pdf.trailer_dictionary().clone()` while emitting **raw** entry bytes,
     // producing an unreadable PDF.  Now `CompressStreams::Yes` (the default)
     // properly FlateDecode-compresses the rebuilt xref bytes and sets
     // `/Filter /FlateDecode` deliberately.  Verify the output parses cleanly.

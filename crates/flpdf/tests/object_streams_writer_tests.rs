@@ -1360,7 +1360,7 @@ fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
         "no missing ref may survive as a null object (ObjStm member or plain body)"
     );
     assert_eq!(
-        reopened.trailer().get("Size"),
+        reopened.trailer_dictionary().get("Size"),
         Some(&Object::Integer(7)),
         "missing refs consume no object numbers: /Size is 7 (0..=6), matching qpdf"
     );

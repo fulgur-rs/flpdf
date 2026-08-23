@@ -362,7 +362,7 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
     );
     assert_eq!(
         merged
-            .trailer()
+            .trailer_dictionary()
             .get_ref("Info")
             .and_then(|reference| merged.resolve(reference).ok())
             .and_then(|object| object.as_dict().cloned())
@@ -371,7 +371,7 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
     );
     assert_eq!(
         merged
-            .trailer()
+            .trailer_dictionary()
             .get_ref("Custom")
             .and_then(|reference| merged.resolve(reference).ok())
             .and_then(|object| object.as_dict().cloned())
@@ -379,7 +379,7 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
         Some(Object::String(b"primary-trailer".to_vec()))
     );
     assert_eq!(
-        merged.trailer().get("ID"),
+        merged.trailer_dictionary().get("ID"),
         Some(&Object::Array(vec![
             Object::String(vec![
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,

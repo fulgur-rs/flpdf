@@ -158,7 +158,7 @@ pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
     // /Encrypt and any other trailer-only references from the sweep), and
     // from every explicitly protected ref.
     let trailer_refs = {
-        let trailer_clone = Object::Dictionary(pdf.trailer().clone());
+        let trailer_clone = Object::Dictionary(pdf.trailer_dictionary().clone());
         let mut refs: Vec<ObjectRef> = Vec::new();
         walk_refs(&trailer_clone, 0, &mut refs)?;
         refs.extend(protect.iter().copied());

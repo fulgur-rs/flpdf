@@ -295,7 +295,7 @@ fn qpdf_full_rewrite_drops_previous_chain_and_page_counts_are_stable() {
         let current = &pair[1];
 
         let pdf = Pdf::open(BufReader::new(File::open(current).unwrap())).unwrap();
-        assert!(pdf.trailer().get("Prev").is_none());
+        assert!(pdf.trailer_dictionary().get("Prev").is_none());
     }
 }
 

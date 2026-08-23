@@ -180,7 +180,7 @@ impl Optimization {
             )?;
         }
 
-        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
+        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
         for (key, value) in crate::qpdf_null::visible_entries(pdf, trailer_entries)? {
             if key != b"Root" {
                 let update = maps.update_object_maps(

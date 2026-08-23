@@ -326,7 +326,7 @@ pub(crate) fn run_test_70<R: Read + Seek>(
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let _s1 = trailer.get_key(b"/S1");
     let _s2 = trailer.get_key(b"/S2");
 

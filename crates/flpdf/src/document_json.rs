@@ -191,7 +191,7 @@ pub fn write_json_key<R: Read + Seek>(
     }
 
     if trailer_selected(wanted_objects) {
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         Json::write_dictionary_key(out, &mut objects_first, b"trailer", 3)?;
         let mut trailer_first = true;
         Json::write_dictionary_open(out, &mut trailer_first, 3)?;

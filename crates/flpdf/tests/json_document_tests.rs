@@ -184,7 +184,7 @@ fn create_from_json_uses_qpdf_rootless_seed_and_complete_metadata() {
         !pdf.ever_called_get_all_pages(),
         "create mode ignores update flags"
     );
-    assert!(pdf.trailer_handle().get_key(b"/Size").is_null());
+    assert!(pdf.trailer().get_key(b"/Size").is_null());
 }
 
 #[test]
@@ -194,7 +194,7 @@ fn create_from_json_exposes_the_imported_canonical_trailer_to_page_primitives() 
 
     assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
     // `trailer_key_handle` must observe the same live trailer as `root_ref`,
-    // matching its own doc's claimed equivalence to `trailer_handle().get_key(key)`
+    // matching its own doc's claimed equivalence to `trailer().get_key(key)`
     // -- both routes are backed by the same canonical handle the JSON importer
     // installs, not the pre-import construction-time snapshot.
     assert_eq!(

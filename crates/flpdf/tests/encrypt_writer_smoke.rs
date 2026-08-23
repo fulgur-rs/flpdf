@@ -324,7 +324,7 @@ fn encrypted_standard_writes_preserve_missing_page_resources_like_qpdf_11_9() {
 }
 
 fn resolve_nested_info_marker(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
-    let info_ref = match pdf.trailer().get("Info") {
+    let info_ref = match pdf.trailer_dictionary().get("Info") {
         Some(Object::Reference(reference)) => *reference,
         other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
     };
@@ -555,7 +555,7 @@ fn aes_encrypted_strings_use_hex_in_compact_and_qdf() {
         let mut reopened = open_encrypted(&bytes, b"");
         assert!(reopened.is_encrypted());
         assert!(reopened.user_password_matched());
-        let encrypt_ref = match reopened.trailer().get("Encrypt") {
+        let encrypt_ref = match reopened.trailer_dictionary().get("Encrypt") {
             Some(Object::Reference(reference)) => *reference,
             other => panic!("trailer /Encrypt must be an indirect reference, got {other:?}"),
         };
@@ -597,7 +597,7 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
     assert_qpdf_check(&bytes);
 
     let mut reopened = open_encrypted(&bytes, b"");
-    let info_ref = match reopened.trailer().get("Info") {
+    let info_ref = match reopened.trailer_dictionary().get("Info") {
         Some(Object::Reference(reference)) => *reference,
         other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
     };

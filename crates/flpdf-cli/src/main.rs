@@ -5506,7 +5506,7 @@ fn run_show_object(
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     let object = match selector {
-        ShowObjectSelector::Trailer => pdf.trailer_handle(),
+        ShowObjectSelector::Trailer => pdf.trailer(),
         ShowObjectSelector::Object(object_ref) => pdf.get_object_handle(object_ref),
         ShowObjectSelector::NoObject => {
             return finish_job_exit_status(

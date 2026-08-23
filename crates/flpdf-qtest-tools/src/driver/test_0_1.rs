@@ -53,7 +53,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // `Pdf::trailer_key_handle`, not `Pdf::trailer_handle().get_key(...)`:
+    // `Pdf::trailer_key_handle`, not `Pdf::trailer().get_key(...)`:
     // the latter lifts the *entire* trailer in one structural walk bounded
     // by the crate's inline-object-nesting limit, so an unrelated, deeply
     // nested sibling trailer entry would degrade `/QTest` to null here too,
@@ -121,7 +121,11 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
             resolve_chain(pdf, first_content)?.0
         }
         None => {
-            let raw_qtest_value = pdf.trailer().get(b"QTest").cloned().unwrap_or(Object::Null);
+            let raw_qtest_value = pdf
+                .trailer_dictionary()
+                .get(b"QTest")
+                .cloned()
+                .unwrap_or(Object::Null);
             resolve_chain(pdf, raw_qtest_value)?.0
         }
     };
@@ -541,7 +545,7 @@ mod tests {
     #[test]
     fn a_parseable_deeply_nested_sibling_trailer_entry_does_not_erase_qtest() {
         // Regression: `run_test_0_1` must read `/QTest` via
-        // `Pdf::trailer_key_handle`, not `Pdf::trailer_handle().get_key(...)`
+        // `Pdf::trailer_key_handle`, not `Pdf::trailer().get_key(...)`
         // — the latter lifts the *entire* trailer in one structural walk
         // bounded by the parser's acceptance limit, so an unrelated sibling
         // entry nested past that bound degrades the whole trailer handle to
@@ -569,7 +573,7 @@ mod tests {
         let mut pdf =
             Pdf::open_mem_owned_with_options(bytes, options).expect("open sibling-nesting fixture");
         assert!(
-            pdf.trailer_handle().as_dictionary().is_some(),
+            pdf.trailer().as_dictionary().is_some(),
             "a parseable 300-level trailer must remain available as a handle"
         );
         let mut stdout = Vec::new();

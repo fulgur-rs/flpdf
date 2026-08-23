@@ -6785,7 +6785,7 @@ mod tests {
             },
         )
         .expect("re-open of V=4 output with user-pw");
-        let info_ref = match rt.trailer().get("Info") {
+        let info_ref = match rt.trailer_dictionary().get("Info") {
             Some(crate::Object::Reference(object_ref)) => *object_ref,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
         };
@@ -7005,7 +7005,7 @@ mod tests {
             },
         )
         .expect("open encrypted fixture");
-        let info_ref = match pdf.trailer().get("Info") {
+        let info_ref = match pdf.trailer_dictionary().get("Info") {
             Some(crate::Object::Reference(object_ref)) => *object_ref,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
         };
@@ -7193,7 +7193,7 @@ mod tests {
             .expect("encryption parameters")
             .cf_string = crate::encryption::state::EncryptionMode::Unknown;
 
-        let info_ref = match pdf.trailer().get("Info") {
+        let info_ref = match pdf.trailer_dictionary().get("Info") {
             Some(crate::Object::Reference(object_ref)) => *object_ref,
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
         };
@@ -7244,7 +7244,7 @@ mod tests {
             crate::pipeline::test_support::NthWriteFailure::new(1),
         )));
         pdf.set_logger(logger);
-        let info_ref = pdf.trailer().get_ref("Info").unwrap();
+        let info_ref = pdf.trailer_dictionary().get_ref("Info").unwrap();
 
         assert!(matches!(
             pdf.get_object_handle(info_ref).try_dereference(),

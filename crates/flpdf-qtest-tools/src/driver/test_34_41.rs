@@ -149,7 +149,7 @@ fn version_prefix_major_minor(version: &str) -> (i64, i64) {
 /// `/Extensions /ADBE /ExtensionLevel` from `root`, resolving indirect
 /// references at each step, defaulting to `0` whenever a link in that chain
 /// is absent or the wrong type. This does not reuse `Pdf::adobe_extension_level`:
-/// that convenience method starts from `self.trailer().get_ref("Root")`,
+/// that convenience method starts from `self.trailer_dictionary().get_ref("Root")`,
 /// which requires `/Root` to be a *literal* `Object::Reference` in the
 /// trailer and silently returns `None` (defaulting to `0`) for a direct
 /// `/Root` dictionary -- unlike qpdf's own `getRoot()`, and unlike

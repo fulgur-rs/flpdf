@@ -193,7 +193,7 @@ fn plain_rewrite_keeps_length_holder_referenced_from_direct_trailer_dict() {
     // graph objects — none orphaned, no dangling trailer reference.
     let mut re = Pdf::open(Cursor::new(out)).expect("re-open output");
     let trailer_held = re
-        .trailer()
+        .trailer_dictionary()
         .get("Info")
         .and_then(|info| info.as_dict())
         .and_then(|d| d.get("Held"))

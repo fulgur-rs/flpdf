@@ -178,7 +178,7 @@ impl CatalogFirstRenumber {
             Vec::new()
         };
         seeds.push(root);
-        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
+        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
         let trailer_entries = if qpdf_visibility {
             crate::qpdf_null::visible_entries(pdf, trailer_entries)?
         } else {
@@ -318,7 +318,7 @@ impl CanonicalCatalogFirstRenumber {
         };
         seeds.push(root);
 
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
         for (key, value) in trailer_entries {
             if matches!(
@@ -659,7 +659,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         .root_ref()
         .ok_or_else(|| Error::Unsupported("reachability: trailer has no /Root".to_string()))?;
     let mut seeds: Vec<ObjectRef> = vec![root];
-    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
+    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
     for (key, value) in crate::qpdf_null::visible_entries(pdf, trailer_entries)? {
         // /Encrypt is intentionally NOT skipped: it is part of the live universe.
         // /Prev, /Size, /ID, /Root are not object roots of the document graph.
@@ -741,7 +741,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
 
     // Seed from the trailer (dict context): visible roots are followed; a
     // null-resolving trailer ref is a dropped key, not resurrected.
-    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
+    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
     for (key, value) in trailer_entries {
         if matches!(key.as_slice(), b"ID" | b"Prev" | b"Root" | b"Size") {
             continue;
@@ -1027,7 +1027,7 @@ impl ObjectStreamRenumber {
             Vec::new()
         };
         seeds.push(root);
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
         for (key, value) in trailer_entries {
             if matches!(
@@ -2423,7 +2423,7 @@ mod tests {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let encrypt_ref = pdf
-            .trailer()
+            .trailer_dictionary()
             .get_ref("Encrypt")
             .expect("fixture has /Encrypt");
         let reachable = reachable_object_set(&mut pdf, true).expect("walk");

@@ -27,7 +27,10 @@ fn opens_pdf_without_resolving_all_objects() {
 
     assert_eq!(pdf.version(), "1.7");
     assert_eq!(pdf.resolved_count(), 0);
-    assert_eq!(pdf.trailer().get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        pdf.trailer_dictionary().get_ref("Root"),
+        Some(ObjectRef::new(1, 0))
+    );
 }
 
 #[test]
@@ -581,7 +584,7 @@ fn resolve_decrypts_encrypted_strings_after_authentication() {
     .unwrap();
 
     let info_ref = pdf
-        .trailer()
+        .trailer_dictionary()
         .get_ref("Info")
         .expect("writer fixture has /Info");
     let Object::Dictionary(dict) = pdf.resolve(info_ref).unwrap() else {

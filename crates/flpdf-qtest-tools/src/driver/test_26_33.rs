@@ -145,11 +145,11 @@ pub(crate) fn run_test_26<R: Read + Seek>(
     let _ = pdf.copy_foreign_object(&qtest)?;
     // GAP(QPDF::getTrailer().replaceKey): flpdf has no public API to mutate
     // `Pdf::trailer()` after open. `ObjectHandle::replace_key` on
-    // `Pdf::trailer_handle()` only mutates the legacy handle-bridge
+    // `Pdf::trailer()` only mutates the legacy handle-bridge
     // snapshot -- `emit_canonical_pdf`/`PdfWriter` never read it; the writer
     // serializes from `Pdf::trailer()`'s own `Dictionary` directly (e.g.
     // `writer.rs`'s `emit_canonical_pdf_inner`: `let mut trailer =
-    // pdf.trailer().clone();`). Without a way to attach the copied `/QTest`,
+    // pdf.trailer_dictionary().clone();`). Without a way to attach the copied `/QTest`,
     // `PdfWriter::write()` cannot reproduce qpdf's real `a.pdf`, so it is
     // not attempted here.
     Ok(())
@@ -352,7 +352,7 @@ pub(crate) fn run_test_30<R: Read + Seek>(
     // `Pdf::encryption_file_key`, `Pdf::encryption_info`) -- so its recipe
     // is reproduced here from those public accessors instead of a GAP.
     let encrypt_value = encrypted
-        .trailer()
+        .trailer_dictionary()
         .get("Encrypt")
         .cloned()
         .unwrap_or(flpdf::Object::Null);
@@ -361,7 +361,7 @@ pub(crate) fn run_test_30<R: Read + Seek>(
         flpdf::Error::System("authenticated input has no /Encrypt dictionary".to_string())
     })?;
     let id0 = encrypted
-        .trailer()
+        .trailer_dictionary()
         .get("ID")
         .and_then(flpdf::Object::as_array)
         .and_then(|items| items.first())

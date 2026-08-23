@@ -556,8 +556,8 @@ impl Comparator for StructuralComparator {
         };
 
         // Compare trailer dictionaries, then follow /Root recursively.
-        let trailer_q = pdf_q.trailer().clone();
-        let trailer_f = pdf_f.trailer().clone();
+        let trailer_q = pdf_q.trailer_dictionary().clone();
+        let trailer_f = pdf_f.trailer_dictionary().clone();
 
         let mut visited: BTreeSet<(ObjectRef, ObjectRef)> = BTreeSet::new();
 

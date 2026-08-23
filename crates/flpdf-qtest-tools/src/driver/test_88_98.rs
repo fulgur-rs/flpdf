@@ -228,14 +228,14 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     let null = ObjectHandle::null();
 
     // `getTrailer()`/`getRoot()` (test_driver.cc:3168-3169) dereference
-    // internally. `Pdf::trailer_handle()` already returns a direct,
+    // internally. `Pdf::trailer()` already returns a direct,
     // resolved dictionary value, so `append_array_item` observes the real
     // type without an extra resolve step; `appendItem` on a dictionary
     // warns `typeWarning("array", "ignoring attempt to append item")` and
     // is a no-op (`QPDFObjectHandle.cc:916-925`), which
     // `ObjectHandle::append_array_item`'s own `prepare_array_mutation`
     // reproduces through this crate's warning pipeline.
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     trailer.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
@@ -474,7 +474,7 @@ pub(crate) fn run_test_93<R: Read + Seek>(
     // (`reader.rs`'s `lift_to_handle_bounded_with_options`), so `root1`
     // below and `root_handle`'s own reference share the same underlying
     // `Rc` -- `is_same_object_as` needs no resolution to observe that.
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let root1 = trailer.get_key(b"/Root");
     let root2 = root_handle(pdf);
     assert!(root1.is_same_object_as(&root2));

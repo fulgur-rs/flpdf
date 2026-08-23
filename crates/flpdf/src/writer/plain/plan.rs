@@ -460,7 +460,7 @@ struct PlacementPlan {
 }
 
 fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec<u8>>> {
-    let id = pdf.trailer_handle().try_get_key(b"/ID")?;
+    let id = pdf.trailer().try_get_key(b"/ID")?;
     let Some(values) = id.try_as_array()? else {
         return Ok(None);
     };
@@ -478,7 +478,7 @@ fn live_source_id0<R: Read + Seek>(pdf: &mut Pdf<R>) -> crate::Result<Option<Vec
 /// while `enqueueObjectsStandard` applies `getKeys()` null visibility before
 /// it seeds the object queue (`QPDFWriter.cc:1163-1192, 2009-2029, 2916-2924`).
 /// The legacy `Pdf::trailer()` dictionary is a construction-time snapshot and
-/// cannot represent a later `trailer_handle()` mutation. Direct dictionaries
+/// cannot represent a later `trailer()` mutation. Direct dictionaries
 /// and arrays are serialized through the canonical writer boundary so nested
 /// dictionary nulls are omitted and array null positions remain present.
 pub(crate) fn canonical_trailer_entries(
@@ -500,7 +500,7 @@ pub(crate) fn canonical_trailer_entries_with_visibility(
     removed_refs: &BTreeSet<ObjectRef>,
     suppress_null_values: bool,
 ) -> crate::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let trailer = pdf.trailer_handle();
+    let trailer = pdf.trailer();
     let entries = trailer.try_as_dictionary()?.unwrap_or_default();
     let mut serialized = Vec::with_capacity(entries.len());
     for (key, value) in entries {
@@ -1002,10 +1002,8 @@ mod tests {
         pdf.delete_object(ObjectRef::new(999, 0));
         let zero = resolved_reference(&mut pdf, ObjectRef::new(100, 0), ObjectRef::new(0, 0));
         let removed = resolved_reference(&mut pdf, ObjectRef::new(101, 0), ObjectRef::new(999, 0));
-        pdf.trailer_handle().replace_key(b"/Zero", zero).unwrap();
-        pdf.trailer_handle()
-            .replace_key(b"/Removed", removed)
-            .unwrap();
+        pdf.trailer().replace_key(b"/Zero", zero).unwrap();
+        pdf.trailer().replace_key(b"/Removed", removed).unwrap();
         let missing = pdf.get_object_handle(ObjectRef::new(999, 0));
         let added = ObjectHandle::dictionary(vec![
             (b"Gone".to_vec(), missing),
@@ -1014,7 +1012,7 @@ mod tests {
                 ObjectHandle::array(vec![ObjectHandle::null()]),
             ),
         ]);
-        pdf.trailer_handle().replace_key(b"/Added", added).unwrap();
+        pdf.trailer().replace_key(b"/Added", added).unwrap();
 
         let output = {
             let mut writer = PdfWriter::new(&mut pdf);
@@ -1037,7 +1035,7 @@ mod tests {
             std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
         ))
         .unwrap();
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         trailer.remove_key(b"/Info");
         let null_ref = ObjectRef::new(100, 0);
         let null_handle = pdf.get_object_handle(null_ref);
@@ -1069,7 +1067,7 @@ mod tests {
             std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
         ))
         .unwrap();
-        pdf.trailer_handle()
+        pdf.trailer()
             .replace_key(
                 b"/Added",
                 ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]),
@@ -1098,7 +1096,7 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(pdf.trailer().get("ID").is_some());
+        assert!(pdf.trailer_dictionary().get("ID").is_some());
         let id0 = live_source_id0(&mut pdf).unwrap();
         assert!(
             id0.is_some(),
@@ -1112,7 +1110,7 @@ mod tests {
             std::fs::File::open(fixture_path("one-page.pdf")).unwrap(),
         ))
         .unwrap();
-        pdf.trailer_handle()
+        pdf.trailer()
             .replace_key(
                 b"/ID",
                 ObjectHandle::array(vec![
@@ -1134,7 +1132,7 @@ mod tests {
             std::fs::File::open(fixture_path("one-page.pdf")).unwrap(),
         ))
         .unwrap();
-        pdf.trailer_handle()
+        pdf.trailer()
             .replace_key(b"/ID", ObjectHandle::array(Vec::new()))
             .unwrap();
 
@@ -1147,7 +1145,7 @@ mod tests {
             std::fs::File::open(fixture_path("no-stream-one-page.pdf")).unwrap(),
         ))
         .unwrap();
-        pdf.trailer_handle()
+        pdf.trailer()
             .replace_key(
                 b"/Info",
                 ObjectHandle::dictionary(vec![(
@@ -1173,7 +1171,7 @@ mod tests {
             std::fs::File::open(fixture_path("no-stream-one-page.pdf")).unwrap(),
         ))
         .unwrap();
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         trailer.remove_key(b"/Info");
         trailer
             .replace_key(b"/ A", ObjectHandle::integer(1))
@@ -1221,7 +1219,7 @@ mod tests {
             std::fs::File::open(fixture_path("three-page.pdf")).unwrap(),
         ))
         .unwrap();
-        let trailer = pdf.trailer_handle();
+        let trailer = pdf.trailer();
         trailer.remove_key(b"/Info");
         let nested_ref =
             resolved_reference(&mut pdf, ObjectRef::new(1000, 0), ObjectRef::new(999, 0));
