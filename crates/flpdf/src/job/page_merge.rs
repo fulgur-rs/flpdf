@@ -1240,14 +1240,15 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             }
         }
 
-        // UNION of the per-page transitive closures, then ONE deep-copy pass
-        // into the growing target: a single renumbering map means an object
-        // shared by several selected pages of this input is copied once. The
-        // closures share one `visited` set so a subtree reachable from several
-        // selected pages of THIS input is walked once for the union, not once
-        // per referencing page (extract_pages parity, flpdf-11lj). The set is
-        // local to this input — never shared across inputs, whose distinct
-        // source docs and numbering would alias.
+        // UNION of the per-page transitive closures for page-scoped discovery.
+        // The closures share one `visited` set so a subtree reachable from
+        // several selected pages of THIS input is walked once for the union,
+        // not once per referencing page (extract_pages parity, flpdf-11lj).
+        // The set is local to this input — never shared across inputs, whose
+        // distinct source docs and numbering would alias. The selected-page
+        // graph itself is copied by the canonical ObjectHandle route below;
+        // this raw set remains only for AcroForm selection and for the
+        // bounded primary metadata bridge.
         let mut closure: BTreeSet<ObjectRef> = BTreeSet::new();
         for &page_ref in &unique {
             extend_page_object_closure(input.source, page_ref, &mut closure)?;
@@ -1257,10 +1258,34 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // through the primary Catalog's complete `/AcroForm` graph.
         let page_closure = closure.clone();
 
+        // qpdf's QPDFPageDocumentHelper::addPage delegates foreign page
+        // insertion to QPDF::copyForeignObject. Copy every selected page
+        // through the destination-owned ObjCopier before the remaining
+        // primary metadata/orphan bridge is assembled. The persistent map is
+        // then used as the seed for that bounded bridge, so references from a
+        // copied carrier to a page graph already copied by qpdf's canonical
+        // route keep the same destination identity instead of being copied a
+        // second time. In particular, do not call copyForeignObject on every
+        // member of `page_closure`: doing so would promote a nested unselected
+        // Page null reservation to a top-level page copy, which qpdf does not
+        // do.
+        for &page_ref in &unique {
+            let source_page = input.source.get_object_handle(page_ref);
+            let copied_page = target.copy_foreign_object(&source_page)?;
+            // cov:ignore-start: QPDF::copyForeignObject returns an indirect
+            // destination handle for an indirect page root; this guard protects
+            // the contract if the allocator ever regresses.
+            if copied_page.object_ref().is_none() {
+                return Err(Error::Missing("merged page missing from foreign copy map"));
+            }
+            // cov:ignore-end
+        }
+        let mut copy_seed = target.take_foreign_object_map(input.source.unique_id());
+
         // Fold the primary's document-level carriers (outline tree, name-tree
-        // /Dests, legacy /Dests, /OpenAction) into the closure BEFORE copying so
-        // the same single copy pass copies and remaps them — no separate
-        // post-copy remap. A no-op for secondary inputs (empty doc_level).
+        // /Dests, legacy /Dests, /OpenAction) into the raw bridge closure
+        // before its one bounded copy pass. A no-op for secondary inputs (empty
+        // doc_level).
         fold_doc_level_closure(input.source, &doc_level, &mut closure)?;
         if is_primary {
             fold_primary_metadata_closure(input.source, &doc_level, &mut closure)?;
@@ -1304,7 +1329,6 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // resolve to the target's existing equivalents instead of being
         // duplicated as new, dead-weight copies or dropped to `Object::Null`
         // (unmapped refs) by `rewrite_refs`.
-        let mut copy_seed: BTreeMap<ObjectRef, ObjectRef> = BTreeMap::new();
         let primary_live = if is_primary && preserve_primary_unreferenced {
             // Exclude `/Type /ObjStm` container refs: an object-stream
             // container is a writer-owned compression artifact, not
@@ -1365,6 +1389,12 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             Vec::new()
         };
 
+        // The selected-page graph has already been copied by the canonical
+        // ObjectHandle route above. Keep those source refs out of the raw
+        // closure bridge so it only handles the primary metadata and the
+        // explicitly requested preserved orphan universe.
+        closure.retain(|source_ref| !page_closure.contains(source_ref));
+
         // qpdf `--pages` null-out parity is page-tree driven: after every closure
         // root has been folded, the selected page set determines which copied
         // source pages are retained. Without `--preserve-unreferenced`, pages
@@ -1372,7 +1402,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // deselected primary page dict is now folded into `closure` above so
         // it IS copied, and the null-out below turns that copy into the same
         // bare `null` qpdf's `replaceObject` produces.
-        // Renumbering-disjointness invariant: copy_objects allocates fresh
+        // Renumbering-disjointness invariant: the raw bridge allocates fresh
         // target object numbers starting one past the current maximum, so the
         // refs it returns never collide with objects already surviving in the
         // target (prior inputs' copied pages, or the seed catalog/pages root).
@@ -1414,8 +1444,8 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
 
         // Wire the primary's inherited document-level structures onto the output
         // catalog (obj 1, distinct from the /Pages root obj 2 rebuilt below).
-        // copy_objects already remapped every destination inside the copied
-        // outline / name-tree / action objects, so this only sets catalog keys.
+        // The canonical page map and the bounded raw metadata bridge have
+        // already remapped their destinations, so this only sets catalog keys.
         // A no-op for secondary inputs (empty doc_level).
         if is_primary {
             wire_doc_level(&mut target, &doc_level, &map)?;
