@@ -162,10 +162,10 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
     };
     let catalog = pdf.get_object_handle(catalog_ref);
     pdf.resolve(&catalog)?;
-    if !catalog.has_key(b"/Threads") {
+    if !catalog.try_has_key(b"/Threads")? {
         return Ok(()); // No article threads.
     }
-    let threads_val = catalog.get_key(b"/Threads");
+    let threads_val = catalog.try_get_key(b"/Threads")?;
     // /Threads may be an indirect (possibly multi-hop) reference to the array.
     let (threads_concrete, _) = pdf.resolve_to_terminal_ref(&threads_val)?;
     let Some(threads) = threads_concrete.as_array() else {
@@ -217,10 +217,10 @@ fn seed_from_surviving_pages<R: Read + Seek>(
         }
         let page = pdf.get_object_handle(page_ref);
         pdf.resolve(&page)?;
-        if !page.has_key(b"/B") {
+        if !page.try_has_key(b"/B")? {
             continue;
         }
-        let b_val = page.get_key(b"/B");
+        let b_val = page.try_get_key(b"/B")?;
         let (b_concrete, _) = pdf.resolve_to_terminal_ref(&b_val)?;
         if let Some(beads) = b_concrete.as_array() {
             for bead in beads {

@@ -88,10 +88,14 @@ fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
 #[test]
 fn thread_bead_production_uses_the_canonical_handle_route() {
     let source = include_str!("../src/thread_bead_p.rs");
-    let production = source
-        .split("#[cfg(test)]")
-        .next()
-        .expect("thread_bead_p has a production section");
+    // Split at the `mod tests` boundary, not the first `#[cfg(test)]`: an
+    // earlier, narrower `#[cfg(test)]` gates only a single test-only import
+    // line above every production function, so stopping there would leave
+    // `production` covering just the module doc and imports.
+    let (before_tests, _) = source
+        .split_once("\nmod tests {")
+        .expect("thread_bead_p has a test module");
+    let production = before_tests.replace("#[cfg(test)]\nuse crate::{Dictionary, Object};\n", "");
     for legacy in [
         "resolve_borrowed",
         "resolve_object(",
