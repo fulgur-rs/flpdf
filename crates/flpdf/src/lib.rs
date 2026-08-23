@@ -106,7 +106,6 @@ pub mod json_inspect;
 pub mod linearization;
 pub mod logger;
 pub mod matrix;
-pub mod name_tree_dests;
 mod nntree;
 pub mod object;
 pub mod object_copy;
@@ -196,9 +195,6 @@ pub use job::{
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
 pub use matrix::{Matrix, Rectangle};
-pub use name_tree_dests::{
-    delete_name_tree_dest, insert_name_tree_dest, DEFAULT_MAX_NAME_TREE_DESTS_DEPTH,
-};
 pub use nntree::{
     NameTree, NameTreeCursor, NumberTree, NumberTreeCursor, DEFAULT_MAX_TREE_DEPTH, LEAF_MAX,
 };

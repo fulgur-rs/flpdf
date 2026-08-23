@@ -2,8 +2,8 @@
 //! across `write_pdf` round-trips and page operations (extract/rebuild/merge).
 //!
 //! This file complements the feature-scoped unit tests in
-//! `outline_document_helper_tests.rs`, `name_tree_dests_tests.rs`, and
-//! `page_label_document_helper_tests.rs` (each of which drills into a single
+//! `outline_document_helper_tests.rs` and `page_label_document_helper_tests.rs`
+//! (each of which drills into a single
 //! reader/writer API in isolation) with cross-cutting scenarios: a deep
 //! outline actually surviving a `write_pdf` round trip (not just an in-memory
 //! walk), both named-destination sources present in the same document,

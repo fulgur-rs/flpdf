@@ -329,10 +329,8 @@ D2 を満たさない。
 |---|---|---|
 | `NameTree::as_map` / `NumberTree::as_map` | `nntree.rs` | canonical name/number-tree 読み取り |
 | `NameTree` / `NumberTree` insertion | `nntree.rs` | `/Kids` リーフへの**分割**を含む |
-| `insert_name_tree_dest` | `name_tree_dests.rs`(116) | 上記 builder 経由の再構築による**挿入** |
-| `delete_name_tree_dest` | `name_tree_dests.rs`(149) | 同じ read/rebuild 経路による**削除**。`lib.rs`(193) から re-export |
-
-いずれも `lib.rs` から re-export されている。
+Catalog `/Names /Dests` の flpdf 固有 convenience adapter は削除し、
+qpdf 対応の typed NameTree/NumberTree は `nntree.rs` に集約する。
 
 **`outline_document_helper.rs` は単なる呼び出し元ではない。** 私的な NNTree 実装を
 production で持っている: `find_name_tree_value`(573: qpdf 流の targeted lookup と
