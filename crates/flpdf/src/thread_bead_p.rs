@@ -80,9 +80,6 @@ use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
-#[cfg(test)]
-use crate::{Dictionary, Object};
-
 /// Drop dangling article-thread bead `/P` references after a page-tree rebuild
 /// (qpdf `--pages` parity).
 ///
@@ -303,9 +300,29 @@ fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_handle::{canonical_dictionary_key, ObjectValue};
     use crate::Pdf;
     use std::collections::BTreeMap;
     use std::io::Cursor;
+
+    struct TestDict(BTreeMap<Vec<u8>, ObjectHandle>);
+
+    impl TestDict {
+        fn get(&self, key: &str) -> Option<&ObjectHandle> {
+            let key = canonical_dictionary_key(key.as_bytes());
+            self.0.get(&key)
+        }
+    }
+
+    fn reference_number(value: Option<&ObjectHandle>) -> Option<u32> {
+        value
+            .and_then(handle_reference)
+            .map(|object_ref| object_ref.number)
+    }
+
+    fn integer_value(value: Option<&ObjectHandle>) -> Option<i64> {
+        value.and_then(ObjectHandle::as_integer)
+    }
 
     /// Serialize `objs` (object number → body) into a classic-xref PDF with
     /// `/Root 1 0 R`.
@@ -402,8 +419,12 @@ mod tests {
     fn open(objs: &BTreeMap<u32, String>) -> Pdf<Cursor<Vec<u8>>> {
         let mut pdf = Pdf::open(Cursor::new(build_pdf(objs))).expect("open fixture");
         for (&number, body) in objs {
-            if let Ok(Object::Reference(target)) = crate::parse_object(body.as_bytes()) {
-                pdf.set_object(ObjectRef::new(number, 0), Object::Reference(target));
+            if let Ok(target) = body.parse::<ObjectRef>() {
+                pdf.set_object_handle(
+                    ObjectRef::new(number, 0),
+                    ObjectHandle::from_value(ObjectValue::Reference(target)),
+                )
+                .expect("install canonical reference fixture");
             }
         }
         pdf
@@ -422,13 +443,10 @@ mod tests {
         }
     }
 
-    fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
+    fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> TestDict {
         let bead = pdf.get_object_handle(ObjectRef::new(num, 0));
         pdf.resolve(&bead).expect("resolve bead");
-        bead.materialize()
-            .expect("materialize bead snapshot")
-            .into_dict()
-            .expect("bead object is a dictionary")
+        TestDict(bead.as_dictionary().expect("bead object is a dictionary"))
     }
 
     #[test]
@@ -447,12 +465,12 @@ mod tests {
         // Ring links, thread back-pointer, and rectangle are retained.
         let n12 = bead12.get("N");
         assert!(
-            matches!(n12, Some(Object::Reference(r)) if r.number == 13),
+            reference_number(n12) == Some(13),
             "bead 12 /N must be kept, got {n12:?}"
         );
         let v12 = bead12.get("V");
         assert!(
-            matches!(v12, Some(Object::Reference(r)) if r.number == 11),
+            reference_number(v12) == Some(11),
             "bead 12 /V must be kept, got {v12:?}"
         );
         assert!(bead12.get("T").is_some(), "bead 12 /T must be kept");
@@ -462,13 +480,13 @@ mod tests {
         let bead11 = bead_dict(&mut pdf, 11);
         let p11 = bead11.get("P");
         assert!(
-            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            reference_number(p11) == Some(3),
             "bead 11 /P (surviving page 3) must be kept, got {p11:?}"
         );
         let bead13 = bead_dict(&mut pdf, 13);
         let p13 = bead13.get("P");
         assert!(
-            matches!(p13, Some(Object::Reference(r)) if r.number == 5),
+            reference_number(p13) == Some(5),
             "bead 13 /P (surviving page 5) must be kept, got {p13:?}"
         );
     }
@@ -497,14 +515,14 @@ mod tests {
         let bead11 = bead_dict(&mut pdf, 11);
         let p11 = bead11.get("P");
         assert!(
-            matches!(p11, Some(Object::Reference(r)) if r.number == 7),
+            reference_number(p11) == Some(7),
             "bead 11 /P (surviving page under new ref) must be remapped, got {p11:?}"
         );
         // The surviving page under its original ref is left unchanged.
         let bead13 = bead_dict(&mut pdf, 13);
         let p13 = bead13.get("P");
         assert!(
-            matches!(p13, Some(Object::Reference(r)) if r.number == 5),
+            reference_number(p13) == Some(5),
             "bead 13 /P (surviving page, identity) must be kept, got {p13:?}"
         );
     }
@@ -541,7 +559,7 @@ mod tests {
         // (ref 3), not the duplicate ref 7 and not dropped — matching qpdf.
         let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
         assert!(
-            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            reference_number(p11.as_ref()) == Some(3),
             "a duplicated page's bead /P must stay at the first occurrence (page 3), got {p11:?}"
         );
         // Bead 12 (on the removed page 4) still loses its /P.
@@ -597,7 +615,7 @@ mod tests {
         let thread = bead_dict(&mut pdf, 10);
         let f = thread.get("F");
         assert!(
-            matches!(f, Some(Object::Reference(r)) if r.number == 11),
+            reference_number(f) == Some(11),
             "thread /F must be kept, got {f:?}"
         );
     }
@@ -621,7 +639,7 @@ mod tests {
         // A surviving bead reached the same way keeps its /P.
         let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
         assert!(
-            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            reference_number(p11.as_ref()) == Some(3),
             "surviving bead /P reached via /B must be kept, got {p11:?}"
         );
     }
@@ -675,7 +693,7 @@ mod tests {
         );
         let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
         assert!(
-            matches!(p11, Some(Object::Reference(r)) if r.number == 21),
+            reference_number(p11.as_ref()) == Some(21),
             "a chained /P to a surviving page must be kept verbatim, got {p11:?}"
         );
     }
@@ -826,7 +844,7 @@ mod tests {
 
         let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
         assert!(
-            matches!(p12, Some(Object::Integer(999))),
+            integer_value(p12.as_ref()) == Some(999),
             "a non-reference /P must be left unchanged, got {p12:?}"
         );
     }
@@ -847,7 +865,7 @@ mod tests {
 
         let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
         assert!(
-            matches!(p12, Some(Object::Reference(r)) if r.number == 30),
+            reference_number(p12.as_ref()) == Some(30),
             "a /P resolving to a non-page object must be left unchanged, got {p12:?}"
         );
     }
@@ -857,7 +875,7 @@ mod tests {
         // A removed page that a surviving outline / named destination still
         // references is replaced with `null` IN PLACE by the earlier null-out
         // pass (crate::outline_dest_remap, pipeline Step 4) BEFORE this pass
-        // (Step 6) runs. The bead's /P then resolves to Object::Null rather than
+        // (Step 6) runs. The bead's /P then resolves to null rather than
         // a /Type /Page dict — but it is still a removed page, and qpdf drops the
         // bead's /P. Object 4 is `null` and is not in `surviving`, so /P must be
         // dropped (matching qpdf; requiring /Type /Page here would wrongly keep
@@ -877,7 +895,7 @@ mod tests {
         // Beads on surviving pages are unaffected.
         let p11 = bead_dict(&mut pdf, 11).get("P").cloned();
         assert!(
-            matches!(p11, Some(Object::Reference(r)) if r.number == 3),
+            reference_number(p11.as_ref()) == Some(3),
             "surviving-page bead /P must be kept, got {p11:?}"
         );
     }
