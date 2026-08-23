@@ -533,8 +533,9 @@ mod tests {
         drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
             .expect("stream target skipped without error");
         assert!(
+            // cov:ignore-start: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
             matches!(
-                // cov:ignore: rustfmt reflow from the resolve_object rename splits this matches! call onto its own line; the call and its assertion body execute normally, llvm-cov attributes a zero-count region to the opening paren
+                // cov:ignore-end
                 pdf.resolve_object(ObjectRef::new(30, 0)),
                 Ok(Object::Stream(_))
             ),
