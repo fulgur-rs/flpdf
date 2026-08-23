@@ -1,4 +1,13 @@
 //! qpdf correspondence: QPDF_optimization.cc inherited-page-attribute push.
+//!
+//! Deviation: null checks on an inheritable key's value chase through a
+//! [`Pdf::set_object`] bare-reference redirect to its terminal via
+//! [`Pdf::resolve_to_terminal`], which has no qpdf counterpart (qpdf's own
+//! object graph can never hold a stored "this object's value is another
+//! reference" redirect the way `Pdf::set_object` permits). See
+//! `pages.rs`'s `resolve_inherited_handle_with_max_depth` for the same
+//! compensation in the sibling bottom-up attribute climb, and the inline
+//! deviation-marker comments below for the exact call sites.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -153,8 +162,10 @@ fn push_node_attributes<R: Read + Seek>(
         else {
             continue;
         };
-        value.try_dereference()?;
-        if value.is_null() {
+        // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+        // bare-reference redirect that has no qpdf counterpart (see
+        // reader.rs::resolve_to_terminal_ref).
+        if pdf.resolve_to_terminal(&value)?.is_null() {
             continue;
         }
         if !allow_changes {
@@ -228,10 +239,10 @@ fn push_child_reference<R: Read + Seek>(
             .and_then(|entries| entries.get(key).cloned())
         {
             None => false,
-            Some(value) => {
-                value.try_dereference()?;
-                !value.is_null()
-            }
+            // qpdf-deviation: terminal chase compensates for a Pdf::set_object
+            // bare-reference redirect that has no qpdf counterpart (see
+            // reader.rs::resolve_to_terminal_ref).
+            Some(value) => !pdf.resolve_to_terminal(&value)?.is_null(),
         };
         if !present {
             if let Some(value) = values.last() {
@@ -378,6 +389,23 @@ mod tests {
         ])
     }
 
+    /// Installs a two-hop `Pdf::set_object` bare-reference redirect
+    /// (`holder 0 R` -> `target 0 R` -> null) at `holder_ref`, where
+    /// `target_ref` is a fresh object whose value resolves to null.
+    fn install_multi_hop_null_redirect<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        holder_ref: ObjectRef,
+        target_ref: ObjectRef,
+    ) {
+        pdf.set_object_handle(target_ref, ObjectHandle::null())
+            .unwrap();
+        pdf.set_object_handle(
+            holder_ref,
+            ObjectHandle::from_value(crate::object_handle::ObjectValue::Reference(target_ref)),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn no_change_mode_rejects_inheritable_key_before_mutation() {
         let mut pdf = Pdf::open_mem_owned(pdf_with_inherited_scalar_rotate()).unwrap();
@@ -433,6 +461,92 @@ mod tests {
             pdf.get_object_handle(leaf_ref).end_offsets(),
             before,
             "inheriting a key must not clear the leaf's source extent"
+        );
+    }
+
+    #[test]
+    fn leaf_multi_hop_null_reference_chain_is_treated_as_absent() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 4 0 R >>",
+            ),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                  /Resources 6 0 R >>",
+            ),
+            (4, b"<< /Font << /F1 5 0 R >> >>"),
+            (5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (6, b"null"),
+            (7, b"null"),
+        ]))
+        .unwrap();
+        install_multi_hop_null_redirect(&mut pdf, ObjectRef::new(6, 0), ObjectRef::new(7, 0));
+
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+        push(&mut pdf, &prepared, true, false).unwrap();
+
+        let leaf = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&leaf).unwrap();
+        assert_eq!(
+            leaf.get_key(b"/Resources").object_ref(),
+            Some(ObjectRef::new(4, 0)),
+            "a /Resources reaching null through a two-hop reference chain \
+             (6 0 R -> 7 0 R -> null) must be treated as absent and replaced \
+             by the inherited value, not just a single-hop null"
+        );
+    }
+
+    #[test]
+    fn ancestor_multi_hop_null_reference_chain_does_not_shadow_grandparent() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (
+                2,
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources 5 0 R >>",
+            ),
+            (
+                3,
+                b"<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 \
+                  /Resources 7 0 R >>",
+            ),
+            (
+                4,
+                b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>",
+            ),
+            (5, b"<< /Font << /F1 6 0 R >> >>"),
+            (6, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            (7, b"null"),
+            (8, b"null"),
+        ]))
+        .unwrap();
+        install_multi_hop_null_redirect(&mut pdf, ObjectRef::new(7, 0), ObjectRef::new(8, 0));
+
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+        push(&mut pdf, &prepared, true, false).unwrap();
+
+        let child = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&child).unwrap();
+        assert_eq!(
+            child.get_key(b"/Resources").object_ref(),
+            Some(ObjectRef::new(7, 0)),
+            "a /Resources reaching null through a two-hop reference chain on \
+             the child /Pages node must be left in place, not erased"
+        );
+
+        let leaf = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve(&leaf).unwrap();
+        assert_eq!(
+            leaf.get_key(b"/Resources").object_ref(),
+            Some(ObjectRef::new(5, 0)),
+            "the leaf must inherit the GRANDPARENT's real /Resources, not be \
+             shadowed by the child's two-hop null reference chain"
         );
     }
 
