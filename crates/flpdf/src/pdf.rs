@@ -112,7 +112,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// port.
     pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<ObjectRef>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
-    /// repeated [`Pdf::trailer_handle`] calls return the same shared handle
+    /// repeated [`Pdf::trailer`] calls return the same shared handle
     /// rather than re-deriving a fresh one from `self.trailer` each time.
     /// Populated lazily on first request.
     pub(crate) trailer_handle_memo: Option<ObjectHandle>,
@@ -328,7 +328,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// unlike `Pdf::trailer().get_key(key)`, this lifts only `key`'s
     /// own value, so an unrelated sibling trailer entry whose literal nesting
     /// exceeds the crate's inline-object-nesting bound cannot degrade this
-    /// result to null the way it degrades [`Pdf::trailer_handle`]'s whole-
+    /// result to null the way it degrades [`Pdf::trailer`]'s whole-
     /// trailer walk. A bare reference (`/Key 1 0 R`) becomes a genuine
     /// indirect handle sharing the canonical `handle_registry` identity
     /// (matching how a dictionary *child* reference lifts, not `lift`'s own
