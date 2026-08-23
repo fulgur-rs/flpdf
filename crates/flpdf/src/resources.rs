@@ -228,7 +228,10 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
 ) -> Result<(BTreeSet<Vec<u8>>, bool)> {
     let page_resources = {
         let mut helper = PageObjectHelper::new(page_ref, pdf);
-        helper.get_resources(true)?
+        // qpdf's forEachFormXObject uses getAttribute("/Resources", false)
+        // while discovering nested Forms; the later per-Form pruning helper
+        // is the first boundary that copies an indirect Resources dictionary.
+        helper.get_resources(false)?
     };
     if page_resources.is_null() {
         return Ok((BTreeSet::new(), false));
