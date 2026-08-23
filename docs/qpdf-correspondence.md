@@ -294,6 +294,14 @@ AES `/Length` 調整を同時に平文化する。dictionary の string serializ
 layout 非対象のため旧 in-place bridge を維持し、canonical full-rewrite と ObjStm
 container は新しい pipeline route を使う。
 
+`flpdf-8f1o` では plain writer の `PlainWritePlan` が、qpdf の
+`willFilterStream` が返す stream data buffer と同じ責務を
+`CachedStreamOutput` に保持し、`plain/body.rs` の emission が再利用する。
+provider を計画時の discard probe と emission で二重に呼ばないため、警告を発行する
+legacy provider に抑制フラグを追加せず、qpdf の一回計算／再利用境界を保つ。
+specialized writer と linearized writer の別経路は、それぞれの qpdf 呼び出し契約を
+別 slice で扱う。
+
 ### ObjectHandle emission-time encryption surface (`flpdf-egzr.3.2.15`, 2026-08-15)
 
 qpdf の暗号化は Object tree を事前に書き換えない。`QPDFWriter.cc:842-847`
