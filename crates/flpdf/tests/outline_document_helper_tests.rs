@@ -4563,14 +4563,14 @@ fn direct_reference_valued_cursor_is_chased_to_its_target() {
         Object::Reference(ObjectRef::new(8, 0)),
     );
     let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
-    pdf.resolve_object_handle(&holder).unwrap();
+    pdf.resolve(&holder).unwrap();
     let direct_reference = holder.shallow_copy().unwrap();
     assert!(direct_reference.object_ref().is_none());
     assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
 
     // Install it as the Outlines dict's /First, bypassing Pdf::set_object.
     let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve_object_handle(&outlines).unwrap();
+    pdf.resolve(&outlines).unwrap();
     outlines.replace_key(b"/First", direct_reference).unwrap();
 
     let roots = root_items(&mut pdf);
@@ -4610,9 +4610,9 @@ fn direct_sibling_next_cycle_terminates_the_top_level_walk() {
     let mut pdf = Pdf::open(Cursor::new(direct_sibling_cycle_pdf())).unwrap();
 
     let handle_a = pdf.get_object_handle(ObjectRef::new(5, 0));
-    pdf.resolve_object_handle(&handle_a).unwrap();
+    pdf.resolve(&handle_a).unwrap();
     let handle_b = pdf.get_object_handle(ObjectRef::new(6, 0));
-    pdf.resolve_object_handle(&handle_b).unwrap();
+    pdf.resolve(&handle_b).unwrap();
     let direct_a = handle_a.shallow_copy().unwrap();
     let direct_b = handle_b.shallow_copy().unwrap();
     assert!(direct_a.object_ref().is_none());
@@ -4622,7 +4622,7 @@ fn direct_sibling_next_cycle_terminates_the_top_level_walk() {
     direct_b.replace_key(b"/Next", direct_a.clone()).unwrap();
 
     let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve_object_handle(&outlines).unwrap();
+    pdf.resolve(&outlines).unwrap();
     outlines.replace_key(b"/First", direct_a).unwrap();
 
     let roots = root_items(&mut pdf);
@@ -4661,9 +4661,9 @@ fn direct_child_sibling_next_cycle_terminates_the_frame_walk() {
     let mut pdf = Pdf::open(Cursor::new(direct_child_sibling_cycle_pdf())).unwrap();
 
     let handle_a = pdf.get_object_handle(ObjectRef::new(6, 0));
-    pdf.resolve_object_handle(&handle_a).unwrap();
+    pdf.resolve(&handle_a).unwrap();
     let handle_b = pdf.get_object_handle(ObjectRef::new(7, 0));
-    pdf.resolve_object_handle(&handle_b).unwrap();
+    pdf.resolve(&handle_b).unwrap();
     let direct_a = handle_a.shallow_copy().unwrap();
     let direct_b = handle_b.shallow_copy().unwrap();
 
@@ -4671,7 +4671,7 @@ fn direct_child_sibling_next_cycle_terminates_the_frame_walk() {
     direct_b.replace_key(b"/Next", direct_a.clone()).unwrap();
 
     let parent = pdf.get_object_handle(ObjectRef::new(5, 0));
-    pdf.resolve_object_handle(&parent).unwrap();
+    pdf.resolve(&parent).unwrap();
     parent.replace_key(b"/First", direct_a).unwrap();
 
     let mut helper = pdf.outline();
@@ -4744,13 +4744,13 @@ fn direct_reference_valued_cursor_self_loop_is_recorded_before_a_second_visit() 
         Object::Reference(ObjectRef::new(8, 0)),
     );
     let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
-    pdf.resolve_object_handle(&holder).unwrap();
+    pdf.resolve(&holder).unwrap();
     let direct_reference = holder.shallow_copy().unwrap();
     assert!(direct_reference.object_ref().is_none());
     assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
 
     let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve_object_handle(&outlines).unwrap();
+    pdf.resolve(&outlines).unwrap();
     outlines.replace_key(b"/First", direct_reference).unwrap();
 
     // Object 8 must be visited exactly once, not twice: the self-loop is a
@@ -4798,13 +4798,13 @@ fn direct_reference_valued_child_cursor_self_loop_is_recorded_before_a_second_vi
         Object::Reference(ObjectRef::new(8, 0)),
     );
     let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
-    pdf.resolve_object_handle(&holder).unwrap();
+    pdf.resolve(&holder).unwrap();
     let direct_reference = holder.shallow_copy().unwrap();
     assert!(direct_reference.object_ref().is_none());
     assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
 
     let parent = pdf.get_object_handle(ObjectRef::new(5, 0));
-    pdf.resolve_object_handle(&parent).unwrap();
+    pdf.resolve(&parent).unwrap();
     parent.replace_key(b"/First", direct_reference).unwrap();
 
     let mut helper = pdf.outline();
@@ -4852,13 +4852,13 @@ fn has_outlines_agrees_with_get_tree_for_a_direct_reference_valued_first_targeti
         Object::Reference(ObjectRef::new(8, 0)),
     );
     let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
-    pdf.resolve_object_handle(&holder).unwrap();
+    pdf.resolve(&holder).unwrap();
     let direct_reference = holder.shallow_copy().unwrap();
     assert!(direct_reference.object_ref().is_none());
     assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
 
     let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve_object_handle(&outlines).unwrap();
+    pdf.resolve(&outlines).unwrap();
     outlines.replace_key(b"/First", direct_reference).unwrap();
 
     assert!(!pdf.outline().has_outlines().unwrap());
@@ -4965,7 +4965,7 @@ fn dest_dict_cache_holds_stale_value_within_one_helper_session() {
     let page_six = pdf.get_object_handle(ObjectRef::new(6, 0));
     let root_ref = pdf.root_ref().unwrap();
     let catalog = pdf.get_object_handle(root_ref);
-    pdf.resolve_object_handle(&catalog).unwrap();
+    pdf.resolve(&catalog).unwrap();
 
     let mut helper = pdf.outline();
     let tree = helper.get_tree().unwrap();

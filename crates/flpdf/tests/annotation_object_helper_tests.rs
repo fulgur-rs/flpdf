@@ -250,7 +250,7 @@ fn annotation_appearance_indirect_dict() {
         .expect("get_appearance_dictionary()");
     assert!(ap.as_dictionary().is_some(), "AP should resolve to a dict");
     let n = ap.get_key(b"/N");
-    pdf.resolve_object_handle(&n).unwrap();
+    pdf.resolve(&n).unwrap();
     assert_eq!(n.object_ref(), Some(ObjectRef::new(5, 0)));
 }
 

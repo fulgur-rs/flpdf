@@ -5153,9 +5153,9 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
 ) -> CliResult<Vec<bool>> {
     let mut warnings = Vec::new();
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     let contents = page.get_key(b"/Contents");
-    let (contents, contents_ref) = pdf.resolve_object_handle_to_terminal_ref(&contents)?;
+    let (contents, contents_ref) = pdf.resolve_to_terminal_ref(&contents)?;
 
     let mut streams = Vec::new();
     if contents.as_stream_dict().is_some() {
@@ -5164,7 +5164,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
         }
     } else if let Some(items) = contents.as_array() {
         for item in items {
-            let (item, item_ref) = pdf.resolve_object_handle_to_terminal_ref(&item)?;
+            let (item, item_ref) = pdf.resolve_to_terminal_ref(&item)?;
             if item.as_stream_dict().is_some() {
                 if let Some(item_ref) = item_ref {
                     streams.push((item_ref, item));

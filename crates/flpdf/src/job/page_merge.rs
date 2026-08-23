@@ -129,7 +129,7 @@ fn discover_primary_doc_level<R: Read + Seek>(source: &mut Pdf<R>) -> Result<Pri
     // the legacy borrowed resolver to discover document-level state.
     let catalog_handle = source.get_object_handle(catalog_ref);
     let catalog = source
-        .resolve_object_handle_to_terminal(&catalog_handle)?
+        .resolve_to_terminal(&catalog_handle)?
         .materialize()?
         .into_dict();
     let Some(catalog) = catalog else {
@@ -304,7 +304,7 @@ fn wire_doc_level<RTgt: Read + Seek>(
         return Ok(()); // cov:ignore: the seed target always has a /Root catalog
     };
     let catalog_handle = target.get_object_handle(catalog_ref);
-    let catalog = target.resolve_object_handle_to_terminal(&catalog_handle)?;
+    let catalog = target.resolve_to_terminal(&catalog_handle)?;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     }
@@ -575,7 +575,7 @@ fn resolve_field_partial_name<R: Read + Seek>(
     field_ref: ObjectRef,
 ) -> Result<Option<Vec<u8>>> {
     let field_handle = source.get_object_handle(field_ref);
-    let field = source.resolve_object_handle_to_terminal(&field_handle)?;
+    let field = source.resolve_to_terminal(&field_handle)?;
     if field.try_as_dictionary()?.is_none() {
         return Ok(None); // cov:ignore: a top-level field ref always resolves to a dictionary
     }
@@ -586,7 +586,7 @@ fn resolve_field_partial_name<R: Read + Seek>(
     // `/T` may be stored through more than one indirect hop; follow the whole
     // chain (not a one-hop resolve) so a multi-hop name string is read and
     // used for collision renaming rather than yielding `None`.
-    let resolved = source.resolve_object_handle_to_terminal(&t_value)?;
+    let resolved = source.resolve_to_terminal(&t_value)?;
     Ok(resolved.as_string().map(|raw| utf8_value(&raw)))
 }
 
@@ -602,7 +602,7 @@ fn remove_target_acroform<R: Read + Seek>(target: &mut Pdf<R>) -> Result<()> {
         return Ok(()); // cov:ignore: the seed target always has a /Root catalog
     };
     let catalog_handle = target.get_object_handle(catalog_ref);
-    let catalog = target.resolve_object_handle_to_terminal(&catalog_handle)?;
+    let catalog = target.resolve_to_terminal(&catalog_handle)?;
     if catalog.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: the seed catalog is always a dict
     }
@@ -706,7 +706,7 @@ fn rename_field<R: Read + Seek>(
     name: Vec<u8>,
 ) -> Result<()> {
     let field_handle = target.get_object_handle(field_ref);
-    let field = target.resolve_object_handle_to_terminal(&field_handle)?;
+    let field = target.resolve_to_terminal(&field_handle)?;
     if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
@@ -724,7 +724,7 @@ fn field_kid_refs<R: Read + Seek>(
     field_ref: ObjectRef,
 ) -> Result<Option<Vec<ObjectRef>>> {
     let field_handle = source.get_object_handle(field_ref);
-    let field = source.resolve_object_handle_to_terminal(&field_handle)?;
+    let field = source.resolve_to_terminal(&field_handle)?;
     if field.try_as_dictionary()?.is_none() {
         return Ok(None); // cov:ignore: a field ref always resolves to a dictionary
     }
@@ -732,13 +732,13 @@ fn field_kid_refs<R: Read + Seek>(
     if kids_value.is_null() {
         return Ok(None);
     }
-    let resolved = source.resolve_object_handle_to_terminal(&kids_value)?;
+    let resolved = source.resolve_to_terminal(&kids_value)?;
     let Some(items) = resolved.try_as_array()? else {
         return Ok(Some(Vec::new())); // cov:ignore: a /Kids value resolves to an array in practice
     };
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
-        let (_, terminal_ref) = source.resolve_object_handle_to_terminal_ref(&item)?;
+        let (_, terminal_ref) = source.resolve_to_terminal_ref(&item)?;
         if let Some(r) = terminal_ref {
             // A `/Kids` element may be a reference to a reference to the field/
             // widget; resolve the holder chain to the terminal ref so trimming
@@ -767,7 +767,7 @@ fn collect_retained_widget_refs<R: Read + Seek>(
 ) -> Result<()> {
     for &page_ref in selected_pages {
         let page_handle = source.get_object_handle(page_ref);
-        let page = source.resolve_object_handle_to_terminal(&page_handle)?;
+        let page = source.resolve_to_terminal(&page_handle)?;
         if page.try_as_dictionary()?.is_none() {
             continue; // cov:ignore: a selected page ref always resolves to a dictionary
         }
@@ -776,12 +776,12 @@ fn collect_retained_widget_refs<R: Read + Seek>(
             continue;
         }
         // /Annots: an inline array or an indirect reference to one.
-        let concrete = source.resolve_object_handle_to_terminal(&annots_val)?;
+        let concrete = source.resolve_to_terminal(&annots_val)?;
         let Some(elems) = concrete.try_as_array()? else {
             continue; // cov:ignore: a non-array /Annots is malformed
         };
         for elem in elems {
-            let (_, terminal_ref) = source.resolve_object_handle_to_terminal_ref(&elem)?;
+            let (_, terminal_ref) = source.resolve_to_terminal_ref(&elem)?;
             if let Some(r) = terminal_ref {
                 // An `/Annots` element may be a reference to a reference to the
                 // widget; resolve the holder chain to the terminal widget ref so it
@@ -801,7 +801,7 @@ fn widget_page_ref<R: Read + Seek>(
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     let widget_handle = source.get_object_handle(widget_ref);
-    let widget = source.resolve_object_handle_to_terminal(&widget_handle)?;
+    let widget = source.resolve_to_terminal(&widget_handle)?;
     if widget.try_as_dictionary()?.is_none() {
         return Ok(None); // cov:ignore: a widget ref always resolves to a dictionary
     }
@@ -812,7 +812,7 @@ fn widget_page_ref<R: Read + Seek>(
         // trim_field_kids, not by this back-pointer.
         return Ok(None);
     }
-    let (_, last_ref) = source.resolve_object_handle_to_terminal_ref(&p_value)?;
+    let (_, last_ref) = source.resolve_to_terminal_ref(&p_value)?;
     Ok(last_ref)
 }
 
@@ -935,7 +935,7 @@ fn rewrite_field_kids<R: Read + Seek>(
         return Ok(()); // cov:ignore: a survivor's parent field is always in the copy map
     };
     let field_handle = target.get_object_handle(target_field_ref);
-    let field = target.resolve_object_handle_to_terminal(&field_handle)?;
+    let field = target.resolve_to_terminal(&field_handle)?;
     if field.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: a copied field ref always resolves to a dictionary
     }
@@ -1407,7 +1407,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
                 .get(&src_ref)
                 .ok_or(Error::Missing("merged page missing from copy map"))?;
             let page = target.get_object_handle(copied_page_ref);
-            target.resolve_object_handle(&page)?;
+            target.resolve(&page)?;
             page.replace_key(b"/Parent", pages_handle.clone())?;
             target.mark_object_handle_dirty(&page)?;
         }

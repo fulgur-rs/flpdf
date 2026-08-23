@@ -51,8 +51,8 @@ where
     A: Read + Seek,
     E: Read + Seek,
 {
-    let act = actual_pdf.resolve_object_handle_to_terminal(act)?;
-    let exp = expected_pdf.resolve_object_handle_to_terminal(exp)?;
+    let act = actual_pdf.resolve_to_terminal(act)?;
+    let exp = expected_pdf.resolve_to_terminal(exp)?;
     if act.type_code()? != exp.type_code()? {
         return Ok(format!("{label}: different types"));
     }
@@ -163,7 +163,7 @@ fn stream_is_xref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<bool> {
     let type_handle = stream_dict.get_key(b"/Type");
-    let type_handle = pdf.resolve_object_handle_to_terminal(&type_handle)?;
+    let type_handle = pdf.resolve_to_terminal(&type_handle)?;
     Ok(type_handle.as_name().is_some_and(|name| name == b"XRef"))
 }
 
@@ -203,7 +203,7 @@ fn resolved_filter_names_with_normalization<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     normalize: bool,
 ) -> flpdf::Result<ResolvedFilterNames> {
-    let filter = pdf.resolve_object_handle_to_terminal(&stream_dict.get_key(b"/Filter"))?;
+    let filter = pdf.resolve_to_terminal(&stream_dict.get_key(b"/Filter"))?;
     if let Some(name) = filter.as_name() {
         return Ok(ResolvedFilterNames {
             names: vec![if normalize {
@@ -223,7 +223,7 @@ fn resolved_filter_names_with_normalization<R: Read + Seek>(
     let mut names = Vec::with_capacity(items.len());
     let mut valid = true;
     for item in items {
-        let item = pdf.resolve_object_handle_to_terminal(&item)?;
+        let item = pdf.resolve_to_terminal(&item)?;
         if let Some(name) = item.as_name() {
             names.push(if normalize {
                 normalize_filter_name(&name).to_vec()
@@ -349,7 +349,7 @@ fn materialize_decode_params_for_legacy<R: Read + Seek>(
     filter_names: &[Vec<u8>],
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<Object> {
-    let params = pdf.resolve_object_handle_to_terminal(handle)?;
+    let params = pdf.resolve_to_terminal(handle)?;
     if let Some(items) = params.as_array() {
         return Ok(Object::Array(
             items
@@ -377,7 +377,7 @@ fn materialize_decode_params_item<R: Read + Seek>(
     filters: &[&[u8]],
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<Object> {
-    let handle = pdf.resolve_object_handle_to_terminal(handle)?;
+    let handle = pdf.resolve_to_terminal(handle)?;
     if !filters.iter().copied().any(is_decode_parameter_consumer) {
         // Non-consuming filters only inspect whether the parameter object is
         // null. Resolve that root object, but leave all child references
@@ -400,7 +400,7 @@ fn materialize_decode_params_item<R: Read + Seek>(
         let Some(value) = entries.get(&canonical) else {
             continue;
         };
-        let value = pdf.resolve_object_handle_to_terminal(value)?;
+        let value = pdf.resolve_to_terminal(value)?;
         selected.insert(key, materialize_legacy_without_resolution(&value)?);
     }
     Ok(Object::Dictionary(selected))
@@ -535,7 +535,7 @@ fn resolve_compare_children<R: Read + Seek>(
             if !child.is_direct() {
                 continue;
             }
-            let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
+            let terminal = pdf.resolve_to_terminal(&child)?;
             if terminal.as_dictionary().is_some() || terminal.as_array().is_some() {
                 resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
             }
@@ -549,7 +549,7 @@ fn resolve_compare_children<R: Read + Seek>(
     seen.push(handle.clone());
     for child in entries.into_values() {
         let child_is_direct = child.is_direct();
-        let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
+        let terminal = pdf.resolve_to_terminal(&child)?;
         if child_is_direct && (terminal.as_dictionary().is_some() || terminal.as_array().is_some())
         {
             // qpdf's dictionary unparse resolves an immediate child for its
@@ -577,7 +577,7 @@ fn materialize_resolved_for_legacy<R: Read + Seek>(
     if depth > 500 {
         return Ok(Object::Null);
     }
-    let handle = pdf.resolve_object_handle_to_terminal(handle)?;
+    let handle = pdf.resolve_to_terminal(handle)?;
     if let Some(items) = handle.as_array() {
         return Ok(Object::Array(
             items
@@ -793,7 +793,7 @@ mod tests {
         // on both dictionaries before deciding whether to omit it.
         let actual_null = actual.get_key(b"/Null");
         assert!(a_pdf
-            .resolve_object_handle_to_terminal(&actual_null)
+            .resolve_to_terminal(&actual_null)
             .expect("resolve actual missing child")
             .is_null());
 

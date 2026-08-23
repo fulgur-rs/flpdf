@@ -2248,9 +2248,9 @@ fn get_attribute_uses_live_inherited_handle_and_copies_when_requested() {
     assert_eq!(copied.as_array().expect("copied box array").len(), 4);
 
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let page_media_box = page.get_key(b"/MediaBox");
-    pdf.resolve_object_handle(&page_media_box).unwrap();
+    pdf.resolve(&page_media_box).unwrap();
     assert!(
         page_media_box.is_direct(),
         "copy_if_shared=true must materialize the copied value on the page"
@@ -2272,9 +2272,9 @@ fn get_crop_box_copies_a_media_box_fallback_when_requested() {
     assert!(crop.is_direct(), "fallback copy must be a direct handle");
 
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let page_crop_box = page.get_key(b"/CropBox");
-    pdf.resolve_object_handle(&page_crop_box).unwrap();
+    pdf.resolve(&page_crop_box).unwrap();
     assert!(
         page_crop_box.is_direct(),
         "copy_if_fallback=true must materialize /CropBox on the page"

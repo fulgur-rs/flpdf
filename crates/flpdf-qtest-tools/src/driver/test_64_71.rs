@@ -48,7 +48,7 @@ fn open_secondary_pdf(
 /// implicit dereference explicitly, matching the identically named helpers
 /// already established for this crate's `test_02_09` file.
 fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> flpdf::Result<()> {
-    pdf.resolve_object_handle(handle)
+    pdf.resolve(handle)
 }
 
 fn dict_key<R: Read + Seek>(

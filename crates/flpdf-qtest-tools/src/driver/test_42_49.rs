@@ -44,9 +44,9 @@ fn chase_key<R: Read + Seek>(
     handle: &ObjectHandle,
     key: &[u8],
 ) -> flpdf::Result<ObjectHandle> {
-    let (chased, _) = pdf.resolve_object_handle_to_terminal_ref(handle)?;
+    let (chased, _) = pdf.resolve_to_terminal_ref(handle)?;
     let child = chased.get_key(key);
-    Ok(pdf.resolve_object_handle_to_terminal_ref(&child)?.0)
+    Ok(pdf.resolve_to_terminal_ref(&child)?.0)
 }
 
 pub(crate) fn run_test_42<R: Read + Seek>(
@@ -64,13 +64,13 @@ pub(crate) fn run_test_42<R: Read + Seek>(
     // literal markers for WARNING lines produced by the very wrong-type
     // accessors gapped below, so nothing observable is lost by stopping here.
     let qtest = pdf.trailer_key_handle(b"QTest");
-    let (qtest, _) = pdf.resolve_object_handle_to_terminal_ref(&qtest)?;
+    let (qtest, _) = pdf.resolve_to_terminal_ref(&qtest)?;
     let dictionary = qtest.get_key(b"/Dictionary");
-    let (dictionary, _) = pdf.resolve_object_handle_to_terminal_ref(&dictionary)?;
+    let (dictionary, _) = pdf.resolve_to_terminal_ref(&dictionary)?;
     let key2 = dictionary.get_key(b"/Key2");
-    let (array, _) = pdf.resolve_object_handle_to_terminal_ref(&key2)?;
+    let (array, _) = pdf.resolve_to_terminal_ref(&key2)?;
     let integer = qtest.get_key(b"/Integer");
-    let (_integer, _) = pdf.resolve_object_handle_to_terminal_ref(&integer)?;
+    let (_integer, _) = pdf.resolve_to_terminal_ref(&integer)?;
     assert!(
         array.as_array().is_some(),
         "qpdf test_42 requires /Dictionary/Key2 to be an array"
@@ -115,9 +115,9 @@ pub(crate) fn run_test_43<R: Read + Seek>(
     let has_acroform = match pdf.root_ref() {
         Some(root_ref) => {
             let root = pdf.get_object_handle(root_ref);
-            let (root, _) = pdf.resolve_object_handle_to_terminal_ref(&root)?;
+            let (root, _) = pdf.resolve_to_terminal_ref(&root)?;
             let acroform = root.get_key(b"/AcroForm");
-            let (acroform, _) = pdf.resolve_object_handle_to_terminal_ref(&acroform)?;
+            let (acroform, _) = pdf.resolve_to_terminal_ref(&acroform)?;
             !acroform.is_null()
         }
         None => false,

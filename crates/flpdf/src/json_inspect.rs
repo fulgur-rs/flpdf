@@ -9433,7 +9433,7 @@ mod tests {
     #[test]
     fn stream_payload_reads_canonically_resolved_original_source_data() {
         // Regression test: a stream reached through the canonical
-        // `get_object_handle` + `resolve_object_handle` path (never
+        // `get_object_handle` + `resolve` path (never
         // `replaceStreamData`-d, so its bytes live only in the parsed
         // original source) must still yield its real content.
         // `ObjectHandle::as_stream_data` returns `None` for exactly this
@@ -9467,7 +9467,7 @@ mod tests {
 
         let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("open canonical fixture");
         let stream = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve_object_handle(&stream)
+        pdf.resolve(&stream)
             .expect("resolve stream lazily from its original source");
         assert!(
             stream.as_stream_data().is_none(),

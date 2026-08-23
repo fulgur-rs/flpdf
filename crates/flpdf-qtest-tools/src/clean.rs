@@ -98,7 +98,7 @@ pub fn clean_trailer_handle<R: Read + Seek>(
     if !trailer.has_key(b"/ID") {
         return Ok(());
     }
-    let id = pdf.resolve_object_handle_to_terminal(&trailer.get_key(b"/ID"))?;
+    let id = pdf.resolve_to_terminal(&trailer.get_key(b"/ID"))?;
     let Some(items) = id.as_array() else {
         return Ok(());
     };
@@ -125,7 +125,7 @@ pub fn clean_encryption_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     trailer: &ObjectHandle,
 ) -> flpdf::Result<()> {
-    let encrypt = pdf.resolve_object_handle_to_terminal(&trailer.get_key(b"/Encrypt"))?;
+    let encrypt = pdf.resolve_to_terminal(&trailer.get_key(b"/Encrypt"))?;
     if encrypt.as_dictionary().is_none() {
         return Ok(());
     }
@@ -494,7 +494,7 @@ mod tests {
         clean_trailer_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
 
         let cleaned_id = pdf
-            .resolve_object_handle_to_terminal(&trailer.get_key(b"/ID"))
+            .resolve_to_terminal(&trailer.get_key(b"/ID"))
             .expect("resolve cleaned /ID");
         assert_eq!(cleaned_id.object_ref(), Some(id_ref));
         let items = cleaned_id.as_array().expect("/ID remains an array");
@@ -512,7 +512,7 @@ mod tests {
         clean_encryption_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
 
         let encrypt = pdf
-            .resolve_object_handle_to_terminal(&trailer.get_key(b"/Encrypt"))
+            .resolve_to_terminal(&trailer.get_key(b"/Encrypt"))
             .expect("resolve /Encrypt handle");
         for key in [b"/O".as_ref(), b"/OE", b"/U", b"/UE", b"/Perms"] {
             assert!(!encrypt.has_key(key), "{key:?} must have been removed");

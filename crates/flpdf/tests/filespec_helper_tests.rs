@@ -356,7 +356,7 @@ fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     catalog.insert("TestOwner", Object::Reference(owner_ref));
     pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     let owner = pdf.get_object_handle(owner_ref);
-    pdf.resolve_object_handle(&owner).unwrap();
+    pdf.resolve(&owner).unwrap();
     let direct_filespec = owner.get_key(b"/Filespec");
 
     let mut filespec = FileSpec::new(direct_filespec.clone(), &mut pdf).unwrap();

@@ -30,10 +30,10 @@ use crate::output::write_bytes;
 // `ObjectHandle::get_key`'s own doc: "Never performs resolution itself"), so
 // every qpdf `getKey(...)`/array-item step that is followed by a further
 // accessor call needs an explicit chase here to observe the same value qpdf
-// would. `resolve_object_handle_to_terminal` (not the single-hop
-// `resolve_object_handle`) is used throughout, matching the precedent
+// would. `resolve_to_terminal` (not the single-hop
+// `resolve`) is used throughout, matching the precedent
 // `driver/test_0_1.rs` itself established (see that file's own doc on
-// `resolve_object_handle_to_terminal_ref`): it degrades to a plain one-hop
+// `resolve_to_terminal_ref`): it degrades to a plain one-hop
 // resolve for ordinary parsed PDF content (where a resolved object's own
 // value is never itself `ObjectValue::Reference` -- that state is reachable
 // only through this crate's own `Pdf::set_object` test seam, per
@@ -53,7 +53,7 @@ fn resolved_terminal<R: Read + Seek>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> flpdf::Result<ObjectHandle> {
-    let resolved = pdf.resolve_object_handle_to_terminal(handle)?;
+    let resolved = pdf.resolve_to_terminal(handle)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(resolved)
 }
@@ -752,10 +752,10 @@ pub(crate) fn run_test_39<R: Read + Seek>(
                 .as_stream_dict()
                 .expect("is_image(true) already confirmed a stream value");
             let filter = pdf
-                .resolve_object_handle_to_terminal(&dict.get_key(b"/Filter"))?
+                .resolve_to_terminal(&dict.get_key(b"/Filter"))?
                 .unparse_resolved();
             let color_space = pdf
-                .resolve_object_handle_to_terminal(&dict.get_key(b"/ColorSpace"))?
+                .resolve_to_terminal(&dict.get_key(b"/ColorSpace"))?
                 .unparse_resolved();
             write!(stdout, "filter: ")?;
             write_bytes(stdout, &filter)?;

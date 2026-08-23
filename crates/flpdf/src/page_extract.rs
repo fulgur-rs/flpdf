@@ -158,7 +158,7 @@ pub fn extract_pages<R: Read + Seek>(
     let pages_handle = target.get_object_handle(pages_root_ref);
     for &copied_page_ref in page_map.values() {
         let page = target.get_object_handle(copied_page_ref);
-        target.resolve_object_handle(&page)?;
+        target.resolve(&page)?;
         page.replace_key(b"/Parent", pages_handle.clone())?;
         target.mark_object_handle_dirty(&page)?;
     }

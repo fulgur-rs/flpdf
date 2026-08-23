@@ -219,7 +219,7 @@ mod tests {
         owner.insert("FS", Object::Dictionary(filespec));
         pdf.set_object(owner_ref, Object::Dictionary(owner));
         let owner = pdf.get_object_handle(owner_ref);
-        pdf.resolve_object_handle(&owner).unwrap();
+        pdf.resolve(&owner).unwrap();
         let direct_filespec = owner.get_key(b"/FS");
         pdf.clear_dirty(owner_ref);
 
@@ -251,7 +251,7 @@ mod tests {
         owner_dict.insert("FS", Object::Dictionary(filespec));
         source.set_object(owner_ref, Object::Dictionary(owner_dict));
         let owner = source.get_object_handle(owner_ref);
-        source.resolve_object_handle(&owner).unwrap();
+        source.resolve(&owner).unwrap();
         let foreign_direct_filespec = owner.get_key(b"/FS");
         assert!(foreign_direct_filespec.is_direct());
 

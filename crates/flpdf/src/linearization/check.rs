@@ -1524,7 +1524,7 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
     // hint stream with a non-zero generation (e.g. after incremental update)
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
-    let hint_obj = pdf.resolve_object_handle_at_offset(offset as u64, hint_ref)?;
+    let hint_obj = pdf.resolve_at_offset(offset as u64, hint_ref)?;
     // qpdf's `InputSource::getLastOffset()` remains at the start of the
     // `endobj` token when `readObject` reports a non-stream hint object. The
     // canonical resolver stores the extent immediately after that token, so

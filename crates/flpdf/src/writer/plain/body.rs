@@ -49,7 +49,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 let mut handles = Vec::with_capacity(members.len());
                 for member in members {
                     let handle = pdf.get_object_handle(member.source);
-                    pdf.resolve_object_handle(&handle)?;
+                    pdf.resolve(&handle)?;
                     handles.push((member.output, handle));
                 }
                 let map = |object_ref| {
@@ -86,7 +86,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 let extends = match origin {
                     crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
                         let source_handle = pdf.get_object_handle(*source);
-                        pdf.resolve_object_handle(&source_handle)?;
+                        pdf.resolve(&source_handle)?;
                         if let Some(source_dict) = source_handle.as_stream_dict() {
                             let extends = source_dict.try_get_key(b"/Extends")?;
                             match extends.object_ref() {
@@ -145,7 +145,7 @@ fn emit_source_from_handle<R: Read + Seek>(
     bytes: &mut Vec<u8>,
 ) -> crate::Result<()> {
     let handle = pdf.get_object_handle(source);
-    pdf.resolve_object_handle(&handle)?;
+    pdf.resolve(&handle)?;
     let map = |object_ref| {
         plan.new_for_original(object_ref).ok_or_else(|| {
             crate::Error::Unsupported(format!(
@@ -965,7 +965,7 @@ fn validate_objstm_member_bodies<R: Read + Seek>(
         };
         for member in members {
             let member_handle = pdf.get_object_handle(member.source);
-            pdf.resolve_object_handle(&member_handle)?;
+            pdf.resolve(&member_handle)?;
             let is_signature = object_streams::is_qpdf_signature_dict(pdf, &member_handle)?;
             let violation = planned_member_body_violation(
                 member.source,
@@ -1180,7 +1180,7 @@ mod tests {
         let (_, data) = pdf
             .with_plain_writer_stream_recovery(|pdf| {
                 let handle = pdf.get_object_handle(ObjectRef::new(5, 0));
-                pdf.resolve_object_handle(&handle)?;
+                pdf.resolve(&handle)?;
                 let (_, data, _) = canonical_stream_output(&handle, &options)?;
                 Ok((Vec::<u8>::new(), data))
             })
@@ -1298,7 +1298,7 @@ mod tests {
 
         let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
         let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve_object_handle(&stream).unwrap();
+        pdf.resolve(&stream).unwrap();
         let options = WriterOptions {
             recompress_flate: true,
             ..WriterOptions::default()
@@ -1320,7 +1320,7 @@ mod tests {
             include_bytes!("../../../../../tests/fixtures/test_driver/stream_flate_error.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let stream = pdf.get_object_handle(ObjectRef::new(6, 0));
-        pdf.resolve_object_handle(&stream).unwrap();
+        pdf.resolve(&stream).unwrap();
         let options = WriterOptions {
             recompress_flate: true,
             ..WriterOptions::default()
@@ -1432,7 +1432,7 @@ mod tests {
                     return None; // cov:ignore: ObjectStreamMode::Disable plans contain only source placements; defensive future-plan arm
                 };
                 let handle = pdf.get_object_handle(*source);
-                pdf.resolve_object_handle(&handle).ok()?;
+                pdf.resolve(&handle).ok()?;
                 handle.as_stream_dict().map(|_| *source)
             })
             .expect("three-page fixture must contain a source stream");

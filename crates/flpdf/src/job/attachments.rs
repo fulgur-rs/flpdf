@@ -271,7 +271,7 @@ impl QPDFJob {
         // `/Root` dictionary (`QPDF.cc:2355-2359`).
         let root_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve_object_handle(&root)?;
+        pdf.resolve(&root)?;
         if root.try_get_key(b"/PageMode")?.try_is_null()? {
             root.replace_key(b"/PageMode", ObjectHandle::name(b"UseAttachments".to_vec()))?;
             pdf.mark_object_handle_dirty(&root)?;
@@ -988,7 +988,7 @@ mod tests {
 
         let root_ref = pdf.root_ref().expect("catalog root");
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve_object_handle(&root).expect("resolve catalog");
+        pdf.resolve(&root).expect("resolve catalog");
         root.replace_key(b"/PageMode", crate::ObjectHandle::name(b"UseNone".to_vec()))
             .expect("set existing page mode");
         pdf.mark_object_handle_dirty(&root)

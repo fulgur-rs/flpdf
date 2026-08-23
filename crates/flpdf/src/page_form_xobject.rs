@@ -577,7 +577,7 @@ pub(crate) fn xobject_object_closure<R: Read + Seek>(
         if let Some(object_ref) = current.object_ref() {
             refs.insert(object_ref);
         }
-        let resolved = pdf.resolve_object_handle_to_terminal(&current)?;
+        let resolved = pdf.resolve_to_terminal(&current)?;
         if let Some(object_ref) = resolved.object_ref() {
             refs.insert(object_ref);
         }

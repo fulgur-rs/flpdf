@@ -940,7 +940,7 @@ pub(crate) enum ObjectValue {
     // An indirect object whose own resolved value is *itself* a bare
     // reference to another object (e.g. `4 0 obj\n5 0 R\nendobj`, or a
     // reference redirected in place via `Pdf::set_object`) -- never seen
-    // from a file/ObjStm parse (`Pdf::resolve_object_handle`'s native path
+    // from a file/ObjStm parse (`Pdf::resolve`'s native path
     // integerizes a top-level bare reference to `Integer` instead, matching
     // qpdf), but a real value `Pdf::set_object` callers pass directly (used
     // throughout this crate to redirect/collapse holder chains). A child
@@ -5447,7 +5447,7 @@ impl ObjectHandle {
     /// An indirect handle that has not yet been resolved (see
     /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
     /// performing hidden resolution; callers that need the real value must
-    /// resolve first (e.g. via `Pdf::resolve_object_handle`).
+    /// resolve first (e.g. via `Pdf::resolve`).
     ///
     /// A tree built through the public [`Self::array`]/[`Self::dictionary`]
     /// factories carries no depth bound the way parsed input does, so this
@@ -10143,12 +10143,12 @@ mod type_code_tests {
         // ObjectValue::Reference(*object_ref)` arm) — e.g.
         // `pdf.set_object(holder, Object::Reference(target))` to redirect a
         // holder chain in place, exactly as `ref_chain.rs`'s own test
-        // fixture does. `resolve_object_handle` itself can never produce
+        // fixture does. `resolve` itself can never produce
         // this state (a top-level bare reference never comes from a
         // file/ObjStm parse — `parser.rs`'s `top_level_no_reference`
         // integerizes it instead, matching qpdf — and `set_object` always
         // resolves the same canonical handle it writes into the legacy
-        // cache, so `resolve_object_handle`'s own `is_resolved` early-return
+        // cache, so `resolve`'s own `is_resolved` early-return
         // guards against ever re-deriving this value itself), but the state
         // is still reachable from any public accessor call on the handle
         // `Pdf::set_object` resolved directly. This test calls the same
@@ -14368,8 +14368,7 @@ mod mutation_tests {
         .expect("open minimal PDF");
         let pages_ref = ObjectRef::new(2, 0);
         let pages = pdf.get_object_handle(pages_ref);
-        pdf.resolve_object_handle(&pages)
-            .expect("resolve loaded Pages object");
+        pdf.resolve(&pages).expect("resolve loaded Pages object");
         let kids = pages.get_key(b"/Kids");
 
         assert!(pdf.dirty_object_refs().is_empty());

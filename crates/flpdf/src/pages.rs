@@ -73,7 +73,7 @@ pub(crate) fn page_parent_entries<R: Read + Seek>(
     key: &[u8],
 ) -> Result<Option<(ObjectHandle, ObjectHandle)>> {
     let dict = cursor.handle();
-    pdf.resolve_object_handle(&dict)?;
+    pdf.resolve(&dict)?;
     Ok(Some((
         dict.try_get_key(key)?,
         dict.try_get_key(b"/Parent")?,
@@ -156,8 +156,8 @@ pub(crate) fn resolve_inherited_handle_from_node_with_max_depth<R: Read + Seek>(
         // null-as-absent inheritance rule.
         // qpdf-deviation: terminal chase compensates for a Pdf::set_object
         // bare-reference redirect that has no qpdf counterpart (see
-        // reader.rs::resolve_object_handle_to_terminal_ref).
-        let terminal = pdf.resolve_object_handle_to_terminal(&value)?;
+        // reader.rs::resolve_to_terminal_ref).
+        let terminal = pdf.resolve_to_terminal(&value)?;
         if !terminal.try_is_null()? {
             return Ok(Some(value));
         }
@@ -244,7 +244,7 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
 ///
 /// - [`Error::Unsupported`] when `page_ref` does not resolve to a dictionary with
 ///   `/Type /Page`, or when a content stream cannot be decoded.
-/// - Any [`Error`] that [`Pdf::resolve_object_handle`] or the canonical content
+/// - Any [`Error`] that [`Pdf::resolve`] or the canonical content
 ///   pipeline may return.
 ///
 /// # Examples
@@ -267,7 +267,7 @@ pub fn page_content_bytes<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> Result<Vec<u8>> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     if page.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot extract /Contents"
@@ -297,7 +297,7 @@ pub fn page_content_bytes<R: Read + Seek>(
     }
 
     let contents = page.try_get_key(b"/Contents")?;
-    let (contents, _) = pdf.resolve_object_handle_to_terminal_ref(&contents)?;
+    let (contents, _) = pdf.resolve_to_terminal_ref(&contents)?;
     if contents.is_null() {
         return Ok(Vec::new());
     }
@@ -312,7 +312,7 @@ pub fn page_content_bytes<R: Read + Seek>(
     let mut streams = Vec::new();
     if let Some(items) = contents.as_array() {
         for item in items {
-            let (item, _) = pdf.resolve_object_handle_to_terminal_ref(&item)?;
+            let (item, _) = pdf.resolve_to_terminal_ref(&item)?;
             if item.as_stream_dict().is_some() {
                 streams.push(item);
             } else {
@@ -564,7 +564,7 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
     };
 
     let resources_ref = resources.object_ref();
-    let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
+    let resources = pdf.resolve_to_terminal(&resources)?;
     match resources.materialize()? {
         Object::Dictionary(dictionary) => Ok(Some(dictionary)),
         _ => match resources_ref {
@@ -926,7 +926,7 @@ mod tests {
         };
         let mut pdf = Pdf::open(reader).expect("PDF should parse");
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve_object_handle(&page)
+        pdf.resolve(&page)
             .expect("the current page should be readable before the boundary");
         fail.set(true);
         let error =
@@ -958,7 +958,7 @@ mod tests {
         };
         let mut pdf = Pdf::open(reader).expect("PDF should parse");
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve_object_handle(&page)
+        pdf.resolve(&page)
             .expect("the current page should be readable before the boundary");
         fail.set(true);
         // A depth limit well past the actual parent chain means the guard
@@ -994,7 +994,7 @@ mod tests {
         // so `next_page_parent` must not defer this already-known
         // non-dictionary value just because it is indirect.
         let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&parent)
+        pdf.resolve(&parent)
             .expect("the malformed parent object should be readable");
         assert!(parent.is_resolved());
         assert!(parent.as_dictionary().is_none());
@@ -1201,7 +1201,7 @@ mod tests {
         let inherited = flpdf_result.expect("qpdf did not treat the malformed value as absent");
         assert_eq!(inherited.object_ref(), Some(ObjectRef::new(4, 0)));
         let terminal = pdf
-            .resolve_object_handle_to_terminal(&inherited)
+            .resolve_to_terminal(&inherited)
             .expect("resolve parsed inherited value");
         assert_eq!(terminal.as_integer(), Some(5));
     }

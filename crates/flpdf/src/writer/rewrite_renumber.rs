@@ -348,7 +348,7 @@ impl CanonicalCatalogFirstRenumber {
 
         while let Some(source) = queue.pop_front() {
             let handle = pdf.get_object_handle(source);
-            pdf.resolve_object_handle(&handle)?;
+            pdf.resolve(&handle)?;
             let mut found = Vec::new();
             collect_canonical_children_with_stream_policy(
                 pdf,
@@ -432,7 +432,7 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
                 .to_string(),
         ));
     }
-    pdf.resolve_object_handle(handle)?;
+    pdf.resolve(handle)?;
     if let Some(reference) = handle.as_reference() {
         if reference.number != 0 {
             found.push(reference);
@@ -468,7 +468,7 @@ fn collect_canonical_children_with_stream_policy<R: Read + Seek>(
         return Ok(());
     }
     if let Some(stream_dict) = handle.as_stream_dict() {
-        pdf.resolve_object_handle(&stream_dict)?;
+        pdf.resolve(&stream_dict)?;
         let skip_stream_parameters = stream_parameters_removed
             .map(|predicate| predicate(handle))
             .transpose()?
@@ -1072,7 +1072,7 @@ impl ObjectStreamRenumber {
             match work {
                 RenumberWork::Ordinary(cur) => {
                     let handle = pdf.get_object_handle(cur);
-                    pdf.resolve_object_handle(&handle)?;
+                    pdf.resolve(&handle)?;
                     let mut found = Vec::new();
                     collect_canonical_children_with_stream_policy(
                         pdf,
@@ -1109,7 +1109,7 @@ impl ObjectStreamRenumber {
                         continue;
                     }
                     let handle = pdf.get_object_handle(source);
-                    pdf.resolve_object_handle(&handle)?;
+                    pdf.resolve(&handle)?;
                     if handle.is_null() {
                         continue;
                     }

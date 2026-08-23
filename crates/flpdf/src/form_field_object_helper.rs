@@ -493,17 +493,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Clear `/AcroForm/NeedAppearances` after a document appearance pass.
     pub fn clear_need_appearances_after_generation(pdf: &mut Pdf<R>) -> Result<()> {
         let root = pdf.trailer_key_handle(b"Root");
-        pdf.resolve_object_handle(&root)?;
+        pdf.resolve(&root)?;
         if root.is_null() {
             return Ok(());
         }
         let acroform = root.get_key(b"/AcroForm");
-        pdf.resolve_object_handle(&acroform)?;
+        pdf.resolve(&acroform)?;
         if acroform.as_dictionary().is_none() {
             return Ok(());
         }
         let need_appearances = acroform.get_key(b"/NeedAppearances");
-        pdf.resolve_object_handle(&need_appearances)?;
+        pdf.resolve(&need_appearances)?;
         if need_appearances.as_boolean() != Some(true) {
             return Ok(());
         }
@@ -833,7 +833,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn resolved(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        self.pdf.resolve_object_handle(&handle)?;
+        self.pdf.resolve(&handle)?;
         Ok(handle)
     }
 }

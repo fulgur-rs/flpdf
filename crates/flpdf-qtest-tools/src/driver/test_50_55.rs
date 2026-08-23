@@ -41,13 +41,13 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // itself") -- unlike qpdf's `mergeResources`, whose `isDictionary()`/
     // `getKey()` calls dereference implicitly. Resolving into separate
     // handles here does not change *which* object gets mutated:
-    // `resolve_object_handle_to_terminal_ref` returns the pdf's own
+    // `resolve_to_terminal_ref` returns the pdf's own
     // canonical, shared handle for an indirect value, so mutating it
     // through `d1`/`d2` mutates the exact same object `d1_handle`/
     // `d2_handle` still refer to (and, for a *direct* `/Dict1`/`/Dict2`,
     // the "resolved" handle is a plain clone of the same shared state).
-    let (d1, _) = pdf.resolve_object_handle_to_terminal_ref(&d1_handle)?;
-    let (d2, _) = pdf.resolve_object_handle_to_terminal_ref(&d2_handle)?;
+    let (d1, _) = pdf.resolve_to_terminal_ref(&d1_handle)?;
+    let (d2, _) = pdf.resolve_to_terminal_ref(&d2_handle)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     d1.merge_resources(&d2, None)?;
@@ -76,7 +76,7 @@ pub(crate) fn run_test_50<R: Read + Seek>(
     // resolved type, matching `merge_resources`'s own no-op contract for a
     // non-dictionary `other`.
     let d2_k1_handle = d2.get_key(b"/k1");
-    let (d2_k1, _) = pdf.resolve_object_handle_to_terminal_ref(&d2_k1_handle)?;
+    let (d2_k1, _) = pdf.resolve_to_terminal_ref(&d2_k1_handle)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     d1.merge_resources(&d2_k1, None)?;
     pdf.mark_object_handle_dirty(&d1)?;
@@ -104,7 +104,7 @@ fn resolve_and_drain<R: Read + Seek>(
     stderr: &mut dyn Write,
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<(ObjectHandle, Option<flpdf::ObjectRef>)> {
-    let resolved = pdf.resolve_object_handle_to_terminal_ref(handle)?;
+    let resolved = pdf.resolve_to_terminal_ref(handle)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     Ok(resolved)
 }

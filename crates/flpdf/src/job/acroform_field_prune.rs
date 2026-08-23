@@ -309,9 +309,9 @@ fn collect_page_widgets<R: Read + Seek>(
         // rejects an indirect handle, QPDF.cc:1980-1991), and
         // QPDFAcroFormDocumentHelper::traverseField / QPDFJob.cc's field
         // walk use plain one-hop getKey/getObjGen with no chase loop. Every
-        // other resolve_object_handle_to_terminal call in this file is the
+        // other resolve_to_terminal call in this file is the
         // same deviation and is marked individually at its own site.
-        let widget = pdf.resolve_object_handle_to_terminal(&widget)?;
+        let widget = pdf.resolve_to_terminal(&widget)?;
         // First-occurrence rule: don't overwrite if already present from a
         // duplicate-page selection (ref_map iteration is in BTreeMap order,
         // first occurrence is recorded first).
@@ -353,7 +353,7 @@ fn field_has_retained_widget<R: Read + Seek>(
     let field = pdf.get_object_handle(field_ref);
     // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
     // see collect_page_widgets's marker for the full citation.
-    let field = pdf.resolve_object_handle_to_terminal(&field)?;
+    let field = pdf.resolve_to_terminal(&field)?;
 
     // A merged field+widget dict is its own widget.
     if widget_to_page.contains_key(&field.identity_key()) {
@@ -363,7 +363,7 @@ fn field_has_retained_widget<R: Read + Seek>(
     // Walk /Kids: entries may be sub-fields (have /T) or pure widgets.
     // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
     // see collect_page_widgets's marker for the full citation.
-    let kids = pdf.resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
+    let kids = pdf.resolve_to_terminal(&field.try_get_key(b"/Kids")?)?;
     let Some(kids_arr) = kids.as_array() else {
         return Ok(false);
     };
@@ -371,7 +371,7 @@ fn field_has_retained_widget<R: Read + Seek>(
     for kid in kids_arr {
         // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
         // bridge; see collect_page_widgets's marker for the full citation.
-        let kid = pdf.resolve_object_handle_to_terminal(&kid)?;
+        let kid = pdf.resolve_to_terminal(&kid)?;
         // qpdf's field-tree traversal ignores direct field/kid entries. Only
         // indirect kids can participate in `/Fields` association; direct
         // page annotations are already collected by `collect_page_widgets`.
@@ -435,7 +435,7 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
     }
     // qpdf-deviation: chases flpdf's temporary Pdf::set_object bare-reference
     // bridge; see collect_page_widgets for the full qpdf source citation.
-    let existing_page = pdf.resolve_object_handle_to_terminal(&existing)?;
+    let existing_page = pdf.resolve_to_terminal(&existing)?;
     if !existing_page.is_null() {
         return Ok(());
     }
@@ -472,9 +472,9 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     let field = pdf.get_object_handle(field_ref);
     // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
     // see collect_page_widgets's marker for the full citation.
-    let field = pdf.resolve_object_handle_to_terminal(&field)?;
+    let field = pdf.resolve_to_terminal(&field)?;
     // qpdf-deviation: same bare-reference bridge chase as above.
-    let kids = pdf.resolve_object_handle_to_terminal(&field.try_get_key(b"/Kids")?)?;
+    let kids = pdf.resolve_to_terminal(&field.try_get_key(b"/Kids")?)?;
     let Some(kids_arr) = kids.as_array() else {
         // Leaf node with no /Kids. Merged field+widget dicts that were
         // retained were already handled by remove_stale_widget_page_ref; dropped
@@ -485,7 +485,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     for kid in kids_arr {
         // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
         // bridge; see collect_page_widgets's marker for the full citation.
-        let kid = pdf.resolve_object_handle_to_terminal(&kid)?;
+        let kid = pdf.resolve_to_terminal(&kid)?;
         // qpdf ignores direct field-tree entries, so do not promote or mutate
         // a direct `/Kids` member here.
         let Some(kid_ref) = kid.object_ref() else {
@@ -493,7 +493,7 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
         };
 
         // qpdf-deviation: same bare-reference bridge chase as above.
-        let subtype = pdf.resolve_object_handle_to_terminal(&kid.try_get_key(b"/Subtype")?)?;
+        let subtype = pdf.resolve_to_terminal(&kid.try_get_key(b"/Subtype")?)?;
         let is_widget = subtype.as_name().as_deref() == Some(b"Widget".as_slice());
 
         if is_widget {
@@ -779,7 +779,7 @@ mod tests {
         // widget 11's `/P` retargeted to a bridge object that redirects to
         // the (now nulled) dropped page 5 -- so `try_has_key` sees a
         // non-null direct child (the bridge) while
-        // `resolve_object_handle_to_terminal` chases through to null.
+        // `resolve_to_terminal` chases through to null.
         let mut pdf = open(build_acroform_pdf());
         pdf.set_object(ObjectRef::new(5, 0), Object::Null);
         pdf.set_object(
@@ -787,7 +787,7 @@ mod tests {
             Object::Reference(ObjectRef::new(5, 0)),
         );
         let raw_widget = pdf.get_object_handle(ObjectRef::new(11, 0));
-        let widget = pdf.resolve_object_handle_to_terminal(&raw_widget).unwrap();
+        let widget = pdf.resolve_to_terminal(&raw_widget).unwrap();
         let bridge = pdf.get_object_handle(ObjectRef::new(99, 0));
         widget.replace_key(b"/P", bridge).unwrap();
         pdf.mark_object_handle_dirty(&widget).unwrap();
@@ -815,7 +815,7 @@ mod tests {
         // the target's null state to match qpdf's actual removal set.
         let mut pdf = open(build_acroform_pdf());
         let raw_widget = pdf.get_object_handle(ObjectRef::new(11, 0));
-        let widget = pdf.resolve_object_handle_to_terminal(&raw_widget).unwrap();
+        let widget = pdf.resolve_to_terminal(&raw_widget).unwrap();
         let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
         let removed_pages = BTreeSet::from([ObjectRef::new(5, 0)]);
 

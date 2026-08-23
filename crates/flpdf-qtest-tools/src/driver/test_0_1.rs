@@ -59,7 +59,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     // nested sibling trailer entry would degrade `/QTest` to null here too,
     // even though `/QTest` itself is untouched.
     let original = pdf.trailer_key_handle(b"QTest");
-    let (chased, terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(&original)?;
+    let (chased, terminal_ref) = pdf.resolve_to_terminal_ref(&original)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     // qpdf's own `hasKey` treats a key resolving to null the same as a
@@ -107,7 +107,7 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     //
     // `resolve_chain`'s own 64-hop count is spent starting from `original`'s
     // *own* reference (its first loop iteration re-resolves it), while
-    // `resolve_object_handle_to_terminal_ref` above already resolved
+    // `resolve_to_terminal_ref` above already resolved
     // `original` once for free before counting any redirects — so a chain
     // landing exactly at that chase's own limit is one hop short of
     // `resolve_chain`'s budget here and errors instead of completing
@@ -164,7 +164,7 @@ fn dictionary_items<R: Read + Seek>(
         .ok_or_else(|| Error::System("dictionary access on non-dictionary object".to_string()))?;
     let mut items = Vec::new();
     for (key, child) in entries {
-        let (terminal, _terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(&child)?;
+        let (terminal, _terminal_ref) = pdf.resolve_to_terminal_ref(&child)?;
         if !terminal.is_null() {
             items.push((key, child.object_ref().is_some()));
         }
@@ -432,7 +432,7 @@ fn write_object_details<R: Read + Seek>(
             }
         }
         // 11 = operator, 12 = inline-image, 13 = unresolved (unreachable:
-        // `resolve_object_handle_to_terminal_ref`'s own contract guarantees
+        // `resolve_to_terminal_ref`'s own contract guarantees
         // `chased`'s value is never itself `ObjectValue::Reference`).
         _ => {
             writeln!(stdout, "/QTest is an unknown object")?;
@@ -1222,7 +1222,7 @@ mod tests {
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
             let original = pdf.trailer_key_handle(b"QTest");
             let (qtest, terminal_ref) = pdf
-                .resolve_object_handle_to_terminal_ref(&original)
+                .resolve_to_terminal_ref(&original)
                 .expect("resolve qtest");
             let mut stdout = Vec::new();
             let capacity = if fail_on == 1 { 0 } else { first_warning_len };
@@ -1272,7 +1272,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open warning fixture");
         let original = pdf.trailer_key_handle(b"QTest");
         let (qtest, terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&original)
+            .resolve_to_terminal_ref(&original)
             .expect("resolve qtest");
         let mut stdout = Vec::new();
         let mut stderr = WriteFailure;
@@ -1307,7 +1307,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open codec-error fixture");
         let original = pdf.trailer_key_handle(b"QTest");
         let (qtest, terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&original)
+            .resolve_to_terminal_ref(&original)
             .expect("resolve qtest");
         let mut stdout = Vec::new();
         let mut stderr = WriteFailure;
@@ -1448,7 +1448,7 @@ mod tests {
 
     #[test]
     fn a_redirect_chain_exactly_at_the_terminal_ref_chase_limit_still_unparses() {
-        // Codex Review on PR #610, follow-up: `resolve_object_handle_to_terminal_ref`
+        // Codex Review on PR #610, follow-up: `resolve_to_terminal_ref`
         // (used for type inspection above) resolves `/QTest`'s own reference
         // once for free before counting any further `Pdf::set_object`
         // redirects, but the legacy `resolve_chain` walk feeding the final
