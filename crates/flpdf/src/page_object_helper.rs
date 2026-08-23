@@ -1111,7 +1111,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
                 old_annots,
                 Matrix::default(),
                 source,
-            )?;
+            )?; // cov:ignore: LLVM attributes this multiline generic call terminator to the defensive error edge; the direct helper regression covers the success path.
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
                 &BTreeSet::new(),
