@@ -366,8 +366,16 @@ fn plan_generate<R: std::io::Read + std::io::Seek>(
     length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
 ) -> crate::Result<PackingPlan> {
-    // `Pdf::object_refs` mirrors qpdf's live-object enumeration and excludes
-    // free/deleted entries, which are not real objects for ObjStm placement.
+    // `Pdf::object_refs` does not by itself guarantee exclusion of a
+    // free/deleted xref row: a caller that has taken a canonical
+    // `ObjectHandle` on such a ref (via `get_object_handle`) before this
+    // planner runs can surface it here through the registry half of
+    // `object_refs` (`reader.rs`'s `canonical_object_refs`). This function
+    // is reached only via the specialized/encrypted writer coordinator
+    // (`writer.rs`), which resolves every registered handle ahead of
+    // object-stream planning, so a stray free-row candidate has not been
+    // observed to reach `refs` here -- but this loop has no independent
+    // free/deleted filter of its own if that upstream ordering changes.
     let mut refs: Vec<ObjectRef> = pdf.object_refs().into_iter().collect();
     refs.sort_by_key(|r| (r.number, r.generation));
 
