@@ -1,3 +1,6 @@
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use assert_cmd::Command;
 use flpdf::{
     acroform_sig_flags, filespec_helper::encode_utf16be, pages, AnnotationObjectHelper, Object, Pdf,
@@ -4550,7 +4553,8 @@ fn rewrite_normalize_content_skips_null_array_entries_like_qpdf() {
         .into_stream()
         .expect("first /Contents element must resolve to a stream");
     assert_eq!(
-        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"q\nQ"
     );
 }

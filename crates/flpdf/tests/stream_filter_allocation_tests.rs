@@ -1,6 +1,9 @@
 //! Measure `/DecodeParms` expansion without sharing a process-wide
 //! allocator with unrelated integration tests.
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use flpdf::{filters, Dictionary, Object};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,9 +57,10 @@ fn decode_parms_do_not_expand_large_values_per_filter() {
     let mut dictionary = Dictionary::new();
     dictionary.insert("Filter", flate_filter_chain(filter_count));
     dictionary.insert("DecodeParms", ignored_decode_parms(large_value_size));
+    let dictionary_handle = filter_handles::dictionary(&dictionary);
 
     let scalar_peak = peak_growth_of(|| {
-        let _ = filters::decode_stream_data(&dictionary, b"not zlib");
+        let _ = filters::decode_stream_data(&dictionary_handle, b"not zlib");
     });
 
     assert!(
@@ -74,9 +78,10 @@ fn decode_parms_do_not_expand_large_values_per_filter() {
                 .collect(),
         ),
     );
+    let aligned_dictionary_handle = filter_handles::dictionary(&aligned_dictionary);
 
     let aligned_peak = peak_growth_of(|| {
-        let _ = filters::decode_stream_data(&aligned_dictionary, b"not zlib");
+        let _ = filters::decode_stream_data(&aligned_dictionary_handle, b"not zlib");
     });
 
     assert!(

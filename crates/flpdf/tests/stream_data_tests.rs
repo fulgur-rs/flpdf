@@ -12,6 +12,9 @@
 //!   (f) Backward compat: `stream_data = None` behaves identically to
 //!       the existing `compress_streams` path (no regression).
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use flpdf::{filters, CompressStreams, Dictionary, Object, ObjectRef, Pdf, Stream, StreamDataMode};
 use std::io::Cursor;
 
@@ -33,7 +36,8 @@ fn make_pdf_with_stream(raw: &[u8], filter: Option<&[u8]>) -> Vec<u8> {
         Some(f) => {
             let mut d = Dictionary::new();
             d.insert("Filter", Object::Name(f.to_vec()));
-            let encoded = filters::encode_stream_data(&d, raw).expect("encode");
+            let encoded =
+                filters::encode_stream_data(&filter_handles::dictionary(&d), raw).expect("encode");
             (encoded, Some(f))
         }
         None => (raw.to_vec(), None),
@@ -131,7 +135,8 @@ fn rewrite_stream_data_preserve_keeps_filter() {
     );
 
     // The decoded bytes must equal the original raw content.
-    let decoded = filters::decode_stream_data(&s.dict, &s.data).expect("decode in preserve output");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
+        .expect("decode in preserve output");
     assert_eq!(decoded.as_slice(), raw, "decoded bytes must match original");
 }
 
@@ -203,7 +208,8 @@ fn rewrite_stream_data_compress_wraps_uncompressed() {
     );
 
     // Round-trip: decoded bytes must equal the original.
-    let decoded = filters::decode_stream_data(&s.dict, &s.data).expect("decode compressed output");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
+        .expect("decode compressed output");
     assert_eq!(
         decoded.as_slice(),
         &raw[..],
@@ -252,8 +258,10 @@ fn rewrite_stream_data_round_trip_preserve() {
     // The content stream in both rewrites should decode to the same bytes.
     let s1 = extract_stream_obj(&out1);
     let s2 = extract_stream_obj(&out2);
-    let d1 = filters::decode_stream_data(&s1.dict, &s1.data).expect("decode out1");
-    let d2 = filters::decode_stream_data(&s2.dict, &s2.data).expect("decode out2");
+    let d1 = filters::decode_stream_data(&filter_handles::dictionary(&s1.dict), &s1.data)
+        .expect("decode out1");
+    let d2 = filters::decode_stream_data(&filter_handles::dictionary(&s2.dict), &s2.data)
+        .expect("decode out2");
     assert_eq!(d1, d2, "preserve mode must be stable across two rewrites");
 }
 

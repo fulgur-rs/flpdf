@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::io::{BufReader, Cursor};
 use std::process::Command as ShellCommand;
 
+use super::filter_handles;
 use flpdf::{filters::decode_stream_data, Dictionary, Object, ObjectRef, Pdf};
 use tempfile::TempDir;
 
@@ -653,8 +654,8 @@ fn compare_objects(
             // Try decoded comparison first; encoding-dependent dict keys are
             // skipped only when both sides decode successfully (i.e. we're
             // comparing semantic content, not the raw encoded form).
-            let decoded_a = decode_stream_data(&a.dict, &a.data);
-            let decoded_b = decode_stream_data(&b.dict, &b.data);
+            let decoded_a = decode_stream_data(&filter_handles::dictionary(&a.dict), &a.data);
+            let decoded_b = decode_stream_data(&filter_handles::dictionary(&b.dict), &b.data);
             match (decoded_a, decoded_b) {
                 (Ok(da), Ok(db)) => {
                     compare_dicts_with_excluded(

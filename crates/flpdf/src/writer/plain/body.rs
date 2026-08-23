@@ -1193,8 +1193,9 @@ mod tests {
     fn canonical_stream_output_decodes_metadata_even_under_compress_policy() {
         let mut filter_dict = Dictionary::new();
         filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        let encoded = crate::filters::encode_stream_data(&filter_dict, b"metadata")
-            .expect("metadata payload must encode");
+        let encoded =
+            crate::filters::test_dictionary_api::encode_stream_data(&filter_dict, b"metadata")
+                .expect("metadata payload must encode");
         let stream = ObjectHandle::stream(
             ObjectHandle::dictionary(vec![
                 (b"Type".to_vec(), ObjectHandle::name(b"Metadata".to_vec())),

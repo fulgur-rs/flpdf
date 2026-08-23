@@ -1931,7 +1931,8 @@ mod byte_gate {
             "empty Flate stream must contain encoded zlib bytes"
         );
         assert_eq!(
-            crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
+                .unwrap(),
             Vec::<u8>::new()
         );
     }

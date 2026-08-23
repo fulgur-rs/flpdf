@@ -1515,7 +1515,9 @@ mod tests {
 
         let stream = wrap_objstm_body(&body, crate::writer::CompressStreams::Yes).unwrap();
 
-        let decoded = crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+        let decoded =
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
+                .unwrap();
         assert_eq!(
             decoded, original_bytes,
             "decoded bytes must equal original body bytes"

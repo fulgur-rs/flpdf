@@ -17,6 +17,9 @@
 //!   - CCITTFaxDecode standalone: passthrough marker + byte-identical after rewrite.
 //!   - JBIG2Decode with /JBIG2Globals indirect ref: passthrough + ref preserved.
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf};
 use predicates::prelude::*;
@@ -81,12 +84,14 @@ fn build_pdf_with_filter_array(
             flate_dict.insert("DecodeParms", parms.clone());
         }
         let flate_encoded =
-            filters::encode_stream_data(&flate_dict, raw_content).expect("encode Flate stage");
+            filters::encode_stream_data(&filter_handles::dictionary(&flate_dict), raw_content)
+                .expect("encode Flate stage");
         ascii85::fixture_bytes(&flate_encoded)
     } else {
         // Keep the generic supported-filter encode path for combinations such
         // as [/FlateDecode /ASCIIHexDecode].
-        filters::encode_stream_data(&stream_dict, raw_content).expect("encode multi-filter stream")
+        filters::encode_stream_data(&filter_handles::dictionary(&stream_dict), raw_content)
+            .expect("encode multi-filter stream")
     };
 
     // Build the filter dict text for the stream header.
@@ -347,8 +352,11 @@ fn cli_show_stream_flate_ascii_hex_chain() {
     let raw = b"FlateDecode+ASCIIHexDecode content for CLI consistency test";
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = filters::encode_stream_data(&flate_dict, &ascii_hex_encode(raw))
-        .expect("encode Flate wrapper");
+    let encoded = filters::encode_stream_data(
+        &filter_handles::dictionary(&flate_dict),
+        &ascii_hex_encode(raw),
+    )
+    .expect("encode Flate wrapper");
     let pdf_bytes =
         build_pdf_with_prefiltered_stream(&encoded, "[/FlateDecode /ASCIIHexDecode]", None);
 

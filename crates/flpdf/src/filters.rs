@@ -6,17 +6,21 @@ use crate::object_handle::ObjectHandle;
 use crate::pipeline::test_support::ascii85_fixture_bytes;
 use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
+use crate::stream_filter::decode_filter_specs_from_object;
+#[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 #[cfg(test)]
 use crate::stream_filter::DECODE_OUTPUT_LIMIT_PREFIX;
 use crate::stream_filter::{
-    decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
-    encode_run_length, is_decoded_filter as stream_is_decoded_filter,
+    decode_filter_specs_from_handle, encode_flate, encode_run_length,
+    is_decoded_filter as stream_is_decoded_filter,
     passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
     undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
     FilterSpec, CRYPT_STAGE_UNSUPPORTED,
 };
-use crate::{Dictionary, Error, Object, Result};
+#[cfg(test)]
+use crate::{Dictionary, Object};
+use crate::{Error, Result};
 
 /// Maximum number of stages a `/Filter` chain may declare on the **decode**
 /// path. Real PDFs use at most a few stages; this rejects only pathological
@@ -44,13 +48,14 @@ pub(crate) struct StreamFilterCapabilities {
 /// None means the stream is not filterable through flpdf's registered
 /// filters. The caller preserves the raw payload, matching qpdf for an
 /// unsupported filter and for compression outside the requested decode level.
-pub(crate) fn stream_filter_capabilities(dict: &Dictionary) -> Option<StreamFilterCapabilities> {
-    let specs = decode_filter_specs_from_object(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
-        Some(MAX_FILTER_CHAIN_LEN),
-    )
-    .ok()?;
+pub(crate) fn stream_filter_capabilities(
+    stream_dict: &ObjectHandle,
+) -> Option<StreamFilterCapabilities> {
+    let filter = stream_dict.try_get_key(b"/Filter").ok()?;
+    let decode_params = stream_dict.try_get_key(b"/DecodeParms").ok()?;
+    let specs =
+        decode_filter_specs_from_handle(&filter, &decode_params, Some(MAX_FILTER_CHAIN_LEN))
+            .ok()?;
 
     let mut capabilities = StreamFilterCapabilities::default();
     for spec in specs {
@@ -64,8 +69,8 @@ pub(crate) fn stream_filter_capabilities(dict: &Dictionary) -> Option<StreamFilt
     Some(capabilities)
 }
 
-pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
-    validate_filter_chain_count(filters.len(), Some(MAX_FILTER_CHAIN_LEN))
+pub(crate) fn validate_filter_chain_len(filter_count: usize) -> Result<()> {
+    validate_filter_chain_count(filter_count, Some(MAX_FILTER_CHAIN_LEN))
 }
 
 /// Return a human-readable codec label if `filter_name` is one of the four
@@ -121,9 +126,9 @@ pub fn is_decoded_filter(filter_name: &[u8]) -> bool {
 ///   `BitStream`/`BitWriter` processing limit is `32` bits, as in qpdf.
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
 ///   ASCII85, ASCIIHex, or RunLength data.
-pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
+pub fn decode_stream_data(stream_dict: &ObjectHandle, stream_data: &[u8]) -> Result<Vec<u8>> {
     decode_stream_data_with_limits_and_warnings(
-        dict,
+        stream_dict,
         stream_data,
         DecodeLimits::default(),
         &mut reject_decode_warning,
@@ -159,7 +164,7 @@ pub enum StreamDecodeEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DataEventMode {
+pub(crate) enum DataEventMode {
     Record,
     Suppress,
 }
@@ -195,10 +200,10 @@ pub struct StreamDecodeOutcome {
 /// its partial bytes and error populated. This applies
 /// [`DecodeLimits::default()`], including the default 16-stage `/Filter` cap.
 pub fn decode_stream_data_recovering(
-    dict: &Dictionary,
+    stream_dict: &ObjectHandle,
     stream_data: &[u8],
 ) -> Result<StreamDecodeOutcome> {
-    decode_stream_data_recovering_with_limits(dict, stream_data, DecodeLimits::default())
+    decode_stream_data_recovering_with_limits(stream_dict, stream_data, DecodeLimits::default())
 }
 
 /// Decode a stream with explicit limits while retaining ordered recovery events.
@@ -210,16 +215,11 @@ pub fn decode_stream_data_recovering(
 /// Runtime codec failures instead remain ordered [`StreamDecodeEvent::Error`]
 /// events alongside any recovered output, as for [`decode_stream_data_recovering`].
 pub fn decode_stream_data_recovering_with_limits(
-    dict: &Dictionary,
+    stream_dict: &ObjectHandle,
     stream_data: &[u8],
     limits: DecodeLimits,
 ) -> Result<StreamDecodeOutcome> {
-    decode_stream_data_recovering_with_limits_and_mode(
-        dict,
-        stream_data,
-        limits,
-        DataEventMode::Record,
-    )
+    decode_stream_data_recovering_from_handle(stream_dict, stream_data, limits)
 }
 
 /// Opt-in limits applied while decoding a stream's filter chain.
@@ -257,13 +257,13 @@ fn reject_decode_warning(message: &str, code: i32) -> PipelineResult<()> {
 }
 
 pub(crate) fn decode_stream_data_with_limits_and_warnings(
-    dict: &Dictionary,
+    stream_dict: &ObjectHandle,
     stream_data: &[u8],
     limits: DecodeLimits,
     warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
 ) -> Result<Vec<u8>> {
-    let outcome = decode_stream_data_recovering_with_limits_and_mode(
-        dict,
+    let outcome = decode_stream_data_from_handle_with_mode(
+        stream_dict,
         stream_data,
         limits,
         DataEventMode::Suppress,
@@ -274,7 +274,7 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
 /// Collapse a recovered outcome into the strict `getStreamData` shape: the
 /// first replayed error wins, otherwise the decoded bytes.
 ///
-/// Shared by the legacy [`decode_stream_data_with_limits`] path and the
+/// Shared by the strict public handle path and the
 /// `ObjectHandle`-native [`decode_stream_data_from_handle`], so "which event
 /// becomes the error" has one definition.
 fn replay_strict_decode_outcome(
@@ -307,21 +307,6 @@ fn replay_strict_decode_event(
     }
 }
 
-fn decode_stream_data_recovering_with_limits_and_mode(
-    dict: &Dictionary,
-    stream_data: &[u8],
-    limits: DecodeLimits,
-    data_events: DataEventMode,
-) -> Result<StreamDecodeOutcome> {
-    decode_stream_data_with_filters(
-        dict.get("Filter"),
-        dict.get("DecodeParms"),
-        stream_data,
-        limits,
-        data_events,
-    )
-}
-
 /// Returns `true` when `error` is the limit-exceeded signal raised when a
 /// supported filter stage aborts because its output would exceed
 /// [`DecodeLimits::max_output`].
@@ -347,12 +332,12 @@ pub(crate) fn is_decode_output_limit_error(error: &Error) -> bool {
 /// [`DecodeLimits::max_output`], or when the `/Filter` chain exceeds
 /// [`DecodeLimits::max_filter_chain`].
 pub fn decode_stream_data_with_limits(
-    dict: &Dictionary,
+    stream_dict: &ObjectHandle,
     stream_data: &[u8],
     limits: DecodeLimits,
 ) -> Result<Vec<u8>> {
     decode_stream_data_with_limits_and_warnings(
-        dict,
+        stream_dict,
         stream_data,
         limits,
         &mut reject_decode_warning,
@@ -382,8 +367,8 @@ pub fn decode_stream_data_with_limits(
 ///   geometry, on the same terms as [`decode_stream_data`].
 /// - a filter is decode-only on the encode path, including `/ASCII85Decode`,
 ///   `/ASCIIHexDecode`, and `LZWDecode`.
-pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
-    encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
+pub fn encode_stream_data(stream_dict: &ObjectHandle, stream_data: &[u8]) -> Result<Vec<u8>> {
+    encode_stream_data_from_handle(stream_dict, stream_data)
 }
 
 /// Encode `stream_data` using `/Filter` and `/DecodeParms` read from an
@@ -406,7 +391,6 @@ pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
 /// `/ASCIIHexDecode`, plus
 /// [`Error::Internal`] if an indirect holder or child still needs a document
 /// resolver after its document has been dropped.
-#[allow(dead_code)] // promoted when flpdf-egzr.3.2.5 migrates writer consumers
 pub(crate) fn encode_stream_data_from_handle(
     stream_dict: &ObjectHandle,
     stream_data: &[u8],
@@ -417,6 +401,7 @@ pub(crate) fn encode_stream_data_from_handle(
     encode_stream_data_from_specs(specs, stream_data)
 }
 
+#[cfg(test)]
 fn decode_stream_data_with_filters(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -438,7 +423,7 @@ fn decode_stream_data_with_filters(
 ///
 /// Plan decision D2 of `flpdf-25kg.3.4` keeps decryption out of this layer, so
 /// a `Crypt` stage is recognised during staging and then refused here. Shared
-/// by the legacy and `ObjectHandle` entry points, and the message itself is
+/// by the strict and recovering `ObjectHandle` entry points, and the message itself is
 /// [`CRYPT_STAGE_UNSUPPORTED`] so that this provider and the registry-side
 /// `CryptStreamFilter::pipe_decode_recovering` report one definition rather
 /// than one literal per route.
@@ -446,6 +431,7 @@ fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec
     Err(Error::Unsupported(CRYPT_STAGE_UNSUPPORTED.to_string()))
 }
 
+#[cfg(test)]
 fn decode_stream_data_with_filters_and_crypt<F>(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -492,7 +478,6 @@ where
 /// stream"`, whereas flpdf emits no warning and raises `filterable`'s text as
 /// the error itself. That gap is plan decision D3, measured against qpdf
 /// 11.9.0 on 2026-08-03 and deliberately not closed here.
-#[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
 pub(crate) fn decode_stream_data_from_handle(
     stream_dict: &ObjectHandle,
     stream_data: &[u8],
@@ -512,7 +497,7 @@ pub(crate) fn decode_stream_data_from_handle(
 /// [`decode_stream_data_recovering_with_limits`].
 ///
 /// [`decode_stream_data_from_handle`] reads the same dictionary through the
-/// same private helper and then applies the legacy path's strict replay, so
+/// same private helper and then applies the strict public path's replay, so
 /// the two differ only in that this form reports a warning or codec error as
 /// an ordered event (alongside [`StreamDecodeEvent::Data`] chunks) where the
 /// strict form turns the first of them into an [`Err`].
@@ -523,7 +508,6 @@ pub(crate) fn decode_stream_data_from_handle(
 /// constructed, on the same terms as [`decode_stream_data_from_handle`].
 /// Runtime codec failures instead remain ordered [`StreamDecodeEvent::Error`]
 /// events alongside any recovered output.
-#[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
 pub(crate) fn decode_stream_data_recovering_from_handle(
     stream_dict: &ObjectHandle,
     stream_data: &[u8],
@@ -555,33 +539,61 @@ fn decode_stream_data_from_handle_with_mode(
     )
 }
 
+#[cfg(test)]
+fn decode_stream_data_recovering_with_limits_and_mode_from_dictionary(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    data_events: DataEventMode,
+) -> Result<StreamDecodeOutcome> {
+    decode_stream_data_with_filters(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        stream_data,
+        limits,
+        data_events,
+    )
+}
+
+#[cfg(test)]
+fn decode_stream_data_with_limits_and_warnings_from_dictionary(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Result<Vec<u8>> {
+    let outcome = decode_stream_data_recovering_with_limits_and_mode_from_dictionary(
+        dict,
+        stream_data,
+        limits,
+        DataEventMode::Suppress,
+    )?;
+    replay_strict_decode_outcome(outcome, warn)
+}
+
 /// The provider a decode entry point installs to handle a `Crypt` stage.
 ///
 /// Erased rather than generic so the engine below stays one non-generic
-/// function both shape readers call. Plan decision D2 of `flpdf-25kg.3.4`
+/// function both the production handle reader and the test-only materialized
+/// fixture reader call. Plan decision D2 of `flpdf-25kg.3.4`
 /// keeps it an explicit parameter instead of a document hookup.
 type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>;
 
 /// Run the staging, codec, and warning-ordering engine over already-read
 /// filter specs.
 ///
-/// Everything downstream of `FilterSpec` lives here in one copy: both shape
-/// readers — the `&Object` one behind the legacy `&Dictionary` entry points
-/// and the `ObjectHandle` one behind [`decode_stream_data_from_handle`] —
-/// funnel into this function, so filter-chain staging, predictor geometry,
-/// [`DecodeLimits::max_output`] enforcement, and event ordering cannot drift
-/// between the two shapes. Nothing in this body inspects a `/Filter` or
-/// `/DecodeParms` object of either shape.
+/// Everything downstream of `FilterSpec` lives here in one copy. Production
+/// callers enter through [`decode_stream_data_from_handle`]; the materialized
+/// reader is compiled only for the in-module equivalence fixture. This keeps
+/// filter-chain staging, predictor geometry, [`DecodeLimits::max_output`]
+/// enforcement, and event ordering in one body without retaining a legacy
+/// production boundary. Nothing in this body inspects a `/Filter` or
+/// `/DecodeParms` object shape.
 ///
-/// [`DecodeLimits::max_filter_chain`] is the exception: it is applied above
-/// this function, once per shape reader, so it *can* drift between them. The
-/// shared `validate_filter_chain_count` keeps the message identical, and each
-/// reader's own placement is pinned absolutely — by
-/// `decode_rejects_overlong_filter_chain_before_malformed_item` here and by
-/// `handle_reader_counts_the_raw_filter_array_before_inspecting_its_items` in
-/// `stream_filter.rs`. What checks the two *against each other* is
-/// `handle_reader_matches_object_reader_for_every_filter_shape`, which sweeps
-/// the corpus at `None`, `Some(16)`, and `Some(0)`.
+/// [`DecodeLimits::max_filter_chain`] is applied above this function, before
+/// either reader snapshots its filter specs. The shared
+/// `validate_filter_chain_count` keeps the error text identical; the
+/// test-only equivalence corpus pins the placement against the handle reader.
 fn decode_prepared_specs(
     specs: Vec<FilterSpec>,
     stream_data: &[u8],
@@ -914,6 +926,7 @@ fn decode_codec_prefix(
         .expect("preflighted codec prefix pipeline is infallible")
 }
 
+#[cfg(test)]
 fn encode_stream_data_with_filters(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -1008,6 +1021,12 @@ fn apply_single_filter_encode(
 
 #[cfg(test)]
 mod tests {
+    use super::test_dictionary_api::{
+        decode_stream_data, decode_stream_data_recovering,
+        decode_stream_data_recovering_with_limits,
+        decode_stream_data_recovering_with_limits_and_mode, decode_stream_data_with_limits,
+        decode_stream_data_with_limits_and_warnings, encode_stream_data,
+    };
     use super::*;
     use crate::object_handle::identity_tests::resolver_bearing_handle;
     use crate::object_handle::warning_emission_tests::{handle_resolving, WarningRecorder};
@@ -3749,6 +3768,17 @@ mod tests {
     }
 
     #[test]
+    fn public_limits_entry_point_uses_the_handle_reader() {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+        )]);
+        let decoded = super::decode_stream_data_with_limits(&dict, b"61>", DecodeLimits::default())
+            .expect("the public limits entry point must delegate to the handle reader");
+        assert_eq!(decoded, b"a");
+    }
+
+    #[test]
     fn native_entry_point_dereferences_the_stream_dictionary_holder_itself() {
         // `QPDF_Stream::filterable` reaches both keys through
         // `stream_dict.getKey` (`libqpdf/QPDF_Stream.cc:386`, `:441`), a
@@ -4533,5 +4563,82 @@ mod tests {
                     .to_string(),
             )));
         }
+    }
+}
+
+/// Dictionary-shaped helpers used only by the legacy fixture tests while the
+/// production filter boundary is ObjectHandle-native. They are kept outside
+/// the production module and are not available to library consumers.
+#[cfg(test)]
+pub(crate) mod test_dictionary_api {
+    use super::*;
+
+    pub(crate) fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
+        decode_stream_data_with_limits_and_warnings_from_dictionary(
+            dict,
+            stream_data,
+            DecodeLimits::default(),
+            &mut reject_decode_warning,
+        )
+    }
+
+    pub(crate) fn decode_stream_data_recovering(
+        dict: &Dictionary,
+        stream_data: &[u8],
+    ) -> Result<StreamDecodeOutcome> {
+        decode_stream_data_recovering_with_limits(dict, stream_data, DecodeLimits::default())
+    }
+
+    pub(crate) fn decode_stream_data_recovering_with_limits(
+        dict: &Dictionary,
+        stream_data: &[u8],
+        limits: DecodeLimits,
+    ) -> Result<StreamDecodeOutcome> {
+        decode_stream_data_recovering_with_limits_and_mode(
+            dict,
+            stream_data,
+            limits,
+            DataEventMode::Record,
+        )
+    }
+
+    pub(crate) fn decode_stream_data_recovering_with_limits_and_mode(
+        dict: &Dictionary,
+        stream_data: &[u8],
+        limits: DecodeLimits,
+        data_events: DataEventMode,
+    ) -> Result<StreamDecodeOutcome> {
+        decode_stream_data_recovering_with_limits_and_mode_from_dictionary(
+            dict,
+            stream_data,
+            limits,
+            data_events,
+        )
+    }
+
+    pub(crate) fn decode_stream_data_with_limits(
+        dict: &Dictionary,
+        stream_data: &[u8],
+        limits: DecodeLimits,
+    ) -> Result<Vec<u8>> {
+        decode_stream_data_with_limits_and_warnings_from_dictionary(
+            dict,
+            stream_data,
+            limits,
+            &mut reject_decode_warning,
+        )
+    }
+
+    pub(crate) fn decode_stream_data_with_limits_and_warnings(
+        dict: &Dictionary,
+        stream_data: &[u8],
+        limits: DecodeLimits,
+        warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+    ) -> Result<Vec<u8>> {
+        decode_stream_data_with_limits_and_warnings_from_dictionary(dict, stream_data, limits, warn)
+    }
+
+    pub(crate) fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
+        encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
     }
 }

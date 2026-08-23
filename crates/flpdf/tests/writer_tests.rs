@@ -448,9 +448,11 @@ fn pdf_writer_rewrites_flate_object_stream_member_and_recomputes_first() {
         panic!("expected object stream object");
     };
 
-    let decoded =
-        filters::decode_stream_data(&rewritten_obj_stream.dict, &rewritten_obj_stream.data)
-            .unwrap();
+    let decoded = filters::decode_stream_data(
+        &filter_handles::dictionary(&rewritten_obj_stream.dict),
+        &rewritten_obj_stream.data,
+    )
+    .unwrap();
     let parsed_first = as_integer(
         rewritten_obj_stream
             .dict
@@ -2080,7 +2082,11 @@ fn decoded_objstm(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_number: u32) -> (Vec<u8
     else {
         panic!("expected object stream object");
     };
-    let decoded = filters::decode_stream_data(&object_stream.dict, &object_stream.data).unwrap();
+    let decoded = filters::decode_stream_data(
+        &filter_handles::dictionary(&object_stream.dict),
+        &object_stream.data,
+    )
+    .unwrap();
     let first = as_integer(
         object_stream
             .dict
@@ -2381,7 +2387,8 @@ fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
     //   Step 2: test-only ASCII85 wrap flated → a85
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let flated = filters::encode_stream_data(&flate_dict, &raw_data).unwrap();
+    let flated =
+        filters::encode_stream_data(&filter_handles::dictionary(&flate_dict), &raw_data).unwrap();
     let a85 = ascii85::fixture_bytes(&flated);
 
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -2485,7 +2492,9 @@ fn pdf_writer_reencodes_single_flatedecode_filter() {
     }
     // No DecodeParms from the old filter chain.
     // Verify the stream decodes to the original data.
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+    let decoded =
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap();
     assert_eq!(decoded, b"stream payload data for filter check");
 }
 
@@ -2516,7 +2525,8 @@ fn pdf_writer_drops_indirect_stream_parameters_after_refiltering() {
         panic!("/Probe must resolve to a stream");
     };
     assert_eq!(
-        filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"refiltered stream payload"
     );
 }
@@ -2547,7 +2557,8 @@ fn pdf_writer_drops_refiltered_stream_parameters_before_objstm_packing() {
             panic!("/Probe must resolve to a stream");
         };
         assert_eq!(
-            filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+            filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+                .unwrap(),
             b"objstm refilter payload"
         );
     }
@@ -2602,7 +2613,9 @@ fn pdf_writer_decodes_and_reencodes_multi_filter_stream() {
 
     // Verify round-trip: decode the output stream and compare to original raw data.
     let raw_data = b"Hello from multi-filter stream!".repeat(20);
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+    let decoded =
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap();
     assert_eq!(
         decoded, raw_data,
         "full-rewrite stream round-trip should recover original data"
@@ -3101,3 +3114,5 @@ fn pdf_writer_preserves_catalog_version_verbatim_under_force_version() {
         other => panic!("expected /Catalog /Version /1.7 to be preserved, got {other:?}"),
     }
 }
+#[path = "support/filter_handles.rs"]
+mod filter_handles;

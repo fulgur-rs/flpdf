@@ -96,7 +96,7 @@ pub use shared::{encode_utf16be, format_pdf_date, md5_checksum};
 mod tests {
     use super::*;
     use crate::embedded_files::{insert_embedded_file, list_embedded_files};
-    use crate::filters::decode_stream_data;
+    use crate::filters::test_dictionary_api::decode_stream_data;
     use crate::job::{
         add_attachment_from_path, extract_attachment, extract_attachment_to_path, write_attachment,
     };

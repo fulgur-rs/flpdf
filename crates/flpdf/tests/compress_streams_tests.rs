@@ -13,7 +13,12 @@
 //! These tests operate at the `apply_stream_compress_policy` API level.
 //! End-to-end / CLI round-trip tests are the responsibility of flpdf-9hc.12.8.
 
-use flpdf::{apply_stream_compress_policy, filters, CompressStreams, Dictionary, Object, Stream};
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
+use flpdf::{
+    apply_stream_compress_policy, filters, CompressStreams, Dictionary, Object, ObjectRef, Stream,
+};
 
 /// Helper: build a `Stream` with the given dict entries and raw data.
 fn make_stream(filter: Option<&[u8]>, data: Vec<u8>) -> Stream {
@@ -32,7 +37,56 @@ fn make_stream(filter: Option<&[u8]>, data: Vec<u8>) -> Stream {
 fn flate_encode(raw: &[u8]) -> Vec<u8> {
     let mut d = Dictionary::new();
     d.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    filters::encode_stream_data(&d, raw).expect("flate encode")
+    filters::encode_stream_data(&filter_handles::dictionary(&d), raw).expect("flate encode")
+}
+
+#[test]
+fn materialized_filter_adapter_covers_direct_object_shapes() {
+    let raw = b"adapter shape coverage";
+    let mut flate = Dictionary::new();
+    flate.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let encoded = filters::encode_stream_data(&filter_handles::dictionary(&flate), raw).unwrap();
+
+    let mut decode_params = Dictionary::new();
+    decode_params.insert("Boolean", Object::Boolean(true));
+    decode_params.insert("Integer", Object::Integer(1));
+    decode_params.insert("Real", Object::Real(0.5));
+    decode_params.insert(
+        "RealLiteral",
+        Object::RealLiteral {
+            value: 0.5,
+            literal: b"0.500".to_vec(),
+        },
+    );
+    decode_params.insert("Name", Object::Name(b"Ignored".to_vec()));
+    decode_params.insert("String", Object::String(b"Ignored".to_vec()));
+    decode_params.insert(
+        "Array",
+        Object::Array(vec![Object::Integer(1), Object::Name(b"Ignored".to_vec())]),
+    );
+    decode_params.insert(
+        "Dictionary",
+        Object::Dictionary({
+            let mut nested = Dictionary::new();
+            nested.insert("Nested", Object::Null);
+            nested
+        }),
+    );
+    decode_params.insert("Reference", Object::Reference(ObjectRef::new(99, 0)));
+    decode_params.insert(
+        "Stream",
+        Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+    );
+    decode_params.insert("Operator", Object::Operator(b"cm".to_vec()));
+    decode_params.insert("InlineImage", Object::InlineImage(b"EI".to_vec()));
+
+    let mut dict = flate;
+    dict.insert("DecodeParms", Object::Dictionary(decode_params));
+    let stream = Stream::new(dict, encoded);
+    let Object::Stream(output) = apply_stream_compress_policy(&stream, CompressStreams::No) else {
+        panic!("compress policy must return a stream");
+    };
+    assert_eq!(output.data, raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -64,8 +118,8 @@ fn compress_yes_adds_flate_to_unfiltered_stream() {
     );
 
     // Round-trip: decode must recover the original bytes.
-    let decoded =
-        filters::decode_stream_data(&out.dict, &out.data).expect("FlateDecode round-trip decode");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&out.dict), &out.data)
+        .expect("FlateDecode round-trip decode");
     assert_eq!(
         decoded, raw,
         "Yes mode: decoded output must equal original raw bytes"
@@ -136,7 +190,8 @@ fn compress_no_removes_filter_from_flate_stream() {
     );
 
     // Round-trip: a PDF reader with no /Filter sees data as-is.
-    let decoded = filters::decode_stream_data(&out.dict, &out.data).expect("unfiltered decode");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&out.dict), &out.data)
+        .expect("unfiltered decode");
     assert_eq!(
         decoded, raw,
         "No mode: round-trip must recover original data"
@@ -245,7 +300,7 @@ fn compress_yes_does_not_double_compress_flate_stream() {
     }
 
     // Round-trip: must still decode back to the original raw bytes.
-    let decoded = filters::decode_stream_data(&out.dict, &out.data)
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&out.dict), &out.data)
         .expect("decode should succeed after Yes mode");
     assert_eq!(
         decoded, raw,
@@ -494,7 +549,8 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
 
     // Round-trip: unfiltered data must equal the original payload.
     let decoded =
-        filters::decode_stream_data(&stream.dict, &stream.data).expect("unfiltered read-back");
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("unfiltered read-back");
     assert_eq!(
         decoded, original_raw,
         "compress_streams=No: decoded output must equal original payload"
@@ -529,7 +585,8 @@ fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
 
     // Round-trip must recover original payload.
     let decoded =
-        filters::decode_stream_data(&stream.dict, &stream.data).expect("FlateDecode read-back");
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("FlateDecode read-back");
     assert_eq!(
         decoded, original_raw,
         "compress_streams=Yes: decoded output must equal original payload"

@@ -9,6 +9,9 @@
 //! are parsed directly), so they run on every build and cover the
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use flpdf::linearization::{LinearizationPlan, RenumberMap};
 use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf, PdfWriter};
 use std::cell::RefCell;
@@ -387,7 +390,9 @@ fn outline_od_shared_stream_emits_ineligible_outline_stream_after_container() {
     let mut js_number = None;
     for r in rt.object_refs() {
         if let Ok(Object::Stream(s)) = rt.resolve(r) {
-            if let Ok(decoded) = filters::decode_stream_data(&s.dict, &s.data) {
+            if let Ok(decoded) =
+                filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
+            {
                 if decoded == b"app.alert('shared');" {
                     js_number = Some(r.number);
                 }
@@ -462,7 +467,9 @@ fn useoutline_od_shared_stream_emits_ineligible_outline_stream_after_first_half_
     let mut js_number = None;
     for r in rt.object_refs() {
         if let Ok(Object::Stream(s)) = rt.resolve(r) {
-            if let Ok(decoded) = filters::decode_stream_data(&s.dict, &s.data) {
+            if let Ok(decoded) =
+                filters::decode_stream_data(&filter_handles::dictionary(&s.dict), &s.data)
+            {
                 if decoded == b"app.alert('shared');" {
                     js_number = Some(r.number);
                 }

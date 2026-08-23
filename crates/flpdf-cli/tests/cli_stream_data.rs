@@ -16,6 +16,9 @@
 //! These assertions catch regressions where the three modes would silently
 //! collapse to identical behaviour (mere "PDF is valid" would not).
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object, ObjectRef, Pdf, Stream};
 use std::io::Cursor;
@@ -33,7 +36,8 @@ use filter_fixtures::{
 fn build_pdf_with_flate_stream(raw: &[u8]) -> Vec<u8> {
     let mut d = Dictionary::new();
     d.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = filters::encode_stream_data(&d, raw).expect("encode FlateDecode stream");
+    let encoded = filters::encode_stream_data(&filter_handles::dictionary(&d), raw)
+        .expect("encode FlateDecode stream");
 
     let mut pdf_bytes: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::<usize>::new();
@@ -120,7 +124,9 @@ fn cli_stream_data_preserve_keeps_filter() {
     );
     // Decode the preserved stream to confirm content is untouched (preserve
     // passes encoded bytes through verbatim; decode_stream_data round-trips).
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).expect("decode");
+    let decoded =
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("decode");
     assert_eq!(
         decoded.as_slice(),
         raw,
@@ -166,7 +172,9 @@ fn cli_stream_data_compress_wraps_with_flate() {
         Some(&Object::Name(b"FlateDecode".to_vec())),
         "--stream-data=compress must keep /Filter /FlateDecode (decode→re-encode)"
     );
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).expect("decode");
+    let decoded =
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("decode");
     assert_eq!(
         decoded.as_slice(),
         raw,
@@ -218,7 +226,9 @@ fn cli_stream_data_lzw_preserve() {
         Some(&Object::Name(b"LZWDecode".to_vec())),
         "--stream-data=preserve must keep /Filter /LZWDecode"
     );
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).expect("lzw decode");
+    let decoded =
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("lzw decode");
     assert_eq!(
         decoded.as_slice(),
         LZW_ABABABABABABAB_PLAIN,
@@ -257,7 +267,9 @@ fn cli_stream_data_lzw_compress() {
         Some(&Object::Name(b"FlateDecode".to_vec())),
         "--stream-data=compress must change /Filter to /FlateDecode"
     );
-    let decoded = filters::decode_stream_data(&stream.dict, &stream.data).expect("flate decode");
+    let decoded =
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("flate decode");
     assert_eq!(
         decoded.as_slice(),
         LZW_ABABABABABABAB_PLAIN,

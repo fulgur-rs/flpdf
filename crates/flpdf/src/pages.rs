@@ -908,7 +908,7 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filters::encode_stream_data;
+    use crate::filters::test_dictionary_api::encode_stream_data;
     use crate::Dictionary;
     use std::cell::Cell;
     use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -1949,7 +1949,11 @@ mod tests {
         let entries = page_content_stream_entries(&mut pdf, page).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, Some(ObjectRef::new(4, 0)));
-        assert!(crate::filters::decode_stream_data(&entries[0].1.dict, &entries[0].1.data).is_ok());
+        assert!(crate::filters::test_dictionary_api::decode_stream_data(
+            &entries[0].1.dict,
+            &entries[0].1.data
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1973,7 +1977,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         // Terminal ref is the stream (6 0 R), not the first hop (5 0 R).
         assert_eq!(entries[0].0, Some(ObjectRef::new(6, 0)));
-        assert!(crate::filters::decode_stream_data(&entries[0].1.dict, &entries[0].1.data).is_ok());
+        assert!(crate::filters::test_dictionary_api::decode_stream_data(
+            &entries[0].1.dict,
+            &entries[0].1.data
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1991,7 +1999,11 @@ mod tests {
         let entries = page_content_stream_entries(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, Some(ObjectRef::new(6, 0)));
-        assert!(crate::filters::decode_stream_data(&entries[0].1.dict, &entries[0].1.data).is_ok());
+        assert!(crate::filters::test_dictionary_api::decode_stream_data(
+            &entries[0].1.dict,
+            &entries[0].1.data
+        )
+        .is_ok());
     }
 
     #[test]

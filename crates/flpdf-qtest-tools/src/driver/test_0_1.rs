@@ -360,8 +360,9 @@ fn write_object_details<R: Read + Seek>(
                 )?;
             }
 
+            let decode_dictionary_handle = decode_dictionary.filter_input_handle();
             match flpdf::filters::decode_stream_data_recovering_with_limits(
-                &decode_dictionary,
+                &decode_dictionary_handle,
                 &data,
                 DecodeLimits {
                     max_output: None,
@@ -444,7 +445,7 @@ mod tests {
         run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
         write_object_details,
     };
-    use flpdf::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+    use flpdf::{Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
     use std::io::{self, Write};
 
     struct WriteFailure;
@@ -867,10 +868,12 @@ mod tests {
             .windows(b"\nUncompressed stream data:\nabc\nEnd of stream data\n".len())
             .any(|line| line == b"\nUncompressed stream data:\nabc\nEnd of stream data\n"));
 
-        let mut core_dictionary = Dictionary::new();
-        core_dictionary.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        let core_dictionary_handle = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"Crypt".to_vec()),
+        )]);
         assert!(
-            flpdf::filters::decode_stream_data_recovering(&core_dictionary, b"abc").is_err(),
+            flpdf::filters::decode_stream_data_recovering(&core_dictionary_handle, b"abc").is_err(),
             "ordinary library decode must continue rejecting identity Crypt"
         );
     }

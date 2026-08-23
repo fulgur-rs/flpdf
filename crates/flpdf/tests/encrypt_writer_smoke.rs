@@ -10,6 +10,9 @@
 //! original — proving the per-object key derivation, AES IV/padding, and
 //! `/Length` updates all line up with what the reader path expects.
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Cursor;
@@ -629,8 +632,9 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
         .resolve(ObjectRef::new(container_number, 0))
         .expect("resolve and decrypt ObjStm container");
     let stream = container.as_stream().expect("ObjStm object is a stream");
-    let decoded = flpdf::filters::decode_stream_data(&stream.dict, &stream.data)
-        .expect("decode decrypted ObjStm payload");
+    let decoded =
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("decode decrypted ObjStm payload");
     let first = match stream.dict.get("First") {
         Some(Object::Integer(value)) => usize::try_from(*value).expect("non-negative /First"),
         other => panic!("ObjStm /First must be an integer, got {other:?}"),

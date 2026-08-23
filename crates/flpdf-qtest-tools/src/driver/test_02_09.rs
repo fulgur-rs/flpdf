@@ -3,8 +3,8 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, Dictionary, Error, Object, ObjectHandle, PageDocumentHelper, Pdf, PdfWriter,
-    Pipeline, PipelineResult, StreamDataMode, StreamDataProvider,
+    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, Pdf, PdfWriter, Pipeline, PipelineResult,
+    StreamDataMode, StreamDataProvider,
 };
 
 use crate::output::write_bytes;
@@ -434,8 +434,10 @@ pub(crate) fn run_test_8<R: Read + Seek>(
         ));
     }
 
-    let mut filter_dict = Dictionary::new();
-    filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let filter_dict = ObjectHandle::dictionary(vec![(
+        b"/Filter".to_vec(),
+        ObjectHandle::name(b"FlateDecode".to_vec()),
+    )]);
     let compressed = flpdf::filters::encode_stream_data(&filter_dict, b"new data for stream\n")?;
     let provider = Rc::new(LengthBugProvider {
         data: Rc::new(compressed),

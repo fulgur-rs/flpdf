@@ -656,7 +656,8 @@ fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_first() {
     };
 
     assert_eq!(
-        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"explicit crypt stream"
     );
     assert_eq!(
@@ -681,7 +682,8 @@ fn v4_explicit_crypt_filter_decrypts_before_flate_when_crypt_is_last() {
     };
 
     assert_eq!(
-        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"explicit crypt stream"
     );
     assert_eq!(
@@ -723,7 +725,8 @@ fn v4_explicit_identity_crypt_filter_is_noop_before_flate() {
     };
 
     assert_eq!(
-        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"explicit crypt stream"
     );
     assert_eq!(
@@ -756,7 +759,8 @@ fn v4_explicit_crypt_filter_before_ascii85_decrypts_at_filter_slot() {
     };
 
     assert_eq!(
-        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"explicit crypt stream"
     );
     assert_eq!(
@@ -783,7 +787,8 @@ fn v4_explicit_crypt_filter_after_ascii85_decrypts_before_filter() {
         panic!("expected stream");
     };
     assert_eq!(
-        flpdf::filters::decode_stream_data(&stream.dict, &stream.data).unwrap(),
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .unwrap(),
         b"explicit crypt stream"
     );
     assert_eq!(
@@ -1185,8 +1190,9 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
     let Object::Stream(stream) = rewritten.resolve(stream_ref).expect("stream") else {
         panic!("Data must resolve to a stream");
     };
-    let decoded = flpdf::filters::decode_stream_data(&stream.dict, &stream.data)
-        .expect("decode output stream");
+    let decoded =
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("decode output stream");
     assert_eq!(
         decoded, b"explicit crypt stream",
         "the source framing EOL must be consumed before the remaining filter chain is decoded"
@@ -3115,3 +3121,5 @@ fn qdf_exact_window_indirect_length_works_through_short_reads() {
         String::from_utf8_lossy(&s.data)
     );
 }
+#[path = "support/filter_handles.rs"]
+mod filter_handles;

@@ -41,14 +41,14 @@ fn recovering_limits_keep_default_chain_cap_but_allow_explicit_unlimited_chain()
     }
 
     assert_eq!(
-        decode_stream_data_recovering(&dictionary, &encoded)
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), &encoded)
             .unwrap_err()
             .to_string(),
         "unsupported PDF feature: filter chain length 17 exceeds maximum of 16"
     );
 
     let outcome = decode_stream_data_recovering_with_limits(
-        &dictionary,
+        &filter_handles::dictionary(&dictionary),
         &encoded,
         DecodeLimits {
             max_output: None,
@@ -68,7 +68,7 @@ fn recovering_limits_keep_default_chain_cap_but_allow_explicit_unlimited_chain()
 fn recovering_final_flate_warning_precedes_predictor_finish_data() {
     let mut flate = Dictionary::new();
     flate.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let mut encoded = encode_stream_data(&flate, b"\0A").unwrap();
+    let mut encoded = encode_stream_data(&filter_handles::dictionary(&flate), b"\0A").unwrap();
     encoded.truncate(encoded.len() - 4);
 
     let mut decode_params = Dictionary::new();
@@ -78,7 +78,8 @@ fn recovering_final_flate_warning_precedes_predictor_finish_data() {
     dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
     dictionary.insert("DecodeParms", Object::Dictionary(decode_params));
 
-    let outcome = decode_stream_data_recovering(&dictionary, &encoded).unwrap();
+    let outcome =
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), &encoded).unwrap();
 
     assert_eq!(outcome.data, b"A\0");
     assert!(matches!(
@@ -142,7 +143,8 @@ fn asciihex_encode(data: &[u8]) -> Vec<u8> {
 fn recovery_events_and_strict_error_share_pipeline_order() {
     let dictionary = error_then_finish_warning_dictionary();
 
-    let outcome = decode_stream_data_recovering(&dictionary, b"78G").unwrap();
+    let outcome =
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), b"78G").unwrap();
 
     assert!(outcome.data.is_empty());
     assert_eq!(outcome.events.len(), 2);
@@ -160,7 +162,7 @@ fn recovery_events_and_strict_error_share_pipeline_order() {
     ));
 
     assert_eq!(
-        decode_stream_data(&dictionary, b"78G")
+        decode_stream_data(&filter_handles::dictionary(&dictionary), b"78G")
             .unwrap_err()
             .to_string(),
         "unsupported PDF feature: character out of range during base Hex decode: G"
@@ -171,7 +173,8 @@ fn recovery_events_and_strict_error_share_pipeline_order() {
 fn recovery_events_keep_odd_nibble_cleanup_after_write_error() {
     let dictionary = odd_nibble_error_dictionary();
 
-    let outcome = decode_stream_data_recovering(&dictionary, b"4G ").unwrap();
+    let outcome =
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), b"4G ").unwrap();
 
     assert_eq!(outcome.data, b"@");
     assert_eq!(outcome.events.len(), 2);
@@ -186,7 +189,7 @@ fn recovery_events_keep_odd_nibble_cleanup_after_write_error() {
         StreamDecodeEvent::Data(data) if data == b"@"
     ));
     assert_eq!(
-        decode_stream_data(&dictionary, b"4G ")
+        decode_stream_data(&filter_handles::dictionary(&dictionary), b"4G ")
             .unwrap_err()
             .to_string(),
         "unsupported PDF feature: character out of range during base Hex decode: G"
@@ -197,7 +200,8 @@ fn recovery_events_keep_odd_nibble_cleanup_after_write_error() {
 fn recovery_events_keep_downstream_data_before_upstream_write_error() {
     let dictionary = downstream_data_before_upstream_error_dictionary();
 
-    let outcome = decode_stream_data_recovering(&dictionary, b"3431G").unwrap();
+    let outcome =
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), b"3431G").unwrap();
 
     assert_eq!(outcome.data, b"A");
     assert_eq!(outcome.events.len(), 2);
@@ -212,7 +216,7 @@ fn recovery_events_keep_downstream_data_before_upstream_write_error() {
                 == "unsupported PDF feature: character out of range during base Hex decode: G"
     ));
     assert_eq!(
-        decode_stream_data(&dictionary, b"3431G")
+        decode_stream_data(&filter_handles::dictionary(&dictionary), b"3431G")
             .unwrap_err()
             .to_string(),
         "unsupported PDF feature: character out of range during base Hex decode: G"
@@ -223,7 +227,8 @@ fn recovery_events_keep_downstream_data_before_upstream_write_error() {
 fn recovery_events_keep_downstream_cleanup_after_upstream_write_error() {
     let dictionary = downstream_data_before_upstream_error_dictionary();
 
-    let outcome = decode_stream_data_recovering(&dictionary, b"343G").unwrap();
+    let outcome =
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), b"343G").unwrap();
 
     assert_eq!(outcome.data, b"@");
     assert!(matches!(
@@ -234,7 +239,7 @@ fn recovery_events_keep_downstream_cleanup_after_upstream_write_error() {
                 && data == b"@"
     ));
     assert_eq!(
-        decode_stream_data(&dictionary, b"343G")
+        decode_stream_data(&filter_handles::dictionary(&dictionary), b"343G")
             .unwrap_err()
             .to_string(),
         "unsupported PDF feature: character out of range during base Hex decode: G"
@@ -246,7 +251,11 @@ fn recovery_events_keep_final_data_and_warning_after_prior_write_error() {
     let dictionary = asciihex_then_flate_dictionary();
     let mut flate_dictionary = Dictionary::new();
     flate_dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let compressed = encode_stream_data(&flate_dictionary, b"partial flate output").unwrap();
+    let compressed = encode_stream_data(
+        &filter_handles::dictionary(&flate_dictionary),
+        b"partial flate output",
+    )
+    .unwrap();
 
     // Dropping the zlib checksum leaves the decoded bytes available but makes
     // Flate warn at finish. The trailing invalid hex digit separately makes
@@ -254,7 +263,8 @@ fn recovery_events_keep_final_data_and_warning_after_prior_write_error() {
     let mut encoded = asciihex_encode(&compressed[..compressed.len() - 4]);
     encoded.push(b'G');
 
-    let outcome = decode_stream_data_recovering(&dictionary, &encoded).unwrap();
+    let outcome =
+        decode_stream_data_recovering(&filter_handles::dictionary(&dictionary), &encoded).unwrap();
 
     assert!(matches!(
         &outcome.events[..],
@@ -275,10 +285,14 @@ fn recovery_events_keep_nonfinal_warning_between_data_and_cleanup() {
     let dictionary = flate_then_asciihex_dictionary();
     let mut flate_dictionary = Dictionary::new();
     flate_dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let compressed = encode_stream_data(&flate_dictionary, b"414").unwrap();
+    let compressed =
+        encode_stream_data(&filter_handles::dictionary(&flate_dictionary), b"414").unwrap();
 
-    let outcome =
-        decode_stream_data_recovering(&dictionary, &compressed[..compressed.len() - 4]).unwrap();
+    let outcome = decode_stream_data_recovering(
+        &filter_handles::dictionary(&dictionary),
+        &compressed[..compressed.len() - 4],
+    )
+    .unwrap();
 
     assert!(matches!(
         &outcome.events[..],
@@ -298,10 +312,14 @@ fn recovery_events_keep_final_cleanup_after_a_nonfinal_warning_and_write_error()
     let dictionary = flate_then_asciihex_dictionary();
     let mut flate_dictionary = Dictionary::new();
     flate_dictionary.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let compressed = encode_stream_data(&flate_dictionary, b"4G ").unwrap();
+    let compressed =
+        encode_stream_data(&filter_handles::dictionary(&flate_dictionary), b"4G ").unwrap();
 
-    let outcome =
-        decode_stream_data_recovering(&dictionary, &compressed[..compressed.len() - 4]).unwrap();
+    let outcome = decode_stream_data_recovering(
+        &filter_handles::dictionary(&dictionary),
+        &compressed[..compressed.len() - 4],
+    )
+    .unwrap();
 
     assert!(matches!(
         &outcome.events[..],
@@ -316,3 +334,5 @@ fn recovery_events_keep_final_cleanup_after_a_nonfinal_warning_and_write_error()
             && cleanup == b"@"
     ));
 }
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
