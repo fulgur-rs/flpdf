@@ -121,15 +121,24 @@ impl QPDFJob {
         })
     }
 
-    /// Show the number of repaired page leaves in document order.
+    /// Show the raw `/Pages /Count` value from the catalog.
+    ///
+    /// This is qpdf's `QPDFJob::doInspection` `--show-npages` boundary
+    /// (`libqpdf/QPDFJob.cc:1646-1655`), not a page-tree enumeration. qpdf
+    /// deliberately reads `/Pages` and then `/Count` through generic
+    /// `QPDFObjectHandle` accessors, so a present but inconsistent count is
+    /// printed verbatim and a missing/malformed key produces qpdf's warning
+    /// plus the integer accessor's zero fallback.
     pub fn show_npages<R: Read + Seek + 'static>(
         &mut self,
         pdf: &mut Pdf<R>,
     ) -> Result<JobExitCode> {
         let logger = self.logger();
         self.inspect(pdf, |pdf| {
-            let pages = PageDocumentHelper::new(pdf).get_all_pages()?;
-            logger.info(format!("{}\n", pages.len()))
+            let root = pdf.root_handle()?;
+            let pages = root.try_get_key(b"/Pages")?;
+            let count = pages.try_get_key(b"/Count")?.try_get_int_value()?;
+            logger.info(format!("{count}\n"))
         })
     }
 
