@@ -13,6 +13,9 @@ pub(crate) mod pclm;
 pub(crate) mod plain;
 #[path = "writer/rewrite_renumber.rs"]
 pub(crate) mod rewrite_renumber;
+#[cfg(test)]
+#[path = "writer/rewrite_renumber_tests.rs"]
+mod rewrite_renumber_tests;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
 mod settings;
