@@ -1007,6 +1007,17 @@ fn first_page_content(path: &std::path::Path) -> Vec<u8> {
     flpdf::pages::page_content_bytes(&mut pdf, page).unwrap()
 }
 
+fn first_page_content_filter(path: &std::path::Path) -> Option<Object> {
+    let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    let page = pdf.resolve_object(page_ref).unwrap().clone();
+    let contents_ref = page.as_dict().unwrap().get_ref("Contents").unwrap();
+    let stream = pdf.resolve_object(contents_ref).unwrap().clone();
+    stream
+        .as_stream()
+        .and_then(|stream| stream.dict.get("Filter").cloned())
+}
+
 #[test]
 fn top_level_normalize_content_y_routes_to_content_normalizer() {
     let temp = tempfile::tempdir().unwrap();
@@ -1023,6 +1034,7 @@ fn top_level_normalize_content_y_routes_to_content_normalizer() {
         .success();
 
     assert_eq!(first_page_content(&output), b"q\nQ");
+    assert_eq!(first_page_content_filter(&output), None);
 }
 
 #[test]

@@ -688,7 +688,7 @@ pub(crate) fn canonical_stream_will_be_refiltered_with_policy(
     if handle.is_data_modified() {
         return Ok(false);
     }
-    let Some((encode_flags, decode_level)) = canonical_stream_filter_plan(
+    let Some((encode_flags, decode_level, _normalized_content)) = canonical_stream_filter_plan(
         handle,
         options,
         apply_full_rewrite_metadata_policy,
@@ -734,8 +734,9 @@ fn canonical_stream_output_with_rewrite_policy(
     // The CLI's page-content normalizer records its completed transform on
     // the live handle. Generic `replaceStreamData` calls remain eligible for
     // QDF normalization, because replacement bytes alone do not establish
-    // that this particular consumer has already normalized them.
-    let normalize_content = normalize_content && !handle.content_normalization_applied();
+    // that this particular consumer has already normalized them. The filter
+    // plan still treats the marker as an effective normalization request so
+    // those already-raw bytes are not recompressed.
     // QPDFWriter.cc:1251-1278 gives cleartext /Type /Metadata streams their
     // own policy: decode fully and emit without a filter, even when the global
     // writer policy would preserve or compress a lone-Flate source. The plain
@@ -775,45 +776,47 @@ fn canonical_stream_output_with_rewrite_policy(
         apply_full_rewrite_metadata_policy,
         normalize_content,
     )?; // cov:ignore: canonical stream policy validation is exercised by the body tests; llvm-cov attributes this continuation to the defensive error path
-    let (data, filtering_attempted) = if let Some((encode_flags, decode_level)) = filter_plan {
-        let mut attempt = 1_u8;
-        let (data, filtering_attempted) = loop {
-            let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
-            let mut filtering_attempted = false;
-            let (attempt_encode_flags, attempt_decode_level) = if attempt == 1 {
-                (encode_flags, decode_level)
-            } else {
-                (0, crate::writer::DecodeLevel::None)
+    let (data, filtering_attempted, normalized_content) =
+        if let Some((encode_flags, decode_level, normalized_content)) = filter_plan {
+            let mut attempt = 1_u8;
+            let (data, filtering_attempted) = loop {
+                let mut buffer =
+                    crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
+                let mut filtering_attempted = false;
+                let (attempt_encode_flags, attempt_decode_level) = if attempt == 1 {
+                    (encode_flags, decode_level)
+                } else {
+                    (0, crate::writer::DecodeLevel::None)
+                };
+                let success = source_for_pipe.pipe_stream_data(
+                    &mut buffer,
+                    &mut filtering_attempted,
+                    attempt_encode_flags,
+                    attempt_decode_level,
+                    false,
+                    attempt == 1,
+                )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
+
+                if success || attempt == 2 {
+                    // QPDFWriter retries a failed filter pipeline against a
+                    // fresh raw pipe (`QPDFWriter.cc:1287-1314`). The second
+                    // attempt's buffer is authoritative even when the
+                    // provider reports that no filtering branch was used.
+                    break (
+                        buffer.take_buffer()?.to_vec(),
+                        filtering_attempted && success,
+                    );
+                }
+                attempt = 2;
             };
-            let success = source_for_pipe.pipe_stream_data(
-                &mut buffer,
-                &mut filtering_attempted,
-                attempt_encode_flags,
-                attempt_decode_level,
+            (data, filtering_attempted, normalized_content)
+        } else {
+            (
+                source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
                 false,
-                attempt == 1,
-            )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
-
-            if success || attempt == 2 {
-                // QPDFWriter retries a failed filter pipeline against a
-                // fresh raw pipe (`QPDFWriter.cc:1287-1314`). The second
-                // attempt's buffer is authoritative even when the
-                // provider reports that no filtering branch was used.
-                break (
-                    buffer.take_buffer()?.to_vec(),
-                    filtering_attempted && success,
-                );
-            }
-            attempt = 2;
+                false,
+            )
         };
-        (data, filtering_attempted)
-    } else {
-        (
-            source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
-            false,
-        )
-    };
-
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
     entries.remove(b"/Length".as_slice());
     if !filtering_attempted {
@@ -826,7 +829,10 @@ fn canonical_stream_output_with_rewrite_policy(
                 b"/Filter" | b"/DecodeParms" | b"/F" | b"/FFilter" | b"/FDecodeParms"
             )
         });
-        if matches!(policy, Some(CompressStreams::Yes)) {
+        // qpdf's normalization branch wins over the ordinary compression
+        // branch (`QPDFWriter.cc:1279-1284`): normalized page content is
+        // emitted decoded, even when compress_streams is enabled.
+        if matches!(policy, Some(CompressStreams::Yes)) && !normalized_content {
             entries.insert(
                 b"/Filter".to_vec(),
                 ObjectHandle::name(b"FlateDecode".to_vec()),
@@ -838,7 +844,8 @@ fn canonical_stream_output_with_rewrite_policy(
         ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
     );
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
-    let refiltered = filtering_attempted && matches!(policy, Some(CompressStreams::Yes));
+    let refiltered =
+        filtering_attempted && matches!(policy, Some(CompressStreams::Yes)) && !normalized_content;
     Ok((dict, data, refiltered, filtering_attempted))
 }
 
@@ -847,11 +854,16 @@ fn canonical_stream_filter_plan(
     options: &WriterOptions,
     apply_full_rewrite_metadata_policy: bool,
     normalize_content: bool,
-) -> crate::Result<Option<(u32, crate::writer::DecodeLevel)>> {
+) -> crate::Result<Option<(u32, crate::writer::DecodeLevel, bool)>> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
-    let normalize_content = normalize_content && !handle.content_normalization_applied();
+    // The CLI may have already normalized and replaced this stream's bytes.
+    // Keep that state as an effective normalization request so qpdf's
+    // normalization branch still suppresses compression, while avoiding a
+    // second tokenizer pass on the same bytes.
+    let normalization_applied = normalize_content && handle.content_normalization_applied();
+    let normalize_content = normalize_content && !normalization_applied;
     let source_has_lone_flate = canonical_is_lone_flate(&stream_dict)?;
     let is_metadata_stream = apply_full_rewrite_metadata_policy
         && stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?
@@ -864,6 +876,7 @@ fn canonical_stream_filter_plan(
             .as_ref()
             .is_none_or(|source| !crate::writer::copy_encryption_encrypts_metadata(source));
     let normalize_content = normalize_content && !is_metadata_stream;
+    let normalized_content = (normalize_content || normalization_applied) && !is_metadata_stream;
     let policy = if is_metadata_stream {
         Some(CompressStreams::No)
     } else {
@@ -878,13 +891,16 @@ fn canonical_stream_filter_plan(
         && source_has_lone_flate
         && !handle.is_data_modified()
         && !options.recompress_flate
-        && !normalize_content
+        && !normalized_content
         && !stream_dict.try_has_key(b"/F")?;
     if !handle.is_data_modified() && (policy.is_none() || preserve_lone_flate) {
         return Ok(None);
     }
 
-    let mut encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
+    // qpdf's `normalize_content` branch is an `else if` before the ordinary
+    // `compress_streams` branch (`QPDFWriter.cc:1279-1284`), so normalization
+    // must not also request Flate re-encoding.
+    let mut encode_flags = if matches!(policy, Some(CompressStreams::Yes)) && !normalized_content {
         crate::object_handle::STREAM_ENCODE_COMPRESS
     } else {
         0
@@ -892,7 +908,7 @@ fn canonical_stream_filter_plan(
     if normalize_content {
         encode_flags |= crate::object_handle::STREAM_ENCODE_NORMALIZE;
     }
-    Ok(Some((encode_flags, decode_level)))
+    Ok(Some((encode_flags, decode_level, normalized_content)))
 }
 
 /// Mirror `QPDFWriter::unparseObject`'s unfiltered-stream cleanup
