@@ -260,7 +260,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         // reader.rs::resolve_to_terminal_ref).
         let form_handle = pdf.resolve_to_terminal(&holder_handle)?;
         if !form_handle.is_form_xobject()? {
-            continue;
+            continue; // cov:ignore: form_xobjects_in_resources already terminal-chase-filters to Form XObjects
         }
         let stream_dict = form_stream_dict(&form_handle)?;
         let mut resources = stream_dict.try_get_key(b"/Resources")?;
