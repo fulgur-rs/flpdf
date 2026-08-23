@@ -275,6 +275,11 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         }
     }
 
+    // Step 6 changes both the AcroForm field tree and widget page links.
+    // qpdf's explicit invalidation contract covers these external mutations
+    // (`qpdf/include/qpdf/QPDFAcroFormDocumentHelper.hh:68-78`); do not let a
+    // helper created before subset write-back reuse the old association map.
+    *pdf.acroform_cache.borrow_mut() = None;
     Ok(())
 }
 
@@ -1033,6 +1038,64 @@ mod tests {
         assert!(
             cat.get("AcroForm").is_none(),
             "/AcroForm should be removed from catalog when /Fields is empty"
+        );
+    }
+
+    #[test]
+    fn prune_invalidates_a_shared_acroform_cache_after_writeback() {
+        let mut pdf = open(build_acroform_pdf());
+        let before = pdf
+            .acroform()
+            .unwrap()
+            .canonical_annotation_to_field_handles()
+            .unwrap();
+        assert!(before
+            .iter()
+            .any(|(annotation, _)| annotation.object_ref() == Some(ObjectRef::new(11, 0))));
+
+        // Retain pages 1 and 2, so FieldC (obj 11) is removed from /Fields.
+        let sel = [ObjectRef::new(3, 0), ObjectRef::new(4, 0)];
+        let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        let after = pdf
+            .acroform()
+            .unwrap()
+            .canonical_annotation_to_field_handles()
+            .unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|(annotation, _)| annotation.object_ref() == Some(ObjectRef::new(11, 0))),
+            "pruning /AcroForm /Fields must invalidate the shared cache"
+        );
+    }
+
+    #[test]
+    fn prune_invalidates_a_shared_acroform_cache_after_removing_acroform() {
+        let mut pdf = open(build_all_on_page1_pdf());
+        let before = pdf
+            .acroform()
+            .unwrap()
+            .canonical_annotation_to_field_handles()
+            .unwrap();
+        assert!(before
+            .iter()
+            .any(|(annotation, _)| annotation.object_ref() == Some(ObjectRef::new(6, 0))));
+
+        // Retain only page 2; all fields and widgets are on dropped page 1.
+        let sel = [ObjectRef::new(4, 0)];
+        let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
+        prune_acroform_after_subset(&mut pdf, &result).unwrap();
+
+        let after = pdf
+            .acroform()
+            .unwrap()
+            .canonical_annotation_to_field_handles()
+            .unwrap();
+        assert!(
+            after.is_empty(),
+            "removing /AcroForm must invalidate the shared cache"
         );
     }
 
