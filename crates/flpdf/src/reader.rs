@@ -1191,7 +1191,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// - `Deleted` — explicit `delete_object()` calls,
     /// - `Missing` — referenced but never present in any xref,
     /// - `Reserved` — forward-reference placeholders that
-    ///   [`Pdf::resolve`] returns as `Object::Null` (no real indirect
+    ///   [`Pdf::resolve_object`] returns as `Object::Null` (no real indirect
     ///   object behind them).
     ///
     /// A `live_object_refs()` entry may still resolve to `Object::Null`; that
@@ -2532,6 +2532,28 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
+    /// Resolve `handle` in place through the canonical qpdf object graph.
+    ///
+    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily and
+    /// retain the same shared object identity: resolving the same indirect
+    /// reference more than once yields handles that alias the same cached
+    /// value rather than independent copies. [`Pdf::resolve_object`] is the
+    /// owned raw-`Object` resolver kept under its own explicit name only for
+    /// the next legacy-route removal slice.
+    ///
+    /// # Errors
+    ///
+    /// Has the same error behavior as [`Pdf::resolve_object_handle`]:
+    /// I/O, parse, filter, or decryption failures propagate. A free, absent,
+    /// or overridden reference resolves to the canonical null fallback rather
+    /// than erroring.
+    pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
+        self.resolve_object_handle(handle)
+    }
+
+    // qpdf-cutover-delete: owned raw-`Object` resolver. Delete after its
+    // callers use canonical handle accessors; do not use it from the new
+    // resolver path.
     /// Resolve `object_ref` to its concrete value, parsing on demand.
     ///
     /// Resolution caches the result so subsequent calls are constant-time. Unknown,
@@ -2548,33 +2570,19 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// An unknown, freed, or compressed-but-broken reference is **not** an error;
     /// it resolves to [`Object::Null`].
-    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: owned raw-`Object` resolver.
-    /// Delete after its callers use canonical handle accessors; do not use it
-    /// from the new resolver path.
-    /// Resolve `handle` in place through the canonical qpdf object graph.
-    ///
-    /// qpdf's typed QPDFObjectHandle accessors call QPDF::resolve lazily and
-    /// retain the same shared object identity. The old raw-value resolver is
-    /// kept under the explicit `resolve_object` name only for the next
-    /// legacy-route removal slice.
-    pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
-        self.resolve_object_handle(handle)
-    }
-
     pub fn resolve_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         Ok(self.resolve_borrowed(object_ref)?.clone())
     }
 
-    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: borrowed raw-`Object` resolver
-    /// and its materialization memo are legacy-only. Delete after callers
-    /// migrate; do not preserve this signature as a new design constraint.
-    ///
+    // qpdf-cutover-delete: borrowed raw-`Object` resolver and its
+    // materialization memo are legacy-only. Delete after callers migrate; do
+    // not preserve this signature as a new design constraint.
     /// Resolve `object_ref` and borrow the cached concrete value.
     ///
-    /// This has the same resolution behavior as [`Pdf::resolve`] but avoids cloning
-    /// the resolved [`Object`]. The returned reference is tied to the mutable borrow
-    /// of this [`Pdf`], so callers must finish using it before resolving or mutating
-    /// other objects through the same reader.
+    /// This has the same resolution behavior as [`Pdf::resolve_object`] but avoids
+    /// cloning the resolved [`Object`]. The returned reference is tied to the mutable
+    /// borrow of this [`Pdf`], so callers must finish using it before resolving or
+    /// mutating other objects through the same reader.
     ///
     /// # Errors
     ///
