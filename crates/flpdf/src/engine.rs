@@ -12,8 +12,10 @@ use crate::xref::{load_xref_state_with_options, XrefLoadOptions};
 #[allow(unused_imports)]
 use crate::{Error, ObjectHandle};
 use crate::{Pdf, Result};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -166,6 +168,7 @@ impl<R: Read + Seek> Pdf<R> {
             cache,
             foreign_object_maps: BTreeMap::new(),
             foreign_object_visiting: BTreeMap::new(),
+            acroform_cache: Rc::new(RefCell::new(None)),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
             legacy_materialized_replacement_refs: BTreeSet::new(),

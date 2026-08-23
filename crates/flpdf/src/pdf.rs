@@ -1,5 +1,6 @@
 //! qpdf correspondence: QPDF's central document container, direct document-state accessors, and teardown (`include/qpdf/QPDF.hh:1438-1518`; `libqpdf/QPDF.cc:215-232,2323-2358,2647-2651`).
 
+use crate::acroform_document_helper::AcroFormCache;
 use crate::cache::ObjectCache;
 use crate::encryption::state::EncryptionState;
 use crate::reader::resolver::ResolverHandle;
@@ -111,6 +112,12 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// remain independently tracked by the canonical `copy_foreign_object`
     /// port.
     pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<ObjectRef>>,
+    /// qpdf's per-source AcroForm helper cache (`QPDFJob::get_afdh_for_qpdf`,
+    /// `QPDFJob.cc:1847-1856`). It stores only canonical ObjectHandle
+    /// identities, so sequential helper facades can share it without a
+    /// self-referential borrow of this Pdf. Transient page-selection helpers
+    /// use their own cache instead.
+    pub(crate) acroform_cache: Rc<RefCell<Option<AcroFormCache>>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
     /// repeated [`Pdf::trailer`] calls return the same shared handle
     /// rather than re-deriving a fresh one from `self.trailer` each time.

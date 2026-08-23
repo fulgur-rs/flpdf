@@ -877,6 +877,39 @@ fn eager_analyze_warns_for_an_orphan_page_widget() {
 }
 
 #[test]
+fn acroform_analysis_is_memoized_per_pdf_source() {
+    let bytes = include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
+    let logger = QPDFLogger::create();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+        &output,
+    )))));
+
+    let mut pdf = Pdf::open_mem_with_options(
+        Arc::from(bytes.as_slice()),
+        PdfOpenOptions {
+            logger: Some(logger),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert!(pdf.acroform().unwrap().has_acro_form().unwrap());
+    assert!(pdf.acroform().unwrap().has_acro_form().unwrap());
+
+    let warning = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        warning
+            .matches(
+                "this widget annotation is not reachable from /AcroForm in the document catalog"
+            )
+            .count(),
+        1,
+        "qpdf analyzes one source QPDF once and reuses its AcroForm helper cache: {warning:?}"
+    );
+}
+
+#[test]
 fn eager_analyze_propagates_an_orphan_warning_sink_failure() {
     let bytes = include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
     let logger = QPDFLogger::create();

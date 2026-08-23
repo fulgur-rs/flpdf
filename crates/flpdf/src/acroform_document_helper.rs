@@ -18,8 +18,10 @@ use crate::{
     Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
 fn record_association(cache: &mut AcroFormCache, annotation: ObjectHandle, field: ObjectHandle) {
     let annotation_identity = annotation.identity_key();
@@ -130,7 +132,7 @@ struct FieldInheritance {
 /// handle maps retain the canonical values needed to project the cache to
 /// legacy ref-valued APIs.
 #[derive(Default)]
-struct AcroFormCache {
+pub(crate) struct AcroFormCache {
     annotation_to_field: HashMap<ObjectHandleIdentity, ObjectHandle>,
     annotation_handles: HashMap<ObjectHandleIdentity, ObjectHandle>,
     field_to_annotations: HashMap<ObjectHandleIdentity, Vec<ObjectHandle>>,
@@ -179,16 +181,18 @@ struct ForeignResourcePlan {
 /// High-level helper for a document's `/AcroForm`.
 ///
 /// Construct with [`AcroFormDocumentHelper::new`] or [`Pdf::acroform`]. The
-/// helper lazily caches qpdf's field/annotation association analysis. The
-/// cache retains live [`ObjectHandle`] identities, so association consumers do
-/// not fall back to stale materialized objects. Call
-/// [`Self::invalidate_cache`] after manually changing the field tree,
-/// AcroForm dictionary, or page annotations, matching qpdf's cache contract.
+/// helper eagerly analyzes once per source `Pdf`, matching qpdf's
+/// `QPDFJob::get_afdh_for_qpdf` memoization (`QPDFJob.cc:1847-1856`), and
+/// lazily reuses that association cache on later facades. The cache retains
+/// live [`ObjectHandle`] identities, so association consumers do not fall
+/// back to stale materialized objects. Call [`Self::invalidate_cache`] after
+/// manually changing the field tree, AcroForm dictionary, or page
+/// annotations, matching qpdf's cache contract.
 ///
 /// For a runnable walkthrough see `examples/list_form_fields.rs`.
 pub struct AcroFormDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
-    cache: Option<AcroFormCache>,
+    cache: Rc<RefCell<Option<AcroFormCache>>>,
 }
 
 impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
@@ -202,7 +206,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// resolver and page-walk failures cannot be represented by an infallible
     /// constructor without a compatibility sentinel or panic.
     pub fn new(pdf: &'a mut Pdf<R>) -> Result<Self> {
-        let mut helper = Self { pdf, cache: None };
+        let cache = Rc::clone(&pdf.acroform_cache);
+        let mut helper = Self { pdf, cache };
         helper.analyze()?;
         Ok(helper)
     }
@@ -219,8 +224,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// route; [`Self::new`] remains the qpdf `analyze()` constructor for
     /// complete documents.
     pub(crate) fn new_for_field_tree(pdf: &'a mut Pdf<R>) -> Result<Self> {
-        let mut helper = Self { pdf, cache: None };
-        helper.cache = Some(helper.analyze_field_tree()?.unwrap_or_default());
+        let cache = Rc::new(RefCell::new(None));
+        let mut helper = Self { pdf, cache };
+        *helper.cache.borrow_mut() = Some(helper.analyze_field_tree()?.unwrap_or_default());
         Ok(helper)
     }
 
@@ -231,7 +237,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// after external mutation of `/AcroForm`, the field tree, or page
     /// annotations when the mutation can change their association.
     pub fn invalidate_cache(&mut self) {
-        self.cache = None;
+        *self.cache.borrow_mut() = None;
     }
 
     /// Return all field-tree object refs in preorder.
@@ -408,8 +414,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         &mut self,
     ) -> Result<Vec<(ObjectHandle, ObjectHandle)>> {
         self.analyze()?;
-        let cache = self
-            .cache
+        let cache = self.cache.borrow();
+        let cache = cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache");
         let mut associations: Vec<_> = cache
@@ -427,7 +433,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     fn analyze(&mut self) -> Result<()> {
-        if self.cache.is_some() {
+        if self.cache.borrow().is_some() {
             return Ok(());
         }
 
@@ -435,7 +441,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // qpdf returns before both field traversal and the orphan-widget
             // fallback when there is no dictionary `/AcroForm` or no
             // `/Fields` key at all.
-            self.cache = Some(AcroFormCache::default());
+            *self.cache.borrow_mut() = Some(AcroFormCache::default());
             return Ok(());
         };
         // qpdf's orphan-widget fallback walks the canonical page annotation
@@ -487,7 +493,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             }
         }
 
-        self.cache = Some(cache);
+        *self.cache.borrow_mut() = Some(cache);
         Ok(())
     }
 
@@ -532,8 +538,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// cannot fall back to a stale materialized [`Object`].
     pub(crate) fn form_field_handles(&mut self) -> Result<BTreeMap<ObjectRef, ObjectHandle>> {
         self.analyze()?;
-        let cache = self
-            .cache
+        let cache = self.cache.borrow();
+        let cache = cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache");
         let mut fields = BTreeMap::new();
@@ -557,8 +563,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// document graph.
     pub fn get_fields_with_qualified_name(&mut self, name: &str) -> Result<BTreeSet<ObjectRef>> {
         self.analyze()?;
-        Ok(self
-            .cache
+        let cache = self.cache.borrow();
+        Ok(cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache")
             .name_to_fields
@@ -587,7 +593,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     fn remove_cached_fields(&mut self, to_remove: &BTreeSet<ObjectRef>) {
-        let Some(cache) = self.cache.as_mut() else {
+        let mut cache_store = self.cache.borrow_mut();
+        let Some(cache) = cache_store.as_mut() else {
             return;
         };
 
@@ -1151,14 +1158,16 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
 
         self.analyze()?;
-        let mut existing_names: BTreeSet<String> = self
-            .cache
-            .as_ref()
-            .expect("analyze always installs an AcroForm cache")
-            .name_to_fields
-            .keys()
-            .cloned()
-            .collect();
+        let mut existing_names: BTreeSet<String> = {
+            let cache = self.cache.borrow();
+            cache
+                .as_ref()
+                .expect("analyze always installs an AcroForm cache")
+                .name_to_fields
+                .keys()
+                .cloned()
+                .collect()
+        };
         existing_names.extend(reserved_names.iter().map(|name| decode_field_name(name)));
         let mut renames = BTreeMap::<String, Vec<u8>>::new();
         let mut seen = HashSet::new();
@@ -1278,12 +1287,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     }
 
     fn update_cached_field(&mut self, field: ObjectHandle) -> Result<()> {
-        let Some(mut cache) = self.cache.take() else {
+        let Some(mut cache) = self.cache.borrow_mut().take() else {
             return Ok(());
         };
         let mut visited = BTreeSet::new();
         let result = self.traverse_field_handles(field, None, 0, &mut visited, &mut cache);
-        self.cache = Some(cache);
+        *self.cache.borrow_mut() = Some(cache);
         result
     }
 
@@ -1419,8 +1428,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(None);
         }
         self.analyze()?;
-        Ok(self
-            .cache
+        let cache = self.cache.borrow();
+        Ok(cache
             .as_ref()
             .expect("analyze always installs an AcroForm cache")
             .annotation_to_field
@@ -3319,7 +3328,7 @@ mod tests {
         helper
             .update_cached_field(copied.clone())
             .expect("the eagerly analyzed cache accepts incremental field updates");
-        assert!(helper.cache.is_some());
+        assert!(helper.cache.borrow().is_some());
         helper
             .canonical_annotation_to_field_handles()
             .expect("warm the qpdf name cache");
@@ -3327,8 +3336,8 @@ mod tests {
             .add_and_rename_form_fields(vec![copied.clone()])
             .expect("append and rename the copied field");
 
-        let cache = helper
-            .cache
+        let cache_store = helper.cache.borrow();
+        let cache = cache_store
             .as_ref()
             .expect("qpdf addFormField keeps the analyzed cache valid");
         let renamed = cache
@@ -3388,8 +3397,8 @@ mod tests {
             .add_and_rename_form_fields(vec![copied])
             .expect("walk the nested cycle once");
 
-        let cache = helper
-            .cache
+        let cache_store = helper.cache.borrow();
+        let cache = cache_store
             .as_ref()
             .expect("qpdf preserves the analyzed cache");
         assert_eq!(cache.name_to_fields["name+1"].len(), 1);
@@ -3459,7 +3468,10 @@ mod tests {
             .get_fields_with_qualified_name("name")
             .expect("read the removed qualified-name cache entry")
             .is_empty());
-        assert!(helper.cache.is_some(), "qpdf preserves a warm cache");
+        assert!(
+            helper.cache.borrow().is_some(),
+            "qpdf preserves a warm cache"
+        );
     }
 
     #[test]
@@ -3517,24 +3529,26 @@ mod tests {
             .remove_form_fields(&BTreeSet::from([ObjectRef::new(4, 0)]))
             .expect("remove the selected top-level field"));
 
-        let cache = helper
-            .cache
-            .as_ref()
-            .expect("qpdf preserves a warm cache after removal");
-        assert_eq!(
-            cache
-                .name_to_fields
-                .get("name")
-                .into_iter()
-                .flatten()
-                .filter_map(ObjectHandle::object_ref)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([ObjectRef::new(7, 0)])
-        );
-        assert!(!cache
-            .annotation_to_field
-            .values()
-            .any(|field| field.object_ref() == Some(ObjectRef::new(4, 0))));
+        {
+            let cache_store = helper.cache.borrow();
+            let cache = cache_store
+                .as_ref()
+                .expect("qpdf preserves a warm cache after removal");
+            assert_eq!(
+                cache
+                    .name_to_fields
+                    .get("name")
+                    .into_iter()
+                    .flatten()
+                    .filter_map(ObjectHandle::object_ref)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([ObjectRef::new(7, 0)])
+            );
+            assert!(!cache
+                .annotation_to_field
+                .values()
+                .any(|field| field.object_ref() == Some(ObjectRef::new(4, 0))));
+        }
 
         assert!(!helper
             .remove_form_fields(&BTreeSet::from([ObjectRef::new(99, 0)]))
@@ -3551,7 +3565,10 @@ mod tests {
             .expect("read the pruned association cache")
             .iter()
             .any(|(annotation, _)| annotation.object_ref() == Some(ObjectRef::new(4, 0))));
-        assert!(helper.cache.is_some(), "qpdf preserves a warm cache");
+        assert!(
+            helper.cache.borrow().is_some(),
+            "qpdf preserves a warm cache"
+        );
     }
 
     #[test]
@@ -3569,12 +3586,12 @@ mod tests {
         // annotation in field one's stale forward list while the reverse map
         // points at field two.
         record_association(&mut cache, annotation.clone(), field_two.clone());
-        helper.cache = Some(cache);
+        *helper.cache.borrow_mut() = Some(cache);
 
         helper.remove_cached_fields(&BTreeSet::from([ObjectRef::new(4, 0)]));
 
-        let cache = helper
-            .cache
+        let cache_store = helper.cache.borrow();
+        let cache = cache_store
             .as_ref()
             .expect("qpdf keeps the association cache warm after removal");
         assert!(!cache
