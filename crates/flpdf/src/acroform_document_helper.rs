@@ -453,7 +453,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             // `QPDF::getAllPages` only enters its page walk when `/Pages`
             // has `/Kids`; `try_has_key` also preserves qpdf's type warning
             // and empty-result behavior for a non-dictionary `/Pages` value.
-            if !pages.is_null() && pages.try_has_key(b"/Kids")? {
+            if pages.try_has_key(b"/Kids")? {
                 // `crate::pages::page_refs` requires `/Pages` to be an
                 // indirect reference (`PageWalk::with_max_depth`); qpdf's own
                 // `getAllPages` has no such requirement. A malformed-but-

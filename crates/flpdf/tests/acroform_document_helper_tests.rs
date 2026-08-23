@@ -1,7 +1,26 @@
 //! Integration tests for [`flpdf::AcroFormDocumentHelper`].
 
-use flpdf::{AcroFormDocumentHelper, Object, ObjectRef, Pdf};
+use flpdf::pipeline::{Pipeline, PipelineHandle, PipelineResult};
+use flpdf::{AcroFormDocumentHelper, Object, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+struct RecordingWarningSink(Arc<Mutex<Vec<u8>>>);
+
+impl Pipeline for RecordingWarningSink {
+    fn identifier(&self) -> &str {
+        "acroform warning recording sink"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
 
 fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
@@ -415,6 +434,40 @@ fn missing_or_malformed_acroform_shapes_are_noops() {
     let malformed_bytes = malformed_acroform_pdf();
     let mut malformed = Pdf::open_mem_owned(malformed_bytes).unwrap();
     assert!(malformed.acroform().unwrap().fields().unwrap().is_empty());
+}
+
+#[test]
+fn eager_analyze_warns_when_pages_is_missing() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /AcroForm 2 0 R >>"),
+            (2, "<< /Fields [] >>"),
+        ],
+        1,
+    );
+    let logger = QPDFLogger::create();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+        &output,
+    )))));
+
+    let mut pdf = Pdf::open_mem_with_options(
+        Arc::from(bytes),
+        PdfOpenOptions {
+            logger: Some(logger),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(pdf.acroform().unwrap().has_acro_form().unwrap());
+
+    let warning = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        warning.contains(
+            "operation for dictionary attempted on object of type null: returning false for a key containment request"
+        ),
+        "expected qpdf null /Pages warning, got {warning:?}"
+    );
 }
 
 #[test]
