@@ -84,7 +84,7 @@
 #![deny(unsafe_code)]
 
 pub mod acroform_document_helper;
-pub mod annotation_helper;
+pub mod annotation_object_helper;
 pub(crate) mod bit_stream;
 pub(crate) mod bit_writer;
 pub mod cache;
@@ -161,7 +161,7 @@ pub mod xref_entry;
 pub use logger::QPDFLogger;
 
 pub use acroform_document_helper::{AcroFormDocumentHelper, AcroFormFieldInfo};
-pub use annotation_helper::AnnotationObjectHelper;
+pub use annotation_object_helper::AnnotationObjectHelper;
 pub use cache::{CacheEntry, ObjectCache};
 pub use content_normalizer::{normalize_content_stream, ContentNormalization};
 pub use content_stream::ObjectHandleParserCallbacks as ObjectParserCallbacks;

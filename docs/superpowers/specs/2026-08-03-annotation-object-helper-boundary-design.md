@@ -15,7 +15,7 @@ oracle は固定済み qpdf 11.9.0 の
 `libqpdf/QPDFAnnotationObjectHelper.cc` である。
 
 - `QPDFAnnotationObjectHelper` が所有する annotation object の読取りは
-  `annotation_helper.rs` に集約する。
+  `annotation_object_helper.rs` に集約する。
 - `QPDFFormFieldObjectHelper` の継承フィールド属性は既存の Tier A1
   `FormFieldObjectHelper` に残す。
 - ページの `/Annots` 配列を列挙する責務は
@@ -59,7 +59,7 @@ ObjectHandle 又は既定値に正規化する。壊れた間接参照のエラ�
 
 1. qpdf の API ごとの integration test を先に追加し、現行 API に存在しない
    ObjectHandle constructor/accessor をコンパイル失敗として確認する。
-2. `annotation_helper.rs` を ObjectHandle-only に置換する。Form field helper は
+2. `annotation_object_helper.rs` を ObjectHandle-only に置換する。Form field helper は
    Tier A1 の module に移して依存を一方向にする。
 3. `page_annotation_enum.rs` の page traversal / widget linkage を消費側へ移し、
    public re-export を削除する。旧 module の実装は削除する。

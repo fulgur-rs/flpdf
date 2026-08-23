@@ -1,6 +1,6 @@
 //! Error-path and edge-case tests for the annotation/form-field helpers.
 //!
-//! The happy paths live in `annotation_helper_tests.rs`. This file targets the
+//! The happy paths live in `annotation_object_helper_tests.rs`. This file targets the
 //! malformed-input branches of [`flpdf::AnnotationObjectHelper`] and
 //! [`flpdf::FormFieldObjectHelper`]:
 //!

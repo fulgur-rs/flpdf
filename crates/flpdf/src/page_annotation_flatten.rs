@@ -394,19 +394,20 @@ fn flatten_annotations_on_page<R: Read + Seek>(
                 // flag gating, stream mutation, and emitted content remain
                 // owned by AnnotationObjectHelper.
                 match read_xobj_bbox_and_matrix(pdf, *appearance_ref)? {
-                    (Some(bbox), matrix) => {
-                        AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
-                            .get_page_content_for_selected_appearance_with_geometry(
-                                &resource_name,
-                                *appearance_ref,
-                                page_rotate,
-                                required_flags,
-                                forbidden_flags,
-                                crate::annotation_helper::AppearanceContentOverrides::with_geometry(
-                                    bbox, matrix, data.flags,
-                                ),
-                            )
-                    }
+                    (Some(bbox), matrix) => AnnotationObjectHelper::from_object_handle(
+                        data.annotation.clone(),
+                        pdf,
+                    )
+                    .get_page_content_for_selected_appearance_with_geometry(
+                        &resource_name,
+                        *appearance_ref,
+                        page_rotate,
+                        required_flags,
+                        forbidden_flags,
+                        crate::annotation_object_helper::AppearanceContentOverrides::with_geometry(
+                            bbox, matrix, data.flags,
+                        ),
+                    ),
                     (None, _) => Ok(Vec::new()),
                 }
             }
@@ -866,12 +867,12 @@ fn merge_widget_default_resources_on_page_with_associations<R: Read + Seek>(
     field_annotation_ids: &HashSet<ObjectHandleIdentity>,
 ) -> Result<()> {
     for annotation in page_annotation_handles(pdf, page_ref)? {
-        let mut annotation_helper =
+        let mut annotation_object_helper =
             AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
-        if annotation_helper.get_subtype()? != b"Widget" {
+        if annotation_object_helper.get_subtype()? != b"Widget" {
             continue; // cov:ignore: non-widget annotations do not merge default resources
         }
-        let appearance = annotation_helper.get_appearance_stream(b"N", None)?;
+        let appearance = annotation_object_helper.get_appearance_stream(b"N", None)?;
         let appearance = match appearance.object_ref() {
             Some(_) => appearance,
             None => match annotation.object_ref() {
@@ -2504,7 +2505,7 @@ mod tests {
     /// Build a minimal annotation fixture for direct ObjectHandle placement
     /// tests. `stream_dictionary` is already a complete stream dictionary and
     /// is wrapped as object 5 when present.
-    fn open_annotation_helper_fixture(
+    fn open_annotation_object_helper_fixture(
         annotation: &str,
         stream_dictionary: Option<&str>,
     ) -> Pdf<Cursor<Vec<u8>>> {
@@ -2518,23 +2519,24 @@ mod tests {
     }
 
     #[test]
-    fn annotation_helper_qpdf_validation_and_rotation_paths() {
+    fn annotation_object_helper_qpdf_validation_and_rotation_paths() {
         let stream_dictionary = "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Length 0 >>";
         let annotation = "<< /Type /Annot /Rect [10 20 110 40] /F 4 /AP << /N 5 0 R >> >>";
 
-        let mut pdf = open_annotation_helper_fixture("<< /Type /Annot /Rect [0 0 100 20] >>", None);
+        let mut pdf =
+            open_annotation_object_helper_fixture("<< /Type /Annot /Rect [0 0 100 20] >>", None);
         assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
             .get_page_content_for_appearance("/Fxo1", 0, 0, 0)
             .unwrap()
             .is_empty());
 
-        let mut pdf = open_annotation_helper_fixture(annotation, Some(stream_dictionary));
+        let mut pdf = open_annotation_object_helper_fixture(annotation, Some(stream_dictionary));
         assert!(AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
             .get_page_content_for_appearance("/Fxo1", 0, 0, 4)
             .unwrap()
             .is_empty());
 
-        let mut pdf = open_annotation_helper_fixture(
+        let mut pdf = open_annotation_object_helper_fixture(
             "<< /Type /Annot /Rect [0 0 100] /AP << /N 5 0 R >> >>",
             Some(stream_dictionary),
         );
@@ -2543,7 +2545,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let mut pdf = open_annotation_helper_fixture(
+        let mut pdf = open_annotation_object_helper_fixture(
             "<< /Type /Annot /Rect [0 0 bad 20] /AP << /N 5 0 R >> >>",
             Some(stream_dictionary),
         );
@@ -2552,7 +2554,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let mut pdf = open_annotation_helper_fixture(
+        let mut pdf = open_annotation_object_helper_fixture(
             annotation,
             Some(
                 "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 0] /Length 0 >>",
@@ -2563,7 +2565,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let mut pdf = open_annotation_helper_fixture(
+        let mut pdf = open_annotation_object_helper_fixture(
             annotation,
             Some(
                 "<< /Type /XObject /Subtype /Form /BBox [0 0 100 20] /Matrix [1 0 bad 1 0 0] /Length 0 >>",
@@ -2576,7 +2578,8 @@ mod tests {
 
         for rotate in [180, 270, 45] {
             let annotation = "<< /Type /Annot /Rect [10 20 110 40] /F 16 /AP << /N 5 0 R >> >>";
-            let mut pdf = open_annotation_helper_fixture(annotation, Some(stream_dictionary));
+            let mut pdf =
+                open_annotation_object_helper_fixture(annotation, Some(stream_dictionary));
             assert!(
                 !AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf)
                     .get_page_content_for_appearance("/Fxo1", rotate, 0, 0)
@@ -3471,7 +3474,7 @@ mod tests {
                 0,
                 0,
                 0,
-                crate::annotation_helper::AppearanceContentOverrides::with_geometry(
+                crate::annotation_object_helper::AppearanceContentOverrides::with_geometry(
                     Rectangle::new(0.0, 0.0, 10.0, 10.0),
                     Matrix::default(),
                     0,

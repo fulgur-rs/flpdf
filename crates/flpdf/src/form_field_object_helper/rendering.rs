@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
-use crate::annotation_helper::AnnotationObjectHelper;
+use crate::annotation_object_helper::AnnotationObjectHelper;
 use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::default_appearance::parse_default_appearance;
 use crate::form_field_object_helper::FormFieldObjectHelper;
