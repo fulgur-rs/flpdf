@@ -456,6 +456,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_handle_chain_bounds_a_reference_cycle() {
+        let mut objs = base_objs();
+        objs.insert(20, "21 0 R".into());
+        objs.insert(21, "20 0 R".into());
+        let mut pdf = open(&objs);
+        let start = pdf.get_object_handle(ObjectRef::new(20, 0));
+
+        let (terminal, terminal_ref) =
+            resolve_handle_chain(&mut pdf, &start).expect("cycle must be bounded");
+        assert!(terminal.as_reference().is_some());
+        assert!(matches!(
+            terminal_ref,
+            Some(ObjectRef {
+                number: 20 | 21,
+                generation: 0
+            })
+        ));
+    }
+
+    #[test]
     fn removed_bead_p_dropped_and_bead_kept() {
         // Keep pages 3 and 5; page 4 removed. Bead 12 (on page 4) loses /P; the
         // bead itself and its ring links stay. Beads 11/13 keep their /P.
