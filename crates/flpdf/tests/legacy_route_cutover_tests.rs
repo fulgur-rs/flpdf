@@ -84,3 +84,25 @@ fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn thread_bead_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/thread_bead_p.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("thread_bead_p has a production section");
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_ref_chain",
+        "Object::",
+        "pdf.set_object(",
+        "use crate::{Dictionary, Object",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "thread_bead_p production still contains the raw route marker {legacy:?}"
+        );
+    }
+}

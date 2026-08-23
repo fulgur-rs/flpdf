@@ -74,11 +74,14 @@
 //! document; cross-document merge — which could renumber a first occurrence —
 //! is out of scope here.)
 
+use crate::object_handle::ObjectHandle;
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
+
+#[cfg(test)]
+use crate::{Dictionary, Object};
 
 /// Drop dangling article-thread bead `/P` references after a page-tree rebuild
 /// (qpdf `--pages` parity).
@@ -102,7 +105,7 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`] / [`Pdf::resolve_borrowed`] while
+/// Any error propagated from [`Pdf::resolve`] while
 /// resolving the catalog, the `/Threads` array, the threads, the surviving
 /// pages, or the beads.
 pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
@@ -121,29 +124,28 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
     seed_from_threads(pdf, &mut queue)?;
     seed_from_surviving_pages(pdf, result, &mut queue)?;
 
-    // Walk the ring(s). resolve_ref_chain normalizes /N//V/F indirection so the
-    // visited key and the write-back target are the terminal bead ref (never an
-    // intermediate reference holder).
+    // Walk the ring(s). The handle chain normalizer keeps the visited key and
+    // the write-back target at the terminal bead ref (never an intermediate
+    // reference holder).
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     while let Some(start_ref) = queue.pop() {
-        let (concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(start_ref))?;
+        let start = pdf.get_object_handle(start_ref);
+        let (concrete, terminal) = resolve_handle_chain(pdf, &start)?;
         let bead_ref = terminal.unwrap_or(start_ref);
         if !visited.insert(bead_ref) {
             continue;
         }
-        let Some(mut bead) = concrete.into_dict() else {
+        let Some(bead) = concrete.as_dictionary() else {
             continue;
         };
         // Enqueue ring neighbours before any mutation; they are chain-resolved
         // when popped.
-        for key in ["N", "V"] {
-            if let Some(Object::Reference(r)) = bead.get(key) {
-                queue.push(*r);
+        for key in [b"/N".as_slice(), b"/V".as_slice()] {
+            if let Some(value) = bead.get(key).and_then(handle_reference) {
+                queue.push(value);
             }
         }
-        if remap_or_drop_bead_p(pdf, &mut bead, &surviving)? {
-            pdf.set_object(bead_ref, Object::Dictionary(bead));
-        }
+        remap_or_drop_bead_p(pdf, &concrete, &surviving)?;
     }
     Ok(())
 }
@@ -158,24 +160,19 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
     let Some(catalog_ref) = pdf.root_ref() else {
         return Ok(()); // No catalog.
     };
-    let threads_val = {
-        let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-        let Some(catalog) = catalog_obj.as_dict() else {
-            return Ok(());
-        };
-        // Shared borrow of the catalog: clone the (small) /Threads value out.
-        catalog.get("Threads").cloned()
-    };
-    let Some(threads_val) = threads_val else {
+    let catalog = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog)?;
+    if !catalog.has_key(b"/Threads") {
         return Ok(()); // No article threads.
-    };
+    }
+    let threads_val = catalog.get_key(b"/Threads");
     // /Threads may be an indirect (possibly multi-hop) reference to the array.
-    let (threads_concrete, _) = resolve_ref_chain(pdf, &threads_val)?;
-    let Object::Array(threads) = threads_concrete else {
+    let (threads_concrete, _) = resolve_handle_chain(pdf, &threads_val)?;
+    let Some(threads) = threads_concrete.as_array() else {
         return Ok(());
     };
-    for thread in &threads {
-        if let Some(first_bead) = thread_first_bead(pdf, thread)? {
+    for thread in threads {
+        if let Some(first_bead) = thread_first_bead(pdf, &thread)? {
             queue.push(first_bead);
         }
     }
@@ -189,16 +186,16 @@ fn seed_from_threads<R: Read + Seek>(pdf: &mut Pdf<R>, queue: &mut Vec<ObjectRef
 /// direct (inline) dictionary; `/F` may itself be a reference chain.
 fn thread_first_bead<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    thread: &Object,
+    thread: &ObjectHandle,
 ) -> Result<Option<ObjectRef>> {
-    let (concrete, _) = resolve_ref_chain(pdf, thread)?;
-    let Some(dict) = concrete.as_dict() else {
+    let (concrete, _) = resolve_handle_chain(pdf, thread)?;
+    let Some(dict) = concrete.as_dictionary() else {
         return Ok(None);
     };
-    let Some(f_val) = dict.get("F") else {
+    let Some(f_val) = dict.get(b"/F".as_slice()) else {
         return Ok(None);
     };
-    let (_, terminal) = resolve_ref_chain(pdf, f_val)?;
+    let (_, terminal) = resolve_handle_chain(pdf, f_val)?;
     Ok(terminal)
 }
 
@@ -218,17 +215,16 @@ fn seed_from_surviving_pages<R: Read + Seek>(
         if !seen_pages.insert(page_ref) {
             continue;
         }
-        let b_val = {
-            let page_obj = pdf.resolve_borrowed(page_ref)?;
-            page_obj.as_dict().and_then(|p| p.get("B")).cloned()
-        };
-        let Some(b_val) = b_val else {
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page)?;
+        if !page.has_key(b"/B") {
             continue;
-        };
-        let (b_concrete, _) = resolve_ref_chain(pdf, &b_val)?;
-        if let Object::Array(beads) = b_concrete {
-            for bead in &beads {
-                if let Some(r) = bead.as_ref_id() {
+        }
+        let b_val = page.get_key(b"/B");
+        let (b_concrete, _) = resolve_handle_chain(pdf, &b_val)?;
+        if let Some(beads) = b_concrete.as_array() {
+            for bead in beads {
+                if let Some(r) = handle_reference(&bead) {
                     queue.push(r);
                 }
             }
@@ -237,8 +233,7 @@ fn seed_from_surviving_pages<R: Read + Seek>(
     Ok(())
 }
 
-/// Remap-or-drop a bead's `/P`. Returns `true` when `bead` was modified (so the
-/// caller writes it back).
+/// Remap-or-drop a bead's `/P` in the live canonical dictionary handle.
 ///
 /// `/P` is by spec an indirect reference to the page the bead belongs to,
 /// possibly through a reference chain. The chain is resolved to its terminal
@@ -251,15 +246,18 @@ fn seed_from_surviving_pages<R: Read + Seek>(
 /// garbage-collected.
 fn remap_or_drop_bead_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    bead: &mut Dictionary,
+    bead: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
-) -> Result<bool> {
-    let Some(p_val) = bead.get("P").cloned() else {
-        return Ok(false);
+) -> Result<()> {
+    let Some(p_val) = bead
+        .as_dictionary()
+        .and_then(|dictionary| dictionary.get(b"/P".as_slice()).cloned())
+    else {
+        return Ok(());
     };
-    let (p_concrete, p_terminal) = resolve_ref_chain(pdf, &p_val)?;
+    let (p_concrete, p_terminal) = resolve_handle_chain(pdf, &p_val)?;
     let Some(page_ref) = p_terminal else {
-        return Ok(false); // Non-reference /P: malformed, left unchanged.
+        return Ok(()); // Non-reference /P: malformed, left unchanged.
     };
     // A removed page that a surviving outline / named destination still
     // references is replaced with `null` *in place* by the earlier null-out pass
@@ -269,27 +267,61 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     // null-out pass nulls objects before this pass runs — the other extraction
     // passes drop keys, not objects — so a `null` terminal here unambiguously
     // means a removed page.
-    if !is_page_dict(&p_concrete) && !matches!(p_concrete, Object::Null) {
-        return Ok(false); // /P does not resolve to a page (or null): left unchanged.
+    if !is_page_dict(&p_concrete) && !p_concrete.is_null() {
+        return Ok(()); // /P does not resolve to a page (or null): left unchanged.
     }
     match surviving.get(&page_ref) {
         Some(&new) if new != page_ref => {
-            bead.insert("P", Object::Reference(new));
-            Ok(true)
+            bead.replace_key(b"/P", pdf.get_object_handle(new))?;
+            pdf.mark_object_handle_dirty(bead)?;
+            Ok(())
         }
-        Some(_) => Ok(false), // Surviving under the same ref: nothing to change.
+        Some(_) => Ok(()), // Surviving under the same ref: nothing to change.
         None => {
-            bead.remove("P");
-            Ok(true)
+            bead.remove_key(b"/P");
+            pdf.mark_object_handle_dirty(bead)?;
+            Ok(())
         }
     }
 }
 
-/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
-fn is_page_dict(obj: &Object) -> bool {
-    obj.as_dict()
-        .and_then(|d| d.get("Type"))
-        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
+/// Whether `obj` is a `<< /Type /Page ... >>` dictionary.
+fn is_page_dict(obj: &ObjectHandle) -> bool {
+    obj.as_dictionary()
+        .and_then(|d| d.get(b"/Type".as_slice()).cloned())
+        .and_then(|t| t.as_name())
+        .is_some_and(|name| name == b"Page")
+}
+
+/// Return an indirect reference carried by a handle without forcing a second
+/// resolution. Parsed dictionary/array references use `object_ref`; the
+/// mutation-only bare-reference value uses `as_reference`.
+fn handle_reference(handle: &ObjectHandle) -> Option<ObjectRef> {
+    handle.object_ref().or_else(|| handle.as_reference())
+}
+
+/// Follow canonical indirect handles and the private bare-reference mutation
+/// shape until the terminal value, retaining the last indirect reference.
+///
+/// The ordinary first dereference is qpdf's `QPDFObjectHandle::dereference` /
+/// `QPDF::resolve` path. The additional `as_reference` hops are only for the
+/// existing mutation-only redirect shape; qpdf's `replaceObject` rejects
+/// an indirect replacement (`QPDF.cc:1980-1991`).
+fn resolve_handle_chain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: &ObjectHandle,
+) -> Result<(ObjectHandle, Option<ObjectRef>)> {
+    let mut current = start.clone();
+    let mut last_ref = current.object_ref();
+    for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
+        pdf.resolve(&current)?;
+        let Some(next) = current.as_reference() else {
+            return Ok((current, last_ref));
+        };
+        last_ref = Some(next);
+        current = pdf.get_object_handle(next);
+    }
+    Ok((current, last_ref))
 }
 
 #[cfg(test)]
@@ -415,8 +447,10 @@ mod tests {
     }
 
     fn bead_dict(pdf: &mut Pdf<Cursor<Vec<u8>>>, num: u32) -> Dictionary {
-        pdf.resolve_object(ObjectRef::new(num, 0))
-            .expect("resolve bead")
+        let bead = pdf.get_object_handle(ObjectRef::new(num, 0));
+        pdf.resolve(&bead).expect("resolve bead");
+        bead.materialize()
+            .expect("materialize bead snapshot")
             .into_dict()
             .expect("bead object is a dictionary")
     }
