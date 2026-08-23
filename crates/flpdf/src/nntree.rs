@@ -694,10 +694,6 @@ impl NameTree {
     pub fn set_max_depth(&mut self, max_depth: usize) {
         self.inner.max_depth = Some(max_depth);
     }
-
-    pub(crate) fn make_root_indirect<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
-        self.inner.make_root_indirect(pdf)
-    }
 }
 
 /// Cursor over a [`NameTree`].
@@ -1493,21 +1489,6 @@ impl<K: TreeKey> NNTree<K> {
 
     fn lift_value<R: Read + Seek>(&self, pdf: &mut Pdf<R>, value: Object) -> Result<ObjectHandle> {
         pdf.lift_object_to_handle(&value)
-    }
-
-    fn make_root_indirect<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<()> {
-        let root = self.ensure_canonical_root(pdf)?;
-        if root.is_indirect() {
-            return Ok(());
-        }
-        let root = pdf.make_indirect_from_object_handle(root)?;
-        self.canonical_root = Some(root.clone());
-        self.root = Object::Reference(
-            root.object_ref()
-                .expect("canonical promotion always returns an indirect handle"),
-        );
-        self.legacy_root_snapshot = self.root.clone();
-        Ok(())
     }
 
     pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
@@ -4253,26 +4234,6 @@ mod tests {
                 Object::Integer(20),
                 Object::String(b"twenty".to_vec()),
             ])
-        );
-    }
-
-    #[test]
-    fn root_promotion_preserves_the_qpdf_object_allocation_identity() {
-        let mut pdf = empty_pdf();
-        let mut root = Dictionary::new();
-        root.insert("Nums", Object::Array(Vec::new()));
-        let mut tree = NNTree::<NumberKey>::new(Object::Dictionary(root), false);
-        let alias = tree.ensure_canonical_root(&mut pdf).unwrap();
-
-        tree.make_root_indirect(&mut pdf).unwrap();
-
-        let root_ref = tree.root().as_ref_id().expect("promoted root reference");
-        let registered = pdf.get_object_handle(root_ref);
-        assert!(alias.is_same_object_as(&registered));
-        assert_eq!(alias.object_ref(), Some(root_ref));
-        assert_eq!(
-            tree.root_handle(&mut pdf).unwrap().diagnostic_ref(),
-            Some(root_ref)
         );
     }
 
