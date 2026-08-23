@@ -698,11 +698,7 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
         let mut annot = Dictionary::new();
         annot.insert("Type", Object::Name(b"Annot".to_vec()));
         annot.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        let flags = if object_ref == ObjectRef::new(6, 0) {
-            Object::Reference(ObjectRef::new(10, 0))
-        } else {
-            Object::Integer(flags)
-        };
+        let flags = Object::Integer(flags);
         annot.insert("F", flags);
         annot.insert(
             "Rect",
@@ -718,12 +714,6 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
         annot.insert("AP", Object::Dictionary(ap));
         pdf.set_object(object_ref, Object::Dictionary(annot));
     }
-    pdf.set_object(
-        ObjectRef::new(10, 0),
-        Object::Reference(ObjectRef::new(11, 0)),
-    );
-    pdf.set_object(ObjectRef::new(11, 0), Object::Integer(4));
-
     let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must be a dictionary");
     };
@@ -1552,98 +1542,6 @@ fn helper_flatten_annotations_prunes_a_chained_annots_holder() {
         "qpdf replaces the outer /Annots holder with the retained annotations"
     );
 }
-
-#[test]
-fn helper_flatten_annotations_follows_chained_appearance_holders() {
-    let mut pdf = open(build_n_page_pdf(1));
-    let mut appearance = Dictionary::new();
-    appearance.insert("BBox", Object::Reference(ObjectRef::new(9, 0)));
-    appearance.insert("Matrix", Object::Reference(ObjectRef::new(11, 0)));
-    pdf.set_object(
-        ObjectRef::new(9, 0),
-        Object::Reference(ObjectRef::new(10, 0)),
-    );
-    pdf.set_object(
-        ObjectRef::new(10, 0),
-        Object::Array(vec![
-            Object::Reference(ObjectRef::new(13, 0)),
-            Object::Reference(ObjectRef::new(14, 0)),
-            Object::Reference(ObjectRef::new(15, 0)),
-            Object::Reference(ObjectRef::new(16, 0)),
-        ]),
-    );
-    pdf.set_object(ObjectRef::new(13, 0), Object::Integer(0));
-    pdf.set_object(ObjectRef::new(14, 0), Object::Integer(0));
-    pdf.set_object(ObjectRef::new(15, 0), Object::Integer(100));
-    pdf.set_object(ObjectRef::new(16, 0), Object::Integer(20));
-    pdf.set_object(
-        ObjectRef::new(11, 0),
-        Object::Reference(ObjectRef::new(12, 0)),
-    );
-    pdf.set_object(
-        ObjectRef::new(12, 0),
-        Object::Array(vec![
-            Object::Reference(ObjectRef::new(17, 0)),
-            Object::Reference(ObjectRef::new(18, 0)),
-            Object::Reference(ObjectRef::new(19, 0)),
-            Object::Reference(ObjectRef::new(20, 0)),
-            Object::Reference(ObjectRef::new(21, 0)),
-            Object::Reference(ObjectRef::new(22, 0)),
-        ]),
-    );
-    pdf.set_object(ObjectRef::new(17, 0), Object::Integer(1));
-    pdf.set_object(ObjectRef::new(18, 0), Object::Integer(0));
-    pdf.set_object(ObjectRef::new(19, 0), Object::Integer(0));
-    pdf.set_object(ObjectRef::new(20, 0), Object::Integer(1));
-    pdf.set_object(ObjectRef::new(21, 0), Object::Integer(0));
-    pdf.set_object(ObjectRef::new(22, 0), Object::Integer(0));
-    pdf.set_object(
-        ObjectRef::new(8, 0),
-        Object::Stream(Stream::new(appearance, Vec::new())),
-    );
-    pdf.set_object(
-        ObjectRef::new(7, 0),
-        Object::Reference(ObjectRef::new(8, 0)),
-    );
-    let mut ap = Dictionary::new();
-    ap.insert("N", Object::Reference(ObjectRef::new(7, 0)));
-    pdf.set_object(
-        ObjectRef::new(5, 0),
-        Object::Reference(ObjectRef::new(6, 0)),
-    );
-    pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(ap));
-    let mut annot = Dictionary::new();
-    annot.insert("AP", Object::Reference(ObjectRef::new(5, 0)));
-    annot.insert(
-        "Rect",
-        Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(100),
-            Object::Integer(20),
-        ]),
-    );
-    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annot));
-    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-        panic!("page must be a dictionary");
-    };
-    page.insert(
-        "Annots",
-        Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
-    );
-    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
-
-    PageDocumentHelper::new(&mut pdf)
-        .flatten_annotations(0, 0x3)
-        .unwrap();
-
-    let content = flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-    assert!(
-        String::from_utf8_lossy(&content).contains("/Fxo1 Do"),
-        "terminal /AP/N stream must be drawn"
-    );
-}
-
 #[test]
 fn helper_flatten_annotations_looks_up_non_utf8_appearance_state_bytes() {
     let mut pdf = open(build_n_page_pdf(1));

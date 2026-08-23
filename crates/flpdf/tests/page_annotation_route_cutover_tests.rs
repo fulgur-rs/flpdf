@@ -66,3 +66,25 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
         "the three grouped widgets must resolve through the canonical qpdf helper composition"
     );
 }
+
+#[test]
+fn page_annotation_flatten_production_has_no_legacy_object_route() {
+    let source = include_str!("../src/page_annotation_flatten.rs");
+    let production = source
+        .split_once("#[cfg(test)]\nmod tests")
+        .expect("page_annotation_flatten test module marker")
+        .0;
+
+    for forbidden in [
+        "Object::",
+        "resolve_borrowed",
+        "resolve_ref_chain",
+        "Pdf::set_object",
+        "qpdf-deviation",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "page_annotation_flatten production still uses legacy {forbidden} route"
+        );
+    }
+}
