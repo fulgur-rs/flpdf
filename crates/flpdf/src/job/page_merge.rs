@@ -48,8 +48,8 @@ use crate::ref_chain::resolve_ref_chain;
 use crate::resources::{should_remove_unreferenced_resources, RemoveUnreferencedResources};
 use crate::subset_prune::sweep_unreachable_objects_except;
 use crate::{
-    Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf,
-    Result,
+    AcroFormDocumentHelper, Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper,
+    PageObjectHelper, Pdf, Result,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -637,7 +637,12 @@ fn build_merged_acroform<R: Read + Seek>(
         return Ok(());
     }
 
-    let acroform = target.acroform()?.canonical_get_or_create_acroform()?;
+    // The target is still a transient grouped copy here: repeated-page
+    // annotations have not yet gone through the qpdf `fixCopiedAnnotations`
+    // replay. Construct only the field-tree cache so that those pending
+    // annotations are not reported as source-document orphans.
+    let acroform =
+        AcroFormDocumentHelper::new_for_field_tree(target)?.canonical_get_or_create_acroform()?;
     if acroform.try_as_dictionary()?.is_none() {
         return Ok(()); // cov:ignore: ensure_acroform_ref always yields a dictionary
     }

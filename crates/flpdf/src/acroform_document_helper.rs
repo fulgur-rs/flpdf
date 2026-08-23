@@ -207,6 +207,23 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(helper)
     }
 
+    /// Create a helper whose cache contains only the `/AcroForm` field tree.
+    ///
+    /// The page-selection merge uses this for its transient, freshly copied
+    /// target while it is still replaying repeated and foreign page
+    /// annotations. qpdf constructs its source-document helpers before those
+    /// copy events (`QPDFJob.cc:2517-2584`), so running the orphan-widget page
+    /// scan against that incomplete target would report a warning for a
+    /// repeated annotation that qpdf has not associated yet. This is an
+    /// internal construction boundary, not an alternate public compatibility
+    /// route; [`Self::new`] remains the qpdf `analyze()` constructor for
+    /// complete documents.
+    pub(crate) fn new_for_field_tree(pdf: &'a mut Pdf<R>) -> Result<Self> {
+        let mut helper = Self { pdf, cache: None };
+        helper.cache = Some(helper.analyze_field_tree()?.unwrap_or_default());
+        Ok(helper)
+    }
+
     /// Invalidate the cached field/annotation associations.
     ///
     /// This mirrors `QPDFAcroFormDocumentHelper::invalidateCache`
@@ -414,30 +431,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(());
         }
 
-        let mut cache = AcroFormCache::default();
-        let Some(acroform) = self.canonical_acroform()? else {
-            self.cache = Some(cache);
+        let Some(mut cache) = self.analyze_field_tree()? else {
+            // qpdf returns before both field traversal and the orphan-widget
+            // fallback when there is no dictionary `/AcroForm` or no
+            // `/Fields` key at all.
+            self.cache = Some(AcroFormCache::default());
             return Ok(());
         };
-        // Mirrors qpdf's combined `acroform.isDictionary() && acroform.hasKey("/Fields")`
-        // guard (`QPDFAcroFormDocumentHelper.cc:241-243`): an `/AcroForm` dictionary
-        // without a `/Fields` key skips both the field traversal and the
-        // orphan-widget fallback below, not just the traversal.
-        if !acroform.try_has_key(b"/Fields")? {
-            self.cache = Some(cache);
-            return Ok(());
-        }
-
-        let fields = self
-            .pdf
-            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
-        if let Some(fields) = fields.as_array() {
-            let mut visited = BTreeSet::new();
-            for field in fields {
-                self.traverse_field_handles(field, None, 0, &mut visited, &mut cache)?;
-            }
-        }
-
         // qpdf's orphan-widget fallback walks the canonical page annotation
         // route and associates an otherwise-unreachable widget with itself.
         // QPDF::getAllPages returns an empty vector when the catalog has no
@@ -477,6 +477,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
                         let annotation = self.pdf.resolve_object_handle_to_terminal(&annotation)?;
                         let identity = annotation.identity_key();
                         if !cache.annotation_to_field.contains_key(&identity) {
+                            annotation.warn_if_possible(
+                                "this widget annotation is not reachable from /AcroForm in the document catalog",
+                            )?;
                             record_association(&mut cache, annotation.clone(), annotation);
                         }
                     }
@@ -486,6 +489,37 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
         self.cache = Some(cache);
         Ok(())
+    }
+
+    /// Build the field/annotation associations reachable from `/Fields`.
+    ///
+    /// The page-based orphan pass is deliberately kept in [`Self::analyze`]
+    /// because it belongs to qpdf's complete-document constructor, while the
+    /// page-selection merge needs this field-tree portion before its copied
+    /// pages have reached their final association state.
+    fn analyze_field_tree(&mut self) -> Result<Option<AcroFormCache>> {
+        let mut cache = AcroFormCache::default();
+        let Some(acroform) = self.canonical_acroform()? else {
+            return Ok(None);
+        };
+        // Mirrors qpdf's combined `acroform.isDictionary() && acroform.hasKey("/Fields")`
+        // guard (`QPDFAcroFormDocumentHelper.cc:241-243`): an `/AcroForm` dictionary
+        // without a `/Fields` key skips both the field traversal and the
+        // orphan-widget fallback below, not just the traversal.
+        if !acroform.try_has_key(b"/Fields")? {
+            return Ok(None);
+        }
+
+        let fields = self
+            .pdf
+            .resolve_object_handle_to_terminal(&acroform.try_get_key(b"/Fields")?)?;
+        if let Some(fields) = fields.as_array() {
+            let mut visited = BTreeSet::new();
+            for field in fields {
+                self.traverse_field_handles(field, None, 0, &mut visited, &mut cache)?;
+            }
+        }
+        Ok(Some(cache))
     }
 
     /// Return the distinct live handles represented by qpdf's

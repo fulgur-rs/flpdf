@@ -1013,6 +1013,33 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         cm: Matrix,
         reserved_names: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
+        self.copy_annotations_with_reserved_names_impl(from_page, cm, reserved_names, false)
+    }
+
+    /// Same-document annotation copy for qpdf's page-selection replay.
+    ///
+    /// `QPDFJob::handlePageSpecs` constructs its destination AcroForm helper
+    /// before repeated-page copies begin. The merged flpdf target already
+    /// contains those page copies when this replay starts, so a fresh full
+    /// `analyze()` would report their not-yet-added widgets as orphaned. Keep
+    /// the canonical field-tree copy/rename route, but defer the page orphan
+    /// scan to the completed output boundary.
+    pub(crate) fn copy_annotations_with_field_tree_only(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        self.copy_annotations_with_reserved_names_impl(from_page, cm, reserved_names, true)
+    }
+
+    fn copy_annotations_with_reserved_names_impl(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        reserved_names: &BTreeSet<Vec<u8>>,
+        field_tree_only: bool,
+    ) -> Result<()> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_same_document_page_handle(self.pdf, &from_page)?;
@@ -1024,7 +1051,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
+            let mut acroform = if field_tree_only {
+                crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?
+            } else {
+                crate::AcroFormDocumentHelper::new(self.pdf)?
+            };
             let transformed = acroform.transform_annotations(old_annots, cm)?;
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),
@@ -1097,6 +1128,42 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         source: &mut Pdf<RS>,
         reserved_names: &BTreeSet<Vec<u8>>,
     ) -> Result<()> {
+        self.copy_annotations_from_with_reserved_names_impl(
+            from_page,
+            cm,
+            source,
+            reserved_names,
+            false,
+        )
+    }
+
+    /// Foreign annotation copy for qpdf's page-selection replay. See
+    /// [`Self::copy_annotations_with_field_tree_only`] for why the destination
+    /// helper must defer its page orphan scan while copied pages are pending.
+    pub(crate) fn copy_annotations_from_with_field_tree_only<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+    ) -> Result<()> {
+        self.copy_annotations_from_with_reserved_names_impl(
+            from_page,
+            cm,
+            source,
+            reserved_names,
+            true,
+        )
+    }
+
+    fn copy_annotations_from_with_reserved_names_impl<RS: Read + Seek>(
+        &mut self,
+        from_page: ObjectHandle,
+        cm: Matrix,
+        source: &mut Pdf<RS>,
+        reserved_names: &BTreeSet<Vec<u8>>,
+        field_tree_only: bool,
+    ) -> Result<()> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
@@ -1107,7 +1174,11 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
 
         let transformed = {
-            let mut acroform = crate::AcroFormDocumentHelper::new(self.pdf)?;
+            let mut acroform = if field_tree_only {
+                crate::AcroFormDocumentHelper::new_for_field_tree(self.pdf)?
+            } else {
+                crate::AcroFormDocumentHelper::new(self.pdf)?
+            };
             let transformed = acroform.transform_annotations_from(old_annots, cm, source)?;
             acroform.add_and_rename_form_fields_with_reserved_names(
                 transformed.new_fields.clone(),

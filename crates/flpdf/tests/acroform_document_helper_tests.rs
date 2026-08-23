@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::AcroFormDocumentHelper`].
 
-use flpdf::pipeline::{Pipeline, PipelineHandle, PipelineResult};
+use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
 use flpdf::{AcroFormDocumentHelper, Object, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,22 @@ impl Pipeline for RecordingWarningSink {
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
         self.0.lock().unwrap().extend_from_slice(data);
         Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+struct FailingWarningSink;
+
+impl Pipeline for FailingWarningSink {
+    fn identifier(&self) -> &str {
+        "acroform warning failing sink"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Err(PipelineError::runtime("warning sink failed"))
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
@@ -834,6 +850,56 @@ fn generate_appearances_if_needed_handles_a_direct_orphan_widget() {
         .resolve_object_handle_to_terminal(&ap.get_key(b"/N"))
         .unwrap();
     assert!(normal.as_stream_dict().is_some());
+}
+
+#[test]
+fn eager_analyze_warns_for_an_orphan_page_widget() {
+    let bytes = include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
+    let logger = QPDFLogger::create();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+        &output,
+    )))));
+
+    let mut pdf = Pdf::open_mem_with_options(
+        Arc::from(bytes.as_slice()),
+        PdfOpenOptions {
+            logger: Some(logger),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(pdf.acroform().unwrap().has_acro_form().unwrap());
+
+    let warning = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        warning.contains(
+            "this widget annotation is not reachable from /AcroForm in the document catalog"
+        ),
+        "expected qpdf orphan-widget warning, got {warning:?}"
+    );
+}
+
+#[test]
+fn eager_analyze_propagates_an_orphan_warning_sink_failure() {
+    let bytes = include_bytes!("../../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf");
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingWarningSink)));
+
+    let mut pdf = Pdf::open_mem_with_options(
+        Arc::from(bytes.as_slice()),
+        PdfOpenOptions {
+            logger: Some(logger),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .unwrap();
+    let result = pdf.acroform();
+
+    assert!(matches!(
+        result,
+        Err(flpdf::Error::System(message)) if message == "warning sink failed"
+    ));
 }
 
 #[test]
