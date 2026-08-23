@@ -7,7 +7,7 @@ use std::rc::Rc;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use flpdf::pipeline::{Pipeline, PipelineResult};
+use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult};
 use flpdf::{
     apply_stream_compress_policy, pages, CompressStreams, CopyEncryptionSource, DecodeLevel,
     Dictionary, EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf,
@@ -35,6 +35,22 @@ struct RecordingPipeline {
     bytes: Rc<RefCell<Vec<u8>>>,
     writes: Rc<RefCell<usize>>,
     finishes: Rc<RefCell<usize>>,
+}
+
+struct FailingPipeline;
+
+impl Pipeline for FailingPipeline {
+    fn identifier(&self) -> &str {
+        "qpdf-writer-failing-contract"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Err(PipelineError::runtime("pipeline write failure"))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 impl Pipeline for RecordingPipeline {
@@ -2690,6 +2706,22 @@ fn set_output_pipeline_writes_and_finishes_once() -> flpdf::Result<()> {
         .arg(&output_path)
         .output()?;
     assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn set_output_pipeline_preserves_downstream_write_error() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_pipeline(FailingPipeline)?;
+
+    let error = writer
+        .write()
+        .expect_err("downstream pipeline failure must propagate");
+    assert!(matches!(
+        error,
+        flpdf::Error::System(message) if message == "pipeline write failure"
+    ));
     Ok(())
 }
 

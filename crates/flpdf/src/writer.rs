@@ -72,12 +72,9 @@ impl<'a> WriterOutputSink<'a> {
     }
 
     fn finish_output(&mut self) -> Result<()> {
+        self.flush()?;
         match self.output {
-            WriterOutput::Memory(_) => Ok(()),
-            WriterOutput::Writer(writer) => {
-                writer.flush()?;
-                Ok(())
-            }
+            WriterOutput::Memory(_) | WriterOutput::Writer(_) => Ok(()),
             WriterOutput::Pipeline(pipeline) => {
                 pipeline.finish()?;
                 Ok(())
@@ -628,29 +625,17 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
                 .write_complete(document.bytes)?;
             result
         } else {
-            if matches!(self.output.as_ref(), Some(WriterOutput::Memory(_))) {
-                // The emitter owns the only complete output Vec. Move that Vec
-                // into the memory sink after emission rather than copying it
-                // through WriterOutput::write_complete.
-                let mut bytes = Vec::new();
-                let result = emit_canonical_pdf(self.pdf, &mut bytes, &options)?;
-                if let Some(WriterOutput::Memory(buffer)) = self.output.as_mut() {
-                    *buffer = Some(bytes);
+            let output = self
+                .output
+                .as_mut()
+                .expect("output was checked before writing");
+            let mut sink = WriterOutputSink::new(output);
+            match emit_canonical_pdf(self.pdf, &mut sink, &options) {
+                Ok(result) => {
+                    sink.finish_output()?;
+                    result
                 }
-                result
-            } else {
-                let output = self
-                    .output
-                    .as_mut()
-                    .expect("output was checked before writing");
-                let mut sink = WriterOutputSink::new(output);
-                match emit_canonical_pdf(self.pdf, &mut sink, &options) {
-                    Ok(result) => {
-                        sink.finish_output()?;
-                        result
-                    }
-                    Err(error) => return Err(sink.take_failure().unwrap_or(error)),
-                }
+                Err(error) => return Err(sink.take_failure().unwrap_or(error)),
             }
         };
 
