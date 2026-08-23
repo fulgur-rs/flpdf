@@ -5144,8 +5144,9 @@ fn normalize_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<Vec<bo
 /// back into the in-memory [`Pdf`] model via [`Pdf::set_object`].
 ///
 /// The `/Length` entry in each stream's dictionary is updated to the new
-/// (normalized) byte count. No filter is applied here — the write path
-/// (full-rewrite + compress_streams) handles re-encoding.
+/// (normalized) byte count. No filter is applied here — the canonical writer
+/// emits the already-normalized bytes through qpdf's normalization branch,
+/// which takes precedence over ordinary stream compression.
 fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,

@@ -902,6 +902,29 @@ fn assert_qpdf_check(bytes: &[u8]) -> flpdf::Result<()> {
     Ok(())
 }
 
+fn qpdf_normalized_contents_snapshot(source: &[u8]) -> flpdf::Result<(Option<Object>, Vec<u8>)> {
+    qpdf_11_9_0()?;
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("qpdf-normalize-input.pdf");
+    let output = dir.path().join("qpdf-normalize-output.pdf");
+    std::fs::write(&input, source)?;
+    let command = Command::new("qpdf")
+        .args([
+            "--normalize-content=y",
+            "--compress-streams=y",
+            "--object-streams=disable",
+            "--static-id",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .output()?;
+    assert!(
+        command.status.success(),
+        "qpdf normalization failed: {command:?}"
+    );
+    decoded_runlength_snapshot(std::fs::read(output)?)
+}
+
 fn runlength_contents_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rewritten PDF must reopen");
     let catalog_ref = pdf.root_ref().expect("fixture must have a catalog");
@@ -3451,9 +3474,12 @@ fn pdf_writer_qdf_explicit_false_suppresses_content_normalization() -> flpdf::Re
 #[test]
 fn pdf_writer_explicit_content_normalization_applies_without_qdf() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
-    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
-        false, b"A\rB",
-    )))?;
+    let source = synthetic_flate_contents_pdf_with_payload(false, b"A\rB");
+    let (qpdf_filter, qpdf_decoded) = qpdf_normalized_contents_snapshot(&source)?;
+    assert_eq!(qpdf_filter, None);
+    assert_eq!(qpdf_decoded, b"A\nB");
+
+    let mut pdf = Pdf::open(Cursor::new(source))?;
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_content_normalization(true);
@@ -3463,8 +3489,8 @@ fn pdf_writer_explicit_content_normalization_applies_without_qdf() -> flpdf::Res
     assert_qpdf_check(&output)?;
 
     let (filter, decoded) = decoded_runlength_snapshot(output)?;
-    assert_eq!(filter, Some(Object::Name(b"FlateDecode".to_vec())));
-    assert_eq!(decoded, b"A\nB");
+    assert_eq!(filter, qpdf_filter);
+    assert_eq!(decoded, qpdf_decoded);
     Ok(())
 }
 
