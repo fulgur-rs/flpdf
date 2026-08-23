@@ -5297,7 +5297,7 @@ fn collect_content_container_refs<R: Read + Seek>(
 /// and non-stream values are intentionally omitted: the former have no object
 /// identity for `contents_seq`, and the latter are the tolerant writer shape
 /// qpdf skips while still rewriting valid sibling streams.
-fn collect_content_stream_refs_tolerant<R: Read + Seek>(
+pub(crate) fn collect_content_stream_refs_tolerant<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<ObjectRef>> {

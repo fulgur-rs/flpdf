@@ -612,6 +612,7 @@ fn append_body_object(
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<ObjectRef>,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let map = |object_ref| {
         renumber.new_for_original(object_ref).ok_or_else(|| {
@@ -633,7 +634,11 @@ fn append_body_object(
     }
 
     let (dict, data, mut refiltered) =
-        crate::writer::plain::body::canonical_stream_output_for_linearization(object, options)?;
+        crate::writer::plain::body::canonical_stream_output_for_linearization(
+            object,
+            options,
+            options.content_normalization && content_normalize_refs.contains(&original_ref),
+        )?;
     let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
     let cleartext_metadata = payload_ctx
@@ -701,6 +706,7 @@ fn append_body_object_for_ref<R: Read + Seek>(
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     renumber: &RenumberMap,
     removed_refs: &BTreeSet<ObjectRef>,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<usize> {
     let object = pdf.get_object_handle(original_ref);
     pdf.resolve_object_handle(&object)?;
@@ -714,6 +720,7 @@ fn append_body_object_for_ref<R: Read + Seek>(
         encrypted_string_emitter,
         renumber,
         removed_refs,
+        content_normalize_refs,
     )
 }
 
@@ -2287,6 +2294,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
         report_progress_event(options);
@@ -2325,6 +2333,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced open-document references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options);
@@ -2438,6 +2447,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Part-2 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options);
@@ -2476,6 +2486,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Part-3 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
         report_progress_event(options);
@@ -2534,6 +2545,7 @@ fn do_write_pass<R: Read + Seek>(
             encrypted_string_emitter.as_deref_mut(),
             renumber,
             &plan.removed_refs,
+            &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced outline references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2606,6 +2618,7 @@ fn do_write_pass<R: Read + Seek>(
                     encrypted_string_emitter.as_deref_mut(),
                     renumber,
                     &plan.removed_refs,
+                    &plan.content_normalize_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options);
@@ -8883,6 +8896,7 @@ mod tests {
             Some(&mut emitter),
             &renumber,
             &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .expect("linearized encrypted body stream");
 
@@ -9037,6 +9051,7 @@ mod tests {
             None,
             &renumber,
             &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .expect("linearized plain body stream");
 
@@ -9073,6 +9088,7 @@ mod tests {
             None,
             None,
             &renumber,
+            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .expect_err("missing reference must not be silently emitted");

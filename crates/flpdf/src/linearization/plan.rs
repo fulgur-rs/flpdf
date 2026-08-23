@@ -168,9 +168,34 @@ pub(crate) fn collect_direct_refs(
     Ok(())
 }
 
+/// The set of terminal indirect page-content stream refs, matching the plain
+/// writer's `contents_seq` identity gate
+/// (`writer.rs`'s `options.content_normalization && contents_seq.contains_key(old_ref)`).
+///
+/// Empty when `options.content_normalization` is off: qpdf's own
+/// `m->normalize_content && m->normalized_streams.count(old_og)` gate
+/// (`QPDFWriter.cc:1277`) is false for every stream in that case, so no
+/// per-stream membership computation is needed.
+fn linearization_content_normalize_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &crate::writer::WriterOptions,
+) -> Result<BTreeSet<ObjectRef>> {
+    if !options.content_normalization {
+        return Ok(BTreeSet::new());
+    }
+    let mut refs = BTreeSet::new();
+    for page_ref in crate::pages::page_refs(pdf)? {
+        for terminal_ref in crate::writer::collect_content_stream_refs_tolerant(pdf, page_ref)? {
+            refs.insert(terminal_ref);
+        }
+    }
+    Ok(refs)
+}
+
 fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     options: &crate::writer::WriterOptions,
+    content_normalize_refs: &BTreeSet<ObjectRef>,
 ) -> Result<BTreeSet<ObjectRef>> {
     let mut skipped_streams = BTreeSet::new();
     for object_ref in pdf.object_refs() {
@@ -194,7 +219,7 @@ fn stream_refs_to_skip_parameter_edges<R: Read + Seek>(
                 &handle,
                 options,
                 true,
-                options.content_normalization,
+                content_normalize_refs.contains(&object_ref),
             )?
         // cov:ignore-end
         {
@@ -977,6 +1002,15 @@ pub struct LinearizationPlan {
     /// and preserved ObjStm containers without re-reading the PDF.
     pub(crate) optimization: Option<crate::optimization::Optimization>,
 
+    /// Terminal indirect page-content stream refs, matching the plain
+    /// writer's `contents_seq` identity gate. Empty when
+    /// `options.content_normalization` was off. The writer must reuse this
+    /// exact set (not recompute it) so a stream's plan-time refilter probe
+    /// and its real emission agree on whether content normalization
+    /// applies, mirroring qpdf's single `m->normalized_streams` set shared
+    /// between `willFilterStream` and emission (`QPDFWriter.cc:1277`).
+    pub(crate) content_normalize_refs: BTreeSet<ObjectRef>,
+
     /// Live source generations that qpdf drops while planning generated or
     /// preserved object streams. References to these objects are rewritten as
     /// qpdf-null values even though the source xref entry itself is live.
@@ -1080,7 +1114,9 @@ impl LinearizationPlan {
                 )
             })?;
         }
-        let skipped_stream_parameter_streams = stream_refs_to_skip_parameter_edges(pdf, options)?;
+        let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
+        let skipped_stream_parameter_streams =
+            stream_refs_to_skip_parameter_edges(pdf, options, &content_normalize_refs)?;
         let optimization = crate::optimization::Optimization::optimize(
             pdf,
             &BTreeMap::new(),
@@ -1840,6 +1876,7 @@ impl LinearizationPlan {
             object_stream_mode,
             removed_refs,
             optimization: Some(optimization),
+            content_normalize_refs,
         })
     }
 
@@ -2294,6 +2331,7 @@ impl Default for LinearizationPlan {
             optimization: None,
             removed_refs: BTreeSet::new(),
             object_stream_mode: crate::writer::ObjectStreamMode::Disable,
+            content_normalize_refs: BTreeSet::new(),
         }
     }
 }
@@ -3092,6 +3130,64 @@ mod tests {
         assert!(!handle_has_stream_parameter_skip(&stream, &BTreeSet::from([other_ref])).unwrap());
         assert!(!handle_has_stream_parameter_skip(&ObjectHandle::integer(1), &skipped).unwrap());
         assert!(!handle_has_stream_parameter_skip(&stream, &BTreeSet::new()).unwrap());
+    }
+
+    /// `linearization_content_normalize_refs` must select exactly the same
+    /// terminal indirect content-stream refs as the plain writer's
+    /// `contents_seq`/`normalized_stream_refs` (`writer.rs:4273-4306`,
+    /// `writer.rs:3820-3828`) on the same document, since the linearization
+    /// plan and the plain writer both gate `canonical_stream_output_*` on
+    /// this identity to match qpdf's single `m->normalized_streams` set
+    /// shared between `willFilterStream` and emission (`QPDFWriter.cc:1277`).
+    /// A page tree that needs qpdf-style repair could make the two
+    /// enumeration sources disagree; this fixture's page tree is already
+    /// well-formed (indirect, non-duplicate `/Kids` leaves), which is the
+    /// only shape this test can attest to.
+    #[test]
+    fn linearization_content_normalize_refs_matches_plain_writer_contents_seq() {
+        let options = crate::writer::WriterOptions {
+            content_normalization: true,
+            ..crate::writer::WriterOptions::default()
+        };
+
+        let mut pdf =
+            Pdf::open(Cursor::new(thumb_first_page_shared_pdf_bytes())).expect("fixture parses");
+        let mine = linearization_content_normalize_refs(&mut pdf, &options).unwrap();
+
+        let mut plain_pdf =
+            Pdf::open(Cursor::new(thumb_first_page_shared_pdf_bytes())).expect("fixture parses");
+        let mut theirs = BTreeSet::new();
+        for page_ref in crate::PageDocumentHelper::new(&mut plain_pdf)
+            .get_all_pages()
+            .unwrap()
+        {
+            for terminal_ref in
+                crate::writer::collect_content_stream_refs_tolerant(&mut plain_pdf, page_ref)
+                    .unwrap()
+            {
+                theirs.insert(terminal_ref);
+            }
+        }
+
+        assert_eq!(
+            mine,
+            BTreeSet::from([ObjectRef::new(6, 0), ObjectRef::new(7, 0)]),
+            "must select only the two page content streams, not the shared image XObject"
+        );
+        assert_eq!(
+            mine, theirs,
+            "linearization plan-time set must match the plain writer's canonical set"
+        );
+    }
+
+    #[test]
+    fn linearization_content_normalize_refs_empty_when_normalization_off() {
+        let options = crate::writer::WriterOptions::default();
+        let mut pdf =
+            Pdf::open(Cursor::new(thumb_first_page_shared_pdf_bytes())).expect("fixture parses");
+        assert!(linearization_content_normalize_refs(&mut pdf, &options)
+            .unwrap()
+            .is_empty());
     }
 
     // -----------------------------------------------------------------------

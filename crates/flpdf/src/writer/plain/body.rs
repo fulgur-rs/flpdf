@@ -615,20 +615,28 @@ fn push_spaces(out: &mut Vec<u8>, count: usize) {
 /// `QPDFWriter::writeLinearized` uses the same metadata decision in its
 /// `willFilterStream` probe and its final emission (`QPDFWriter.cc:1234-1314`),
 /// so planning and writing must share the full-rewrite metadata policy here.
+///
+/// `normalize_content` must be the caller's own per-stream identity
+/// decision (matching qpdf's `m->normalize_content &&
+/// m->normalized_streams.count(old_og)` gate, `QPDFWriter.cc:1277`), not a
+/// blanket `options.content_normalization` -- normalization applies only to
+/// actual page-content streams, never document-wide.
 pub(crate) fn canonical_stream_output_for_linearization(
     handle: &ObjectHandle,
     options: &WriterOptions,
+    normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
     let (dict, data, refiltered, _) =
-        canonical_stream_output_for_linearization_with_status(handle, options)?;
+        canonical_stream_output_for_linearization_with_status(handle, options, normalize_content)?;
     Ok((dict, data, refiltered))
 }
 
 pub(crate) fn canonical_stream_output_for_linearization_with_status(
     handle: &ObjectHandle,
     options: &WriterOptions,
+    normalize_content: bool,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool, bool)> {
-    canonical_stream_output_with_status(handle, options, true, options.content_normalization)
+    canonical_stream_output_with_status(handle, options, true, normalize_content)
 }
 
 /// Return whether the qpdf-shaped stream pipeline will replace the source
