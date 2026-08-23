@@ -458,6 +458,33 @@ mod tests {
     }
 
     #[test]
+    fn direct_pages_root_walks_direct_descendant_and_reference_kids() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (
+                1,
+                b"<< /Type /Catalog /Pages << /Type /Pages /Kids [<< /Type /Pages /Kids [3 0 R] /Count 1 /Rotate 90 >>] /Count 1 >> >>",
+            ),
+            (
+                3,
+                b"<< /Type /Page /MediaBox [0 0 612 792] >>",
+            ),
+        ]))
+        .unwrap();
+        let prepared = PreparedPages {
+            root: PageTreeRoot::Direct {
+                catalog: ObjectRef::new(1, 0),
+            },
+            pages: vec![ObjectRef::new(3, 0)],
+        };
+
+        push(&mut pdf, &prepared, true, false).expect("direct root walk");
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).expect("resolve direct-root page");
+        assert_eq!(page.get_key(b"/Rotate").as_integer(), Some(90));
+    }
+
+    #[test]
     fn warning_mode_reports_unknown_intermediate_pages_key() {
         let mut pdf = Pdf::open_mem_owned(pdf_with_unknown_intermediate_pages_key()).unwrap();
         let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
@@ -533,5 +560,35 @@ mod tests {
 
         assert!(matches!(error, Error::Unsupported(ref message)
                 if message.contains("page tree depth exceeds maximum")));
+    }
+
+    #[test]
+    fn canonical_inherited_attribute_chain_bounds_a_reference_cycle() {
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes(&[
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>"),
+        ]))
+        .unwrap();
+        pdf.set_object(
+            ObjectRef::new(20, 0),
+            Object::Reference(ObjectRef::new(21, 0)),
+        );
+        pdf.set_object(
+            ObjectRef::new(21, 0),
+            Object::Reference(ObjectRef::new(20, 0)),
+        );
+        let start = pdf.get_object_handle(ObjectRef::new(20, 0));
+
+        let (terminal, terminal_ref) =
+            resolve_handle_chain(&mut pdf, &start).expect("reference cycle is bounded");
+        assert!(terminal.as_reference().is_some());
+        assert!(matches!(
+            terminal_ref,
+            Some(ObjectRef {
+                number: 20 | 21,
+                generation: 0
+            })
+        ));
     }
 }
