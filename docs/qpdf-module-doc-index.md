@@ -140,7 +140,6 @@
 | `crates/flpdf/src/resource_finder.rs` | correspondence | \`ResourceFinder.cc\` |
 | `crates/flpdf/src/resource_replacer.rs` | correspondence | \`QPDFAcroFormDocumentHelper.cc\` \`ResourceReplacer\` |
 | `crates/flpdf/src/resources.rs` | correspondence | \`QPDFPageObjectHelper::removeUnreferencedResources\` |
-| `crates/flpdf/src/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
 | `crates/flpdf/src/signatures.rs` | correspondence | QPDFAcroFormDocumentHelper.cc signature disabling and QPDF.cc restriction removal plus flpdf-only inspection |
 | `crates/flpdf/src/stream_filter.rs` | correspondence | QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from either Object-shaped or ObjectHandle-shaped /Filter and /DecodeParms values |
 | `crates/flpdf/src/struct_tree_pg.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for structure elements |
@@ -161,6 +160,8 @@
 | `crates/flpdf/src/writer/plain/mod.rs` | correspondence | QPDFWriter.cc standard write pipeline split across plain writer modules |
 | `crates/flpdf/src/writer/plain/plan.rs` | correspondence | QPDFWriter.cc standard-write object placement and renumber planning |
 | `crates/flpdf/src/writer/plain/xref.rs` | correspondence | QPDFWriter.cc classic and stream xref emission for the plain writer |
+| `crates/flpdf/src/writer/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
+| `crates/flpdf/src/writer/rewrite_renumber_tests.rs` | correspondence | test-only coverage for QPDFWriter trailer reference renumbering |
 | `crates/flpdf/src/writer/serialize.rs` | correspondence | QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives |
 | `crates/flpdf/src/writer/settings.rs` | correspondence | QPDFWriter.cc writer-setting state and conversion to emission options |
 | `crates/flpdf/src/xref.rs` | correspondence | QPDF.cc xref loading and repair |

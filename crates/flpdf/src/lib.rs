@@ -145,7 +145,6 @@ pub mod ref_chain;
 mod resource_finder;
 mod resource_replacer;
 pub mod resources;
-pub(crate) mod rewrite_renumber;
 pub mod signatures;
 pub(crate) mod stream_filter;
 pub mod struct_tree_pg;

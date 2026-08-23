@@ -661,7 +661,7 @@ mod tests {
             .cloned()
             .map(|members| ObjectStreamGroup::Synthetic { members })
             .collect();
-        let rn = crate::rewrite_renumber::ObjectStreamRenumber::build(
+        let rn = crate::writer::rewrite_renumber::ObjectStreamRenumber::build(
             &mut pdf,
             &renumber_groups,
             true,
