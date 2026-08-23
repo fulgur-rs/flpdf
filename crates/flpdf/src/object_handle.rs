@@ -1977,19 +1977,36 @@ impl ObjectHandle {
     #[allow(dead_code)] // reached through the try_* accessors, whose own
                         // production consumers land with flpdf-25kg.3.6
     pub(crate) fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
-        let slot = self.0.borrow();
-        if let Some(resolver) = slot.resolver.as_ref().and_then(Weak::upgrade) {
-            return Some(resolver);
-        }
+        // qpdf's `setChildDescription` copies the owning QPDF onto the child
+        // (`libqpdf/QPDFObject_private.hh:79-91`). A missing-key null can be
+        // nested through several dictionary lookups, so follow the complete
+        // child-description chain rather than checking only its immediate
+        // parent. Keep a slot-identity guard because malformed programmatic
+        // direct values can construct reciprocal description links.
+        let mut current = self.clone();
+        let mut seen = BTreeSet::new();
+        loop {
+            let current_id = Rc::as_ptr(&current.0) as usize;
+            if !seen.insert(current_id) {
+                break;
+            }
 
-        if let Some(ObjectDescription::Child(child)) = &slot.description {
-            let resolver = child
-                .parent
-                .upgrade()
-                .and_then(|parent| parent.borrow().resolver.as_ref().and_then(Weak::upgrade));
+            let (resolver, parent) = {
+                let slot = current.0.borrow();
+                let resolver = slot.resolver.as_ref().and_then(Weak::upgrade);
+                let parent = match &slot.description {
+                    Some(ObjectDescription::Child(child)) => child.parent.upgrade(),
+                    _ => None,
+                };
+                (resolver, parent)
+            };
             if let Some(resolver) = resolver {
                 return Some(resolver);
             }
+            let Some(parent) = parent else {
+                break;
+            };
+            current = ObjectHandle(parent);
         }
 
         // qpdf's literal `QPDFObjectHandle::newNull()` carries neither a
@@ -1997,17 +2014,13 @@ impl ObjectHandle {
         // array, dictionary, or stream dictionary
         // (`libqpdf/QPDF_Null.cc:12-15`, `QPDFParser.cc:397-410`). Do not lend
         // it the parent's context through our containment back-links: a
-        // dictionary accessor on that null must take qpdf's contextless
-        // exception path. A dictionary-missing-key null is different: qpdf's
-        // `setChildDescription` copies the parent QPDF* onto it
-        // (`libqpdf/QPDFObject_private.hh:79-91`), so the Child description
-        // branch above intentionally preserves that context-aware warning.
-        // Non-null direct children still use the parent fallback below, and
+        // contextless null must take qpdf's exception path. Non-null direct
+        // children still use the containment-parent fallback below, and
         // indirect nulls retain their own resolver above.
+        let slot = self.0.borrow();
         if matches!(&*slot.state.borrow(), ObjectValue::Null) {
             return None;
         }
-
         slot.containment_parents.iter().find_map(|parent| {
             parent
                 .upgrade()
@@ -17439,6 +17452,34 @@ pub(crate) mod warning_emission_tests {
             warnings(&recorder),
             ["object 5 0 at offset 253 -> dictionary key /EF: operation for dictionary attempted on object of type null: treating as empty"]
         );
+    }
+
+    #[test]
+    fn nested_missing_key_warning_keeps_the_qpdf_document_context() {
+        let (root, recorder) =
+            handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+
+        let pages = root.try_get_key(b"/Pages").unwrap();
+        let count = pages.try_get_key(b"/Count").unwrap();
+
+        assert_eq!(count.try_get_int_value().unwrap(), 0);
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "object 3 0 -> dictionary key /Pages: operation for dictionary attempted on object of type null: returning null for attempted key retrieval",
+                "object 3 0 -> dictionary key /Pages -> null returned from getting key  from non-Dictionary: operation for integer attempted on object of type null: returning 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn context_terminates_on_a_reciprocal_child_description_cycle() {
+        let first = ObjectHandle::integer(1);
+        let second = ObjectHandle::integer(2);
+        first.set_child_description(&second, " -> first $VD", "/First");
+        second.set_child_description(&first, " -> second $VD", "/Second");
+
+        assert!(first.context().is_none());
     }
 
     #[test]

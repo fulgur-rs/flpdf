@@ -244,3 +244,82 @@ fn ordinary_show_pages_does_not_resolve_contents_reference() {
     assert!(String::from_utf8_lossy(&flpdf.stderr).is_empty());
     assert!(String::from_utf8_lossy(&flpdf.stdout).contains("contents: 5 0 R"));
 }
+
+fn pdf_with_catalog_and_optional_pages(pages_object: Option<&[u8]>) -> tempfile::NamedTempFile {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog = if pages_object.is_some() {
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".as_slice()
+    } else {
+        b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".as_slice()
+    };
+    let mut offsets = vec![bytes.len()];
+    bytes.extend_from_slice(catalog);
+    if let Some(pages_object) = pages_object {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(pages_object);
+    }
+    let startxref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+            offsets.len() + 1
+        )
+        .as_bytes(),
+    );
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), bytes).unwrap();
+    file
+}
+
+fn assert_show_npages_matches_qpdf(path: &std::path::Path) {
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-npages", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--show-npages", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        flpdf.status.code(),
+        qpdf.status.code(),
+        "qpdf stdout={:?} stderr={:?}; flpdf stdout={:?} stderr={:?}",
+        qpdf.stdout,
+        qpdf.stderr,
+        flpdf.stdout,
+        flpdf.stderr
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stdout),
+        normalize_newlines(&qpdf.stdout)
+    );
+    assert_eq!(
+        normalize_newlines(&flpdf.stderr),
+        normalize_newlines(&qpdf.stderr)
+    );
+}
+
+#[test]
+fn show_npages_reads_the_present_pages_count_without_walking_kids() {
+    let file = pdf_with_catalog_and_optional_pages(Some(
+        b"2 0 obj\n<< /Type /Pages /Kids [] /Count 99 >>\nendobj\n",
+    ));
+
+    assert_show_npages_matches_qpdf(file.path());
+}
+
+#[test]
+fn show_npages_preserves_qpdf_missing_pages_warning_and_status() {
+    let file = pdf_with_catalog_and_optional_pages(None);
+
+    assert_show_npages_matches_qpdf(file.path());
+}
