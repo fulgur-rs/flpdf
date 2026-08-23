@@ -2088,9 +2088,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// is a no-op. Resolution is delegated directly to the canonical
     /// `ResolverHandle` cache; it never materializes a legacy [`Object`].
     ///
+    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily
+    /// and retain the same shared object identity: resolving the same
+    /// indirect reference more than once yields handles that alias the same
+    /// cached value rather than independent copies. [`Pdf::resolve_object`]
+    /// is the owned raw-`Object` resolver, kept under its own explicit name
+    /// only for the next legacy-route removal slice.
+    ///
     /// This does not chase through an already-resolved
     /// [`Pdf::set_object`]-driven bare-reference redirect to its terminal
-    /// value — see [`Pdf::resolve_object_handle_to_terminal`] for that.
+    /// value — see [`Pdf::resolve_to_terminal`] for that.
     /// [`Pdf::resolve_borrowed`] (and everything built on it, notably
     /// `ref_chain.rs`'s own bounded chain-follow primitive) depends on this
     /// method exposing exactly one hop per call, not silently collapsing a
@@ -2104,7 +2111,7 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// I/O, parse, filter, or decryption failures propagate. Free, absent, or
     /// overridden references resolve to the canonical null fallback.
-    pub fn resolve_object_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
+    pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
         // ObjectHandle resolution is qpdf's canonical cache operation. The
         // resolver owns the source xref table, live parser, stream pipeline,
         // and one handle per object reference; no raw Object materialization
@@ -2118,13 +2125,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// header at `offset`, rather than the effective xref row, determines the
     /// returned [`ObjectHandle`] identity. It is used by linearization hint
     /// streams, whose `/H[0]` value is a physical byte location.
-    pub(crate) fn resolve_object_handle_at_offset(
+    pub(crate) fn resolve_at_offset(
         &self,
         offset: u64,
         expected: ObjectRef,
     ) -> Result<ObjectHandle> {
-        self.resolver
-            .resolve_object_handle_at_offset(offset, expected)
+        self.resolver.resolve_at_offset(offset, expected)
     }
 
     /// Return qpdf's first-1024-byte linearization candidate as an exact
@@ -2167,7 +2173,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.with_writer_stream_recovery(operation)
     }
 
-    /// Resolve `handle` (via [`Pdf::resolve_object_handle`]), then chase
+    /// Resolve `handle` (via [`Pdf::resolve`]), then chase
     /// through a [`Pdf::set_object`]-driven bare-reference redirect (if any)
     /// to its terminal (non-reference) value. Every accessor (`type_code`,
     /// `as_integer`, `unparse_resolved`, …) called on the *returned* handle
@@ -2226,18 +2232,15 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// Same as [`Pdf::resolve_object_handle`].
-    pub fn resolve_object_handle_to_terminal(
-        &mut self,
-        handle: &ObjectHandle,
-    ) -> Result<ObjectHandle> {
-        Ok(self.resolve_object_handle_to_terminal_ref(handle)?.0)
+    /// Same as [`Pdf::resolve`].
+    pub fn resolve_to_terminal(&mut self, handle: &ObjectHandle) -> Result<ObjectHandle> {
+        Ok(self.resolve_to_terminal_ref(handle)?.0)
     }
 
     /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: terminal-ref legacy API.
     /// Delete with `ObjectValue::Reference`; do not call from new code.
     ///
-    /// Same chase as [`Pdf::resolve_object_handle_to_terminal`], additionally
+    /// Same chase as [`Pdf::resolve_to_terminal`], additionally
     /// returning the object reference the terminal value was actually read
     /// from. This is `None` exactly when the returned handle is direct with
     /// no indirect identity of its own — either `handle` itself was direct,
@@ -2245,7 +2248,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// back to a null handle. Whenever it is `Some`, the returned handle is
     /// that object's own canonical, indirect handle. Otherwise it is `handle.object_ref()` when no
     /// [`Pdf::set_object`] redirect was chased (matching
-    /// [`Pdf::resolve_object_handle_to_terminal`]'s own "returns `handle`
+    /// [`Pdf::resolve_to_terminal`]'s own "returns `handle`
     /// unchanged" case), or the *last* hop's ref when one or more redirects
     /// were followed — deliberately not the chain's first ref, which callers
     /// needing offset/diagnostic attribution for the terminal object itself
@@ -2254,12 +2257,12 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// # Errors
     ///
-    /// Same as [`Pdf::resolve_object_handle`].
-    pub fn resolve_object_handle_to_terminal_ref(
+    /// Same as [`Pdf::resolve`].
+    pub fn resolve_to_terminal_ref(
         &mut self,
         handle: &ObjectHandle,
     ) -> Result<(ObjectHandle, Option<ObjectRef>)> {
-        self.resolve_object_handle(handle)?;
+        self.resolve(handle)?;
         let Some(mut current_ref) = handle.as_reference() else {
             // already terminal (the common case) — or unresolved/null;
             // `handle.object_ref()` is already the correct terminal ref,
@@ -2273,7 +2276,7 @@ impl<R: Read + Seek> Pdf<R> {
         // a reference whose own value is another reference to chase here.
         for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
             let hop = self.get_object_handle(current_ref);
-            self.resolve_object_handle(&hop)?;
+            self.resolve(&hop)?;
             match hop.as_reference() {
                 Some(next) => current_ref = next,
                 // `hop` itself, not a copy of it: qpdf's own dereference
@@ -2296,7 +2299,7 @@ impl<R: Read + Seek> Pdf<R> {
                 //
                 // `hop` is always a resolved value here, so it presents a
                 // value exactly as a copy of it would: the one state that
-                // would differ, `Unresolved`, needs `resolve_object_handle`
+                // would differ, `Unresolved`, needs `resolve`
                 // to have hit a `CacheEntry::Reserved` entry, and that guard
                 // exists only while `resolve_pending_stream_length` is on the
                 // stack (it is the sole `set_reserved` caller and clears the
@@ -2532,25 +2535,6 @@ impl<R: Read + Seek> Pdf<R> {
         }
     }
 
-    /// Resolve `handle` in place through the canonical qpdf object graph.
-    ///
-    /// qpdf's typed `QPDFObjectHandle` accessors call `QPDF::resolve` lazily and
-    /// retain the same shared object identity: resolving the same indirect
-    /// reference more than once yields handles that alias the same cached
-    /// value rather than independent copies. [`Pdf::resolve_object`] is the
-    /// owned raw-`Object` resolver kept under its own explicit name only for
-    /// the next legacy-route removal slice.
-    ///
-    /// # Errors
-    ///
-    /// Has the same error behavior as [`Pdf::resolve_object_handle`]:
-    /// I/O, parse, filter, or decryption failures propagate. A free, absent,
-    /// or overridden reference resolves to the canonical null fallback rather
-    /// than erroring.
-    pub fn resolve(&mut self, handle: &ObjectHandle) -> Result<()> {
-        self.resolve_object_handle(handle)
-    }
-
     // qpdf-cutover-delete: owned raw-`Object` resolver. Delete after its
     // callers use canonical handle accessors; do not use it from the new
     // resolver path.
@@ -2694,7 +2678,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// bounded retry budget, and canonical parsing must never bypass it.
     fn materialize_canonical_compatibility_value(&mut self, object_ref: ObjectRef) -> Result<bool> {
         let handle = self.get_object_handle(object_ref);
-        self.resolve_object_handle(&handle)?;
+        self.resolve(&handle)?;
         self.synchronize_canonical_recovered_stream_eol(object_ref)?;
         self.synchronize_legacy_resolution_state();
         if !handle.is_resolved() {
@@ -2944,7 +2928,7 @@ impl<R: Read + Seek> Pdf<R> {
         if self.resolve_to_cache(object_ref)? {
             if self.handle_mutated_object_refs.contains(&object_ref) {
                 let handle = self.get_object_handle(object_ref);
-                self.resolve_object_handle(&handle)?;
+                self.resolve(&handle)?;
                 return handle.materialize();
             }
             if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
@@ -2984,7 +2968,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolve_to_cache(object_ref)?;
         if self.handle_mutated_object_refs.contains(&object_ref) {
             let handle = self.get_object_handle(object_ref);
-            self.resolve_object_handle(&handle)?;
+            self.resolve(&handle)?;
             self.legacy_materialized_memo
                 .insert(object_ref, handle.materialize()?);
             return Ok(self
@@ -3292,7 +3276,7 @@ impl<R: Read + Seek> Pdf<R> {
         let canonical_error = if prefer_legacy_framing {
             None
         } else {
-            self.resolve_object_handle(&stream_handle).err()
+            self.resolve(&stream_handle).err()
         };
         if !prefer_legacy_framing
             && canonical_error.is_none()
@@ -4276,8 +4260,7 @@ mod tests {
         let mut pdf = Pdf::open(std::io::BufReader::new(file)).expect("authenticate fixture");
         let object_ref = ObjectRef::new(4, 0);
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve object 4 0");
+        pdf.resolve(&handle).expect("resolve object 4 0");
         handle
             .get_raw_stream_data()
             .expect("read raw stream data (triggers length recovery)");
@@ -4308,8 +4291,7 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("open destination PDF");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve_object_handle(&root)
-            .expect("resolve destination root");
+        pdf.resolve(&root).expect("resolve destination root");
         let nums = root.get_key(b"/Names").get_key(b"/Nums");
 
         let mut foreign_pdf = Pdf::open(Cursor::new(bytes)).expect("open foreign PDF");
@@ -4456,8 +4438,7 @@ mod tests {
             other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: unreachable given this test's own fixture
         };
         let info_handle = rt.get_object_handle(info_ref);
-        rt.resolve_object_handle(&info_handle)
-            .expect("resolve /Info handle");
+        rt.resolve(&info_handle).expect("resolve /Info handle");
         let dict = info_handle
             .as_dictionary()
             .expect("/Info must be a dictionary");
@@ -5139,7 +5120,7 @@ mod tests {
         )
         .expect("open qpdf oracle fixture with flpdf");
         let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve_object_handle(&stream)
+        pdf.resolve(&stream)
             .expect("resolve source-backed encrypted stream");
         let flpdf = stream
             .get_stream_data(crate::writer::DecodeLevel::All)
@@ -6254,8 +6235,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve_object_handle(&pages).expect("resolve pages");
-        pdf.resolve_object_handle(&page).expect("resolve page");
+        pdf.resolve(&pages).expect("resolve pages");
+        pdf.resolve(&page).expect("resolve page");
 
         // Each handle is held by: this test's own local variable, the
         // registry, and the other object's resolved value (the cycle).
@@ -6552,7 +6533,7 @@ mod tests {
             .expect("make stream indirect");
         let stream_ref = stream.object_ref().expect("stream ref");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve_object_handle(&root).expect("resolve root");
+        pdf.resolve(&root).expect("resolve root");
         root.replace_key(b"/Extra", stream.clone()).unwrap();
         pdf.mark_object_dirty(ObjectRef::new(1, 0));
 
@@ -6746,7 +6727,7 @@ mod tests {
     fn canonical_removal_emits_a_null_child_without_legacy_materialization() {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&pages).expect("resolve pages");
+        pdf.resolve(&pages).expect("resolve pages");
         let kids = pages.get_key(b"/Kids");
         assert_eq!(kids.try_array_len().expect("read page kids"), Some(1));
 
@@ -6790,8 +6771,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open target");
         let mut foreign_pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open foreign");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve_object_handle(&root)
-            .expect("resolve target root");
+        pdf.resolve(&root).expect("resolve target root");
         let foreign = foreign_pdf.get_object_handle(ObjectRef::new(3, 0));
         let error = root
             .replace_key(b"/Foreign", foreign)
@@ -6863,6 +6843,42 @@ mod tests {
     }
 
     #[test]
+    fn qpdf_json_mutated_cache_paths_reenter_canonical_resolution() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+                b"2 0 obj\n42\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+
+        // A raw cache entry can already be resolved while its canonical handle
+        // remains unresolved. The qpdf-JSON path must resolve that handle before
+        // materializing the value, rather than trusting the stale raw snapshot.
+        let first_ref = ObjectRef::new(1, 0);
+        pdf.handle_mutated_object_refs.insert(first_ref);
+        pdf.cache.set_resolved(first_ref, Object::Null);
+        let mut expected_catalog = Dictionary::new();
+        expected_catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(first_ref)
+                .expect("canonical JSON resolution"),
+            Object::Dictionary(expected_catalog)
+        );
+
+        // The borrowed path reaches the same canonical re-entry after its raw
+        // cache read installs a fresh resolved entry.
+        let second_ref = ObjectRef::new(2, 0);
+        pdf.handle_mutated_object_refs.insert(second_ref);
+        assert_eq!(
+            pdf.resolve_qpdf_json_object_borrowed(second_ref)
+                .expect("borrowed canonical JSON resolution"),
+            &Object::Integer(42)
+        );
+    }
+
+    #[test]
     fn mark_object_dirty_makes_a_replace_key_mutation_survive_a_full_rewrite() {
         // Regression test: ObjectHandle::replace_key mutates the live
         // handle graph directly and has no path back to Pdf's dirty
@@ -6872,7 +6888,7 @@ mod tests {
         let page_ref = ObjectRef::new(3, 0);
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page).expect("resolve page");
+        pdf.resolve(&page).expect("resolve page");
         page.replace_key(b"/Rotate", ObjectHandle::integer(90))
             .unwrap();
         pdf.mark_object_dirty(page_ref);
@@ -6911,8 +6927,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(pdf_with_one_stream(b"original payload"))
             .expect("open stream fixture");
         let stream = pdf.get_object_handle(stream_ref);
-        pdf.resolve_object_handle(&stream)
-            .expect("resolve loaded stream");
+        pdf.resolve(&stream).expect("resolve loaded stream");
 
         stream
             .replace_stream_data_with_callback(
@@ -6943,7 +6958,7 @@ mod tests {
         let mut reopened = Pdf::open_mem_owned(output).expect("reopen rewritten output");
         let rewritten_stream = reopened.get_object_handle(stream_ref);
         reopened
-            .resolve_object_handle(&rewritten_stream)
+            .resolve(&rewritten_stream)
             .expect("resolve rewritten stream");
         assert_eq!(
             rewritten_stream
@@ -8167,7 +8182,7 @@ mod tests {
             Some(&Object::Integer(1))
         );
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle).unwrap();
+        pdf.resolve(&handle).unwrap();
         handle
             .replace_key(b"/Value", ObjectHandle::integer(2))
             .unwrap();
@@ -8209,7 +8224,7 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve the canonical handle before mutating it");
         handle
             .replace_key(b"/Value", ObjectHandle::integer(2))
@@ -8252,7 +8267,7 @@ mod tests {
         );
         let mut source = Pdf::open_mem_owned(bytes.clone()).expect("open source");
         let source_owner = source.get_object_handle(object_ref);
-        source.resolve_object_handle(&source_owner).unwrap();
+        source.resolve(&source_owner).unwrap();
         let foreign = source_owner.get_key(b"/Child");
         assert!(foreign.is_direct());
         let mut destination = Pdf::open_mem_owned(bytes).expect("open destination");
@@ -8273,7 +8288,7 @@ mod tests {
             classic_pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"], object_ref);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
         let owner = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&owner).unwrap();
+        pdf.resolve(&owner).unwrap();
         let inner = ObjectHandle::integer(42);
         let container = ObjectHandle::dictionary(vec![(b"Inner".to_vec(), inner.clone())]);
         owner.replace_key(b"/Container", container).unwrap();
@@ -8292,7 +8307,7 @@ mod tests {
         );
         let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
         let owner = pdf.get_object_handle(owner_ref);
-        pdf.resolve_object_handle(&owner).unwrap();
+        pdf.resolve(&owner).unwrap();
         let child = owner.get_key(b"/Child");
 
         owner.remove_key(b"/Child");
@@ -8317,7 +8332,7 @@ mod tests {
 
         let mut reopened = Pdf::open_mem_owned(out).expect("reopen full-rewrite output");
         let reopened_owner = reopened.get_object_handle(owner_ref);
-        reopened.resolve_object_handle(&reopened_owner).unwrap();
+        reopened.resolve(&reopened_owner).unwrap();
         assert!(
             reopened_owner.get_key(b"/Child").is_null(),
             "canonical writer must emit the live owner's remove_key mutation"
@@ -9002,7 +9017,7 @@ mod tests {
         let first = pdf.new_reserved().expect("first reserved object");
         let second = pdf.new_reserved().expect("second reserved object");
 
-        pdf.resolve_object_handle(&first)
+        pdf.resolve(&first)
             .expect("reserved handles do not enter the source resolver");
         assert!(first.is_indirect());
         assert_eq!(first.object_ref(), Some(ObjectRef::new(4, 0)));
@@ -9274,7 +9289,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
-        pdf.resolve_object_handle(&root).expect("resolve catalog");
+        pdf.resolve(&root).expect("resolve catalog");
         assert!(root.as_dictionary().is_some(), "catalog dictionary");
         root.replace_key(b"/Reserved", reserved).unwrap();
 
@@ -9467,8 +9482,7 @@ mod tests {
         let bytes = pdf_with_one_stream_with_null_filters(b"immediate payload");
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         let source = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve_object_handle(&source)
-            .expect("resolve source stream");
+        pdf.resolve(&source).expect("resolve source stream");
         pdf.set_immediate_copy_from(true);
         let destination = pdf.new_stream().expect("new destination stream");
 
@@ -9523,8 +9537,7 @@ mod tests {
         let bytes = pdf_with_one_stream(b"original payload");
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         let source = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve_object_handle(&source)
-            .expect("resolve source stream");
+        pdf.resolve(&source).expect("resolve source stream");
 
         assert!(source.as_stream_data().is_none());
         let copy = source.copy_stream().expect("copy original stream");
@@ -9542,8 +9555,7 @@ mod tests {
         let bytes = pdf_with_one_stream(b"immediate payload");
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         let source = pdf.get_object_handle(ObjectRef::new(4, 0));
-        pdf.resolve_object_handle(&source)
-            .expect("resolve source stream");
+        pdf.resolve(&source).expect("resolve source stream");
         pdf.set_immediate_copy_from(true);
 
         let copy = source.copy_stream().expect("copy immediate stream");
@@ -9619,7 +9631,7 @@ mod tests {
         let stream_ref = stream.object_ref().expect("stream reference");
         let root_ref = ObjectRef::new(1, 0);
         let root = pdf.get_object_handle(root_ref);
-        pdf.resolve_object_handle(&root).expect("resolve root");
+        pdf.resolve(&root).expect("resolve root");
         root.replace_key(b"/Extra", stream.clone()).unwrap();
         pdf.mark_object_dirty(root_ref);
 
@@ -10366,8 +10378,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         let object_ref = ObjectRef::new(1, 0);
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve original stream");
+        pdf.resolve(&handle).expect("resolve original stream");
         let original_dict = handle.as_stream_dict().expect("original stream dictionary");
         let parsed_offset = original_dict.get_parsed_offset();
         assert!(
@@ -10424,8 +10435,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         let object_ref = ObjectRef::new(1, 0);
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve original stream");
+        pdf.resolve(&handle).expect("resolve original stream");
 
         let mut nested = Object::Integer(7);
         for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
@@ -10470,7 +10480,7 @@ mod tests {
         let mut pdf = Pdf::open(ReadFailingCursor::new(bytes)).expect("open stream fixture");
         let object_ref = ObjectRef::new(1, 0);
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve the original stream handle");
         assert!(
             handle.as_stream_data().is_none(),
@@ -10508,7 +10518,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
         let object_ref = ObjectRef::new(1, 0);
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve the original stream handle");
 
         let mut replacement_dict = Dictionary::new();
@@ -10944,8 +10954,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let dangling_ref = ObjectRef::new(99, 0);
         let handle = pdf.get_object_handle(dangling_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve dangling reference");
+        pdf.resolve(&handle).expect("resolve dangling reference");
         assert!(handle.is_null());
 
         assert!(!pdf.object_refs().contains(&dangling_ref));
@@ -11193,21 +11202,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_is_a_no_op_for_a_direct_handle() {
+    fn resolve_is_a_no_op_for_a_direct_handle() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let direct = ObjectHandle::integer(7);
-        pdf.resolve_object_handle(&direct)
-            .expect("a direct handle is a no-op");
+        pdf.resolve(&direct).expect("a direct handle is a no-op");
         assert_eq!(direct.as_integer(), Some(7));
     }
 
     #[test]
-    fn resolve_object_handle_matches_resolve_borrowed_for_a_live_object() {
+    fn resolve_matches_resolve_borrowed_for_a_live_object() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
 
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle).expect("resolve handle");
+        pdf.resolve(&handle).expect("resolve handle");
 
         let legacy = pdf.resolve_borrowed(object_ref).expect("resolve legacy");
         let legacy_dict = legacy.as_dict().expect("legacy resolves to a dictionary");
@@ -11223,13 +11231,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_is_a_no_op_for_an_already_terminal_value() {
+    fn resolve_to_terminal_is_a_no_op_for_an_already_terminal_value() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
 
         let handle = pdf.get_object_handle(object_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("resolve a plain, never-redirected object");
 
         assert!(
@@ -11241,12 +11249,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_ref_reports_the_objects_own_ref_for_a_natural_single_hop()
-    {
+    fn resolve_to_terminal_ref_reports_the_objects_own_ref_for_a_natural_single_hop() {
         // No `set_object` redirect is involved at all: `object_ref` resolves
         // directly to its dictionary. The terminal ref must be the object's
         // own ref, not `None` — this is the case
-        // `resolve_object_handle_to_terminal`'s "already terminal" fast path
+        // `resolve_to_terminal`'s "already terminal" fast path
         // takes, and it must still report a ref for a caller that needs one
         // (e.g. a diagnostic source-offset lookup keyed on that ref).
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
@@ -11254,7 +11261,7 @@ mod tests {
 
         let handle = pdf.get_object_handle(object_ref);
         let (result, terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&handle)
+            .resolve_to_terminal_ref(&handle)
             .expect("resolve a plain, never-redirected object, also reporting its ref");
 
         assert!(result.as_dictionary().is_some());
@@ -11262,12 +11269,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_ref_reports_no_ref_for_a_direct_handle() {
+    fn resolve_to_terminal_ref_reports_no_ref_for_a_direct_handle() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let direct = ObjectHandle::integer(7);
 
         let (result, terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&direct)
+            .resolve_to_terminal_ref(&direct)
             .expect("a direct handle has no ref to chase from");
 
         assert_eq!(result.as_integer(), Some(7));
@@ -11275,13 +11282,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_does_not_chase_a_set_object_reference_redirect() {
-        // `resolve_object_handle` itself must keep its existing single-hop
+    fn resolve_does_not_chase_a_set_object_reference_redirect() {
+        // `resolve` itself must keep its existing single-hop
         // contract: `Pdf::resolve_borrowed` (and `ref_chain.rs`'s own
         // bounded chain-follow primitive, used across ~20 production
         // modules) depends on observing an intermediate `Object::Reference`
         // per hop, not a silently pre-chased terminal value. Chasing
-        // through to the terminal is `resolve_object_handle_to_terminal`'s
+        // through to the terminal is `resolve_to_terminal`'s
         // job — see the tests below.
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let target_ref = ObjectRef::new(100, 0);
@@ -11290,8 +11297,7 @@ mod tests {
         pdf.set_object(redirect_ref, Object::Reference(target_ref));
 
         let handle = pdf.get_object_handle(redirect_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve redirect handle");
+        pdf.resolve(&handle).expect("resolve redirect handle");
 
         assert_eq!(handle.as_reference(), Some(target_ref));
         assert_eq!(
@@ -11306,8 +11312,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_chases_a_set_object_reference_redirect_to_its_terminal_value(
-    ) {
+    fn resolve_to_terminal_chases_a_set_object_reference_redirect_to_its_terminal_value() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let target_ref = ObjectRef::new(100, 0);
         let redirect_ref = ObjectRef::new(200, 0);
@@ -11316,7 +11321,7 @@ mod tests {
 
         let handle = pdf.get_object_handle(redirect_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("resolve redirect handle to its terminal value");
 
         assert_eq!(result.as_boolean(), Some(true));
@@ -11352,7 +11357,7 @@ mod tests {
         );
 
         let (_ref_result, terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&handle)
+            .resolve_to_terminal_ref(&handle)
             .expect("resolve redirect handle, also reporting its terminal ref");
         assert_eq!(
             terminal_ref,
@@ -11362,7 +11367,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_returns_the_canonical_handle_not_a_copy() {
+    fn resolve_to_terminal_returns_the_canonical_handle_not_a_copy() {
         // qpdf's `QPDFObjectHandle::dereference`
         // (`libqpdf/QPDFObjectHandle.cc:2376-2383`) hands back the canonical
         // `QPDFObject` and every mutator edits it in place; there is no
@@ -11383,7 +11388,7 @@ mod tests {
 
         let handle = pdf.get_object_handle(redirect_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("resolve redirect handle to its terminal dictionary");
 
         let nested_handle = result
@@ -11397,7 +11402,7 @@ mod tests {
             .unwrap();
 
         let canonical_target = pdf.get_object_handle(target_ref);
-        pdf.resolve_object_handle(&canonical_target)
+        pdf.resolve(&canonical_target)
             .expect("resolve canonical target");
         assert!(
             result.is_same_object_as(&canonical_target),
@@ -11427,7 +11432,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_chases_a_multi_hop_reference_redirect_chain() {
+    fn resolve_to_terminal_chases_a_multi_hop_reference_redirect_chain() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let terminal_ref = ObjectRef::new(100, 0);
         let middle_ref = ObjectRef::new(200, 0);
@@ -11438,7 +11443,7 @@ mod tests {
 
         let handle = pdf.get_object_handle(outer_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("resolve multi-hop redirect handle to its terminal value");
 
         assert_eq!(result.as_integer(), Some(42));
@@ -11450,7 +11455,7 @@ mod tests {
         );
 
         let (_ref_result, observed_terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&handle)
+            .resolve_to_terminal_ref(&handle)
             .expect("resolve multi-hop redirect handle, also reporting its terminal ref");
         assert_eq!(
             observed_terminal_ref,
@@ -11473,14 +11478,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_bounds_a_self_referential_redirect_without_hanging() {
+    fn resolve_to_terminal_bounds_a_self_referential_redirect_without_hanging() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let self_ref = ObjectRef::new(100, 0);
         pdf.set_object(self_ref, Object::Reference(self_ref));
 
         let handle = pdf.get_object_handle(self_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("a self-referential redirect must not hang, overflow, or error");
 
         assert!(result.is_null());
@@ -11489,7 +11494,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_bounds_a_mutual_redirect_cycle_without_hanging() {
+    fn resolve_to_terminal_bounds_a_mutual_redirect_cycle_without_hanging() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let ref_a = ObjectRef::new(100, 0);
         let ref_b = ObjectRef::new(200, 0);
@@ -11498,7 +11503,7 @@ mod tests {
 
         let handle_a = pdf.get_object_handle(ref_a);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle_a)
+            .resolve_to_terminal(&handle_a)
             .expect("a mutual redirect cycle must not hang, overflow, or error");
 
         assert!(result.is_null());
@@ -11511,7 +11516,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_accepts_a_chain_exactly_at_the_depth_limit() {
+    fn resolve_to_terminal_accepts_a_chain_exactly_at_the_depth_limit() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let terminal_ref = ObjectRef::new(1000, 0);
         pdf.set_object(terminal_ref, Object::Integer(7));
@@ -11524,19 +11529,19 @@ mod tests {
 
         let handle = pdf.get_object_handle(current_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("a chain exactly at the depth limit must resolve, not be treated as cyclic");
 
         assert_eq!(result.as_integer(), Some(7));
 
         let (_ref_result, observed_terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&handle)
+            .resolve_to_terminal_ref(&handle)
             .expect("a chain exactly at the depth limit must resolve, also reporting its ref");
         assert_eq!(observed_terminal_ref, Some(terminal_ref));
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_treats_a_chain_one_hop_past_the_limit_as_cyclic() {
+    fn resolve_to_terminal_treats_a_chain_one_hop_past_the_limit_as_cyclic() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let terminal_ref = ObjectRef::new(1000, 0);
         pdf.set_object(terminal_ref, Object::Integer(7));
@@ -11549,13 +11554,13 @@ mod tests {
 
         let handle = pdf.get_object_handle(current_ref);
         let result = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("a too-long chain falls back rather than erroring");
 
         assert!(result.is_null());
 
         let (ref_fallback, observed_terminal_ref) = pdf
-            .resolve_object_handle_to_terminal_ref(&handle)
+            .resolve_to_terminal_ref(&handle)
             .expect("a too-long chain falls back rather than erroring");
         assert!(ref_fallback.is_null());
         assert_eq!(
@@ -11579,7 +11584,7 @@ mod tests {
         fail_warning_delivery(&mut pdf);
 
         assert!(matches!(
-            pdf.resolve_object_handle_to_terminal_ref(&handle),
+            pdf.resolve_to_terminal_ref(&handle),
             Err(crate::Error::System(ref message)) if message == "sink write failure 1"
         ));
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
@@ -11589,13 +11594,13 @@ mod tests {
     /// canonical resolution updates the ResolverHandle slot only. It does
     /// not populate the legacy raw-Object cache as a side effect.
     #[test]
-    fn resolve_object_handle_keeps_legacy_cache_untouched_for_nulls() {
+    fn resolve_keeps_legacy_cache_untouched_for_nulls() {
         let bytes = classic_pdf_with_bodies(&[b"1 0 obj\nnull\nendobj\n"], ObjectRef::new(1, 0));
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open literal-null fixture");
 
         let literal_null_ref = ObjectRef::new(1, 0);
         let literal_null_handle = pdf.get_object_handle(literal_null_ref);
-        pdf.resolve_object_handle(&literal_null_handle)
+        pdf.resolve(&literal_null_handle)
             .expect("resolve literal null");
         assert!(literal_null_handle.is_null());
         assert!(
@@ -11608,8 +11613,7 @@ mod tests {
 
         let dangling_ref = ObjectRef::new(999, 0);
         let dangling_handle = pdf.get_object_handle(dangling_ref);
-        pdf.resolve_object_handle(&dangling_handle)
-            .expect("resolve dangling ref");
+        pdf.resolve(&dangling_handle).expect("resolve dangling ref");
         assert!(dangling_handle.is_null());
         assert!(
             pdf.cache.entry(dangling_ref).is_none(),
@@ -11618,7 +11622,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_compressed_member_accepts_inline_nesting_past_max_inline_depth() {
+    fn resolve_compressed_member_accepts_inline_nesting_past_max_inline_depth() {
         // Nesting between MAX_INLINE_DEPTH (256) and MAX_PARSE_DEPTH (500) is
         // accepted by the canonical live parser for ObjStm members. The
         // handle route must preserve that qpdf parser bound rather than
@@ -11671,7 +11675,7 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
 
         let legacy = pdf
@@ -11682,7 +11686,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_compressed_member_recovers_qpdfs_excessive_nesting() {
+    fn resolve_compressed_member_recovers_qpdfs_excessive_nesting() {
         // `QPDFParser` does not make deep ObjStm data a hard parse failure:
         // its context-owned recovery warns and returns null when it encounters
         // the 501st container. The former slice parser was strict here, so
@@ -11734,7 +11738,7 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("qpdf-style excessive nesting recovery");
         assert!(handle.is_null());
         assert_eq!(
@@ -11749,8 +11753,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_uncompressed_accepts_the_same_nesting_depth_via_canonical_parser() {
-        // Task 6's `resolve_object_handle` routed every indirect handle
+    fn resolve_uncompressed_accepts_the_same_nesting_depth_via_canonical_parser() {
+        // Task 6's `resolve` routed every indirect handle
         // (Uncompressed and Compressed alike) through the same `lift`
         // bridge, so this exact depth (between MAX_INLINE_DEPTH and
         // MAX_PARSE_DEPTH) used to be rejected for BOTH. This task reroutes
@@ -11759,7 +11763,7 @@ mod tests {
         // `resolve_borrowed` (which was never subject to MAX_INLINE_DEPTH)
         // already accepted at this depth. The Compressed case now also
         // accepts this depth (see
-        // `resolve_object_handle_compressed_member_accepts_inline_nesting_past_max_inline_depth`),
+        // `resolve_compressed_member_accepts_inline_nesting_past_max_inline_depth`),
         // via the canonical live parser rather than `lift_bounded`. This is an
         // intentional behavior change, not a weakened test: the assertion
         // below pins parity with `resolve_borrowed`, not just "no longer
@@ -11776,7 +11780,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
 
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("nesting between MAX_INLINE_DEPTH and MAX_PARSE_DEPTH must now succeed");
 
         let legacy = pdf
@@ -11790,8 +11794,7 @@ mod tests {
     /// dictionary, and nested indirect-reference variant emitted by qpdf's
     /// live parser. This is the coverage anchor for that source class.
     #[test]
-    fn resolve_object_handle_compressed_member_preserves_scalar_dictionary_and_reference_variants()
-    {
+    fn resolve_compressed_member_preserves_scalar_dictionary_and_reference_variants() {
         let member_value: &[u8] =
             b"<< /B true /R 1.5 /RL .5 /N /Foo /S (bar) /Nul null /Kid 5 0 R /Sub << /X 1 >> >>";
         let header = b"7 0 ".to_vec();
@@ -11835,7 +11838,7 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve compressed scalar/dictionary/reference dict");
 
         let dict = handle.as_dictionary().expect("dictionary");
@@ -11866,7 +11869,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_preserves_source_filter_array_alignment() {
+    fn resolve_preserves_source_filter_array_alignment() {
         let object_ref = ObjectRef::new(1, 0);
         let stream_body = b"1 0 obj\n<< /Length 3 /Filter [/ASCIIHexDecode /Crypt /FlateDecode] /DecodeParms [<< /A 1 >> << /Name /Identity >> << /B 2 >>] >>\nstream\nabc\nendstream\nendobj\n";
         let bytes = classic_pdf_with_bodies(&[stream_body], object_ref);
@@ -11886,7 +11889,7 @@ mod tests {
         });
 
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve through the canonical stream parser");
 
         let dict = handle.as_stream_dict().expect("stream dictionary");
@@ -11950,7 +11953,7 @@ mod tests {
     /// bridge state (the memo entry and the handle itself) in that case, not
     /// only when the cache entry was already `Deleted`/`Missing` via a prior
     /// `delete_object` call — pinned here so a later narrowing of
-    /// `resolve_object_handle`'s fallback wildcard arm (the one thing this
+    /// `resolve`'s fallback wildcard arm (the one thing this
     /// self-healed silently through before this test existed) gets caught
     /// instead of silently regressing.
     #[test]
@@ -11995,7 +11998,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
 
         let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle).expect("resolve");
+        pdf.resolve(&handle).expect("resolve");
         assert!(
             handle.get_parsed_offset() >= 0,
             "canonical parsing must record a real offset before deletion"
@@ -12254,7 +12257,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_stamps_the_public_canonical_root_and_nested_handles() {
+    fn resolve_stamps_the_public_canonical_root_and_nested_handles() {
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Nested << /Value 7 >> >>\nendobj\n"],
             ObjectRef::new(1, 0),
@@ -12262,7 +12265,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve through the public canonical path");
 
         assert!(
@@ -12280,7 +12283,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_preserves_leading_whitespace_before_a_scalar_description() {
+    fn resolve_preserves_leading_whitespace_before_a_scalar_description() {
         let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n\n 7\nendobj\n"], ObjectRef::new(1, 0));
         let mut pdf = Pdf::open_with_options(
             Cursor::new(bytes),
@@ -12292,7 +12295,7 @@ mod tests {
         .expect("open scalar fixture");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve through the public canonical path");
 
         assert_eq!(
@@ -12308,7 +12311,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_gives_canonical_parser_children_the_document_resolver() {
+    fn resolve_gives_canonical_parser_children_the_document_resolver() {
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Outer << /Inner << /Value 7 >> >> >>\nendobj\n"],
             ObjectRef::new(1, 0),
@@ -12316,7 +12319,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        pdf.resolve_object_handle(&handle)
+        pdf.resolve(&handle)
             .expect("resolve through the public canonical path");
 
         let inner = handle
@@ -12533,7 +12536,7 @@ mod tests {
             Pdf::open_mem_owned(classic_pdf_with_bodies(&[body], object_ref)).expect("open");
         let canonical_handle = canonical_pdf.get_object_handle(object_ref);
         canonical_pdf
-            .resolve_object_handle(&canonical_handle)
+            .resolve(&canonical_handle)
             .expect("canonical resolution");
         let canonical = canonical_handle
             .materialize()

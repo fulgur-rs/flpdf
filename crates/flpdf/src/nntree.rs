@@ -257,7 +257,7 @@ fn resolved_array<R: Read + Seek>(
     };
     source.try_dereference()?;
     let source = if source.as_reference().is_some() {
-        pdf.resolve_object_handle_to_terminal(source)?
+        pdf.resolve_to_terminal(source)?
     } else {
         source.clone()
     };
@@ -276,7 +276,7 @@ fn resolved_key<K: TreeKey, R: Read + Seek>(
 ) -> Result<Option<K::Key>> {
     value.try_dereference()?;
     let value = if value.as_reference().is_some() {
-        pdf.resolve_object_handle_to_terminal(value)?
+        pdf.resolve_to_terminal(value)?
     } else {
         value.clone()
     };
@@ -883,7 +883,7 @@ impl HandleNumberTree {
         path: &mut Vec<ObjectHandle>,
         entries: &mut BTreeMap<i64, ObjectHandle>,
     ) -> Result<()> {
-        let node = pdf.resolve_object_handle_to_terminal(&node)?;
+        let node = pdf.resolve_to_terminal(&node)?;
         if path
             .iter()
             .any(|ancestor| ancestor.is_same_object_as(&node))
@@ -2171,7 +2171,7 @@ impl<K: TreeKey> NNTree<K> {
             if let (Some(first_kid), Some(last_kid)) = (kids.values.first(), kids.values.last()) {
                 first_kid.try_dereference()?;
                 let first_kid = if first_kid.as_reference().is_some() {
-                    pdf.resolve_object_handle_to_terminal(first_kid)?
+                    pdf.resolve_to_terminal(first_kid)?
                 } else {
                     first_kid.clone()
                 };
@@ -2180,7 +2180,7 @@ impl<K: TreeKey> NNTree<K> {
                 }
                 last_kid.try_dereference()?;
                 let last_kid = if last_kid.as_reference().is_some() {
-                    pdf.resolve_object_handle_to_terminal(last_kid)?
+                    pdf.resolve_to_terminal(last_kid)?
                 } else {
                     last_kid.clone()
                 };
@@ -2453,7 +2453,7 @@ impl<K: TreeKey> NNTree<K> {
     ) -> Result<ObjectHandle> {
         handle.try_dereference()?;
         if handle.as_reference().is_some() {
-            pdf.resolve_object_handle_to_terminal(handle)
+            pdf.resolve_to_terminal(handle)
         } else {
             Ok(handle.clone())
         }
@@ -2466,8 +2466,8 @@ impl<K: TreeKey> NNTree<K> {
         // redirect inside an indirect handle, but the existing Pdf bridge can
         // still produce it; traverse it only at this compatibility boundary.
         // qpdf-deviation: this compatibility-boundary chase has no qpdf
-        // counterpart (see reader.rs::resolve_object_handle_to_terminal_ref).
-        let root = pdf.resolve_object_handle_to_terminal(&root)?;
+        // counterpart (see reader.rs::resolve_to_terminal_ref).
+        let root = pdf.resolve_to_terminal(&root)?;
         Ok(root.object_ref().map_or_else(
             || NodeHandle::root_with_handle(root.clone()),
             |object_ref| NodeHandle::indirect_with_handle(object_ref, root.clone()),
@@ -3810,6 +3810,22 @@ mod tests {
             changed.handle.materialize().unwrap()
         );
         assert_eq!(tree.root(), &Object::Reference(holder));
+    }
+
+    #[test]
+    fn legacy_terminal_handle_collapses_a_bare_reference_redirect() {
+        let mut pdf = empty_pdf();
+        let holder = ObjectRef::new(20, 0);
+        let terminal = ObjectRef::new(21, 0);
+        pdf.set_object(holder, Object::Reference(terminal));
+        pdf.set_object(terminal, Object::Dictionary(Dictionary::new()));
+        let handle = pdf.get_object_handle(holder);
+        let mut tree = NNTree::<NameKey>::new(Object::Null, true);
+
+        let resolved = tree
+            .legacy_terminal_handle(&mut pdf, &handle)
+            .expect("redirect should resolve to its terminal handle");
+        assert_eq!(resolved.object_ref(), Some(terminal));
     }
 
     #[test]

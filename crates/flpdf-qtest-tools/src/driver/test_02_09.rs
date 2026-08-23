@@ -24,14 +24,14 @@ use crate::output::write_bytes;
 // leaf-position twin, for a handle whose *own* value (not a further child)
 // is about to be read or mutated.
 //
-// `Pdf::resolve_object_handle`'s underlying `ObjectHandle::try_dereference`
+// `Pdf::resolve`'s underlying `ObjectHandle::try_dereference`
 // is a documented no-op for an already-direct or already-resolved handle,
 // so calling either helper on a handle that happens to be resolved already
 // (for example, one returned by `PageDocumentHelper::get_all_pages`, whose
 // own repair walk may have already touched it) costs nothing.
 
 fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> flpdf::Result<()> {
-    pdf.resolve_object_handle(handle)
+    pdf.resolve(handle)
 }
 
 fn dict_key<R: Read + Seek>(

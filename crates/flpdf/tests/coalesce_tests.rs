@@ -291,9 +291,9 @@ fn coalesce_decodes_indirect_filter_and_decode_params_through_the_provider() {
 
     coalesce_page(&mut pdf, ObjectRef::new(3, 0)).expect("coalesce should succeed");
     let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let contents = page.get_key(b"/Contents");
-    pdf.resolve_object_handle(&contents).unwrap();
+    pdf.resolve(&contents).unwrap();
 
     let mut expected = body1.to_vec();
     expected.push(b'\n');
@@ -509,9 +509,9 @@ fn coalesce_replaces_single_element_array() {
     coalesce_page(&mut pdf, page_ref).expect("qpdf coalesce must replace a single-element array");
 
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let contents = page.get_key(b"/Contents");
-    pdf.resolve_object_handle(&contents).unwrap();
+    pdf.resolve(&contents).unwrap();
     assert_eq!(contents.type_code().unwrap(), 10);
     assert_eq!(contents.get_raw_stream_data().unwrap().as_ref(), body);
 }
@@ -612,9 +612,9 @@ fn coalesce_empty_array_replaces_contents_with_an_empty_provider_stream() {
     coalesce_page(&mut pdf, page_ref).expect("qpdf coalesce must replace an empty array");
 
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let contents = page.get_key(b"/Contents");
-    pdf.resolve_object_handle(&contents).unwrap();
+    pdf.resolve(&contents).unwrap();
     assert_eq!(contents.type_code().unwrap(), 10);
     assert!(contents.get_raw_stream_data().unwrap().is_empty());
     let stream_dict = contents.as_stream_dict().unwrap();
@@ -637,9 +637,9 @@ fn coalesce_ignores_non_stream_array_members_after_warning() {
     coalesce_page(&mut pdf, page_ref).expect("qpdf coalesce must ignore a non-stream array member");
 
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let contents = page.get_key(b"/Contents");
-    pdf.resolve_object_handle(&contents).unwrap();
+    pdf.resolve(&contents).unwrap();
     assert_eq!(contents.type_code().unwrap(), 10);
     assert_eq!(contents.get_raw_stream_data().unwrap().as_ref(), body);
 }
@@ -661,9 +661,9 @@ fn coalesce_ignores_array_element_chain_to_non_stream() {
     coalesce_page(&mut pdf, ObjectRef::new(3, 0))
         .expect("qpdf coalesce must ignore a non-stream chain target");
     let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let contents = page.get_key(b"/Contents");
-    pdf.resolve_object_handle(&contents).unwrap();
+    pdf.resolve(&contents).unwrap();
     assert_eq!(contents.get_raw_stream_data().unwrap().as_ref(), b"q Q");
 }
 
@@ -677,7 +677,7 @@ fn coalesce_reads_provider_backed_first_stream_once_for_metadata_and_payload() {
     );
     let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should open");
     let first_stream = pdf.get_object_handle(ObjectRef::new(4, 0));
-    pdf.resolve_object_handle(&first_stream)
+    pdf.resolve(&first_stream)
         .expect("first stream should resolve");
 
     let calls = Rc::new(Cell::new(0));
@@ -699,9 +699,9 @@ fn coalesce_reads_provider_backed_first_stream_once_for_metadata_and_payload() {
     assert_eq!(calls.get(), 0, "provider registration must remain lazy");
 
     let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-    pdf.resolve_object_handle(&page).unwrap();
+    pdf.resolve(&page).unwrap();
     let contents = page.get_key(b"/Contents");
-    pdf.resolve_object_handle(&contents).unwrap();
+    pdf.resolve(&contents).unwrap();
     assert_eq!(
         contents.get_raw_stream_data().unwrap().as_ref(),
         b"q Q\nBT ET"

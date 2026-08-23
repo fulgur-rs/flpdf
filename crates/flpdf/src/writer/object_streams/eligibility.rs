@@ -186,7 +186,7 @@ pub(crate) fn is_qpdf_signature_dict<R: std::io::Read + std::io::Seek>(
         return Ok(false);
     }
     let type_value = object.try_get_key(b"/Type")?;
-    let type_value = pdf.resolve_object_handle_to_terminal(&type_value)?;
+    let type_value = pdf.resolve_to_terminal(&type_value)?;
     if !type_value.try_is_name_and_equals(b"Sig")? {
         return Ok(false);
     }

@@ -388,7 +388,7 @@ mod tests {
         .unwrap();
         let stream_ref = ObjectRef::new(7, 0);
         let stream = pdf.get_object_handle(stream_ref);
-        pdf.resolve_object_handle(&stream).unwrap();
+        pdf.resolve(&stream).unwrap();
         stream
             .as_stream_dict()
             .unwrap()

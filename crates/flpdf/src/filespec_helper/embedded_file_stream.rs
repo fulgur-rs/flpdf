@@ -199,12 +199,12 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let (stream, terminal_ref) = self
             .pdf
             .borrow_mut()
-            .resolve_object_handle_to_terminal_ref(&self.stream)?;
+            .resolve_to_terminal_ref(&self.stream)?;
         let stream = match terminal_ref {
             Some(object_ref) => {
                 let mut pdf = self.pdf.borrow_mut();
                 let stream = pdf.get_object_handle(object_ref);
-                pdf.resolve_object_handle(&stream)?;
+                pdf.resolve(&stream)?;
                 stream
             }
             None => stream,
@@ -225,9 +225,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
         let key = canonical_dictionary_key(key);
         let value = dictionary.get_key(&key);
-        self.pdf
-            .borrow_mut()
-            .resolve_object_handle_to_terminal(&value)
+        self.pdf.borrow_mut().resolve_to_terminal(&value)
     }
 
     fn param_value(&self, key: &[u8]) -> Result<ObjectHandle> {
@@ -406,16 +404,13 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(());
         };
         let params = stream_dict.get_key(b"/Params");
-        let (resolved, terminal_ref) = self
-            .pdf
-            .borrow_mut()
-            .resolve_object_handle_to_terminal_ref(&params)?;
+        let (resolved, terminal_ref) = self.pdf.borrow_mut().resolve_to_terminal_ref(&params)?;
         if resolved.as_dictionary().is_some() {
             let target = match terminal_ref {
                 Some(object_ref) => {
                     let mut pdf = self.pdf.borrow_mut();
                     let target = pdf.get_object_handle(object_ref);
-                    pdf.resolve_object_handle(&target)?;
+                    pdf.resolve(&target)?;
                     target
                 }
                 None => resolved,

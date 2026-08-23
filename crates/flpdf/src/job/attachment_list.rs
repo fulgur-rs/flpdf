@@ -300,7 +300,7 @@ where
         // the recognized name keys is listed too; keys whose value is null are
         // skipped, as they are by QPDFObjectHandle::getKeys.
         for (stream_key, stream) in ef_entries {
-            if pdf.resolve_object_handle_to_terminal(&stream)?.is_null() {
+            if pdf.resolve_to_terminal(&stream)?.is_null() {
                 continue;
             }
             out.extend_from_slice(b"    ")?;

@@ -265,7 +265,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
     // shape with no qpdf counterpart (QPDF::replaceObject rejects indirect
     // replacement, libqpdf/QPDF.cc:1980-1991).
     let handle = pdf
-        .resolve_object_handle_to_terminal(handle)
+        .resolve_to_terminal(handle)
         .map_err(ConvertError::from)?;
     if handle.type_code().map_err(ConvertError::from)? == 10 {
         // The former split consumer resolved and converted the complete
@@ -318,7 +318,7 @@ fn write_file_mode_object_entry<R: Read + Seek>(
     // shape with no qpdf counterpart (QPDF::replaceObject rejects indirect
     // replacement, libqpdf/QPDF.cc:1980-1991).
     let handle = pdf
-        .resolve_object_handle_to_terminal(handle)
+        .resolve_to_terminal(handle)
         .map_err(ConvertError::from)?;
     if handle.type_code().map_err(ConvertError::from)? == 10 {
         Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
@@ -559,7 +559,7 @@ mod tests {
     /// value before writing the entry. `ObjectHandle::write_json`'s
     /// `dereference_indirect` only dereferences the holder's own indirect
     /// identity (one hop); a resolved value that is itself a bare reference
-    /// needs a second, explicit chase (`Pdf::resolve_object_handle_to_terminal`,
+    /// needs a second, explicit chase (`Pdf::resolve_to_terminal`,
     /// the same helper `outline_document_helper.rs`'s `resolve_value_handle`
     /// uses for this exact bridge shape) or the holder serializes as the
     /// literal `"target R"` string instead of the target's value.
@@ -795,7 +795,7 @@ mod tests {
         let handle = pdf.get_object_handle(holder_ref);
 
         let terminal = pdf
-            .resolve_object_handle_to_terminal(&handle)
+            .resolve_to_terminal(&handle)
             .expect("terminal chase must preserve the canonical stream");
         assert_eq!(
             terminal.type_code().expect("type code"),

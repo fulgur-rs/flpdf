@@ -62,7 +62,7 @@ pub(crate) fn remove_unreferenced_resources_on_page<R: Read + Seek>(
         if value.is_null() {
             continue;
         }
-        pdf.resolve_object_handle(&value)?;
+        pdf.resolve(&value)?;
         if value.as_dictionary().is_none() {
             // qpdf only shallow-copies and mutates a category when
             // `dict.isDictionary()` (`QPDFPageObjectHelper.cc:576-585`); a
@@ -158,7 +158,7 @@ fn prune_canonical_resource_target<R: Read + Seek>(
         if value.is_null() {
             continue;
         }
-        pdf.resolve_object_handle(&value)?;
+        pdf.resolve(&value)?;
         if value.as_dictionary().is_none() {
             // qpdf leaves a malformed /Font or /XObject category untouched;
             // see the matching comment in remove_unreferenced_resources_on_page.
@@ -253,7 +253,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         };
         let form_handle = pdf.get_object_handle(form_ref);
         let decoded = (|| -> Result<Vec<u8>> {
-            pdf.resolve_object_handle(&form_handle)?;
+            pdf.resolve(&form_handle)?;
             let stream_dict = form_stream_dict(&form_handle)?;
             let stream_data = form_handle.get_raw_stream_data()?;
             decode_stream_data_from_handle(
@@ -543,7 +543,7 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
         return Ok(false);
     };
     let catalog = pdf.get_object_handle(root_ref);
-    let pages = pdf.resolve_object_handle_to_terminal(&catalog.try_get_key(b"/Pages")?)?;
+    let pages = pdf.resolve_to_terminal(&catalog.try_get_key(b"/Pages")?)?;
     if pages.is_null() {
         return Ok(false);
     }
@@ -557,13 +557,13 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
     let mut indirect_resources_seen: BTreeSet<ObjectRef> = BTreeSet::new();
 
     while let Some(node) = queue.pop_front() {
-        let node = pdf.resolve_object_handle_to_terminal(&node)?;
+        let node = pdf.resolve_to_terminal(&node)?;
         if !nodes_seen.insert(node.identity_key()) {
             continue;
         }
 
         let dict = node.as_stream_dict().unwrap_or_else(|| node.clone());
-        let kids = pdf.resolve_object_handle_to_terminal(&dict.try_get_key(b"/Kids")?)?;
+        let kids = pdf.resolve_to_terminal(&dict.try_get_key(b"/Kids")?)?;
         if let Some(kids) = kids.try_as_array()? {
             // qpdf returns true for any non-leaf page node that owns a
             // /Resources key, even if only one descendant page is selected.
@@ -581,7 +581,7 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
             }
         }
 
-        let resources = pdf.resolve_object_handle_to_terminal(&resources)?;
+        let resources = pdf.resolve_to_terminal(&resources)?;
         let Some(resources_dict) = resources.as_dictionary() else {
             continue;
         };
@@ -595,12 +595,12 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
             }
         }
 
-        let xobject = pdf.resolve_object_handle_to_terminal(&xobject)?;
+        let xobject = pdf.resolve_to_terminal(&xobject)?;
         let Some(entries) = xobject.as_dictionary() else {
             continue;
         };
         for object in entries.into_values() {
-            let object = pdf.resolve_object_handle_to_terminal(&object)?;
+            let object = pdf.resolve_to_terminal(&object)?;
             if object.is_form_xobject()? {
                 queue.push_back(object);
             }

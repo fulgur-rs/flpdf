@@ -94,7 +94,7 @@ pub fn apply_rotate_to_pages<R: Read + Seek>(
         // not a materialized Object snapshot. Resolve and validate the page
         // through the same canonical handle before mutating it.
         let page = pdf.get_object_handle(page_ref);
-        pdf.resolve_object_handle(&page)?;
+        pdf.resolve(&page)?;
         if page.as_dictionary().is_none() {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} is not a dictionary, cannot set /Rotate"

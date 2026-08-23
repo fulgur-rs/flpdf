@@ -6,7 +6,7 @@
 //! common annotation attributes, mirroring qpdf's own transparently
 //! dereferencing `QPDFObjectHandle` API on top of this crate's
 //! [`ObjectHandle`], which requires an explicit resolve at every hop
-//! (`Pdf::resolve_object_handle`) — see
+//! (`Pdf::resolve`) — see
 //! [`crate::form_field_object_helper::FormFieldObjectHelper`] for the same
 //! established shape.
 //!
@@ -102,9 +102,9 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
 
     /// Resolve `self.annot` and return the key's resolved child handle.
     fn resolved_key(&mut self, key: &[u8]) -> Result<ObjectHandle> {
-        self.pdf.resolve_object_handle(&self.annot)?;
+        self.pdf.resolve(&self.annot)?;
         let child = self.annot.get_key(key);
-        self.pdf.resolve_object_handle(&child)?;
+        self.pdf.resolve(&child)?;
         Ok(child)
     }
 
@@ -205,7 +205,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         }
         let mut nums = [0.0f64; 4];
         for (i, item) in items.iter().enumerate() {
-            self.pdf.resolve_object_handle(item)?;
+            self.pdf.resolve(item)?;
             let Some(n) = as_number(item) else {
                 return Ok(zero);
             };
@@ -308,7 +308,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         let ap = self.get_appearance_dictionary()?;
         if ap.as_dictionary().is_some() {
             let ap_sub = ap.get_key(&dict_key(which));
-            self.pdf.resolve_object_handle(&ap_sub)?;
+            self.pdf.resolve(&ap_sub)?;
             if ap_sub.as_stream_dict().is_some() {
                 // qpdf issue #949: a direct appearance stream disregards
                 // state entirely (`QPDFAnnotationObjectHelper.cc:59-63`).
@@ -326,7 +326,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
                 };
                 if !desired_state.is_empty() {
                     let ap_sub_val = ap_sub.get_key(&dict_key(&desired_state));
-                    self.pdf.resolve_object_handle(&ap_sub_val)?;
+                    self.pdf.resolve(&ap_sub_val)?;
                     if ap_sub_val.as_stream_dict().is_some() {
                         return Ok(ap_sub_val);
                     }
@@ -466,7 +466,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
 
     /// Return a normalized rectangle when `handle` is a valid four-number array.
     fn rectangle_from_handle(&mut self, handle: &ObjectHandle) -> Result<Option<Rectangle>> {
-        self.pdf.resolve_object_handle(handle)?;
+        self.pdf.resolve(handle)?;
         let Some(items) = handle.as_array() else {
             return Ok(None);
         };
@@ -475,7 +475,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         }
         let mut numbers = [0.0; 4];
         for (index, item) in items.iter().enumerate() {
-            self.pdf.resolve_object_handle(item)?;
+            self.pdf.resolve(item)?;
             let Some(number) = as_number(item) else {
                 return Ok(None);
             };
@@ -491,7 +491,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
 
     /// Return a six-number matrix, or `None` when qpdf would use identity.
     fn matrix_from_handle(&mut self, handle: &ObjectHandle) -> Result<Option<Matrix>> {
-        self.pdf.resolve_object_handle(handle)?;
+        self.pdf.resolve(handle)?;
         let Some(items) = handle.as_array() else {
             return Ok(None);
         };
@@ -500,7 +500,7 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
         }
         let mut numbers = [0.0; 6];
         for (index, item) in items.iter().enumerate() {
-            self.pdf.resolve_object_handle(item)?;
+            self.pdf.resolve(item)?;
             let Some(number) = as_number(item) else {
                 return Ok(None);
             };

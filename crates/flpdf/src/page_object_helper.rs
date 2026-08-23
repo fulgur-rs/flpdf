@@ -689,7 +689,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         allow_shrink: bool,
         allow_expand: bool,
     ) -> Result<Option<Matrix>> {
-        self.pdf.resolve_object_handle(&form)?;
+        self.pdf.resolve(&form)?;
         let form_dict = if form.is_form_xobject()? {
             // cov:ignore-start: is_form_xobject only returns true for a stream
             // with a canonical stream dictionary, so this defensive branch is
@@ -703,13 +703,13 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         };
         let bbox = self
             .pdf
-            .resolve_object_handle_to_terminal(&form_dict.try_get_key(b"/BBox")?)?;
+            .resolve_to_terminal(&form_dict.try_get_key(b"/BBox")?)?;
         let Some(bbox) = rectangle_from_handle(self.pdf, &bbox)? else {
             return Ok(None);
         };
         let form_matrix = self
             .pdf
-            .resolve_object_handle_to_terminal(&form_dict.try_get_key(b"/Matrix")?)?;
+            .resolve_to_terminal(&form_dict.try_get_key(b"/Matrix")?)?;
         let form_matrix = matrix_from_handle(self.pdf, &form_matrix)?.unwrap_or_default();
         let transform = if invert_transformations {
             self.get_matrix_for_transformations(true)?
@@ -936,7 +936,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
 
         let media = self
             .pdf
-            .resolve_object_handle_to_terminal(&page.try_get_key(b"/MediaBox")?)?;
+            .resolve_to_terminal(&page.try_get_key(b"/MediaBox")?)?;
         let Some(media) = rectangle_from_handle(self.pdf, &media)? else {
             return Ok(());
         };
@@ -949,9 +949,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             b"/TrimBox",
             b"/ArtBox",
         ] {
-            let value = self
-                .pdf
-                .resolve_object_handle_to_terminal(&page.try_get_key(key)?)?;
+            let value = self.pdf.resolve_to_terminal(&page.try_get_key(key)?)?;
             let Some(rectangle) = rectangle_from_handle(self.pdf, &value)? else {
                 continue;
             };
@@ -1045,7 +1043,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         validate_same_document_page_handle(self.pdf, &from_page)?;
         let old_annots = self
             .pdf
-            .resolve_object_handle_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
+            .resolve_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
         if old_annots.try_as_array()?.is_none() {
             return Ok(());
         }
@@ -1167,8 +1165,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
-        let old_annots =
-            source.resolve_object_handle_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
+        let old_annots = source.resolve_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
         if old_annots.try_as_array()?.is_none() {
             return Ok(());
         }
@@ -1407,13 +1404,13 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             }
             let xobjects = self
                 .pdf
-                .resolve_object_handle_to_terminal(&resources.try_get_key(b"/XObject")?)?;
+                .resolve_to_terminal(&resources.try_get_key(b"/XObject")?)?;
             let Some(entries) = xobjects.as_dictionary() else {
                 continue;
             };
 
             for (key, value) in entries {
-                let object = self.pdf.resolve_object_handle_to_terminal(&value)?;
+                let object = self.pdf.resolve_to_terminal(&value)?;
                 if selector(&object)? {
                     action(object.clone(), xobjects.clone(), key)?;
                 }
@@ -1617,7 +1614,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let page_ref = self.require_page_ref()?;
         let annots = self
             .pdf
-            .resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+            .resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
         if annots.is_null() {
             return Ok(Vec::new());
         }
@@ -1654,7 +1651,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let page = self.resolved_page_handle()?;
         let annots = self
             .pdf
-            .resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+            .resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
         let Some(annots_array) = annots.as_array() else {
             return Ok(Vec::new());
         };
@@ -1663,14 +1660,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             .filter(|value| !value.is_empty());
         let mut result = Vec::with_capacity(annots_array.len());
         for item in annots_array {
-            let annotation = self.pdf.resolve_object_handle_to_terminal(&item)?;
+            let annotation = self.pdf.resolve_to_terminal(&item)?;
             if annotation.as_dictionary().is_none() {
                 continue;
             }
             if let Some(expected) = only_subtype {
                 let subtype = self
                     .pdf
-                    .resolve_object_handle_to_terminal(&annotation.try_get_key(b"/Subtype")?)?;
+                    .resolve_to_terminal(&annotation.try_get_key(b"/Subtype")?)?;
                 if subtype.as_name().as_deref() != Some(expected) {
                     continue;
                 }
@@ -1858,7 +1855,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         if value.is_null() {
             return Ok(None);
         }
-        self.pdf.resolve_object_handle(&value)?;
+        self.pdf.resolve(&value)?;
         let Some(items) = value.as_array() else {
             return Err(Error::Unsupported(format!(
                 "{} on page {} does not resolve to an array",
@@ -1875,7 +1872,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
         let mut coords = [0.0f64; 4];
         for (index, item) in items.into_iter().take(4).enumerate() {
-            self.pdf.resolve_object_handle(&item)?;
+            self.pdf.resolve(&item)?;
             let Some(value) = item
                 .as_integer()
                 .map(|value| value as f64)
@@ -1895,7 +1892,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     }
 
     fn rectangle_for_matrix(&mut self, value: &ObjectHandle) -> Result<Option<PageBox>> {
-        self.pdf.resolve_object_handle(value)?;
+        self.pdf.resolve(value)?;
         let Some(items) = value.as_array() else {
             return Ok(None);
         };
@@ -1904,7 +1901,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         }
         let mut coords = [0.0f64; 4];
         for (index, item) in items.into_iter().take(4).enumerate() {
-            self.pdf.resolve_object_handle(&item)?;
+            self.pdf.resolve(&item)?;
             let Some(number) = item
                 .as_integer()
                 .map(|value| value as f64)
@@ -1932,12 +1929,12 @@ fn collect_resource_names<R: Read + Seek>(
     resources: &ObjectHandle,
 ) -> Result<std::collections::BTreeSet<Vec<u8>>> {
     let mut result = std::collections::BTreeSet::new();
-    let resources = pdf.resolve_object_handle_to_terminal(resources)?;
+    let resources = pdf.resolve_to_terminal(resources)?;
     let Some(entries) = resources.as_dictionary() else {
         return Ok(result);
     };
     for value in entries.into_values() {
-        let value = pdf.resolve_object_handle_to_terminal(&value)?;
+        let value = pdf.resolve_to_terminal(&value)?;
         if let Some(entries) = value.as_dictionary() {
             result.extend(entries.into_keys());
         }
@@ -1954,7 +1951,7 @@ fn resolve_resource_dictionary<R: Read + Seek>(
     if value.is_null() {
         return Ok(None);
     }
-    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    let value = pdf.resolve_to_terminal(&value)?;
     Ok(value.as_dictionary().map(|_| value))
 }
 
@@ -1972,7 +1969,7 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     // filter runs. This is a no-op when /Resources is absent or malformed,
     // preserving qpdf's warning/no-resource boundary for those documents.
     let existing_xobjects = resources.get_key(b"/XObject");
-    pdf.resolve_object_handle(&existing_xobjects)?;
+    pdf.resolve(&existing_xobjects)?;
     let empty_xobjects = ObjectHandle::dictionary(Vec::new());
     let seed = ObjectHandle::dictionary(vec![(b"/XObject".to_vec(), empty_xobjects)]);
     resources.merge_resources(&seed, None)?;
@@ -2018,7 +2015,7 @@ fn externalize_inline_images_for_target<R: Read + Seek>(
     }
 
     let xobjects = resources.get_key(b"/XObject");
-    pdf.resolve_object_handle(&xobjects)?;
+    pdf.resolve(&xobjects)?;
     if xobjects.as_dictionary().is_some() {
         for image in filter.images {
             let stream = pdf.new_stream_with_data(Rc::new(image.data))?;
@@ -2063,7 +2060,7 @@ pub(crate) fn rectangle_from_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
 ) -> Result<Option<Rectangle>> {
-    pdf.resolve_object_handle(handle)?;
+    pdf.resolve(handle)?;
     let Some(items) = handle.as_array() else {
         return Ok(None);
     };
@@ -2072,7 +2069,7 @@ pub(crate) fn rectangle_from_handle<R: Read + Seek>(
     }
     let mut values = [0.0f64; 4];
     for (index, item) in items.into_iter().enumerate() {
-        pdf.resolve_object_handle(&item)?;
+        pdf.resolve(&item)?;
         let Some(value) = item
             .as_integer()
             .map(|value| value as f64)
@@ -2156,7 +2153,7 @@ fn append_annotation_handles<R: Read + Seek>(
     page: &ObjectHandle,
     annotations: Vec<ObjectHandle>,
 ) -> Result<()> {
-    let existing = pdf.resolve_object_handle_to_terminal(&page.try_get_key(b"/Annots")?)?;
+    let existing = pdf.resolve_to_terminal(&page.try_get_key(b"/Annots")?)?;
     let annots = if existing.as_array().is_some() {
         existing
     } else {
@@ -2221,7 +2218,7 @@ fn matrix_from_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     handle: &ObjectHandle,
 ) -> Result<Option<Matrix>> {
-    pdf.resolve_object_handle(handle)?;
+    pdf.resolve(handle)?;
     let Some(items) = handle.as_array() else {
         return Ok(None);
     };
@@ -2230,7 +2227,7 @@ fn matrix_from_handle<R: Read + Seek>(
     }
     let mut values = [0.0f64; 6];
     for (index, item) in items.into_iter().enumerate() {
-        pdf.resolve_object_handle(&item)?;
+        pdf.resolve(&item)?;
         let Some(value) = item
             .as_integer()
             .map(|value| value as f64)
@@ -2248,7 +2245,7 @@ fn resolve_attribute_target<R: Read + Seek>(
     object: ObjectHandle,
     description: &str,
 ) -> Result<(ObjectHandle, bool)> {
-    pdf.resolve_object_handle(&object)?;
+    pdf.resolve(&object)?;
     if object.is_form_xobject()? {
         return Ok((object, true));
     }
@@ -2259,7 +2256,7 @@ fn resolve_attribute_target<R: Read + Seek>(
     }
 
     let page_type = object.try_get_key(b"/Type")?;
-    pdf.resolve_object_handle(&page_type)?;
+    pdf.resolve(&page_type)?;
     match page_type.as_name() {
         Some(name) if name.as_slice() == b"Page" => Ok((object, false)),
         Some(name) => Err(Error::Unsupported(format!(
@@ -2294,7 +2291,7 @@ fn get_attribute_for_target<R: Read + Seek>(
         object.clone()
     };
     let inheritable = !is_form && is_inheritable_page_attribute(key);
-    let mut result = pdf.resolve_object_handle_to_terminal(&dict.try_get_key(key)?)?;
+    let mut result = pdf.resolve_to_terminal(&dict.try_get_key(key)?)?;
     let mut inherited = false;
 
     if result.is_null() && inheritable {
@@ -2318,7 +2315,7 @@ fn get_attribute_for_target<R: Read + Seek>(
                 key,
                 DEFAULT_MAX_PAGE_TREE_DEPTH,
             )? {
-                result = pdf.resolve_object_handle_to_terminal(&value)?;
+                result = pdf.resolve_to_terminal(&value)?;
                 inherited = true;
             }
         }

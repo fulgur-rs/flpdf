@@ -49,3 +49,22 @@ fn qpdf_named_resolve_surface_resolves_a_handle_in_place() {
     );
     assert!(root.get_key(b"/Pages").is_indirect());
 }
+
+#[test]
+fn qpdf_cutover_has_no_legacy_handle_aliases() {
+    let sources = [("reader.rs", include_str!("../src/reader.rs"))];
+    let forbidden = [
+        "pub fn resolve_object_handle(",
+        "pub fn resolve_object_handle_to_terminal(",
+        "pub fn resolve_object_handle_to_terminal_ref(",
+    ];
+
+    for (name, source) in sources {
+        for needle in forbidden {
+            assert!(
+                !source.contains(needle),
+                "legacy raw-object route marker {needle:?} remains in {name}"
+            );
+        }
+    }
+}

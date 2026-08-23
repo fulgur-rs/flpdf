@@ -276,8 +276,7 @@ fn process(
         // then through the canonical path would replay qpdf's warnings.
         let stream_handle = pdf.get_object_handle(obj_ref);
         if !stream_handle.is_resolved() {
-            pdf.resolve_object_handle(&stream_handle)
-                .map_err(|e| e.to_string())?;
+            pdf.resolve(&stream_handle).map_err(|e| e.to_string())?;
         }
         let Some(stream_dict) = stream_handle.as_stream_dict() else {
             continue;
@@ -372,14 +371,14 @@ fn canonical_page_content_bytes<R: Read + Seek>(
     page_ref: ObjectRef,
 ) -> FlpdfResult<Vec<u8>> {
     let page = pdf.get_object_handle(page_ref);
-    pdf.resolve_object_handle(&page)?;
+    pdf.resolve(&page)?;
     if !page.has_key(b"/Contents") {
         return Ok(Vec::new());
     }
 
     let contents = page.get_key(b"/Contents");
     let contents_was_indirect = contents.object_ref().is_some();
-    let (contents, _) = pdf.resolve_object_handle_to_terminal_ref(&contents)?;
+    let (contents, _) = pdf.resolve_to_terminal_ref(&contents)?;
     if contents.is_null() {
         return Ok(Vec::new());
     }
@@ -414,7 +413,7 @@ fn collect_canonical_content_streams<R: Read + Seek>(
     streams: &mut Vec<ObjectHandle>,
     allow_array: bool,
 ) -> FlpdfResult<()> {
-    let (value, _) = pdf.resolve_object_handle_to_terminal_ref(value)?;
+    let (value, _) = pdf.resolve_to_terminal_ref(value)?;
     if value.as_stream_dict().is_some() {
         streams.push(value);
         return Ok(());
@@ -450,7 +449,7 @@ fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHan
     // qpdf's getKey()/isName() dereference through the canonical object
     // handle. Follow the complete holder chain here as well, while keeping
     // the decode boundary below in its existing Dictionary-shaped form.
-    let Ok((type_handle, _)) = pdf.resolve_object_handle_to_terminal_ref(&type_handle) else {
+    let Ok((type_handle, _)) = pdf.resolve_to_terminal_ref(&type_handle) else {
         return false;
     };
     matches!(type_handle.as_name(), Some(name) if name.as_slice() == b"ObjStm")

@@ -26,7 +26,7 @@ use super::emit_new_diagnostics;
 /// `damagedPDF` when `/Root` does not resolve to a dictionary and, under
 /// `check_mode`, repairs a missing/invalid `/Type`. This port only reaches
 /// for the handle itself; a caller that needs the dictionary type checked
-/// resolves it through [`resolved_key`]/`Pdf::resolve_object_handle_to_terminal`
+/// resolves it through [`resolved_key`]/`Pdf::resolve_to_terminal`
 /// and inspects it directly -- the same substitute this crate's own
 /// `test_34_41.rs` uses via its own (non-shared, so not reused here) private
 /// `root_handle`.
@@ -47,7 +47,7 @@ fn resolved_key<R: Read + Seek>(
     key: &[u8],
 ) -> flpdf::Result<ObjectHandle> {
     let child = parent.get_key(key);
-    pdf.resolve_object_handle_to_terminal(&child)
+    pdf.resolve_to_terminal(&child)
 }
 
 /// `QPDFObjectHandle::isScalar` (`libqpdf/QPDFObjectHandle.cc:450-453`):
@@ -185,7 +185,7 @@ pub(crate) fn run_test_88<R: Read + Seek>(
 
     // Test errors (test_driver.cc:3155-3159).
     let root = root_handle(pdf);
-    let root = pdf.resolve_object_handle_to_terminal(&root)?;
+    let root = pdf.resolve_to_terminal(&root)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let arr2 = replace_key_and_get_new(&root, b"/QTest", ObjectHandle::parse(b"[1 2]")?)?;
     // GAP(QPDFObjectHandle::setObjectDescription): no public equivalent
@@ -240,13 +240,13 @@ pub(crate) fn run_test_89<R: Read + Seek>(
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let root = root_handle(pdf);
-    let root = pdf.resolve_object_handle_to_terminal(&root)?;
+    let root = pdf.resolve_to_terminal(&root)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     root.append_array_item(null.clone())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
 
     let object5_ref = pdf.get_object_handle(ObjectRef::new(5, 0));
-    let object5 = pdf.resolve_object_handle_to_terminal(&object5_ref)?;
+    let object5 = pdf.resolve_to_terminal(&object5_ref)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     object5.replace_key(b"/X", null.clone())?;
 
@@ -398,7 +398,7 @@ pub(crate) fn run_test_92<R: Read + Seek>(
     // later `assert(oh.getOwningQPDF() == nullptr)` (test_driver.cc:3218)
     // are not ported; every other assertion in this test is.
     let root_h = root_handle(&mut qpdf);
-    let root = qpdf.resolve_object_handle_to_terminal(&root_h)?;
+    let root = qpdf.resolve_to_terminal(&root_h)?;
     assert!(root.is_indirect());
     assert!(root.as_dictionary().is_some());
 
@@ -411,7 +411,7 @@ pub(crate) fn run_test_92<R: Read + Seek>(
         .first()
         .cloned()
         .expect("minimal.pdf's /Kids has at least one page");
-    let page1 = qpdf.resolve_object_handle_to_terminal(&first_kid)?;
+    let page1 = qpdf.resolve_to_terminal(&first_kid)?;
     assert!(page1.is_indirect());
     assert!(page1.as_dictionary().is_some());
 
@@ -626,7 +626,7 @@ pub(crate) fn run_test_97<R: Read + Seek>(
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let container = pdf.trailer_key_handle(b"Nulls");
-    let container = pdf.resolve_object_handle_to_terminal(&container)?;
+    let container = pdf.resolve_to_terminal(&container)?;
     let container_items = container
         .as_array()
         .expect("many-nulls.pdf's /Nulls trailer entry is an array");
@@ -639,7 +639,7 @@ pub(crate) fn run_test_97<R: Read + Seek>(
         .first()
         .cloned()
         .expect("many-nulls.pdf's /Nulls trailer array has at least one element");
-    let nulls = pdf.resolve_object_handle_to_terminal(&first_item)?;
+    let nulls = pdf.resolve_to_terminal(&first_item)?;
     let items = nulls
         .as_array()
         .expect("many-nulls.pdf's /Nulls[0] is a large direct array of nulls");

@@ -4835,7 +4835,7 @@ pub(crate) mod tests {
         // `QPDF_Stream::filterable` (`libqpdf/QPDF_Stream.cc:391-413`).
         let mut pdf = Pdf::open(Cursor::new(pdf_with_a_filter_name_object())).expect("open");
         let filter = pdf.get_object_handle(ObjectRef::new(2, 0));
-        pdf.resolve_object_handle(&filter).expect("resolve /Filter");
+        pdf.resolve(&filter).expect("resolve /Filter");
 
         // Control, so the assertion after the drop cannot pass vacuously for a
         // handle that never carried a value in the first place.

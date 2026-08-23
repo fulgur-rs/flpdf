@@ -270,7 +270,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
         let catalog_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
         let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.pdf.resolve_object_handle(&catalog)?;
+        self.pdf.resolve(&catalog)?;
         let Some(catalog_dict) = catalog.as_dictionary() else {
             // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
             return Err(Error::Unsupported(format!(
@@ -284,7 +284,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
         // cov:ignore-end
         let pages = catalog.try_get_key(b"/Pages")?;
-        let root = self.pdf.resolve_object_handle_to_terminal(&pages)?;
+        let root = self.pdf.resolve_to_terminal(&pages)?;
         if root.as_dictionary().is_none() {
             // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
             return Err(Error::Unsupported(
