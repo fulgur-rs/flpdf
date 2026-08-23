@@ -68,7 +68,7 @@ fn collect_primary_fields(
 ) -> Result<Vec<ObjectHandle>> {
     let mut field_refs = BTreeSet::new();
     {
-        let mut acroform = AcroFormDocumentHelper::new(merged)?;
+        let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;
         for &page_ref in pages {
             let widgets = acroform.get_widget_annotations_for_page(page_ref)?;
             for widget in widgets {
@@ -80,7 +80,7 @@ fn collect_primary_fields(
         }
     }
     let primary_order = {
-        let mut acroform = AcroFormDocumentHelper::new(merged)?;
+        let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;
         acroform.top_level_fields()?
     };
     Ok(primary_order
@@ -289,7 +289,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
             // not create or merge a foreign destination `/DR`.
             let source_page = merged.get_object_handle(first_output_page);
             PageObjectHelper::new(final_refs[output_index], merged)
-                .copy_annotations_with_reserved_names(
+                .copy_annotations_with_field_tree_only(
                     source_page,
                     Matrix::default(),
                     &primary_field_names,
@@ -298,7 +298,7 @@ fn rebuild_acroform_in_final_page_order<R: Read + Seek + 'static>(
             let source_page = sources[source_index].get_object_handle(source_page_ref);
             let source = &mut sources[source_index];
             let mut destination = PageObjectHelper::new(final_refs[output_index], merged);
-            destination.copy_annotations_from_with_reserved_names(
+            destination.copy_annotations_from_with_field_tree_only(
                 source_page,
                 Matrix::default(),
                 source,
