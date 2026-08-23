@@ -819,9 +819,11 @@ mod tests {
     /// fixture this helper serves keeps it direct.
     fn resolve_one_level(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: Object) -> Object {
         match value {
+            // cov:ignore-start: this fixture's /AcroForm is never re-indirected
             Object::Reference(reference) => {
-                pdf.resolve_object(reference).expect("resolve reference") // cov:ignore: this fixture's /AcroForm is never re-indirected
+                pdf.resolve_object(reference).expect("resolve reference")
             }
+            // cov:ignore-end
             other => other,
         }
     }

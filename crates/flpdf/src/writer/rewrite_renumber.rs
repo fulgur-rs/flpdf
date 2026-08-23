@@ -1460,11 +1460,12 @@ mod tests {
             Object::Stream(_) => "stream".to_string(),
             Object::Dictionary(dict) => match dict.get("Type") {
                 Some(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(name)),
+                // cov:ignore-start: test-only type-tag oracle; no writer-renumber fixture gives an object an indirect /Type
                 Some(Object::Reference(tref)) => match pdf.resolve_object(*tref) {
-                    // cov:ignore: test-only type-tag oracle; no writer-renumber fixture gives an object an indirect /Type
                     Ok(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(&name)),
                     _ => "dict".to_string(),
                 },
+                // cov:ignore-end
                 _ => "dict".to_string(),
             },
             _ => "other".to_string(),
