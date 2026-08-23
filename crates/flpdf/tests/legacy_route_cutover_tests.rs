@@ -139,3 +139,25 @@ fn thread_bead_tests_have_no_raw_snapshot_route() {
         );
     }
 }
+
+#[test]
+fn inherited_attributes_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/optimization/inherited_attrs.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("inherited_attrs has a production section");
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "terminal_ref_of_chain",
+        "Object::",
+        "Dictionary",
+        "pdf.set_object(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "inherited_attrs production still contains raw route marker {legacy:?}"
+        );
+    }
+}
