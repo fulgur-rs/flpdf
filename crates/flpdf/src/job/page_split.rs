@@ -712,7 +712,11 @@ mod tests {
 
     impl Pipeline for RecordingWarningSink {
         fn identifier(&self) -> &str {
+            // cov:ignore-start: QPDFLogger::warn only ever calls
+            // PipelineHandle::write, never identifier (used only for a
+            // misconfigured-pipeline error context this test never triggers).
             "split_pages warning recording sink"
+            // cov:ignore-end
         }
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
@@ -721,7 +725,7 @@ mod tests {
         }
 
         fn finish(&mut self) -> PipelineResult<()> {
-            Ok(())
+            Ok(()) // cov:ignore: QPDFLogger::warn only ever calls PipelineHandle::write, never finish
         }
     }
 
@@ -762,11 +766,11 @@ mod tests {
         )
         .expect("split job should succeed with a recoverable, suppressed warning");
 
+        let delivered = String::from_utf8_lossy(&recorded.lock().unwrap()).into_owned();
         assert!(
-            recorded.lock().unwrap().is_empty(),
+            delivered.is_empty(),
             "a source opened with suppress_warnings:true must stay suppressed \
-             through split_pages: {:?}",
-            String::from_utf8_lossy(&recorded.lock().unwrap())
+             through split_pages: {delivered:?}"
         );
     }
 
