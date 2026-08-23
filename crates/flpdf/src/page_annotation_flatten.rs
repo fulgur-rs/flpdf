@@ -269,6 +269,14 @@ fn flatten_annotations_on_page<R: Read + Seek>(
     // ── Step 4: Materialize /Resources on the leaf page ────────────────────
     // Resolve inherited resources, then clone them so we can add /XObject
     // entries without mutating shared parent /Resources dicts.
+    //
+    // Unlike /Resources itself (unconditionally materialized here, matching
+    // qpdf's own unconditional `ph.getAttribute("/Resources", true)` at
+    // `QPDFPageDocumentHelper.cc:70`), /Resources/XObject is deliberately
+    // NOT touched here. qpdf privatizes-or-creates it lazily, once per
+    // annotation, only inside the `!content.empty()` branch
+    // (`resources.mergeResources("<< /XObject << >> >>"_qpdf)`,
+    // `QPDFPageDocumentHelper.cc:123`) -- see Step 5.
     let mut page_helper = PageObjectHelper::new(page_ref, pdf);
     let resources = page_helper.get_attribute(b"/Resources", true)?;
     let page = pdf.get_object_handle(page_ref);
@@ -280,23 +288,6 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         page.replace_key(b"/Resources", replacement.clone())?;
         pdf.mark_object_handle_dirty(&page)?;
         replacement
-    };
-    let xobj_value = resources.try_get_key(b"/XObject")?;
-    let xobj_dict = if xobj_value.is_null() {
-        let replacement = ObjectHandle::dictionary(Vec::new());
-        resources.replace_key(b"/XObject", replacement.clone())?;
-        pdf.mark_object_handle_dirty(&resources)?;
-        replacement
-    } else {
-        pdf.resolve_object_handle(&xobj_value)?;
-        if xobj_value.as_dictionary().is_some() {
-            xobj_value
-        } else {
-            let replacement = ObjectHandle::dictionary(Vec::new());
-            resources.replace_key(b"/XObject", replacement.clone())?;
-            pdf.mark_object_handle_dirty(&resources)?;
-            replacement
-        }
     };
 
     // ── Step 5: Build content appendix and register XObjects ──────────────
@@ -312,10 +303,19 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         // accepted candidate's number is "the value used, not the next
         // value" -- it only becomes final once this annotation is confirmed
         // to produce content, below.
+        //
+        // /XObject may not exist yet (it is only privatized-or-created
+        // below, once content is known to be non-empty), so peek at it
+        // read-only here without creating it.
+        let existing_xobj = resources.try_get_key(b"/XObject")?;
+        let existing_xobj = pdf.resolve_object_handle_to_terminal(&existing_xobj)?;
         let xobj_name = loop {
             let candidate = format!("Fxo{xobj_counter}");
             let candidate_key = format!("/{candidate}");
-            if !xobj_dict.try_has_key(candidate_key.as_bytes())? {
+            let collides = existing_xobj
+                .as_dictionary()
+                .is_some_and(|dict| dict.contains_key(candidate_key.as_bytes()));
+            if !collides {
                 break candidate;
             }
             xobj_counter += 1;
@@ -338,6 +338,23 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         xobj_counter += 1;
 
         // Register the Form XObject only when qpdf produced drawing content.
+        // Privatize an existing indirect /XObject dict, or create one if
+        // absent, exactly when qpdf does (QPDFPageDocumentHelper.cc:123):
+        // merging an empty placeholder dict into /Resources is qpdf's own
+        // idiom for that privatize-or-create step, and ObjectHandle::merge_resources
+        // already implements the identical privatization semantics.
+        let empty_xobject_placeholder = ObjectHandle::dictionary(vec![(
+            b"/XObject".to_vec(),
+            ObjectHandle::dictionary(Vec::new()),
+        )]);
+        // Mark dirty before the fallible merge, matching the DR-merge call
+        // site's own convention above: a partially-applied merge must still
+        // be reflected in the dirty set.
+        pdf.mark_object_handle_dirty(&resources)?;
+        resources.merge_resources(&empty_xobject_placeholder, None)?;
+        let xobj_dict = resources.try_get_key(b"/XObject")?;
+        pdf.resolve_object_handle(&xobj_dict)?;
+
         let xobject = if data.appearance.is_indirect() {
             data.appearance.clone()
         } else {
@@ -2931,6 +2948,176 @@ mod tests {
             !content_str.contains("Fxo3"),
             "the skipped zero-area annotation must not have consumed a name, got: {content_str}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: a page whose only annotation candidate produces empty flatten
+    // content must not create /Resources/XObject at all. qpdf's
+    // `resources.mergeResources("<< /XObject << >> >>"_qpdf)` runs only
+    // inside the `!content.empty()` branch (`QPDFPageDocumentHelper.cc:123`);
+    // creating /XObject unconditionally for a page whose selected candidate
+    // yields nothing (e.g. a malformed zero-area appearance) is a regression
+    // this test guards against.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn empty_flatten_content_does_not_create_xobject_dict() {
+        // Zero-width /BBox produces empty flatten content (same technique as
+        // skipped_annotation_does_not_consume_an_xobj_name), and this is the
+        // *only* candidate on the page.
+        let zero_area_body = make_xobj_stream([0.0, 0.0, 0.0, 20.0], b"");
+        let (n5, obj5_bytes) = obj_wrap(5, zero_area_body);
+        let (n4, obj4_bytes) = obj_dict(
+            4,
+            "<< /Type /Annot /Subtype /Widget /Rect [0 0 100 20] /AP << /N 5 0 R >> >>",
+        );
+
+        let bytes = build_pdf("/Annots [4 0 R]", &[(n4, obj4_bytes), (n5, obj5_bytes)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page_ref = ObjectRef::new(3, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 0, "the zero-area annotation must produce no output");
+
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve_object_handle(&page).unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        pdf.resolve_object_handle(&resources).unwrap();
+        let xobject = resources.try_get_key(b"/XObject").unwrap();
+        pdf.resolve_object_handle(&xobject).unwrap();
+        assert!(
+            xobject.is_null(),
+            "no candidate produced content, so /Resources/XObject must not be created"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: two pages sharing an indirect /Resources/XObject dictionary.
+    // Flattening one page must privatize its own /XObject dict (mirroring
+    // qpdf's `resources.mergeResources("<< /XObject << >> >>"_qpdf)`
+    // privatize-or-create idiom, `QPDFPageDocumentHelper.cc:123`) rather than
+    // mutating the shared indirect object in place, which would leak the new
+    // /FxoN entry onto every other page still referencing it.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn shared_indirect_xobject_dict_is_privatized_per_page() {
+        // obj 7: an indirect /XObject dictionary shared by two pages.
+        let (n7, obj7_bytes) = obj_dict(7, "<< /Im1 10 0 R >>");
+        let (n10, obj10_bytes) = obj_wrap(
+            10,
+            b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x00\nendstream\n".to_vec(),
+        );
+
+        let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
+        let (n8, obj8_bytes) = obj_wrap(8, xobj_body.clone());
+        let (n9, obj9_bytes) = obj_wrap(9, xobj_body);
+        let (n5, obj5_bytes) = obj_dict(
+            5,
+            "<< /Type /Annot /Subtype /Widget /Rect [10 10 100 100] /AP << /N 8 0 R >> >>",
+        );
+        let (n6, obj6_bytes) = obj_dict(
+            6,
+            "<< /Type /Annot /Subtype /Widget /Rect [10 10 100 100] /AP << /N 9 0 R >> >>",
+        );
+
+        let mut pdf_bytes = Vec::new();
+        pdf_bytes.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets: Vec<(u32, u64)> = Vec::new();
+        let mut push = |pdf: &mut Vec<u8>, num: u32, body: &[u8]| {
+            offsets.push((num, pdf.len() as u64));
+            pdf.extend_from_slice(body);
+        };
+        push(
+            &mut pdf_bytes,
+            1,
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        );
+        push(
+            &mut pdf_bytes,
+            2,
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n",
+        );
+        push(
+            &mut pdf_bytes,
+            3,
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject 7 0 R >> /Annots [5 0 R] >>\nendobj\n",
+        );
+        push(
+            &mut pdf_bytes,
+            4,
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject 7 0 R >> /Annots [6 0 R] >>\nendobj\n",
+        );
+        for (num, body) in [
+            (n5, &obj5_bytes),
+            (n6, &obj6_bytes),
+            (n7, &obj7_bytes),
+            (n8, &obj8_bytes),
+            (n9, &obj9_bytes),
+            (n10, &obj10_bytes),
+        ] {
+            push(&mut pdf_bytes, num, body);
+        }
+
+        let xref_start = pdf_bytes.len() as u64;
+        let max_num = offsets.iter().map(|(n, _)| *n).max().unwrap();
+        let total = max_num as usize + 1;
+        let mut xref = format!("xref\n0 {total}\n0000000000 65535 f \n");
+        for i in 1u32..=max_num {
+            let off = offsets
+                .iter()
+                .find(|(n, _)| *n == i)
+                .map(|(_, off)| *off)
+                .unwrap_or(0);
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf_bytes.extend_from_slice(xref.as_bytes());
+        pdf_bytes.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
+        let page1_ref = ObjectRef::new(3, 0);
+        let page2_ref = ObjectRef::new(4, 0);
+
+        let count = flatten_annotations_on_page(&mut pdf, page1_ref, FlattenMode::All).unwrap();
+        assert_eq!(count, 1);
+
+        // Page 1's /Resources/XObject must now be a privatized (direct)
+        // dictionary carrying the new Fxo entry.
+        let page1 = pdf.get_object_handle(page1_ref);
+        pdf.resolve_object_handle(&page1).unwrap();
+        let resources1 = page1.try_get_key(b"/Resources").unwrap();
+        pdf.resolve_object_handle(&resources1).unwrap();
+        let xobject1 = resources1.try_get_key(b"/XObject").unwrap();
+        pdf.resolve_object_handle(&xobject1).unwrap();
+        assert!(
+            !xobject1.is_indirect(),
+            "flattening must privatize a shared indirect /XObject dict"
+        );
+        assert!(xobject1.try_has_key(b"/Fxo1").unwrap());
+
+        // The original shared object (obj 7) must be untouched: still only
+        // /Im1, no leaked /Fxo1 -- this is what page 2 (still pointing at the
+        // original indirect ref) would see.
+        let original = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve_object_handle(&original).unwrap();
+        assert!(
+            original.try_has_key(b"/Im1").unwrap(),
+            "original shared dict must retain its own entry"
+        );
+        assert!(
+            !original.try_has_key(b"/Fxo1").unwrap(),
+            "flattening page 1 must not leak /Fxo1 into the shared object page 2 still uses"
+        );
+
+        // Page 2's /Resources/XObject must still be the original, untouched
+        // indirect reference.
+        let page2 = pdf.get_object_handle(page2_ref);
+        pdf.resolve_object_handle(&page2).unwrap();
+        let resources2 = page2.try_get_key(b"/Resources").unwrap();
+        pdf.resolve_object_handle(&resources2).unwrap();
+        let xobject2 = resources2.try_get_key(b"/XObject").unwrap();
+        assert_eq!(xobject2.object_ref(), Some(ObjectRef::new(7, 0)));
     }
 
     // -----------------------------------------------------------------------
