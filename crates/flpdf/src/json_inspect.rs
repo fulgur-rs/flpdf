@@ -830,12 +830,14 @@ pub(crate) fn stream_payload_with_decode_status(
         });
     }
 
-    let Some(stream_dict) = stream.as_stream_dict() else {
-        return Ok(StreamPayload {
-            bytes: Cow::Owned(raw_data.as_ref().clone()),
-            decode_succeeded: false,
-        });
-    };
+    // `get_raw_stream_data` above only succeeds for a handle whose resolved
+    // value is `ObjectValue::Stream`, and that success dereferences `stream`
+    // as a side effect — so `as_stream_dict` is guaranteed `Some` here, the
+    // same as qpdf's `QPDF_Stream` always carrying its own `stream_dict`
+    // member once a `QPDF_Stream` instance exists at all.
+    let stream_dict = stream
+        .as_stream_dict()
+        .expect("get_raw_stream_data succeeded, so stream must have a stream dict");
     let Some(capabilities) = crate::filters::stream_filter_capabilities(&stream_dict) else {
         return Ok(StreamPayload {
             bytes: Cow::Owned(raw_data.as_ref().clone()),
@@ -9397,16 +9399,11 @@ mod tests {
         // surfaces the same contract as `Err` rather than silently
         // substituting an empty payload.
         let handle = ObjectHandle::integer(7);
-        match stream_payload_with_decode_status(&handle, DecodeLevel::Generalized) {
-            Err(crate::Error::Internal(_)) => {}
-            other => panic!(
-                "expected Error::Internal for a non-stream handle, got {}",
-                match other {
-                    Ok(_) => "Ok(..)".to_owned(),
-                    Err(e) => e.to_string(),
-                }
-            ),
-        }
+        let result = stream_payload_with_decode_status(&handle, DecodeLevel::Generalized);
+        assert!(
+            matches!(result, Err(crate::Error::Internal(_))),
+            "a non-stream handle must surface Error::Internal instead of a silent empty payload"
+        );
     }
 
     #[test]
