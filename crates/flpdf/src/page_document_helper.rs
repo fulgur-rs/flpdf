@@ -163,7 +163,19 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         } else {
             refs.insert(idx, page);
         }
-        rebuild_page_tree(self.pdf, &refs)
+        let result = rebuild_page_tree(self.pdf, &refs)?;
+        // The inserted page may carry annotations (in particular orphan
+        // Widgets not reachable through `/AcroForm/Fields`) that a shared
+        // `Pdf::acroform_cache` warmed before this call has no knowledge of.
+        // qpdf's own per-step `QPDFAcroFormDocumentHelper` construction
+        // (`QPDFJob.cc:2141-2193`) never observes a page inserted after it
+        // was built either; invalidating here reproduces that "no stale
+        // analysis survives a page-tree mutation" guarantee, matching
+        // `AcroFormDocumentHelper::invalidate_cache`'s own documented
+        // contract ("after manually changing the field tree, AcroForm
+        // dictionary, or page annotations").
+        *self.pdf.acroform_cache.borrow_mut() = None;
+        Ok(result)
     }
 
     fn materialize_page_input<RS: Read + Seek>(

@@ -4,14 +4,33 @@
 //! `PageDocumentHelper` for all page-list access rather than calling
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
+use flpdf::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use flpdf::{
     Dictionary, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, PageObjectHelper,
-    Pdf, Stream,
+    Pdf, QPDFLogger, Stream,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+struct RecordingWarningSink(Arc<Mutex<Vec<u8>>>);
+
+impl Pipeline for RecordingWarningSink {
+    fn identifier(&self) -> &str {
+        "page document helper warning recording sink"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Minimal PDF builder
@@ -3143,5 +3162,72 @@ fn add_page_at_rejects_reference_outside_document() {
             .unwrap()
             .len(),
         3
+    );
+}
+
+#[test]
+fn add_page_invalidates_a_shared_acroform_cache_warmed_before_insertion() {
+    // qpdf's own per-step `QPDFAcroFormDocumentHelper` construction
+    // (`QPDFJob.cc:2141-2193`) never survives across an unrelated document
+    // mutation between steps. flpdf's `Pdf::acroform_cache` is shared across
+    // every `AcroFormDocumentHelper::new()` call for a source, so
+    // `PageDocumentHelper::add_page`/`add_page_at` must invalidate it after
+    // inserting a page: the inserted page can carry an orphan Widget (not
+    // reachable through `/AcroForm/Fields`) that a pre-insertion analysis
+    // has no knowledge of.
+    let bytes = fs::read("../../tests/fixtures/compat/acroform-sig-orphan-widget.pdf").unwrap();
+    let mut source = Pdf::open(Cursor::new(bytes)).unwrap();
+    let source_page = PageDocumentHelper::new(&mut source)
+        .get_all_pages()
+        .unwrap()[0];
+
+    let mut output = Pdf::empty().unwrap();
+    // The orphan-widget fallback only runs when `/AcroForm` exists with a
+    // `/Fields` key (`AcroFormDocumentHelper::analyze_field_tree`); give the
+    // empty output an /AcroForm with no fields so the page-walk actually
+    // executes on both the pre- and post-insertion analyses below.
+    let root_ref = output.root_ref().unwrap();
+    let root = output.get_object_handle(root_ref);
+    output.resolve(&root).unwrap();
+    let acroform = output
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Fields".to_vec(),
+            ObjectHandle::array(Vec::new()),
+        )]))
+        .unwrap();
+    root.replace_key(b"/AcroForm", acroform).unwrap();
+    output.mark_object_handle_dirty(&root).unwrap();
+
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(RecordingWarningSink(Arc::clone(
+        &recorded,
+    )))));
+    output.set_logger(logger);
+
+    // `AcroFormDocumentHelper::new` analyzes unconditionally in its
+    // constructor. Warm the cache while the document has no pages at all,
+    // so this first analysis cannot see the orphan widget inserted next.
+    let _ = output.acroform().unwrap();
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "an empty document has nothing to warn about"
+    );
+
+    PageDocumentHelper::new(&mut output)
+        .add_page(PageInput::foreign(&mut source, source_page), false)
+        .unwrap();
+
+    // A fresh analysis (not a stale pre-insertion one) must observe the
+    // newly copied page's orphan widget and warn about it, matching what
+    // `source`'s own analysis reports for the same page.
+    let _ = output.acroform().unwrap();
+    let warning = String::from_utf8(recorded.lock().unwrap().clone()).unwrap();
+    assert!(
+        warning.contains(
+            "this widget annotation is not reachable from /AcroForm in the document catalog"
+        ),
+        "add_page must invalidate the pre-insertion AcroForm cache so the orphan widget \
+         on the newly copied page is detected: {warning:?}"
     );
 }
