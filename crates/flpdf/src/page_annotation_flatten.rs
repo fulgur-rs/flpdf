@@ -322,15 +322,14 @@ fn flatten_annotations_on_page<R: Read + Seek>(
         };
 
         let resource_name = format!("/{xobj_name}");
-        let content_result = match &data.appearance {
-            _ => AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
+        let content_result =
+            AnnotationObjectHelper::from_object_handle(data.annotation.clone(), pdf)
                 .get_page_content_for_appearance(
                     &resource_name,
                     page_rotate,
                     required_flags,
                     forbidden_flags,
-                ),
-        };
+                );
         let content = content_result?;
         if content.is_empty() {
             continue;
