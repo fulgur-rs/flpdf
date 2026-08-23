@@ -375,7 +375,7 @@ impl QPDFJob {
 ///
 /// ```no_run
 /// use std::io::Cursor;
-/// use flpdf::{filespec_helper, Pdf};
+/// use flpdf::Pdf;
 ///
 /// # fn main() -> flpdf::Result<()> {
 /// let mut pdf: Pdf<Cursor<Vec<u8>>> = todo!();
@@ -482,7 +482,7 @@ pub fn ascii_filename_fallback(filename: &str) -> Vec<u8> {
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use flpdf::{filespec_helper, Pdf};
+/// use flpdf::Pdf;
 ///
 /// # fn main() -> flpdf::Result<()> {
 /// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
@@ -546,7 +546,7 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use flpdf::{filespec_helper, Pdf};
+/// use flpdf::Pdf;
 ///
 /// # fn main() -> flpdf::Result<()> {
 /// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
@@ -582,7 +582,7 @@ pub fn write_attachment<R: Read + Seek, W: Write>(
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use flpdf::{filespec_helper, Pdf};
+/// use flpdf::Pdf;
 ///
 /// # fn main() -> flpdf::Result<()> {
 /// let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;

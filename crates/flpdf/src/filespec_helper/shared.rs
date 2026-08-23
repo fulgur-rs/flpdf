@@ -22,10 +22,16 @@ pub(super) fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
     }
 }
 
-// qpdf's `QUtil::safe_fopen` reports `open <path>: <message>` without Rust's
-// platform-specific numeric OS-error suffix. Keep this diagnostic helper
-// available to the JSON input path without coupling that path to either
-// qpdf-shaped object helper.
+// qpdf's `QUtil::safe_fopen` reports `"open " + filename + ": " +
+// strerror(errno)` (`libqpdf/QUtil.cc:512-515`, `QPDFSystemError.cc:12-27`),
+// with no numeric error code. `std::io::Error`'s `Display` appends a
+// `" (os error N)"` suffix that qpdf's message lacks; strip it so the two
+// diagnostics match byte-for-byte. A missing file is special-cased to
+// qpdf's portable C-runtime wording ("No such file or directory") on every
+// host, since Rust's `std::io::Error` on Windows instead surfaces the
+// native Win32 FormatMessage text ("The system cannot find the file
+// specified."). Keep this diagnostic helper available to the JSON input
+// path without coupling that path to either qpdf-shaped object helper.
 pub(crate) fn qpdf_style_open_error(path: &Path, error: std::io::Error) -> Error {
     let rendered = error.to_string();
     let message = if error.kind() == std::io::ErrorKind::NotFound {
