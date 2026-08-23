@@ -638,7 +638,7 @@ fn append_body_object(
             object,
             options,
             options.content_normalization && content_normalize_refs.contains(&original_ref),
-        )?;
+        )?; // cov:ignore: LLVM maps this covered stream-output call terminator to a zero-count continuation region
     let mut entries = dict.try_as_dictionary()?.unwrap_or_default();
     let payload_ctx = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
     let cleartext_metadata = payload_ctx
