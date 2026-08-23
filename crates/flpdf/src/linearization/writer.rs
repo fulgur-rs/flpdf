@@ -6556,7 +6556,11 @@ mod tests {
                 .ok()
                 .and_then(|o| o.into_stream())
                 .and_then(|stream| {
-                    crate::filters::decode_stream_data(&stream.dict, &stream.data).ok()
+                    crate::filters::test_dictionary_api::decode_stream_data(
+                        &stream.dict,
+                        &stream.data,
+                    )
+                    .ok()
                 })
                 .map(|d| d.windows(raw_content.len()).any(|w| w == raw_content))
                 .unwrap_or(false)
@@ -6633,7 +6637,8 @@ mod tests {
         let mut enc_dict = Dictionary::new();
         enc_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         let compressed =
-            crate::filters::encode_stream_data(&enc_dict, payload).expect("flate encode");
+            crate::filters::test_dictionary_api::encode_stream_data(&enc_dict, payload)
+                .expect("flate encode");
 
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.5\n");
@@ -6715,8 +6720,11 @@ mod tests {
             .into_iter()
             .find_map(|r| {
                 let stream = reopened.resolve(r).ok()?.into_stream()?;
-                let decoded =
-                    crate::filters::decode_stream_data(&stream.dict, &stream.data).ok()?;
+                let decoded = crate::filters::test_dictionary_api::decode_stream_data(
+                    &stream.dict,
+                    &stream.data,
+                )
+                .ok()?;
                 decoded
                     .windows(payload.len())
                     .any(|w| w == payload)
@@ -10053,12 +10061,14 @@ mod tests {
         // NOT decode the encrypted output's payload (AES-CBC ciphertext).
         let mut flate_dict = Dictionary::new();
         flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        crate::filters::decode_stream_data(&flate_dict, unencrypted_payload).expect(
-            "premise: the unencrypted control's hint stream payload must be valid \
+        crate::filters::test_dictionary_api::decode_stream_data(&flate_dict, unencrypted_payload)
+            .expect(
+                "premise: the unencrypted control's hint stream payload must be valid \
              zlib (structural_streams_filtered is true under default options)",
-        );
+            );
         assert!(
-            crate::filters::decode_stream_data(&flate_dict, encrypted_payload).is_err(),
+            crate::filters::test_dictionary_api::decode_stream_data(&flate_dict, encrypted_payload)
+                .is_err(),
             "encrypted output's hint stream payload must NOT decode as zlib — \
              if it does, the hint stream was never actually run through the cipher"
         );

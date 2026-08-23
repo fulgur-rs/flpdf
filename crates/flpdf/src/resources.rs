@@ -1120,7 +1120,9 @@ mod tests {
         let form_body = b"BT /F1 12 Tf ET";
         let mut filter_dict = Dictionary::new();
         filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        let encoded = crate::filters::encode_stream_data(&filter_dict, form_body).unwrap();
+        let encoded =
+            crate::filters::test_dictionary_api::encode_stream_data(&filter_dict, form_body)
+                .unwrap();
         let mut form_dict = Dictionary::new();
         form_dict.insert("Type", Object::Name(b"XObject".to_vec()));
         form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));

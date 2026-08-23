@@ -120,12 +120,16 @@ where
         // not send that already-consumed Crypt stage through the codec chain
         // (`QPDF_Stream.cc:345-374`, `QPDF_encryption.cc:1041-1153`).
         remove_consumed_crypt_stages(&mut act_decode_dict);
-        let decoded_act = flpdf::filters::decode_stream_data(&act_decode_dict, act_data.as_ref())?;
+        let act_filter_handle = filter_dictionary_handle(&act_decode_dict);
+        let decoded_act =
+            flpdf::filters::decode_stream_data(&act_filter_handle, act_data.as_ref())?;
 
         let exp_data = raw_stream_data(exp)?;
         let mut exp_decode_dict = materialize_decode_dictionary(&exp_dict, expected_pdf)?;
         remove_consumed_crypt_stages(&mut exp_decode_dict);
-        let decoded_exp = flpdf::filters::decode_stream_data(&exp_decode_dict, exp_data.as_ref())?;
+        let exp_filter_handle = filter_dictionary_handle(&exp_decode_dict);
+        let decoded_exp =
+            flpdf::filters::decode_stream_data(&exp_filter_handle, exp_data.as_ref())?;
         return Ok(compare_stream_bytes(label, &decoded_act, &decoded_exp));
     }
 
@@ -293,6 +297,51 @@ fn materialize_decode_dictionary<R: Read + Seek>(
         legacy.insert(key, value);
     }
     Ok(legacy)
+}
+
+/// Pass only the filter-owned keys across the canonical ObjectHandle boundary.
+/// The qtest comparator keeps its materialized dictionary for warning/source
+/// attribution, but codec dispatch must not call a legacy `&Dictionary` API.
+fn filter_dictionary_handle(dict: &Dictionary) -> ObjectHandle {
+    let mut entries = Vec::new();
+    for (key, handle_key) in [
+        ("Filter", b"/Filter".as_slice()),
+        ("DecodeParms", b"/DecodeParms".as_slice()),
+    ] {
+        if let Some(value) = dict.get(key) {
+            entries.push((handle_key.to_vec(), filter_value_handle(value)));
+        }
+    }
+    ObjectHandle::dictionary(entries)
+}
+
+fn filter_value_handle(value: &Object) -> ObjectHandle {
+    match value {
+        Object::Null => ObjectHandle::null(),
+        Object::Boolean(value) => ObjectHandle::boolean(*value),
+        Object::Integer(value) => ObjectHandle::integer(*value),
+        Object::Real(value) => ObjectHandle::real(*value),
+        Object::RealLiteral { value, .. } => ObjectHandle::real(*value),
+        Object::Name(value) => ObjectHandle::name(value.clone()),
+        Object::String(value) => ObjectHandle::string(value.clone()),
+        Object::Array(values) => {
+            ObjectHandle::array(values.iter().map(filter_value_handle).collect())
+        }
+        Object::Dictionary(dictionary) => ObjectHandle::dictionary(
+            dictionary
+                .iter()
+                .map(|(key, value)| {
+                    let mut canonical = Vec::with_capacity(key.len() + 1);
+                    canonical.push(b'/');
+                    canonical.extend_from_slice(key);
+                    (canonical, filter_value_handle(value))
+                })
+                .collect(),
+        ),
+        Object::Reference(_) | Object::Stream(_) | Object::Operator(_) | Object::InlineImage(_) => {
+            ObjectHandle::boolean(false)
+        }
+    }
 }
 
 fn materialize_decode_params_for_legacy<R: Read + Seek>(

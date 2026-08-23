@@ -45,6 +45,9 @@
 //! - **CI** (`CI` env var set): panics if qpdf is absent.
 //! - **Local runs**: print a diagnostic and skip the qpdf guard.
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use assert_cmd::Command as CargoCommand;
 use flpdf::{
     filters::decode_stream_data,
@@ -842,8 +845,11 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
         );
 
         // Decoded bytes must be non-empty (round-trip sanity).
-        let decoded = decode_stream_data(&content_stream.dict, &content_stream.data)
-            .expect("decoding FlateDecode stream must succeed");
+        let decoded = decode_stream_data(
+            &filter_handles::dictionary(&content_stream.dict),
+            &content_stream.data,
+        )
+        .expect("decoding FlateDecode stream must succeed");
         assert!(
             !decoded.is_empty(),
             "compress-streams=y: decoded content stream must be non-empty"

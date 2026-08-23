@@ -1719,7 +1719,8 @@ mod tests {
             "stale LZW /DecodeParms must not survive the filter swap"
         );
         let decoded_content =
-            crate::filters::decode_stream_data(&stream.dict, &stream.data).unwrap();
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
+                .unwrap();
         assert_eq!(
             decoded_content, b"/F1_1 18 Tf",
             "content must reference the RENAMED name, consistent with /Resources"

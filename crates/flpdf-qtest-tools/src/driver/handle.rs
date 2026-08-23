@@ -1,6 +1,6 @@
 use std::io::{Read, Seek};
 
-use flpdf::{Dictionary, Error, Object, ObjectRef, Pdf};
+use flpdf::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf};
 
 const MAX_REF_CHAIN_DEPTH: usize = 64;
 
@@ -46,6 +46,84 @@ impl ResolvedStreamDictionary {
 
     pub(crate) fn decode_param_type_warnings(&self) -> &[DecodeParamTypeWarning] {
         &self.decode_param_type_warnings
+    }
+
+    /// Return the canonical filter-input dictionary without reintroducing the
+    /// removed `&Dictionary` filter API. The qtest driver retains its
+    /// materialized dictionary for warning attribution, but codec access now
+    /// receives only the `/Filter` and `/DecodeParms` handle view.
+    pub(crate) fn filter_input_handle(&self) -> ObjectHandle {
+        let mut entries = Vec::new();
+        for (key, value) in [
+            (b"/Filter".as_slice(), self.dictionary.get(b"Filter")),
+            (
+                b"/DecodeParms".as_slice(),
+                self.dictionary.get(b"DecodeParms"),
+            ),
+        ] {
+            if let Some(value) = value {
+                let value = if key == b"/DecodeParms" {
+                    decode_params_handle(value)
+                } else {
+                    filter_value_handle(value)
+                };
+                entries.push((key.to_vec(), value));
+            }
+        }
+        ObjectHandle::dictionary(entries)
+    }
+}
+
+fn decode_params_handle(value: &Object) -> ObjectHandle {
+    match value {
+        Object::Null => ObjectHandle::null(),
+        Object::Array(values) => ObjectHandle::array(
+            values
+                .iter()
+                .map(|value| match value {
+                    Object::Null => ObjectHandle::null(),
+                    Object::Dictionary(_) => filter_value_handle(value),
+                    // The qtest driver has already emitted qpdf's type
+                    // warning. A consumer filter then sees an empty
+                    // dictionary, matching QPDFObjectHandle::getKeys on a
+                    // non-dictionary DecodeParms item.
+                    _ => ObjectHandle::dictionary(Vec::new()),
+                })
+                .collect(),
+        ),
+        Object::Dictionary(_) => filter_value_handle(value),
+        // See the array-item case above: qpdf warns and treats a scalar
+        // DecodeParms body as an empty dictionary for a consuming filter.
+        _ => ObjectHandle::dictionary(Vec::new()),
+    }
+}
+
+fn filter_value_handle(value: &Object) -> ObjectHandle {
+    match value {
+        Object::Null => ObjectHandle::null(),
+        Object::Boolean(value) => ObjectHandle::boolean(*value),
+        Object::Integer(value) => ObjectHandle::integer(*value),
+        Object::Real(value) => ObjectHandle::real(*value),
+        Object::RealLiteral { value, .. } => ObjectHandle::real(*value),
+        Object::Name(value) => ObjectHandle::name(value.clone()),
+        Object::String(value) => ObjectHandle::string(value.clone()),
+        Object::Array(values) => {
+            ObjectHandle::array(values.iter().map(filter_value_handle).collect())
+        }
+        Object::Dictionary(dictionary) => ObjectHandle::dictionary(
+            dictionary
+                .iter()
+                .map(|(key, value)| {
+                    let mut canonical = Vec::with_capacity(key.len() + 1);
+                    canonical.push(b'/');
+                    canonical.extend_from_slice(key);
+                    (canonical, filter_value_handle(value))
+                })
+                .collect(),
+        ),
+        Object::Reference(_) | Object::Stream(_) | Object::Operator(_) | Object::InlineImage(_) => {
+            ObjectHandle::boolean(false)
+        }
     }
 }
 

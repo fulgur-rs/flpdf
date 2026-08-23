@@ -16244,7 +16244,7 @@ mod stream_provider_contract_tests {
         let mut filter_dict = Dictionary::new();
         filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
         let encoded = Rc::new(
-            crate::filters::encode_stream_data(&filter_dict, decoded)
+            crate::filters::test_dictionary_api::encode_stream_data(&filter_dict, decoded)
                 .expect("provider source encoding"),
         );
         let pdf = crate::Pdf::empty().expect("empty PDF");

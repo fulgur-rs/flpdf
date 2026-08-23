@@ -3926,7 +3926,7 @@ fn apply_explicit_crypt_filters(
         .expect("caller checked for an explicit /Crypt filter");
     let decode_params = stream.dict.get("DecodeParms").cloned();
     if let Some(filters) = filter.as_array() {
-        crate::filters::validate_filter_chain_len(filters)?;
+        crate::filters::validate_filter_chain_len(filters.len())?;
     }
 
     // qpdf's QPDF::decryptStream prepends one decryption stage to the source
@@ -4066,7 +4066,10 @@ pub(crate) fn parse_object_stream_entry(
     stream_object: &crate::Stream,
     target_index: u32,
 ) -> Result<ParsedObjectStreamEntry> {
-    let stream_data = crate::filters::decode_stream_data(&stream_object.dict, &stream_object.data)?;
+    let stream_data = crate::filters::test_dictionary_api::decode_stream_data(
+        &stream_object.dict,
+        &stream_object.data,
+    )?;
 
     let stream_object_count = object_stream_count(stream_object)?;
     let stream_data_first = parse_non_negative_i64(
@@ -5660,7 +5663,8 @@ mod tests {
     fn flate_encoded(plaintext: &[u8]) -> Vec<u8> {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-        crate::filters::encode_stream_data(&dict, plaintext).expect("Flate encode")
+        crate::filters::test_dictionary_api::encode_stream_data(&dict, plaintext)
+            .expect("Flate encode")
     }
 
     fn ascii_hex_encoded_without_eod(plaintext: &[u8]) -> Vec<u8> {
@@ -5946,7 +5950,7 @@ mod tests {
         .expect("remove first Crypt");
 
         assert_eq!(
-            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
                 .expect("decode remaining Flate"),
             plaintext
         );
@@ -5984,7 +5988,7 @@ mod tests {
             .expect("remove Crypt without re-encoding the ASCIIHex prefix");
 
         assert_eq!(
-            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
                 .expect("decode remaining ASCIIHex"),
             plaintext
         );
@@ -6052,7 +6056,7 @@ mod tests {
         .expect("remove Crypt without DecodeParms");
 
         assert_eq!(
-            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
                 .expect("decode remaining Flate"),
             plaintext
         );
@@ -6084,7 +6088,7 @@ mod tests {
         .expect("remove Crypt with short DecodeParms");
 
         assert_eq!(
-            crate::filters::decode_stream_data(&stream.dict, &stream.data)
+            crate::filters::test_dictionary_api::decode_stream_data(&stream.dict, &stream.data)
                 .expect("decode remaining Flate"),
             plaintext
         );
@@ -8607,6 +8611,18 @@ mod tests {
             .into_dict()
             .expect("dictionary member");
         assert_eq!(dictionary.get_ref("V"), Some(ObjectRef::new(6, 0)));
+    }
+
+    #[test]
+    fn object_stream_file_object_mode_propagates_filter_decode_errors() {
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        dict.insert("N", Object::Integer(1));
+        dict.insert("First", Object::Integer(4));
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let stream = Stream::new(dict, b"not zlib".to_vec());
+
+        assert!(parse_object_stream_entry(&stream, 0).is_err());
     }
 
     #[test]

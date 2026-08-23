@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from either Object-shaped or ObjectHandle-shaped /Filter and /DecodeParms values.
+//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from ObjectHandle-shaped /Filter and /DecodeParms values. A materialized Object reader exists only inside cfg(test) equivalence fixtures.
 //!
 //! # `SF_Crypt::setDecodeParms` validation is reproduced but unreached
 //!
@@ -56,7 +56,9 @@ use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
 use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::tiff_predictor::{TiffPredictor, TiffPredictorAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult};
-use crate::{Error, Object, Result};
+#[cfg(test)]
+use crate::Object;
+use crate::{Error, Result};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -270,8 +272,8 @@ pub(crate) const FILTER_TYPE_ERROR: &str = "stream filter type is not name or ar
 /// qpdf validates every filter name against `filter_factories` first and
 /// returns on an unknown one (`QPDF_Stream.cc:433-435`), so `:459`'s condition
 /// is never evaluated for a stream whose `/Filter` names an unimplemented
-/// codec. Both flpdf shape readers make the same factory decision before
-/// reading `/DecodeParms`, through [`validate_filter_factories`].
+/// codec. The handle reader makes the same factory decision before reading
+/// `/DecodeParms`, through [`validate_filter_factories`].
 pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
     "stream /DecodeParms length is inconsistent with filters";
 
@@ -280,15 +282,10 @@ pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
 /// Unlike qpdf, which caps nothing here, flpdf refuses pathological chains on
 /// the decode path; `filters::MAX_FILTER_CHAIN_LEN` documents that divergence.
 ///
-/// Both shape readers call this, so the cap's *body* — the comparison and the
-/// message — has exactly one definition. Its *position* does not: each reader
-/// hand-places two calls (one inside the `/Filter` array arm, ahead of
-/// per-item validation; one after the `/DecodeParms` branch), and
-/// `filters::validate_filter_chain_len` places a fifth. Nothing structural
-/// keeps those placements aligned — only
-/// `handle_reader_matches_object_reader_for_every_filter_shape`, which sweeps
-/// the corpus at `None`, `Some(16)`, and `Some(0)` and fails if either
-/// reader's placement drifts.
+/// The handle reader calls this before it snapshots an array, so the cap's
+/// *body* — the comparison and the message — has exactly one definition.
+/// The test-only materialized reader uses the same helper in its equivalence
+/// corpus; it is not part of the production filter boundary.
 pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
     if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
         return Err(Error::Unsupported(format!(
@@ -298,6 +295,7 @@ pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) 
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn decode_filter_specs_from_object(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -368,7 +366,7 @@ pub(crate) fn decode_filter_specs_from_object(
         .collect())
 }
 
-/// The same read as [`decode_filter_specs_from_object`], entered through the
+/// The same read as `decode_filter_specs_from_object`, entered through the
 /// resolving `try_*` accessors.
 ///
 /// `QPDF_Stream::filterable` reaches `/Filter` and `/DecodeParms` through
@@ -759,7 +757,7 @@ fn param_value_from_handle(
 /// [`param_value_from_handle`] for a non-consuming filter that never reads an
 /// entry. It only classifies shared-snapshot children and never resolves them.
 ///
-/// Deliberately the shape of [`param_value_from_object`]: the same
+/// Deliberately the shape of `param_value_from_object`: the same
 /// classification off the same non-resolving accessor, so a *direct* value
 /// reduces to the identical [`ParamValue`] all three readers agree on.
 ///
@@ -804,6 +802,7 @@ fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
 /// whether null values are omitted — and whether the stage is `Crypt`, which
 /// keeps every key ([`retains_decode_param_key`]) with name payloads under
 /// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`].
+#[cfg(test)]
 fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> DecodeParams {
     let omits_null_values = filter_reads_decode_params(filter_name);
     let crypt_stage = is_crypt_filter(filter_name);
@@ -824,6 +823,7 @@ fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> Dec
     }
 }
 
+#[cfg(test)]
 fn param_value_from_object(value: &Object, keeps_name: bool) -> ParamValue {
     match clamped_int_param(value) {
         Some(int) => ParamValue::Int(int),
@@ -1420,6 +1420,7 @@ fn clamp_handle_value_to_i32(value: i64, handle: &ObjectHandle) -> Result<i32> {
 /// The filters no longer call this. It runs once per value in
 /// `param_value_from_object`, so the clamp is applied while the `Object` shape
 /// is read and every filter sees only the already-clamped `ParamValue::Int`.
+#[cfg(test)]
 fn clamped_int_param(value: &Object) -> Option<i32> {
     value.as_integer().map(clamp_to_i32)
 }

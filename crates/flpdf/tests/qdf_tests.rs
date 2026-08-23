@@ -21,6 +21,9 @@
 //!       lines; "N G obj" lines still present.
 //!   (n) qdf=false: no "%% Original object ID:" lines regardless of flag.
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use flpdf::{
     filters, CompressStreams, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, Stream,
 };
@@ -38,7 +41,8 @@ fn lzw_decode_raw(data: &[u8], early_change: bool) -> Vec<u8> {
         params.insert("EarlyChange", Object::Integer(0));
         dict.insert("DecodeParms", Object::Dictionary(params));
     }
-    filters::decode_stream_data(&dict, data).expect("LZWDecode should succeed")
+    filters::decode_stream_data(&filter_handles::dictionary(&dict), data)
+        .expect("LZWDecode should succeed")
 }
 
 /// Build a minimal in-memory PDF with an explicit stream object.
@@ -93,7 +97,7 @@ fn build_minimal_pdf_with_stream(
 fn flate_encode(raw: &[u8]) -> Vec<u8> {
     let mut d = Dictionary::new();
     d.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    filters::encode_stream_data(&d, raw).expect("flate encode")
+    filters::encode_stream_data(&filter_handles::dictionary(&d), raw).expect("flate encode")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,7 +363,8 @@ fn qdf_mode_round_trip_content_preserved() {
         panic!("/Metadata must be a stream after second rewrite");
     };
     let decoded =
-        filters::decode_stream_data(&stream.dict, &stream.data).expect("second-pass decode");
+        filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+            .expect("second-pass decode");
     assert_eq!(
         decoded.as_slice(),
         raw,

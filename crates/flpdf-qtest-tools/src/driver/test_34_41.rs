@@ -507,8 +507,10 @@ pub(crate) fn run_test_36<R: Read + Seek>(
         // one-filter `/FlateDecode` dictionary with no `/DecodeParms`
         // reproduces a bare raw-inflate stage with no predictor applied.
         let raw = ef_f.get_raw_stream_data()?;
-        let mut synthetic_filter = flpdf::Dictionary::new();
-        synthetic_filter.insert(b"Filter", Object::Name(b"FlateDecode".to_vec()));
+        let synthetic_filter = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
         let data = flpdf::filters::decode_stream_data(&synthetic_filter, &raw)?;
 
         let dict_handle = ef_f

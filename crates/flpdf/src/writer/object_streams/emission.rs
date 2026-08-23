@@ -193,7 +193,8 @@ pub(crate) fn wrap_objstm_body(
             encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
 
             // Compress the body bytes via the existing helper.
-            let encoded = crate::filters::encode_stream_data(&encode_dict, &body.bytes)?;
+            let encoded =
+                crate::filters::test_dictionary_api::encode_stream_data(&encode_dict, &body.bytes)?;
 
             // Build the final stream dictionary in qpdf-compatible key order.
             let mut dict = Dictionary::new();

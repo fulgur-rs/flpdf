@@ -3377,7 +3377,8 @@ pub(crate) fn reencode_stream_for_compress(
         let reencoded_stream = reencoded
             .as_stream_mut()
             .expect("stream compression always returns a stream");
-        if filters::decode_stream_data(&reencoded_stream.dict, &reencoded_stream.data)
+        let filter_dict = filter_dictionary_handle(&reencoded_stream.dict);
+        if filters::decode_stream_data(&filter_dict, &reencoded_stream.data)
             .is_ok_and(|decoded| decoded.is_empty())
         {
             reencoded_stream.data.clear();
@@ -5149,6 +5150,57 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
     apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All, false)
 }
 
+/// Build the narrow live-handle view needed by the filter pipeline from a
+/// materialized writer stream. The legacy writer still exposes this public
+/// convenience helper as a `Stream`; only `/Filter` and `/DecodeParms` cross
+/// into the canonical filter boundary, so unrelated dictionary entries and
+/// their references are intentionally not copied here.
+fn filter_dictionary_handle(dict: &Dictionary) -> ObjectHandle {
+    let mut entries = Vec::new();
+    for (key, handle_key) in [
+        ("Filter", b"/Filter".as_slice()),
+        ("DecodeParms", b"/DecodeParms".as_slice()),
+    ] {
+        if let Some(value) = dict.get(key) {
+            entries.push((handle_key.to_vec(), filter_value_handle(value)));
+        }
+    }
+    ObjectHandle::dictionary(entries)
+}
+
+fn filter_value_handle(value: &Object) -> ObjectHandle {
+    match value {
+        Object::Null => ObjectHandle::null(),
+        Object::Boolean(value) => ObjectHandle::boolean(*value),
+        Object::Integer(value) => ObjectHandle::integer(*value),
+        Object::Real(value) => ObjectHandle::real(*value),
+        Object::RealLiteral { value, .. } => ObjectHandle::real(*value),
+        Object::Name(value) => ObjectHandle::name(value.clone()),
+        Object::String(value) => ObjectHandle::string(value.clone()),
+        Object::Array(values) => {
+            ObjectHandle::array(values.iter().map(filter_value_handle).collect())
+        }
+        Object::Dictionary(dictionary) => ObjectHandle::dictionary(
+            dictionary
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        crate::object_handle::canonical_dictionary_key_from_legacy(key),
+                        filter_value_handle(value),
+                    )
+                })
+                .collect(),
+        ),
+        // A reference, stream, or content-only token is not a valid filter
+        // name/parameter value at this materialized boundary. A boolean keeps
+        // the canonical reader on the same unsupported-shape branch without
+        // asking a contextless handle to resolve a reference.
+        Object::Reference(_) | Object::Stream(_) | Object::Operator(_) | Object::InlineImage(_) => {
+            ObjectHandle::boolean(false)
+        }
+    }
+}
+
 fn apply_stream_compress_policy_with_decode_level(
     stream: &crate::Stream,
     policy: CompressStreams,
@@ -5176,7 +5228,8 @@ fn apply_stream_compress_policy_with_decode_level(
     // responsibility corresponding to QPDF_Stream::filterable). Keep that
     // validation in the existing decoder instead of duplicating its parser
     // here; any resulting Err takes the raw-preservation fallback below.
-    let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
+    let filter_dict = filter_dictionary_handle(&stream.dict);
+    let decoded = match filters::decode_stream_data(&filter_dict, &stream.data) {
         Ok(d) => d,
         Err(_) => {
             // Decode failure (unsupported codec or corrupt data): emit the data
@@ -5220,8 +5273,10 @@ fn apply_stream_compress_policy_with_decode_level(
             // (vanishingly rare for in-memory zlib), keep the original stream
             // verbatim — declaring /FlateDecode on uncompressed bytes would
             // produce an unreadable PDF.
-            let mut encode_dict = Dictionary::new();
-            encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            let encode_dict = ObjectHandle::dictionary(vec![(
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            )]);
             let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
                 Ok(e) => e,
                 Err(_) => return Object::Stream(stream.clone()), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
@@ -9795,6 +9850,30 @@ mod tests {
         collect_content_container_refs(&mut pdf, ObjectRef::new(3, 0), &mut containers)
             .expect("a non-dictionary page value is ignored");
         assert!(containers.is_empty());
+    }
+
+    #[test]
+    fn reencode_empty_nonfilter_stream_uses_handle_filter_route() {
+        let (reencoded, source_was_lone_flate) = reencode_stream_for_compress(
+            crate::Stream::new(Dictionary::new(), Vec::new()),
+            &WriterOptions::default(),
+            false,
+            true,
+            None,
+            false,
+            false,
+        );
+        let stream = reencoded
+            .into_stream()
+            .expect("stream compression must return a stream");
+
+        assert!(!source_was_lone_flate);
+        assert!(stream.data.is_empty());
+        assert!(matches!(
+            stream.dict.get("Filter"),
+            Some(Object::Name(name)) if name == b"FlateDecode"
+        ));
+        assert_eq!(stream.dict.get("Length"), Some(&Object::Integer(0)));
     }
 
     #[test]

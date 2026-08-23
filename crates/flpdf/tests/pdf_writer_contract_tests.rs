@@ -956,7 +956,10 @@ fn decoded_runlength_snapshot(bytes: Vec<u8>) -> flpdf::Result<(Option<Object>, 
     if let Some(filter) = filter.clone() {
         dict.insert("Filter", filter);
     }
-    Ok((filter, flpdf::filters::decode_stream_data(&dict, &data)?))
+    Ok((
+        filter,
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&dict), &data)?,
+    ))
 }
 
 #[test]
@@ -3383,7 +3386,10 @@ fn pdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
         .expect("metadata reference");
     let metadata = rewritten.resolve(metadata_ref)?.clone();
     let metadata = metadata.as_stream().expect("metadata stream");
-    let decoded = flpdf::filters::decode_stream_data(&metadata.dict, &metadata.data)?;
+    let decoded = flpdf::filters::decode_stream_data(
+        &filter_handles::dictionary(&metadata.dict),
+        &metadata.data,
+    )?;
     assert_eq!(decoded, b"M\rN");
     Ok(())
 }
@@ -3577,8 +3583,9 @@ fn public_compress_policy_treats_null_filter_as_no_filters() {
         output.dict.get("Filter"),
         Some(&Object::Name(b"FlateDecode".to_vec()))
     );
-    let decoded = flpdf::filters::decode_stream_data(&output.dict, &output.data)
-        .expect("compressed null-filter source must decode");
+    let decoded =
+        flpdf::filters::decode_stream_data(&filter_handles::dictionary(&output.dict), &output.data)
+            .expect("compressed null-filter source must decode");
     assert_eq!(decoded, b"ABC");
 }
 
@@ -3691,3 +3698,5 @@ fn pdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Re
     assert_eq!(stream.data, source_data);
     Ok(())
 }
+#[path = "support/filter_handles.rs"]
+mod filter_handles;

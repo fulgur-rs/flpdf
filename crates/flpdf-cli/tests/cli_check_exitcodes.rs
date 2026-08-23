@@ -14,6 +14,9 @@
 //!   2. warnings-only PDF    → exit 3
 //!   3. corrupt/error PDF    → exit 2
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
@@ -199,7 +202,11 @@ fn recovered_content_stream_pdf_bytes() -> Vec<u8> {
 fn bomb_content_stream_pdf_bytes(decoded_len: usize) -> Vec<u8> {
     let mut flate_dict = flpdf::Dictionary::new();
     flate_dict.insert("Filter", flpdf::Object::Name(b"FlateDecode".to_vec()));
-    let encoded = flpdf::filters::encode_stream_data(&flate_dict, &vec![0u8; decoded_len]).unwrap();
+    let encoded = flpdf::filters::encode_stream_data(
+        &filter_handles::dictionary(&flate_dict),
+        &vec![0u8; decoded_len],
+    )
+    .unwrap();
 
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.4\n");

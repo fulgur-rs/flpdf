@@ -5,6 +5,7 @@
 //! structured [`MatrixReport`]s.
 
 pub mod comparators;
+pub mod filter_handles;
 pub mod json_diff;
 pub use comparators::{QpdfJsonComparator, StructuralComparator};
 

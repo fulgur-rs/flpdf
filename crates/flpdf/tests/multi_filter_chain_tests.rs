@@ -8,6 +8,9 @@
 //!   (e) DecodeParms as a bare null Object — must not panic; filters apply without predictor
 //!   (f) [/ASCII85Decode /FlateDecode /RunLengthDecode] — mixed registered decoder chain
 
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use flpdf::{filters, Dictionary, Object};
 
 fn ascii_hex_encode(input: &[u8]) -> Vec<u8> {
@@ -45,12 +48,14 @@ fn chain_ascii85_then_flate_round_trip() {
 
     // Stored bytes must still satisfy the declared decode order:
     //   encoded → ASCII85Decode → FlateDecode → raw
-    let flate_encoded = filters::encode_stream_data(&flate_dict, raw).expect("Flate encode");
+    let flate_encoded = filters::encode_stream_data(&filter_handles::dictionary(&flate_dict), raw)
+        .expect("Flate encode");
     let encoded = ascii85::fixture_bytes(&flate_encoded);
 
     // decode_stream_data applies filters in declared order:
     //   encoded → ASCII85Decode → FlateDecode → raw
-    let decoded = filters::decode_stream_data(&dict, &encoded).expect("decode chain");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&dict), &encoded)
+        .expect("decode chain");
 
     assert_eq!(
         decoded.as_slice(),
@@ -81,11 +86,15 @@ fn chain_flate_then_ascii_hex_decodes_preencoded_fixture() {
     // with the remaining Flate encoder: raw → ASCIIHex → Flate.
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = filters::encode_stream_data(&flate_dict, &ascii_hex_encode(raw))
-        .expect("encode Flate wrapper");
+    let encoded = filters::encode_stream_data(
+        &filter_handles::dictionary(&flate_dict),
+        &ascii_hex_encode(raw),
+    )
+    .expect("encode Flate wrapper");
 
     // decode: encoded → FlateDecode → ASCIIHex-decode → raw
-    let decoded = filters::decode_stream_data(&dict, &encoded).expect("decode chain");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&dict), &encoded)
+        .expect("decode chain");
 
     assert_eq!(
         decoded.as_slice(),
@@ -140,12 +149,13 @@ fn chain_ascii85_then_flate_with_predictor_decode_params() {
     // Stored bytes remain ASCII85(Flate+predictor(raw)); the public decode path
     // still consumes the original array-form Filter and DecodeParms semantics.
     let flate_encoded =
-        filters::encode_stream_data(&flate_only_dict, &raw).expect("Flate encode with predictor");
+        filters::encode_stream_data(&filter_handles::dictionary(&flate_only_dict), &raw)
+            .expect("Flate encode with predictor");
     let encoded = ascii85::fixture_bytes(&flate_encoded);
 
     // decode: ASCII85Decode, then FlateDecode + undo predictor → original raw
-    let decoded =
-        filters::decode_stream_data(&dict, &encoded).expect("decode with predictor chain");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&dict), &encoded)
+        .expect("decode with predictor chain");
 
     assert_eq!(
         decoded.as_slice(),
@@ -174,10 +184,12 @@ fn chain_flate_then_run_length_round_trip() {
     );
 
     // encode: raw → RunLength-encode → FlateDecode-encode
-    let encoded = filters::encode_stream_data(&dict, raw).expect("encode chain");
+    let encoded =
+        filters::encode_stream_data(&filter_handles::dictionary(&dict), raw).expect("encode chain");
 
     // decode: FlateDecode → RunLength-decode → raw
-    let decoded = filters::decode_stream_data(&dict, &encoded).expect("decode chain");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&dict), &encoded)
+        .expect("decode chain");
 
     assert_eq!(
         decoded.as_slice(),
@@ -197,12 +209,16 @@ fn chain_ascii85_then_flate_then_run_length_decodes_asymmetric_payload() {
     let mut run_length_dict = Dictionary::new();
     run_length_dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
     let run_length_encoded =
-        filters::encode_stream_data(&run_length_dict, raw).expect("RunLength encode");
+        filters::encode_stream_data(&filter_handles::dictionary(&run_length_dict), raw)
+            .expect("RunLength encode");
 
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let flate_encoded =
-        filters::encode_stream_data(&flate_dict, &run_length_encoded).expect("Flate encode");
+    let flate_encoded = filters::encode_stream_data(
+        &filter_handles::dictionary(&flate_dict),
+        &run_length_encoded,
+    )
+    .expect("Flate encode");
 
     let encoded = ascii85::fixture_bytes(&flate_encoded);
 
@@ -216,7 +232,8 @@ fn chain_ascii85_then_flate_then_run_length_decodes_asymmetric_payload() {
         ]),
     );
 
-    let decoded = filters::decode_stream_data(&chain_dict, &encoded).expect("decode mixed chain");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&chain_dict), &encoded)
+        .expect("decode mixed chain");
 
     assert_eq!(decoded, raw);
 }
@@ -244,10 +261,13 @@ fn chain_null_decode_parms_is_ignored() {
 
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = filters::encode_stream_data(&flate_dict, &ascii_hex_encode(raw))
-        .expect("encode Flate wrapper with null DecodeParms");
-    let decoded =
-        filters::decode_stream_data(&dict, &encoded).expect("decode with null DecodeParms");
+    let encoded = filters::encode_stream_data(
+        &filter_handles::dictionary(&flate_dict),
+        &ascii_hex_encode(raw),
+    )
+    .expect("encode Flate wrapper with null DecodeParms");
+    let decoded = filters::decode_stream_data(&filter_handles::dictionary(&dict), &encoded)
+        .expect("decode with null DecodeParms");
 
     assert_eq!(
         decoded.as_slice(),
@@ -276,10 +296,12 @@ fn scalar_decode_parms_are_reused_across_public_multi_filter_path() {
 
     let mut flate_dict = Dictionary::new();
     flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let flate_encoded = filters::encode_stream_data(&flate_dict, raw).expect("Flate encode");
+    let flate_encoded = filters::encode_stream_data(&filter_handles::dictionary(&flate_dict), raw)
+        .expect("Flate encode");
     let encoded = ascii85::fixture_bytes(&flate_encoded);
     dict.insert("DecodeParms", Object::Dictionary(params));
-    let error = filters::decode_stream_data(&dict, &encoded).unwrap_err();
+    let error =
+        filters::decode_stream_data(&filter_handles::dictionary(&dict), &encoded).unwrap_err();
 
     assert_eq!(
         error.to_string(),

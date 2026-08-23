@@ -4,6 +4,9 @@
 ///   --json stdout / --json-output file / --json-key / --json-object /
 ///   --json-key invalid / --json-object invalid /
 ///   --json-stream-data inline / --json-stream-data file side files.
+#[path = "support/filter_handles.rs"]
+mod filter_handles;
+
 use assert_cmd::Command;
 use flpdf::{filters, Dictionary, Object};
 use predicates::prelude::*;
@@ -1367,7 +1370,8 @@ fn json_flag_conflicts_with_compress_streams() {
 fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
     let mut d = Dictionary::new();
     d.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    let encoded = filters::encode_stream_data(&d, content).expect("encode FlateDecode stream");
+    let encoded = filters::encode_stream_data(&filter_handles::dictionary(&d), content)
+        .expect("encode FlateDecode stream");
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let off1 = pdf.len();
@@ -1411,7 +1415,8 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
 fn one_page_pdf_with_run_length_stream(content: &[u8]) -> Vec<u8> {
     let mut d = Dictionary::new();
     d.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
-    let encoded = filters::encode_stream_data(&d, content).expect("encode RunLength stream");
+    let encoded = filters::encode_stream_data(&filter_handles::dictionary(&d), content)
+        .expect("encode RunLength stream");
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let off1 = pdf.len();
