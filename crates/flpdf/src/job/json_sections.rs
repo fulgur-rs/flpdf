@@ -311,11 +311,11 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
             .unwrap_or_else(Json::make_null);
 
         let (mut appearancestate, annotationflags) = {
-            let mut annotation_helper =
+            let mut annotation_object_helper =
                 crate::AnnotationObjectHelper::from_object_handle(annotation.clone(), pdf);
             (
-                annotation_helper.get_appearance_state()?,
-                annotation_helper.get_flags()?,
+                annotation_object_helper.get_appearance_state()?,
+                annotation_object_helper.get_flags()?,
             )
         };
         // qpdf's getName() includes the leading slash. The shared annotation

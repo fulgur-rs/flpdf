@@ -940,7 +940,7 @@ fn field_cycle_guard_does_not_loop_forever() {
 // ── AnnotationObjectHelper — non-dictionary object ───────────────────────────
 
 #[test]
-fn annotation_helper_on_non_dict_returns_defaults() {
+fn annotation_object_helper_on_non_dict_returns_defaults() {
     // Object 4 is an integer, not a dictionary. qpdf's QPDFObjectHandle::
     // getKey on a non-dictionary handle type-warns and returns null rather
     // than throwing, so every accessor falls back to its default.
