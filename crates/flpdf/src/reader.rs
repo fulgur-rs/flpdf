@@ -213,6 +213,23 @@ impl<R: Read + Seek> Pdf<R> {
             .map(crate::parser::RecoveredStreamEol::as_bytes)
     }
 
+    /// Exact source framing recorded by the canonical ObjectHandle resolver
+    /// after a repaired stream-length scan. This is intentionally separate
+    /// from [`Self::recovered_stream_eol`], whose map is synchronized only for
+    /// legacy `Object` compatibility reads. Job-level stream inspection needs
+    /// the qpdf-shaped metadata without entering that compatibility route.
+    pub(crate) fn canonical_recovered_stream_eol(
+        &self,
+        object_ref: ObjectRef,
+    ) -> Option<&'static [u8]> {
+        if self.transformed_stream_refs.contains(&object_ref) {
+            return None;
+        }
+        self.resolver
+            .recovered_stream_eol(object_ref)
+            .map(crate::parser::RecoveredStreamEol::as_bytes)
+    }
+
     /// Whether this document authenticated an `/Encrypt` dictionary while opening.
     pub fn is_encrypted(&self) -> bool {
         self.encryption.borrow().is_some()
@@ -4186,6 +4203,15 @@ mod tests {
         let logger = crate::QPDFLogger::create();
         logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
         pdf.set_logger(logger);
+    }
+
+    #[test]
+    fn canonical_recovered_stream_eol_ignores_transformed_streams() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.transformed_stream_refs.insert(object_ref);
+
+        assert_eq!(pdf.canonical_recovered_stream_eol(object_ref), None);
     }
 
     #[test]
