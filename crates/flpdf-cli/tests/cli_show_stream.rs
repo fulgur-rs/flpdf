@@ -396,6 +396,57 @@ fn show_stream_raw_matches_show_object_for_encrypted_recovered_length_stream() {
     assert_eq!(show_stream_out, show_object_out);
 }
 
+/// Regression test: after qpdf-style xref reconstruction, a recovered
+/// stream-length EOL must not be trimmed a second time by `show-stream`/
+/// `dump-object` -- `synchronize_canonical_recovered_stream_eol` already
+/// skips this classification once the source has been reconstructed
+/// (`resolver.reconstructed_xref()`), and `canonical_recovered_stream_eol`
+/// must mirror that same guard. Builds a PDF with no valid xref table
+/// (forcing full reconstruction) whose one stream's `/Length` is an
+/// indirect reference to a non-integer object (forcing length recovery),
+/// content `abc\n`.
+#[test]
+fn show_stream_raw_matches_show_object_after_xref_reconstruction() {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    bytes.extend_from_slice(b"3 0 obj\n<< /Length 9 0 R >>\nstream\nabc\nendstream\nendobj\n");
+    bytes.extend_from_slice(b"9 0 obj\n/Broken\nendobj\n");
+    bytes.extend_from_slice(b"trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), &bytes).unwrap();
+
+    let mut show_stream = Command::cargo_bin("flpdf").unwrap();
+    let show_stream_out = show_stream
+        .args(["show-stream", "--raw-stream-data", "3 0"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "Attempting to reconstruct cross-reference table",
+        ))
+        .stderr(predicate::str::contains(
+            "attempting to recover stream length",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut show_object = Command::cargo_bin("flpdf").unwrap();
+    let show_object_out = show_object
+        .args(["--show-object=3", "--raw-stream-data"])
+        .arg(temp.path())
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(show_stream_out, b"abc\n".as_slice());
+    assert_eq!(show_stream_out, show_object_out);
+}
+
 /// A single-element filter array `/Filter [/CCITTFaxDecode]` is equivalent to
 /// the direct name form and must also produce the passthrough marker.
 /// CCITTFaxDecode (unlike DCTDecode) has no decode factory, so it still

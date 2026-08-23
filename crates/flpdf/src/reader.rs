@@ -222,16 +222,22 @@ impl<R: Read + Seek> Pdf<R> {
     /// `transformed_stream_refs` is populated only by the legacy
     /// `resolve_to_cache` decrypt path, which pure canonical `ObjectHandle`
     /// callers never reach, so it cannot gate this method. Instead this
-    /// mirrors the same encryption-transform classification
+    /// mirrors the same guards
     /// [`Self::synchronize_canonical_recovered_stream_eol`] uses: a recovered
-    /// EOL is ciphertext framing (not real content) when the stream's own
-    /// bytes were replaced, it has a data provider, or qpdf's `decryptStream`
-    /// route would transform this stream.
+    /// EOL is not removable framing when the stream's own bytes were
+    /// replaced, it has a data provider, qpdf's `decryptStream` route would
+    /// transform this stream, or the source went through qpdf-style xref
+    /// reconstruction (after reconstruction the canonical raw stream view
+    /// is itself the public compatibility value; trimming it a second time
+    /// here would make that raw byte look like writer-only framing).
     pub(crate) fn canonical_recovered_stream_eol(
         &self,
         object_ref: ObjectRef,
         stream: &ObjectHandle,
     ) -> Result<Option<&'static [u8]>> {
+        if self.resolver.reconstructed_xref() {
+            return Ok(None);
+        }
         if stream.as_stream_data().is_some() || stream.has_stream_data_provider() {
             return Ok(None);
         }
