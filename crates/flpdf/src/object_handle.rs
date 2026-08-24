@@ -2954,6 +2954,61 @@ impl ObjectHandle {
         }
     }
 
+    /// Insert or replace `key` with `value` on a live dictionary, preserving
+    /// a literal direct null rather than collapsing it to key removal.
+    ///
+    /// [`Self::replace_key`] mirrors qpdf's `QPDF_Dictionary::replaceKey`
+    /// null/absence conflation (a direct null and a missing key are
+    /// indistinguishable per the PDF spec,
+    /// `libqpdf/QPDF_Dictionary.cc:136-146`) — the correct behavior for an
+    /// ordinary semantic document edit. This method exists for a different
+    /// responsibility: restoring a dictionary to an exact prior raw state
+    /// (e.g. undoing a writer's temporary output-only mutation), where a
+    /// previously captured direct-null entry must be put back as a present
+    /// key with that null value, not silently dropped. Ownership is checked
+    /// the same way as [`Self::replace_key`]; this is also a no-op on a
+    /// non-dictionary handle for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when `value` belongs to a different
+    /// document than the dictionary receiver, matching [`Self::replace_key`]'s
+    /// ownership boundary.
+    pub(crate) fn restore_key_raw(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
+        // cov:ignore-start: `restore_catalog_extensions` is this method's
+        // only caller and always invokes it on an already-resolved Catalog
+        // dictionary, so the non-dictionary guard below is defensive, not
+        // reachable from that call site.
+        if !self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
+            return Ok(());
+        }
+        // cov:ignore-end
+        self.check_key_value_ownership(&value)?;
+        // cov:ignore-start: the same caller only ever restores a snapshot
+        // captured from this very dictionary's own child, which can never be
+        // a direct alias of the dictionary itself.
+        if self.is_direct_value_alias(&value) {
+            return Ok(());
+        }
+        // cov:ignore-end
+        // cov:ignore-start: the dictionary type was already confirmed above,
+        // so the closure's non-dictionary fallthrough is unreachable here.
+        let replaced = self.with_value_mut(|v| {
+            if let Some(ObjectValue::Dictionary(entries)) = v {
+                return Some(entries.insert(key.to_vec(), value.clone()));
+            }
+            None
+        });
+        // cov:ignore-end
+        if let Some(old_value) = replaced {
+            if let Some(old_value) = old_value {
+                self.detach_child_from_state_owners(&old_value);
+            }
+            self.attach_child_to_state_owners(&value);
+        } // cov:ignore: closing brace has no llvm-cov region after the covered attach_child_to_state_owners call
+        Ok(())
+    }
+
     /// Set one item in the live array, porting qpdf's `setArrayItem`
     /// (`libqpdf/QPDFObjectHandle.cc:871-883`). The receiver is dereferenced
     /// before its array type is inspected, so an unresolved indirect holder

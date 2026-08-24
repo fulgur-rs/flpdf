@@ -3249,7 +3249,16 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     };
     crate::writer::configure_progress_for_pdf(pdf, options, generated_object_stream_count, true)?;
     let renumber = RenumberMap::from_plan(&plan);
-    write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
+    // `write_linearized_impl` applies qpdf's output-only /Extensions /ADBE
+    // reconciliation after the plan is frozen. Snapshot after optimization
+    // and planning so permanent qpdf graph preparation remains attached to the
+    // caller's Pdf, while the temporary Catalog mutation is restored on both
+    // success and failure. This is the linearized counterpart of the plain
+    // writer's extension-only restore boundary.
+    let catalog_snapshot = crate::writer::snapshot_catalog_extensions(pdf)?;
+    let result = write_linearized_impl(&plan, &renumber, pdf, options, pass1_path);
+    crate::writer::restore_catalog_extensions(pdf, catalog_snapshot)?;
+    result
 }
 
 /// Write the pass-1 body through qpdf's stdio-shaped buffering boundary.
