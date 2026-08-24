@@ -1573,7 +1573,12 @@ fn radio_keeps_direct_children_without_appearance_or_grandchildren() {
 }
 
 #[test]
-fn get_top_level_field_limits_depth_but_inherited_reference_reaches_the_terminal_value() {
+fn get_top_level_field_has_no_depth_limit_and_reaches_the_terminal_value() {
+    // qpdf's `getTopLevelField` (`QPDFFormFieldObjectHelper.cc:35-46`) climbs
+    // `/Parent` with a pure cycle guard and no depth bound. A 101-level
+    // indirect chain (deeper than the unrelated page-tree depth limit that
+    // used to be misapplied here) must resolve to its terminal node, the
+    // same way `field_value_reference`'s inherited-value walk already does.
     let mut objects = Vec::new();
     for number in 10..=111 {
         let dictionary = if number == 111 {
@@ -1588,10 +1593,8 @@ fn get_top_level_field_limits_depth_but_inherited_reference_reaches_the_terminal
 
     let top_level = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .get_top_level_field()
-        .unwrap_err();
-    assert!(top_level
-        .to_string()
-        .contains("field tree depth exceeds maximum"));
+        .expect("a long acyclic indirect /Parent chain must resolve, not error");
+    assert_eq!(top_level, (ObjectRef::new(111, 0), true));
 
     let field_value_reference = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .field_value_reference()
@@ -2128,6 +2131,23 @@ fn get_top_level_field_stops_before_a_parent_that_resolves_to_null() {
         (10, "<< /Parent 20 0 R >>".into()),
         (20, "null".into()),
     ]);
+    let mut pdf = open(bytes);
+
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .get_top_level_field()
+            .unwrap(),
+        (ObjectRef::new(10, 0), false)
+    );
+}
+
+#[test]
+fn get_top_level_field_stops_at_a_direct_parent_since_only_indirect_can_be_reported() {
+    // `get_top_level_field` returns an `ObjectRef`, which cannot represent a
+    // direct dictionary, so a `/Parent` value that resolves to a direct
+    // dictionary (rather than an indirect reference) stops the climb at the
+    // last indirect ancestor instead of erroring or continuing into it.
+    let bytes = doc(vec![(10, "<< /Parent << /T (a) >> >>".into())]);
     let mut pdf = open(bytes);
 
     assert_eq!(
