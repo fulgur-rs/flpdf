@@ -342,6 +342,7 @@ dependencies = [
  "libc",
  "libjpeg-turbo-rs",
  "md-5",
+ "same-file",
  "serde_json",
  "sha2",
  "stacker",

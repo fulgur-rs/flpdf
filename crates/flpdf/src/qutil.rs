@@ -1,4 +1,4 @@
-//! qpdf correspondence: `QUtil.cc` UTF-8 single-byte encoding primitives.
+//! qpdf correspondence: `QUtil.cc` filesystem identity and UTF-8 single-byte encoding primitives.
 //!
 //! This module owns the qpdf `QUtil::utf8_to_ascii`,
 //! `QUtil::utf8_to_win_ansi`, and `QUtil::utf8_to_mac_roman` behavior used by
@@ -6,6 +6,36 @@
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
 //! unrepresentable input to `?`, matching qpdf's default replacement argument.
 //! It does not own PDF resource lookup, font selection, or password policy.
+
+use std::path::Path;
+
+/// Return whether two existing paths identify the same filesystem object.
+///
+/// This is qpdf's `QUtil::same_file` (`libqpdf/QUtil.cc:574-610`): missing or
+/// otherwise uninspectable paths are not considered equal, while hard-link
+/// and symlink aliases compare by the underlying file identity. On Unix,
+/// qpdf compares `stat()` device/inode numbers without opening either path
+/// (`libqpdf/QUtil.cc:601-604`); opening first (as the `same_file` crate's
+/// path-based comparison does) would block indefinitely on a FIFO
+/// destination with no writer yet connected. On Windows qpdf's own
+/// comparison opens both paths via `CreateFile`
+/// (`libqpdf/QUtil.cc:581-591`), so the `same_file` crate's handle-based
+/// comparison matches there.
+#[must_use]
+pub fn same_file(first: &Path, second: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(first_meta), Ok(second_meta)) = (first.metadata(), second.metadata()) else {
+            return false;
+        };
+        first_meta.dev() == second_meta.dev() && first_meta.ino() == second_meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        same_file::is_same_file(first, second).unwrap_or(false)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum SingleByteEncoding {
@@ -148,7 +178,69 @@ const MAC_ROMAN_TO_UNICODE: [u32; 128] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi};
+    use super::{same_file, utf8_to_ascii, utf8_to_mac_roman, utf8_to_win_ansi};
+
+    #[test]
+    fn same_file_identifies_hard_link_and_symlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let hard_link = dir.path().join("hard-link");
+        let symlink = dir.path().join("symlink");
+        let unrelated = dir.path().join("unrelated");
+        std::fs::write(&original, b"content").unwrap();
+        std::fs::write(&unrelated, b"content").unwrap();
+        std::fs::hard_link(&original, &hard_link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&original, &symlink).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&original, &symlink).unwrap();
+
+        assert!(same_file(&original, &original));
+        assert!(same_file(&original, &hard_link));
+        assert!(same_file(&original, &symlink));
+        assert!(!same_file(&original, &unrelated));
+    }
+
+    #[test]
+    fn same_file_returns_false_for_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        let missing = dir.path().join("missing");
+        std::fs::write(&existing, b"content").unwrap();
+
+        assert!(!same_file(&existing, &missing));
+        assert!(!same_file(&missing, &missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_does_not_open_a_fifo_and_completes_without_a_reader() {
+        // qpdf's own `QUtil::same_file` compares `stat()` device/inode
+        // numbers without opening either path (`libqpdf/QUtil.cc:601-604`).
+        // A same_file implementation that opens its arguments (e.g. the
+        // `same_file` crate's path-based `is_same_file`) would block
+        // indefinitely here: opening a FIFO for reading waits for a writer,
+        // and nothing in this test ever opens the write end. Bound the call
+        // in a thread so a regression fails this test instead of hanging
+        // the process.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("mkfifo command should be available on Unix test runners");
+        assert!(status.success(), "mkfifo failed: {status}");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe_path = fifo_path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(same_file(&probe_path, &probe_path));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("same_file must not open a FIFO path; it deadlocks with no writer connected");
+        assert!(result, "a FIFO path must compare equal to itself");
+    }
 
     #[test]
     fn utf8_to_ascii_preserves_ascii_and_replaces_unrepresentable_text() {

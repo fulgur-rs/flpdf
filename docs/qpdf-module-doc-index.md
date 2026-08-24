@@ -132,7 +132,7 @@
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/qpdf_time.rs` | correspondence | \`QUtil::QPDFTime\`, \`get_current_qpdf_time\`, and \`qpdf_time_to_pdf_time\` |
-| `crates/flpdf/src/qutil.rs` | correspondence | \`QUtil.cc\` UTF-8 single-byte encoding primitives |
+| `crates/flpdf/src/qutil.rs` | correspondence | \`QUtil.cc\` filesystem identity and UTF-8 single-byte encoding primitives |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |
 | `crates/flpdf/src/reader/resolver.rs` | correspondence | \`QPDF::resolve\` (\`libqpdf/QPDF.cc:1700-1753\`) and the \`QPDF::Members\` fields it touches |
