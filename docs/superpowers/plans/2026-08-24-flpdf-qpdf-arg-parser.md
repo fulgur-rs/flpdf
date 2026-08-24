@@ -4,7 +4,7 @@
 
 **Goal:** Replace flpdf-cli's scattered qpdf argv preprocessing with one CLI-owned parser boundary that preserves qpdf 11.9.0 option-table and value-terminated-segment behavior.
 
-**Architecture:** Add crates/flpdf-cli/src/qpdf_args.rs with a QpdfArgParser that owns grammar state, canonical option spelling, bare-option equals handling, and raw named-segment extraction. It returns canonical residual argv plus feature-neutral raw segments; existing clap, overlay, attachment, reader, and writer consumers remain responsible for feature semantics.
+**Architecture:** Add crates/flpdf-cli/src/arg_parser.rs with an ArgParser that owns grammar state, canonical option spelling, bare-option equals handling, and raw named-segment extraction. It returns canonical residual argv plus feature-neutral raw segments; existing clap, overlay, attachment, reader, and writer consumers remain responsible for feature semantics.
 
 **Tech Stack:** Rust 2021, clap 4 derive/command metadata, assert_cmd CLI tests, qpdf 11.9.0 source and executable oracle.
 
@@ -26,14 +26,14 @@
 ### Task 1: Define the parser result and grammar tables
 
 Files:
-- Create: crates/flpdf-cli/src/qpdf_args.rs
+- Create: crates/flpdf-cli/src/arg_parser.rs
 - Modify: crates/flpdf-cli/src/main.rs near the crate module/import declarations
-- Test: crates/flpdf-cli/src/qpdf_args.rs unit tests
+- Test: crates/flpdf-cli/src/arg_parser.rs unit tests
 
 Interfaces:
-- ParsedQpdfArgs contains residual_args: Vec<String> and ordered raw named segments.
+- ParsedArgs contains residual_args: Vec<String> and ordered raw named segments.
 - A raw named segment contains its canonical option name and captured tokens; it does not parse page ranges, encryption, or attachment metadata.
-- QpdfArgParser::from_command(command).parse(args) returns CliResult<ParsedQpdfArgs>.
+- ArgParser::from_command(command).parse(args) returns CliResult<ParsedArgs>.
 
 - [ ] Step 1: Write the failing parser interface tests.
 
@@ -43,7 +43,7 @@ Use a minimal clap command and assert the wished-for API:
     fn parser_returns_canonical_residual_args_and_raw_segments() {
         let command = clap::Command::new("flpdf")
             .arg(clap::Arg::new("qdf").long("qdf"));
-        let parsed = QpdfArgParser::from_command(command)
+        let parsed = ArgParser::from_command(command)
             .parse(vec!["flpdf".into(), "-qdf".into(), "input.pdf".into()])
             .expect("qpdf argv should parse");
         assert_eq!(parsed.residual_args, ["flpdf", "--qdf", "input.pdf"]);
@@ -54,23 +54,23 @@ Add a second test that captures a raw overlay segment without running PageRange:
 
 - [ ] Step 2: Run the focused test and verify the expected RED failure.
 
-    cargo test -p flpdf-cli qpdf_args --quiet
+    cargo test -p flpdf-cli arg_parser --quiet
 
-Expected: compilation failure because qpdf_args and its parser result do not exist.
+Expected: compilation failure because arg_parser and its parser result do not exist.
 
 - [ ] Step 3: Implement the minimal parser result and explicit grammar types.
 
-    pub(crate) struct ParsedQpdfArgs {
+    pub(crate) struct ParsedArgs {
         pub(crate) residual_args: Vec<String>,
-        pub(crate) named_segments: Vec<QpdfNamedSegment>,
+        pub(crate) named_segments: Vec<NamedSegment>,
     }
 
-    pub(crate) struct QpdfNamedSegment {
+    pub(crate) struct NamedSegment {
         pub(crate) option: String,
         pub(crate) tokens: Vec<String>,
     }
 
-    pub(crate) struct QpdfArgParser {
+    pub(crate) struct ArgParser {
         known_long_options: HashSet<String>,
         bare_long_options: HashSet<String>,
     }
@@ -79,24 +79,24 @@ from_command may seed ordinary option names and aliases from clap during the sta
 
 - [ ] Step 4: Run the focused tests and verify GREEN.
 
-    cargo test -p flpdf-cli qpdf_args --quiet
+    cargo test -p flpdf-cli arg_parser --quiet
 
 Expected: the interface and result-shape tests pass with no production consumer changes.
 
 - [ ] Step 5: Commit the parser interface slice.
 
-    git add crates/flpdf-cli/src/qpdf_args.rs crates/flpdf-cli/src/main.rs
+    git add crates/flpdf-cli/src/arg_parser.rs crates/flpdf-cli/src/main.rs
     git commit -m "refactor(cli): add qpdf argv parser boundary"
 
 ### Task 2: Move canonical spelling and option-state scanning into the parser
 
 Files:
-- Modify: crates/flpdf-cli/src/qpdf_args.rs
-- Test: crates/flpdf-cli/src/qpdf_args.rs
+- Modify: crates/flpdf-cli/src/arg_parser.rs
+- Test: crates/flpdf-cli/src/arg_parser.rs
 - Reference/remove after migration: qpdf grammar helpers in crates/flpdf-cli/src/main.rs
 
 Interfaces:
-- QpdfArgParser::parse(Vec<String>) -> CliResult<ParsedQpdfArgs> owns the raw argv state machine.
+- ArgParser::parse(Vec<String>) -> CliResult<ParsedArgs> owns the raw argv state machine.
 - Existing semantic parsers continue receiving canonical residual tokens and raw segment tokens.
 
 - [ ] Step 1: Write RED tests for qpdf spelling and terminator behavior.
@@ -105,7 +105,7 @@ Cover these individual behaviors: -qdf and --qdf equivalence; bare --check=ignor
 
 - [ ] Step 2: Run the tests and verify each RED failure.
 
-    cargo test -p flpdf-cli qpdf_args --quiet
+    cargo test -p flpdf-cli arg_parser --quiet
 
 Expected: the new assertions fail because the parser state machine is not implemented.
 
@@ -123,25 +123,25 @@ Keep grammar errors in the parser. Do not call feature-specific validators from 
 
 - [ ] Step 4: Run the focused tests and verify GREEN.
 
-    cargo test -p flpdf-cli qpdf_args --quiet
+    cargo test -p flpdf-cli arg_parser --quiet
 
 - [ ] Step 5: Commit the grammar state machine.
 
-    git add crates/flpdf-cli/src/qpdf_args.rs
+    git add crates/flpdf-cli/src/arg_parser.rs
     git commit -m "feat(cli): match qpdf argv grammar"
 
 ### Task 3: Move raw overlay and attachment extraction behind the parser
 
 Files:
-- Modify: crates/flpdf-cli/src/qpdf_args.rs
+- Modify: crates/flpdf-cli/src/arg_parser.rs
 - Modify: crates/flpdf-cli/src/main.rs
-- Test: crates/flpdf-cli/src/qpdf_args.rs
+- Test: crates/flpdf-cli/src/arg_parser.rs
 - Test: existing main.rs unit tests while migrating callers
 
 Interfaces:
 - main calls one parser entry point before Cli::parse_from.
-- main maps raw QpdfNamedSegment values to existing parse_overlay_segment, parse_add_attachment_segment, and parse_copy_attachments_segment functions.
-- No overlay, attachment, or encryption semantic validation moves into qpdf_args.rs.
+- main maps raw NamedSegment values to existing parse_overlay_segment, parse_add_attachment_segment, and parse_copy_attachments_segment functions.
+- No overlay, attachment, or encryption semantic validation moves into arg_parser.rs.
 
 - [ ] Step 1: Write RED migration tests for ordering and opacity.
 
@@ -149,31 +149,31 @@ Cover repeated overlay/underlay order, all add-attachment groups with only the f
 
 - [ ] Step 2: Run the tests and verify RED.
 
-    cargo test -p flpdf-cli qpdf_args --quiet
+    cargo test -p flpdf-cli arg_parser --quiet
 
 Expected: migration assertions fail against the old scattered helpers.
 
-- [ ] Step 3: Migrate main to QpdfArgParser.
+- [ ] Step 3: Migrate main to ArgParser.
 
-Replace the sequence calling rewrite_qpdf_single_dash, normalize_qpdf_bare_equals, extract_overlay_groups, and extract_attachment_groups with one parser invocation. Convert raw named segments into the existing semantic OverlaySpec and attachment argument types in main. Delete old grammar constants, segment-state enum, and duplicate extraction state machines only after all callers use qpdf_args.
+Replace the sequence calling rewrite_qpdf_single_dash, normalize_qpdf_bare_equals, extract_overlay_groups, and extract_attachment_groups with one parser invocation. Convert raw named segments into the existing semantic OverlaySpec and attachment argument types in main. Delete old grammar constants, segment-state enum, and duplicate extraction state machines only after all callers use arg_parser.
 
 - [ ] Step 4: Run parser and existing CLI tests and verify GREEN.
 
-    cargo test -p flpdf-cli qpdf_args --quiet
+    cargo test -p flpdf-cli arg_parser --quiet
     cargo test -p flpdf-cli --test cli_tests --quiet
 
 Expected: parser tests and the baseline 199 non-ignored CLI tests pass.
 
 - [ ] Step 5: Commit the consumer migration.
 
-    git add crates/flpdf-cli/src/qpdf_args.rs crates/flpdf-cli/src/main.rs
+    git add crates/flpdf-cli/src/arg_parser.rs crates/flpdf-cli/src/main.rs
     git commit -m "refactor(cli): route segment parsing through qpdf args"
 
 ### Task 4: Add end-to-end qpdf-shaped CLI regression coverage
 
 Files:
 - Modify: crates/flpdf-cli/tests/cli_tests.rs
-- Modify: crates/flpdf-cli/src/qpdf_args.rs only for parser corrections identified by tests
+- Modify: crates/flpdf-cli/src/arg_parser.rs only for parser corrections identified by tests
 - Reference: crates/flpdf-cli/tests/cli_object_streams.rs, cli_stream_data.rs, and cli_optimization_matrix.rs
 
 Interfaces:
@@ -205,7 +205,7 @@ Expected: zero failures; qpdf-dependent tests may retain repository skip behavio
 
 - [ ] Step 5: Commit the regression coverage.
 
-    git add crates/flpdf-cli/tests/cli_tests.rs crates/flpdf-cli/src/qpdf_args.rs
+    git add crates/flpdf-cli/tests/cli_tests.rs crates/flpdf-cli/src/arg_parser.rs
     git commit -m "test(cli): cover qpdf argument grammar"
 
 ### Task 5: Run quality gates and hand off the implementation branch

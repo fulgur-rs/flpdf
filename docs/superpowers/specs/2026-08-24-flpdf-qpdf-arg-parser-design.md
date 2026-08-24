@@ -32,7 +32,7 @@ actual top-level parser.
 
 ### Ownership boundary
 
-Add a CLI-only `qpdf_args` module. It owns:
+Add a CLI-only `arg_parser` module with an `ArgParser` type. It owns:
 
 - canonical recognition of long and single-dash long spellings;
 - attached `=value` handling for bare and value-bearing options;
@@ -65,7 +65,7 @@ range validation and attachment metadata validation remain outside the parser.
 
 ### Migration
 
-1. Move the grammar helpers and their unit tests into `qpdf_args.rs`.
+1. Move the grammar helpers and their unit tests into `arg_parser.rs`.
 2. Replace the three preprocessing calls in `main` with one parser invocation.
 3. Keep existing overlay and attachment semantic parsing, but consume the
    parser's raw segments.
@@ -107,4 +107,3 @@ CLI integration tests will verify that the canonical argv reaches the existing
 consumer paths and that qpdf-shaped invocations do not regress existing
 `cli_tests` behavior. qpdf 11.9.0 probes remain the authority for ambiguous
 grammar and diagnostics.
-
