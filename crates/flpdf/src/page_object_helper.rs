@@ -1395,15 +1395,15 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             if resources.is_null() {
                 continue;
             }
-            let xobjects = self
-                .pdf
-                .resolve_to_terminal(&resources.try_get_key(b"/XObject")?)?;
+            let xobjects = resources.try_get_key(b"/XObject")?;
+            self.pdf.resolve(&xobjects)?;
             let Some(entries) = xobjects.as_dictionary() else {
                 continue;
             };
 
             for (key, value) in entries {
-                let object = self.pdf.resolve_to_terminal(&value)?;
+                let object = value;
+                self.pdf.resolve(&object)?;
                 if selector(&object)? {
                     action(object.clone(), xobjects.clone(), key)?;
                 }

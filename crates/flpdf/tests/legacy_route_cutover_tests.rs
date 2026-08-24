@@ -526,6 +526,33 @@ fn copy_annotations_reads_source_annots_through_handles() {
 }
 
 #[test]
+fn xobject_traversal_reads_resources_through_handles() {
+    let source = include_str!("../src/page_object_helper.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("PageObjectHelper source should have a production section");
+    let function = production
+        .split("fn for_each_xobject_filtered")
+        .nth(1)
+        .and_then(|rest| rest.split("    /// Visit image XObjects").next())
+        .expect("XObject traversal production function should remain present");
+
+    assert!(
+        !function.contains("resolve_to_terminal"),
+        "XObject traversal must not use the non-qpdf terminal-resolution bridge"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&xobjects)"),
+        "XObject traversal must resolve /XObject through the canonical handle"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&object)"),
+        "XObject traversal must resolve each entry through its canonical handle"
+    );
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source
