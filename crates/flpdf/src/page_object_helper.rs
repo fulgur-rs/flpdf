@@ -16,8 +16,8 @@
 //! - [`content_stream_objects`](PageObjectHelper::content_stream_objects) —
 //!   decode via the existing stream filter pipeline, then parse into
 //!   qpdf-shaped [`Object`] events.
-//! - [`get_resources`](PageObjectHelper::get_resources) — delegates to
-//!   [`crate::pages::resolve_inherited_resources`] (walks `/Parent` chain).
+//! - [`get_resources`](PageObjectHelper::get_resources) — delegates to the
+//!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
 //! - [`rotate`](PageObjectHelper::rotate) — **getter** that uses the page-local
 //!   inherited `/Rotate` lookup.
 //! - [`get_annotations`](PageObjectHelper::get_annotations) — reads the leaf's
