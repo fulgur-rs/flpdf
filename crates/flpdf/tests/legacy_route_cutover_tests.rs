@@ -272,3 +272,22 @@ fn page_closure_production_uses_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn overlay_appearance_stream_has_no_raw_snapshot_route() {
+    let source = include_str!("../src/overlay_appearance_stream.rs");
+    for legacy in [
+        "Object as PdfObject",
+        "type Object =",
+        "resolve_object(",
+        "set_object(",
+        "PdfObject::",
+        "into_stream()",
+        "into_dict()",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "overlay_appearance_stream still contains the raw route marker {legacy:?}"
+        );
+    }
+}
