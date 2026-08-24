@@ -16,7 +16,7 @@
 //! - [`content_stream_objects`](PageObjectHelper::content_stream_objects) —
 //!   decode via the existing stream filter pipeline, then parse into
 //!   qpdf-shaped [`Object`] events.
-//! - [`resources`](PageObjectHelper::resources) — delegates to
+//! - [`get_resources`](PageObjectHelper::get_resources) — delegates to
 //!   [`crate::pages::resolve_inherited_resources`] (walks `/Parent` chain).
 //! - [`rotate`](PageObjectHelper::rotate) — **getter** that uses the page-local
 //!   inherited `/Rotate` lookup.
@@ -68,25 +68,6 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## Get page resources
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, PageObjectHelper};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let page_refs = pages::page_refs(&mut pdf)?;
-//! if let Some(&page_ref) = page_refs.first() {
-//!     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-//!     if let Some(res) = helper.resources()? {
-//!         let has_font = res.get("Font").is_some();
-//!         println!("page has fonts: {has_font}");
-//!     }
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
 //! ## Read effective rotation (getter, not mutating)
 //!
 //! ```no_run
@@ -131,7 +112,7 @@ use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
 use crate::writer::DecodeLevel;
-use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
+use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -1497,50 +1478,6 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         Ok(result)
     }
 
-    /// Return the effective `/Resources` dictionary for this page, walking up
-    /// the `/Parent` chain until one is found.
-    ///
-    /// Returns `Ok(None)` when no node in the inheritance chain carries a
-    /// `/Resources` entry.
-    ///
-    /// This delegates to the canonical [`Self::get_resources`] handle route.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the page-tree depth limit is exceeded.
-    /// - Any error from [`Pdf::resolve`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use std::fs::File;
-    /// use std::io::BufReader;
-    /// use flpdf::{pages, Pdf, PageObjectHelper};
-    ///
-    /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-    /// let page_refs = pages::page_refs(&mut pdf)?;
-    /// if let Some(&page_ref) = page_refs.first() {
-    ///     let mut helper = PageObjectHelper::new(page_ref, &mut pdf);
-    ///     let resources = helper.resources()?;
-    ///     println!("resources present: {}", resources.is_some());
-    /// }
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn resources(&mut self) -> Result<Option<Dictionary>> {
-        let value = self.get_resources(false)?;
-        if value.is_null() {
-            return Ok(None);
-        }
-        match value.materialize()? {
-            Object::Dictionary(dictionary) => Ok(Some(dictionary)),
-            other => Err(Error::Unsupported(format!(
-                "/Resources on page {} has unexpected type {}",
-                self.target_description(),
-                object_type_name(&other)
-            ))),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // rotate  (GETTER — resolves inherited value, does not mutate)
     // -----------------------------------------------------------------------
@@ -2407,23 +2344,6 @@ fn current_description(current: &ObjectHandle) -> String {
         .unwrap_or_else(|| "direct page-tree dictionary".to_owned())
 }
 
-fn object_type_name(obj: &Object) -> &'static str {
-    match obj {
-        Object::Null => "null",
-        Object::Boolean(_) => "boolean",
-        Object::Integer(_) => "integer",
-        Object::Real(_) | Object::RealLiteral { .. } => "real",
-        Object::Name(_) => "name",
-        Object::String(_) => "string",
-        Object::Operator(_) => "operator",
-        Object::InlineImage(_) => "inline-image",
-        Object::Array(_) => "array",
-        Object::Dictionary(_) => "dictionary",
-        Object::Stream(_) => "stream",
-        Object::Reference(_) => "reference",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -2501,32 +2421,6 @@ mod tests {
             .get_media_box(false)
             .expect("the 100th ancestor's /MediaBox must be reachable");
         assert!(!media_box.try_is_null().expect("resolved handle"));
-    }
-
-    /// `object_type_name` collapses both real variants to `"real"` — both
-    /// forms should produce the same diagnostic string.
-    #[test]
-    fn object_type_name_collapses_real_and_real_literal() {
-        assert_eq!(object_type_name(&Object::Real(1.5)), "real");
-        assert_eq!(
-            object_type_name(&Object::RealLiteral {
-                value: 1.5,
-                literal: b"1.5".to_vec(),
-            }),
-            "real"
-        );
-    }
-
-    #[test]
-    fn object_type_name_labels_content_only_values() {
-        assert_eq!(
-            object_type_name(&Object::Operator(b"q".to_vec())),
-            "operator"
-        );
-        assert_eq!(
-            object_type_name(&Object::InlineImage(b"data".to_vec())),
-            "inline-image"
-        );
     }
 
     #[test]
