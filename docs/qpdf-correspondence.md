@@ -726,8 +726,17 @@ CLI の qpdf 11.9.0 differential test、および fixture の live probe で確�
 `copyForeignObject` / `replaceForeignIndirectObjects` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
 
-なお、`object_copy.rs` の `copy_objects` / `page_closure.rs` は旧来の
-pre-closed raw `Object` 経路であり、canonical parity の責務ではない。
+`page_closure.rs` の `page_object_closure` は今回、旧 raw `Object` snapshot
+ではなく、qpdf の canonical object identity に対応する `ObjectHandle` graph
+を走査する route へ切り替えた。開始 page 以外の `Page` / `Catalog` 境界と
+`/Pages` の `/Kids` 除外という既存の page-closure contract は、qpdf の live
+handle traversal と page-boundary 構造（`QPDF.cc:2019-2272`;
+`QPDF_optimization.cc:271-334`）に沿って実装している。
+
+一方、`object_copy.rs` の `copy_objects` は production qpdf route から切り離された
+旧 pre-closed API として残っているが、新しい consumer や互換 adapter を追加する
+理由にはしない。canonical parity の責務は次の `copy_foreign_object` に集約し、
+`copy_objects` の削除は残存する examples/tests の cutover 後に別の cleanup として扱う。
 qpdf 11.9.0 の `QPDF::copyForeignObject`（`QPDF.cc:2019-2272`）に対応する
 正本は `object_copy::copy_foreign_object` で、`reserveObjects` / 完全な
 `ObjectHandle` graph replacement / `/Pages` 境界 / per-source map reuse を

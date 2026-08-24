@@ -246,3 +246,29 @@ fn resources_form_pruning_production_uses_the_handle_route() {
         );
     }
 }
+
+#[test]
+fn page_closure_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/page_closure.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("page_closure has a test module")
+        .0;
+
+    for legacy in ["resolve_borrowed", "Object::"] {
+        assert!(
+            !production.contains(legacy),
+            "page_closure production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "get_object_handle",
+        "try_get_keys",
+        "try_is_dictionary_of_type",
+    ] {
+        assert!(
+            production.contains(canonical),
+            "page_closure production must use the canonical handle API {canonical:?}"
+        );
+    }
+}
