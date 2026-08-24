@@ -2004,11 +2004,13 @@ pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
     let was_dirty = pdf.is_dirty(root_ref);
     let catalog = pdf.get_object_handle(root_ref);
     pdf.resolve(&catalog)?;
-    let extensions = if catalog.try_has_key(b"/Extensions")? {
-        Some(catalog.try_get_key(b"/Extensions")?)
-    } else {
-        None
-    };
+    // Raw dictionary membership, not `try_has_key`'s qpdf-semantic hasKey:
+    // an explicit `/Extensions null` entry is a present key whose restored
+    // shape must survive, even though qpdf's own `hasKey`/`getKeys` treat a
+    // null-resolving value as absent (`libqpdf/QPDF_Dictionary.cc:98-99`).
+    let extensions = catalog
+        .try_as_dictionary()?
+        .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
     Ok(Some(CatalogExtensionsSnapshot {
         root_ref,
         extensions,
@@ -2025,14 +2027,20 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
         return Ok(()); // cov:ignore: snapshot is always Some after valid linearization planning
     };
     let (_, catalog) = writer_catalog_copy(pdf)?;
-    let current_extensions = if catalog.try_has_key(b"/Extensions")? {
-        Some(catalog.try_get_key(b"/Extensions")?)
-    } else {
-        None
-    };
+    // Raw dictionary membership, matching the snapshot side (see
+    // `snapshot_catalog_extensions`).
+    let current_extensions = catalog
+        .try_as_dictionary()?
+        .and_then(|dict| dict.get(b"/Extensions".as_slice()).cloned());
+    // Identity, not serialized-value equality: the writer always allocates a
+    // fresh handle when it injects or replaces `/Extensions /ADBE`, even when
+    // the resulting bytes happen to match the original. Comparing by
+    // `unparse()` would treat that byte-identical replacement as "unchanged"
+    // and skip restoring the captured handle, leaving any external reference
+    // to the original handle detached from the Catalog.
     let extensions_changed = match (&snapshot.extensions, &current_extensions) {
         (None, None) => false,
-        (Some(before), Some(after)) => before.unparse() != after.unparse(),
+        (Some(before), Some(after)) => !before.is_same_object_as(after),
         _ => true,
     };
     if extensions_changed || (!snapshot.was_dirty && pdf.is_dirty(snapshot.root_ref)) {
@@ -9663,6 +9671,133 @@ mod tests {
         assert!(
             !pdf.is_dirty(root_ref),
             "failed output-only Catalog mutation must restore the source dirty flag"
+        );
+    }
+
+    #[test]
+    fn linearized_pdf_writer_restores_extensions_handle_identity_when_bytes_match() {
+        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        let catalog = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+
+        // Pre-populate `/Extensions /ADBE` with exactly what the linearized
+        // write below injects, so the writer's replacement is byte-identical
+        // to the original -- the case a serialized-value comparison misses.
+        let adbe = ObjectHandle::dictionary(vec![
+            (
+                b"/BaseVersion".to_vec(),
+                ObjectHandle::name(b"1.7".to_vec()),
+            ),
+            (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(8)),
+        ]);
+        let extensions = ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]);
+        catalog
+            .replace_key(b"/Extensions", extensions)
+            .expect("set /Extensions");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+        assert!(
+            pdf.is_dirty(root_ref),
+            "test must start with a dirty Catalog"
+        );
+        let original_extensions = catalog.get_key(b"/Extensions");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("linearized write");
+        let _ = writer.get_buffer().expect("linearized buffer");
+        drop(writer);
+
+        let catalog_after = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog_after).expect("Catalog must resolve");
+        let restored_extensions = catalog_after.get_key(b"/Extensions");
+        assert!(
+            restored_extensions.is_same_object_as(&original_extensions),
+            "a byte-identical /Extensions replacement must still restore the \
+             original handle identity, not merely skip because serialized \
+             bytes match"
+        );
+    }
+
+    #[test]
+    fn restore_catalog_extensions_preserves_an_indirect_null_reference() {
+        // `write_linearized_impl` itself rejects any indirect reference
+        // reachable within a source `/Extensions` subtree whenever the
+        // effective Adobe extension level changes
+        // (`CatalogAdbeStatus::orphans_indirect_object`,
+        // `linearization/writer.rs:3805-3823`), so this shape cannot reach
+        // `snapshot_catalog_extensions`/`restore_catalog_extensions` through
+        // the full `PdfWriter` linearized pipeline today. Exercise the two
+        // functions directly instead: an indirect reference to a null object
+        // is distinct from a missing key per the PDF spec -- qpdf's own
+        // `QPDF_Dictionary::replaceKey` collapses only a *direct* null to key
+        // removal and explicitly "allow[s] indirect nulls which are
+        // equivalent to a dangling reference, which is permitted by the
+        // spec" (`libqpdf/QPDF_Dictionary.cc:136-146`). This shape must
+        // survive a snapshot/restore round trip as that same reference, not
+        // be dropped to key absence the way `try_has_key`'s qpdf-semantic
+        // null omission would.
+        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        let catalog = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+
+        let null_object = pdf
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("allocate indirect null object");
+        catalog
+            .replace_key(b"/Extensions", null_object.clone())
+            .expect("set an indirect null /Extensions reference");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        let snapshot = snapshot_catalog_extensions(&mut pdf)
+            .expect("snapshot")
+            .expect("snapshot must be present for a Catalog with a /Root");
+
+        // Simulate what `inject_adbe_extension` does when the writer decides
+        // to inject an Adobe extension: replace `/Extensions` with a fresh
+        // dictionary.
+        let catalog = pdf.get_object_handle(root_ref);
+        let adbe = ObjectHandle::dictionary(vec![(
+            b"/ADBE".to_vec(),
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.7".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(8)),
+            ]),
+        )]);
+        catalog
+            .replace_key(b"/Extensions", adbe)
+            .expect("simulate writer injection");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        restore_catalog_extensions(&mut pdf, Some(snapshot)).expect("restore");
+
+        let catalog_after = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog_after).expect("Catalog must resolve");
+        let restored = catalog_after
+            .try_as_dictionary()
+            .expect("Catalog dictionary lookup")
+            .expect("Catalog must be a dictionary")
+            .get(b"/Extensions".as_slice())
+            .cloned()
+            .expect("an indirect /Extensions reference must survive the restore");
+        assert_eq!(
+            restored.object_ref(),
+            null_object.object_ref(),
+            "restore_catalog_extensions must preserve an indirect null \
+             /Extensions reference, not drop it because try_has_key would \
+             treat it as absent"
         );
     }
 
