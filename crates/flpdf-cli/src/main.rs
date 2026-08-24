@@ -968,6 +968,8 @@ struct IsEncryptedCommand {
     input: PathBuf,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    recovery: RecoveryArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -1519,8 +1521,22 @@ impl From<CliRemoveUnreferencedResources> for RemoveUnreferencedResources {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, ClapArgs)]
+struct RecoveryArgs {
+    /// Ignore any cross-reference streams in the file, falling back to
+    /// cross-reference tables or triggering document recovery.
+    #[arg(long = "ignore-xref-streams")]
+    ignore_xref_streams: bool,
+    /// Avoid attempting to recover when errors are found in a file's
+    /// cross reference table or stream lengths.
+    #[arg(long = "suppress-recovery")]
+    suppress_recovery: bool,
+}
+
 #[derive(Debug, Clone, Default, ClapArgs)]
 struct PasswordArgs {
+    #[command(flatten)]
+    recovery: RecoveryArgs,
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
     password: Option<String>,
@@ -1865,7 +1881,7 @@ fn main() {
             &args.encrypt,
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
-            args.password.allow_weak_crypto,
+            &args.password,
         );
         let result = run_rewrite(
             args.input,
@@ -2017,7 +2033,7 @@ fn main() {
             &args.encrypt,
             args.copy_encryption.as_deref(),
             args.encryption_file_password.as_deref(),
-            args.password.allow_weak_crypto,
+            &args.password,
         );
         run_rewrite(
             args.input,
@@ -2402,7 +2418,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => run_show_encryption(&cmd.input, cmd.repair, &cmd.password),
-        Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair),
+        Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair, cmd.recovery),
         Commands::RequiresPassword(cmd) => {
             run_requires_password(&cmd.input, cmd.repair, &cmd.password)
         }
@@ -2494,7 +2510,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 &cmd.encrypt,
                 cmd.copy_encryption.as_deref(),
                 cmd.encryption_file_password.as_deref(),
-                cmd.password.allow_weak_crypto,
+                &cmd.password,
             );
             let normalize_content = matches!(cmd.normalize_content, Some(CliYesNo::Yes));
             options.content_normalization = normalize_content;
@@ -2675,10 +2691,10 @@ fn apply_encryption_options(
     encrypt: &[String],
     copy_encryption: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
-    allow_weak_crypto: bool,
+    password_args: &PasswordArgs,
 ) {
     if !encrypt.is_empty() {
-        match parse_encrypt_segment(encrypt, allow_weak_crypto) {
+        match parse_encrypt_segment(encrypt, password_args.allow_weak_crypto) {
             Ok(params) => {
                 options.encrypt = Some(params);
             }
@@ -2689,7 +2705,7 @@ fn apply_encryption_options(
         }
     }
     if let Some(donor_path) = copy_encryption {
-        match build_copy_encryption_source(donor_path, encryption_file_password) {
+        match build_copy_encryption_source(donor_path, encryption_file_password, password_args) {
             Ok(src) => {
                 options.copy_encryption = Some(src);
             }
@@ -2714,18 +2730,17 @@ fn apply_encryption_options(
 fn build_copy_encryption_source(
     path: &std::path::Path,
     password: Option<&str>,
+    password_args: &PasswordArgs,
 ) -> CliResult<CopyEncryptionSource> {
     let file =
         File::open(path).map_err(|e| format!("--copy-encryption: cannot open {:?}: {e}", path))?;
     let reader = BufReader::new(file);
 
-    let pw_bytes: Vec<u8> = password.unwrap_or("").as_bytes().to_vec();
-    let opts = PdfOpenOptions {
-        password: pw_bytes,
-        repair: true,
-        ..PdfOpenOptions::default()
-    };
-    let mut opts = opts;
+    let mut donor_password = password_args.clone();
+    donor_password.password = Some(password.unwrap_or("").to_owned());
+    donor_password.password_file = None;
+    let mut opts = pdf_open_options(true, &donor_password)
+        .map_err(|error| format!("--copy-encryption: failed to configure {:?}: {error}", path))?;
     configure_document_logger(&mut opts, path);
     let mut donor = Pdf::open_with_options(reader, opts)
         .map_err(|e| format!("--copy-encryption: failed to open {:?}: {e}", path))?;
@@ -3156,6 +3171,7 @@ fn run_rewrite(
             &input,
             &output,
             repair,
+            password,
             linearize,
             linearize_pass1,
             remove_restrictions,
@@ -3175,6 +3191,7 @@ fn run_rewrite(
             &input,
             &output,
             repair,
+            password,
             linearize,
             linearize_pass1,
             remove_restrictions,
@@ -3198,6 +3215,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
     input: &Path,
     output: &Path,
     repair: bool,
+    password: &PasswordArgs,
     linearize: bool,
     linearize_pass1: Option<&Path>,
     remove_restrictions: bool,
@@ -3358,7 +3376,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // source documents until after the destination writer has consumed
         // every copied Form stream, not just until page stacking returns.
         let _built_overlay_specs = if !overlay_specs.is_empty() {
-            let mut built = build_overlay_specs(overlay_specs, repair)?;
+            let mut built = build_overlay_specs(overlay_specs, repair, password)?;
 
             // flpdf-9hc.16.8: propagate max input header version + Adobe
             // extension_level to the writer (mirrors qpdf QPDFJob.cc L1714
@@ -3813,26 +3831,20 @@ fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<V
 fn build_overlay_specs(
     specs: &[OverlaySpec],
     repair: bool,
+    password: &PasswordArgs,
 ) -> CliResult<Vec<flpdf::OverlaySpec<BufReader<File>>>> {
     let mut built = Vec::with_capacity(specs.len());
     for spec in specs {
         let path = PathBuf::from(&spec.file);
         let file = File::open(&path).map_err(|error| error_with_file(&path, error.into()))?;
         // Overlay sources are read-only; qpdf accepts weak-crypto opens
-        // unconditionally because its flag only gates writes.
-        let mut options = PdfOpenOptions {
-            // qpdf's recovery permission is enabled on the document by
-            // default; the absence of `--repair` must not turn it off (see
-            // `pdf_open_options`'s identical treatment for the primary
-            // document).
-            repair: repair || PdfOpenOptions::default().repair,
-            password: spec
-                .password
-                .as_ref()
-                .map(|p| p.as_bytes().to_vec())
-                .unwrap_or_default(),
-            ..Default::default()
-        };
+        // unconditionally because its flag only gates writes. Retain the
+        // command-wide open policy (including recovery and xref handling),
+        // replacing only the source-local password.
+        let mut source_password = password.clone();
+        source_password.password = spec.password.clone();
+        source_password.password_file = None;
+        let mut options = pdf_open_options(repair, &source_password)?;
         configure_document_logger(&mut options, &path);
         let mut source = Pdf::open_with_options(BufReader::new(file), options)
             .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
@@ -4045,6 +4057,7 @@ fn run_page_extraction(
                 primary_input,
                 output,
                 repair,
+                password,
                 page_ops,
                 overlay_specs,
                 remove_unref,
@@ -4060,6 +4073,7 @@ fn run_page_extraction(
                 primary_input,
                 output,
                 repair,
+                password,
                 page_ops,
                 overlay_specs,
                 remove_unref,
@@ -4165,6 +4179,7 @@ fn run_page_extraction(
         output,
         source_path,
         repair,
+        password,
         page_ops,
         overlay_specs,
         remove_unref,
@@ -4341,6 +4356,7 @@ fn run_page_extraction_from_multiple_sources(
         output,
         primary_input,
         repair,
+        password,
         page_ops,
         overlay_specs,
         // QPDFJob has already applied the page-copy resource policy to each
@@ -4367,6 +4383,7 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
     primary_input: &Path,
     output: &Path,
     repair: bool,
+    password: &PasswordArgs,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
@@ -4417,6 +4434,7 @@ fn run_page_extraction_from_repeated_pdf<R: Read + Seek + 'static>(
         output,
         primary_input,
         repair,
+        password,
         page_ops,
         overlay_specs,
         remove_unref,
@@ -4438,6 +4456,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     output: &Path,
     input_path: &Path,
     repair: bool,
+    password: &PasswordArgs,
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
@@ -4528,7 +4547,7 @@ fn run_page_extraction_after_plan<R: Read + Seek + 'static>(
     // `StreamDataProvider` (`libqpdf/QPDF.cc:2248-2257`). Retain the opened
     // source documents through the in-memory writer for the same reason.
     let _built_overlay_specs = if !overlay_specs.is_empty() {
-        let mut built = build_overlay_specs(overlay_specs, repair)?;
+        let mut built = build_overlay_specs(overlay_specs, repair, password)?;
         let initial_version = parse_pdf_version(pdf.version()).unwrap_or(PdfVersion::new(1, 0, 0));
         let mut max_version = PdfVersion::new(
             initial_version.major(),
@@ -5350,11 +5369,15 @@ fn is_bad_password_error(error: &flpdf::Error) -> bool {
 ///
 /// qpdf `--is-encrypted` (qpdf manual): exit 0 = encrypted, exit 2 = not
 /// encrypted (`qpdf_exit_is_not_encrypted = 2`). No required stdout.
-fn run_is_encrypted(input: &PathBuf, repair: bool) -> CliResult<()> {
+fn run_is_encrypted(input: &PathBuf, repair: bool, recovery: RecoveryArgs) -> CliResult<()> {
     // No password is taken/used: qpdf detects encryption structurally
     // (presence of /Encrypt) without authenticating, so we deliberately
     // probe with an empty password and accept the auth-failed outcome.
-    let encrypted = match probe_encryption(input, repair, &PasswordArgs::default())? {
+    let password = PasswordArgs {
+        recovery,
+        ..PasswordArgs::default()
+    };
+    let encrypted = match probe_encryption(input, repair, &password)? {
         EncryptionProbe::Opened { encrypted } => encrypted,
         EncryptionProbe::EncryptedAuthFailed => true,
     };
@@ -5720,10 +5743,7 @@ fn open_pdf_file_impl(
 }
 
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
-    let password_is_hex_key = password.password_is_hex_key;
-    let suppress_password_recovery = password.suppress_password_recovery;
-    let password_mode = password.password_mode.into();
-    let password = if let Some(password) = &password.password {
+    let password_bytes = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
     } else if let Some(path) = &password.password_file {
         let mut bytes = std::fs::read(path)?;
@@ -5737,17 +5757,30 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         Vec::new()
     };
 
-    Ok(PdfOpenOptions {
-        // qpdf's recovery permission is enabled on the document by default.
-        // Keep accepting `--repair` as an explicit compatibility spelling;
-        // the absence of that flag must not turn recovery off.
-        repair: repair || PdfOpenOptions::default().repair,
+    Ok(pdf_open_options_with_password_bytes(
+        repair,
         password,
-        password_mode,
-        suppress_password_recovery,
-        password_is_hex_key,
+        password_bytes,
+    ))
+}
+
+fn pdf_open_options_with_password_bytes(
+    repair: bool,
+    password: &PasswordArgs,
+    password_bytes: Vec<u8>,
+) -> PdfOpenOptions {
+    let recovery = password.recovery;
+    PdfOpenOptions {
+        // qpdf's recovery permission is enabled on the document by default;
+        // --suppress-recovery is the explicit opt-out.
+        repair: !recovery.suppress_recovery && (repair || PdfOpenOptions::default().repair),
+        ignore_xref_streams: recovery.ignore_xref_streams,
+        password: password_bytes,
+        password_mode: password.password_mode.into(),
+        suppress_password_recovery: password.suppress_password_recovery,
+        password_is_hex_key: password.password_is_hex_key,
         ..PdfOpenOptions::default()
-    })
+    }
 }
 
 fn cli_logger() -> QPDFLogger {
@@ -6306,14 +6339,13 @@ fn run_copy_attachments_from(
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
     // Open the source with its own password (independent of the target's).
-    // qpdf's recovery permission is enabled on the document by default; the
-    // absence of `--repair` must not turn it off (see `pdf_open_options`'s
-    // identical treatment for the primary document).
-    let mut src_options = PdfOpenOptions {
-        repair: repair || PdfOpenOptions::default().repair,
-        password: args.password.clone(),
-        ..PdfOpenOptions::default()
-    };
+    // Retain the command-wide open policy so qpdf's recovery/xref controls
+    // apply to this secondary input exactly as they do to the target.
+    let mut source_password = password.clone();
+    source_password.password = None;
+    source_password.password_file = None;
+    let mut src_options =
+        pdf_open_options_with_password_bytes(repair, &source_password, args.password.clone());
     configure_document_logger(&mut src_options, &args.file);
     let src_file =
         File::open(&args.file).map_err(|error| error_with_file(&args.file, error.into()))?;
@@ -7615,7 +7647,7 @@ mod tests {
             to: Some("1-2".into()),
             repeat: Some("1".into()),
         }];
-        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false, &PasswordArgs::default()).unwrap();
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].kind, flpdf::OverlayKind::Underlay);
         // repeat is Some when the segment supplied --repeat.
@@ -7634,7 +7666,7 @@ mod tests {
             to: None,
             repeat: None,
         }];
-        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false, &PasswordArgs::default()).unwrap();
         assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
         assert!(
             built[0].repeat.is_none(),
@@ -7654,7 +7686,7 @@ mod tests {
         }];
         // `flpdf::OverlaySpec` is not Debug (it holds a `Pdf`), so match the Ok
         // arm explicitly instead of `unwrap_err()`.
-        let err = match build_overlay_specs(&cli_specs, false) {
+        let err = match build_overlay_specs(&cli_specs, false, &PasswordArgs::default()) {
             Ok(_) => panic!("expected error for a missing source file"),
             Err(e) => e.to_string(),
         };
@@ -7690,13 +7722,14 @@ mod tests {
             }]
         };
 
-        let absent = build_overlay_specs(&spec(None), false).unwrap();
+        let absent = build_overlay_specs(&spec(None), false, &PasswordArgs::default()).unwrap();
         assert_eq!(absent[0].from.resolve(3).unwrap(), vec![1, 2, 3]);
 
-        let empty = build_overlay_specs(&spec(Some("")), false).unwrap();
+        let empty = build_overlay_specs(&spec(Some("")), false, &PasswordArgs::default()).unwrap();
         assert_eq!(empty[0].from.resolve(3).unwrap(), Vec::<u32>::new());
 
-        let explicit = build_overlay_specs(&spec(Some("2")), false).unwrap();
+        let explicit =
+            build_overlay_specs(&spec(Some("2")), false, &PasswordArgs::default()).unwrap();
         assert_eq!(explicit[0].from.resolve(3).unwrap(), vec![2]);
     }
 
@@ -7717,13 +7750,14 @@ mod tests {
             }]
         };
 
-        let absent = build_overlay_specs(&spec(None), false).unwrap();
+        let absent = build_overlay_specs(&spec(None), false, &PasswordArgs::default()).unwrap();
         assert_eq!(absent[0].to.resolve(3).unwrap(), vec![1, 2, 3]);
 
-        let empty = build_overlay_specs(&spec(Some("")), false).unwrap();
+        let empty = build_overlay_specs(&spec(Some("")), false, &PasswordArgs::default()).unwrap();
         assert_eq!(empty[0].to.resolve(3).unwrap(), Vec::<u32>::new());
 
-        let explicit = build_overlay_specs(&spec(Some("2-3")), false).unwrap();
+        let explicit =
+            build_overlay_specs(&spec(Some("2-3")), false, &PasswordArgs::default()).unwrap();
         assert_eq!(explicit[0].to.resolve(3).unwrap(), vec![2, 3]);
     }
 
@@ -7744,16 +7778,17 @@ mod tests {
             }]
         };
 
-        let absent = build_overlay_specs(&spec(None), false).unwrap();
+        let absent = build_overlay_specs(&spec(None), false, &PasswordArgs::default()).unwrap();
         assert!(absent[0].repeat.is_none(), "absent --repeat -> None");
 
-        let empty = build_overlay_specs(&spec(Some("")), false).unwrap();
+        let empty = build_overlay_specs(&spec(Some("")), false, &PasswordArgs::default()).unwrap();
         assert!(
             empty[0].repeat.is_none(),
             "explicit empty --repeat= -> None (no repeat), same as absent"
         );
 
-        let explicit = build_overlay_specs(&spec(Some("2")), false).unwrap();
+        let explicit =
+            build_overlay_specs(&spec(Some("2")), false, &PasswordArgs::default()).unwrap();
         assert_eq!(
             explicit[0].repeat.as_ref().unwrap().resolve(3).unwrap(),
             vec![2]
@@ -7777,7 +7812,7 @@ mod tests {
             repeat: None,
         }];
 
-        let built = build_overlay_specs(&cli_specs, false).unwrap();
+        let built = build_overlay_specs(&cli_specs, false, &PasswordArgs::default()).unwrap();
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].kind, flpdf::OverlayKind::Overlay);
     }
