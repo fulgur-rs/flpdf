@@ -296,37 +296,9 @@ pub fn page_content_bytes<R: Read + Seek>(
         }
     }
 
-    let contents = page.try_get_key(b"/Contents")?;
-    let (contents, _) = pdf.resolve_to_terminal_ref(&contents)?;
-    if contents.is_null() {
+    let streams = page.get_page_contents()?;
+    if streams.is_empty() {
         return Ok(Vec::new());
-    }
-
-    // `ObjectHandle::array_or_stream_to_stream_array` intentionally mirrors
-    // qpdf's one-hop handle view. This public compatibility helper also has a
-    // long-standing contract to follow holder chains in `/Contents`, so first
-    // reduce every legal holder to its terminal handle and then hand the
-    // normalized stream array to the canonical pipe path. The stream handles
-    // themselves remain resolver-backed; no legacy `Object` materialization is
-    // introduced for filter metadata or stream bytes.
-    let mut streams = Vec::new();
-    if let Some(items) = contents.as_array() {
-        for item in items {
-            let (item, _) = pdf.resolve_to_terminal_ref(&item)?;
-            if item.as_stream_dict().is_some() {
-                streams.push(item);
-            } else {
-                return Err(Error::Unsupported(format!(
-                    "/Contents array element on page {page_ref} does not resolve to a stream"
-                )));
-            }
-        }
-    } else if contents.as_stream_dict().is_some() {
-        streams.push(contents);
-    } else {
-        return Err(Error::Unsupported(format!(
-            "/Contents on page {page_ref} is not a stream or array"
-        )));
     }
 
     let normalized_contents = ObjectHandle::array(streams);
@@ -2395,16 +2367,12 @@ mod tests {
         format!("{num} 0 obj\n{target} 0 R\nendobj\n").into_bytes()
     }
 
-    // -----------------------------------------------------------------------
-    // Holder-chain (flpdf-3x23) tests: /Contents reached via ref → ref → value
-    // must be followed to its terminal, not dropped at the first hop.
-    // -----------------------------------------------------------------------
-
-    // Site 1: /Contents = single indirect Reference behind a 2-hop chain.
+    // qpdf's getPageContents resolves the /Contents handle once. A bare
+    // reference object created through Pdf::set_object is not a second qpdf
+    // object-handle hop and is therefore treated as a non-stream shape.
     #[test]
-    fn page_content_bytes_follows_single_contents_holder_chain() {
+    fn page_content_bytes_does_not_follow_single_contents_holder_chain() {
         let body = b"BT /F1 12 Tf (Chained) Tj ET";
-        // /Contents 4 0 R ; 4 0 R → 5 0 R (carrier) ; 5 0 R is the stream.
         let carrier = ref_carrier_object_bytes(4, 5);
         let stream_bytes = stream_object_bytes(5, body);
         let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, carrier), (5, stream_bytes)]);
@@ -2414,13 +2382,11 @@ mod tests {
             Object::Reference(ObjectRef::new(5, 0)),
         );
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        assert_eq!(content, body);
+        assert!(content.is_empty());
     }
 
-    // Site 1 error arm: a 2-hop chain terminating at a non-stream is rejected.
     #[test]
-    fn page_content_bytes_single_contents_chain_to_non_stream_errors() {
-        // /Contents 4 0 R ; 4 0 R → 5 0 R ; 5 0 R is a dictionary, not a stream.
+    fn page_content_bytes_skips_single_contents_chain_to_non_stream() {
         let carrier = ref_carrier_object_bytes(4, 5);
         let non_stream = b"5 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
         let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, carrier), (5, non_stream)]);
@@ -2429,21 +2395,14 @@ mod tests {
             ObjectRef::new(4, 0),
             Object::Reference(ObjectRef::new(5, 0)),
         );
-        let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
-        // A single /Contents reference dispatches on its terminal type: a value
-        // that is neither a stream nor an array hits the catch-all error.
-        assert!(
-            matches!(&err, Error::Unsupported(msg) if msg.contains("not a stream or array")),
-            "expected Unsupported(\"…not a stream or array\"), got {err:?}"
-        );
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(content.is_empty());
     }
 
-    // Site 2: /Contents array element reached via a 2-hop chain.
     #[test]
-    fn page_content_bytes_follows_array_element_holder_chain() {
+    fn page_content_bytes_does_not_follow_array_element_holder_chain() {
         let body1 = b"q 1 0 0 1 0 0 cm";
         let body2 = b"BT /F1 12 Tf (World) Tj ET";
-        // First element is direct (4 0 R → stream); second is chained (5 0 R → 6 0 R → stream).
         let stream1 = stream_object_bytes(4, body1);
         let carrier = ref_carrier_object_bytes(5, 6);
         let stream2 = stream_object_bytes(6, body2);
@@ -2457,15 +2416,12 @@ mod tests {
             Object::Reference(ObjectRef::new(6, 0)),
         );
         let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
-        let mut expected = body1.to_vec();
-        expected.push(b'\n');
-        expected.extend_from_slice(body2);
-        assert_eq!(content, expected);
+        assert_eq!(content, body1);
+        assert_ne!(content, [body1.as_slice(), body2].concat());
     }
 
-    // Site 2 error arm: a chained array element terminating at a non-stream errors.
     #[test]
-    fn page_content_bytes_array_element_chain_to_non_stream_errors() {
+    fn page_content_bytes_skips_array_element_chain_to_non_stream() {
         let stream1 = stream_object_bytes(4, b"q Q");
         let carrier = ref_carrier_object_bytes(5, 6);
         let non_stream = b"6 0 obj\n<< /NotAStream true >>\nendobj\n".to_vec();
@@ -2478,11 +2434,8 @@ mod tests {
             ObjectRef::new(5, 0),
             Object::Reference(ObjectRef::new(6, 0)),
         );
-        let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
-        assert!(
-            matches!(&err, Error::Unsupported(msg) if msg.contains("does not resolve to a stream")),
-            "expected Unsupported(\"…does not resolve to a stream\"), got {err:?}"
-        );
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(content, b"q Q");
     }
 
     // Site 4: inherited /Resources held behind a 2-hop chain on the parent node.
