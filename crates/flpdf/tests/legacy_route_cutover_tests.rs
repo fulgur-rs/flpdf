@@ -446,6 +446,33 @@ fn page_object_helper_has_no_legacy_resources_projection() {
 }
 
 #[test]
+fn form_xobject_placement_resolves_properties_through_handles() {
+    let source = include_str!("../src/page_object_helper.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("PageObjectHelper source should have a production section");
+    let function = production
+        .split("pub fn get_matrix_for_form_xobject_placement")
+        .nth(1)
+        .and_then(|rest| rest.split("    /// Build qpdf's `placeFormXObject`").next())
+        .expect("Form placement production function should remain present");
+
+    assert!(
+        !function.contains("resolve_to_terminal"),
+        "Form placement must not use the non-qpdf terminal-resolution bridge"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&bbox)"),
+        "Form /BBox must be resolved through the canonical handle"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&form_matrix)"),
+        "Form /Matrix must be resolved through the canonical handle"
+    );
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source
