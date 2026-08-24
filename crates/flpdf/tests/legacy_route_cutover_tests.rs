@@ -473,6 +473,36 @@ fn form_xobject_placement_resolves_properties_through_handles() {
 }
 
 #[test]
+fn flatten_rotation_reads_boxes_through_handles() {
+    let source = include_str!("../src/page_object_helper.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("PageObjectHelper source should have a production section");
+    let function = production
+        .split("pub fn flatten_rotation")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("    /// Copy annotations from another page")
+                .next()
+        })
+        .expect("flatten_rotation production function should remain present");
+
+    assert!(
+        !function.contains("resolve_to_terminal"),
+        "flatten_rotation must not use the non-qpdf terminal-resolution bridge"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&media)"),
+        "flatten_rotation must resolve /MediaBox through the canonical handle"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&value)"),
+        "flatten_rotation must resolve page boxes through canonical handles"
+    );
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source

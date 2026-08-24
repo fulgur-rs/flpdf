@@ -913,9 +913,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             return Ok(());
         }
 
-        let media = self
-            .pdf
-            .resolve_to_terminal(&page.try_get_key(b"/MediaBox")?)?;
+        let media = page.try_get_key(b"/MediaBox")?;
+        self.pdf.resolve(&media)?;
         let Some(media) = rectangle_from_handle(self.pdf, &media)? else {
             return Ok(());
         };
@@ -928,7 +927,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             b"/TrimBox",
             b"/ArtBox",
         ] {
-            let value = self.pdf.resolve_to_terminal(&page.try_get_key(key)?)?;
+            let value = page.try_get_key(key)?;
+            self.pdf.resolve(&value)?;
             let Some(rectangle) = rectangle_from_handle(self.pdf, &value)? else {
                 continue;
             };
