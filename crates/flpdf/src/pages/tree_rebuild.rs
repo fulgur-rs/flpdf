@@ -431,6 +431,10 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     let prepared =
         prepare_for_optimization_with_max_depth(pdf, max_depth)?.ok_or(Error::Missing("/Pages"))?;
     let page_root = prepared.root;
+    // qpdf's page mutation APIs update `m->all_pages` in place. This rebuild
+    // replaces the page tree wholesale, so invalidate the cached prepared
+    // snapshot before any replacement can fail partway.
+    pdf.invalidate_page_list_cache();
     let root = page_tree_root_handle(pdf, page_root)?;
     let mut page_tree_nodes = Vec::new();
     collect_page_tree_nodes(
@@ -745,6 +749,29 @@ mod tests {
             pdf.ever_called_get_all_pages(),
             "qpdf rebuild preparation enumerates pages through getAllPages"
         );
+    }
+
+    #[test]
+    fn rebuild_invalidates_the_cached_page_list() {
+        let mut pdf = open(build_nested_pdf());
+        let before = crate::PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("initial page list");
+        assert_eq!(
+            before,
+            vec![
+                ObjectRef::new(4, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(6, 0)
+            ]
+        );
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(5, 0)]).expect("page rebuild");
+
+        let after = crate::PageDocumentHelper::new(&mut pdf)
+            .get_all_pages()
+            .expect("page list after rebuild");
+        assert_eq!(after, vec![ObjectRef::new(5, 0)]);
     }
 
     #[allow(

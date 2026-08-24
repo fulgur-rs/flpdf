@@ -3,6 +3,7 @@
 use crate::acroform_document_helper::AcroFormCache;
 use crate::cache::ObjectCache;
 use crate::encryption::state::EncryptionState;
+use crate::pages::repair::PreparedPages;
 use crate::reader::resolver::ResolverHandle;
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefForm};
 use std::cell::RefCell;
@@ -201,6 +202,12 @@ pub struct Pdf<R: Read + Seek + 'static> {
     pub(crate) qpdf_removed_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     pub(crate) ever_called_get_all_pages: bool,
+    /// qpdf's `m->all_pages` cache (`QPDF_pages.cc:39-75`). The prepared
+    /// root and leaf identities stay together because page consumers need the
+    /// repaired root as well as the ordered page list. An empty qpdf page
+    /// vector is not cached by qpdf (it is its cache sentinel), so this is
+    /// populated only for a non-empty page list.
+    pub(crate) page_list_cache: Option<PreparedPages>,
     pub(crate) encryption: Rc<RefCell<Option<EncryptionState>>>,
 }
 
@@ -264,8 +271,36 @@ impl<R: Read + Seek> Pdf<R> {
         self.ever_called_get_all_pages
     }
 
+    /// Rebuild qpdf's document-owned page-list cache after direct `/Pages`
+    /// tree manipulation.
+    ///
+    /// This is qpdf's `QPDF::updateAllPagesCache`
+    /// (`include/qpdf/QPDF.hh:695-704`). Page-specific mutation APIs update
+    /// the cache themselves, but callers that edit page-tree handles directly
+    /// must invoke this boundary before asking for the refreshed page list.
+    pub fn update_all_pages_cache(&mut self) -> Result<()> {
+        self.invalidate_page_list_cache();
+        let _ = crate::PageDocumentHelper::new(self).get_all_pages()?;
+        Ok(())
+    }
+
     pub(crate) fn mark_get_all_pages_called(&mut self) {
         self.ever_called_get_all_pages = true;
+    }
+
+    pub(crate) fn cached_page_list(&self) -> Option<PreparedPages> {
+        self.page_list_cache.clone()
+    }
+
+    pub(crate) fn cache_page_list(&mut self, prepared: &PreparedPages) {
+        if !prepared.pages.is_empty() {
+            self.page_list_cache = Some(prepared.clone());
+        }
+    }
+
+    /// Invalidate qpdf's page-list cache after a page-tree mutation.
+    pub(crate) fn invalidate_page_list_cache(&mut self) {
+        self.page_list_cache = None;
     }
 
     /// Adobe extension level from the catalog's `/Extensions /ADBE
