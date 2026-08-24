@@ -1493,6 +1493,19 @@ impl<R: Read + Seek> Pdf<R> {
         crate::object_copy::copy_foreign_object(self, foreign)
     }
 
+    /// Copy a direct or indirect foreign value through the same persistent
+    /// qpdf-shaped `ObjCopier` map used by [`Self::copy_foreign_object`]. This
+    /// is the internal counterpart of qpdf's
+    /// `replaceForeignIndirectObjects` (`libqpdf/QPDF.cc:2158-2213`) for
+    /// direct Catalog/trailer children.
+    pub(crate) fn copy_foreign_value(
+        &mut self,
+        source_id: u64,
+        foreign: &ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        crate::object_copy::copy_foreign_value(self, source_id, foreign)
+    }
+
     /// Replace an indirect object's canonical value from an [`ObjectHandle`].
     ///
     /// This is the handle-shaped counterpart of [`Self::set_object`]. qpdf's
@@ -1723,6 +1736,20 @@ impl<R: Read + Seek> Pdf<R> {
     ) -> BTreeMap<ObjectRef, ObjectRef> {
         self.foreign_object_maps
             .remove(&source_id)
+            .unwrap_or_default()
+    }
+
+    /// Return a snapshot of qpdf's persistent per-source foreign-object map
+    /// without taking ownership of it. Page merge uses this boundary to keep
+    /// selected-page membership distinct from later primary Catalog metadata
+    /// copying while the same map remains live for subsequent copies.
+    pub(crate) fn foreign_object_map_snapshot(
+        &self,
+        source_id: u64,
+    ) -> BTreeMap<ObjectRef, ObjectRef> {
+        self.foreign_object_maps
+            .get(&source_id)
+            .cloned()
             .unwrap_or_default()
     }
 

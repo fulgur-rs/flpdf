@@ -98,22 +98,6 @@ pub(crate) fn extend_page_object_closure<R: Read + Seek>(
     extend_closure_from_queue(pdf, queue, Some(page_ref), visited)
 }
 
-pub(crate) fn extend_object_closure<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    root: &Object,
-    visited: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let mut refs = Vec::new();
-    collect_refs_in_object(root, 0, &mut refs)?;
-    let mut queue = VecDeque::new();
-    for reference in refs {
-        if visited.insert(reference) {
-            queue.push_back(reference);
-        }
-    }
-    extend_closure_from_queue(pdf, queue, None, visited)
-}
-
 fn extend_closure_from_queue<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut queue: VecDeque<ObjectRef>,
@@ -326,36 +310,6 @@ mod tests {
         extend_page_object_closure(&mut pdf, p2, &mut shared).unwrap();
 
         assert_eq!(shared, independent);
-    }
-
-    #[test]
-    fn direct_root_follows_long_indirect_array_chain_but_stops_at_page() {
-        let mut owned: Vec<(u32, String)> = vec![
-            (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
-            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
-            (3, "<< /Type /Page /Parent 2 0 R /Contents 90 0 R >>".into()),
-            (90, "<< /Length 0 >>\nstream\n\nendstream".into()),
-        ];
-        for number in 10..80 {
-            owned.push((number, format!("[{} 0 R]", number + 1)));
-        }
-        owned.push((80, "[3 0 R]".into()));
-        let borrowed: Vec<(u32, &str)> = owned
-            .iter()
-            .map(|(number, body)| (*number, body.as_str()))
-            .collect();
-        let mut pdf = Pdf::open_mem_owned(build_pdf(&borrowed, 1)).unwrap();
-        let mut closure = BTreeSet::new();
-
-        extend_object_closure(
-            &mut pdf,
-            &Object::Reference(ObjectRef::new(10, 0)),
-            &mut closure,
-        )
-        .unwrap();
-
-        assert!(closure.contains(&ObjectRef::new(3, 0)));
-        assert!(!closure.contains(&ObjectRef::new(90, 0)));
     }
 
     fn nested_arrays(depth: usize) -> Object {

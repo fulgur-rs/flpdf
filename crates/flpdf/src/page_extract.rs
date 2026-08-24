@@ -230,14 +230,15 @@ pub(crate) fn null_copied_removed_pages<R: Read + Seek>(
     all_pages: &[ObjectRef],
     selected: &BTreeSet<ObjectRef>,
     map: &BTreeMap<ObjectRef, ObjectRef>,
-) {
+) -> Result<()> {
     for source_page in all_pages {
         if !selected.contains(source_page) {
             if let Some(&copied_page) = map.get(source_page) {
-                target.set_object(copied_page, Object::Null);
+                target.replace_object_handle(copied_page, ObjectHandle::null())?;
             }
         }
     }
+    Ok(())
 }
 
 /// Extract page `page_index` (0-based) from `source` into a brand-new minimal

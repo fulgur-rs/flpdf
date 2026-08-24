@@ -2242,21 +2242,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         };
         Ok(resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.is_some())
     }
-
-    pub(crate) fn acroform_inherited_entries(&mut self) -> Result<Vec<(Vec<u8>, Object)>> {
-        let Some(acroform) = self.acroform_dict()? else {
-            return Ok(Vec::new());
-        };
-        Ok([b"DA".as_slice(), b"DR".as_slice()]
-            .into_iter()
-            .filter_map(|key| {
-                acroform
-                    .get(key)
-                    .cloned()
-                    .map(|value| (key.to_vec(), value))
-            })
-            .collect())
-    }
 }
 
 pub(crate) fn collect_reachable_refs<R: Read + Seek>(
@@ -2415,44 +2400,6 @@ fn resolve_array_value<R: Read + Seek>(
         }
         Some(_) => Ok(None),
     }
-}
-
-pub(crate) fn remap_refs_in_object(obj: Object, map: &BTreeMap<ObjectRef, ObjectRef>) -> Object {
-    match obj {
-        Object::Reference(object_ref) => map
-            .get(&object_ref)
-            .copied()
-            .map(Object::Reference)
-            .unwrap_or(Object::Null),
-        Object::Array(items) => Object::Array(
-            items
-                .into_iter()
-                .map(|item| remap_refs_in_object(item, map))
-                .collect(),
-        ),
-        Object::Dictionary(dict) => Object::Dictionary(remap_refs_in_dict(dict, map)),
-        Object::Stream(mut stream) => {
-            stream.dict = remap_refs_in_dict(stream.dict, map);
-            Object::Stream(stream)
-        }
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::RealLiteral { .. }
-        | Object::Name(_)
-        | Object::String(_)
-        | Object::Operator(_)
-        | Object::InlineImage(_) => obj,
-    }
-}
-
-fn remap_refs_in_dict(dict: Dictionary, map: &BTreeMap<ObjectRef, ObjectRef>) -> Dictionary {
-    let mut out = Dictionary::new();
-    for (key, value) in dict.iter() {
-        out.insert(key, remap_refs_in_object(value.clone(), map));
-    }
-    out
 }
 
 fn resource_renames_from_conflicts(conflicts: &ResourceConflicts) -> ResourceRenames {
