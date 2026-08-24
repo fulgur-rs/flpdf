@@ -729,9 +729,16 @@ CLI の qpdf 11.9.0 differential test、および fixture の live probe で確�
 `page_closure.rs` の `page_object_closure` は今回、旧 raw `Object` snapshot
 ではなく、qpdf の canonical object identity に対応する `ObjectHandle` graph
 を走査する route へ切り替えた。開始 page 以外の `Page` / `Catalog` 境界と
-`/Pages` の `/Kids` 除外という既存の page-closure contract は、qpdf の live
-handle traversal と page-boundary 構造（`QPDF.cc:2019-2272`;
-`QPDF_optimization.cc:271-334`）に沿って実装している。
+`/Pages` の `/Kids` 除外という既存の page-closure contract 自体は本 PR で
+変更していない（走査対象を raw `Object` から `ObjectHandle` に置き換えた
+だけ）。この境界の一次オラクルは `reserveObjects`（`QPDF.cc:2019-2272`）
+の `foreign.isPagesObject()` 早期 return（`/Pages` ノードへは踏み込まない）
+と `!top && foreign.isPageObject()` 早期 return（開始 page 以外の `/Page`
+境界で停止する）。`QPDF_optimization.cc` の `updateObjectMapsInternal`
+（`QPDFWriter` の object-usage 追跡専用、`copyForeignObject` とは無関係）は
+`is_page_node && key == "/Parent"` を明示的に skip する逆の規約（開始
+page からも `/Parent` を辿らない）を持つため、本関数の境界規約の根拠には
+ならない — 参照として削除した。
 
 一方、`object_copy.rs` の `copy_objects` は production qpdf route から切り離された
 旧 pre-closed API として残っているが、新しい consumer や互換 adapter を追加する
