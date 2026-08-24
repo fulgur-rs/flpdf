@@ -298,3 +298,42 @@ fn overlay_appearance_stream_has_no_raw_snapshot_route() {
         );
     }
 }
+
+#[test]
+fn page_extract_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/page_extract.rs");
+    let production = source
+        .split_once("#[cfg(test)]")
+        .expect("page_extract has a test module")
+        .0;
+    let production: String = production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for legacy in [
+        "use crate::{Dictionary",
+        "Object,",
+        "Object::",
+        "resolve_object(",
+        "set_object(",
+        "Result<Dictionary>",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "page_extract production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "get_object_handle",
+        "replace_object_handle",
+        "shallow_copy",
+        "try_get_key",
+    ] {
+        assert!(
+            production.contains(canonical),
+            "page_extract production must use the canonical handle API {canonical:?}"
+        );
+    }
+}

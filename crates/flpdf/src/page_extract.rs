@@ -54,7 +54,7 @@
 use crate::page_label_document_helper::merge_adjacent_ranges;
 use crate::pages::page_refs;
 use crate::subset_prune::sweep_unreachable_objects;
-use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 
@@ -271,9 +271,9 @@ pub fn extract_page<R: Read + Seek>(
 /// called once per input (with `used`/`kids` accumulating across calls) by
 /// [`crate::job::merge_documents`], its sole caller.
 ///
-/// New object numbers for clones are allocated above the current maximum in
-/// `target`, recomputed on entry so repeated calls into a growing target do
-/// not collide.
+/// New object numbers for clones are allocated by the target's canonical
+/// `make_indirect_object_handle` registry, so repeated calls into a growing
+/// target cannot collide with prior handle allocations.
 pub(crate) fn append_selection_kids(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     selected: &[ObjectRef],
@@ -281,12 +281,6 @@ pub(crate) fn append_selection_kids(
     used: &mut BTreeSet<ObjectRef>,
     kids: &mut Vec<ObjectRef>,
 ) -> Result<()> {
-    let mut next_num: u32 = target
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0);
     for &src_ref in selected {
         let copied_page_ref = *map
             .get(&src_ref)
@@ -294,22 +288,14 @@ pub(crate) fn append_selection_kids(
         let kid = if used.insert(copied_page_ref) {
             copied_page_ref
         } else {
-            next_num = next_num.checked_add(1).ok_or_else(|| {
-                // cov:ignore-start: unreachable in practice — copy_objects
-                // renumbers the freshly built target sequentially from a small
-                // base, so hitting u32::MAX would need ~2^32 copied objects.
-                // The `})?;` terminator carries the Err-propagation region of
-                // this same arm, so the block extends through it.
-                Error::Unsupported(
-                    "page extract: object-number overflow allocating duplicate page".to_string(),
-                )
-            })?;
-            // cov:ignore-end
-            let clone_ref = ObjectRef::new(next_num, 0);
-            // The one intentional copy: the duplicate kid's own dictionary.
-            let dict = resolve_dict(target, copied_page_ref, "copied page is not a dictionary")?; // cov:ignore: Err arm unreachable — the first copy of this page resolved to a dictionary before it was reparented above
-            target.set_object(clone_ref, Object::Dictionary(dict));
-            clone_ref
+            // qpdf's insertPage uses shallowCopy and then makeIndirectObject
+            // for a page object that is already present in the page tree.
+            let page = target.get_object_handle(copied_page_ref);
+            target.resolve(&page)?;
+            let clone = target.make_indirect_object_handle(page.shallow_copy()?)?;
+            clone.object_ref().ok_or(Error::Missing(
+                "duplicate extracted page missing from target",
+            ))?
         };
         kids.push(kid);
     }
@@ -318,30 +304,31 @@ pub(crate) fn append_selection_kids(
 
 /// Resolve the target catalog's `/Pages` root ref.
 pub(crate) fn target_pages_root(target: &mut Pdf<Cursor<Vec<u8>>>) -> Result<ObjectRef> {
-    let catalog_ref = target.root_ref().ok_or(Error::Missing("/Root"))?;
-    let catalog = resolve_dict(target, catalog_ref, "/Root is not a dictionary")?;
+    let catalog = target.root_handle()?;
     catalog
-        .get("Pages")
-        .and_then(|o| match o {
-            Object::Reference(r) => Some(*r),
-            _ => None,
-        })
+        .try_get_key(b"/Pages")?
+        .object_ref()
         .ok_or(Error::Missing("/Pages"))
 }
 
-/// Resolve `r` in `target` and move out its [`Dictionary`], or fail with `ctx`.
+/// Resolve `r` in `target` as a live dictionary handle for malformed-fixture
+/// tests, or fail with `ctx`.
 ///
-/// Shared by [`target_pages_root`] and the merge route's page/root bookkeeping;
-/// the error arm guards against a ref resolving to a non-dictionary (or a
-/// missing object, which resolves to [`Object::Null`]).
-pub(crate) fn resolve_dict(
+/// Production callers use direct canonical handle access at their ownership
+/// boundary; this test helper keeps the non-dictionary error classification
+/// covered without reintroducing a raw snapshot route.
+#[cfg(test)]
+fn resolve_dict(
     target: &mut Pdf<Cursor<Vec<u8>>>,
     r: ObjectRef,
     ctx: &'static str,
-) -> Result<Dictionary> {
-    match target.resolve_object(r)? {
-        Object::Dictionary(d) => Ok(d),
-        _ => Err(Error::Missing(ctx)),
+) -> Result<ObjectHandle> {
+    let handle = target.get_object_handle(r);
+    target.resolve(&handle)?;
+    if handle.as_dictionary().is_some() {
+        Ok(handle)
+    } else {
+        Err(Error::Missing(ctx))
     }
 }
 
