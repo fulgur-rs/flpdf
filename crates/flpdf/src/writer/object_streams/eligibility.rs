@@ -5,6 +5,7 @@
 //! stale generations that the writer must serialize as null.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
 use crate::object::ObjectRef;
 use crate::ObjectHandle;
@@ -164,11 +165,24 @@ pub(crate) fn compressible_objgens_qpdf_plan<R: std::io::Read + std::io::Seek>(
 /// an empty input yields no streams. (qpdf is `(n + 99) / 100` then
 /// `n / streams` rounded up; `div_ceil` expresses both directly.)
 pub(crate) fn even_split_into_streams(eligible: &[ObjectRef]) -> Vec<Vec<ObjectRef>> {
+    even_split_into_streams_with_cap(
+        eligible,
+        NonZeroUsize::new(100).expect("qpdf's ObjStm cap is non-zero"),
+    )
+}
+
+/// Distribute `eligible` objects using qpdf's even-split algorithm with an
+/// explicit member cap. The explicit-cap form keeps the planner's internal
+/// test seam useful while the production default remains qpdf's cap of 100.
+pub(crate) fn even_split_into_streams_with_cap(
+    eligible: &[ObjectRef],
+    cap: NonZeroUsize,
+) -> Vec<Vec<ObjectRef>> {
     let n = eligible.len();
     if n == 0 {
         return Vec::new();
     }
-    let n_streams = n.div_ceil(100);
+    let n_streams = n.div_ceil(cap.get());
     let n_per = n.div_ceil(n_streams);
     eligible.chunks(n_per).map(|chunk| chunk.to_vec()).collect()
 }

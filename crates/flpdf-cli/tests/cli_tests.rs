@@ -1031,6 +1031,15 @@ fn preserve_unreferenced_retains_orphan_across_writer_cli_surfaces() {
                 "--object-streams=generate",
             ],
         ),
+        (
+            "rewrite-qdf-generate",
+            vec![
+                "rewrite",
+                "--qdf",
+                "--preserve-unreferenced",
+                "--object-streams=generate",
+            ],
+        ),
         ("qdf", vec!["qdf", "--preserve-unreferenced"]),
         ("top-level", vec!["--preserve-unreferenced"]),
     ] {

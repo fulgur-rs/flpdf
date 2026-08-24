@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 
 use super::eligibility::{
     collect_indirect_objstm_length_refs, compressible_objgens_qpdf_plan, eligibility_context,
-    is_eligible_for_objstm_handle, EligibilityContext,
+    even_split_into_streams_with_cap, is_eligible_for_objstm_handle, EligibilityContext,
 };
 use crate::object::ObjectRef;
 use crate::writer::WriterOptions;
@@ -125,8 +125,9 @@ pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerCon
 /// - `Disable`  → returns an empty plan (zero batches).
 /// - `Preserve` → reconstructs the source document's ObjStm grouping,
 ///   skipping ineligible members and applying the configured legacy cap.
-/// - `Generate` → greedily packs all eligible objects in
-///   `(number, generation)` ascending order, cap-delimited.
+/// - `Generate` → follows qpdf's compressible-object traversal and evenly
+///   splits the result across the minimum number of streams allowed by the
+///   member cap.
 #[cfg(test)]
 pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
@@ -162,9 +163,7 @@ pub(crate) fn plan_object_streams_with_reachability<R: std::io::Read + std::io::
         ObjectStreamMode::Preserve => {
             plan_preserve(pdf, &ctx, &length_exclusions, config.batch_size_cap)
         }
-        ObjectStreamMode::Generate => {
-            plan_generate(pdf, config, &ctx, &length_exclusions, reachable)
-        }
+        ObjectStreamMode::Generate => plan_generate(pdf, config, &length_exclusions, reachable),
     }
 }
 
@@ -352,52 +351,27 @@ pub(crate) fn plan_preserve_for_test<R: std::io::Read + std::io::Seek>(
     plan_preserve(pdf, ctx, length_exclusions, batch_size_cap)
 }
 
-/// Generate mode: greedily pack all eligible objects in number/generation order.
+/// Generate mode: follow qpdf's live compressible-object traversal and evenly
+/// split it across the minimum number of object streams.
 fn plan_generate<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
     config: &PlannerConfig,
-    ctx: &EligibilityContext,
     length_exclusions: &BTreeSet<ObjectRef>,
     reachable: Option<&BTreeSet<ObjectRef>>,
 ) -> crate::Result<PackingPlan> {
-    // `Pdf::object_refs` does not by itself guarantee exclusion of a
-    // free/deleted xref row: a caller that has taken a canonical
-    // `ObjectHandle` on such a ref (via `get_object_handle`) before this
-    // planner runs can surface it here through the registry half of
-    // `object_refs` (`reader.rs`'s `canonical_object_refs`). This function
-    // is reached only via the specialized/encrypted writer coordinator
-    // (`writer.rs`), which resolves every registered handle ahead of
-    // object-stream planning, so a stray free-row candidate has not been
-    // observed to reach `refs` here -- but this loop has no independent
-    // free/deleted filter of its own if that upstream ordering changes.
-    let mut refs: Vec<ObjectRef> = pdf.object_refs().into_iter().collect();
-    refs.sort_by_key(|r| (r.number, r.generation));
-
-    let cap = config.batch_size_cap.get();
-    let mut current_batch: Vec<ObjectRef> = Vec::new();
-    let mut batches: Vec<Vec<ObjectRef>> = Vec::new();
-
-    for obj_ref in refs {
-        if length_exclusions.contains(&obj_ref)
-            || reachable.is_some_and(|reachable| !reachable.contains(&obj_ref))
-        {
-            continue;
-        }
-        let obj = pdf.get_object_handle(obj_ref);
-        if !is_eligible_for_objstm_handle(obj_ref, &obj, ctx)? {
-            continue;
-        }
-        current_batch.push(obj_ref);
-        if current_batch.len() >= cap {
-            batches.push(std::mem::take(&mut current_batch));
-        }
-    }
-    if !current_batch.is_empty() {
-        batches.push(current_batch);
-    }
+    // QPDFWriter::generateObjectStreams obtains its candidates from
+    // QPDF::getCompressibleObjGens (QPDFWriter.cc:1970-2004), not from the
+    // object-number-sorted xref universe. That walk is the semantic source of
+    // both member order and the set of reachable candidates.
+    let mut compressible = compressible_objgens_qpdf_plan(pdf)?;
+    compressible.eligible.retain(|member| {
+        !length_exclusions.contains(member)
+            && reachable.is_none_or(|reachable| reachable.contains(member))
+    });
+    let batches = even_split_into_streams_with_cap(&compressible.eligible, config.batch_size_cap);
 
     Ok(PackingPlan {
         batches,
-        removed_refs: BTreeSet::new(),
+        removed_refs: compressible.removed_refs,
     })
 }

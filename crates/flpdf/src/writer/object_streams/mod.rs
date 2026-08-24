@@ -870,6 +870,17 @@ mod tests {
     ///   They receive consecutive object numbers starting at 3.
     ///   Pass `extra_data` as per-object bytes; length must equal `n_extra`.
     fn one_objstm_pdf_n(extra_data: &[&[u8]]) -> Vec<u8> {
+        one_objstm_pdf_n_with_catalog_suffix(extra_data, b"")
+    }
+
+    /// Variant of [`one_objstm_pdf_n`] that adds references to extra members
+    /// directly to the Catalog. This keeps the generated objects reachable so
+    /// planner tests exercise qpdf's batch-cap algorithm rather than the
+    /// reachability filter.
+    fn one_objstm_pdf_n_with_catalog_suffix(
+        extra_data: &[&[u8]],
+        catalog_suffix: &[u8],
+    ) -> Vec<u8> {
         let n_extra = extra_data.len();
         // ObjStm object number = 3 + n_extra
         let objstm_num = 3 + n_extra as u32;
@@ -882,7 +893,9 @@ mod tests {
 
         // Object 1: Catalog
         let catalog_offset = bytes.len();
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R");
+        bytes.extend_from_slice(catalog_suffix);
+        bytes.extend_from_slice(b" >>\nendobj\n");
 
         // Build ObjStm payload
         let pages_bytes: &[u8] = b"<< /Type /Pages /Count 0 /Kids [] >>";
@@ -1047,11 +1060,11 @@ mod tests {
     }
 
     #[test]
-    fn planner_generate_mode_packs_eligible_objects_in_sorted_order() {
+    fn planner_generate_mode_follows_qpdf_reachable_order() {
         // one_objstm_pdf_n with 1 extra member:
         //   obj 1: Catalog dict  → eligible
         //   obj 2: Pages dict    → eligible (compressed)
-        //   obj 3: string (hello)→ eligible (compressed)
+        //   obj 3: string (hello)→ unreachable and therefore omitted by qpdf
         //   obj 4: ObjStm stream → ineligible
         //   obj 5: XRef stream   → ineligible
         let pdf_bytes = one_objstm_pdf_n(&[b"(world)"]);
@@ -1065,14 +1078,14 @@ mod tests {
 
         assert_eq!(plan.batches.len(), 1);
         let batch = &plan.batches[0];
-        // Must be in (number, generation) ascending order
+        // This simple graph's qpdf traversal happens to be object-number order.
         let numbers: Vec<u32> = batch.iter().map(|r| r.number).collect();
         assert!(
             numbers.windows(2).all(|w| w[0] < w[1]),
-            "batch must be sorted by object number; got {numbers:?}"
+            "expected qpdf order for this graph; got {numbers:?}"
         );
-        // Eligible count: 1, 2, 3 → 3 objects
-        assert_eq!(batch.len(), 3, "expected 3 eligible objects");
+        // Reachable eligible count: 1, 2 → 2 objects.
+        assert_eq!(batch.len(), 2, "expected 2 reachable eligible objects");
         // All refs must have generation 0
         for r in batch {
             assert_eq!(r.generation, 0);
@@ -1103,7 +1116,15 @@ mod tests {
         // 5 extra members → obj 2,3,4,5,6,7 are compressed; obj 1 plain Catalog.
         // ObjStm=obj8, XRef=obj9. Eligible: 1,2,3,4,5,6,7 → 7 objects.
         let extra: Vec<&[u8]> = vec![b"(a)" as &[u8], b"(b)", b"(c)", b"(d)", b"(e)"];
-        let pdf_bytes = one_objstm_pdf_n(&extra);
+        let mut catalog_suffix = b" /Extras [".to_vec();
+        for (index, _) in extra.iter().enumerate() {
+            if index != 0 {
+                catalog_suffix.push(b' ');
+            }
+            catalog_suffix.extend_from_slice(format!("{} 0 R", 3 + index).as_bytes());
+        }
+        catalog_suffix.push(b']');
+        let pdf_bytes = one_objstm_pdf_n_with_catalog_suffix(&extra, &catalog_suffix);
         let mut pdf = open_pdf(pdf_bytes);
 
         let config = PlannerConfig {
