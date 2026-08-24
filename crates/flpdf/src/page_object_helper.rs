@@ -1020,9 +1020,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_same_document_page_handle(self.pdf, &from_page)?;
-        let old_annots = self
-            .pdf
-            .resolve_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
+        let old_annots = from_page.try_get_key(b"/Annots")?;
+        self.pdf.resolve(&old_annots)?;
         if old_annots.try_as_array()?.is_none() {
             return Ok(());
         }
@@ -1150,7 +1149,8 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         let destination = self.resolved_page_handle()?;
         self.require_page_ref()?;
         validate_foreign_page_handle(source, self.pdf, &from_page)?;
-        let old_annots = source.resolve_to_terminal(&from_page.try_get_key(b"/Annots")?)?;
+        let old_annots = from_page.try_get_key(b"/Annots")?;
+        source.resolve(&old_annots)?;
         if old_annots.try_as_array()?.is_none() {
             return Ok(());
         }

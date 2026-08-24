@@ -503,6 +503,50 @@ fn flatten_rotation_reads_boxes_through_handles() {
 }
 
 #[test]
+fn copy_annotations_reads_source_annots_through_handles() {
+    let source = include_str!("../src/page_object_helper.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("PageObjectHelper source should have a production section");
+    let same_document = production
+        .split("fn copy_annotations_with_reserved_names_impl")
+        .nth(1)
+        .and_then(|rest| rest.split("    /// This is qpdf's foreign-document").next())
+        .expect("same-document annotation copy implementation should remain present");
+    let foreign_document = production
+        .split("fn copy_annotations_from_with_reserved_names_impl")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("    /// Coalesce the page's content streams")
+                .next()
+        })
+        .expect("foreign-document annotation copy implementation should remain present");
+
+    for (route, function) in [
+        ("same-document", same_document),
+        ("foreign-document", foreign_document),
+    ] {
+        assert!(
+            !function.contains("resolve_to_terminal"),
+            "{route} annotation copy must not use the non-qpdf terminal-resolution bridge"
+        );
+        assert!(
+            function.contains("try_get_key(b\"/Annots\")"),
+            "{route} annotation copy must read /Annots from the source handle"
+        );
+    }
+    assert!(
+        same_document.contains("self.pdf.resolve(&old_annots)"),
+        "same-document annotation copy must resolve /Annots through the destination Pdf"
+    );
+    assert!(
+        foreign_document.contains("source.resolve(&old_annots)"),
+        "foreign-document annotation copy must resolve /Annots through the source Pdf"
+    );
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source
