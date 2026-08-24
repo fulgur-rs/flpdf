@@ -4630,7 +4630,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_image_refs_propagates_invalid_resources_error() {
+    fn collect_image_refs_ignores_non_dictionary_resources_like_qpdf() {
         let mut pdf = load_one_page_pdf();
         let page_ref = ObjectRef::new(3, 0);
 
@@ -4641,11 +4641,12 @@ mod tests {
         page.insert("Resources", Object::Integer(7));
         pdf.set_object(page_ref, Object::Dictionary(page));
 
-        let error = collect_image_refs(&mut pdf, page_ref).expect_err("invalid resources");
-        assert!(
-            matches!(&error, ConvertError::PdfError(message) if message.contains("/Resources entry")),
-            "unexpected error: {error:?}"
-        );
+        // qpdf's QPDFPageObjectHelper::getAttribute returns the non-dictionary
+        // value, while forEachXObject then uses getKeyIfDict and produces no
+        // images rather than throwing (`QPDFPageObjectHelper.cc:224-260,318-357`).
+        assert!(collect_image_refs(&mut pdf, page_ref)
+            .expect("qpdf treats non-dictionary /Resources as empty")
+            .is_empty());
     }
 
     // ── 29. three-page.pdf: length and pageposfrom1 sequence ─────────────────

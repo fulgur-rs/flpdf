@@ -9,20 +9,19 @@ use crate::json::Json;
 use crate::json_inspect::{
     json_array, json_dictionary, pdf_dest_to_json, pdf_object_to_json, ConvertError,
 };
-use crate::object::{Object, ObjectRef};
 use crate::object_handle::ObjectHandle;
 use crate::pdf_string::decode_pdf_text_string;
-use crate::Pdf;
+use crate::{ObjectRef, PageObjectHelper, Pdf};
 use std::io::{Read, Seek};
 
 // ── build_pages_section ───────────────────────────────────────────────────────
 
 /// Flatten a `/Contents` entry into a list of indirect-reference strings.
 /// Handles three forms:
-/// - `Object::Reference(r)` → `["N M R"]`
-/// - `Object::Array([Reference, ...])` → each element as `"N M R"` (direct
+/// - an indirect reference handle → `["N M R"]`
+/// - an array of reference handles → each element as `"N M R"` (direct
 ///   streams in the array are silently skipped — they carry no ref string)
-/// - `Object::Null` or absent → `[]`
+/// - a null handle or an absent key → `[]`
 ///
 /// Direct inline Streams outside an array have no object number and are
 /// therefore skipped (spec-compliant PDFs use indirect refs for /Contents).
@@ -90,37 +89,22 @@ pub(crate) fn collect_image_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: crate::ObjectRef,
 ) -> Result<Vec<String>, ConvertError> {
-    let resources = match crate::pages::resolve_inherited_resources(pdf, page_ref) {
-        Ok(Some(d)) => d,
-        Ok(None) => return Ok(vec![]),
-        Err(e) => return Err(ConvertError::PdfError(e.to_string())),
-    };
-    // Bridge: `crate::pages` is not part of this migration slice and still
-    // returns a legacy `Dictionary`; lift it once here so the rest of this
-    // function can use the ObjectHandle idiom like the rest of json_inspect.
-    let resources_dict = pdf
-        .lift_object_to_handle(&Object::Dictionary(resources))?
-        .as_dictionary()
-        .unwrap_or_default();
-
-    // Resolve the /XObject sub-dictionary (may itself be indirect).
-    let Some(xobject_handle) = resources_dict.get(b"/XObject".as_slice()) else {
-        return Ok(vec![]);
-    };
-    pdf.resolve(xobject_handle)?;
-    let Some(xobject_dict) = xobject_handle.as_dictionary() else {
-        return Ok(vec![]);
+    // qpdf's doJSONPages calls QPDFPageObjectHelper::getImages directly
+    // (`QPDFJob.cc:1030-1078`), so keep inherited-resource resolution inside
+    // the canonical page helper instead of lifting a legacy Dictionary.
+    let images = {
+        let mut page = PageObjectHelper::new(page_ref, pdf);
+        page.get_images()?
     };
 
-    // Iterate in name (key) order — BTreeMap gives byte-lex order automatically.
     let mut image_refs: Vec<String> = Vec::new();
-    for value in xobject_dict.values() {
+    for value in images.into_values() {
         // Each XObject entry should be an indirect Reference.
         let Some(xobj_ref) = value.object_ref() else {
             // Direct inline stream — no ref string available, skip.
             continue;
         };
-        pdf.resolve(value)?;
+        pdf.resolve(&value)?;
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
@@ -634,16 +618,6 @@ pub(crate) fn checksum_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Source of a filespec value found in the EmbeddedFiles name tree.
-///
-/// PDF name tree leaf values can be either an indirect Reference (the common
-/// case) or a direct Dictionary embedded inline. Both shapes must produce an
-/// `attachments` entry.
-enum FilespecSource {
-    Indirect(crate::ObjectRef),
-    Direct(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
-}
-
 /// Build a JSON entry for one filespec dictionary.
 ///
 /// Returns an object with keys in alphabetical order:
@@ -892,98 +866,35 @@ fn filespec_dict_to_json<R: Read + Seek>(
 ///
 /// Returns a [`ConvertError`] if any indirect object resolution fails.
 pub fn build_attachments_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, ConvertError> {
-    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-
-    // Resolve the Catalog.
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(Json::make_dictionary()),
+    // qpdf's doJSONAttachments delegates name-tree traversal to
+    // QPDFEmbeddedFileDocumentHelper::getEmbeddedFiles
+    // (`QPDFJob.cc:1281-1330`). The helper returns live Filespec handles for
+    // both indirect and direct name-tree leaves, so no raw NameTree snapshot
+    // or write-back route belongs in this JSON section.
+    let entries = {
+        let mut embedded_files = pdf.embedded_files();
+        embedded_files.get_embedded_files()?
     };
-    let catalog = pdf
-        .resolve_borrowed(catalog_ref)
-        .map_err(ConvertError::from)?;
-    let mut catalog = match catalog {
-        Object::Dictionary(dictionary) => dictionary.clone(),
-        _ => return Ok(Json::make_dictionary()),
-    };
-    let names_val = catalog.get("Names").cloned();
-
-    enum NamesLocation {
-        Direct,
-        Indirect(crate::ObjectRef),
-    }
-
-    let (names_location, mut names_dict) = match names_val {
-        Some(Object::Dictionary(dictionary)) => (NamesLocation::Direct, dictionary),
-        Some(source @ Object::Reference(source_ref)) => {
-            let (terminal, terminal_ref) =
-                crate::ref_chain::resolve_ref_chain(pdf, &source).map_err(ConvertError::from)?;
-            match terminal.into_dict() {
-                Some(dictionary) => (
-                    NamesLocation::Indirect(terminal_ref.unwrap_or(source_ref)),
-                    dictionary,
-                ),
-                None => return Ok(Json::make_dictionary()),
-            }
-        }
-        _ => return Ok(Json::make_dictionary()),
-    };
-
-    // /EmbeddedFiles name tree root: keep the original object shape so the
-    // shared walker can resolve an indirect root itself and track its
-    // ObjectRef in the visited set (cycle guard on a self-referential root).
-    let ef_root = match names_dict.get("EmbeddedFiles").cloned() {
-        Some(v) => v,
-        None => return Ok(Json::make_dictionary()),
-    };
-
-    let original_ef_root = ef_root.clone();
-    let mut tree = crate::NameTree::new(ef_root, true);
-    tree.set_max_depth(DEFAULT_MAX_PAGE_TREE_DEPTH);
-    let entries = tree.as_map(pdf).map_err(ConvertError::from)?;
-    if tree.root() != &original_ef_root {
-        names_dict.insert("EmbeddedFiles", tree.into_root());
-        match names_location {
-            NamesLocation::Direct => {
-                catalog.insert("Names", Object::Dictionary(names_dict));
-                pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-            }
-            NamesLocation::Indirect(names_ref) => {
-                pdf.set_object(names_ref, Object::Dictionary(names_dict));
-            }
-        }
-    }
-
-    let mut raw_entries: Vec<(String, FilespecSource)> = Vec::with_capacity(entries.len());
-    for (key_bytes, value) in entries {
-        let source = match value {
-            Object::Reference(object_ref) => FilespecSource::Indirect(object_ref),
-            Object::Dictionary(dictionary) => {
-                // Bridge: the NameTree walker (out of this migration's
-                // scope) still yields a legacy Object; lift a direct leaf
-                // dictionary once so filespec_dict_to_json can use the
-                // ObjectHandle idiom like the rest of json_inspect.
-                let dict = pdf
-                    .lift_object_to_handle(&Object::Dictionary(dictionary))?
-                    .as_dictionary()
-                    .unwrap_or_default();
-                FilespecSource::Direct(dict)
-            }
-            _ => continue,
-        };
-        raw_entries.push((String::from_utf8_lossy(&key_bytes).into_owned(), source));
-    }
+    let mut raw_entries: Vec<(String, ObjectHandle)> = entries
+        .into_iter()
+        .map(|(key_bytes, filespec)| (String::from_utf8_lossy(&key_bytes).into_owned(), filespec))
+        .collect();
 
     // Sort by name (alphabetical)
     raw_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Build the output object. Both indirect (Reference) and direct
-    // (inlined Dictionary) filespec values yield an attachments entry.
+    // Build the output object. Both indirect and direct Filespec handles yield
+    // an attachments entry.
     let mut pairs: Vec<(String, Json)> = Vec::new();
-    for (name, source) in raw_entries {
-        let entry = match source {
-            FilespecSource::Indirect(filespec_ref) => filespec_to_json(pdf, filespec_ref)?,
-            FilespecSource::Direct(dict) => filespec_dict_to_json(pdf, &dict, None)?,
+    for (name, filespec) in raw_entries {
+        let entry = if let Some(filespec_ref) = filespec.object_ref() {
+            filespec_to_json(pdf, filespec_ref)?
+        } else {
+            pdf.resolve(&filespec)?;
+            let Some(dict) = filespec.as_dictionary() else {
+                continue;
+            };
+            filespec_dict_to_json(pdf, &dict, None)?
         };
         pairs.push((name, entry));
     }
@@ -1078,7 +989,7 @@ pub(crate) fn cf_method_string<R: Read + Seek>(
 ///
 /// Returns `None` if the key is absent, the value is not a name, or the
 /// name's bytes are not valid UTF-8 (matching the strict, non-lossy
-/// decoding the original `Object`-based lookup used).
+/// decoding the original raw lookup used).
 fn dict_name_str<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
@@ -1173,8 +1084,7 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
     // resolves an indirect reference in place, so a single call covers both
     // shapes; a present but non-dictionary value (any type, including an
     // unresolved reference) falls out of `as_dictionary()` as `None`,
-    // matching the prior explicit `Object::Dictionary`/`Object::Reference`/
-    // catch-all arms.
+    // matching the prior explicit dictionary/reference/catch-all arms.
     let encrypt_handle = pdf.trailer_key_handle(b"Encrypt");
     pdf.resolve(&encrypt_handle)?;
     let encrypt_dict = encrypt_handle.as_dictionary();
