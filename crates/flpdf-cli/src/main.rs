@@ -64,7 +64,9 @@ impl Write for PipelineWriter {
 #[derive(Debug, Clone)]
 struct WriterOptions {
     object_streams: ObjectStreamMode,
-    compress_streams: CompressStreams,
+    /// Explicit `--compress-streams` value; `None` preserves qpdf's default
+    /// without overriding an explicitly selected stream-data mode.
+    compress_streams: Option<CompressStreams>,
     content_normalization: bool,
     content_normalization_set: bool,
     qdf: bool,
@@ -89,7 +91,7 @@ impl Default for WriterOptions {
     fn default() -> Self {
         Self {
             object_streams: ObjectStreamMode::Preserve,
-            compress_streams: CompressStreams::Yes,
+            compress_streams: None,
             content_normalization: false,
             content_normalization_set: false,
             qdf: false,
@@ -117,9 +119,11 @@ impl Default for WriterOptions {
 fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfiguration {
     let mut configuration = WriterConfiguration::default();
     configuration.set_object_stream_mode(options.object_streams);
-    configuration.set_compress_streams(matches!(options.compress_streams, CompressStreams::Yes));
     if let Some(mode) = options.stream_data {
         configuration.set_stream_data_mode(mode);
+    }
+    if let Some(mode) = options.compress_streams {
+        configuration.set_compress_streams(matches!(mode, CompressStreams::Yes));
     }
     configuration.set_recompress_flate(options.recompress_flate);
     configuration.set_qdf_mode(options.qdf && !linearize);
@@ -1221,9 +1225,12 @@ struct RewriteCommand {
     /// `n`: decode each source stream and emit raw bytes without any filter.
     ///
     /// Only affects the full-rewrite path.
-    #[arg(long = "compress-streams", value_enum, default_value_t = CliYesNo::Yes,
-          help = "Compress output streams with FlateDecode (qpdf default: y)")]
-    compress_streams: CliYesNo,
+    #[arg(
+        long = "compress-streams",
+        value_enum,
+        help = "Compress output streams with FlateDecode (qpdf default: y)"
+    )]
+    compress_streams: Option<CliYesNo>,
 
     /// Normalize PDF content streams (qpdf --normalize-content=y|n).
     ///
@@ -1289,13 +1296,14 @@ struct RewriteCommand {
 
     /// Stream data mode (qpdf --stream-data={preserve,uncompress,compress}).
     ///
-    /// Higher-level policy that overrides --compress-streams when set.
+    /// Higher-level policy that sets stream decode behavior before an explicitly
+    /// supplied --compress-streams value, matching qpdf's writer setter order.
     /// - `preserve`: pass streams through verbatim — no decode or re-encode.
     /// - `uncompress`: decode streams and emit raw bytes (no /Filter).
     /// - `compress`: decode streams and re-encode with /FlateDecode.
     ///
     /// Default: not set (falls back to --compress-streams).
-    /// When both --stream-data and --compress-streams are supplied, --stream-data wins.
+    /// When both are supplied explicitly, --compress-streams wins.
     /// Only affects the full-rewrite path.
     #[arg(long = "stream-data", value_enum)]
     stream_data: Option<CliStreamDataMode>,
@@ -1879,8 +1887,8 @@ fn main() {
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
-                "y" => options.compress_streams = CompressStreams::Yes,
-                "n" => options.compress_streams = CompressStreams::No,
+                "y" => options.compress_streams = Some(CompressStreams::Yes),
+                "n" => options.compress_streams = Some(CompressStreams::No),
                 other => {
                     eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
                     std::process::exit(2);
@@ -1967,8 +1975,8 @@ fn main() {
         };
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
-                "y" => options.compress_streams = CompressStreams::Yes,
-                "n" => options.compress_streams = CompressStreams::No,
+                "y" => options.compress_streams = Some(CompressStreams::Yes),
+                "n" => options.compress_streams = Some(CompressStreams::No),
                 other => {
                     eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
                     std::process::exit(2);
@@ -2036,8 +2044,8 @@ fn main() {
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
-                "y" => options.compress_streams = CompressStreams::Yes,
-                "n" => options.compress_streams = CompressStreams::No,
+                "y" => options.compress_streams = Some(CompressStreams::Yes),
+                "n" => options.compress_streams = Some(CompressStreams::No),
                 other => {
                     eprintln!("flpdf: --compress-streams must be y or n, got: {:?}", other);
                     std::process::exit(2);
@@ -2505,10 +2513,10 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 // output preparation directly.
                 qdf: cmd.qdf,
                 object_streams: cmd.object_streams.into(),
-                compress_streams: match cmd.compress_streams {
+                compress_streams: cmd.compress_streams.map(|mode| match mode {
                     CliYesNo::Yes => CompressStreams::Yes,
                     CliYesNo::No => CompressStreams::No,
-                },
+                }),
                 newline_before_endstream: match cmd.newline_before_endstream {
                     CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
                     // qpdf treats `--newline-before-endstream=<value>` as the
