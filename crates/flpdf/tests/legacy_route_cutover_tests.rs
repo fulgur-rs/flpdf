@@ -84,6 +84,35 @@ fn acroform_top_level_field_uses_the_canonical_form_field_helper() {
 }
 
 #[test]
+fn acroform_field_prune_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/job/acroform_field_prune.rs");
+    let production = source
+        .split_once("mod tests {")
+        .expect("acroform_field_prune has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_to_terminal",
+        "Object::",
+        "set_object(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "acroform_field_prune production still contains the raw route marker {legacy:?}"
+        );
+    }
+    assert!(
+        production.contains("replace_key("),
+        "acroform_field_prune production must mutate ObjectHandle dictionaries"
+    );
+    assert!(
+        production.contains("mark_object_handle_dirty"),
+        "acroform_field_prune production must mark handle mutations dirty"
+    );
+}
+
+#[test]
 fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
     let source = include_str!("../src/page_form_xobject.rs");
     for legacy in [

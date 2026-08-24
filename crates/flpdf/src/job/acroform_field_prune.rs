@@ -66,7 +66,7 @@
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
@@ -149,38 +149,28 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     }
 
     // ── Step 3: locate and process /AcroForm ──────────────────────────────
-    let catalog_ref = match pdf.root_ref() {
-        Some(r) => r,
-        None => return Ok(()), // No catalog.
-    };
-
-    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-    let Some(catalog) = catalog_obj.as_dict() else {
+    // QPDFJob works from the live catalog handle and mutates its existing
+    // AcroForm graph in place (`QPDFJob.cc:2610-2632`).  Keep the same
+    // ObjectHandle identity throughout this operation; do not materialize a
+    // parallel raw dictionary snapshot.
+    let catalog = pdf.trailer().try_get_key(b"/Root")?;
+    pdf.resolve(&catalog)?;
+    if catalog.as_dictionary().is_none() {
         return Ok(());
-    };
+    }
 
     // /AcroForm may be a direct dict or an indirect reference.
-    let (acroform_ref, acroform_dict) = match catalog.get("AcroForm").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-            Object::Dictionary(d) => (Some(r), d.clone()),
-            _ => return Ok(()),
-        },
-        Some(Object::Dictionary(d)) => (None, d),
-        _ => return Ok(()), // No /AcroForm — nothing to do.
-    };
+    let acroform = catalog.try_get_key(b"/AcroForm")?;
+    pdf.resolve(&acroform)?;
+    if acroform.as_dictionary().is_none() {
+        return Ok(()); // No /AcroForm — nothing to do.
+    }
 
     // Resolve /Fields, handling the indirect-array form.
-    let fields_val = match acroform_dict.get("Fields").cloned() {
-        Some(v) => v,
-        None => return Ok(()), // /AcroForm with no /Fields.
-    };
-    let fields_arr: Vec<Object> = match fields_val {
-        Object::Array(arr) => arr,
-        Object::Reference(r) => match pdf.resolve_borrowed(r)? {
-            Object::Array(arr) => arr.clone(),
-            _ => return Ok(()),
-        },
-        _ => return Ok(()),
+    let fields = acroform.try_get_key(b"/Fields")?;
+    pdf.resolve(&fields)?;
+    let Some(fields_arr) = fields.as_array() else {
+        return Ok(()); // /Fields is missing or not an array.
     };
 
     // ── Step 4: for each top-level field, decide keep/drop ────────────────
@@ -188,17 +178,18 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // least one widget in `widget_to_page` (i.e. a widget on a retained page).
     // Matching qpdf: we do NOT prune /Kids of kept fields — the retained-page
     // test is purely a keep-or-drop decision at the /Fields list level.
-    let mut kept_fields: Vec<Object> = Vec::new();
+    let mut kept_fields = Vec::new();
 
-    for field_val in &fields_arr {
-        let field_ref = match field_val {
-            Object::Reference(r) => *r,
-            _ => continue, // Non-reference entry in /Fields; skip.
-        };
+    for field in fields_arr {
+        if field.object_ref().is_none() {
+            // qpdf's AcroForm traversal ignores direct field entries
+            // (`QPDFAcroFormDocumentHelper.cc:289-308`).
+            continue;
+        }
 
         let has_widget = field_has_retained_widget(
             pdf,
-            field_ref,
+            field.object_ref().expect("field entries are indirect"),
             &widget_to_page,
             &mut BTreeSet::new(),
             0,
@@ -206,7 +197,7 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
         )?;
 
         if has_widget {
-            kept_fields.push(Object::Reference(field_ref));
+            kept_fields.push(field);
         }
     }
 
@@ -229,11 +220,8 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     // Collect all widgets reachable from kept fields; strip /P from any that
     // are NOT in widget_to_page (i.e. live in a kept field's /Kids but were on
     // a dropped page).
-    for field_val in &kept_fields {
-        let field_ref = match field_val {
-            Object::Reference(r) => *r,
-            _ => continue,
-        };
+    for field in &kept_fields {
+        let field_ref = field.object_ref().expect("kept field entries are indirect");
         strip_dropped_widget_p_refs(
             pdf,
             field_ref,
@@ -248,31 +236,20 @@ pub fn prune_acroform_after_subset_with_max_depth<R: Read + Seek>(
     if kept_fields.is_empty() {
         // All fields dropped → remove /AcroForm from catalog entirely,
         // matching qpdf's observed behaviour.
-        let catalog_obj2 = pdf.resolve_borrowed(catalog_ref)?;
-        if let Some(mut cat) = catalog_obj2.as_dict().cloned() {
-            cat.remove("AcroForm");
-            pdf.set_object(catalog_ref, Object::Dictionary(cat));
-        }
+        catalog.remove_key(b"/AcroForm");
+        pdf.mark_object_handle_dirty(&catalog)?;
     } else {
-        // Update /Fields on the AcroForm dict.
-        let mut new_acroform = acroform_dict;
-        new_acroform.insert("Fields", Object::Array(kept_fields));
-
-        match acroform_ref {
-            Some(r) => {
-                // /AcroForm was an indirect object — update it in place.
-                pdf.set_object(r, Object::Dictionary(new_acroform));
-            }
-            None => {
-                // /AcroForm was a direct dictionary on the catalog — write it
-                // back into the catalog.
-                let catalog_obj2 = pdf.resolve_borrowed(catalog_ref)?;
-                if let Some(mut cat) = catalog_obj2.as_dict().cloned() {
-                    cat.insert("AcroForm", Object::Dictionary(new_acroform));
-                    pdf.set_object(catalog_ref, Object::Dictionary(cat));
-                }
-            }
-        }
+        // qpdf creates a fresh array for an indirect /Fields holder and
+        // replaces the key on the live AcroForm handle. A direct holder
+        // remains direct (`QPDFJob.cc:2620-2631`).
+        let replacement = ObjectHandle::array(kept_fields);
+        let replacement = if fields.is_indirect() {
+            pdf.make_indirect_object_handle(replacement)?
+        } else {
+            replacement
+        };
+        acroform.replace_key(b"/Fields", replacement)?;
+        pdf.mark_object_handle_dirty(&acroform)?;
     }
 
     // Step 6 changes both the AcroForm field tree and widget page links.
@@ -306,17 +283,6 @@ fn collect_page_widgets<R: Read + Seek>(
         page.get_annotations_filtered(Some(b"/Widget"))?
     };
     for widget in widgets {
-        // qpdf-deviation: chases flpdf's temporary Pdf::set_object
-        // bare-reference bridge (ObjectValue::Reference) to its terminal
-        // value; qpdf's resolved object graph has no reference-value type
-        // at all (QPDF::resolve, QPDF.cc:1699-1753, never returns a value
-        // that is itself another reference, and QPDF::replaceObject
-        // rejects an indirect handle, QPDF.cc:1980-1991), and
-        // QPDFAcroFormDocumentHelper::traverseField / QPDFJob.cc's field
-        // walk use plain one-hop getKey/getObjGen with no chase loop. Every
-        // other resolve_to_terminal call in this file is the
-        // same deviation and is marked individually at its own site.
-        let widget = pdf.resolve_to_terminal(&widget)?;
         // First-occurrence rule: don't overwrite if already present from a
         // duplicate-page selection (ref_map iteration is in BTreeMap order,
         // first occurrence is recorded first).
@@ -356,9 +322,7 @@ fn field_has_retained_widget<R: Read + Seek>(
     }
 
     let field = pdf.get_object_handle(field_ref);
-    // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
-    // see collect_page_widgets's marker for the full citation.
-    let field = pdf.resolve_to_terminal(&field)?;
+    pdf.resolve(&field)?;
 
     // A merged field+widget dict is its own widget.
     if widget_to_page.contains_key(&field.identity_key()) {
@@ -366,17 +330,14 @@ fn field_has_retained_widget<R: Read + Seek>(
     }
 
     // Walk /Kids: entries may be sub-fields (have /T) or pure widgets.
-    // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
-    // see collect_page_widgets's marker for the full citation.
-    let kids = pdf.resolve_to_terminal(&field.try_get_key(b"/Kids")?)?;
+    let kids = field.try_get_key(b"/Kids")?;
+    pdf.resolve(&kids)?;
     let Some(kids_arr) = kids.as_array() else {
         return Ok(false);
     };
 
     for kid in kids_arr {
-        // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
-        // bridge; see collect_page_widgets's marker for the full citation.
-        let kid = pdf.resolve_to_terminal(&kid)?;
+        pdf.resolve(&kid)?;
         // qpdf's field-tree traversal ignores direct field/kid entries. Only
         // indirect kids can participate in `/Fields` association; direct
         // page annotations are already collected by `collect_page_widgets`.
@@ -406,7 +367,7 @@ fn field_has_retained_widget<R: Read + Seek>(
 /// replaces every genuinely removed original page-tree leaf with `null` in
 /// place (`null_removed_pages`, page-driven, independent of how it is
 /// referenced) — so a `/P` pointing at a removed page already resolves to
-/// `Object::Null` by the time this runs there. This function is also a public
+/// a null object by the time this runs there. This function is also a public
 /// API entry point that a caller may invoke directly after
 /// [`crate::pages::tree_rebuild::rebuild_page_tree`] without that null-out
 /// step, so `removed_pages` (the same original-leaf drop set the null-out
@@ -423,6 +384,7 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
     retained_page_refs: &BTreeSet<ObjectRef>,
     removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
+    pdf.resolve(widget)?;
     if widget.as_dictionary().is_none() || !widget.try_has_key(b"/P")? {
         return Ok(());
     }
@@ -438,10 +400,8 @@ fn remove_stale_widget_page_ref<R: Read + Seek>(
         pdf.mark_object_handle_dirty(widget)?;
         return Ok(());
     }
-    // qpdf-deviation: chases flpdf's temporary Pdf::set_object bare-reference
-    // bridge; see collect_page_widgets for the full qpdf source citation.
-    let existing_page = pdf.resolve_to_terminal(&existing)?;
-    if !existing_page.is_null() {
+    pdf.resolve(&existing)?;
+    if !existing.is_null() {
         return Ok(());
     }
     widget.remove_key(b"/P");
@@ -475,11 +435,9 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     }
 
     let field = pdf.get_object_handle(field_ref);
-    // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference bridge;
-    // see collect_page_widgets's marker for the full citation.
-    let field = pdf.resolve_to_terminal(&field)?;
-    // qpdf-deviation: same bare-reference bridge chase as above.
-    let kids = pdf.resolve_to_terminal(&field.try_get_key(b"/Kids")?)?;
+    pdf.resolve(&field)?;
+    let kids = field.try_get_key(b"/Kids")?;
+    pdf.resolve(&kids)?;
     let Some(kids_arr) = kids.as_array() else {
         // Leaf node with no /Kids. Merged field+widget dicts that were
         // retained were already handled by remove_stale_widget_page_ref; dropped
@@ -488,17 +446,15 @@ fn strip_dropped_widget_p_refs<R: Read + Seek>(
     };
 
     for kid in kids_arr {
-        // qpdf-deviation: chases flpdf's Pdf::set_object bare-reference
-        // bridge; see collect_page_widgets's marker for the full citation.
-        let kid = pdf.resolve_to_terminal(&kid)?;
+        pdf.resolve(&kid)?;
         // qpdf ignores direct field-tree entries, so do not promote or mutate
         // a direct `/Kids` member here.
         let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
 
-        // qpdf-deviation: same bare-reference bridge chase as above.
-        let subtype = pdf.resolve_to_terminal(&kid.try_get_key(b"/Subtype")?)?;
+        let subtype = kid.try_get_key(b"/Subtype")?;
+        pdf.resolve(&subtype)?;
         let is_widget = subtype.as_name().as_deref() == Some(b"Widget".as_slice());
 
         if is_widget {
@@ -607,7 +563,7 @@ mod tests {
             ),
             (3, b"<< /Type /Page /Parent 2 0 R /Annots [6 0 R] >>"),
             (4, b"<< /Type /Page /Parent 2 0 R >>"),
-            (5, b"<< /Fields [6 0 R] /DA (/Helvetica 12 Tf 0 g) >>"),
+            (5, b"<< /Fields [<< /FT /Tx /T (DirectTop) /Kids [] >> 6 0 R] /DA (/Helvetica 12 Tf 0 g) >>"),
             (
                 6,
                 b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (FieldA) \
@@ -689,32 +645,34 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
     }
 
-    fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
-        match pdf.resolve_borrowed(r).unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            other => panic!("{r} is not a dictionary: {other:?}"),
-        }
+    fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> BTreeMap<Vec<u8>, ObjectHandle> {
+        let handle = pdf.get_object_handle(r);
+        pdf.resolve(&handle).unwrap();
+        handle
+            .as_dictionary()
+            .unwrap_or_else(|| panic!("{r} is not a dictionary: {handle:?}"))
+    }
+
+    fn reference_target(value: &ObjectHandle) -> Option<ObjectRef> {
+        value.object_ref().or_else(|| value.as_reference())
     }
 
     fn acroform_fields(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<ObjectRef> {
-        let cat_ref = pdf.root_ref().expect("root");
-        let cat = dict_of(pdf, cat_ref);
-        let acro_val = match cat.get("AcroForm").cloned() {
-            None => return vec![],
-            Some(v) => v,
-        };
-        let acro_dict = match acro_val {
-            Object::Dictionary(d) => d,
-            Object::Reference(r) => match pdf.resolve_borrowed(r).unwrap() {
-                Object::Dictionary(d) => d.clone(),
-                _ => return vec![],
-            },
-            _ => return vec![],
-        };
-        match acro_dict.get("Fields").cloned() {
-            Some(Object::Array(arr)) => arr.iter().filter_map(Object::as_ref_id).collect(),
-            _ => vec![],
+        let catalog = pdf.trailer().try_get_key(b"/Root").unwrap();
+        pdf.resolve(&catalog).unwrap();
+        let acroform = catalog.try_get_key(b"/AcroForm").unwrap();
+        pdf.resolve(&acroform).unwrap();
+        if acroform.as_dictionary().is_none() {
+            return vec![];
         }
+        let fields = acroform.try_get_key(b"/Fields").unwrap();
+        pdf.resolve(&fields).unwrap();
+        fields
+            .as_array()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|field| field.object_ref())
+            .collect()
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────
@@ -726,6 +684,7 @@ mod tests {
         let pages = page_refs(&mut pdf).unwrap();
         let result = rebuild_page_tree(&mut pdf, &pages).unwrap();
         assert!(prune_acroform_after_subset(&mut pdf, &result).is_ok());
+        assert!(acroform_fields(&mut pdf).is_empty());
     }
 
     // `direct_page_widget_removes_dropped_page_ref` and
@@ -766,46 +725,9 @@ mod tests {
 
         let widget_dict = dict_of(&mut pdf, ObjectRef::new(7, 0));
         assert_eq!(
-            widget_dict.get("P"),
-            Some(&Object::Reference(ObjectRef::new(3, 0))),
+            widget_dict.get(b"/P".as_slice()).and_then(reference_target),
+            Some(ObjectRef::new(3, 0)),
             "an indirect widget already owned by a retained page must keep /P"
-        );
-    }
-
-    #[test]
-    fn indirect_widget_with_nulled_page_ref_has_p_removed() {
-        // `try_has_key` already treats a `/P` value that resolves to null in
-        // a *single* hop as absent (matching qpdf's `QPDF_Dictionary::hasKey`
-        // null-suppression), so this function's removal branch is reached
-        // only through the flpdf-only `Pdf::set_object` bare-reference
-        // bridge this file already documents (`collect_page_widgets`'s qpdf
-        // source citation): an indirect object whose own resolved value is
-        // itself another reference. Build that exact two-hop shape --
-        // widget 11's `/P` retargeted to a bridge object that redirects to
-        // the (now nulled) dropped page 5 -- so `try_has_key` sees a
-        // non-null direct child (the bridge) while
-        // `resolve_to_terminal` chases through to null.
-        let mut pdf = open(build_acroform_pdf());
-        pdf.set_object(ObjectRef::new(5, 0), Object::Null);
-        pdf.set_object(
-            ObjectRef::new(99, 0),
-            Object::Reference(ObjectRef::new(5, 0)),
-        );
-        let raw_widget = pdf.get_object_handle(ObjectRef::new(11, 0));
-        let widget = pdf.resolve_to_terminal(&raw_widget).unwrap();
-        let bridge = pdf.get_object_handle(ObjectRef::new(99, 0));
-        widget.replace_key(b"/P", bridge).unwrap();
-        pdf.mark_object_handle_dirty(&widget).unwrap();
-        let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
-
-        remove_stale_widget_page_ref(&mut pdf, &widget, &retained, &BTreeSet::new()).unwrap();
-
-        let widget_dict = dict_of(&mut pdf, ObjectRef::new(11, 0));
-        assert_eq!(
-            widget_dict.get("P"),
-            None,
-            "an indirect widget whose /P resolves to null through the \
-             flpdf-only redirect bridge must lose the key"
         );
     }
 
@@ -819,17 +741,16 @@ mod tests {
         // it is reported via `removed_pages`. The removal must not depend on
         // the target's null state to match qpdf's actual removal set.
         let mut pdf = open(build_acroform_pdf());
-        let raw_widget = pdf.get_object_handle(ObjectRef::new(11, 0));
-        let widget = pdf.resolve_to_terminal(&raw_widget).unwrap();
+        let widget = pdf.get_object_handle(ObjectRef::new(11, 0));
+        pdf.resolve(&widget).unwrap();
         let retained = BTreeSet::from([ObjectRef::new(3, 0), ObjectRef::new(4, 0)]);
         let removed_pages = BTreeSet::from([ObjectRef::new(5, 0)]);
 
         remove_stale_widget_page_ref(&mut pdf, &widget, &retained, &removed_pages).unwrap();
 
         let widget_dict = dict_of(&mut pdf, ObjectRef::new(11, 0));
-        assert_eq!(
-            widget_dict.get("P"),
-            None,
+        assert!(
+            !widget_dict.contains_key(b"/P".as_slice()),
             "a widget /P pointing at a page reported as removed must lose \
              the key even when the target has not been nulled yet"
         );
@@ -838,16 +759,19 @@ mod tests {
     #[test]
     fn widget_non_reference_page_value_is_preserved() {
         let mut pdf = open(build_acroform_pdf());
-        let mut widget = dict_of(&mut pdf, ObjectRef::new(7, 0));
-        widget.insert("P", Object::Integer(7));
-        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(widget));
+        let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve(&widget).unwrap();
+        widget.replace_key(b"/P", ObjectHandle::integer(7)).unwrap();
+        pdf.mark_object_handle_dirty(&widget).unwrap();
 
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
 
         assert_eq!(
-            dict_of(&mut pdf, ObjectRef::new(7, 0)).get("P"),
-            Some(&Object::Integer(7)),
+            dict_of(&mut pdf, ObjectRef::new(7, 0))
+                .get(b"/P".as_slice())
+                .and_then(ObjectHandle::as_integer),
+            Some(7),
             "qpdf writer does not infer page ownership from a non-reference /P value"
         );
     }
@@ -855,16 +779,20 @@ mod tests {
     #[test]
     fn widget_non_page_reference_is_preserved() {
         let mut pdf = open(build_acroform_pdf());
-        let mut widget = dict_of(&mut pdf, ObjectRef::new(7, 0));
-        widget.insert("P", Object::Reference(ObjectRef::new(6, 0)));
-        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(widget));
+        let widget = pdf.get_object_handle(ObjectRef::new(7, 0));
+        pdf.resolve(&widget).unwrap();
+        let non_page_ref = pdf.get_object_handle(ObjectRef::new(6, 0));
+        widget.replace_key(b"/P", non_page_ref).unwrap();
+        pdf.mark_object_handle_dirty(&widget).unwrap();
 
         let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
 
         assert_eq!(
-            dict_of(&mut pdf, ObjectRef::new(7, 0)).get("P"),
-            Some(&Object::Reference(ObjectRef::new(6, 0))),
+            dict_of(&mut pdf, ObjectRef::new(7, 0))
+                .get(b"/P".as_slice())
+                .and_then(reference_target),
+            Some(ObjectRef::new(6, 0)),
             "qpdf does not rewrite a non-page /P target through an owner heuristic"
         );
     }
@@ -877,7 +805,7 @@ mod tests {
 
         let catalog = dict_of(&mut pdf, ObjectRef::new(1, 0));
         assert!(
-            catalog.get("AcroForm").is_none(),
+            !catalog.contains_key(b"/AcroForm".as_slice()),
             "direct field-tree kid must not keep its parent field"
         );
     }
@@ -944,11 +872,10 @@ mod tests {
         // Pre-condition: strip /P from FieldA (7) and B1 (9) to confirm the
         // update is driven by our code, not just a pre-existing correct value.
         for &r in &[ObjectRef::new(7, 0), ObjectRef::new(9, 0)] {
-            let Object::Dictionary(mut d) = pdf.resolve_object(r).unwrap() else {
-                panic!("expected dict for {r}");
-            };
-            d.remove("P");
-            pdf.set_object(r, Object::Dictionary(d));
+            let widget = pdf.get_object_handle(r);
+            pdf.resolve(&widget).unwrap();
+            widget.remove_key(b"/P");
+            pdf.mark_object_handle_dirty(&widget).unwrap();
         }
 
         // Extract pages 1 and 2 (objects 3 and 4).
@@ -958,11 +885,17 @@ mod tests {
 
         // FieldA (7): the absent /P must remain absent.
         let field_a = dict_of(&mut pdf, ObjectRef::new(7, 0));
-        assert_eq!(field_a.get("P"), None, "FieldA /P must not be synthesized");
+        assert!(
+            !field_a.contains_key(b"/P".as_slice()),
+            "FieldA /P must not be synthesized"
+        );
 
         // B1 (9): the absent /P must remain absent.
         let b1 = dict_of(&mut pdf, ObjectRef::new(9, 0));
-        assert_eq!(b1.get("P"), None, "B1 /P must not be synthesized");
+        assert!(
+            !b1.contains_key(b"/P".as_slice()),
+            "B1 /P must not be synthesized"
+        );
     }
 
     /// Dropped-page widget in a kept field's /Kids must have /P removed
@@ -979,9 +912,8 @@ mod tests {
 
         let b2 = dict_of(&mut pdf, ObjectRef::new(10, 0));
         assert!(
-            b2.get("P").is_none(),
-            "B2 (dropped page) /P should be removed; got {:?}",
-            b2.get("P")
+            !b2.contains_key(b"/P".as_slice()),
+            "B2 (dropped page) /P should be removed"
         );
     }
 
@@ -1016,10 +948,13 @@ mod tests {
         let fields = acroform_fields(&mut pdf);
         assert_eq!(fields, vec![ObjectRef::new(8, 0)]);
         let b1 = dict_of(&mut pdf, ObjectRef::new(9, 0));
-        assert_eq!(b1.get("P"), Some(&Object::Reference(ObjectRef::new(3, 0))));
+        assert_eq!(
+            b1.get(b"/P".as_slice()).and_then(reference_target),
+            Some(ObjectRef::new(3, 0))
+        );
         let b2 = dict_of(&mut pdf, ObjectRef::new(10, 0));
         assert!(
-            b2.get("P").is_none(),
+            !b2.contains_key(b"/P".as_slice()),
             "dropped-page widget /P must be stripped"
         );
     }
@@ -1033,10 +968,9 @@ mod tests {
         let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
 
-        let cat_ref = pdf.root_ref().unwrap();
-        let cat = dict_of(&mut pdf, cat_ref);
+        let cat = dict_of(&mut pdf, ObjectRef::new(1, 0));
         assert!(
-            cat.get("AcroForm").is_none(),
+            !cat.contains_key(b"/AcroForm".as_slice()),
             "/AcroForm should be removed from catalog when /Fields is empty"
         );
     }
@@ -1118,19 +1052,24 @@ mod tests {
 
         // FieldB's /Kids should still contain both B1 and B2 (qpdf does not prune).
         let field_b = dict_of(&mut pdf, ObjectRef::new(8, 0));
-        match field_b.get("Kids") {
-            Some(Object::Array(kids)) => {
+        match field_b
+            .get(b"/Kids".as_slice())
+            .and_then(ObjectHandle::as_array)
+        {
+            Some(kids) => {
                 assert_eq!(
                     kids.len(),
                     2,
                     "FieldB /Kids should still have 2 entries (not pruned)"
                 );
                 assert!(
-                    kids.contains(&Object::Reference(ObjectRef::new(9, 0))),
+                    kids.iter()
+                        .any(|kid| kid.object_ref() == Some(ObjectRef::new(9, 0))),
                     "B1 should remain in /Kids"
                 );
                 assert!(
-                    kids.contains(&Object::Reference(ObjectRef::new(10, 0))),
+                    kids.iter()
+                        .any(|kid| kid.object_ref() == Some(ObjectRef::new(10, 0))),
                     "B2 should remain in /Kids (qpdf-compatible: no /Kids pruning)"
                 );
             }
