@@ -1981,6 +1981,73 @@ fn writer_catalog_copy<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(ObjectRef, O
     Ok((root_ref, catalog))
 }
 
+/// Capture the output-only `/Extensions` value and dirty state of the live
+/// Catalog before a specialized writer mutates it for emission.
+///
+/// qpdf's writer may replace `/Extensions /ADBE` while preparing an output
+/// object, but the canonical flpdf `PdfWriter` keeps the source `Pdf` attached
+/// to the caller. Preserve permanent graph preparation while restoring only
+/// this output-only Catalog key after linearization.
+pub(crate) struct CatalogExtensionsSnapshot {
+    root_ref: ObjectRef,
+    extensions: Option<ObjectHandle>,
+    was_dirty: bool,
+}
+
+/// Snapshot the live Catalog's output-only extension state.
+pub(crate) fn snapshot_catalog_extensions<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> Result<Option<CatalogExtensionsSnapshot>> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(None); // cov:ignore: linearization planning rejects a missing /Root first
+    };
+    let was_dirty = pdf.is_dirty(root_ref);
+    let catalog = pdf.get_object_handle(root_ref);
+    pdf.resolve(&catalog)?;
+    let extensions = if catalog.try_has_key(b"/Extensions")? {
+        Some(catalog.try_get_key(b"/Extensions")?)
+    } else {
+        None
+    };
+    Ok(Some(CatalogExtensionsSnapshot {
+        root_ref,
+        extensions,
+        was_dirty,
+    }))
+}
+
+/// Restore a previously captured output-only Catalog extension state.
+pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    snapshot: Option<CatalogExtensionsSnapshot>,
+) -> Result<()> {
+    let Some(snapshot) = snapshot else {
+        return Ok(()); // cov:ignore: snapshot is always Some after valid linearization planning
+    };
+    let (_, catalog) = writer_catalog_copy(pdf)?;
+    let current_extensions = if catalog.try_has_key(b"/Extensions")? {
+        Some(catalog.try_get_key(b"/Extensions")?)
+    } else {
+        None
+    };
+    let extensions_changed = match (&snapshot.extensions, &current_extensions) {
+        (None, None) => false,
+        (Some(before), Some(after)) => before.unparse() != after.unparse(),
+        _ => true,
+    };
+    if extensions_changed || (!snapshot.was_dirty && pdf.is_dirty(snapshot.root_ref)) {
+        match snapshot.extensions {
+            Some(extensions) => catalog.replace_key(b"/Extensions", extensions)?,
+            None => catalog.remove_key(b"/Extensions"),
+        }
+        pdf.set_object_handle(snapshot.root_ref, catalog)?;
+    }
+    if !snapshot.was_dirty {
+        pdf.clear_dirty(snapshot.root_ref);
+    }
+    Ok(())
+}
+
 /// Detect whether the destination Catalog carries `/Extensions /ADBE` in any
 /// form (dict-valued or via indirect reference; regardless of `/ExtensionLevel`
 /// presence or value).
@@ -9454,6 +9521,148 @@ mod tests {
         assert!(
             pdf.is_dirty(root_ref),
             "pre-existing Root dirty flag must survive the full-rewrite restore"
+        );
+    }
+
+    #[test]
+    fn linearized_pdf_writer_restores_output_only_catalog_state() {
+        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        assert_eq!(pdf.adobe_extension_level(), None);
+        assert!(!pdf.is_dirty(root_ref), "fixture Catalog must start clean");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("linearized write");
+        let first = writer.get_buffer().expect("linearized buffer");
+        drop(writer);
+
+        assert_eq!(
+            pdf.adobe_extension_level(),
+            None,
+            "output-only /ADBE injection must not leak into the source Catalog"
+        );
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "output-only Catalog mutation must not leave the source Catalog dirty"
+        );
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("repeated linearized write");
+        let second = writer.get_buffer().expect("repeated linearized buffer");
+
+        assert_eq!(first, second, "repeated linearized writes must be stable");
+        let mut output = crate::Pdf::open_mem_owned(first).expect("output must reopen");
+        assert_eq!(
+            output.adobe_extension_level(),
+            Some(8),
+            "the linearized output must retain the requested extension"
+        );
+    }
+
+    #[test]
+    fn linearized_pdf_writer_preserves_preexisting_catalog_dirty_state() {
+        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        let catalog = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+        assert!(
+            pdf.is_dirty(root_ref),
+            "test must start with a dirty Catalog"
+        );
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("linearized write");
+        let _ = writer.get_buffer().expect("linearized buffer");
+        drop(writer);
+
+        assert_eq!(pdf.adobe_extension_level(), None);
+        assert!(
+            pdf.is_dirty(root_ref),
+            "pre-existing Catalog dirtiness must survive the restore"
+        );
+    }
+
+    #[test]
+    fn linearized_pdf_writer_restores_an_existing_extensions_dictionary() {
+        let source =
+            include_bytes!("../../../tests/fixtures/compat/one-page-stale-adbe-no-ext-vendor.pdf")
+                .to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        assert_eq!(pdf.adobe_extension_level(), None);
+        assert!(!pdf.is_dirty(root_ref), "fixture Catalog must start clean");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("linearized write");
+        let _ = writer.get_buffer().expect("linearized buffer");
+        drop(writer);
+
+        assert_eq!(pdf.adobe_extension_level(), None);
+        let catalog = pdf.resolve_object(root_ref).expect("Catalog must resolve");
+        let extensions = catalog
+            .as_dict()
+            .and_then(|dict| dict.get("Extensions"))
+            .and_then(Object::as_dict)
+            .expect("source Extensions dictionary must survive");
+        assert!(
+            extensions.get("XYZW").is_some(),
+            "non-ADBE developer extension must survive the restore"
+        );
+        assert!(
+            extensions.get("ADBE").is_some(),
+            "the source's malformed ADBE entry must survive the restore"
+        );
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "restoring an output-only extension must restore Catalog dirtiness"
+        );
+    }
+
+    #[test]
+    fn linearized_pdf_writer_restores_catalog_state_after_write_error() {
+        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        let tempdir = tempfile::tempdir().expect("temporary directory");
+        let pass1_path = tempdir.path().join("missing-parent").join("pass1.pdf");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_linearization_pass1_filename(pass1_path);
+        writer.set_minimum_pdf_version("1.7", 8);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        assert!(writer.write().is_err(), "missing pass-1 parent must fail");
+        drop(writer);
+
+        assert_eq!(
+            pdf.adobe_extension_level(),
+            None,
+            "failed output-only /ADBE injection must not leak into the source Catalog"
+        );
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "failed output-only Catalog mutation must restore the source dirty flag"
         );
     }
 
