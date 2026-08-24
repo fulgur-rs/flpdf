@@ -16,7 +16,7 @@ use crate::json_inspect::{
 };
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PlOStream, PlStdioFile};
-use crate::Pdf;
+use crate::{Pdf, UsageError};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
@@ -221,23 +221,6 @@ pub enum JsonJobOutput<'a> {
     },
 }
 
-/// A qpdf `QPDFUsage`-class error: an invalid command-line argument or
-/// combination of options, reported before any file is touched.
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-pub struct UsageError {
-    message: String,
-}
-
-impl UsageError {
-    /// Construct a usage error with the given message.
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
 /// Failure while resolving command-level JSON options or writing JSON output.
 #[derive(Debug, thiserror::Error)]
 pub enum JsonJobError {
@@ -282,10 +265,7 @@ pub fn write_json<R: Read + Seek>(
             }
         }
         (JsonStreamData::File, None, JsonJobOutput::Stdout(_)) => {
-            return Err(UsageError {
-                message: MISSING_STREAM_PREFIX.to_owned(),
-            }
-            .into());
+            return Err(UsageError::new(MISSING_STREAM_PREFIX).into());
         }
     };
 

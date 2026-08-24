@@ -91,6 +91,15 @@ fn logger_with_info_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
+fn logger_with_error_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
+    let logger = QPDFLogger::create();
+    let state = Arc::new(Mutex::new(SinkState::default()));
+    logger.set_error(Some(PipelineHandle::new(RecordingSink {
+        state: Arc::clone(&state),
+    })));
+    (logger, state)
+}
+
 fn xref_stream_with_extra_data() -> Vec<u8> {
     let mut bytes = b"%PDF-1.5\n".to_vec();
     let xref_offset = bytes.len();
@@ -234,7 +243,12 @@ fn json_job_partial_initialization_defers_missing_output_to_run() {
     let mut job = QPDFJob::new();
 
     job.initialize_from_json_partial(&json).unwrap();
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job.run().unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "an output file name is required; use - for standard output"
+    ));
 }
 
 #[test]
@@ -338,11 +352,56 @@ fn json_job_rejects_same_input_output_before_truncating_a_hard_link() {
     })
     .to_string();
 
-    let mut job = QPDFJob::new();
-    job.initialize_from_json(&json).unwrap();
+    let mut full_job = QPDFJob::new();
+    let error = full_job.initialize_from_json(&json).unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string()
+                == "input file and output file are the same; use --replace-input to intentionally overwrite the input"
+    ));
 
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let mut job = QPDFJob::new();
+    job.initialize_from_json_partial(&json).unwrap();
+
+    let error = match job.create_qpdf() {
+        Err(error) => error,
+        Ok(_) => panic!("same-file configuration must fail before opening the input"),
+    };
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string()
+                == "input file and output file are the same; use --replace-input to intentionally overwrite the input"
+    ));
     assert_eq!(std::fs::read(&input).unwrap(), before);
+}
+
+#[test]
+fn create_qpdf_reports_an_ordinary_output_configuration_failure() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let (logger, error_state) = logger_with_error_sink();
+    logger.info(Vec::<u8>::new()).unwrap();
+
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": "-",
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json_partial(&json).unwrap();
+
+    assert!(job.create_qpdf().unwrap().is_none());
+    assert!(error_state
+        .lock()
+        .unwrap()
+        .bytes
+        .windows(b"QPDFLogger: called setSave on standard output after standard output has already been used".len())
+        .any(|window| {
+            window
+                == b"QPDFLogger: called setSave on standard output after standard output has already been used"
+        }));
 }
 
 #[test]
@@ -394,9 +453,19 @@ fn json_job_without_output_is_a_usage_error() {
     let json = serde_json::json!({"inputFile": input}).to_string();
     let mut job = QPDFJob::new();
 
-    assert!(job.initialize_from_json(&json).is_err());
+    let error = job.initialize_from_json(&json).unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "an output file name is required; use - for standard output"
+    ));
 
-    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    let error = job.run().unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage)
+            if usage.to_string() == "an output file name is required; use - for standard output"
+    ));
 }
 
 #[test]
@@ -514,28 +583,46 @@ fn unknown_qpdf_job_argv_is_a_usage_error() {
     let args = vec!["qpdfjob".to_owned(), "--not-a-qpdf-option".to_owned()];
     let mut job = QPDFJob::new();
 
-    assert!(job.initialize_from_argv(&args).is_err());
+    let error = job.initialize_from_argv(&args).unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage) if usage.to_string() == "unrecognized argument --not-a-qpdf-option"
+    ));
 }
 
 #[test]
 fn argv_usage_rejects_short_options_too_many_positionals_and_missing_input() {
     let mut job = QPDFJob::new();
-    assert!(job
+    let error = job
         .initialize_from_argv(&["qpdfjob".to_owned(), "-x".to_owned()])
-        .is_err());
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage) if usage.to_string() == "unrecognized argument -x"
+    ));
 
     let mut job = QPDFJob::new();
-    assert!(job
+    let error = job
         .initialize_from_argv(&[
             "qpdfjob".to_owned(),
             "a.pdf".to_owned(),
             "b.pdf".to_owned(),
             "c.pdf".to_owned(),
         ])
-        .is_err());
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage) if usage.to_string() == "unknown argument c.pdf"
+    ));
 
     let mut job = QPDFJob::new();
-    assert!(job.initialize_from_argv(&["qpdfjob".to_owned()]).is_err());
+    let error = job
+        .initialize_from_argv(&["qpdfjob".to_owned()])
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        Error::Usage(usage) if usage.to_string() == "an input file name is required"
+    ));
 }
 
 #[test]

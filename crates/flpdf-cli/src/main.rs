@@ -8,7 +8,7 @@ use flpdf::fix_qdf;
 use flpdf::job::{
     apply_rotate_to_pages, flatten_rotation_on_pages, AttachmentAddOptions, AttachmentCopyOptions,
     CheckError, JobExitCode, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData,
-    PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
+    PageSpecInput, QPDFJob, SplitPageOptions,
 };
 use flpdf::pipeline::PipelineHandle;
 use flpdf::qutil::same_file as qpdf_same_file;
@@ -31,10 +31,10 @@ use flpdf::{
         ShowLinearizationError,
     },
     normalize_content_stream, pages, parse_pdf_version, AcroFormDocumentHelper, CompressStreams,
-    CopyEncryptionSource, EncryptMethod, EncryptParams, NewlineBeforeEndstream, ObjectHandle,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper, PasswordMode,
-    Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
-    RemoveUnreferencedResources, StreamDataMode, WriterConfiguration,
+    CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
+    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
+    PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission,
+    QPDFLogger, RemoveUnreferencedResources, StreamDataMode, UsageError, WriterConfiguration,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -2059,12 +2059,22 @@ fn main() {
             }
             std::process::exit(exit_err.code.as_i32());
         }
-        if let Some(usage_error) = error.downcast_ref::<UsageError>() {
+        if let Some(usage_error) = find_usage_error(error.as_ref()) {
             usage_exit(usage_error);
         }
         emit_logger_error(format!("{}: {error}\n", progname()));
         std::process::exit(2);
     }
+}
+
+fn find_usage_error<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a UsageError> {
+    if let Some(usage_error) = error.downcast_ref::<UsageError>() {
+        return Some(usage_error);
+    }
+    if let Some(Error::Usage(usage_error)) = error.downcast_ref::<Error>() {
+        return Some(usage_error);
+    }
+    error.source().and_then(find_usage_error)
 }
 
 fn usage_exit(error: &UsageError) -> ! {
