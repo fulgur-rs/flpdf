@@ -682,15 +682,13 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
         } else {
             return Ok(None);
         };
-        let bbox = self
-            .pdf
-            .resolve_to_terminal(&form_dict.try_get_key(b"/BBox")?)?;
+        let bbox = form_dict.try_get_key(b"/BBox")?;
+        self.pdf.resolve(&bbox)?;
         let Some(bbox) = rectangle_from_handle(self.pdf, &bbox)? else {
             return Ok(None);
         };
-        let form_matrix = self
-            .pdf
-            .resolve_to_terminal(&form_dict.try_get_key(b"/Matrix")?)?;
+        let form_matrix = form_dict.try_get_key(b"/Matrix")?;
+        self.pdf.resolve(&form_matrix)?;
         let form_matrix = matrix_from_handle(self.pdf, &form_matrix)?.unwrap_or_default();
         let transform = if invert_transformations {
             self.get_matrix_for_transformations(true)?
