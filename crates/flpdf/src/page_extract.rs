@@ -384,6 +384,25 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dict_returns_a_live_dictionary_handle() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+                (3, "<< /Marker 7 >>"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let handle = resolve_dict(&mut pdf, ObjectRef::new(3, 0), "not a dict")
+            .expect("dictionary resolves through the canonical handle route");
+        assert_eq!(
+            handle.try_get_key(b"/Marker").unwrap().as_integer(),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn target_pages_root_errors_when_pages_is_not_a_reference() {
         // /Pages is an inline dictionary (a direct object), not an indirect
         // reference, so target_pages_root cannot extract a root ref.
