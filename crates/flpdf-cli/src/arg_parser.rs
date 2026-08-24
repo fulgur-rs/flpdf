@@ -222,9 +222,7 @@ impl ArgParser {
     fn canonical_top_level_option(&self, arg: String) -> String {
         if let Some(rest) = arg.strip_prefix("--") {
             let name = rest.split('=').next().unwrap_or(rest);
-            if self.bare_long_options.contains(name)
-                && should_discard_bare_value(name, &arg)
-            {
+            if self.bare_long_options.contains(name) && should_discard_bare_value(name, &arg) {
                 return format!("--{name}");
             }
             return arg;
@@ -312,8 +310,7 @@ mod tests {
 
     #[test]
     fn parser_returns_canonical_residual_args_and_raw_segments() {
-        let command = clap::Command::new("flpdf")
-            .arg(clap::Arg::new("qdf").long("qdf"));
+        let command = clap::Command::new("flpdf").arg(clap::Arg::new("qdf").long("qdf"));
         let parsed = ArgParser::from_command(command)
             .parse(vec!["flpdf".into(), "-qdf".into(), "input.pdf".into()])
             .expect("qpdf argv should parse");
@@ -346,8 +343,11 @@ mod tests {
 
     #[test]
     fn parser_discards_attached_value_for_bare_option() {
-        let command = clap::Command::new("flpdf")
-            .arg(clap::Arg::new("check").long("check").action(clap::ArgAction::SetTrue));
+        let command = clap::Command::new("flpdf").arg(
+            clap::Arg::new("check")
+                .long("check")
+                .action(clap::ArgAction::SetTrue),
+        );
         let parsed = ArgParser::from_command(command)
             .parse(vec!["flpdf".into(), "--check=ignored".into()])
             .expect("bare option should accept qpdf's attached value form");
@@ -357,8 +357,7 @@ mod tests {
 
     #[test]
     fn parser_captures_pages_segment_and_resumes_after_terminator() {
-        let command = clap::Command::new("flpdf")
-            .arg(clap::Arg::new("qdf").long("qdf"));
+        let command = clap::Command::new("flpdf").arg(clap::Arg::new("qdf").long("qdf"));
         let parsed = ArgParser::from_command(command)
             .parse(vec![
                 "flpdf".into(),
@@ -390,9 +389,6 @@ mod tests {
             ])
             .expect("overlay segment should parse");
 
-        assert_eq!(
-            parsed.named_segments[0].tokens,
-            ["source.pdf", "--to=1"]
-        );
+        assert_eq!(parsed.named_segments[0].tokens, ["source.pdf", "--to=1"]);
     }
 }

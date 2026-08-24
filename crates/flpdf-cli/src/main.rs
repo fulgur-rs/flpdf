@@ -1615,9 +1615,7 @@ fn warn_if_static_id(args: &Cli) {
     );
 }
 
-fn preprocess_qpdf_args(
-    args: Vec<String>,
-) -> CliResult<(Vec<String>, Vec<OverlaySpec>, Vec<Vec<String>>)> {
+fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
     let parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(args)?;
     let mut overlay_specs = Vec::new();
     let mut attachment_segments = Vec::new();
@@ -1637,11 +1635,11 @@ fn preprocess_qpdf_args(
         }
     }
 
-    Ok((
-        parsed.residual_args,
+    Ok(PreprocessedArgs {
+        residual_args: parsed.residual_args,
         overlay_specs,
         attachment_segments,
-    ))
+    })
 }
 
 fn main() {
@@ -1652,9 +1650,11 @@ fn main() {
     // Parse qpdf's argv grammar before clap parses feature values. The parser
     // preserves named segment boundaries and returns feature-neutral raw
     // tokens to the existing semantic consumers below.
-    let (residual_args, overlay_specs, attachment_segments) = match preprocess_qpdf_args(
-        std::env::args().collect(),
-    ) {
+    let PreprocessedArgs {
+        residual_args,
+        overlay_specs,
+        attachment_segments,
+    } = match preprocess_qpdf_args(std::env::args().collect()) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("flpdf: {error}");
@@ -3595,6 +3595,12 @@ struct OverlaySpec {
     repeat: Option<String>,
 }
 
+struct PreprocessedArgs {
+    residual_args: Vec<String>,
+    overlay_specs: Vec<OverlaySpec>,
+    attachment_segments: Vec<Vec<String>>,
+}
+
 /// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
 ///
 /// Grammar: `FILE and sub-options in any order`. `FILE` is either bare or `--file=PATH`;
@@ -3692,9 +3698,7 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
 
 #[cfg(test)]
 fn parse_test_args(args: Vec<String>) -> CliResult<arg_parser::ParsedArgs> {
-    let has_program = args
-        .first()
-        .is_some_and(|arg| !arg.starts_with('-'));
+    let has_program = args.first().is_some_and(|arg| !arg.starts_with('-'));
     let mut parser_args = args;
     if !has_program {
         parser_args.insert(0, "flpdf".to_owned());
@@ -6366,14 +6370,12 @@ mod tests {
 
     #[test]
     fn preprocess_qpdf_args_routes_raw_segments_through_arg_parser() {
-        let (residual, overlay_specs, attachment_segments) = preprocess_qpdf_args(strs(&[
-            "flpdf",
-            "--overlay",
-            "source.pdf",
-            "--to=1",
-            "--",
-        ]))
-        .expect("qpdf preprocessing should succeed");
+        let PreprocessedArgs {
+            residual_args: residual,
+            overlay_specs,
+            attachment_segments,
+        } = preprocess_qpdf_args(strs(&["flpdf", "--overlay", "source.pdf", "--to=1", "--"]))
+            .expect("qpdf preprocessing should succeed");
 
         assert_eq!(residual, strs(&["flpdf"]));
         assert_eq!(overlay_specs.len(), 1);
