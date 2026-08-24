@@ -2644,11 +2644,9 @@ fn rejects_xref_stream_w_above_qpdf_offset_width() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
-/// `parse_xref_entries`: when the entry width implied by `/W` requires more
-/// bytes than the decoded stream provides, the `cursor.pos + entry_width >
-/// len` guard returns `Error::Parse("xref stream data truncated")`. Here `/W
-/// [1 3 1]` needs 5 bytes per entry across two declared entries but only one
-/// entry's worth of data is present.
+/// qpdf's `processXRefStream` compares the decoded stream length with the
+/// `/W`/`/Index`-derived size before parsing entries. A short stream is a
+/// terminal `Error::Parse` with the full size diagnostic.
 #[test]
 fn rejects_xref_stream_truncated_data() {
     // /Index declares 2 entries (10 bytes) but only 5 bytes of data are present.
@@ -2666,7 +2664,9 @@ fn rejects_xref_stream_truncated_data() {
         .expect_err("truncated xref stream data should fail strict parse");
     let message = format!("{err}");
     assert!(
-        message.contains("xref stream data truncated"),
+        message.contains(
+            "Cross-reference stream data has the wrong size; expected = 10; actual = 5",
+        ),
         "got {message}"
     );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
@@ -4044,7 +4044,7 @@ fn ignore_xref_streams_leaves_classic_xref_tables_untouched() {
 //   shadowed in the xref-stream path: `parse_xref_entries` checks
 //   `cursor.pos + entry_width > len` (full entry width) BEFORE any
 //   `read_be_u64` call, and the per-field reads sum to exactly `entry_width`.
-//   Truncated stream data therefore surfaces as "xref stream data truncated"
+//   Truncated stream data therefore surfaces as qpdf's decoded-size diagnostic
 //   (see `rejects_xref_stream_truncated_data`), and `read_be_u64`'s guard is
 //   never the one that fires through `load_xref_and_trailer`.
 //

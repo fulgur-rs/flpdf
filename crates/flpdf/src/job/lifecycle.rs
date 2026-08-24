@@ -31,6 +31,7 @@ struct JobConfiguration {
     output_file: Option<PathBuf>,
     password: Vec<u8>,
     check: bool,
+    require_output: bool,
     progress: bool,
     writer: WriterConfiguration,
 }
@@ -248,6 +249,10 @@ impl QPDFJob {
     /// `qpdfjob-ctest.c`: `inputFile`, `outputFile`, `password`, `staticId`,
     /// `decrypt`, and `objectStreams`.
     pub fn initialize_from_json(&mut self, json: &str) -> Result<()> {
+        // The qpdf C API sets this prefix before parsing JSON
+        // (`libqpdf/qpdfjob-c.cc:79-87`), so initialization and run-time
+        // configuration errors share the same observable source name.
+        self.set_message_prefix("qpdfjob json");
         let value = crate::json::Json::parse(json.as_bytes())
             .map_err(|error| Error::parse(0, format!("qpdfjob JSON: {error}")))?;
         if !value.is_dictionary() {
@@ -272,6 +277,7 @@ impl QPDFJob {
                 .get_dict_item(b"password")
                 .get_string()
                 .unwrap_or_default(),
+            require_output: true,
             ..JobConfiguration::default()
         };
         if json_flag(&value, b"staticId") {
@@ -294,6 +300,13 @@ impl QPDFJob {
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
         self.warnings = false;
+        if self.configuration.output_file.is_none() {
+            let error = Error::Unsupported(
+                "an output file name is required; use - for standard output".to_owned(),
+            );
+            self.report_job_error(&error)?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -308,7 +321,7 @@ impl QPDFJob {
         let file = match File::open(&input) {
             Ok(file) => file,
             Err(error) => {
-                let error = Error::file_io("open input", input.clone(), error);
+                let error = Error::file_io("open", input.clone(), error);
                 self.report_job_error(&error)?;
                 return Ok(None);
             }
@@ -363,6 +376,13 @@ impl QPDFJob {
 
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
+        if self.configuration.require_output && self.configuration.output_file.is_none() {
+            let error = Error::Unsupported(
+                "an output file name is required; use - for standard output".to_owned(),
+            );
+            self.report_job_error(&error)?;
+            return Ok(JobExitCode::Error);
+        }
         let Some(mut pdf) = self.create_qpdf()? else {
             return Ok(JobExitCode::Error);
         };
@@ -388,8 +408,43 @@ impl QPDFJob {
     }
 
     fn report_job_error(&self, error: &Error) -> Result<()> {
-        self.logger
-            .error(format!("{}: {error}\n", self.message_prefix))
+        // qpdf's C wrapper streams the prefix, separator, message, and final
+        // newline separately (`qpdfjob-c.cc:32-39`). Keeping those writes
+        // separate preserves custom-pipeline boundaries as well as bytes.
+        let pipeline = self.logger.get_error()?;
+        pipeline
+            .write(self.message_prefix.as_bytes())
+            .map_err(Error::from)?;
+        pipeline.write(b": ").map_err(Error::from)?;
+        pipeline
+            .write(Self::job_error_message(error).as_bytes())
+            .map_err(Error::from)?;
+        pipeline.write(b"\n").map_err(Error::from)
+    }
+
+    fn job_error_message(error: &Error) -> String {
+        match error {
+            Error::FileIo {
+                operation,
+                path,
+                source,
+            } => {
+                let source = source.to_string();
+                let source = source
+                    .split_once(" (os error ")
+                    .map_or(source.as_str(), |(message, _)| message);
+                format!("{operation} {}: {source}", path.display())
+            }
+            Error::Unsupported(message)
+                if message == "an output file name is required; use - for standard output" =>
+            {
+                message.clone()
+            }
+            Error::Unsupported(message) if message.starts_with("qpdfjob usage error: ") => {
+                message["qpdfjob usage error: ".len()..].to_owned()
+            }
+            _ => error.to_string(),
+        }
     }
 
     /// Create a complete JSON-input document with this job's logger already
