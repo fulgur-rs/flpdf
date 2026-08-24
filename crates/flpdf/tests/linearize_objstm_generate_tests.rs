@@ -1400,6 +1400,7 @@ fn writer_progress_preserves_recoverable_stream_content_in_all_routes() {
                 if reporter_registered {
                     writer.register_progress_reporter(Box::new(move |percent| {
                         events_for_reporter.borrow_mut().push(percent);
+                        Ok(())
                     }));
                 }
                 writer.set_output_memory().expect("configure memory output");

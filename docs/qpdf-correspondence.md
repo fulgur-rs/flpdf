@@ -283,6 +283,14 @@ snapshot (`QPDFWriter.cc:2114-2116,2189-2193`) と同じ順序で、修復が mi
 object も `events_expected` に含める。specialized writer の同じ repair 境界は
 `writer.rs:3010-3025` にある。linearized writer は既存の準備後 snapshot を維持する。
 
+進捗callbackの失敗は `QPDFWriter.cc:2957-2982` の
+`ProgressReporter::reportProgress` 呼び出しからwrite全体へ例外が伝播するqpdfの責務に
+合わせ、flpdfの `PdfWriter::register_progress_reporter` /
+`QPDFJob::register_progress_reporter` は `FnMut(u8) -> Result<()>` を受け、standard・
+ObjStm・linearizationの全イベントで `Result` をその場で伝播する。完了後にfirst errorを
+検査する迂回や、callback failureを成功扱いにするlegacy routeは維持しない
+（`flpdf-egzr.8.8`）。
+
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
 経路にしか入らない構造的リスクがここに集中している。`emit_canonical_pdf_inner`

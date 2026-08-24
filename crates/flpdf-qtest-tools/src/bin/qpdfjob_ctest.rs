@@ -138,6 +138,7 @@ fn run_tests() -> Result<()> {
     let mut job = QPDFJob::new();
     job.register_progress_reporter(|percent| {
         print_line(format!("qpdfjob: d.pdf: write progress: {percent}%"));
+        Ok(())
     });
     job.initialize_from_argv(&argv)?;
     let mut pdf = job
@@ -172,6 +173,7 @@ fn run_argv(argv: Vec<String>, progress_label: Option<&str>) -> Result<JobExitCo
         let label = label.to_owned();
         job.register_progress_reporter(move |percent| {
             print_line(format!("{label}: write progress: {percent}%"));
+            Ok(())
         });
     }
     job.initialize_from_argv(&argv)?;

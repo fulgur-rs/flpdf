@@ -163,6 +163,7 @@ fn argv_job_run_writes_output_and_reports_progress() {
     let mut job = QPDFJob::new();
     job.register_progress_reporter(move |percent| {
         progress_for_job.lock().unwrap().push(percent);
+        Ok(())
     });
     job.initialize_from_argv(&args).unwrap();
 
@@ -303,6 +304,26 @@ fn json_job_progress_uses_the_qpdf_default_info_reporter() {
     assert!(info
         .windows(b"write progress: 100%\n".len())
         .any(|window| { window == b"write progress: 100%\n" }));
+}
+
+#[test]
+fn json_job_progress_logger_failures_abort_and_propagate_from_write() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("progress-output.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "progress": "",
+    })
+    .to_string();
+    let logger = QPDFLogger::create();
+    logger.set_info(Some(PipelineHandle::new(FailingSink)));
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
 }
 
 #[test]
@@ -810,6 +831,7 @@ fn registered_progress_reporter_is_attached_to_each_writer() {
     let progress_for_callback = Arc::clone(&progress);
     job.register_progress_reporter(move |percent| {
         progress_for_callback.lock().unwrap().push(percent);
+        Ok(())
     });
 
     let mut writer = PdfWriter::new(&mut pdf);
