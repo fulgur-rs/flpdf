@@ -2808,7 +2808,7 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
         .into());
     }
     for token in &tokens[..3] {
-        if token.starts_with("-") {
+        if token.starts_with("-") && token != "-" {
             return Err(format!(
                 "unrecognized argument {token} (encryption options must be terminated with --)"
             )
@@ -7097,11 +7097,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_encrypt_password_starting_with_dash_is_rejected() {
+    fn non_bare_hyphen_encrypt_password_is_rejected() {
         let err = parse_encrypt_segment(&strs(&["-user", "owner", "128"]), true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("unrecognized argument -user"), "got: {err}");
+    }
+
+    #[test]
+    fn bare_hyphen_encrypt_password_is_accepted() {
+        let params = parse_encrypt_segment(&strs(&["-", "-", "128"]), true).unwrap();
+        assert_eq!(params.user_password, b"-");
+        assert_eq!(params.owner_password, b"-");
     }
 
     #[test]
