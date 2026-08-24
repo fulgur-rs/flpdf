@@ -596,6 +596,25 @@ fn clear_page_tree_resolves_the_pages_root_through_a_handle() {
 }
 
 #[test]
+fn page_content_bytes_uses_the_canonical_page_contents_route() {
+    let source = include_str!("../src/pages.rs");
+    let function = source
+        .split("pub fn page_content_bytes")
+        .nth(1)
+        .and_then(|rest| rest.split("/// Resolve a `Page`'s `/Contents`").next())
+        .expect("page_content_bytes production function should remain present");
+
+    assert!(
+        !function.contains("resolve_to_terminal_ref"),
+        "page_content_bytes must not use the non-qpdf holder-chain bridge"
+    );
+    assert!(
+        function.contains("page.get_page_contents()"),
+        "page_content_bytes must use ObjectHandle::get_page_contents"
+    );
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source
