@@ -41,6 +41,49 @@ fn check_valid_fixture_exits_successfully() {
 }
 
 #[test]
+fn check_accepts_ignore_xref_streams_on_a_clean_pdf() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--ignore-xref-streams",
+            "--check",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("File is not encrypted\n"));
+}
+
+#[test]
+fn suppress_recovery_matches_qpdf_on_a_recoverable_xref_error() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--suppress-recovery",
+            "--check",
+            "../../tests/fixtures/test_driver/repairable_input.pdf",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"));
+}
+
+#[test]
+fn recovery_help_text_matches_qpdf_wording() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Ignore any cross-reference streams in the file",
+        ))
+        .stdout(predicate::str::contains(
+            "Avoid attempting to recover when errors are found",
+        ));
+}
+
+#[test]
 fn check_accepts_qpdf_bare_flag_with_discarded_equals_value() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args(["--check=ignored", "../../tests/fixtures/minimal.pdf"])

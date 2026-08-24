@@ -968,6 +968,8 @@ struct IsEncryptedCommand {
     input: PathBuf,
     #[arg(long)]
     repair: bool,
+    #[command(flatten)]
+    recovery: RecoveryArgs,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -1519,8 +1521,22 @@ impl From<CliRemoveUnreferencedResources> for RemoveUnreferencedResources {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, ClapArgs)]
+struct RecoveryArgs {
+    /// Ignore any cross-reference streams in the file, falling back to
+    /// cross-reference tables or triggering document recovery.
+    #[arg(long = "ignore-xref-streams")]
+    ignore_xref_streams: bool,
+    /// Avoid attempting to recover when errors are found in a file's
+    /// cross reference table or stream lengths.
+    #[arg(long = "suppress-recovery")]
+    suppress_recovery: bool,
+}
+
 #[derive(Debug, Clone, Default, ClapArgs)]
 struct PasswordArgs {
+    #[command(flatten)]
+    recovery: RecoveryArgs,
     /// Password bytes for encrypted PDFs.
     #[arg(long, conflicts_with = "password_file")]
     password: Option<String>,
@@ -2402,7 +2418,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
         Commands::QdfFix(cmd) => run_qdf_fix(&cmd.input, &cmd.output),
         Commands::ShowStream(cmd) => run_show_stream(cmd),
         Commands::ShowEncryption(cmd) => run_show_encryption(&cmd.input, cmd.repair, &cmd.password),
-        Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair),
+        Commands::IsEncrypted(cmd) => run_is_encrypted(&cmd.input, cmd.repair, cmd.recovery),
         Commands::RequiresPassword(cmd) => {
             run_requires_password(&cmd.input, cmd.repair, &cmd.password)
         }
@@ -5350,11 +5366,15 @@ fn is_bad_password_error(error: &flpdf::Error) -> bool {
 ///
 /// qpdf `--is-encrypted` (qpdf manual): exit 0 = encrypted, exit 2 = not
 /// encrypted (`qpdf_exit_is_not_encrypted = 2`). No required stdout.
-fn run_is_encrypted(input: &PathBuf, repair: bool) -> CliResult<()> {
+fn run_is_encrypted(input: &PathBuf, repair: bool, recovery: RecoveryArgs) -> CliResult<()> {
     // No password is taken/used: qpdf detects encryption structurally
     // (presence of /Encrypt) without authenticating, so we deliberately
     // probe with an empty password and accept the auth-failed outcome.
-    let encrypted = match probe_encryption(input, repair, &PasswordArgs::default())? {
+    let password = PasswordArgs {
+        recovery,
+        ..PasswordArgs::default()
+    };
+    let encrypted = match probe_encryption(input, repair, &password)? {
         EncryptionProbe::Opened { encrypted } => encrypted,
         EncryptionProbe::EncryptedAuthFailed => true,
     };
@@ -5722,6 +5742,7 @@ fn open_pdf_file_impl(
 fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenOptions> {
     let password_is_hex_key = password.password_is_hex_key;
     let suppress_password_recovery = password.suppress_password_recovery;
+    let recovery = password.recovery;
     let password_mode = password.password_mode.into();
     let password = if let Some(password) = &password.password {
         password.as_bytes().to_vec()
@@ -5738,10 +5759,10 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
     };
 
     Ok(PdfOpenOptions {
-        // qpdf's recovery permission is enabled on the document by default.
-        // Keep accepting `--repair` as an explicit compatibility spelling;
-        // the absence of that flag must not turn recovery off.
-        repair: repair || PdfOpenOptions::default().repair,
+        // qpdf's recovery permission is enabled on the document by default;
+        // --suppress-recovery is the explicit opt-out.
+        repair: !recovery.suppress_recovery && (repair || PdfOpenOptions::default().repair),
+        ignore_xref_streams: recovery.ignore_xref_streams,
         password,
         password_mode,
         suppress_password_recovery,
