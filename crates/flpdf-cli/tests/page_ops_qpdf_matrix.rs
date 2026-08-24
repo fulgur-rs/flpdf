@@ -202,19 +202,66 @@ fn own_page_attributes_of(path: &Path) -> Vec<(bool, bool)> {
 /// Return the key tokens that appear directly inside the outermost `<< >>`
 /// dictionary of `output` (as `--show-object` prints one object per
 /// invocation), skipping any nested dictionary or array. A `/Name` token
-/// nested inside a value (e.g. `/Resources << /XObject << /Rotate 4 0 R >>
-/// >>`) must not be mistaken for a key the outer dictionary itself owns.
+/// nested inside a value (e.g. a `/Rotate` key inside a nested
+/// `/Resources`/`/XObject` dictionary) must not be mistaken for a key the
+/// outer dictionary itself owns, and a `/Name` that is itself some other
+/// key's *value* (e.g. `/Foo /Rotate`) must not be mistaken for a key
+/// either: PDF dictionaries strictly alternate key/value pairs, so only a
+/// token in key position at depth 1 is recorded.
 fn top_level_dict_keys(output: &str) -> Vec<&str> {
+    let tokens: Vec<&str> = output.split_whitespace().collect();
     let mut depth = 0i32;
+    let mut expect_key = false;
     let mut keys = Vec::new();
-    for token in output.split_whitespace() {
-        match token {
-            "<<" => depth += 1,
-            ">>" => depth -= 1,
-            "[" => depth += 1,
-            "]" => depth -= 1,
-            name if depth == 1 && name.starts_with('/') => keys.push(name),
-            _ => {}
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "<<" => {
+                depth += 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            ">>" => {
+                depth -= 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            "[" => {
+                depth += 1;
+                i += 1;
+            }
+            "]" => {
+                depth -= 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            token if depth == 1 && expect_key => {
+                if token.starts_with('/') {
+                    keys.push(token);
+                }
+                expect_key = false;
+                i += 1;
+            }
+            _ if depth == 1 => {
+                // Consuming a top-level value. `<<`/`[` composite values are
+                // handled by the depth-tracking arms above (expect_key stays
+                // false until the matching close bracket returns to depth
+                // 1); a scalar value is either a 3-token indirect reference
+                // ("N G R") or a single token (Name/Number/String/Boolean).
+                let is_reference = i + 2 < tokens.len()
+                    && tokens[i].bytes().all(|b| b.is_ascii_digit())
+                    && tokens[i + 1].bytes().all(|b| b.is_ascii_digit())
+                    && tokens[i + 2] == "R";
+                i += if is_reference { 3 } else { 1 };
+                expect_key = true;
+            }
+            _ => i += 1,
         }
     }
     keys
@@ -233,6 +280,26 @@ fn top_level_dict_keys_ignores_nested_names_with_the_same_key_name() {
     );
     assert!(keys.contains(&"/Resources"), "got {keys:?}");
     assert!(keys.contains(&"/Type"), "got {keys:?}");
+}
+
+#[test]
+fn top_level_dict_keys_ignores_a_name_valued_extension_entry() {
+    // A page with an unrelated top-level entry whose *value* happens to be
+    // the bare Name /Rotate (e.g. /Foo /Rotate) must not be reported as if
+    // the page dictionary owned a /Rotate key: PDF dictionaries strictly
+    // alternate key/value, and /Rotate here is in value position.
+    let output = "<< /Foo /Rotate /Type /Page >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        !keys.contains(&"/Rotate"),
+        "a name-valued /Foo entry must not manufacture an owned /Rotate key: {keys:?}"
+    );
+    assert!(keys.contains(&"/Foo"), "got {keys:?}");
+    assert!(keys.contains(&"/Type"), "got {keys:?}");
+    assert!(
+        !keys.contains(&"/Page"),
+        "/Type's own value /Page must not be reported as a key either: {keys:?}"
+    );
 }
 
 fn assert_own_page_attributes_match(qpdf_output: &Path, flpdf_output: &Path) {
