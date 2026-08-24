@@ -79,7 +79,7 @@ use crate::writer::{
     inject_adbe_extension, report_progress_event, serialize::xref_stream, strip_adbe_extension,
     CompressStreams, NewlineBeforeEndstream, ObjectWriterEmission, WriterOptions, WriterResult,
 };
-use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Object, ObjectHandle, ObjectRef, Pdf, Result};
 
 const EBADF_ERRNO: i32 = 9;
 
@@ -1184,7 +1184,7 @@ fn canonical_linearization_trailer_entries(
 ///     (ISO 32000-1 §14.4).
 fn finalize_linearized_id(
     options: &WriterOptions,
-    source_trailer: &Dictionary,
+    source_id0: Option<&[u8]>,
     det_id_source_id0: Option<&[u8]>,
     copy_encryption: Option<&crate::encryption::CopyEncryptionSource>,
 ) -> Object {
@@ -1204,8 +1204,7 @@ fn finalize_linearized_id(
             Object::String(vec![0u8; 16]),
         ])
     } else if let Some(source) = copy_encryption {
-        let generated =
-            crate::writer::generate_id_array(source_trailer.get("ID"), options.static_id);
+        let generated = crate::writer::generate_id_array_from_source_id0(None, options.static_id);
         let id1 = generated
             .as_array()
             .and_then(|values| values.get(1))
@@ -1217,7 +1216,7 @@ fn finalize_linearized_id(
             Object::String(id1),
         ])
     } else {
-        crate::writer::generate_id_array(source_trailer.get("ID"), options.static_id)
+        crate::writer::generate_id_array_from_source_id0(source_id0, options.static_id)
     }
 }
 
@@ -1228,10 +1227,8 @@ fn finalize_linearized_id(
 /// first string with the same byte width as the original `/ID[0]` (falling
 /// back to 16 bytes when there is no non-empty original identifier), followed
 /// by a 16-byte all-zero changing identifier.
-fn linearization_pass1_id(source_trailer: &Dictionary) -> Object {
-    let first_len = crate::writer::source_permanent_id(source_trailer)
-        .map(|id| id.len())
-        .unwrap_or(16);
+fn linearization_pass1_id(source_id0: Option<&[u8]>) -> Object {
+    let first_len = source_id0.map(|id| id.len()).unwrap_or(16);
     Object::Array(vec![
         Object::String(vec![0u8; first_len]),
         Object::String(vec![0u8; 16]),
@@ -3376,20 +3373,19 @@ fn write_linearized_impl<R: Read + Seek>(
     // preserved permanent identifier and the `/Info`-derived suffix feeds the
     // seed; reading either after the placeholder is installed would mistake the
     // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    let source_trailer = pdf.trailer_dictionary().clone();
     let source_trailer_handle = pdf.trailer().shallow_copy()?;
+    let source_id0 = crate::writer::source_permanent_id_handle(&source_trailer_handle);
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
-            let id0 = crate::writer::source_permanent_id(&source_trailer);
             let suffix = crate::writer::deterministic_id_info_suffix(pdf);
-            (id0, suffix)
+            (source_id0.clone(), suffix)
         } else {
             (None, Vec::new())
         };
-    let pass1_id = linearization_pass1_id(&source_trailer);
+    let pass1_id = linearization_pass1_id(source_id0.as_deref());
     let finalized_id = finalize_linearized_id(
         options,
-        &source_trailer,
+        source_id0.as_deref(),
         det_id_source_id0.as_deref(),
         options.copy_encryption.as_ref(),
     );
@@ -3932,9 +3928,9 @@ fn write_linearized_impl<R: Read + Seek>(
             )
         })?;
 
-    let info_new_ref: Option<ObjectRef> = pdf
-        .trailer_dictionary()
-        .get_ref("Info")
+    let info_new_ref: Option<ObjectRef> = source_trailer_handle
+        .try_get_key(b"/Info")?
+        .object_ref()
         .and_then(|orig| renumber.new_for_original(orig));
 
     let first_page_object_new_num: u32 = {
@@ -4588,7 +4584,7 @@ mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
     use crate::writer::{WriterOptions, DETERMINISTIC_ID_ARRAY_LEN};
-    use crate::Pdf;
+    use crate::{Dictionary, Pdf};
     use std::io::Cursor;
 
     struct FinishErrorWriter {
@@ -6803,6 +6799,52 @@ mod tests {
         );
         // /ID[1] is derived and must differ from /ID[0] here.
         assert_ne!(&id[ID0_HEX], &id[ID1_HEX], "changing /ID must differ");
+    }
+
+    #[test]
+    fn linearized_id_uses_live_trailer_after_merge_mutation() {
+        let original_id = "0102030405060708090a0b0c0d0e0f10";
+        let merged_id = "202122232425262728292a2b2c2d2e2f";
+        let source = tiny_pdf_with(
+            &format!("/ID [<{original_id}> <ffffffffffffffffffffffffffffffff>]"),
+            None,
+        );
+        let mut pdf = Pdf::open(Cursor::new(source)).expect("source parses");
+
+        // page_merge::wire_primary_trailer mutates the target's live trailer
+        // handle. The construction-time dictionary must not remain the ID
+        // source for the later linearized writer.
+        pdf.trailer()
+            .replace_key(
+                b"/ID",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(hex::decode(merged_id).unwrap()),
+                    ObjectHandle::string(vec![0xff; 16]),
+                ]),
+            )
+            .expect("live trailer mutation");
+
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let options = WriterOptions {
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let mut document =
+            write_linearized(&plan, &renumber, &mut pdf, &options).expect("linearized output");
+        document.back_patch().expect("back patch");
+
+        let id = first_id_array(&document.bytes);
+        assert_eq!(
+            &id[ID0_HEX],
+            merged_id.as_bytes(),
+            "linearized /ID[0] must come from the live trailer after merge"
+        );
+        assert_ne!(
+            &id[ID0_HEX],
+            original_id.as_bytes(),
+            "linearized /ID[0] must not read the stale construction snapshot"
+        );
     }
 
     #[test]
