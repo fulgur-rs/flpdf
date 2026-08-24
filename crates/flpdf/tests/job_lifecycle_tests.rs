@@ -238,6 +238,34 @@ fn json_job_partial_initialization_defers_missing_output_to_run() {
 }
 
 #[test]
+fn json_job_partial_initialization_still_rejects_a_malformed_output_file() {
+    // qpdf's JSONHandler dispatches `outputFile` to a string-only handler
+    // (QPDFJob_json.cc:262-265) and rejects any other present type with a
+    // usage error (JSONHandler.cc:186), regardless of partial-init mode: a
+    // present-but-wrong-typed value is not the same as an absent key.
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({"inputFile": input, "outputFile": 42}).to_string();
+    let mut job = QPDFJob::new();
+
+    let error = job.initialize_from_json_partial(&json).unwrap_err();
+
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("outputFile") && message.contains("must be a string")));
+}
+
+#[test]
+fn json_job_rejects_a_malformed_output_file_outside_partial_mode() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({"inputFile": input, "outputFile": false}).to_string();
+    let mut job = QPDFJob::new();
+
+    let error = job.initialize_from_json(&json).unwrap_err();
+
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("outputFile") && message.contains("must be a string")));
+}
+
+#[test]
 fn json_job_progress_uses_the_qpdf_default_info_reporter() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();

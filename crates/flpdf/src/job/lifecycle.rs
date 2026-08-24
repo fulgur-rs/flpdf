@@ -338,7 +338,11 @@ impl QPDFJob {
             b"progress",
         ];
         let mut unsupported_key = None;
+        let mut output_file_key_present = false;
         value.for_each_dict_item(|key, _item| {
+            if key == b"outputFile" {
+                output_file_key_present = true;
+            }
             if unsupported_key.is_none() && !SUPPORTED_TOP_LEVEL_KEYS.contains(&key) {
                 unsupported_key = Some(key.to_vec());
             }
@@ -352,6 +356,18 @@ impl QPDFJob {
 
         let input = value.get_dict_item(b"inputFile").get_string();
         let output = value.get_dict_item(b"outputFile").get_string();
+        // qpdf's JSONHandler dispatches `outputFile` to a string-only handler
+        // (`QPDFJob_json.cc:262-265`'s `setupOutputFile` -> `addParameter` ->
+        // `addStringHandler`); a present value of any other JSON type falls
+        // through every type check in `JSONHandler::handle` and is rejected
+        // with a usage error (`libqpdf/JSONHandler.cc:186`), regardless of
+        // partial-initialization mode. Only a genuinely *absent* key reaches
+        // `partial`'s deferred-output allowance below.
+        if output_file_key_present && output.is_none() {
+            return Err(Error::Unsupported(
+                "qpdfjob JSON key \"outputFile\" must be a string".to_owned(),
+            ));
+        }
         let Some(input) = input.filter(|value| !value.is_empty()) else {
             return Err(Error::Unsupported(
                 "qpdfjob JSON requires inputFile".to_owned(),
