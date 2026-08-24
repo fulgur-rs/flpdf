@@ -1090,6 +1090,44 @@ fn qdf_mode_generate_uses_objstm_and_xref_stream() {
     );
 }
 
+/// qdf=true + Generate + deterministic_id must write the real content-derived
+/// `/ID`, not the all-zero deterministic-ID placeholder. The QDF+ObjStm
+/// xref-stream trailer route is a second `/ID`-writing site distinct from the
+/// classic-table QDF trailer (which already threads `det_id_source_id0`/
+/// `det_id_info_suffix` through `IdPlan::Deterministic`); this regression
+/// keeps both sites in sync.
+#[test]
+fn qdf_mode_generate_deterministic_id_writes_content_derived_id() {
+    let source = build_pdf_with_objstm_for_qdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let options = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
+
+    let all_zero_id = b"/ID [<00000000000000000000000000000000><00000000000000000000000000000000>]";
+    assert!(
+        !output
+            .windows(all_zero_id.len())
+            .any(|w| w == all_zero_id.as_slice()),
+        "qdf=true + Generate + deterministic_id must not emit the all-zero \
+         deterministic-ID placeholder"
+    );
+
+    let report = check_output(Cursor::new(output)).unwrap();
+    assert!(
+        report.valid,
+        "qdf+Generate+deterministic_id output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
 /// Non-QDF output must never contain "%% Original object ID:" lines,
 /// whether no_original_object_ids is true or false.
 #[test]

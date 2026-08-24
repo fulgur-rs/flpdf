@@ -5397,8 +5397,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 options.deterministic_id,
                 generated_id_handle.as_ref(),
             )?; // cov:ignore: validated xref trailer construction; LLVM maps this continuation to the call setup
-            let id = plain::xref::IdPlan::Materialized {
-                value: plain::xref::materialized_id_handle(&trailer_handle.try_get_key(b"/ID")?)?, // cov:ignore: build_writer_trailer_handle constructs the writer-owned /ID in the validated two-string shape
+            let id = if options.deterministic_id {
+                plain::xref::IdPlan::Deterministic {
+                    source_id0: det_id_source_id0.clone(),
+                    info_suffix: det_id_info_suffix.clone(),
+                }
+            } else {
+                plain::xref::IdPlan::Materialized {
+                    value: plain::xref::materialized_id_handle(
+                        &trailer_handle.try_get_key(b"/ID")?,
+                    )?, // cov:ignore: build_writer_trailer_handle constructs the writer-owned /ID in the validated two-string shape
+                }
             };
             let trailer = plain::xref::TrailerPlan {
                 form: XrefForm::Stream,
