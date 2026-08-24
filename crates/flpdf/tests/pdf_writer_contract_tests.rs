@@ -2782,6 +2782,25 @@ fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()>
 }
 
 #[test]
+fn pdf_writer_invalid_minimum_versions_do_not_panic_before_final_write() -> flpdf::Result<()> {
+    for invalid_first in [true, false] {
+        let mut pdf = open_minimal_pdf()?;
+        let mut writer = PdfWriter::new(&mut pdf);
+        if invalid_first {
+            writer.set_minimum_pdf_version("invalid", 99);
+            writer.set_minimum_pdf_version("1.4", 2);
+        } else {
+            writer.set_minimum_pdf_version("1.4", 2);
+            writer.set_minimum_pdf_version("invalid", 99);
+        }
+        writer.set_output_memory()?;
+        writer.write()?;
+        assert!(!writer.get_buffer()?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn pdf_writer_preserves_forced_pdf_extension_pair() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
     let mut writer = PdfWriter::new(&mut pdf);

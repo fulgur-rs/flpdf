@@ -326,13 +326,21 @@ fn update_minimum_pdf_version(
     version: String,
     extension_level: i64,
 ) {
+    let Some(candidate) = crate::pdf_version::parse_pdf_version(&version) else {
+        // qpdf's parseVersion has no error channel and treats an invalid
+        // setter value as an unusable 0.0 candidate. Ignore it here so a
+        // public setter never stores a value that a later setter must unwrap.
+        return;
+    };
     match current {
         None => *current = Some((version, extension_level)),
         Some((current_version, current_extension_level)) => {
-            let current_parsed = crate::pdf_version::parse_pdf_version(current_version)
-                .expect("validated minimum PDF version remains parseable");
-            let candidate = crate::pdf_version::parse_pdf_version(&version)
-                .expect("validated minimum PDF version is parseable");
+            let Some(current_parsed) = crate::pdf_version::parse_pdf_version(current_version)
+            else {
+                *current_version = version;
+                *current_extension_level = extension_level;
+                return;
+            };
             if candidate > current_parsed
                 || (candidate == current_parsed && extension_level > *current_extension_level)
             {
@@ -864,6 +872,39 @@ mod lifecycle_tests {
         writer.set_minimum_pdf_version("1.5", 0);
 
         assert_eq!(writer.get_final_version().unwrap(), "1.5");
+    }
+
+    #[test]
+    fn invalid_minimum_version_can_be_corrected_before_write() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let mut writer = PdfWriter::new(&mut pdf);
+
+        writer.set_minimum_pdf_version("invalid", 99);
+        writer.set_minimum_pdf_version("1.4", 2);
+
+        assert_eq!(writer.get_final_version().unwrap(), "1.4");
+    }
+
+    #[test]
+    fn invalid_minimum_version_after_valid_input_does_not_panic() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let mut writer = PdfWriter::new(&mut pdf);
+
+        writer.set_minimum_pdf_version("1.4", 2);
+        writer.set_minimum_pdf_version("invalid", 99);
+
+        assert_eq!(writer.get_final_version().unwrap(), "1.4");
+    }
+
+    #[test]
+    fn invalid_existing_minimum_version_is_replaced_by_a_valid_candidate() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.settings.minimum_pdf_version = Some(("invalid".to_owned(), 99));
+
+        writer.set_minimum_pdf_version("1.4", 2);
+
+        assert_eq!(writer.get_final_version().unwrap(), "1.4");
     }
 
     #[test]
