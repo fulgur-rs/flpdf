@@ -189,7 +189,12 @@ impl ArgParser {
                 tokens.push(self.canonical_segment_option(kind, token));
             }
             if !terminated {
-                return Err(format!("--{option}: segment must be terminated by --").into());
+                let message = if kind == SegmentKind::AddAttachment {
+                    format!("--{option}: missing -- terminator")
+                } else {
+                    format!("--{option}: segment must be terminated by a `--` token")
+                };
+                return Err(message.into());
             }
 
             let segment = NamedSegment {
@@ -284,11 +289,10 @@ fn collect_long_options(command: &Command, names: &mut HashSet<String>) {
 }
 
 fn option_name(arg: &str) -> &str {
-    arg.strip_prefix("--")
-        .unwrap_or(arg)
-        .split('=')
-        .next()
-        .unwrap_or(arg)
+    let Some(rest) = arg.strip_prefix("--") else {
+        return "";
+    };
+    rest.split('=').next().unwrap_or(rest)
 }
 
 fn should_discard_bare_value(name: &str, arg: &str) -> bool {
