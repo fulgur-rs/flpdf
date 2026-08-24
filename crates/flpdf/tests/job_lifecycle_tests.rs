@@ -150,11 +150,15 @@ fn json_job_run_writes_output_with_static_id_and_generated_object_streams() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
     let output = tempdir.path().join("json-output.pdf");
-    let json = format!(
-        "{{\n  \"inputFile\": \"{}\",\n  \"outputFile\": \"{}\",\n  \"staticId\": \"\",\n  \"decrypt\": \"\",\n  \"progress\": \"\",\n  \"objectStreams\": \"generate\"\n}}",
-        input.display(),
-        output.display()
-    );
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "staticId": "",
+        "decrypt": "",
+        "progress": "",
+        "objectStreams": "generate"
+    })
+    .to_string();
     let mut job = QPDFJob::new();
     job.initialize_from_json(&json).unwrap();
 
