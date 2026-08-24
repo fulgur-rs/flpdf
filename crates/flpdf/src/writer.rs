@@ -3638,14 +3638,10 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
             .map(|catalog| (r, catalog, was_dirty))
     });
 
-    // qpdf's full-rewrite writer resolves source streams with its default
-    // stream-framing recovery enabled. Keep that recovery scoped to the
-    // specialized coordinator as well as the plain writer: this route now
-    // resolves ordinary objects through ObjectHandle, so malformed source
-    // `/Length` values must reach the same recovered stream shape before the
-    // handle-aware consumer serializes them.
-    let result =
-        pdf.with_plain_writer_stream_recovery(|pdf| emit_canonical_pdf_inner(pdf, out, options));
+    // qpdf's full-rewrite writer resolves source streams through the document's
+    // single `attempt_recovery` permission while emitting them. The canonical
+    // handle route therefore does not need a writer-local recovery override.
+    let result = emit_canonical_pdf_inner(pdf, out, options);
 
     // Restore only the pre-write `/Extensions` value on top of whatever the
     // write left behind, rather than the whole pre-call Catalog. A full-dict

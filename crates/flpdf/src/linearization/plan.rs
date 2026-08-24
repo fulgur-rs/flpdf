@@ -1104,15 +1104,12 @@ impl LinearizationPlan {
         // the producer must not use a legacy-resolve/materialize bridge in
         // the other direction.
         if pdf.root_ref().is_some() {
-            pdf.with_writer_stream_recovery(|pdf| {
-                crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
-                    pdf,
-                    true,
-                    false,
-                    &BTreeSet::new(),
-                    None,
-                )
-            })?;
+            crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber::build_qpdf_with_stream_policy(
+                pdf,
+                true,
+                false,
+                &BTreeSet::new(),
+                None)?;
         }
         let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
         let skipped_stream_parameter_streams =

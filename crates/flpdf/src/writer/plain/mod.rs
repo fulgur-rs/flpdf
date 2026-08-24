@@ -23,19 +23,17 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> crate::Result<WriterResult> {
-    pdf.with_plain_writer_stream_recovery(|pdf| {
-        #[cfg(test)]
-        PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    #[cfg(test)]
+    PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-        let plan = plan::PlainWritePlan::build(pdf, options)?;
-        crate::writer::configure_progress_for_pdf(
-            pdf,
-            options,
-            plan.generated_object_stream_count(),
-            false,
-        )?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
-        write_planned(pdf, out, options, &plan)
-    })
+    let plan = plan::PlainWritePlan::build(pdf, options)?;
+    crate::writer::configure_progress_for_pdf(
+        pdf,
+        options,
+        plan.generated_object_stream_count(),
+        false,
+    )?; // cov:ignore: a pre-emission object-enumeration failure is surfaced by the underlying writer validation
+    write_planned(pdf, out, options, &plan)
 }
 
 fn write_planned<R: Read + Seek, W: Write>(
