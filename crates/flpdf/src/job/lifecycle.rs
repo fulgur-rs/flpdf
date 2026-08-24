@@ -7,13 +7,33 @@
 //! page-transform, and remaining inspection consumers are later job slices.
 
 use super::json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput};
-use crate::{Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, Result, Severity};
+use crate::{
+    Error, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, Result, Severity,
+    WriterConfiguration,
+};
 use std::cell::RefCell;
-use std::io::{Cursor, Read, Seek};
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read, Seek};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 type ProgressHandler = Box<dyn FnMut(u8) + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
+
+/// Portable writer/input state populated by the qpdf job argv/JSON boundary.
+///
+/// This is deliberately smaller than the CLI's clap model. It owns the
+/// settings exercised by `qpdf/qpdfjob-ctest.c`; full command-line transform
+/// dispatch remains in the operation-specific job slices.
+#[derive(Debug, Clone, Default)]
+struct JobConfiguration {
+    input_file: Option<PathBuf>,
+    output_file: Option<PathBuf>,
+    password: Vec<u8>,
+    check: bool,
+    progress: bool,
+    writer: WriterConfiguration,
+}
 
 /// qpdf-compatible status returned by a completed job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +42,8 @@ pub enum JobExitCode {
     /// No warning was recorded, or warnings were explicitly configured to be
     /// exit-zero.
     Success = 0,
+    /// The job could not create or write its requested document.
+    Error = 2,
     /// Warnings were recorded and the job was not configured to suppress the
     /// warning exit status.
     Warning = 3,
@@ -49,6 +71,7 @@ pub struct QPDFJob {
     suppress_warnings: bool,
     warnings_exit_zero: bool,
     progress_handler: Option<SharedProgressHandler>,
+    configuration: JobConfiguration,
 }
 
 impl Default for QPDFJob {
@@ -75,6 +98,7 @@ impl QPDFJob {
             suppress_warnings: false,
             warnings_exit_zero: false,
             progress_handler: None,
+            configuration: JobConfiguration::default(),
         }
     }
 
@@ -145,6 +169,227 @@ impl QPDFJob {
         writer.register_progress_reporter(Box::new(move |percent| {
             (reporter.borrow_mut())(percent);
         }));
+    }
+
+    /// Initialize the portable qpdf-job argument surface used by qtest.
+    ///
+    /// This mirrors `QPDFJob::initializeFromArgv` for the arguments owned by
+    /// `qpdfjob-ctest.c`: one input, one output, deterministic/static IDs,
+    /// object-stream mode, password, decrypt, and check. The full CLI parser
+    /// remains outside this production library boundary.
+    pub fn initialize_from_argv(&mut self, argv: &[String]) -> Result<()> {
+        let mut configuration = JobConfiguration::default();
+        let mut positionals = Vec::new();
+        let mut parse_options = true;
+
+        for argument in argv.iter().skip(1) {
+            if parse_options && argument == "--" {
+                parse_options = false;
+                continue;
+            }
+            if parse_options && argument.starts_with("--") {
+                match argument.as_str() {
+                    "--deterministic-id" => configuration.writer.set_deterministic_id(true),
+                    "--static-id" => configuration.writer.set_static_id(true),
+                    "--decrypt" => {
+                        configuration.writer.set_preserve_encryption(false);
+                    }
+                    "--progress" => configuration.progress = true,
+                    "--check" => configuration.check = true,
+                    _ if argument.starts_with("--password=") => {
+                        configuration.password = argument.as_bytes()[11..].to_vec();
+                    }
+                    _ if argument.starts_with("--object-streams=") => {
+                        configuration
+                            .writer
+                            .set_object_stream_mode(parse_object_stream_mode(&argument[17..])?);
+                    }
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "qpdfjob usage error: unknown option {argument}"
+                        )));
+                    }
+                }
+            } else if parse_options && argument.starts_with('-') {
+                return Err(Error::Unsupported(format!(
+                    "qpdfjob usage error: unknown option {argument}"
+                )));
+            } else {
+                positionals.push(argument.clone());
+            }
+        }
+
+        if positionals.len() > 2 {
+            return Err(Error::Unsupported(
+                "qpdfjob usage error: too many positional arguments".to_owned(),
+            ));
+        }
+        configuration.input_file = positionals.first().map(PathBuf::from);
+        configuration.output_file = positionals.get(1).map(PathBuf::from);
+        if configuration.input_file.is_none() && !configuration.check {
+            return Err(Error::Unsupported(
+                "qpdfjob usage error: input file is required".to_owned(),
+            ));
+        }
+
+        self.configuration = configuration;
+        self.input_name = self
+            .configuration
+            .input_file
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string());
+        self.warnings = false;
+        Ok(())
+    }
+
+    /// Initialize the portable qpdf-job JSON surface used by qtest.
+    ///
+    /// The accepted keys correspond to the complete JSON fields used by
+    /// `qpdfjob-ctest.c`: `inputFile`, `outputFile`, `password`, `staticId`,
+    /// `decrypt`, and `objectStreams`.
+    pub fn initialize_from_json(&mut self, json: &str) -> Result<()> {
+        let value = crate::json::Json::parse(json.as_bytes())
+            .map_err(|error| Error::parse(0, format!("qpdfjob JSON: {error}")))?;
+        if !value.is_dictionary() {
+            return Err(Error::Unsupported(
+                "qpdfjob JSON must contain a dictionary".to_owned(),
+            ));
+        }
+
+        let input = value.get_dict_item(b"inputFile").get_string();
+        let output = value.get_dict_item(b"outputFile").get_string();
+        let Some(input) = input.filter(|value| !value.is_empty()) else {
+            return Err(Error::Unsupported(
+                "qpdfjob JSON requires inputFile".to_owned(),
+            ));
+        };
+        let mut configuration = JobConfiguration {
+            input_file: Some(PathBuf::from(String::from_utf8_lossy(&input).into_owned())),
+            output_file: output
+                .filter(|value| !value.is_empty())
+                .map(|value| PathBuf::from(String::from_utf8_lossy(&value).into_owned())),
+            password: value
+                .get_dict_item(b"password")
+                .get_string()
+                .unwrap_or_default(),
+            ..JobConfiguration::default()
+        };
+        if json_flag(&value, b"staticId") {
+            configuration.writer.set_static_id(true);
+        }
+        if json_flag(&value, b"decrypt") {
+            configuration.writer.set_preserve_encryption(false);
+        }
+        configuration.progress = json_flag(&value, b"progress");
+        if let Some(mode) = value.get_dict_item(b"objectStreams").get_string() {
+            configuration
+                .writer
+                .set_object_stream_mode(parse_object_stream_mode(&String::from_utf8_lossy(&mode))?);
+        } // cov:ignore: the successful objectStreams branch is covered; llvm-cov attributes this closing span separately
+
+        self.configuration = configuration;
+        self.input_name = self
+            .configuration
+            .input_file
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string());
+        self.warnings = false;
+        Ok(())
+    }
+
+    /// Create the configured input document, returning `None` after qpdf-style
+    /// error reporting for a missing or malformed input.
+    pub fn create_qpdf(&mut self) -> Result<Option<Pdf<BufReader<File>>>> {
+        let Some(input) = self.configuration.input_file.clone() else {
+            let error = Error::Unsupported("qpdfjob input file is not configured".to_owned());
+            self.report_job_error(&error)?;
+            return Ok(None);
+        };
+        let file = match File::open(&input) {
+            Ok(file) => file,
+            Err(error) => {
+                let error = Error::file_io("open input", input.clone(), error);
+                self.report_job_error(&error)?;
+                return Ok(None);
+            }
+        };
+        match self.open(
+            BufReader::new(file),
+            input.display().to_string(),
+            PdfOpenOptions {
+                password: self.configuration.password.clone(),
+                ..PdfOpenOptions::default()
+            },
+        ) {
+            Ok(pdf) => Ok(Some(pdf)),
+            Err(error) => {
+                self.report_job_error(&error)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Write a created document through the configured qpdf writer and
+    /// complete the shared warning/status boundary.
+    pub fn write_qpdf<R>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode>
+    where
+        R: Read + Seek + 'static,
+    {
+        let Some(output) = self.configuration.output_file.clone() else {
+            return Ok(JobExitCode::Error);
+        };
+        let writer_configuration = self.configuration.writer.clone();
+        let progress_requested = self.configuration.progress;
+        let write_result = (|| {
+            let mut writer = PdfWriter::new(pdf);
+            writer_configuration.apply_to(&mut writer);
+            if progress_requested {
+                self.configure_writer_progress(&mut writer);
+            }
+            writer.set_output_file(&output)?;
+            writer.write()
+        })();
+        match write_result {
+            Ok(()) => {
+                self.record_document_warnings(pdf);
+                self.complete(true)
+            }
+            Err(error) => {
+                self.report_job_error(&error)?;
+                Ok(JobExitCode::Error)
+            }
+        }
+    }
+
+    /// Run the configured create/write or check lifecycle.
+    pub fn run(&mut self) -> Result<JobExitCode> {
+        let Some(mut pdf) = self.create_qpdf()? else {
+            return Ok(JobExitCode::Error);
+        };
+        if self.configuration.check || self.configuration.output_file.is_none() {
+            let check_result = self.check(&mut pdf);
+            return self.map_check_result(check_result);
+        }
+        self.write_qpdf(&mut pdf)
+    }
+
+    fn map_check_result(
+        &self,
+        result: std::result::Result<JobExitCode, super::check::CheckError>,
+    ) -> Result<JobExitCode> {
+        match result {
+            Ok(status) => Ok(status),
+            Err(super::check::CheckError::ErrorsDetected) => Ok(JobExitCode::Error),
+            Err(super::check::CheckError::Operation(error)) => {
+                self.report_job_error(&error)?;
+                Ok(JobExitCode::Error)
+            }
+        }
+    }
+
+    fn report_job_error(&self, error: &Error) -> Result<()> {
+        self.logger
+            .error(format!("{}: {error}\n", self.message_prefix))
     }
 
     /// Create a complete JSON-input document with this job's logger already
@@ -341,6 +586,22 @@ impl QPDFJob {
     }
 }
 
+fn parse_object_stream_mode(value: &str) -> Result<ObjectStreamMode> {
+    match value {
+        "preserve" => Ok(ObjectStreamMode::Preserve),
+        "disable" => Ok(ObjectStreamMode::Disable),
+        "generate" => Ok(ObjectStreamMode::Generate),
+        other => Err(Error::Unsupported(format!(
+            "qpdfjob: invalid objectStreams value {other}"
+        ))),
+    }
+}
+
+fn json_flag(value: &crate::json::Json, key: &[u8]) -> bool {
+    let value = value.get_dict_item(key);
+    value.get_bool().unwrap_or(false) || value.get_string().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +658,26 @@ mod tests {
                 PdfOpenOptions::default(),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn check_result_mapping_preserves_success_and_maps_both_errors() {
+        let job = QPDFJob::new();
+        assert_eq!(
+            job.map_check_result(Ok(JobExitCode::Success)).unwrap(),
+            JobExitCode::Success
+        );
+        assert_eq!(
+            job.map_check_result(Err(super::super::check::CheckError::ErrorsDetected))
+                .unwrap(),
+            JobExitCode::Error
+        );
+        assert_eq!(
+            job.map_check_result(Err(super::super::check::CheckError::Operation(
+                Error::Internal("operation failed".to_owned()),
+            )))
+            .unwrap(),
+            JobExitCode::Error
+        );
     }
 }

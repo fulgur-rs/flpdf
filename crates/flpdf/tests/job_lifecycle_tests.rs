@@ -90,8 +90,226 @@ fn new_job_matches_qpdf_defaults() {
     assert_eq!(job.logger(), QPDFLogger::default_logger());
     assert!(!job.has_warnings());
     assert_eq!(job.complete(false).unwrap(), JobExitCode::Success);
+    assert_eq!(JobExitCode::Error.as_i32(), 2);
     assert_eq!(JobExitCode::Success.as_i32(), 0);
     assert_eq!(JobExitCode::Warning.as_i32(), 3);
+}
+
+#[test]
+fn argv_job_run_writes_output_and_reports_progress() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("argv-output.pdf");
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--deterministic-id".to_owned(),
+        "--progress".to_owned(),
+        "--password=unused".to_owned(),
+        "--decrypt".to_owned(),
+        "--object-streams=disable".to_owned(),
+        "--".to_owned(),
+    ];
+    let progress = Arc::new(Mutex::new(Vec::new()));
+    let progress_for_job = Arc::clone(&progress);
+    let mut job = QPDFJob::new();
+    job.register_progress_reporter(move |percent| {
+        progress_for_job.lock().unwrap().push(percent);
+    });
+    job.initialize_from_argv(&args).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.exists());
+    let progress = progress.lock().unwrap();
+    assert_eq!(progress.first(), Some(&0));
+    assert_eq!(progress.last(), Some(&100));
+}
+
+#[test]
+fn argv_job_run_returns_warning_status_for_repairable_input() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/test_driver/repairable_input.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("warning-output.pdf");
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--static-id".to_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    assert!(output.exists());
+}
+
+#[test]
+fn json_job_run_writes_output_with_static_id_and_generated_object_streams() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("json-output.pdf");
+    let json = format!(
+        "{{\n  \"inputFile\": \"{}\",\n  \"outputFile\": \"{}\",\n  \"staticId\": \"\",\n  \"decrypt\": \"\",\n  \"progress\": \"\",\n  \"objectStreams\": \"generate\"\n}}",
+        input.display(),
+        output.display()
+    );
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    assert!(output.exists());
+    let bytes = std::fs::read(output).unwrap();
+    assert!(bytes
+        .windows(b"/Type /ObjStm".len())
+        .any(|window| { window == b"/Type /ObjStm" }));
+}
+
+#[test]
+fn create_qpdf_and_write_qpdf_are_separate_job_boundaries() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("separate-output.pdf");
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--static-id".to_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+
+    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Success);
+    assert!(output.exists());
+}
+
+#[test]
+fn write_qpdf_failure_returns_qpdf_error_status() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        tempdir.path().to_string_lossy().into_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+
+    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Error);
+}
+
+#[test]
+fn write_qpdf_without_an_output_returns_qpdf_error_status() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let args = vec!["qpdfjob".to_owned(), input.to_string_lossy().into_owned()];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+    let mut pdf = job.create_qpdf().unwrap().expect("input should open");
+
+    assert_eq!(job.write_qpdf(&mut pdf).unwrap(), JobExitCode::Error);
+}
+
+#[test]
+fn missing_input_returns_qpdf_error_status_without_panicking() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let args = vec![
+        "qpdfjob".to_owned(),
+        tempdir
+            .path()
+            .join("missing.pdf")
+            .to_string_lossy()
+            .into_owned(),
+        tempdir
+            .path()
+            .join("output.pdf")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+}
+
+#[test]
+fn unknown_qpdf_job_argv_is_a_usage_error() {
+    let args = vec!["qpdfjob".to_owned(), "--not-a-qpdf-option".to_owned()];
+    let mut job = QPDFJob::new();
+
+    assert!(job.initialize_from_argv(&args).is_err());
+}
+
+#[test]
+fn argv_usage_rejects_short_options_too_many_positionals_and_missing_input() {
+    let mut job = QPDFJob::new();
+    assert!(job
+        .initialize_from_argv(&["qpdfjob".to_owned(), "-x".to_owned()])
+        .is_err());
+
+    let mut job = QPDFJob::new();
+    assert!(job
+        .initialize_from_argv(&[
+            "qpdfjob".to_owned(),
+            "a.pdf".to_owned(),
+            "b.pdf".to_owned(),
+            "c.pdf".to_owned(),
+        ])
+        .is_err());
+
+    let mut job = QPDFJob::new();
+    assert!(job.initialize_from_argv(&["qpdfjob".to_owned()]).is_err());
+}
+
+#[test]
+fn create_qpdf_reports_unconfigured_and_malformed_inputs() {
+    let mut job = QPDFJob::new();
+    assert!(job.create_qpdf().unwrap().is_none());
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let malformed = tempdir.path().join("malformed.pdf");
+    std::fs::write(&malformed, b"not a PDF").unwrap();
+    let args = vec![
+        "qpdfjob".to_owned(),
+        malformed.to_string_lossy().into_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+    assert!(job.create_qpdf().unwrap().is_none());
+}
+
+#[test]
+fn run_check_and_check_operation_failure_map_to_error_status() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        "--check".to_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+
+    let logger = QPDFLogger::create();
+    logger.set_info(Some(PipelineHandle::new(FailingSink)));
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_argv(&args).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+}
+
+#[test]
+fn invalid_qpdf_job_json_is_rejected_at_initialization() {
+    let mut job = QPDFJob::new();
+    assert!(job.initialize_from_json("[]").is_err());
+    assert!(job
+        .initialize_from_json("{\"outputFile\":\"out.pdf\"}")
+        .is_err());
+    assert!(job
+        .initialize_from_json("{\"inputFile\":\"input.pdf\",\"objectStreams\":\"unknown\"}")
+        .is_err());
 }
 
 #[test]
