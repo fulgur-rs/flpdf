@@ -489,7 +489,7 @@ impl QPDFJob {
         ) {
             if crate::qutil::same_file(input, output) {
                 return Err(Error::Unsupported(
-                    "input file and output file are the same; use --replace-input to intentionally overwrite the input".to_owned(),
+                    "input file and output file are the same; use --replace-input to intentionally overwrite the input file".to_owned(),
                 ));
             }
         }
