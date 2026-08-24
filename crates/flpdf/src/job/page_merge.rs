@@ -1269,6 +1269,32 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // member of `page_closure`: doing so would promote a nested unselected
         // Page null reservation to a top-level page copy, which qpdf does not
         // do.
+        // qpdf keeps the primary Catalog and `/Pages` identities in place
+        // while `handlePageSpecs` adds selected pages. Pre-register those
+        // identities in the canonical per-source ObjCopier before copying a
+        // selected page, so a page graph that points back to either root
+        // reuses the destination's existing roots instead of creating a
+        // detached duplicate (`QPDF.cc:2019-2093`).
+        let source_id = input.source.unique_id();
+        let mut copy_seed = target.take_foreign_object_map(source_id);
+        if is_primary && preserve_primary_unreferenced {
+            let primary_catalog_ref = input
+                .source
+                .root_ref()
+                .expect("page_refs above already required a resolvable /Root");
+            let target_catalog_ref = target
+                .root_ref()
+                .expect("Pdf::empty always populates a root catalog");
+            let primary_pages_ref = input
+                .source
+                .resolve_object(primary_catalog_ref)?
+                .as_dict()
+                .and_then(|dict| dict.get_ref("Pages"))
+                .expect("page_refs above already required an indirect primary /Pages");
+            copy_seed.insert(primary_catalog_ref, target_catalog_ref);
+            copy_seed.insert(primary_pages_ref, pages_root_ref);
+        }
+        target.set_foreign_object_map(source_id, copy_seed);
         for &page_ref in &unique {
             let source_page = input.source.get_object_handle(page_ref);
             let copied_page = target.copy_foreign_object(&source_page)?;
@@ -1280,7 +1306,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
             }
             // cov:ignore-end
         }
-        let mut copy_seed = target.take_foreign_object_map(input.source.unique_id());
+        let copy_seed = target.take_foreign_object_map(source_id);
 
         // Fold the primary's document-level carriers (outline tree, name-tree
         // /Dests, legacy /Dests, /OpenAction) into the raw bridge closure
@@ -1361,29 +1387,6 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
                 primary_live.push(object_ref);
             }
             closure.extend(primary_live.iter().copied());
-            // `page_refs(input.source)` above already succeeded for this same
-            // primary in this same loop iteration (nothing between the two
-            // calls mutates `input.source`'s catalog/`/Pages`), which
-            // requires `/Root` to resolve to a dictionary and its `/Pages`
-            // entry to be an indirect reference (`PageWalk::with_max_depth`,
-            // `pages.rs:826-833`). Both `expect`s below encode that already-
-            // proven invariant rather than re-deriving a fallback path qpdf
-            // has no counterpart for.
-            let primary_catalog_ref = input
-                .source
-                .root_ref()
-                .expect("page_refs above already required a resolvable /Root");
-            let target_catalog_ref = target
-                .root_ref()
-                .expect("Pdf::empty always populates a root catalog");
-            copy_seed.insert(primary_catalog_ref, target_catalog_ref);
-            let primary_pages_ref = input
-                .source
-                .resolve_object(primary_catalog_ref)?
-                .as_dict()
-                .and_then(|dict| dict.get_ref("Pages"))
-                .expect("page_refs above already required an indirect primary /Pages");
-            copy_seed.insert(primary_pages_ref, pages_root_ref);
             primary_live
         } else {
             Vec::new()
@@ -1393,7 +1396,7 @@ pub(crate) fn merge_documents_with_resource_mode_and_preserve_primary<R: Read + 
         // ObjectHandle route above. Keep those source refs out of the raw
         // closure bridge so it only handles the primary metadata and the
         // explicitly requested preserved orphan universe.
-        closure.retain(|source_ref| !page_closure.contains(source_ref));
+        closure.retain(|source_ref| !copy_seed.contains_key(source_ref));
 
         // qpdf `--pages` null-out parity is page-tree driven: after every closure
         // root has been folded, the selected page set determines which copied

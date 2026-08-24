@@ -7,6 +7,7 @@
 //! those objects as well.
 
 use assert_cmd::Command;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
@@ -16,6 +17,31 @@ fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(name)
+}
+
+fn write_pdf_fixture(path: &Path, objects: &[(u32, &str)], root: u32) {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    let max = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+    for (number, body) in objects {
+        offsets.insert(*number, bytes.len() as u64);
+        bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_offset = bytes.len();
+    let size = max + 1;
+    bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..=max {
+        match offsets.get(&number) {
+            Some(offset) => bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            .as_bytes(),
+    );
+    std::fs::write(path, bytes).expect("synthetic PDF fixture should be writable");
 }
 
 fn qpdf_available() -> bool {
@@ -257,6 +283,158 @@ fn multi_source_pages_preserve_orphan_reference_to_primary_catalog_resolves_to_t
     );
 }
 
+#[test]
+fn selected_page_back_reference_to_primary_catalog_resolves_to_target_catalog() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = temp.path().join("primary-selected-backref.pdf");
+    write_pdf_fixture(
+        &primary,
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Owner 1 0 R >>",
+            ),
+        ],
+        1,
+    );
+    let foreign = fixture("one-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_result = run_qpdf(&[
+        "--preserve-unreferenced",
+        "--pages",
+        ".",
+        "1",
+        foreign.to_str().unwrap(),
+        "1",
+        "--",
+        "--static-id",
+        primary.to_str().unwrap(),
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf selected-page back-reference merge failed: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--preserve-unreferenced", "--pages", ".", "1"])
+        .arg(&foreign)
+        .arg("1")
+        .arg("--")
+        .arg("--static-id")
+        .arg(&primary)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_qdf_path = temp.path().join("qpdf-qdf.pdf");
+    let flpdf_qdf_path = temp.path().join("flpdf-qdf.pdf");
+    let qpdf_qdf = normalize_qdf(&qpdf_output, &qpdf_qdf_path);
+    let flpdf_qdf = normalize_qdf(&flpdf_output, &flpdf_qdf_path);
+
+    for (label, qdf) in [("qpdf", &qpdf_qdf), ("flpdf", &flpdf_qdf)] {
+        assert_eq!(
+            catalog_object_numbers(qdf).len(),
+            1,
+            "{label} output must contain one Catalog"
+        );
+        assert_eq!(
+            owner_reference_target(qdf),
+            Some(catalog_object_numbers(qdf)[0]),
+            "{label} selected page /Owner must resolve to the output Catalog"
+        );
+    }
+}
+
+#[test]
+fn selected_page_indirect_null_is_retained_by_preserve_unreferenced() {
+    if !qpdf_available() {
+        if std::env::var_os("CI").is_some() {
+            panic!("qpdf 11.9.0 is required for this parity test on CI");
+        }
+        eprintln!("skipping: qpdf 11.9.0 is not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let primary = temp.path().join("primary-selected-null.pdf");
+    write_pdf_fixture(
+        &primary,
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Foo 4 0 R >>",
+            ),
+            (4, "null"),
+        ],
+        1,
+    );
+    let foreign = fixture("one-page.pdf");
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_result = run_qpdf(&[
+        "--preserve-unreferenced",
+        "--pages",
+        ".",
+        "1",
+        foreign.to_str().unwrap(),
+        "1",
+        "--",
+        "--static-id",
+        primary.to_str().unwrap(),
+        qpdf_output.to_str().unwrap(),
+    ]);
+    assert!(
+        qpdf_result.status.success(),
+        "qpdf selected-page indirect-null merge failed: {}",
+        String::from_utf8_lossy(&qpdf_result.stderr)
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--preserve-unreferenced", "--pages", ".", "1"])
+        .arg(&foreign)
+        .arg("1")
+        .arg("--")
+        .arg("--static-id")
+        .arg(&primary)
+        .arg(&flpdf_output)
+        .assert()
+        .success();
+
+    let qpdf_qdf_path = temp.path().join("qpdf-qdf.pdf");
+    let flpdf_qdf_path = temp.path().join("flpdf-qdf.pdf");
+    let qpdf_qdf = normalize_qdf(&qpdf_output, &qpdf_qdf_path);
+    let flpdf_qdf = normalize_qdf(&flpdf_output, &flpdf_qdf_path);
+    assert_eq!(
+        null_object_numbers(&qpdf_qdf).len(),
+        1,
+        "qpdf must retain the selected page's indirect null object"
+    );
+    assert_eq!(
+        null_object_numbers(&flpdf_qdf).len(),
+        null_object_numbers(&qpdf_qdf).len(),
+        "flpdf must retain the same indirect null object under preserve-unreferenced"
+    );
+}
+
 /// Object numbers of every top-level `/Type /Catalog` object in `qdf`
 /// (QDF-normalized, one object per `N 0 obj` line). A well-formed merge
 /// output has exactly one.
@@ -286,6 +464,15 @@ fn owner_reference_target(qdf: &[u8]) -> Option<u32> {
         .unwrap()
         .captures(text)
         .map(|capture| capture[1].parse().unwrap())
+}
+
+fn null_object_numbers(qdf: &[u8]) -> Vec<u32> {
+    let text = String::from_utf8_lossy(qdf);
+    regex::Regex::new(r"(?m)^(\d+) 0 obj\nnull\nendobj")
+        .unwrap()
+        .captures_iter(&text)
+        .map(|capture| capture[1].parse().unwrap())
+        .collect()
 }
 
 /// When the primary itself already uses object streams, a compressed
