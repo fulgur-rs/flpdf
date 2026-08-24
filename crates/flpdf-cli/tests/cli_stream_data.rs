@@ -94,6 +94,21 @@ fn rewrite_with_args(src: &[u8], extra_args: &[&str]) -> Vec<u8> {
     std::fs::read(&out_path).unwrap()
 }
 
+fn top_level_rewrite_with_args(src: &[u8], extra_args: &[&str]) -> Vec<u8> {
+    let temp = tempfile::tempdir().unwrap();
+    let in_path = temp.path().join("in.pdf");
+    let out_path = temp.path().join("out.pdf");
+    std::fs::write(&in_path, src).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let mut args = extra_args.to_vec();
+    args.push(in_path.to_str().unwrap());
+    args.push(out_path.to_str().unwrap());
+    cmd.args(&args).assert().success();
+
+    std::fs::read(&out_path).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Helper: extract object `4 0 R` as a Stream from an in-memory PDF.
 // ---------------------------------------------------------------------------
@@ -135,6 +150,48 @@ fn cli_stream_data_preserve_keeps_filter() {
         raw,
         "preserve must yield the original raw payload after decode"
     );
+}
+
+#[test]
+fn cli_top_level_stream_data_modes_reach_the_writer() {
+    let raw = b"top-level stream-data payload: route all three modes";
+    let src = build_pdf_with_flate_stream(raw);
+
+    for (mode, filter_expected) in [
+        ("preserve", true),
+        ("uncompress", false),
+        ("compress", true),
+    ] {
+        let flag = format!("--stream-data={mode}");
+        let out = top_level_rewrite_with_args(&src, &["--static-id", flag.as_str()]);
+        let stream = extract_obj4(&out);
+        assert_eq!(
+            stream.dict.get("Filter").is_some(),
+            filter_expected,
+            "top-level --stream-data={mode} routed to the wrong writer mode"
+        );
+    }
+}
+
+#[test]
+fn cli_top_level_stream_data_overrides_compress_streams() {
+    let raw = b"top-level stream-data precedence payload";
+    let src = build_pdf_with_flate_stream(raw);
+    let out = top_level_rewrite_with_args(
+        &src,
+        &[
+            "--static-id",
+            "-stream-data=uncompress",
+            "--compress-streams=y",
+        ],
+    );
+
+    let stream = extract_obj4(&out);
+    assert!(
+        stream.dict.get("Filter").is_none(),
+        "top-level --stream-data=uncompress must override --compress-streams=y"
+    );
+    assert_eq!(stream.data, raw);
 }
 
 // ---------------------------------------------------------------------------
