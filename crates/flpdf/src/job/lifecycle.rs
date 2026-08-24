@@ -18,7 +18,7 @@ use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-type ProgressHandler = Box<dyn FnMut(u8) + 'static>;
+type ProgressHandler = Box<dyn FnMut(u8) -> Result<()> + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
 
 struct JobOutputPipeline(PipelineHandle);
@@ -167,10 +167,12 @@ impl QPDFJob {
     /// The callback is shared rather than moved into one writer so the same
     /// job can configure multiple output stages while retaining one callback
     /// registration. The writer owns the qpdf event accounting and invokes
-    /// this callback only after its internal borrow is released.
+    /// this callback only after its internal borrow is released. A callback
+    /// error aborts the active writer, matching qpdf's exception propagation
+    /// from QPDFWriter::indicateProgress.
     pub fn register_progress_reporter<F>(&mut self, reporter: F)
     where
-        F: FnMut(u8) + 'static,
+        F: FnMut(u8) -> Result<()> + 'static,
     {
         self.progress_handler = Some(Rc::new(RefCell::new(Box::new(reporter))));
     }
@@ -198,17 +200,16 @@ impl QPDFJob {
                         |path| path.display().to_string(),
                     );
                 let callback: ProgressHandler = Box::new(move |percent| {
-                    let _ = logger.info(format!(
+                    logger.info(format!(
                         "{prefix}: {output_name}: write progress: {percent}%\n"
-                    ));
+                    ))
                 });
                 Rc::new(RefCell::new(callback))
             }
             None => return,
         };
-        writer.register_progress_reporter(Box::new(move |percent| {
-            (reporter.borrow_mut())(percent);
-        }));
+        writer
+            .register_progress_reporter(Box::new(move |percent| (reporter.borrow_mut())(percent)));
     }
 
     /// Initialize the portable qpdf-job argument surface used by qtest.

@@ -39,7 +39,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 layout
                     .uncompressed
                     .insert(output.number, (output.generation, offset));
-                crate::writer::report_progress_event(options);
+                crate::writer::report_progress_event(options)?;
             }
             PlannedIndirectObject::ObjectStream {
                 origin,
@@ -69,7 +69,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                             &plan.removed_refs,
                         );
                         if result.is_ok() {
-                            crate::writer::report_progress_event(options);
+                            crate::writer::report_progress_event(options)?;
                         }
                         result
                     },

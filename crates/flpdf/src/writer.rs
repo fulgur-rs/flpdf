@@ -560,7 +560,16 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
         }
     }
 
-    pub fn register_progress_reporter(&mut self, reporter: Box<dyn FnMut(u8) + 'static>) {
+    /// Register a qpdf progress callback.
+    ///
+    /// The callback's error is returned from [`PdfWriter::write`] at the
+    /// progress event that raised it; it is not deferred until a completed
+    /// write. This is the Rust equivalent of qpdf's exception propagation
+    /// from QPDFWriter::ProgressReporter::reportProgress.
+    pub fn register_progress_reporter(
+        &mut self,
+        reporter: Box<dyn FnMut(u8) -> crate::Result<()> + 'static>,
+    ) {
         self.settings.progress_reporter = Some(ProgressReporter::new(reporter));
     }
 
@@ -646,7 +655,7 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             }
         };
 
-        report_progress_finished(&options);
+        report_progress_finished(&options)?;
         self.result = Some(result);
         self.write_succeeded = true;
         Ok(())
@@ -1196,8 +1205,10 @@ impl V5Randomness {
 /// `WriterOptions` is cloneable because the full-rewrite preflight creates
 /// short-lived option snapshots. Keeping the callback behind shared interior
 /// mutability preserves that property while still allowing each snapshot to
-/// report to the one registered qpdf progress reporter.
-type ProgressCallback = Box<dyn FnMut(u8) + 'static>;
+/// report to the one registered qpdf progress reporter. The callback is
+/// fallible so a pipeline failure can abort the active writer like qpdf's
+/// uncaught progress-reporter exception.
+type ProgressCallback = Box<dyn FnMut(u8) -> crate::Result<()> + 'static>;
 type SharedProgressCallback = Rc<RefCell<ProgressCallback>>;
 type SharedProgressState = Rc<RefCell<ProgressStateInner>>;
 
@@ -1208,15 +1219,15 @@ pub(crate) struct ProgressReporter {
 }
 
 impl ProgressReporter {
-    pub(crate) fn new(reporter: Box<dyn FnMut(u8) + 'static>) -> Self {
+    pub(crate) fn new(reporter: Box<dyn FnMut(u8) -> crate::Result<()> + 'static>) -> Self {
         Self {
             callback: Rc::new(RefCell::new(reporter)),
             state: Rc::new(RefCell::new(ProgressStateInner::default())),
         }
     }
 
-    pub(crate) fn report(&self, percent: u8) {
-        (self.callback.borrow_mut())(percent);
+    pub(crate) fn report(&self, percent: u8) -> crate::Result<()> {
+        (self.callback.borrow_mut())(percent)
     }
 
     pub(crate) fn configure(&self, events_expected: usize) {
@@ -1232,12 +1243,12 @@ impl ProgressReporter {
     /// snapshot while a linearized file performs both passes. The callback is
     /// invoked after the state borrow is released so a reporter can safely
     /// observe external state without extending the writer's interior borrow.
-    pub(crate) fn indicate(&self, decrement: bool, finished: bool) {
+    pub(crate) fn indicate(&self, decrement: bool, finished: bool) -> crate::Result<()> {
         let progress = {
             let mut state = self.state.borrow_mut();
             if decrement {
                 state.events_seen = state.events_seen.saturating_sub(1);
-                return;
+                return Ok(());
             }
 
             state.events_seen = state.events_seen.saturating_add(1);
@@ -1262,8 +1273,9 @@ impl ProgressReporter {
         };
 
         if let Some(progress) = progress {
-            self.report(progress);
+            self.report(progress)?;
         }
+        Ok(())
     }
 }
 
@@ -1621,22 +1633,25 @@ pub(crate) fn configure_progress(options: &WriterOptions, object_count: usize, l
     } // cov:ignore: LLVM maps this closing brace as an executable branch line
 }
 
-pub(crate) fn report_progress_event(options: &WriterOptions) {
+pub(crate) fn report_progress_event(options: &WriterOptions) -> Result<()> {
     if let Some(reporter) = options.progress_reporter.as_ref() {
-        reporter.indicate(false, false);
+        reporter.indicate(false, false)?;
     }
+    Ok(())
 }
 
-pub(crate) fn decrement_progress_event(options: &WriterOptions) {
+pub(crate) fn decrement_progress_event(options: &WriterOptions) -> Result<()> {
     if let Some(reporter) = options.progress_reporter.as_ref() {
-        reporter.indicate(true, false);
+        reporter.indicate(true, false)?;
     }
+    Ok(())
 }
 
-pub(crate) fn report_progress_finished(options: &WriterOptions) {
+pub(crate) fn report_progress_finished(options: &WriterOptions) -> Result<()> {
     if let Some(reporter) = options.progress_reporter.as_ref() {
-        reporter.indicate(false, true);
+        reporter.indicate(false, true)?;
     }
+    Ok(())
 }
 
 /// True when `--force-version` pins the output header below PDF 1.5.
@@ -3788,7 +3803,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 offsets.insert(output.number, (0, offset));
             }
         }
-        report_progress_event(options);
+        report_progress_event(options)?;
     }
 
     let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
@@ -4841,7 +4856,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
         emitted_old_to_new.insert(*old_ref, ObjectRef::new(emit_ref.number, 0));
-        report_progress_event(options);
+        report_progress_event(options)?;
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -4891,7 +4906,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             &mut |out, _member_index, _member_ref, handle| {
                 let result = handle.write_object_with_ref_map_and_removed(out, &map, &removed_refs);
                 if result.is_ok() {
-                    report_progress_event(options);
+                    report_progress_event(options)?;
                 }
                 result
             },
@@ -10206,7 +10221,7 @@ mod tests {
 
     #[test]
     fn progress_reporter_debug_uses_qpdf_writer_shape() {
-        let reporter = ProgressReporter::new(Box::new(|_| {}));
+        let reporter = ProgressReporter::new(Box::new(|_| Ok(())));
 
         assert_eq!(format!("{reporter:?}"), "ProgressReporter(..)");
     }
@@ -10218,13 +10233,14 @@ mod tests {
         let options = WriterOptions {
             progress_reporter: Some(ProgressReporter::new(Box::new(move |percent| {
                 events_for_reporter.borrow_mut().push(percent);
+                Ok(())
             }))),
             ..WriterOptions::default()
         };
 
         configure_progress(&options, 2, true);
-        report_progress_event(&options);
-        report_progress_finished(&options);
+        report_progress_event(&options).unwrap();
+        report_progress_finished(&options).unwrap();
 
         assert_eq!(&*events.borrow(), &[0, 100]);
     }

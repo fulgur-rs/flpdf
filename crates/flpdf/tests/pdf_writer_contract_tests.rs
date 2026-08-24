@@ -295,6 +295,7 @@ fn flpdf_progress_for_bytes(source: &[u8], linearized: bool) -> flpdf::Result<(V
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -311,6 +312,7 @@ fn flpdf_qdf_progress_for_bytes(source: &[u8]) -> flpdf::Result<Vec<u8>> {
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -326,11 +328,31 @@ fn flpdf_decode_level_progress_for_bytes(source: &[u8]) -> flpdf::Result<Vec<u8>
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
     let events = events.borrow().clone();
     Ok(events)
+}
+
+#[test]
+fn progress_reporter_failures_abort_pdf_writer_write() {
+    let mut pdf = open_minimal_pdf().unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+        Err(flpdf::Error::System("progress reporter failure".to_owned()))
+    }));
+    writer.set_output_memory().unwrap();
+
+    assert!(matches!(
+        writer.write(),
+        Err(flpdf::Error::System(message)) if message == "progress reporter failure"
+    ));
+    assert_eq!(&*events.borrow(), &[0]);
 }
 
 struct FailingWriter;
@@ -2928,6 +2950,7 @@ fn pdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -2985,6 +3008,7 @@ fn pdf_writer_progress_throttles_large_documents() -> flpdf::Result<()> {
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -3020,6 +3044,7 @@ fn pdf_writer_objstm_progress_counts_members_not_containers() -> flpdf::Result<(
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -3082,6 +3107,7 @@ fn pdf_writer_linearized_objstm_progress_accounts_for_pass_one() -> flpdf::Resul
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -3106,6 +3132,7 @@ fn pdf_writer_failure_does_not_report_success() -> flpdf::Result<()> {
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_writer(FailingWriter)?;
 
@@ -3153,10 +3180,12 @@ fn pdf_writer_re_registration_uses_the_latest_reporter() -> flpdf::Result<()> {
     let old_events_for_reporter = Rc::clone(&old_events);
     writer.register_progress_reporter(Box::new(move |percent| {
         old_events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     let new_events_for_reporter = Rc::clone(&new_events);
     writer.register_progress_reporter(Box::new(move |percent| {
         new_events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;
@@ -3178,6 +3207,7 @@ fn pdf_writer_progress_callback_panic_does_not_reach_success() -> flpdf::Result<
         if percent == 0 {
             panic!("progress callback failure");
         }
+        Ok(())
     }));
     writer.set_output_memory()?;
 
@@ -3198,6 +3228,7 @@ fn pdf_writer_linearization_reports_progress_before_sink_completion() -> flpdf::
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
+        Ok(())
     }));
     writer.set_output_memory()?;
     writer.write()?;

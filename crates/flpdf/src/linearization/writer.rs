@@ -2297,7 +2297,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Catalog references are valid by construction.
         xref_offsets.insert(catalog_new_ref.number, offset);
-        report_progress_event(options);
+        report_progress_event(options)?;
         catalog_emitted_early = true;
     }
 
@@ -2336,7 +2336,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced open-document references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options);
+        report_progress_event(options)?;
     }
 
     // Open-document ObjStm containers (qpdf part4).  qpdf places the
@@ -2359,16 +2359,16 @@ fn do_write_pass<R: Read + Seek>(
         xref_offsets.insert(container.container_new_num, offset);
         for _ in &container.members {
             if pass1_digest {
-                decrement_progress_event(options);
+                decrement_progress_event(options)?;
             }
-            report_progress_event(options);
+            report_progress_event(options)?;
             if pass1_digest {
                 // qpdf's writeObjectStream performs an offset-measuring pass
                 // followed by the payload pass inside each outer linearization
                 // pass. The first outer pass therefore reports each member
                 // twice after the decrement, while the final pass's net effect
                 // is one event (QPDFWriter.cc:1639-1707).
-                report_progress_event(options);
+                report_progress_event(options)?;
             }
         }
     }
@@ -2450,7 +2450,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Part-2 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options);
+        report_progress_event(options)?;
     }
 
     // Part 3 (Annex F) continued: shared objects sit INSIDE the first-page
@@ -2489,7 +2489,7 @@ fn do_write_pass<R: Read + Seek>(
             &plan.content_normalize_refs,
         )?; // cov:ignore: planner-produced Part-3 references are valid by construction.
         xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options);
+        report_progress_event(options)?;
     }
 
     // Part-3 ObjStm containers.  These hold shared/catalog members and MUST
@@ -2509,11 +2509,11 @@ fn do_write_pass<R: Read + Seek>(
         xref_offsets.insert(container.container_new_num, offset);
         for _ in &container.members {
             if pass1_digest {
-                decrement_progress_event(options);
+                decrement_progress_event(options)?;
             }
-            report_progress_event(options);
+            report_progress_event(options)?;
             if pass1_digest {
-                report_progress_event(options);
+                report_progress_event(options)?;
             }
         }
     }
@@ -2621,7 +2621,7 @@ fn do_write_pass<R: Read + Seek>(
                     &plan.content_normalize_refs,
                 )?; // cov:ignore: planner-produced Part-4 references are valid by construction.
                 xref_offsets.insert(new_ref.number, offset);
-                report_progress_event(options);
+                report_progress_event(options)?;
             }
             Part4Emit::Container(container) => {
                 let offset = append_objstm_container_object(
@@ -2636,11 +2636,11 @@ fn do_write_pass<R: Read + Seek>(
                 xref_offsets.insert(container.container_new_num, offset);
                 for _ in &container.members {
                     if pass1_digest {
-                        decrement_progress_event(options);
+                        decrement_progress_event(options)?;
                     }
-                    report_progress_event(options);
+                    report_progress_event(options)?;
                     if pass1_digest {
-                        report_progress_event(options);
+                        report_progress_event(options)?;
                     }
                 }
             }
