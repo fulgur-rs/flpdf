@@ -618,7 +618,7 @@ q2fo は AcroForm について旧 `json_inspect` 経路を削除し、ヘルパ�
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QUtil.cc` | 2003 | `qutil.rs`（`utf8_to_ascii`/`utf8_to_win_ansi`/`utf8_to_mac_roman`、qpdf `QUtil.cc:1528-1667`）をcanonicalな単一バイトUTF-8変換の責務として公開。password recovery側の別変換表はその読取り責務に限定され、AcroForm appearanceからは参照しない | 🔀 `QUtil`全体の移植ではなく、appearanceが必要とする3つのpublic conversion contractだけを先行移植 |
+| `QUtil.cc` | 2003 | `qutil.rs`（`same_file`、qpdf `QUtil.cc:574-610`、および `utf8_to_ascii`/`utf8_to_win_ansi`/`utf8_to_mac_roman`、qpdf `QUtil.cc:1528-1667`）をcanonicalなQUtil責務として公開。password recovery側の別変換表はその読取り責務に限定され、AcroForm appearanceからは参照しない | 🔀 `QUtil`全体の移植ではなく、jobのfilesystem identity guardとappearanceが必要とする3つのpublic conversion contractを先行移植 |
 | `QTC.cc` | 50 | 無し | ❌ |
 | `BitStream.cc` / `BitWriter.cc` | 111 | `bit_stream.rs`（MSB-first bit 読み取り、Rust の error 値）/ `bit_writer.rs`（MSB-first bit 詰め、Pipeline stage）。production consumer は `linearization/hint_stream.rs`（hint stream の生成・読み取り）と `linearization/show.rs`（`read_h_page_offset` / `read_h_shared_object` / `read_h_generic` の hint decoder）、および `bit_writer.rs` 自身 | ✅ `flpdf-qxba.9.1` で cutover。`linearization/hint_stream.rs` 側に bit 実装は残っていない |
 | `Buffer.cc` / `MD5.cc` | 286 | `Vec<u8>` / 外部 crate | ⚪ |

@@ -7,6 +7,7 @@
 //! page-transform, and remaining inspection consumers are later job slices.
 
 use super::json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput};
+use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
     Error, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, Result, Severity,
     WriterConfiguration,
@@ -14,11 +15,27 @@ use crate::{
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 type ProgressHandler = Box<dyn FnMut(u8) + 'static>;
 type SharedProgressHandler = Rc<RefCell<ProgressHandler>>;
+
+struct JobOutputPipeline(PipelineHandle);
+
+impl Pipeline for JobOutputPipeline {
+    fn identifier(&self) -> &str {
+        "qpdf job output"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.0.write(data)
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        self.0.finish()
+    }
+}
 
 /// Portable writer/input state populated by the qpdf job argv/JSON boundary.
 ///
@@ -353,6 +370,10 @@ impl QPDFJob {
     /// Create the configured input document, returning `None` after qpdf-style
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<Pdf<BufReader<File>>>> {
+        if let Err(error) = self.check_configuration() {
+            self.report_job_error(&error)?;
+            return Ok(None);
+        }
         let Some(input) = self.configuration.input_file.clone() else {
             let error = Error::Unsupported("qpdfjob input file is not configured".to_owned());
             self.report_job_error(&error)?;
@@ -399,7 +420,12 @@ impl QPDFJob {
             if progress_requested {
                 self.configure_writer_progress(&mut writer);
             }
-            writer.set_output_file(&output)?;
+            if output == Path::new("-") {
+                self.logger.save_to_standard_output(true)?;
+                writer.set_output_pipeline(JobOutputPipeline(self.logger.get_save()?))?;
+            } else {
+                writer.set_output_file(&output)?;
+            }
             writer.write()
         })();
         match write_result {
@@ -445,6 +471,29 @@ impl QPDFJob {
                 Ok(JobExitCode::Error)
             }
         }
+    }
+
+    /// Apply qpdf's pre-open output destination and file-identity checks.
+    ///
+    /// This is the portable subset of `QPDFJob::checkConfiguration`
+    /// (`libqpdf/QPDFJob.cc:567-631`): stdout is reserved before the input is
+    /// opened, and `QUtil::same_file` rejects destructive aliases before the
+    /// writer can truncate them.
+    fn check_configuration(&self) -> Result<()> {
+        if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
+            self.logger.save_to_standard_output(true)?;
+        }
+        if let (Some(input), Some(output)) = (
+            self.configuration.input_file.as_deref(),
+            self.configuration.output_file.as_deref(),
+        ) {
+            if crate::qutil::same_file(input, output) {
+                return Err(Error::Unsupported(
+                    "input file and output file are the same; use --replace-input to intentionally overwrite the input".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn report_job_error(&self, error: &Error) -> Result<()> {
@@ -784,5 +833,12 @@ mod tests {
             )),
             "unknown option --bad"
         );
+    }
+
+    #[test]
+    fn job_output_pipeline_exposes_its_qpdf_identifier() {
+        let pipeline = JobOutputPipeline(PipelineHandle::new(crate::pipeline::Discard));
+
+        assert_eq!(pipeline.identifier(), "qpdf job output");
     }
 }

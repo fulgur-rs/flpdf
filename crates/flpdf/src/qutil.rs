@@ -1,4 +1,4 @@
-//! qpdf correspondence: `QUtil.cc` UTF-8 single-byte encoding primitives.
+//! qpdf correspondence: `QUtil.cc` filesystem identity and UTF-8 single-byte encoding primitives.
 //!
 //! This module owns the qpdf `QUtil::utf8_to_ascii`,
 //! `QUtil::utf8_to_win_ansi`, and `QUtil::utf8_to_mac_roman` behavior used by
@@ -6,6 +6,18 @@
 //! `libqpdf/QPDFFormFieldObjectHelper.cc:811-849`). It converts invalid or
 //! unrepresentable input to `?`, matching qpdf's default replacement argument.
 //! It does not own PDF resource lookup, font selection, or password policy.
+
+use std::path::Path;
+
+/// Return whether two existing paths identify the same filesystem object.
+///
+/// This is qpdf's `QUtil::same_file` (`libqpdf/QUtil.cc:574-610`): missing or
+/// otherwise uninspectable paths are not considered equal, while hard-link
+/// and symlink aliases compare by the underlying file identity.
+#[must_use]
+pub fn same_file(first: &Path, second: &Path) -> bool {
+    same_file::is_same_file(first, second).unwrap_or(false)
+}
 
 #[derive(Clone, Copy)]
 enum SingleByteEncoding {

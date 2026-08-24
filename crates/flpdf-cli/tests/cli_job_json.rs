@@ -69,3 +69,60 @@ fn job_json_file_preserves_qpdf_warning_status() {
 
     assert!(directory.path().join("output.pdf").is_file());
 }
+
+#[test]
+fn job_json_file_rejects_same_input_and_output_without_truncating_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let input = directory.path().join("input.pdf");
+    let output = directory.path().join("output.pdf");
+    fs::copy(fixture, &input).unwrap();
+    fs::hard_link(&input, &output).unwrap();
+    let before = fs::read(&input).unwrap();
+    fs::write(
+        directory.path().join("same.json"),
+        serde_json::json!({
+            "inputFile": input,
+            "outputFile": output,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=same.json")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "input file and output file are the same",
+        ));
+
+    assert_eq!(fs::read(&input).unwrap(), before);
+}
+
+#[test]
+fn job_json_file_dash_output_is_written_to_stdout() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("stdout.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"-"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=stdout.json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(!directory.path().join("-").exists());
+}

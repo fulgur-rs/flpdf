@@ -9,6 +9,7 @@ use flpdf::job::{
     PageSpecInput, QPDFJob, SplitPageOptions, UsageError,
 };
 use flpdf::pipeline::PipelineHandle;
+use flpdf::qutil::same_file as qpdf_same_file;
 use flpdf::writer::DecodeLevel as StreamDecodeLevel;
 use flpdf::{
     collate,
@@ -5364,11 +5365,11 @@ fn reject_same_file(
     inspect_label: &str,
 ) -> CliResult<()> {
     match std::fs::metadata(output) {
-        Ok(output_metadata) => {
+        Ok(_) => {
             // This is only a non-destructive hint: if inspecting the input
             // fails, the real input open below owns its path-specific error.
             // Output metadata failures remain fail-closed in the next arm.
-            if let Ok(true) = paths_identify_same_file(input, output, &output_metadata) {
+            if qpdf_same_file(input, output) {
                 return Err(same_file_message.into());
             }
         }
@@ -5426,28 +5427,6 @@ fn open_verified_json_output(input: &File, output: &Path) -> CliResult<File> {
         output_file.seek(SeekFrom::Start(0))?;
     }
     Ok(output_file)
-}
-
-#[cfg(unix)]
-fn paths_identify_same_file(
-    input: &Path,
-    _output: &Path,
-    output_metadata: &std::fs::Metadata,
-) -> std::io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-
-    let input_metadata = std::fs::metadata(input)?;
-    Ok(input_metadata.dev() == output_metadata.dev()
-        && input_metadata.ino() == output_metadata.ino())
-}
-
-#[cfg(not(unix))]
-fn paths_identify_same_file(
-    input: &Path,
-    output: &Path,
-    _output_metadata: &std::fs::Metadata,
-) -> std::io::Result<bool> {
-    same_file::is_same_file(input, output)
 }
 
 fn run_dump_object(

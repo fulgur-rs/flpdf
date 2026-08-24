@@ -219,6 +219,71 @@ fn json_job_run_writes_output_with_static_id_and_generated_object_streams() {
 }
 
 #[test]
+fn json_job_rejects_same_input_output_before_truncating_a_hard_link() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("input.pdf");
+    let output = tempdir.path().join("hard-link.pdf");
+    std::fs::copy(fixture, &input).unwrap();
+    std::fs::hard_link(&input, &output).unwrap();
+    let before = std::fs::read(&input).unwrap();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+    })
+    .to_string();
+
+    let mut job = QPDFJob::new();
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+}
+
+#[test]
+fn json_job_dash_output_uses_the_job_save_pipeline() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("input.pdf");
+    std::fs::copy(fixture, &input).unwrap();
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": "-",
+    })
+    .to_string();
+    let logger = QPDFLogger::create();
+    let state = Arc::new(Mutex::new(SinkState::default()));
+    logger
+        .set_save(
+            Some(PipelineHandle::new(RecordingSink {
+                state: Arc::clone(&state),
+            })),
+            false,
+        )
+        .unwrap();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json(&json).unwrap();
+    let dash = Path::new("-");
+    let _ = std::fs::remove_file(dash);
+
+    let status = job.run().unwrap();
+    let bytes = state.lock().unwrap().bytes.clone();
+    let literal_dash_exists = dash.exists();
+    let _ = std::fs::remove_file(dash);
+
+    assert_eq!(status, JobExitCode::Success);
+    assert!(
+        bytes.starts_with(b"%PDF-"),
+        "stdout sink must receive PDF bytes"
+    );
+    assert!(
+        !literal_dash_exists,
+        "dash must not be opened as a literal output path"
+    );
+}
+
+#[test]
 fn json_job_without_output_is_a_usage_error() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let json = serde_json::json!({"inputFile": input}).to_string();

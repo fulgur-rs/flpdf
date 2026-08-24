@@ -24,6 +24,7 @@ hex.workspace = true
 getrandom.workspace = true
 libc.workspace = true
 stacker.workspace = true
+same-file.workspace = true
 # Not used directly: `ar_archive_writer` is `stacker`'s transitive
 # build-dependency (via `psm`). Declaring it here is what makes the
 # `=0.5.1` MSRV pin in the workspace `[workspace.dependencies]` an active
