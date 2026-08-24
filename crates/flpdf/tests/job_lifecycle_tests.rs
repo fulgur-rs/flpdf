@@ -82,6 +82,35 @@ fn logger_with_warning_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
+fn xref_stream_with_extra_data() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let xref_offset = bytes.len();
+    let xref_header =
+        b"1 0 obj\n<< /Type /XRef /Size 4 /Root 2 0 R /W [1 3 1] /Index [0 4] /Length 21 >>\nstream\n";
+    let xref_tail = b"\nendstream\nendobj\n";
+    let catalog_offset = xref_offset + xref_header.len() + 21 + xref_tail.len();
+    let catalog = b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n";
+    let pages_offset = catalog_offset + catalog.len();
+    let pages = b"3 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n";
+
+    let mut entries = Vec::with_capacity(21);
+    entries.extend_from_slice(&[0, 0, 0, 0xff, 0xff]);
+    for offset in [xref_offset, catalog_offset, pages_offset] {
+        entries.push(1);
+        entries.extend_from_slice(&(offset as u32).to_be_bytes()[1..]);
+        entries.push(0);
+    }
+    entries.push(0);
+
+    bytes.extend_from_slice(xref_header);
+    bytes.extend_from_slice(&entries);
+    bytes.extend_from_slice(xref_tail);
+    bytes.extend_from_slice(catalog);
+    bytes.extend_from_slice(pages);
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
 #[test]
 fn new_job_matches_qpdf_defaults() {
     let job = QPDFJob::default();
@@ -146,6 +175,25 @@ fn argv_job_run_returns_warning_status_for_repairable_input() {
 }
 
 #[test]
+fn xref_stream_extra_data_produces_qpdf_warning_status() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let input = tempdir.path().join("xref-extra.pdf");
+    let output = tempdir.path().join("xref-extra-output.pdf");
+    std::fs::write(&input, xref_stream_with_extra_data()).unwrap();
+    let args = vec![
+        "qpdfjob".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--static-id".to_owned(),
+    ];
+    let mut job = QPDFJob::new();
+    job.initialize_from_argv(&args).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Warning);
+    assert!(output.exists());
+}
+
+#[test]
 fn json_job_run_writes_output_with_static_id_and_generated_object_streams() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
@@ -168,6 +216,17 @@ fn json_job_run_writes_output_with_static_id_and_generated_object_streams() {
     assert!(bytes
         .windows(b"/Type /ObjStm".len())
         .any(|window| { window == b"/Type /ObjStm" }));
+}
+
+#[test]
+fn json_job_without_output_is_a_usage_error() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({"inputFile": input}).to_string();
+    let mut job = QPDFJob::new();
+
+    assert!(job.initialize_from_json(&json).is_err());
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
 }
 
 #[test]

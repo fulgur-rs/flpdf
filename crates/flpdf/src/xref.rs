@@ -3073,7 +3073,7 @@ fn parse_xref_stream(
         // function's own `Err` propagates -- mirroring that same qpdf ordering
         // without changing what any `error_diagnostics_sink: None` caller
         // observes (the sink is write-only, and only on this closure's `Err`).
-        let build = || -> Result<(Dictionary, Vec<ParsedXrefEntry>, BTreeSet<ObjectRef>, bool)> {
+        let build = || -> Result<XrefStreamBuild> {
             let stream = match &object {
                 Object::Stream(stream) => stream,
                 _ => return Err(Error::parse(xref_pos, "xref not found")),
@@ -3110,14 +3110,56 @@ fn parse_xref_stream(
                 &handle_stream_data,
                 filters::DecodeLimits::default(),
             )?;
+            let entry_size = widths
+                .0
+                .checked_add(widths.1)
+                .and_then(|size| size.checked_add(widths.2))
+                .ok_or_else(|| Error::parse(xref_pos, "xref stream entry size overflow"))?;
+            let expected_size = ranges.iter().try_fold(0usize, |total, &(_, count)| {
+                let count = usize::try_from(count)
+                    .map_err(|_| Error::parse(xref_pos, "xref stream entry count overflow"))?;
+                let range_size = entry_size.checked_mul(count).ok_or_else(|| {
+                    // cov:ignore-start: 32-bit oversized xref stream arithmetic requires an unrepresentable input
+                    Error::parse(xref_pos, "xref stream data size calculation overflow")
+                })?; // cov:ignore-end
+                total.checked_add(range_size).ok_or_else(|| {
+                    // cov:ignore-start: 32-bit oversized xref stream arithmetic requires an unrepresentable input
+                    Error::parse(xref_pos, "xref stream data size calculation overflow")
+                }) // cov:ignore-end
+            })?;
+            let size_warning = if stream_data.len() < expected_size {
+                return Err(Error::parse(
+                    xref_pos,
+                    format!(
+                        "Cross-reference stream data has the wrong size; expected = {expected_size}; actual = {}",
+                        stream_data.len()
+                    ),
+                ));
+            } else if stream_data.len() > expected_size {
+                Some(Diagnostic::warning(
+                    format!(
+                        "(xref stream, offset {xref_pos}): Cross-reference stream data has the wrong size; expected = {expected_size}; actual = {}",
+                        stream_data.len()
+                    ),
+                    None,
+                ))
+            } else {
+                None
+            };
             let mut cursor = ByteCursor::new(&stream_data, 0);
             let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
             let trailer_references = collect_trailer_references(&trailer);
 
-            Ok((trailer, entries, trailer_references, has_first_xref_item))
+            Ok((
+                trailer,
+                entries,
+                trailer_references,
+                has_first_xref_item,
+                size_warning,
+            ))
         };
         let build_result = build().map(
-            |(trailer, entries, trailer_references, has_first_xref_item)| {
+            |(trailer, entries, trailer_references, has_first_xref_item, size_warning)| {
                 (
                     object_ref,
                     object,
@@ -3125,6 +3167,7 @@ fn parse_xref_stream(
                     entries,
                     trailer_references,
                     has_first_xref_item,
+                    size_warning,
                 )
             },
         );
@@ -3135,19 +3178,30 @@ fn parse_xref_stream(
         (build_result, reconstruction_trigger, bootstrap_cache)
     };
 
-    let (object_ref, object, trailer, entries, trailer_references, has_first_xref_item) =
-        match build_result {
-            Ok(built) => built,
-            Err(error) => {
-                let error = reconstruction_trigger.unwrap_or(error);
-                if let Some(sink) = error_diagnostics_sink {
-                    for diagnostic in repair_diagnostics.entries() {
-                        sink.push(diagnostic.clone());
-                    }
+    let (
+        object_ref,
+        object,
+        trailer,
+        entries,
+        trailer_references,
+        has_first_xref_item,
+        size_warning,
+    ) = match build_result {
+        Ok(built) => built,
+        Err(error) => {
+            let error = reconstruction_trigger.unwrap_or(error);
+            if let Some(sink) = error_diagnostics_sink {
+                for diagnostic in repair_diagnostics.entries() {
+                    sink.push(diagnostic.clone());
                 }
-                return Err(error);
-            }
-        };
+            } // cov:ignore: diagnostic forwarding closes only on a sink-backed xref build failure
+            return Err(error);
+        }
+    };
+
+    if let Some(size_warning) = size_warning {
+        repair_diagnostics.push(size_warning);
+    }
 
     for entry in entries {
         match entry {
@@ -3213,6 +3267,14 @@ fn xref_file_object_diagnostic(
 }
 
 type XrefWidths = (usize, usize, usize);
+
+type XrefStreamBuild = (
+    Dictionary,
+    Vec<ParsedXrefEntry>,
+    BTreeSet<ObjectRef>,
+    bool,
+    Option<Diagnostic>,
+);
 
 // qpdf 11.9.0's QPDF::processXRefStream rejects each /W value above
 // sizeof(qpdf_offset_t) before summing the entry size (libqpdf/QPDF.cc:986-1003).
