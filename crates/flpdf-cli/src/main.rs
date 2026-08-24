@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod arg_parser;
+
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
 use flpdf::fix_qdf;
