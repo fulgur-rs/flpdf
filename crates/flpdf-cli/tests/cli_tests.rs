@@ -65,7 +65,116 @@ fn suppress_recovery_matches_qpdf_on_a_recoverable_xref_error() {
         ])
         .assert()
         .code(2)
+        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("Attempting to reconstruct").not());
+}
+
+#[test]
+fn suppress_recovery_applies_to_an_overlay_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("overlay-corrupt.pdf");
+    let output = temp.path().join("overlay.pdf");
+    std::fs::write(&source, corrupt_xref_with_info_pdf()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--suppress-recovery",
+            "--overlay",
+            source.to_str().unwrap(),
+            "--",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("Attempting to reconstruct").not());
+}
+
+#[test]
+fn ignore_xref_streams_applies_to_an_overlay_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("overlay.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--ignore-xref-streams",
+            "--overlay",
+            "../../tests/fixtures/compat/three-page-objstm.pdf",
+            "--",
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
         .stderr(predicate::str::contains("parse error"));
+}
+
+#[test]
+fn suppress_recovery_applies_to_a_copy_attachments_donor() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("copy-attachments.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--suppress-recovery",
+            "../../tests/fixtures/minimal.pdf",
+            "--copy-attachments-from",
+            "../../tests/fixtures/test_driver/missing_startxref.pdf",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("Attempting to reconstruct").not());
+}
+
+#[test]
+fn suppress_recovery_applies_to_a_copy_encryption_donor() {
+    let temp = tempfile::tempdir().unwrap();
+    let donor = temp.path().join("encrypted-corrupt.pdf");
+    let output = temp.path().join("copy-encryption.pdf");
+    std::fs::write(
+        &donor,
+        corrupt_startxref(include_bytes!(
+            "../../../tests/fixtures/compat/encrypted-r4-three-page.pdf"
+        )),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--suppress-recovery",
+            "--copy-encryption",
+            donor.to_str().unwrap(),
+            "--encryption-file-password=",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("Attempting to reconstruct").not());
+}
+
+#[test]
+fn is_encrypted_applies_suppressed_recovery() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "is-encrypted",
+            "--suppress-recovery",
+            "../../tests/fixtures/test_driver/missing_startxref.pdf",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"))
+        .stderr(predicate::str::contains("Attempting to reconstruct").not());
 }
 
 #[test]
@@ -7695,6 +7804,24 @@ fn add_attachment_non_ascii_date_is_clean_error_not_panic() {
         .failure()
         .stderr(predicate::str::contains("invalid PDF date"))
         .stderr(predicate::str::contains("panicked").not());
+}
+
+fn corrupt_startxref(input: &[u8]) -> Vec<u8> {
+    let mut bytes = input.to_vec();
+    let Some(start) = bytes
+        .windows(b"startxref\n".len())
+        .position(|window| window == b"startxref\n")
+    else {
+        unreachable!("fixture should contain startxref token")
+    };
+    let digits_start = start + b"startxref\n".len();
+    let Some(relative_end) = bytes[digits_start..].iter().position(|byte| *byte == b'\n') else {
+        unreachable!("fixture should terminate startxref value")
+    };
+    for byte in &mut bytes[digits_start..digits_start + relative_end] {
+        *byte = b'0';
+    }
+    bytes
 }
 
 fn corrupt_xref_with_info_pdf() -> Vec<u8> {
