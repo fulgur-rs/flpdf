@@ -7,7 +7,7 @@
 //!   preserve   → /Filter /FlateDecode kept, raw bytes round-trip
 //!   uncompress → /Filter absent, raw bytes appear verbatim in the stream
 //!   compress   → /Filter /FlateDecode present, decoded bytes round-trip
-//!   override   → --stream-data=uncompress wins over --compress-streams=y
+//!   precedence → explicit --compress-streams wins over --stream-data
 //!
 //! flpdf-9hc.7.7 additions:
 //!   LZWDecode ×3 modes, DCTDecode/JBIG2Decode/JPXDecode/CCITTFaxDecode passthrough ×3 modes,
@@ -174,24 +174,26 @@ fn cli_top_level_stream_data_modes_reach_the_writer() {
 }
 
 #[test]
-fn cli_top_level_stream_data_overrides_compress_streams() {
+fn cli_top_level_compress_streams_overrides_stream_data() {
     let raw = b"top-level stream-data precedence payload";
     let src = build_pdf_with_flate_stream(raw);
-    let out = top_level_rewrite_with_args(
-        &src,
-        &[
-            "--static-id",
-            "-stream-data=uncompress",
-            "--compress-streams=y",
-        ],
-    );
 
-    let stream = extract_obj4(&out);
-    assert!(
-        stream.dict.get("Filter").is_none(),
-        "top-level --stream-data=uncompress must override --compress-streams=y"
-    );
-    assert_eq!(stream.data, raw);
+    for (first, second) in [
+        ("--stream-data=uncompress", "--compress-streams=y"),
+        ("--compress-streams=y", "--stream-data=uncompress"),
+    ] {
+        let out = top_level_rewrite_with_args(&src, &["--static-id", first, second]);
+        let stream = extract_obj4(&out);
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            "explicit --compress-streams=y must win regardless of argv order"
+        );
+        let decoded =
+            filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+                .expect("decode explicitly compressed stream");
+        assert_eq!(decoded, raw);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,27 +245,44 @@ fn cli_stream_data_compress_wraps_with_flate() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: --stream-data wins over --compress-streams when both are supplied
+// Test: explicit --compress-streams wins over --stream-data when both are supplied
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_stream_data_overrides_compress_streams() {
-    let raw = b"override-mode-payload: --stream-data must beat --compress-streams=y";
+fn cli_compress_streams_overrides_stream_data() {
+    let raw = b"override-mode-payload: --compress-streams must beat --stream-data";
     let src = build_pdf_with_flate_stream(raw);
-    // uncompress should win over the conflicting compress-streams=y.
-    let out = rewrite_with_args(&src, &["--stream-data=uncompress", "--compress-streams=y"]);
+
+    for (first, second) in [
+        ("--stream-data=uncompress", "--compress-streams=y"),
+        ("--compress-streams=y", "--stream-data=uncompress"),
+    ] {
+        let out = rewrite_with_args(&src, &[first, second]);
+        let stream = extract_obj4(&out);
+        assert_eq!(
+            stream.dict.get("Filter"),
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            "explicit --compress-streams=y must win regardless of argv order"
+        );
+        let decoded =
+            filters::decode_stream_data(&filter_handles::dictionary(&stream.dict), &stream.data)
+                .expect("decode explicitly compressed stream");
+        assert_eq!(decoded, raw);
+    }
+}
+
+#[test]
+fn explicit_compress_streams_n_overrides_stream_data_compress() {
+    let raw = b"explicit n must override stream-data=compress";
+    let src = build_pdf_with_flate_stream(raw);
+    let out = rewrite_with_args(&src, &["--stream-data=compress", "--compress-streams=n"]);
 
     let stream = extract_obj4(&out);
     assert!(
         stream.dict.get("Filter").is_none(),
-        "--stream-data=uncompress must take precedence and strip /Filter even when \
-         --compress-streams=y is also passed; got {:?}",
-        stream.dict.get("Filter")
+        "explicit --compress-streams=n must win over --stream-data=compress"
     );
-    assert_eq!(
-        stream.data, raw,
-        "override path must still write the decoded raw payload"
-    );
+    assert_eq!(stream.data, raw);
 }
 
 // ===========================================================================

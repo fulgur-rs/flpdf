@@ -5574,7 +5574,7 @@ fn rewrite_help_shows_compress_streams_default_y() {
         .assert()
         .success()
         .stdout(predicate::str::contains("compress-streams"))
-        .stdout(predicate::str::contains("default: y"));
+        .stdout(predicate::str::contains("`y` (default)"));
 }
 
 #[test]
