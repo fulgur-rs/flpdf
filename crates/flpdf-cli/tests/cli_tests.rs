@@ -50,6 +50,49 @@ fn check_accepts_qpdf_bare_flag_with_discarded_equals_value() {
 }
 
 #[test]
+fn top_level_single_dash_qdf_reaches_qdf_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("single-dash-qdf.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "-qdf",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(std::fs::read(&output).unwrap().starts_with(b"%PDF-"));
+    assert!(std::fs::read(&output)
+        .unwrap()
+        .windows(b"%QDF-1.0".len())
+        .any(|window| window == b"%QDF-1.0"));
+}
+
+#[test]
+fn overlay_segment_preserves_trailing_top_level_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("overlay-trailing-flag.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+            "--overlay",
+            "../../tests/fixtures/compat/one-page.pdf",
+            "--",
+            "--static-id",
+        ])
+        .assert()
+        .success();
+
+    assert!(output.exists());
+}
+
+#[test]
 fn check_encrypted_fixture_accepts_correct_empty_password_flag() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([

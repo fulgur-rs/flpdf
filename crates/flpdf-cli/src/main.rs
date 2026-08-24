@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod arg_parser;
+
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
 use flpdf::fix_qdf;
@@ -581,7 +583,7 @@ struct Cli {
     // ── Overlay / underlay flags (flpdf-9hc.16), top-level alias ──────────
     // Mirror qpdf's top-level `qpdf in --overlay f -- out` form. Like the
     // `rewrite` subcommand fields, the per-group boundaries are extracted from
-    // raw argv by `extract_overlay_groups` before clap parses; these fields
+    // raw argv by `preprocess_qpdf_args` before clap parses; these fields
     // exist only for `--help` documentation and to accept a leaked token.
     /// Overlay pages from another file on top of the output (qpdf `--overlay`;
     /// top-level alias of `rewrite --overlay`). Repeatable; terminate each
@@ -1343,7 +1345,7 @@ struct RewriteCommand {
     //                          [--repeat=R] --
     //
     // The repeated occurrences and their per-group boundaries are extracted
-    // from the raw argv by `extract_overlay_groups` BEFORE clap parses (clap's
+    // from the raw argv by `preprocess_qpdf_args` BEFORE clap parses (clap's
     // derive flattens repeated `Vec<String>` occurrences, losing the group
     // boundary and the per-group declaration order needed for byte-identical
     // composition). These two fields exist only so `--help` documents the
@@ -1618,25 +1620,46 @@ fn warn_if_static_id(args: &Cli) {
     );
 }
 
+fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
+    let parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(args)?;
+    let mut overlay_specs = Vec::new();
+    let mut attachment_segments = Vec::new();
+
+    for segment in parsed.named_segments {
+        match segment.option.as_str() {
+            "overlay" => overlay_specs.push(parse_overlay_segment(
+                OverlayKind::Overlay,
+                &segment.tokens,
+            )?),
+            "underlay" => overlay_specs.push(parse_overlay_segment(
+                OverlayKind::Underlay,
+                &segment.tokens,
+            )?),
+            "add-attachment" => attachment_segments.push(segment.tokens),
+            _ => {}
+        }
+    }
+
+    Ok(PreprocessedArgs {
+        residual_args: parsed.residual_args,
+        overlay_specs,
+        attachment_segments,
+    })
+}
+
 fn main() {
     // One private qpdf-style logger owns all document routes for this
     // invocation. It is deliberately distinct from the library process
     // default so later save/info routing can be configured as one unit.
     let _ = cli_logger();
-    // Extract overlay/underlay and repeated attachment groups from raw argv
-    // before clap parses: clap's derive would flatten repeated occurrences and
-    // lose the per-group boundaries that qpdf's job configuration preserves.
-    // The residual argv retains one dispatch marker for each operation.
-    let rewritten_args =
-        normalize_qpdf_bare_equals(rewrite_qpdf_single_dash(std::env::args().collect()));
-    let (residual_args, overlay_specs) = match extract_overlay_groups(rewritten_args) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("flpdf: {error}");
-            std::process::exit(2);
-        }
-    };
-    let (residual_args, attachment_segments) = match extract_attachment_groups(residual_args) {
+    // Parse qpdf's argv grammar before clap parses feature values. The parser
+    // preserves named segment boundaries and returns feature-neutral raw
+    // tokens to the existing semantic consumers below.
+    let PreprocessedArgs {
+        residual_args,
+        overlay_specs,
+        attachment_segments,
+    } = match preprocess_qpdf_args(std::env::args().collect()) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("flpdf: {error}");
@@ -1686,7 +1709,7 @@ fn main() {
     }
 
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
-    // `extract_overlay_groups`, so a stripped group leaves no trace for the
+    // `preprocess_qpdf_args`, so a stripped group leaves no trace for the
     // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
     // top-level default/`--linearize` rewrite branches) consume `overlay_specs`;
     // every other command/mode would silently ignore it. Reject that here so an
@@ -3599,6 +3622,12 @@ struct OverlaySpec {
     repeat: Option<String>,
 }
 
+struct PreprocessedArgs {
+    residual_args: Vec<String>,
+    overlay_specs: Vec<OverlaySpec>,
+    attachment_segments: Vec<Vec<String>>,
+}
+
 /// Parse the raw token slice captured between `--overlay`/`--underlay` and `--`.
 ///
 /// Grammar: `FILE and sub-options in any order`. `FILE` is either bare or `--file=PATH`;
@@ -3694,442 +3723,57 @@ fn parse_overlay_segment(kind: OverlayKind, tokens: &[String]) -> CliResult<Over
     })
 }
 
-/// A qpdf value-terminated option table that temporarily changes which
-/// single-dash option names are recognized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QpdfArgSegment {
-    Encrypt,
-    Pages,
-    AddAttachment,
-    CopyAttachments,
-    Overlay,
+#[cfg(test)]
+fn parse_test_args(args: Vec<String>) -> CliResult<arg_parser::ParsedArgs> {
+    let has_program = args.first().is_some_and(|arg| !arg.starts_with('-'));
+    let mut parser_args = args;
+    if !has_program {
+        parser_args.insert(0, "flpdf".to_owned());
+    }
+    let mut parsed = arg_parser::ArgParser::from_command(Cli::command()).parse(parser_args)?;
+    if !has_program {
+        parsed.residual_args.remove(0);
+    }
+    Ok(parsed)
 }
 
-impl QpdfArgSegment {
-    fn from_option_name(name: &str) -> Option<Self> {
-        match name {
-            "encrypt" => Some(Self::Encrypt),
-            "pages" => Some(Self::Pages),
-            "add-attachment" => Some(Self::AddAttachment),
-            "copy-attachments-from" => Some(Self::CopyAttachments),
-            "overlay" | "underlay" => Some(Self::Overlay),
-            _ => None,
-        }
-    }
-
-    fn accepts(self, name: &str) -> bool {
-        match self {
-            Self::Encrypt => matches!(
-                name,
-                "use-aes"
-                    | "force-V4"
-                    | "force-R5"
-                    | "allow-insecure"
-                    | "print"
-                    | "modify"
-                    | "extract"
-                    | "annotate"
-                    | "form"
-                    | "assemble"
-                    | "accessibility"
-                    | "cleartext-metadata"
-            ),
-            Self::Pages => matches!(name, "file" | "password" | "range"),
-            Self::AddAttachment => matches!(
-                name,
-                "key"
-                    | "filename"
-                    | "mimetype"
-                    | "description"
-                    | "creationdate"
-                    | "moddate"
-                    | "replace"
-            ),
-            Self::CopyAttachments => matches!(name, "password" | "prefix"),
-            Self::Overlay => matches!(name, "file" | "password" | "to" | "from" | "repeat"),
-        }
-    }
-}
-
-fn collect_clap_long_options(command: &clap::Command, names: &mut HashSet<String>) {
-    for arg in command.get_arguments() {
-        if let Some(long) = arg.get_long() {
-            names.insert(long.to_string());
-        }
-        if let Some(aliases) = arg.get_all_aliases() {
-            names.extend(aliases.into_iter().map(str::to_string));
-        }
-    }
-    for subcommand in command.get_subcommands() {
-        collect_clap_long_options(subcommand, names);
-    }
-}
-
-fn long_option_name(arg: &str) -> Option<&str> {
-    arg.strip_prefix("--")
-        .filter(|rest| !rest.is_empty())
-        .and_then(|rest| rest.split("=").next())
-}
-
-fn single_dash_option_name(arg: &str) -> Option<&str> {
-    if arg == "-" || arg.starts_with("--") {
-        return None;
-    }
-    let rest = arg.strip_prefix("-")?;
-    if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    rest.split("=").next()
-}
-
-/// Return the canonical spelling of a qpdf bare option that starts a
-/// value-terminated segment. qpdf's generic argument parser strips an
-/// attached `=value` before dispatching the bare handler, so the scanners must
-/// do the same before clap sees the residual argv.
-fn qpdf_bare_segment_flag(arg: &str) -> Option<&'static str> {
-    match long_option_name(arg) {
-        Some("encrypt") => Some("--encrypt"),
-        Some("pages") => Some("--pages"),
-        Some("add-attachment") => Some("--add-attachment"),
-        Some("copy-attachments-from") => Some("--copy-attachments-from"),
-        _ => None,
-    }
-}
-
-/// qpdf 11.9.0 registers these options with `addBare` in
-/// `libqpdf/qpdf/auto_job_init.hh:40-91`. Keep value-bearing options out of
-/// this list: qpdf's parser preserves their equals value for the parameter
-/// handler, while a bare handler ignores it.
-const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
-    "add-attachment",
-    "allow-weak-crypto",
-    "check",
-    "check-linearization",
-    "coalesce-contents",
-    "copy-attachments-from",
-    "decrypt",
-    "deterministic-id",
-    "filtered-stream-data",
-    "flatten-rotation",
-    "generate-appearances",
-    "ignore-xref-streams",
-    "is-encrypted",
-    "json-input",
-    "keep-inline-images",
-    "linearize",
-    "list-attachments",
-    "newline-before-endstream",
-    "no-original-object-ids",
-    "no-warn",
-    "optimize-images",
-    "overlay",
-    "pages",
-    "password-is-hex-key",
-    "preserve-unreferenced",
-    "preserve-unreferenced-resources",
-    "progress",
-    "qdf",
-    "raw-stream-data",
-    "recompress-flate",
-    "remove-page-labels",
-    "remove-restrictions",
-    "replace-input",
-    "report-memory-usage",
-    "requires-password",
-    "set-page-labels",
-    "show-linearization",
-    "show-npages",
-    "show-pages",
-    "static-aes-iv",
-    "static-id",
-    "suppress-password-recovery",
-    "suppress-recovery",
-    "test-json-schema",
-    "underlay",
-    "verbose",
-    "warning-exit-0",
-    "empty",
-    "with-images",
-];
-
-fn collect_qpdf_bare_long_options(command: &clap::Command, names: &mut HashSet<String>) {
-    for arg in command.get_arguments() {
-        let Some(long) = arg.get_long() else {
-            continue;
-        };
-        if matches!(arg.get_action(), clap::ArgAction::SetTrue)
-            && QPDF_BARE_LONG_OPTIONS.contains(&long)
-        {
-            names.insert(long.to_owned());
-        }
-    }
-    for subcommand in command.get_subcommands() {
-        collect_qpdf_bare_long_options(subcommand, names);
-    }
-}
-
-/// Discard `=value` attached to qpdf bare flags before clap parses argv.
-///
-/// This follows `QPDFArgParser::parseArgs`: a value-terminated qpdf segment
-/// owns every token up to its `--` terminator, so normalization is suspended
-/// inside those segments. The top-level `--` also ends option processing, as it
-/// does for qpdf and clap.
-fn normalize_qpdf_bare_equals(args: Vec<String>) -> Vec<String> {
-    let mut bare_options = HashSet::new();
-    collect_qpdf_bare_long_options(&Cli::command(), &mut bare_options);
-
-    let mut out = Vec::with_capacity(args.len());
-    let mut active_segment = None;
-    let mut passthrough = false;
-    for mut arg in args {
-        if passthrough {
-            out.push(arg);
-            continue;
-        }
-        if arg == "--" {
-            out.push(arg);
-            if active_segment.take().is_none() {
-                passthrough = true;
-            }
-            continue;
-        }
-        if active_segment.is_some() {
-            out.push(arg);
-            continue;
-        }
-
-        if let Some(name) = long_option_name(&arg).map(str::to_owned) {
-            // qpdf registers this option with addBare, but flpdf retains its
-            // value_enum extension for the recognized y/n/never spellings.
-            // Unknown attached values still have qpdf's bare-flag meaning.
-            let discard_equals_value = if name == "newline-before-endstream" {
-                arg.split_once('=')
-                    .is_some_and(|(_, value)| !matches!(value, "y" | "n" | "never"))
-            } else {
-                bare_options.contains(name.as_str()) && arg.contains('=')
-            };
-            if discard_equals_value {
-                arg = format!("--{name}");
-            }
-            active_segment = QpdfArgSegment::from_option_name(&name);
-        }
-        out.push(arg);
-    }
-    out
-}
-
-/// Rewrite recognized qpdf-style single-dash long options into double-dash form.
-///
-/// Recognition follows the clap command tree at top level. Within qpdf
-/// value-terminated segments, only that segment sub-options are recognized;
-/// unknown dash-prefixed tokens remain operands. A bare `--` closes an active
-/// segment and resumes top-level option recognition. Outside a segment, `--`
-/// is the real clap end-of-options marker and leaves every later token untouched.
+#[cfg(test)]
 fn rewrite_qpdf_single_dash(args: Vec<String>) -> Vec<String> {
-    let mut known_long_options = HashSet::new();
-    collect_clap_long_options(&Cli::command(), &mut known_long_options);
-
-    let mut out = Vec::with_capacity(args.len());
-    let mut active_segment = None;
-    let mut passthrough = false;
-
-    for mut arg in args {
-        if passthrough {
-            out.push(arg);
-            continue;
-        }
-        if arg == "--" {
-            out.push(arg);
-            if active_segment.take().is_none() {
-                passthrough = true;
-            }
-            continue;
-        }
-
-        if let Some(name) = single_dash_option_name(&arg) {
-            let recognized = active_segment
-                .map(|segment: QpdfArgSegment| segment.accepts(name))
-                .unwrap_or_else(|| known_long_options.contains(name));
-            if recognized {
-                arg = format!("-{arg}");
-            }
-        }
-
-        if active_segment.is_none() {
-            if let Some(name) = long_option_name(&arg) {
-                active_segment = QpdfArgSegment::from_option_name(name);
-            }
-        }
-        out.push(arg);
-    }
-    out
+    parse_test_args(args)
+        .expect("test argv should parse")
+        .residual_args
 }
 
-/// Split the `--overlay`/`--underlay` groups out of the raw argument vector,
-/// preserving their declaration order and per-group boundaries.
-///
-/// clap's derive collects repeated `Vec<String>` occurrences into one flat
-/// vector, which loses both the boundary between successive `--overlay`/
-/// `--underlay` groups and their interleaved declaration order — information
-/// the byte-identical composition (underlays-then-overlays naming across
-/// groups, drawn in qpdf order) depends on. So the groups are extracted from
-/// the raw argv here, *before* clap parses, and the residual vector (with every
-/// `--overlay`/`--underlay` flag, its tokens, and its terminating `--` removed)
-/// is handed to clap. The returned `OverlaySpec`s are in CLI declaration order.
-///
-/// A group runs from its `--overlay`/`--underlay` flag up to (but not
-/// including) the next bare `--` token, which qpdf requires to terminate it.
-/// Tokens such as `--password=…` that merely start with `--` do not terminate a
-/// group; only a token equal to `--` does.
-///
-/// The scan is scoped to *rewrite-level* overlay flags: the sibling
-/// value-terminated segments (`--encrypt`, `--pages`, `--add-attachment`,
-/// `--copy-attachments-from`) are each consumed as a unit up to their own
-/// terminating `--`, so an `--overlay`/`--underlay` token appearing as one of
-/// their values is preserved verbatim rather than starting a spurious group
-/// (mirroring qpdf's left-to-right parser, which consumes each value-terminated
-/// option as a whole).
-///
-/// # Errors
-///
-/// Returns an error if a group is not terminated by a `--` token, or if
-/// [`parse_overlay_segment`] rejects the captured tokens (missing/duplicate
-/// file, invalid page range, unknown sub-flag, …).
+#[cfg(test)]
+fn normalize_qpdf_bare_equals(args: Vec<String>) -> Vec<String> {
+    rewrite_qpdf_single_dash(args)
+}
+
+#[cfg(test)]
 fn extract_overlay_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<OverlaySpec>)> {
-    let mut residual: Vec<String> = Vec::with_capacity(args.len());
-    let mut specs: Vec<OverlaySpec> = Vec::new();
-
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        // A sibling value-terminated segment owns every token up to its own
-        // terminating `--`. Copy it verbatim into the residual (for clap) without
-        // scanning inside, so an `--overlay`/`--underlay` that is really a *value*
-        // of one of these flags is not mistaken for a new overlay group. An
-        // unterminated segment is copied to the end and left for clap to reject.
-        // `--add-attachment=...` (qpdf's bare-option equals-form, which discards
-        // the `=value` and reads the file from the segment's own positional
-        // token -- see extract_attachment_groups) starts the same opaque segment
-        // as `--add-attachment`; without this, a file whose name happens to be
-        // literally `--overlay`/`--underlay` inside such a segment would be
-        // misread as a new overlay group by this earlier pass.
-        if let Some(flag) = qpdf_bare_segment_flag(&arg) {
-            residual.push(flag.to_owned());
-            for tok in iter.by_ref() {
-                let is_terminator = tok == "--";
-                residual.push(tok);
-                if is_terminator {
-                    break;
-                }
-            }
-            continue;
-        }
-        let kind = match arg.as_str() {
-            "--overlay" => Some(OverlayKind::Overlay),
-            "--underlay" => Some(OverlayKind::Underlay),
-            _ => None,
+    let parsed = parse_test_args(args)?;
+    let mut overlay_specs = Vec::new();
+    for segment in parsed.named_segments {
+        let kind = match segment.option.as_str() {
+            "overlay" => OverlayKind::Overlay,
+            "underlay" => OverlayKind::Underlay,
+            _ => continue,
         };
-        let kind = kind.or_else(|| {
-            arg.strip_prefix("--overlay=")
-                .map(|_| OverlayKind::Overlay)
-                .or_else(|| {
-                    arg.strip_prefix("--underlay=")
-                        .map(|_| OverlayKind::Underlay)
-                })
-        });
-        let Some(kind) = kind else {
-            residual.push(arg);
-            continue;
-        };
-
-        // Collect tokens up to (and consuming) the terminating bare `--`.
-        let mut tokens: Vec<String> = Vec::new();
-        let mut terminated = false;
-        for tok in iter.by_ref() {
-            if tok == "--" {
-                terminated = true;
-                break;
-            }
-            tokens.push(tok);
-        }
-        if !terminated {
-            let flag = match kind {
-                OverlayKind::Overlay => "--overlay",
-                OverlayKind::Underlay => "--underlay",
-            };
-            return Err(format!(
-                "{flag}: overlay/underlay group must be terminated by a `--` token"
-            )
-            .into());
-        }
-        specs.push(parse_overlay_segment(kind, &tokens)?);
+        overlay_specs.push(parse_overlay_segment(kind, &segment.tokens)?);
     }
-
-    Ok((residual, specs))
+    Ok((parsed.residual_args, overlay_specs))
 }
 
-/// Extract repeated qpdf `--add-attachment` segments before clap flattens
-/// their occurrences into one `Vec<String>`.
-///
-/// The first segment is retained in the residual argv as the clap dispatch
-/// marker; later segments are removed because the batch route below consumes
-/// the captured groups directly. Other value-terminated qpdf segments are
-/// copied as opaque units so an `--add-attachment` token used as one of their
-/// values is not mistaken for a top-level operation.
+#[cfg(test)]
 fn extract_attachment_groups(args: Vec<String>) -> CliResult<(Vec<String>, Vec<Vec<String>>)> {
-    let mut residual = Vec::with_capacity(args.len());
-    let mut groups = Vec::new();
-    let mut iter = args.into_iter();
-
-    while let Some(arg) = iter.next() {
-        if let Some(flag) = qpdf_bare_segment_flag(&arg).filter(|flag| *flag != "--add-attachment")
-        {
-            residual.push(flag.to_owned());
-            for token in iter.by_ref() {
-                let is_terminator = token == "--";
-                residual.push(token);
-                if is_terminator {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        // qpdf registers `--add-attachment` as a bare option (`addBare`,
-        // QPDFJob_argv.cc:38), so `QPDFArgParser` silently discards any
-        // `=value` attached directly to the flag itself (the bare handler
-        // never reads its `parameter`, QPDFArgParser.cc:531-533) and the
-        // file always comes from the next plain positional token in the
-        // segment, if any -- confirmed against `/usr/bin/qpdf` 11.9.0:
-        // `--add-attachment=x --` errors "add attachment: no file
-        // specified" (nothing follows to serve as the file), while
-        // `--add-attachment=x y --` embeds `y` and silently drops `x`.
-        if qpdf_bare_segment_flag(&arg) != Some("--add-attachment") {
-            residual.push(arg);
-            continue;
-        }
-
-        let mut tokens = Vec::new();
-        let mut terminated = false;
-        for token in iter.by_ref() {
-            if token == "--" {
-                terminated = true;
-                break;
-            }
-            tokens.push(token);
-        }
-        if !terminated {
-            return Err("--add-attachment: missing -- terminator".into());
-        }
-
-        if groups.is_empty() {
-            residual.push("--add-attachment".to_owned());
-            residual.extend(tokens.iter().cloned());
-            residual.push("--".to_owned());
-        }
-        groups.push(tokens);
-    }
-
-    Ok((residual, groups))
+    let parsed = parse_test_args(args)?;
+    let groups = parsed
+        .named_segments
+        .into_iter()
+        .filter(|segment| segment.option == "add-attachment")
+        .map(|segment| segment.tokens)
+        .collect();
+    Ok((parsed.residual_args, groups))
 }
 
 /// Build the library [`flpdf::OverlaySpec`]s from the parsed CLI segments,
@@ -6752,6 +6396,22 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_qpdf_args_routes_raw_segments_through_arg_parser() {
+        let PreprocessedArgs {
+            residual_args: residual,
+            overlay_specs,
+            attachment_segments,
+        } = preprocess_qpdf_args(strs(&["flpdf", "--overlay", "source.pdf", "--to=1", "--"]))
+            .expect("qpdf preprocessing should succeed");
+
+        assert_eq!(residual, strs(&["flpdf"]));
+        assert_eq!(overlay_specs.len(), 1);
+        assert_eq!(overlay_specs[0].file, "source.pdf");
+        assert_eq!(overlay_specs[0].to.as_deref(), Some("1"));
+        assert!(attachment_segments.is_empty());
+    }
+
+    #[test]
     fn standard_save_writer_rejects_stdout_after_info_use() {
         let logger = QPDFLogger::create();
         logger.info([]).unwrap();
@@ -7399,32 +7059,52 @@ mod tests {
 
     #[test]
     fn single_dash_segment_sub_option_is_rewritten() {
-        let out =
-            rewrite_qpdf_single_dash(strs(&["flpdf", "-overlay", "stamp.pdf", "-to=1", "--"]));
+        let parsed = arg_parser::ArgParser::from_command(Cli::command())
+            .parse(strs(&["flpdf", "-overlay", "stamp.pdf", "-to=1", "--"]))
+            .unwrap();
+        assert_eq!(parsed.residual_args, strs(&["flpdf"]));
+        assert_eq!(parsed.named_segments[0].option, "overlay");
         assert_eq!(
-            out,
-            strs(&["flpdf", "--overlay", "stamp.pdf", "--to=1", "--",])
+            parsed.named_segments[0].tokens,
+            strs(&["stamp.pdf", "--to=1"])
         );
     }
 
     #[test]
     fn each_segment_kind_recognizes_its_sub_options() {
-        assert!(QpdfArgSegment::Encrypt.accepts("use-aes"));
-        assert!(QpdfArgSegment::Pages.accepts("range"));
-        assert!(QpdfArgSegment::AddAttachment.accepts("replace"));
-        assert!(QpdfArgSegment::CopyAttachments.accepts("prefix"));
+        let parsed = arg_parser::ArgParser::from_command(Cli::command())
+            .parse(strs(&[
+                "flpdf",
+                "--encrypt",
+                "-use-aes",
+                "--",
+                "--pages",
+                "-range=1",
+                "--",
+                "--add-attachment",
+                "-replace",
+                "--",
+                "--copy-attachments-from",
+                "-prefix=copy-",
+                "--",
+            ]))
+            .unwrap();
+
+        assert_eq!(parsed.named_segments[0].tokens, ["--use-aes"]);
+        assert_eq!(parsed.named_segments[1].tokens, ["--range=1"]);
+        assert_eq!(parsed.named_segments[2].tokens, ["--replace"]);
+        assert_eq!(parsed.named_segments[3].tokens, ["--prefix=copy-"]);
     }
 
     #[test]
     fn collect_clap_long_options_includes_aliases() {
         let command = clap::Command::new("test")
             .arg(clap::Arg::new("mode").long("mode").alias("legacy-mode"));
-        let mut names = HashSet::new();
+        let parsed = arg_parser::ArgParser::from_command(command)
+            .parse(strs(&["test", "-legacy-mode"]))
+            .unwrap();
 
-        collect_clap_long_options(&command, &mut names);
-
-        assert!(names.contains("mode"));
-        assert!(names.contains("legacy-mode"));
+        assert_eq!(parsed.residual_args, strs(&["test", "--legacy-mode"]));
     }
 
     #[test]
@@ -7839,13 +7519,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_unterminated_sibling_segment_copied_to_end() {
-        // An unterminated --encrypt segment is copied verbatim (clap raises the
-        // error later); the inner --overlay must NOT be hijacked into a group.
+    fn extract_unterminated_sibling_segment_errors_at_parser_boundary() {
+        // qpdf's named option table must be terminated before the parser
+        // resumes the main table; the inner --overlay is not a new group.
         let argv = strs(&["--encrypt", "u", "o", "128", "--overlay", "x"]);
-        let (residual, specs) = extract_overlay_groups(argv.clone()).unwrap();
-        assert!(specs.is_empty(), "got: {specs:?}");
-        assert_eq!(residual, argv);
+        let error = extract_overlay_groups(argv).unwrap_err().to_string();
+        assert!(error.contains("--encrypt"), "got: {error}");
+        assert!(error.contains("terminated"), "got: {error}");
     }
 
     #[test]
