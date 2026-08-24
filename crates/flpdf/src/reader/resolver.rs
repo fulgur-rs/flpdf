@@ -1974,13 +1974,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let member_start = first
                 .checked_add(object_offset)
                 .ok_or_else(|| Error::parse(0, "object stream member offset overflow"))?;
-            if member_start > decoded_stream_data.len() {
-                return Err(ObjectStreamResolutionError::Operation(Error::parse(
-                    member_start,
-                    "object stream member offset is out of range",
-                )));
-            }
-            let member_start = i64::try_from(member_start)
+            // qpdf seeks the member input even when the declared offset is
+            // beyond the decoded ObjStm payload. Let the live parser emit its
+            // normal EOF diagnostic instead of manufacturing a range error
+            // (`QPDF.cc:1825-1828`).
+            let member_data = decoded_stream_data.get(member_start..).unwrap_or_default();
+            // `InputSource::getLastOffset()` remains at the decoded EOF after
+            // that seek/read attempt; use the same offset for the warning.
+            let diagnostic_start = member_start.min(decoded_stream_data.len());
+            let member_start = i64::try_from(diagnostic_start)
                 .map_err(|_| Error::parse(0, "object stream member offset is too large"))?;
             let description_template =
                 self.object_stream_description_template(stream_number, object_ref);
@@ -1990,7 +1992,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             };
             let (value, parsed_offset, diagnostics) =
                 match parse_qpdf_direct_object_handle_with_diagnostics(
-                    &decoded_stream_data[member_start as usize..],
+                    member_data,
                     member_start,
                     Some(member_start),
                     &mut handles,
@@ -8191,10 +8193,11 @@ mod tests {
     }
 
     #[test]
-    fn an_object_stream_rejects_a_member_offset_out_of_range() {
+    fn an_object_stream_reports_eof_for_a_member_offset_out_of_range() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = b"7 0 << /Value 1 >>".to_vec();
+        let expected_eof_offset = stream_data.len();
         let stream_dict = ObjectHandle::dictionary(vec![
             (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
             (b"N".to_vec(), ObjectHandle::integer(1)),
@@ -8241,9 +8244,9 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic
-                .message
-                .contains("object stream member offset is out of range")));
+            .any(|diagnostic| diagnostic.message.contains(&format!(
+                "object stream 4 (object 7 0, offset {expected_eof_offset}): unexpected EOF"
+            ))));
     }
 
     #[test]
