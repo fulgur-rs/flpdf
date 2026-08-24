@@ -55,6 +55,63 @@ fn check_accepts_ignore_xref_streams_on_a_clean_pdf() {
 }
 
 #[test]
+fn top_level_object_streams_modes_reach_the_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = "../../tests/fixtures/compat/one-page.pdf";
+
+    for mode in ["preserve", "disable", "generate"] {
+        let output = temp.path().join(format!("object-streams-{mode}.pdf"));
+        let flag = format!("--object-streams={mode}");
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args([
+                "--static-id",
+                flag.as_str(),
+                input,
+                output.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+
+        let rendered = std::fs::read(&output).unwrap();
+        let has_objstm = contains(&rendered, b"/Type /ObjStm");
+        assert_eq!(
+            has_objstm,
+            mode == "generate",
+            "top-level --object-streams={mode} produced unexpected ObjStm shape"
+        );
+    }
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "-object-streams=generate",
+            "--static-id",
+            input,
+            temp.path()
+                .join("object-streams-single-dash.pdf")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn top_level_writer_mode_help_matches_qpdf_terms() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--object-streams"))
+        .stdout(predicate::str::contains("preserve"))
+        .stdout(predicate::str::contains("generate"))
+        .stdout(predicate::str::contains("--stream-data"))
+        .stdout(predicate::str::contains("uncompress"));
+}
+
+#[test]
 fn suppress_recovery_matches_qpdf_on_a_recoverable_xref_error() {
     Command::cargo_bin("flpdf")
         .unwrap()

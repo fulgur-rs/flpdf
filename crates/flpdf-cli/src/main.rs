@@ -515,6 +515,22 @@ struct Cli {
     /// rewrite.  Provided so qtest commands parse cleanly.
     #[arg(long = "compress-streams")]
     compress_streams: Option<String>,
+    /// Control what qpdf does regarding object streams. `preserve` preserves
+    /// original object streams (the default), `disable` creates output with no
+    /// object streams, and `generate` creates object streams and compresses
+    /// objects when possible.
+    #[arg(
+        long = "object-streams",
+        value_enum,
+        default_value_t = CliObjectStreamMode::Preserve
+    )]
+    object_streams: CliObjectStreamMode,
+    /// Control how streams are compressed in the output. `compress` is the
+    /// same as `--compress-streams=y --decode-level=generalized`, `preserve`
+    /// is the same as `--compress-streams=n --decode-level=none`, and
+    /// `uncompress` is the same as `--compress-streams=n --decode-level=generalized`.
+    #[arg(long = "stream-data", value_enum)]
+    stream_data: Option<CliStreamDataMode>,
     /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
     /// linearization writer's distinct pass-1 intermediate file.
     #[arg(long = "linearize-pass1")]
@@ -1853,6 +1869,8 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            object_streams: args.object_streams.into(),
+            stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             ..WriterOptions::default()
@@ -1940,6 +1958,8 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            object_streams: args.object_streams.into(),
+            stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
@@ -2003,6 +2023,8 @@ fn main() {
             static_aes_iv: args.static_aes_iv,
             no_original_object_ids: args.no_original_object_ids,
             preserve_unreferenced_objects: args.preserve_unreferenced,
+            object_streams: args.object_streams.into(),
+            stream_data: args.stream_data.map(Into::into),
             content_normalization: normalize_content,
             content_normalization_set: args.normalize_content.is_some(),
             qdf: args.qdf,
