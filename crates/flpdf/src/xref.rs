@@ -2753,6 +2753,12 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
             (message.clone(), None)
         }
         Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
+        // qpdf's outer `parse` catches non-QPDF exceptions raised by
+        // `read_xref` and turns them into a damaged-PDF exception with the
+        // fixed `error reading xref: ` prefix and offset zero
+        // (`QPDF.cc:450-464`). Keep the inner I/O message rather than the
+        // public Error display, which would add flpdf's `I/O error: ` label.
+        Error::Io(error) => (format!("error reading xref: {error}"), None),
         other => (other.to_string(), Some(startxref)),
     };
     diagnostics.push(Diagnostic::warning(message, offset));
@@ -3609,10 +3615,11 @@ mod tests {
         merge_bootstrap_cache_prefer_source, merge_bootstrap_handle_state_prefer_source,
         merge_previous_xref_sections, merge_xref_stream_from_classic_trailer,
         parse_trailer_candidate, parse_xref_index, parse_xref_stream, parse_xref_table,
-        prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
-        recover_xref_from_linear_scan, BootstrapHandleDocument, BootstrapHandleState, ByteCursor,
-        LoadedXref, LoadedXrefState, RecoveryPolicy, XrefEntryLookup, XrefForm, XrefLoadOptions,
-        XrefObjectDescription, XrefReadContext, XrefReadContextSpec, XrefRegistration,
+        prepend_repair_diagnostics, push_repair_diagnostics,
+        recover_trailer_from_xref_stream_candidate, recover_xref_from_linear_scan,
+        BootstrapHandleDocument, BootstrapHandleState, ByteCursor, LoadedXref, LoadedXrefState,
+        RecoveryPolicy, XrefEntryLookup, XrefForm, XrefLoadOptions, XrefObjectDescription,
+        XrefReadContext, XrefReadContextSpec, XrefRegistration,
     };
     use crate::filters;
     use crate::object_handle::DocumentResolver;
@@ -3623,6 +3630,26 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
     use std::rc::Rc;
+
+    #[test]
+    fn repair_diagnostics_wrap_io_failures_as_qpdf_xref_errors() {
+        let mut diagnostics = Diagnostics::default();
+        let trigger = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "seek failed",
+        ));
+
+        push_repair_diagnostics(&mut diagnostics, &trigger, 123);
+
+        assert_eq!(
+            diagnostics.entries(),
+            &[
+                Diagnostic::warning("file is damaged", None),
+                Diagnostic::warning("error reading xref: seek failed", None),
+                Diagnostic::warning("Attempting to reconstruct cross-reference table", None),
+            ]
+        );
+    }
 
     fn test_objstm_payload(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
         let mut header = Vec::new();
