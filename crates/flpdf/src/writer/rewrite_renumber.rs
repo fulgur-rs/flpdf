@@ -914,7 +914,7 @@ impl ObjectStreamRenumber {
     /// container regardless of their supplied order.
     ///
     /// `skip_length` is always `true` here: generate mode emits a direct
-    /// `/Length` (qdf forces object streams off), so a stream's indirect
+    /// `/Length` (QDF object-stream mode is selected independently), so a stream's indirect
     /// `/Length` edge is dead and a holder reachable only through it is dropped,
     /// matching qpdf's reachability GC. An orphan holder is never an object-stream
     /// member (members are reached via non-`/Length` edges only), so no group is

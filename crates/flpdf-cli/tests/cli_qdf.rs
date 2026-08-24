@@ -2,16 +2,16 @@
 //!
 //! Pins the CLI wiring for QDF:
 //!  - `flpdf rewrite --qdf` produces canonical QDF (uncompressed, normalized,
-//!    `%QDF-1.0`, `%% Original object ID:`, classic `xref` table, no XRef /
-//!    ObjStm stream, indirect `/Length H 0 R` with a holder object).
+//!    `%QDF-1.0`, `%% Original object ID:`, and indirect `/Length H 0 R` with
+//!    a holder object; classic inputs with default/disable mode use a classic
+//!    xref table, while explicit preserve/generate can emit ObjStm + XRef.
 //!  - Top-level `flpdf --qdf` behaves identically to `rewrite --qdf`.
 //!  - The `qdf` subcommand is a byte-for-byte alias of `rewrite --qdf`
 //!    (modulo the random trailer `/ID`, which neither path makes
 //!    deterministic — see the `/ID`-line normalization in the alias test).
 //!  - `qdf-fix` repairs a hand-edited stream's `/Length` holder.
-//!  - Conflict diagnostics: `--qdf` + `--object-streams=generate|disable`
-//!    is non-fatal (stderr diagnostic, ObjStm still off); `--qdf` +
-//!    `--linearize` is fatal (exit 1).
+//!  - `--qdf` forwards the explicit `--object-streams` mode without a
+//!    compatibility diagnostic; `--qdf` + `--linearize` is fatal (exit 1).
 //!
 //! qpdf is used only as an external `--check` oracle and follows the same
 //! skip policy as `cli_object_streams_qpdf_parity.rs`: hard-fail on CI,
@@ -333,7 +333,7 @@ fn qdf_fix_repairs_hand_edited_stream_length() {
 }
 
 #[test]
-fn qdf_object_streams_generate_emits_diagnostic_and_proceeds() {
+fn qdf_object_streams_generate_matches_qpdf() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
@@ -349,21 +349,28 @@ fn qdf_object_streams_generate_emits_diagnostic_and_proceeds() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "--qdf forces object streams off; ignoring --object-streams=generate",
-        ));
+        .stderr(predicate::str::is_empty());
 
     let rendered = std::fs::read(&output).unwrap();
     assert!(
-        !rendered
+        rendered
             .windows(b"/Type /ObjStm".len())
             .any(|w| w == b"/Type /ObjStm"),
-        "QDF must not emit ObjStm even with --object-streams=generate"
+        "QDF + --object-streams=generate must emit ObjStm"
     );
+    assert!(
+        rendered
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "QDF + --object-streams=generate must emit an xref stream"
+    );
+    assert!(!rendered
+        .windows(b"\nxref\n".len())
+        .any(|w| w == b"\nxref\n"));
 }
 
 #[test]
-fn qdf_object_streams_disable_emits_diagnostic() {
+fn qdf_object_streams_disable_matches_qpdf() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
@@ -379,9 +386,15 @@ fn qdf_object_streams_disable_emits_diagnostic() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "--qdf forces object streams off; ignoring --object-streams=disable",
-        ));
+        .stderr(predicate::str::is_empty());
+
+    let rendered = std::fs::read(&output).unwrap();
+    assert!(!rendered
+        .windows(b"/Type /ObjStm".len())
+        .any(|w| w == b"/Type /ObjStm"));
+    assert!(!rendered
+        .windows(b"/Type /XRef".len())
+        .any(|w| w == b"/Type /XRef"));
 }
 
 #[test]

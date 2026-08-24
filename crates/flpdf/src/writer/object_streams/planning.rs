@@ -107,19 +107,13 @@ pub(crate) struct ObjectStreamPlan {
 /// 100.  Future writer-side knobs (e.g. an explicit cap override) would be
 /// threaded through this conversion.
 ///
-/// When `options.qdf` is `true`, the effective mode is forced to
-/// [`ObjectStreamMode::Disable`] regardless of `options.object_streams`.  QDF
-/// output must not contain any ObjStm containers.  `options.object_streams` is
-/// intentionally left unmodified so that conflicts between
-/// `--qdf` and an explicit `--object-streams=generate` flag can be detected.
+/// QDF changes stream formatting and normalization, but does not override
+/// [`WriterOptions::object_streams`]. This matches qpdf's `setQDFMode` and
+/// `setObjectStreamMode` setters, which remain independent until the writer's
+/// setup dispatches the selected object-stream mode.
 pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerConfig {
-    let mode = if options.qdf {
-        ObjectStreamMode::Disable
-    } else {
-        options.object_streams
-    };
     PlannerConfig {
-        mode,
+        mode: options.object_streams,
         batch_size_cap: DEFAULT_BATCH_SIZE_CAP,
     }
 }

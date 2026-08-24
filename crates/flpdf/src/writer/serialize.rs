@@ -368,27 +368,42 @@ pub(crate) mod xref_stream {
     /// including) `/ID`, in qpdf's fixed order: `/Type /Length /Filter /DecodeParms
     /// /W [/Index]`, then the sorted trimmed trailer entries (including generated
     /// `/Root` and `/Size`, with `/Prev` immediately after `/Size`). The caller
-    /// appends `/ID` (concrete or inline-written) and the ` >>\nstream\n…` framing.
+    /// appends `/ID` (concrete or inline-written) and the stream framing. QDF uses
+    /// qpdf's newline-plus-two-space layout; `/Index` remains on the `/W` line,
+    /// matching `QPDFWriter::writeXRefStream`.
     fn write_object_dict_prefix(
         out: &mut Vec<u8>,
         object: ObjectRef,
         dict: &XrefStreamDict,
         payload_len: usize,
+        qdf: bool,
     ) {
         out.extend_from_slice(format!("{} {} obj\n", object.number, object.generation).as_bytes());
-        out.extend_from_slice(b"<< /Type /XRef");
-        out.extend_from_slice(format!(" /Length {payload_len}").as_bytes());
+        if qdf {
+            out.extend_from_slice(b"<<\n  /Type /XRef");
+            out.extend_from_slice(format!("\n  /Length {payload_len}").as_bytes());
+        } else {
+            out.extend_from_slice(b"<< /Type /XRef");
+            out.extend_from_slice(format!(" /Length {payload_len}").as_bytes());
+        }
         if dict.filtered {
-            out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
+            if qdf {
+                // cov:ignore-start: qpdf never filters a QDF structural stream
+                out.extend_from_slice(b"\n  /Filter /FlateDecode /DecodeParms << /Columns ");
+                // cov:ignore-end
+            } else {
+                out.extend_from_slice(b" /Filter /FlateDecode /DecodeParms << /Columns ");
+            }
             out.extend_from_slice(columns(dict.widths).to_string().as_bytes());
             out.extend_from_slice(b" /Predictor 12 >>");
         }
+        if qdf {
+            out.extend_from_slice(b"\n  /W [ ");
+        } else {
+            out.extend_from_slice(b" /W [ ");
+        }
         out.extend_from_slice(
-            format!(
-                " /W [ {} {} {} ]",
-                dict.widths[0], dict.widths[1], dict.widths[2]
-            )
-            .as_bytes(),
+            format!("{} {} {} ]", dict.widths[0], dict.widths[1], dict.widths[2]).as_bytes(),
         );
         if let Some((start, count)) = dict.index {
             out.extend_from_slice(format!(" /Index [ {start} {count} ]").as_bytes());
@@ -410,7 +425,13 @@ pub(crate) mod xref_stream {
             entries.push((b"/Size".to_vec(), dict.size.to_string().into_bytes()));
             entries.sort_by(|left, right| left.0.cmp(&right.0));
             for (key, value) in entries {
-                out.extend_from_slice(b" /");
+                if qdf {
+                    // cov:ignore-start: QDF xref emission always supplies canonical trailer entries
+                    out.extend_from_slice(b"\n  /");
+                    // cov:ignore-end
+                } else {
+                    out.extend_from_slice(b" /");
+                }
                 crate::object::write_name_escaped(out, key.strip_prefix(b"/").unwrap_or(&key));
                 out.push(b' ');
                 out.extend_from_slice(&value);
@@ -432,7 +453,13 @@ pub(crate) mod xref_stream {
             }
             trailer.insert("Size", Object::Integer(i64::from(dict.size)));
             for (key, value) in trailer.iter() {
-                out.extend_from_slice(b" /");
+                if qdf {
+                    // cov:ignore-start: QDF xref emission never uses a materialized trailer snapshot
+                    out.extend_from_slice(b"\n  /");
+                    // cov:ignore-end
+                } else {
+                    out.extend_from_slice(b" /");
+                }
                 crate::object::write_name_escaped(out, key);
                 out.push(b' ');
                 value.write_pdf(out);
@@ -447,13 +474,72 @@ pub(crate) mod xref_stream {
         }
     }
 
-    /// Append the ` >>\nstream\n<payload>\nendstream\nendobj\n` framing that closes a
-    /// cross-reference stream object (the `\n` before `endstream` is qpdf's fixed
-    /// xref-stream framing, independent of the `NewlineBeforeEndstream` policy).
-    fn write_object_framing(out: &mut Vec<u8>, payload: &[u8]) {
-        out.extend_from_slice(b" >>\nstream\n");
+    /// Append the framing that closes a cross-reference stream object. QDF adds
+    /// the extra newline after `endobj`, as `closeObject` does in qpdf.
+    fn write_object_framing(out: &mut Vec<u8>, payload: &[u8], qdf: bool) {
+        if qdf {
+            out.extend_from_slice(b"\nstream\n");
+        } else {
+            out.extend_from_slice(b" >>\nstream\n");
+        }
         out.extend_from_slice(payload);
         out.extend_from_slice(b"\nendstream\nendobj\n");
+        if qdf {
+            out.push(b'\n');
+        }
+    }
+
+    fn write_object_internal(
+        out: &mut Vec<u8>,
+        object: ObjectRef,
+        dict: &XrefStreamDict,
+        payload: &[u8],
+        qdf: bool,
+        id_writer: Option<crate::object::TrailerIdWriter>,
+    ) -> Option<std::ops::Range<usize>> {
+        write_object_dict_prefix(out, object, dict, payload.len(), qdf);
+        let (id_range, has_id) = if let Some(id_writer) = id_writer {
+            if qdf {
+                out.extend_from_slice(b"\n  /ID ");
+            } else {
+                out.extend_from_slice(b" /ID ");
+            }
+            id_writer(out);
+            (None, true)
+        } else if let Some((id0, id1)) = dict.id {
+            if qdf {
+                out.extend_from_slice(b"\n  /ID ");
+            } else {
+                out.extend_from_slice(b" /ID ");
+            }
+            let id_start = out.len();
+            out.push(b'[');
+            out.push(b'<');
+            push_hex(out, id0);
+            out.extend_from_slice(b"><");
+            push_hex(out, id1);
+            out.extend_from_slice(b">]");
+            (Some(id_start..out.len()), true)
+        } else {
+            (None, false)
+        };
+        if let Some(encrypt) = dict.encrypt {
+            if qdf && !has_id {
+                // cov:ignore-start: qpdf xref streams always emit /ID before /Encrypt
+                out.extend_from_slice(b"\n  /Encrypt ");
+                // cov:ignore-end
+            } else {
+                out.extend_from_slice(b" /Encrypt ");
+            }
+            out.extend_from_slice(
+                format!("{} {} R", encrypt.number, encrypt.generation).as_bytes(),
+            );
+        }
+        if qdf {
+            out.extend_from_slice(b"\n>>");
+        }
+        write_object_framing(out, payload, qdf);
+        id_range
     }
 
     /// Write a complete cross-reference stream indirect object
@@ -472,25 +558,17 @@ pub(crate) mod xref_stream {
         dict: &XrefStreamDict,
         payload: &[u8],
     ) -> Option<std::ops::Range<usize>> {
-        write_object_dict_prefix(out, object, dict, payload.len());
-        let id_range = dict.id.map(|(id0, id1)| {
-            out.extend_from_slice(b" /ID ");
-            let id_start = out.len();
-            out.push(b'[');
-            out.push(b'<');
-            push_hex(out, id0);
-            out.extend_from_slice(b"><");
-            push_hex(out, id1);
-            out.extend_from_slice(b">]");
-            id_start..out.len()
-        });
-        if let Some(encrypt) = dict.encrypt {
-            out.extend_from_slice(
-                format!(" /Encrypt {} {} R", encrypt.number, encrypt.generation).as_bytes(),
-            );
-        }
-        write_object_framing(out, payload);
-        id_range
+        write_object_internal(out, object, dict, payload, false, None)
+    }
+
+    /// QDF-formatted variant of [`write_object`].
+    pub(crate) fn write_object_qdf(
+        out: &mut Vec<u8>,
+        object: ObjectRef,
+        dict: &XrefStreamDict,
+        payload: &[u8],
+    ) -> Option<std::ops::Range<usize>> {
+        write_object_internal(out, object, dict, payload, true, None)
     }
 
     /// Like [`write_object`] but writes the trailer `/ID` via `id_writer` at its
@@ -507,15 +585,18 @@ pub(crate) mod xref_stream {
         payload: &[u8],
         id_writer: &mut dyn FnMut(&mut Vec<u8>),
     ) {
-        write_object_dict_prefix(out, object, dict, payload.len());
-        out.extend_from_slice(b" /ID ");
-        id_writer(out);
-        if let Some(encrypt) = dict.encrypt {
-            out.extend_from_slice(
-                format!(" /Encrypt {} {} R", encrypt.number, encrypt.generation).as_bytes(),
-            );
-        }
-        write_object_framing(out, payload);
+        write_object_internal(out, object, dict, payload, false, Some(id_writer));
+    }
+
+    /// QDF-formatted variant of [`write_object_with_id_writer`].
+    pub(crate) fn write_object_with_id_writer_qdf(
+        out: &mut Vec<u8>,
+        object: ObjectRef,
+        dict: &XrefStreamDict,
+        payload: &[u8],
+        id_writer: &mut dyn FnMut(&mut Vec<u8>),
+    ) {
+        write_object_internal(out, object, dict, payload, true, Some(id_writer));
     }
 
     // ---------------------------------------------------------------------------

@@ -862,14 +862,15 @@ byte golden の無い書き込み経路は安全に移動できない。🔀 行
 | `job/overlay.rs` の `job::overlay::byte_gate` | **QDF byte-identity テスト 12 件** — `three_page_*_qdf_is_byte_identical` 3 件(1320, 1339, 1357) と annotation-copy 系 `*_is_byte_identical_qdf` 9 件(1528-1889) | ✅ `--lib job::overlay::byte_gate` で列挙済み |
 | `cli_byte_identical_overlay.rs`(293-338) | 上記の CLI 版 QDF variant（`--qdf --no-original-object-ids`） | ✅ 列挙済み |
 
-### QDF で「穴」になりえない組み合わせ
+### QDF の組み合わせ整理
 
-QDF は他の出力モードと**排他**であり、次の組み合わせに byte gate を作っても
-意図した writer 経路を通らない。
+QDF のテキスト整形は、オブジェクトストリーム形式とは独立して qpdf の
+writer に適用される。一方、linearize と暗号化出力は qpdf の設定境界で
+排他になる。
 
 | 組み合わせ | 排他の実装箇所 |
 |---|---|
-| QDF × ObjStm | `qdf_tests.rs:734` `qdf_overrides_generate_mode_no_objstm` — QDF が `Generate` を上書きし ObjStm を出さない |
+| QDF × ObjStm | `qdf_tests.rs:749,913,1013` — QDF preserves explicit `Preserve`/`Generate`; `Disable` keeps the classic no-ObjStm form, matching qpdf's mode-independent writer setup |
 | QDF × linearize | `flpdf-cli/src/main.rs:1466` `--qdf and --linearize cannot be used together` |
 | QDF × 暗号化出力 | `writer.rs:3135` `--encrypt / --copy-encryption-from cannot be combined with --qdf` |
 

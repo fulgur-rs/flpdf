@@ -14,7 +14,8 @@ pub(crate) use emission::{
     emit_objstm_body_from_handles, emit_objstm_body_from_resolved, wrap_objstm_body,
 };
 pub(crate) use emission::{
-    emit_objstm_body_from_handles_with_writer, wrap_objstm_body_as_handle, ObjStmBody,
+    emit_objstm_body_from_handles_with_writer, emit_objstm_body_from_handles_with_writer_qdf,
+    wrap_objstm_body_as_handle, ObjStmBody,
 };
 pub use planning::ObjectStreamMode;
 pub(crate) use planning::{
@@ -1665,10 +1666,10 @@ mod tests {
         assert_eq!(config.mode, ObjectStreamMode::Generate);
     }
 
-    // ── QDF forces Disable mode (flpdf-9hc.6.2) ─────────────────────────────
+    // ── QDF leaves the explicit object-stream mode unchanged ───────────────
 
     #[test]
-    fn qdf_flag_forces_disable_mode_over_preserve() {
+    fn qdf_flag_preserves_preserve_mode() {
         let options = crate::writer::WriterOptions {
             qdf: true,
             object_streams: ObjectStreamMode::Preserve,
@@ -1677,15 +1678,14 @@ mod tests {
         let config = planner_config_from_options(&options);
         assert_eq!(
             config.mode,
-            ObjectStreamMode::Disable,
-            "qdf=true must force effective mode to Disable (was Preserve)"
+            ObjectStreamMode::Preserve,
+            "qdf=true must not override the explicit Preserve mode"
         );
-        // original field must be unchanged
         assert_eq!(options.object_streams, ObjectStreamMode::Preserve);
     }
 
     #[test]
-    fn qdf_flag_forces_disable_mode_over_generate() {
+    fn qdf_flag_preserves_generate_mode() {
         let options = crate::writer::WriterOptions {
             qdf: true,
             object_streams: ObjectStreamMode::Generate,
@@ -1694,10 +1694,9 @@ mod tests {
         let config = planner_config_from_options(&options);
         assert_eq!(
             config.mode,
-            ObjectStreamMode::Disable,
-            "qdf=true must force effective mode to Disable (was Generate)"
+            ObjectStreamMode::Generate,
+            "qdf=true must not override the explicit Generate mode"
         );
-        // original field must be unchanged so layer 6.6 can detect the conflict
         assert_eq!(options.object_streams, ObjectStreamMode::Generate);
     }
 

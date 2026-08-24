@@ -65,6 +65,8 @@ pub(crate) struct TrailerPlan {
     pub(crate) id: IdPlan,
     pub(crate) encrypt: Option<ObjectRef>,
     pub(crate) structural_filtered: bool,
+    /// Whether the enclosing writer is emitting qpdf's QDF layout.
+    pub(crate) qdf: bool,
 }
 
 /// Append a classic xref table or xref stream for an already-written body.
@@ -158,7 +160,11 @@ fn append_xref_stream_and_trailer(
                 .as_ref()
                 .map(|(id0, id1)| (id0.as_slice(), id1.as_slice()));
             let dictionary = xref_stream::XrefStreamDict { id, ..dictionary };
-            xref_stream::write_object(bytes, xref_ref, &dictionary, &payload);
+            if trailer.qdf {
+                xref_stream::write_object_qdf(bytes, xref_ref, &dictionary, &payload);
+            } else {
+                xref_stream::write_object(bytes, xref_ref, &dictionary, &payload);
+            }
         }
         IdPlan::Deterministic {
             source_id0,
@@ -167,13 +173,23 @@ fn append_xref_stream_and_trailer(
             let mut id_writer = |out: &mut Vec<u8>| {
                 write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
             };
-            xref_stream::write_object_with_id_writer(
-                bytes,
-                xref_ref,
-                &dictionary,
-                &payload,
-                &mut id_writer,
-            );
+            if trailer.qdf {
+                xref_stream::write_object_with_id_writer_qdf(
+                    bytes,
+                    xref_ref,
+                    &dictionary,
+                    &payload,
+                    &mut id_writer,
+                );
+            } else {
+                xref_stream::write_object_with_id_writer(
+                    bytes,
+                    xref_ref,
+                    &dictionary,
+                    &payload,
+                    &mut id_writer,
+                );
+            }
         }
     }
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
@@ -409,6 +425,7 @@ mod tests {
             id: IdPlan::Materialized { value: None },
             encrypt: None,
             structural_filtered: false,
+            qdf: false,
         }
     }
 
@@ -443,6 +460,7 @@ mod tests {
             },
             encrypt: Some(ObjectRef::new(8, 0)),
             structural_filtered: false,
+            qdf: false,
         };
 
         append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
@@ -697,6 +715,26 @@ mod tests {
     }
 
     #[test]
+    fn qdf_xref_stream_uses_multiline_dictionary_and_blank_separator() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        let mut trailer = trailer(XrefForm::Stream);
+        trailer.qdf = true;
+        trailer.id = IdPlan::Materialized {
+            value: Some((b"first".to_vec(), b"second".to_vec())),
+        };
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
+
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(
+            "2 0 obj\n<<\n  /Type /XRef\n  /Length 6\n  /W [ 1 1 0 ]\n  /Root 1 0 R\n  /Size 3\n  /ID [<6669727374><7365636f6e64>]\n>>\nstream\n"
+        ));
+        assert!(text.ends_with("endstream\nendobj\n\nstartxref\n4\n%%EOF\n"));
+    }
+
+    #[test]
     fn xref_stream_emits_encrypt_after_materialized_id() {
         let mut bytes = b"BODY".to_vec();
         let mut layout = BodyLayout::default();
@@ -751,6 +789,26 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("/Added 1"));
         assert!(text.contains("/ID [<"));
+    }
+
+    #[test]
+    fn qdf_deterministic_xref_stream_uses_qdf_id_writer() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        let mut trailer = trailer(XrefForm::Stream);
+        trailer.qdf = true;
+        trailer.id = IdPlan::Deterministic {
+            source_id0: None,
+            info_suffix: Vec::new(),
+        };
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
+
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("2 0 obj\n<<\n  /Type /XRef"));
+        assert!(text.contains("\n  /ID [<"));
+        assert!(text.ends_with("endobj\n\nstartxref\n4\n%%EOF\n"));
     }
 
     #[test]
