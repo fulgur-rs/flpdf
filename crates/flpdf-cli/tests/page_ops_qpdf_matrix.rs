@@ -252,14 +252,22 @@ fn top_level_dict_keys(output: &str) -> Vec<&str> {
                 i += 1;
             }
             token if depth == 1 && token.starts_with('(') => {
-                // A literal string. qpdf's own PDF syntax allows balanced,
-                // unescaped nested parens inside one; consume whitespace
-                // tokens (which may include embedded spaces from a
-                // multi-word string) until the paren depth returns to 0.
+                // A literal string. PDF syntax allows both balanced,
+                // unescaped nested parens and backslash-escaped `\(`/`\)`
+                // inside one (flpdf's own writer emits the latter,
+                // `write_literal_string`); consume whitespace tokens (which
+                // may include embedded spaces from a multi-word string)
+                // until an *unescaped* paren balance returns to 0.
                 let mut paren_depth = 0i32;
+                let mut escaped = false;
                 loop {
                     for byte in tokens[i].bytes() {
+                        if escaped {
+                            escaped = false;
+                            continue;
+                        }
                         match byte {
+                            b'\\' => escaped = true,
                             b'(' => paren_depth += 1,
                             b')' => paren_depth -= 1,
                             _ => {}
@@ -351,6 +359,20 @@ fn top_level_dict_keys_handles_a_literal_string_with_nested_parens() {
     assert!(
         keys.contains(&"/MediaBox"),
         "a nested-paren literal string must not swallow the real key: {keys:?}"
+    );
+}
+
+#[test]
+fn top_level_dict_keys_honors_escaped_parens_in_a_literal_string() {
+    // flpdf's own writer (`write_literal_string`) emits a literal paren as
+    // `\(`/`\)`. An escaped `\)` must not be mistaken for the string's
+    // terminator, or the scan stops early and shifts the rest of the
+    // key/value parsing, potentially dropping the real key that follows.
+    let output = r"<< /Foo (a \) words) /MediaBox [ 0 0 612 792 ] >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "an escaped close-paren inside a literal string must not swallow the real key: {keys:?}"
     );
 }
 
