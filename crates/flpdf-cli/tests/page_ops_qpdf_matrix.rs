@@ -210,7 +210,12 @@ fn own_page_attributes_of(path: &Path) -> Vec<(bool, bool)> {
 /// token in key position at depth 1 is recorded. A literal-string value
 /// (`( ... )`) can contain embedded whitespace, so `split_whitespace`
 /// divides it into multiple tokens; those are consumed by tracking `(`/`)`
-/// balance until the string closes, not treated as one scalar token.
+/// balance until the string closes, not treated as one scalar token. This
+/// literal-string scan runs at every nesting depth, not only depth 1: a
+/// literal string nested inside an array or dictionary can itself contain a
+/// `[`, `]`, `<<`, or `>>` character (split into its own whitespace token,
+/// e.g. `(a ] b)` -> `"(a"`, `"]"`, `"b)"`), and that must not be
+/// reinterpreted as a real composite delimiter and shift the depth count.
 fn top_level_dict_keys(output: &str) -> Vec<&str> {
     let tokens: Vec<&str> = output.split_whitespace().collect();
     let mut depth = 0i32;
@@ -218,6 +223,39 @@ fn top_level_dict_keys(output: &str) -> Vec<&str> {
     let mut keys = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
+        if tokens[i].starts_with('(') {
+            // A literal string. PDF syntax allows both balanced, unescaped
+            // nested parens and backslash-escaped `\(`/`\)` inside one
+            // (flpdf's own writer emits the latter, `write_literal_string`);
+            // consume whitespace tokens (which may include embedded spaces
+            // from a multi-word string, or delimiter-like characters split
+            // into their own tokens) until an *unescaped* paren balance
+            // returns to 0.
+            let mut paren_depth = 0i32;
+            let mut escaped = false;
+            loop {
+                for byte in tokens[i].bytes() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    match byte {
+                        b'\\' => escaped = true,
+                        b'(' => paren_depth += 1,
+                        b')' => paren_depth -= 1,
+                        _ => {}
+                    }
+                }
+                i += 1;
+                if paren_depth <= 0 || i >= tokens.len() {
+                    break;
+                }
+            }
+            if depth == 1 {
+                expect_key = true;
+            }
+            continue;
+        }
         match tokens[i] {
             "<<" => {
                 depth += 1;
@@ -250,35 +288,6 @@ fn top_level_dict_keys(output: &str) -> Vec<&str> {
                 }
                 expect_key = false;
                 i += 1;
-            }
-            token if depth == 1 && token.starts_with('(') => {
-                // A literal string. PDF syntax allows both balanced,
-                // unescaped nested parens and backslash-escaped `\(`/`\)`
-                // inside one (flpdf's own writer emits the latter,
-                // `write_literal_string`); consume whitespace tokens (which
-                // may include embedded spaces from a multi-word string)
-                // until an *unescaped* paren balance returns to 0.
-                let mut paren_depth = 0i32;
-                let mut escaped = false;
-                loop {
-                    for byte in tokens[i].bytes() {
-                        if escaped {
-                            escaped = false;
-                            continue;
-                        }
-                        match byte {
-                            b'\\' => escaped = true,
-                            b'(' => paren_depth += 1,
-                            b')' => paren_depth -= 1,
-                            _ => {}
-                        }
-                    }
-                    i += 1;
-                    if paren_depth <= 0 || i >= tokens.len() {
-                        break;
-                    }
-                }
-                expect_key = true;
             }
             _ if depth == 1 => {
                 // Consuming a top-level value. `<<`/`[` composite values and
@@ -374,6 +383,24 @@ fn top_level_dict_keys_honors_escaped_parens_in_a_literal_string() {
         keys.contains(&"/MediaBox"),
         "an escaped close-paren inside a literal string must not swallow the real key: {keys:?}"
     );
+}
+
+#[test]
+fn top_level_dict_keys_ignores_composite_delimiters_inside_a_nested_literal_string() {
+    // A literal string nested inside an array (depth 2) can itself contain
+    // `]` as a standalone whitespace token. Because literal-string scanning
+    // used to be gated on depth == 1, that `]` was reinterpreted as the
+    // array's own terminator, prematurely dropping to depth 1 and then to
+    // depth 0 at the real terminator — losing track of the real /MediaBox
+    // key that follows.
+    let output = "<< /Foo [ (a ] b) ] /MediaBox [ 0 0 612 792 ] >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "a `]` character inside a nested literal string must not be mistaken \
+         for the array's real terminator: {keys:?}"
+    );
+    assert!(keys.contains(&"/Foo"), "got {keys:?}");
 }
 
 fn assert_own_page_attributes_match(qpdf_output: &Path, flpdf_output: &Path) {
