@@ -12,9 +12,9 @@
 //!   (g) qdf=true full-rewrite: round-trip — re-writing the QDF output via
 //!       full-rewrite recovers byte-identical decoded content.
 //!   (h) qdf=true full-rewrite: LZWDecode stream decoded and /Filter absent.
-//!   (j) qdf=true: ObjStm decomposition — output has no /Type /ObjStm,
-//!       formerly-compressed objects appear as plain indirect.
-//!   (k) qdf=true + object_streams=Generate: qdf overrides Generate, no ObjStm.
+//!   (j) qdf=true + object_streams=Disable: ObjStm decomposition — output has
+//!       no /Type /ObjStm and formerly-compressed objects are plain indirect.
+//!   (k) qdf=true + object_streams=Generate: ObjStm + xref-stream output.
 //!   (l) qdf=true + no_original_object_ids=false: "%% Original object ID: N G"
 //!       appears immediately before each "N G obj" line (≥2 objects verified).
 //!   (m) qdf=true + no_original_object_ids=true: no "%% Original object ID:"
@@ -610,6 +610,7 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
 
     let options = WriterTestSettings {
         qdf: true,
+        object_streams: ObjectStreamMode::Disable,
         ..WriterTestSettings::default()
     };
 
@@ -739,13 +740,14 @@ fn non_qdf_header_has_no_qdf_marker_but_has_binary_marker() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (k) qdf=true + object_streams=Generate → qdf overrides Generate, no ObjStm
+// (k) qdf=true + object_streams=Generate → ObjStm + xref stream
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// When both qdf=true and object_streams=Generate are set, qdf wins:
-/// the output must not contain any /Type /ObjStm.
+/// qpdf keeps an explicit object-stream Generate request in QDF mode. The
+/// output therefore uses the QDF text formatting together with ObjStm and an
+/// xref stream; QDF does not silently change the selected object-stream mode.
 #[test]
-fn qdf_overrides_generate_mode_no_objstm() {
+fn qdf_preserves_generate_mode_with_objstm() {
     let source = build_pdf_with_objstm_for_qdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -766,35 +768,54 @@ fn qdf_overrides_generate_mode_no_objstm() {
         report.diagnostics.entries()
     );
 
-    // qdf must override Generate — no /Type /ObjStm in output.
-    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
-    for obj_ref in reopened.object_refs() {
-        if let Ok(Object::Stream(s)) = reopened.resolve_object(obj_ref) {
-            let is_objstm = matches!(
-                s.dict.get("Type"),
-                Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
-            );
-            assert!(
-                !is_objstm,
-                "qdf=true must override Generate and emit no /Type /ObjStm; found one at obj {}",
-                obj_ref.number
-            );
-        }
-    }
+    assert!(
+        output
+            .windows(b"/Type /ObjStm".len())
+            .any(|w| w == b"/Type /ObjStm"),
+        "qdf=true + Generate must emit an object stream"
+    );
+    assert!(
+        output
+            .windows(b"/Type /XRef".len())
+            .any(|w| w == b"/Type /XRef"),
+        "qdf=true + Generate must emit an xref stream"
+    );
+    assert!(
+        !output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "qdf=true + Generate must not fall back to a classic xref table"
+    );
+}
 
-    // Object 2 must still be resolvable as the Pages dict.
-    let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
-    let pages = reopened2.resolve_object(ObjectRef::new(2, 0)).unwrap();
-    match &pages {
-        Object::Dictionary(d) => {
-            assert_eq!(
-                d.get("Type"),
-                Some(&Object::Name(b"Pages".to_vec())),
-                "object 2 (Pages) must be resolvable after qdf+Generate rewrite"
-            );
-        }
-        other => panic!("object 2 should be a Dictionary, got {:?}", other),
+#[test]
+fn qdf_generate_objstm_keeps_page_context_comments() {
+    let source = std::fs::read("../../tests/fixtures/compat/three-page.pdf").unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let options = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(text.contains("/Type /ObjStm"));
+    for page in 1..=3 {
+        assert_eq!(
+            text.matches(&format!("%% Page {page}\n")).count(),
+            1,
+            "QDF ObjStm output must annotate page {page} exactly once"
+        );
+        assert_eq!(
+            text.matches(&format!("%% Contents for page {page}\n"))
+                .count(),
+            1,
+            "QDF ObjStm output must annotate page {page}'s contents exactly once"
+        );
     }
+    assert!(check_output(Cursor::new(output)).unwrap().valid);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -914,17 +935,15 @@ fn qdf_original_object_id_comments_suppressed_when_flag_true() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (o) qdf=true with xref-stream source → output must use classic xref table
+// (o) qdf=true with an ObjStm/xref-stream source → preserve source containers
 //     (flpdf-9hc.6.6)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// QDF mode must force a classic xref table even when the source PDF used an
-/// xref stream.  The output must:
-///   - contain "\nxref\n" (classic table marker)
-///   - contain "\ntrailer <<\n" (classic trailer keyword; qdf format since 6.3)
-///   - NOT contain "/Type /XRef" (no xref stream)
+/// With the default Preserve mode, qpdf retains ObjStm and xref-stream form
+/// when the source document has those containers. QDF formatting is orthogonal
+/// to the source/object-stream policy.
 #[test]
-fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
+fn qdf_mode_preserves_source_objstm_and_xref_stream() {
     // build_pdf_with_objstm_for_qdf() produces a PDF-1.5 xref-stream document.
     let source = build_pdf_with_objstm_for_qdf();
 
@@ -940,42 +959,35 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
 
     let options = WriterTestSettings {
         qdf: true,
+        object_streams: ObjectStreamMode::Preserve,
         ..WriterTestSettings::default()
     };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
-    // Classic xref table marker (leading newline avoids matching "startxref\n").
-    assert!(
-        output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
-        "qdf=true must emit a classic xref table (\\nxref\\n) even for an xref-stream source"
-    );
-
-    // Classic (table-form) trailer keyword. Since flpdf-9hc.6.3 the qdf path
-    // formats it as "trailer <<\n" (qpdf --qdf convention) rather than the
-    // compact "trailer\n<<"; either way it is a classic trailer, NOT an xref
-    // stream, which is what this 6.6 test asserts.
     assert!(
         output
-            .windows(b"\ntrailer <<\n".len())
-            .any(|w| w == b"\ntrailer <<\n"),
-        "qdf=true must emit a classic trailer dict (\\ntrailer <<\\n) even for an xref-stream source"
+            .windows(b"/Type /ObjStm".len())
+            .any(|w| w == b"/Type /ObjStm"),
+        "qdf=true + Preserve must retain source object streams"
     );
-
-    // No xref stream must remain.
     assert!(
-        !output
+        output
             .windows(b"/Type /XRef".len())
             .any(|w| w == b"/Type /XRef"),
-        "qdf=true must not emit any /Type /XRef stream"
+        "qdf=true + Preserve must retain xref-stream form"
+    );
+    assert!(
+        !output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "qdf=true + Preserve must not downgrade to a classic xref table"
     );
 
     // Output must be structurally valid.
     let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
-        "qdf xref-stream→table output must be valid; diagnostics: {:?}",
+        "qdf xref-stream output must be valid; diagnostics: {:?}",
         report.diagnostics.entries()
     );
 }
@@ -1032,14 +1044,14 @@ fn qdf_mode_keeps_xref_table_when_source_has_classic_table() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (q) qdf=true + object_streams=Generate → classic xref table, no /ObjStm
-//     (flpdf-9hc.6.6 override holds even with Generate requested)
+// (q) qdf=true + object_streams=Generate → ObjStm + xref stream
+//     (qpdf QPDFWriter::setObjectStreamMode parity)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// When qdf=true and object_streams=Generate are both set, QDF wins: the output
-/// must use a classic xref table and must not contain any /Type /ObjStm.
+/// Explicit Generate is forwarded to qpdf's writer after QDF setup and must
+/// produce the same container form as the live qpdf oracle.
 #[test]
-fn qdf_mode_forces_xref_table_with_generate_override() {
+fn qdf_mode_generate_uses_objstm_and_xref_stream() {
     let source = build_pdf_with_objstm_for_qdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -1052,47 +1064,66 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
-    // Classic xref table must be present.
     assert!(
-        output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
-        "qdf=true + Generate must still emit a classic xref table"
+        output
+            .windows(b"/Type /ObjStm".len())
+            .any(|w| w == b"/Type /ObjStm"),
+        "qdf=true + Generate must emit /Type /ObjStm"
     );
     assert!(
         output
-            .windows(b"\ntrailer <<\n".len())
-            .any(|w| w == b"\ntrailer <<\n"),
-        "qdf=true + Generate must still emit a classic trailer"
-    );
-
-    // No xref stream.
-    assert!(
-        !output
             .windows(b"/Type /XRef".len())
             .any(|w| w == b"/Type /XRef"),
-        "qdf=true + Generate must not emit /Type /XRef"
+        "qdf=true + Generate must emit /Type /XRef"
     );
-
-    // No ObjStm (6.2 regression guard still holds).
-    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
-    for obj_ref in reopened.object_refs() {
-        if let Ok(Object::Stream(s)) = reopened.resolve_object(obj_ref) {
-            let is_objstm = matches!(
-                s.dict.get("Type"),
-                Some(Object::Name(n)) if n.as_slice() == b"ObjStm"
-            );
-            assert!(
-                !is_objstm,
-                "qdf=true + Generate must not emit /Type /ObjStm; found at obj {}",
-                obj_ref.number
-            );
-        }
-    }
+    assert!(
+        !output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
+        "qdf=true + Generate must not emit a classic xref table"
+    );
 
     // Output must be valid.
     let report = check_output(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
-        "qdf+Generate xref-table output must be valid; diagnostics: {:?}",
+        "qdf+Generate xref-stream output must be valid; diagnostics: {:?}",
+        report.diagnostics.entries()
+    );
+}
+
+/// qdf=true + Generate + deterministic_id must write the real content-derived
+/// `/ID`, not the all-zero deterministic-ID placeholder. The QDF+ObjStm
+/// xref-stream trailer route is a second `/ID`-writing site distinct from the
+/// classic-table QDF trailer (which already threads `det_id_source_id0`/
+/// `det_id_info_suffix` through `IdPlan::Deterministic`); this regression
+/// keeps both sites in sync.
+#[test]
+fn qdf_mode_generate_deterministic_id_writes_content_derived_id() {
+    let source = build_pdf_with_objstm_for_qdf();
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+
+    let options = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+
+    let mut output = Vec::new();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
+
+    let all_zero_id = b"/ID [<00000000000000000000000000000000><00000000000000000000000000000000>]";
+    assert!(
+        !output
+            .windows(all_zero_id.len())
+            .any(|w| w == all_zero_id.as_slice()),
+        "qdf=true + Generate + deterministic_id must not emit the all-zero \
+         deterministic-ID placeholder"
+    );
+
+    let report = check_output(Cursor::new(output)).unwrap();
+    assert!(
+        report.valid,
+        "qdf+Generate+deterministic_id output must be valid; diagnostics: {:?}",
         report.diagnostics.entries()
     );
 }

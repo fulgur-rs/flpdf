@@ -1193,8 +1193,8 @@ struct RewriteCommand {
     /// human-readable/editable; pair with the qdf-fix subcommand after manual
     /// edits (qpdf --qdf equivalent).
     ///
-    /// Uses the canonical writer and forces object streams off. Cannot be combined with
-    /// --linearize (QDF is inherently non-linearized).
+    /// Uses the canonical writer and preserves the explicit --object-streams mode. Cannot be
+    /// combined with --linearize (QDF is inherently non-linearized).
     #[arg(long = "qdf")]
     qdf: bool,
     /// Preserve input objects that are not reachable from trailer roots
@@ -2031,7 +2031,7 @@ fn main() {
             ..WriterOptions::default()
         };
         // Top-level `--qdf` is an alias of `rewrite --qdf`; both configure the
-        // same canonical qpdf writer. The library forces ObjStm off under qdf.
+        // same canonical qpdf writer.
         // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
@@ -2468,30 +2468,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             if cmd.qdf && cmd.linearize {
                 eprintln!("flpdf: --qdf and --linearize cannot be used together");
                 std::process::exit(1);
-            }
-            // Non-fatal conflict diagnostic deferred from flpdf-9hc.6.6:
-            // --qdf forces object streams off (the library disables ObjStm
-            // under qdf via 6.2). `preserve` is the clap default and is
-            // indistinguishable from "not passed", so only an explicit
-            // `disable`/`generate` is diagnosable; `disable` already agrees
-            // with QDF so only `generate` is surprising, but report both
-            // explicit non-default values for clarity. Proceed with QDF.
-            if cmd.qdf {
-                match cmd.object_streams {
-                    CliObjectStreamMode::Generate => {
-                        eprintln!(
-                            "flpdf: --qdf forces object streams off; ignoring \
-                             --object-streams=generate"
-                        );
-                    }
-                    CliObjectStreamMode::Disable => {
-                        eprintln!(
-                            "flpdf: --qdf forces object streams off; ignoring \
-                             --object-streams=disable"
-                        );
-                    }
-                    CliObjectStreamMode::Preserve => {}
-                }
             }
             let mut options = WriterOptions {
                 static_id: cmd.static_id,

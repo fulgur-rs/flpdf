@@ -358,6 +358,7 @@ impl PlainWritePlan {
             id,
             encrypt,
             structural_filtered,
+            qdf: options.qdf,
         };
 
         let plan = Self {
@@ -971,6 +972,7 @@ mod tests {
                 id: IdPlan::Materialized { value: None },
                 encrypt: None,
                 structural_filtered: false,
+                qdf: false,
             },
         }
     }

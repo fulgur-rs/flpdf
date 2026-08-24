@@ -60,7 +60,7 @@ pub(crate) fn emit_objstm_body_from_resolved_with_writer<F>(
 where
     F: FnMut(&mut Vec<u8>, u32, ObjectRef, &Object) -> crate::Result<()>,
 {
-    emit_objstm_body_from_members(members, write_member)
+    emit_objstm_body_from_members(members, write_member, false)
 }
 
 /// Serialise ObjStm members directly from the canonical ObjectHandle graph.
@@ -94,12 +94,26 @@ pub(crate) fn emit_objstm_body_from_handles_with_writer<F>(
 where
     F: FnMut(&mut Vec<u8>, u32, ObjectRef, &ObjectHandle) -> crate::Result<()>,
 {
-    emit_objstm_body_from_members(members, write_member)
+    emit_objstm_body_from_members(members, write_member, false)
+}
+
+/// QDF-formatted ObjStm body emission. QPDFWriter writes the pair table with
+/// one `<object> <offset>` row per line in QDF mode; the ordinary writer uses a
+/// single space between pairs.
+pub(crate) fn emit_objstm_body_from_handles_with_writer_qdf<F>(
+    members: &[(ObjectRef, ObjectHandle)],
+    write_member: &mut F,
+) -> crate::Result<ObjStmBody>
+where
+    F: FnMut(&mut Vec<u8>, u32, ObjectRef, &ObjectHandle) -> crate::Result<()>,
+{
+    emit_objstm_body_from_members(members, write_member, true)
 }
 
 fn emit_objstm_body_from_members<T, F>(
     members: &[(ObjectRef, T)],
     write_member: &mut F,
+    qdf: bool,
 ) -> crate::Result<ObjStmBody>
 where
     F: FnMut(&mut Vec<u8>, u32, ObjectRef, &T) -> crate::Result<()>,
@@ -147,7 +161,7 @@ where
     use std::io::Write as _;
     for (i, ((obj_ref, _), offset)) in members.iter().zip(offsets.iter()).enumerate() {
         if i > 0 {
-            pair_table.push(b' ');
+            pair_table.push(if qdf { b'\n' } else { b' ' });
         }
         // Write directly into `pair_table` to avoid a temporary `String`
         // allocation per member.
