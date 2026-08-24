@@ -4027,14 +4027,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // /Length edge is NOT numbered here and disappears cleanly from `renumbered`.
     // In non-QDF mode this is the same behaviour as before.
     use crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber;
-    // The unencrypted/non-QDF case can reach this legacy path only when a
-    // requested Preserve or Generate mode was suppressed to Disable by
-    // force-version < 1.5. Keep its qpdf null-visibility behavior byte-stable.
-    let qpdf_null_visibility = !options.qdf
-        && options.encrypt.is_none()
-        && options.copy_encryption.is_none()
-        && pdf.encryption_ref().is_none()
-        && pdf.deleted_object_refs().is_empty();
+    // qpdf's getTrimmedTrailer applies QPDFObjectHandle::getKeys null
+    // visibility before QPDFWriter::writeTrailer in every writer mode
+    // (QPDFWriter.cc:1163-1192, 2009-2029). Keep that visibility separate
+    // from the explicit removed-reference set below: arrays retain null
+    // positions, while dictionary entries whose values resolve to null are
+    // omitted regardless of QDF or encryption mode.
+    let qpdf_null_visibility = true;
     let removed_refs: BTreeSet<ObjectRef> = pdf.deleted_object_refs().into_iter().collect();
     // QPDFWriter::write calls initializeSpecialStreams() -- which repairs the
     // page tree via QPDF::getAllPages() (promoting a direct /Kids leaf to a

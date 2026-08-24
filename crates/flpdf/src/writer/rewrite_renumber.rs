@@ -327,14 +327,21 @@ impl CanonicalCatalogFirstRenumber {
             ) {
                 continue;
             }
-            collect_canonical_enqueue_refs_with_stream_policy(
-                pdf,
-                &value,
-                0,
-                skip_length,
-                &mut seeds,
-                stream_parameters_removed,
-            )?; // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
+            // QPDFWriter::getTrimmedTrailer obtains the trailer's visible keys
+            // before enqueueing their values. A top-level trailer reference
+            // that resolves to null is therefore omitted entirely, while an
+            // array-valued trailer entry still reaches the recursive collector
+            // so its null elements retain their positions/identities.
+            if !value.try_is_null()? {
+                collect_canonical_enqueue_refs_with_stream_policy(
+                    pdf,
+                    &value,
+                    0,
+                    skip_length,
+                    &mut seeds,
+                    stream_parameters_removed,
+                )?; // cov:ignore: successful trailer traversal is covered; llvm-cov attributes this continuation to the defensive error path
+            }
         }
 
         let mut old_to_new = HashMap::new();

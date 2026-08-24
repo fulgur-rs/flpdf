@@ -1,8 +1,8 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    filters, load_xref_and_trailer, parse_object, CompressStreams, Dictionary, Object, ObjectRef,
-    ObjectStreamMode, Pdf, PdfOpenOptions, XrefForm,
+    filters, load_xref_and_trailer, parse_object, CompressStreams, Dictionary, EncryptParams,
+    Object, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, XrefForm,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -1154,6 +1154,98 @@ fn qdf_consumer_omits_dictionary_keys_that_resolve_to_null() {
             .any(|window| window == b"/Keep"),
         "non-null dictionary keys must remain visible"
     );
+}
+
+fn null_resolving_trailer_fixture() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = bytes.len();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let pages_offset = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{pages_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /Missing 99 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn assert_null_resolving_trailer_is_hidden(output: &[u8]) {
+    assert!(
+        !contains_subslice(output, b"/Missing"),
+        "qpdf writer must omit trailer keys whose references resolve to null"
+    );
+    assert!(
+        !contains_subslice(output, b"%% Original object ID: 99 0")
+            && !contains_subslice(output, b"99 0 obj"),
+        "a trailer-only null reference must not be assigned or emitted as an object"
+    );
+}
+
+/// qpdf's `QPDFWriter::writeTrailer` applies the same null-valued dictionary
+/// visibility rule as body dictionaries, including QDF output. A dangling
+/// trailer reference therefore disappears instead of being renumbered and
+/// emitted as a live-looking reference. This is the QDF regression for
+/// flpdf-9hc.42; the qpdf 11.9.0 oracle emits no `/Missing` entry.
+#[test]
+fn qdf_drops_null_resolving_trailer_keys_like_qpdf() {
+    let mut pdf = Pdf::open(Cursor::new(null_resolving_trailer_fixture()))
+        .expect("trailer fixture must open");
+    let mut output = Vec::new();
+    let options = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &options).expect("QDF rewrite must succeed");
+
+    assert_null_resolving_trailer_is_hidden(&output);
+}
+
+/// The same qpdf null-visibility rule applies when the specialized coordinator
+/// emits a fresh encrypted document or copies encryption from an authenticated
+/// donor; mode selection must not turn a dangling trailer edge into a live
+/// output object.
+#[test]
+fn encrypted_writer_modes_drop_null_resolving_trailer_keys() {
+    let mut pdf = Pdf::open(Cursor::new(null_resolving_trailer_fixture()))
+        .expect("trailer fixture must open");
+    let mut output = Vec::new();
+    let options = WriterTestSettings {
+        encrypt: Some(EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())),
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &options).expect("encrypted rewrite must succeed");
+    assert_null_resolving_trailer_is_hidden(&output);
+
+    let mut donor = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: Vec::new(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("encrypted donor must open");
+    let copy_encryption = donor
+        .writer_copy_encryption_source()
+        .expect("copy-encryption source must be readable")
+        .expect("encrypted donor must expose copy-encryption state");
+
+    let mut pdf = Pdf::open(Cursor::new(null_resolving_trailer_fixture()))
+        .expect("trailer fixture must open");
+    let mut copied_output = Vec::new();
+    let options = WriterTestSettings {
+        copy_encryption: Some(copy_encryption),
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut copied_output, &options)
+        .expect("copy-encrypted rewrite must succeed");
+    assert_null_resolving_trailer_is_hidden(&copied_output);
 }
 
 /// A full rewrite normalizes every object's generation to 0 and drops objects
