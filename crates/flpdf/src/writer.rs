@@ -2045,7 +2045,13 @@ pub(crate) fn restore_catalog_extensions<R: Read + Seek>(
     };
     if extensions_changed || (!snapshot.was_dirty && pdf.is_dirty(snapshot.root_ref)) {
         match snapshot.extensions {
-            Some(extensions) => catalog.replace_key(b"/Extensions", extensions)?,
+            // `restore_key_raw`, not `replace_key`: this restores the exact
+            // pre-write raw entry, including a literal direct null, rather
+            // than performing a semantic document edit (`replace_key` treats
+            // a direct null as key removal, matching qpdf's own
+            // `QPDF_Dictionary::replaceKey`, which is the wrong contract
+            // when undoing a temporary output-only mutation).
+            Some(extensions) => catalog.restore_key_raw(b"/Extensions", extensions)?,
             None => catalog.remove_key(b"/Extensions"),
         }
         pdf.set_object_handle(snapshot.root_ref, catalog)?;
@@ -9798,6 +9804,82 @@ mod tests {
             "restore_catalog_extensions must preserve an indirect null \
              /Extensions reference, not drop it because try_has_key would \
              treat it as absent"
+        );
+    }
+
+    #[test]
+    fn restore_catalog_extensions_preserves_a_direct_null_extensions_entry() {
+        // The full linearized-write path cannot reach a direct-null
+        // `/Extensions` case either, for a related but distinct reason:
+        // `inject_adbe_extension`/`strip_adbe_extension` never run at all
+        // unless `eff_ext > 0 || adbe_status.has_adbe`
+        // (`linearization/writer.rs:3805`), and a source Catalog with a
+        // direct `/Extensions null` has neither -- there is nothing for the
+        // writer to mutate, so `restore_catalog_extensions` never has real
+        // work to undo. Exercise the two functions directly instead, the
+        // same way as the indirect-null case above: a direct null is
+        // restoration's harder case precisely because `ObjectHandle::
+        // replace_key` (qpdf-faithfully) collapses a direct null to key
+        // removal for an ordinary semantic edit
+        // (`libqpdf/QPDF_Dictionary.cc:136-146`) -- restoration is a
+        // different responsibility (undo a temporary mutation, not perform
+        // one), so it must route through `restore_key_raw` instead.
+        let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        let catalog = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+
+        // `replace_key` itself collapses a direct null to key removal
+        // (matching qpdf), so `restore_key_raw` is used here too, purely to
+        // arrange this test's starting state.
+        catalog
+            .restore_key_raw(b"/Extensions", ObjectHandle::null())
+            .expect("set an explicit direct-null /Extensions");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        let snapshot = snapshot_catalog_extensions(&mut pdf)
+            .expect("snapshot")
+            .expect("snapshot must be present for a Catalog with a /Root");
+
+        // Simulate what `inject_adbe_extension` does when the writer decides
+        // to inject an Adobe extension: replace `/Extensions` with a fresh
+        // dictionary.
+        let catalog = pdf.get_object_handle(root_ref);
+        let adbe = ObjectHandle::dictionary(vec![(
+            b"/ADBE".to_vec(),
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.7".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(8)),
+            ]),
+        )]);
+        catalog
+            .replace_key(b"/Extensions", adbe)
+            .expect("simulate writer injection");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        restore_catalog_extensions(&mut pdf, Some(snapshot)).expect("restore");
+
+        let catalog_after = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog_after).expect("Catalog must resolve");
+        let restored = catalog_after
+            .try_as_dictionary()
+            .expect("Catalog dictionary lookup")
+            .expect("Catalog must be a dictionary")
+            .get(b"/Extensions".as_slice())
+            .cloned()
+            .expect(
+                "a direct-null /Extensions entry must survive the restore as \
+                 a present key, not be dropped by replace_key's null-collapse",
+            );
+        assert!(
+            restored.is_direct() && restored.is_null(),
+            "the restored /Extensions entry must remain a direct null"
         );
     }
 
