@@ -207,7 +207,10 @@ fn own_page_attributes_of(path: &Path) -> Vec<(bool, bool)> {
 /// outer dictionary itself owns, and a `/Name` that is itself some other
 /// key's *value* (e.g. `/Foo /Rotate`) must not be mistaken for a key
 /// either: PDF dictionaries strictly alternate key/value pairs, so only a
-/// token in key position at depth 1 is recorded.
+/// token in key position at depth 1 is recorded. A literal-string value
+/// (`( ... )`) can contain embedded whitespace, so `split_whitespace`
+/// divides it into multiple tokens; those are consumed by tracking `(`/`)`
+/// balance until the string closes, not treated as one scalar token.
 fn top_level_dict_keys(output: &str) -> Vec<&str> {
     let tokens: Vec<&str> = output.split_whitespace().collect();
     let mut depth = 0i32;
@@ -248,12 +251,33 @@ fn top_level_dict_keys(output: &str) -> Vec<&str> {
                 expect_key = false;
                 i += 1;
             }
+            token if depth == 1 && token.starts_with('(') => {
+                // A literal string. qpdf's own PDF syntax allows balanced,
+                // unescaped nested parens inside one; consume whitespace
+                // tokens (which may include embedded spaces from a
+                // multi-word string) until the paren depth returns to 0.
+                let mut paren_depth = 0i32;
+                loop {
+                    for byte in tokens[i].bytes() {
+                        match byte {
+                            b'(' => paren_depth += 1,
+                            b')' => paren_depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                    if paren_depth <= 0 || i >= tokens.len() {
+                        break;
+                    }
+                }
+                expect_key = true;
+            }
             _ if depth == 1 => {
-                // Consuming a top-level value. `<<`/`[` composite values are
-                // handled by the depth-tracking arms above (expect_key stays
-                // false until the matching close bracket returns to depth
-                // 1); a scalar value is either a 3-token indirect reference
-                // ("N G R") or a single token (Name/Number/String/Boolean).
+                // Consuming a top-level value. `<<`/`[` composite values and
+                // literal strings are handled by the arms above (expect_key
+                // stays false until the value closes); a remaining scalar
+                // value is either a 3-token indirect reference ("N G R") or
+                // a single token (Name/Number/Boolean/hex string).
                 let is_reference = i + 2 < tokens.len()
                     && tokens[i].bytes().all(|b| b.is_ascii_digit())
                     && tokens[i + 1].bytes().all(|b| b.is_ascii_digit())
@@ -299,6 +323,34 @@ fn top_level_dict_keys_ignores_a_name_valued_extension_entry() {
     assert!(
         !keys.contains(&"/Page"),
         "/Type's own value /Page must not be reported as a key either: {keys:?}"
+    );
+}
+
+#[test]
+fn top_level_dict_keys_consumes_a_multi_word_literal_string_value() {
+    // A literal-string value containing embedded whitespace splits into
+    // multiple `split_whitespace` tokens (e.g. "(two words)" -> "(two",
+    // "words)"). The real key that follows it must still be recognized as
+    // a key, not consumed as if it were a second value token.
+    let output = "<< /Foo (two words) /MediaBox [ 0 0 612 792 ] /Type /Page >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "a multi-word literal-string value before /MediaBox must not swallow the real key: {keys:?}"
+    );
+    assert!(keys.contains(&"/Foo"), "got {keys:?}");
+    assert!(keys.contains(&"/Type"), "got {keys:?}");
+}
+
+#[test]
+fn top_level_dict_keys_handles_a_literal_string_with_nested_parens() {
+    // PDF literal strings permit balanced, unescaped nested parens; the
+    // string must not be considered "closed" at the first inner `)`.
+    let output = "<< /Foo (a (nested) string) /MediaBox [ 0 0 612 792 ] >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "a nested-paren literal string must not swallow the real key: {keys:?}"
     );
 }
 
