@@ -284,6 +284,13 @@ fn overlay_appearance_stream_has_no_raw_snapshot_route() {
         "PdfObject::",
         "into_stream()",
         "into_dict()",
+        // General raw-route markers (not just the former `PdfObject` alias),
+        // matching the neighboring cutover guards in this file.
+        "use crate::Object",
+        "Object::Dictionary",
+        "Object::Stream",
+        "resolve_borrowed",
+        "materialize(",
     ] {
         assert!(
             !source.contains(legacy),
