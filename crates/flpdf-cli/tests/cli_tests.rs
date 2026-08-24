@@ -70,6 +70,21 @@ fn suppress_recovery_matches_qpdf_on_a_recoverable_xref_error() {
 }
 
 #[test]
+fn repair_conflicts_with_suppress_recovery() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--repair",
+            "--suppress-recovery",
+            "--check",
+            "../../tests/fixtures/minimal.pdf",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
 fn suppress_recovery_applies_to_an_overlay_source() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("overlay-corrupt.pdf");
@@ -105,6 +120,46 @@ fn ignore_xref_streams_applies_to_an_overlay_source() {
             "../../tests/fixtures/compat/three-page-objstm.pdf",
             "--",
             "../../tests/fixtures/compat/one-page.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"));
+}
+
+#[test]
+fn ignore_xref_streams_applies_to_a_copy_attachments_donor() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("copy-attachments.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--ignore-xref-streams",
+            "../../tests/fixtures/minimal.pdf",
+            "--copy-attachments-from",
+            "../../tests/fixtures/compat/three-page-objstm.pdf",
+            "--",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"));
+}
+
+#[test]
+fn ignore_xref_streams_applies_to_a_copy_encryption_donor() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("copy-encryption.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--ignore-xref-streams",
+            "--copy-encryption",
+            "../../tests/fixtures/compat/three-page-objstm.pdf",
+            "--encryption-file-password=",
+            "../../tests/fixtures/minimal.pdf",
             output.to_str().unwrap(),
         ])
         .assert()
@@ -175,6 +230,20 @@ fn is_encrypted_applies_suppressed_recovery() {
         .code(2)
         .stderr(predicate::str::contains("parse error"))
         .stderr(predicate::str::contains("Attempting to reconstruct").not());
+}
+
+#[test]
+fn is_encrypted_applies_ignore_xref_streams() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "is-encrypted",
+            "--ignore-xref-streams",
+            "../../tests/fixtures/compat/three-page-objstm.pdf",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("parse error"));
 }
 
 #[test]

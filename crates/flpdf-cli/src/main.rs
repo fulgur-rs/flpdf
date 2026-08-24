@@ -1529,7 +1529,7 @@ struct RecoveryArgs {
     ignore_xref_streams: bool,
     /// Avoid attempting to recover when errors are found in a file's
     /// cross reference table or stream lengths.
-    #[arg(long = "suppress-recovery")]
+    #[arg(long = "suppress-recovery", conflicts_with = "repair")]
     suppress_recovery: bool,
 }
 
