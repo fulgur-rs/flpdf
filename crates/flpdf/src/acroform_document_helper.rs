@@ -1527,47 +1527,6 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         Ok(())
     }
 
-    /// Walk `/Parent` from `start` up to qpdf's top-level field handle.
-    ///
-    /// Mirrors `QPDFFormFieldObjectHelper::getTopLevelField`
-    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:36-47`). This is
-    /// [`Self::get_field_for_annotation`]'s natural composition partner: qpdf's
-    /// `getFormFieldsForPage` calls `getFieldForAnnotation(annot).
-    /// getTopLevelField()` for exactly this reason — `getFieldForAnnotation`
-    /// alone can return a "separated" widget's own ref (see that method's
-    /// doc), and callers that want the human-meaningful named field walk the
-    /// rest of the way up here.
-    ///
-    /// Cycle-guarded on the visited [`ObjectRef`] set, returning the last
-    /// node reached before a repeat — matching qpdf's `QPDFObjGen::set`
-    /// guard for the common indirect-`/Parent` case. A **direct** (inline)
-    /// `/Parent` value stops the walk immediately rather than being
-    /// followed, unlike qpdf's `QPDFObjectHandle`-native walk, which would
-    /// continue onto it — this crate has no live-identity tracking for an
-    /// arbitrarily long direct-only `/Parent` chain (see
-    /// [`crate::form_field_object_helper`]'s module doc for the same gap in
-    /// its own `/Parent` walk). A direct `/Parent` on a field is a
-    /// degenerate case that cannot come from parsing real PDF bytes (`/Parent`
-    /// must be indirect for two or more kids to share a field).
-    ///
-    /// # Errors
-    ///
-    /// Any error from [`Pdf::resolve`].
-    pub fn get_top_level_field(&mut self, start: ObjectRef) -> Result<ObjectRef> {
-        let mut current = start;
-        let mut seen = BTreeSet::new();
-        while seen.insert(current) {
-            let Some(dict) = self.pdf.resolve_borrowed(current)?.as_dict() else {
-                break;
-            };
-            match dict.get("Parent") {
-                Some(Object::Reference(parent_ref)) => current = *parent_ref,
-                _ => break,
-            }
-        }
-        Ok(current)
-    }
-
     /// Return whether the catalog visibly contains an `/AcroForm` entry.
     ///
     /// This mirrors `QPDFAcroFormDocumentHelper::hasAcroForm`
@@ -2592,61 +2551,8 @@ mod tests {
         // `traverseField`: `is_field` is true here because /Parent is
         // present, so `our_field = field` (9), matching
         // `libqpdf/QPDFAcroFormDocumentHelper.cc:343-347`. Callers that want
-        // the named field walk the rest of the way with
-        // `get_top_level_field` (see the next test).
+        // the named field use the canonical FormFieldObjectHelper route.
         assert_eq!(map.get(&ObjectRef::new(9, 0)), Some(&ObjectRef::new(9, 0)));
-        assert_eq!(
-            helper.get_top_level_field(ObjectRef::new(9, 0)).unwrap(),
-            ObjectRef::new(8, 0)
-        );
-        // A merged top-level field/widget has no /Parent: get_top_level_field
-        // is a no-op.
-        assert_eq!(
-            helper.get_top_level_field(ObjectRef::new(7, 0)).unwrap(),
-            ObjectRef::new(7, 0)
-        );
-    }
-
-    #[test]
-    fn get_top_level_field_stops_at_cycle() {
-        let mut pdf = empty_pdf();
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(6, 0)))])),
-        );
-        pdf.set_object(
-            ObjectRef::new(6, 0),
-            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(5, 0)))])),
-        );
-        // Must terminate rather than looping forever.
-        let top = AcroFormDocumentHelper::new(&mut pdf)
-            .unwrap()
-            .get_top_level_field(ObjectRef::new(5, 0))
-            .unwrap();
-        assert!(top == ObjectRef::new(5, 0) || top == ObjectRef::new(6, 0));
-    }
-
-    #[test]
-    fn get_top_level_field_stops_at_non_dictionary_parent() {
-        // 5's /Parent is an indirect reference to 6, but 6 doesn't resolve to
-        // a dictionary. qpdf's getTopLevelField advances onto /Parent's
-        // target unconditionally (`libqpdf/QPDFFormFieldObjectHelper.cc:34-45`
-        // — no dictionary check before the `top_field = top_field.getKey(
-        // "/Parent")` assignment) and only checks dict-ness at the top of the
-        // *next* iteration (`getKeyIfDict`), so the walk stops on 6 itself
-        // rather than backing up to 5.
-        let mut pdf = empty_pdf();
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Dictionary(dict(&[("Parent", Object::Reference(ObjectRef::new(6, 0)))])),
-        );
-        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
-
-        let top = AcroFormDocumentHelper::new(&mut pdf)
-            .unwrap()
-            .get_top_level_field(ObjectRef::new(5, 0))
-            .unwrap();
-        assert_eq!(top, ObjectRef::new(6, 0));
     }
 
     #[test]

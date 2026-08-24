@@ -70,6 +70,20 @@ fn qpdf_cutover_has_no_legacy_handle_aliases() {
 }
 
 #[test]
+fn acroform_top_level_field_uses_the_canonical_form_field_helper() {
+    let acroform = include_str!("../src/acroform_document_helper.rs");
+    let page_specs = include_str!("../src/job/page_specs.rs");
+    assert!(
+        !acroform.contains("pub fn get_top_level_field(&mut self, start: ObjectRef)"),
+        "AcroFormDocumentHelper still exposes the duplicate raw top-level-field route"
+    );
+    assert!(
+        page_specs.contains("FormFieldObjectHelper::new"),
+        "page-spec field collection must use the canonical FormFieldObjectHelper"
+    );
+}
+
+#[test]
 fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
     let source = include_str!("../src/page_form_xobject.rs");
     for legacy in [
