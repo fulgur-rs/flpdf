@@ -150,7 +150,7 @@ fn deterministic_id_incompatible_with_encryption() {
     let output = tmp.path().join("out.pdf");
 
     // Top-level alias path: `flpdf --deterministic-id --encrypt U O 256 -- IN OUT`.
-    // The writer rejects the combination with qpdf's wording before any
+    // The writer translates qpdf's generateID logic_error before any
     // encryption work happens.
     CargoCommand::cargo_bin("flpdf")
         .expect("flpdf binary")
@@ -160,7 +160,7 @@ fn deterministic_id_incompatible_with_encryption() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "incompatible with encrypted output files",
+            "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID",
         ));
 }
 

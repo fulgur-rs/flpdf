@@ -3141,7 +3141,7 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Unsupported`] when [`WriterOptions::deterministic_id`]
+/// Returns [`crate::Error::Internal`] when [`WriterOptions::deterministic_id`]
 /// is combined with encrypted output ([`WriterOptions::encrypt`] or
 /// [`WriterOptions::copy_encryption`]): a content-derived `/ID` cannot be
 /// produced once the bytes are encrypted, because the identifier would need to
@@ -3429,23 +3429,14 @@ fn write_linearized_impl<R: Read + Seek>(
     let pass1_source_trailer = source_trailer_handle.shallow_copy()?;
     pass1_source_trailer.replace_key(b"/ID", pass1_id_handle)?;
 
-    // This guard mirrors a real qpdf restriction, not a blanket rejection of
-    // linearize+encrypt — verified empirically against qpdf 11.9.0: `qpdf
-    // --linearize --encrypt "" "" 128 --use-aes=y --` succeeds on its own (a
-    // non-deterministic `/ID` alongside encryption), while adding
-    // `--deterministic-id` to that same command fails with qpdf's own
-    // `QPDFWriter::generateID has no data for deterministic ID` internal
-    // error. The reason is circularity: a deterministic (content-derived)
-    // `/ID` cannot be computed before the encrypted bytes exist, yet the file
-    // encryption key that produces those bytes itself derives from `/ID[0]`
-    // (PDF 1.7 §7.6.3.3 Algorithm 2). Mirror the flat
-    // (`crate::writer::emit_canonical_pdf`) guard so both write paths
-    // reject exactly the same combination.
-    let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
-    if options.deterministic_id && encrypting {
-        return Err(crate::Error::Unsupported(
-            "the deterministic-id option is incompatible with encrypted output files".to_string(),
-        ));
+    // QPDFWriter::setEncryptionParameters and
+    // QPDFWriter::copyEncryptionParameters call generateID() before the
+    // linearized pass can produce deterministic ID data. Translate that
+    // qpdf logic_error rather than treating the combination as an unsupported
+    // feature.
+    if options.deterministic_id && (options.encrypt.is_some() || options.copy_encryption.is_some())
+    {
+        return Err(crate::writer::generate_id_without_data());
     }
 
     // `plan`/`renumber` are built from a separate `Pdf` handle opened on the
@@ -7246,17 +7237,16 @@ mod tests {
         assert!(reopened.trailer_dictionary().get("Encrypt").is_some());
     }
 
-    /// `--deterministic-id` combined with encryption is rejected up front:
-    /// a content-derived `/ID` cannot be computed once the bytes are
-    /// encrypted, and the file encryption key itself derives from `/ID[0]`
-    /// (PDF Algorithm 2) — the same restriction qpdf enforces (verified
-    /// empirically: `qpdf --deterministic-id --linearize --encrypt ...`
-    /// fails with qpdf's own `QPDFWriter::generateID` internal error). This
-    /// guard does not mean linearize+encrypt is unsupported in general —
+    /// `--deterministic-id` combined with encryption reaches qpdf's
+    /// `QPDFWriter::generateID` logic error before bytes are emitted: a
+    /// content-derived `/ID` cannot be computed once the bytes are encrypted,
+    /// and the file encryption key itself derives from `/ID[0]`
+    /// (PDF Algorithm 2). This does not mean linearize+encrypt is unsupported
+    /// in general —
     /// non-deterministic (default) and `--static-id` `/ID`s combine with
     /// encryption just fine; see [`write_linearized`]'s `# Errors` section.
-    /// Mirrors the flat (`emit_canonical_pdf`) guard, including its
-    /// wording.
+    /// The returned [`crate::Error::Internal`] carries qpdf's exact
+    /// `generateID` message.
     #[test]
     fn deterministic_id_linearized_rejects_encrypt() {
         let mut pdf = open_tiny_pdf();
@@ -7273,8 +7263,11 @@ mod tests {
         let mut pdf2 = open_tiny_pdf();
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
         assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            matches!(
+                err,
+                crate::Error::Internal(ref message)
+                    if message == "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID.  This may happen if deterministic ID and file encryption are requested together."
+            ),
             "got {err:?}"
         );
     }
@@ -7321,8 +7314,11 @@ mod tests {
         let mut pdf2 = open_tiny_pdf();
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
         assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            matches!(
+                err,
+                crate::Error::Internal(ref message)
+                    if message == "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID.  This may happen if deterministic ID and file encryption are requested together."
+            ),
             "got {err:?}"
         );
     }

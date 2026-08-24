@@ -731,6 +731,18 @@ impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
             options.copy_encryption = self.pdf.writer_copy_encryption_source()?;
         }
 
+        // QPDFWriter::setEncryptionParameters and
+        // QPDFWriter::copyEncryptionParameters both call generateID() before
+        // installing the encryption state (QPDFWriter.cc:619 and :656). A
+        // deterministic ID has no data until the writer has emitted the bytes,
+        // so qpdf reports generateID's logic_error for this combination before
+        // forced-version handling can disable encryption.
+        if options.deterministic_id
+            && (options.encrypt.is_some() || options.copy_encryption.is_some())
+        {
+            return Err(generate_id_without_data());
+        }
+
         if forced_version_disables_encryption(&options) {
             options.encrypt = None;
             options.copy_encryption = None;
@@ -2979,6 +2991,19 @@ pub(crate) fn generate_id_handle(source_id0: Option<&[u8]>, static_id: bool) -> 
     ])
 }
 
+/// Return qpdf's `QPDFWriter::generateID` logic error when deterministic ID
+/// data is requested before the writer has emitted any bytes.
+///
+/// qpdf throws this exact message from `QPDFWriter.cc:1868-1874` when
+/// `setEncryptionParameters` or `copyEncryptionParameters` reaches
+/// `generateID` before the deterministic MD5 pipeline has produced its data.
+pub(crate) fn generate_id_without_data() -> crate::Error {
+    crate::Error::Internal(
+        "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID.  This may happen if deterministic ID and file encryption are requested together."
+            .to_string(),
+    )
+}
+
 /// Build the `/Info`-derived suffix of qpdf's deterministic `/ID` seed.
 ///
 /// qpdf (`QPDFWriter::generateID`) appends, for every `/Info` entry whose value
@@ -3950,11 +3975,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             "encrypt and copy_encryption are mutually exclusive".to_string(),
         ));
     }
-    if options.deterministic_id && encrypting {
-        return Err(crate::Error::Unsupported(
-            "the deterministic-id option is incompatible with encrypted output files".to_string(),
-        ));
-    }
     // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
     // Catalog BEFORE any downstream dispatch, so every full-rewrite route sees
     // the injected Catalog.
@@ -4418,7 +4438,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // Generate qpdf's ordinary/static identifier once before either encryption
     // key derivation or trailer emission. The complete array is reused at every
     // trailer site so the emitted /ID[0] is the exact salt used by the context.
-    let generated_id = if options.deterministic_id || options.copy_encryption.is_some() {
+    let generated_id = if options.deterministic_id {
+        if encrypting {
+            // QPDFWriter::generateID is called by the encryption setup before
+            // the deterministic MD5 pipeline can produce its data.
+            return Err(generate_id_without_data());
+        }
+        None
+    } else if options.copy_encryption.is_some() {
         None
     } else {
         Some(generate_id_array(
@@ -7288,7 +7315,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_id_rejected_with_encryption() {
+    fn deterministic_id_reports_qpdf_internal_error_with_encryption() {
         let fixture = build_partition_fixture();
         let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let opts = WriterOptions {
@@ -7301,8 +7328,11 @@ mod tests {
         };
         let err = emit_canonical_pdf(&mut pdf, &mut Vec::new(), &opts).unwrap_err();
         assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m == "the deterministic-id option is incompatible with encrypted output files"),
+            matches!(
+                err,
+                crate::Error::Internal(ref message)
+                    if message == "INTERNAL ERROR: QPDFWriter::generateID has no data for deterministic ID.  This may happen if deterministic ID and file encryption are requested together."
+            ),
             "got {err:?}"
         );
     }

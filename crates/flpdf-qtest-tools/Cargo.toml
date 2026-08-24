@@ -18,6 +18,10 @@ name = "qpdfjob-ctest"
 path = "src/bin/qpdfjob_ctest.rs"
 
 [[bin]]
+name = "qpdf-ctest"
+path = "src/bin/qpdf_ctest.rs"
+
+[[bin]]
 name = "flpdf-test-driver"
 path = "src/bin/driver.rs"
 
