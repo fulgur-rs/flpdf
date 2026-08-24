@@ -13,7 +13,7 @@
 mod filter_handles;
 
 use flpdf::linearization::{LinearizationPlan, RenumberMap};
-use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf, PdfWriter};
+use flpdf::{filters, CompressStreams, Object, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter};
 use std::cell::RefCell;
 use std::io::Cursor;
 use std::path::Path;
@@ -1435,4 +1435,52 @@ fn writer_progress_preserves_recoverable_stream_content_in_all_routes() {
             }
         }
     }
+}
+
+/// qpdf's `--suppress-recovery` must remain effective during writing. The
+/// writer recovery scope may not turn an explicit `repair: false` back on.
+#[test]
+fn writer_respects_explicit_recovery_suppression() {
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        build_recoverable_length_pdf(),
+        PdfOpenOptions {
+            repair: false,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("strict open must accept the valid xref table");
+
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_compress_streams(false);
+    writer.set_output_memory().expect("configure memory output");
+    writer
+        .write()
+        .expect("qpdf suppress-recovery still writes the surviving document");
+    let output = writer.get_buffer().expect("take writer output");
+    drop(writer);
+
+    let diagnostics = pdf.repair_diagnostics();
+    assert_eq!(
+        diagnostics.entries().len(),
+        1,
+        "suppressed recovery must retain only the initial endstream warning"
+    );
+    assert!(
+        diagnostics.entries()[0]
+            .message
+            .contains("expected endstream"),
+        "got {:?}",
+        diagnostics.entries()[0].message
+    );
+    assert!(
+        diagnostics
+            .entries()
+            .iter()
+            .all(|entry| !entry.message.contains("recovered stream length")),
+        "suppressed recovery must not recover the malformed stream"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("Hello"),
+        "suppressed recovery must omit the unrecoverable content stream"
+    );
 }
