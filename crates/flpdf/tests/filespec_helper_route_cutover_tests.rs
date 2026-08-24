@@ -31,3 +31,22 @@ fn filespec_helpers_have_qpdf_owner_modules_and_no_old_facade() {
         assert!(job.contains(function));
     }
 }
+
+#[test]
+fn filespec_helper_tests_do_not_keep_a_raw_embedded_stream_projection() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let module = fs::read_to_string(root.join("src/filespec_helper/mod.rs")).unwrap();
+
+    assert!(
+        !module.contains("fn resolve_ef_stream"),
+        "filespec_helper tests must not keep the raw resolve_ef_stream helper"
+    );
+    assert!(
+        !module.contains("resolve_borrowed(stream_ref)"),
+        "filespec_helper tests must not resolve the embedded stream through raw Object"
+    );
+    assert!(
+        module.contains("get_embedded_file_stream"),
+        "filespec_helper tests must use the canonical FileSpec stream accessor"
+    );
+}
