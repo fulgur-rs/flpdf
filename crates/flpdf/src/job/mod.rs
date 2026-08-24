@@ -44,9 +44,7 @@ pub use attachments::{
 #[cfg(test)]
 pub(crate) use check::check_bytes_for_test;
 pub use check::CheckError;
-pub use json::{
-    write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
-};
+pub use json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
 // Keep the internal aliases available to the json_inspect unit tests without
 // exposing the staged implementation through the public job API.
 #[cfg_attr(not(test), allow(unused_imports))]

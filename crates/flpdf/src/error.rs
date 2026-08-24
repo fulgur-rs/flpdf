@@ -5,6 +5,26 @@ use thiserror::Error;
 /// Crate-wide [`std::result::Result`] specialization.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A qpdf `QPDFUsage`-class error raised by the job/configuration boundary.
+///
+/// Usage failures are distinct from PDF capability and I/O failures: qpdf
+/// catches `QPDFUsage` separately and sends it through its CLI usage/help
+/// exit path before any input or output file is touched.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct UsageError {
+    message: String,
+}
+
+impl UsageError {
+    /// Construct a usage error with the given qpdf-compatible message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 /// Errors produced by the public APIs of `flpdf`.
 ///
 /// Unscoped I/O failures bubble up via [`Error::Io`]. Filesystem operations
@@ -16,6 +36,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// trailer.
 /// [`Error::Encrypted`] covers all encryption-related failures; its subkind is
 /// carried by [`EncryptedError`].
+/// [`Error::Usage`] covers qpdf job/configuration usage failures and must be
+/// routed through the CLI's usage/help exit path rather than reported as a PDF
+/// error.
 /// [`Error::Internal`] and [`Error::System`] mirror qpdf's public classification
 /// of `std::logic_error` and `std::runtime_error`, respectively.
 /// [`Error::OpenFailure`] preserves the terminal source error and accumulated
@@ -41,6 +64,10 @@ pub enum Error {
 
     #[error("unsupported PDF feature: {0}")]
     Unsupported(String),
+
+    /// A qpdf job/configuration usage failure.
+    #[error(transparent)]
+    Usage(#[from] UsageError),
 
     #[error("missing required PDF entry: {0}")]
     Missing(&'static str),

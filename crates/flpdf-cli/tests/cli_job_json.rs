@@ -2,6 +2,14 @@ use assert_cmd::Command;
 use std::fs;
 use std::path::PathBuf;
 
+fn expected_usage(message: &str) -> String {
+    format!(
+        "\nflpdf: {message}\n\nFor help:\n  flpdf --help=usage       usage information\n  \
+flpdf --help=topic       help on a topic\n  flpdf --help=--option    help on an option\n  \
+flpdf --help             general help and a topic list\n\n"
+    )
+}
+
 #[test]
 fn job_json_file_runs_through_the_production_qpdf_job() {
     let directory = tempfile::tempdir().unwrap();
@@ -67,12 +75,9 @@ fn job_json_file_missing_output_reports_one_diagnostic() {
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
-        stderr
-            .matches("an output file name is required; use - for standard output")
-            .count(),
-        1
+        stderr,
+        expected_usage("an output file name is required; use - for standard output")
     );
-    assert!(!stderr.contains("error with job-json file"));
 }
 
 #[test]
@@ -148,9 +153,9 @@ fn job_json_file_rejects_same_input_and_output_without_truncating_input() {
         .arg("--job-json-file=same.json")
         .assert()
         .code(2)
-        .stderr(predicates::str::contains(
-            "input file and output file are the same",
-        ));
+        .stderr(predicates::str::diff(expected_usage(
+            "input file and output file are the same; use --replace-input to intentionally overwrite the input",
+        )));
 
     assert_eq!(fs::read(&input).unwrap(), before);
 }

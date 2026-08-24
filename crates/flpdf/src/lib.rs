@@ -178,7 +178,7 @@ pub use encryption::EncryptionInfo;
 pub use encryption::{
     CopyEncryptionSource, EncryptMethod, EncryptParams, ObjectKeyAlg, PasswordMode,
 };
-pub use error::{EncryptedError, Error, Result};
+pub use error::{EncryptedError, Error, Result, UsageError};
 pub use filespec_helper::{
     encode_utf16be, format_pdf_date, md5_checksum, EmbeddedFileStream, FileParamDates, FileSpec,
     FileSpecBuilder,

@@ -10,7 +10,7 @@ use super::json::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput};
 use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
 use crate::{
     Error, ObjectStreamMode, Pdf, PdfOpenOptions, PdfWriter, QPDFLogger, Result, Severity,
-    WriterConfiguration,
+    UsageError, WriterConfiguration,
 };
 use std::cell::RefCell;
 use std::fs::File;
@@ -245,31 +245,25 @@ impl QPDFJob {
                             .set_object_stream_mode(parse_object_stream_mode(&argument[17..])?);
                     }
                     _ => {
-                        return Err(Error::Unsupported(format!(
-                            "qpdfjob usage error: unknown option {argument}"
-                        )));
+                        return Err(
+                            UsageError::new(format!("unrecognized argument {argument}")).into()
+                        );
                     }
                 }
             } else if parse_options && argument.starts_with('-') {
-                return Err(Error::Unsupported(format!(
-                    "qpdfjob usage error: unknown option {argument}"
-                )));
+                return Err(UsageError::new(format!("unrecognized argument {argument}")).into());
             } else {
                 positionals.push(argument.clone());
             }
         }
 
         if positionals.len() > 2 {
-            return Err(Error::Unsupported(
-                "qpdfjob usage error: too many positional arguments".to_owned(),
-            ));
+            return Err(UsageError::new(format!("unknown argument {}", positionals[2])).into());
         }
         configuration.input_file = positionals.first().map(PathBuf::from);
         configuration.output_file = positionals.get(1).map(PathBuf::from);
         if configuration.input_file.is_none() && !configuration.check {
-            return Err(Error::Unsupported(
-                "qpdfjob usage error: input file is required".to_owned(),
-            ));
+            return Err(UsageError::new("an input file name is required").into());
         }
 
         self.configuration = configuration;
@@ -408,11 +402,8 @@ impl QPDFJob {
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
         self.warnings = false;
-        if !partial && self.configuration.output_file.is_none() {
-            let error = Error::Unsupported(
-                "an output file name is required; use - for standard output".to_owned(),
-            );
-            return Err(error);
+        if !partial {
+            self.check_configuration()?;
         }
         Ok(())
     }
@@ -420,9 +411,13 @@ impl QPDFJob {
     /// Create the configured input document, returning `None` after qpdf-style
     /// error reporting for a missing or malformed input.
     pub fn create_qpdf(&mut self) -> Result<Option<Pdf<BufReader<File>>>> {
-        if let Err(error) = self.check_configuration() {
-            self.report_job_error(&error)?;
-            return Ok(None);
+        match self.check_configuration() {
+            Ok(()) => {}
+            Err(error @ Error::Usage(_)) => return Err(error),
+            Err(error) => {
+                self.report_job_error(&error)?;
+                return Ok(None);
+            }
         }
         let Some(input) = self.configuration.input_file.clone() else {
             let error = Error::Unsupported("qpdfjob input file is not configured".to_owned());
@@ -492,13 +487,6 @@ impl QPDFJob {
 
     /// Run the configured create/write or check lifecycle.
     pub fn run(&mut self) -> Result<JobExitCode> {
-        if self.configuration.require_output && self.configuration.output_file.is_none() {
-            let error = Error::Unsupported(
-                "an output file name is required; use - for standard output".to_owned(),
-            );
-            self.report_job_error(&error)?;
-            return Ok(JobExitCode::Error);
-        }
         let Some(mut pdf) = self.create_qpdf()? else {
             return Ok(JobExitCode::Error);
         };
@@ -530,6 +518,12 @@ impl QPDFJob {
     /// opened, and `QUtil::same_file` rejects destructive aliases before the
     /// writer can truncate them.
     fn check_configuration(&self) -> Result<()> {
+        if self.configuration.require_output && self.configuration.output_file.is_none() {
+            return Err(UsageError::new(
+                "an output file name is required; use - for standard output",
+            )
+            .into());
+        }
         if self.configuration.output_file.as_deref() == Some(Path::new("-")) {
             self.logger.save_to_standard_output(true)?;
         }
@@ -538,9 +532,10 @@ impl QPDFJob {
             self.configuration.output_file.as_deref(),
         ) {
             if crate::qutil::same_file(input, output) {
-                return Err(Error::Unsupported(
-                    "input file and output file are the same; use --replace-input to intentionally overwrite the input file".to_owned(),
-                ));
+                return Err(UsageError::new(
+                    "input file and output file are the same; use --replace-input to intentionally overwrite the input",
+                )
+                .into());
             }
         }
         Ok(())
@@ -573,14 +568,6 @@ impl QPDFJob {
                     .split_once(" (os error ")
                     .map_or(source.as_str(), |(message, _)| message);
                 format!("{operation} {}: {source}", path.display())
-            }
-            Error::Unsupported(message)
-                if message == "an output file name is required; use - for standard output" =>
-            {
-                message.clone()
-            }
-            Error::Unsupported(message) if message.starts_with("qpdfjob usage error: ") => {
-                message["qpdfjob usage error: ".len()..].to_owned()
             }
             _ => error.to_string(),
         }
@@ -872,16 +859,6 @@ mod tests {
             )))
             .unwrap(),
             JobExitCode::Error
-        );
-    }
-
-    #[test]
-    fn job_error_message_strips_the_qpdf_usage_marker() {
-        assert_eq!(
-            QPDFJob::job_error_message(&Error::Unsupported(
-                "qpdfjob usage error: unknown option --bad".to_owned(),
-            )),
-            "unknown option --bad"
         );
     }
 
