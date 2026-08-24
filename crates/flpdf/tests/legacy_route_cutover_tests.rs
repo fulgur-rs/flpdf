@@ -677,3 +677,18 @@ fn qtest_test_39_uses_the_canonical_page_resource_route() {
         );
     }
 }
+
+#[test]
+fn embedded_files_tests_do_not_keep_the_raw_projection_helpers() {
+    let source = include_str!("../src/embedded_files.rs");
+    for legacy in [
+        "resolve_embedded_file_stream_ref",
+        "collect_embedded_file_pairs_raw",
+        "raw_object_from_handle",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "embedded_files.rs still contains the obsolete test-only raw helper {legacy:?}"
+        );
+    }
+}
