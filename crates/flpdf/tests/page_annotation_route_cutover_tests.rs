@@ -1,4 +1,7 @@
-use flpdf::{AcroFormDocumentHelper, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf};
+use flpdf::{
+    AcroFormDocumentHelper, FormFieldObjectHelper, ObjectRef, PageDocumentHelper, PageObjectHelper,
+    Pdf,
+};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -45,15 +48,18 @@ fn canonical_helpers_preserve_grouped_widget_field_association() {
         .unwrap();
     assert_eq!(widgets.len(), 5);
 
-    let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
-    let annotation_to_field = acroform.annotation_to_field_map().unwrap();
+    let annotation_to_field = {
+        let mut acroform = AcroFormDocumentHelper::new(&mut pdf).unwrap();
+        acroform.annotation_to_field_map().unwrap()
+    };
     let top_level_fields: Vec<ObjectRef> = widgets
         .into_iter()
         .map(|widget| {
             let annotation_ref = widget.object_ref().unwrap();
-            acroform
-                .get_top_level_field(annotation_to_field[&annotation_ref])
+            FormFieldObjectHelper::new(annotation_to_field[&annotation_ref], &mut pdf)
+                .get_top_level_field()
                 .unwrap()
+                .0
         })
         .collect();
 

@@ -11,6 +11,7 @@ use super::page_merge::{
     source_top_level_field_names, MergeInput,
 };
 use super::page_plan::PagePlan;
+use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::page_label_document_helper::LabelRange;
 use crate::pages::tree_rebuild::RebuildResult;
 use crate::resources::RemoveUnreferencedResources;
@@ -67,6 +68,7 @@ fn collect_primary_fields(
     pages: &[ObjectRef],
 ) -> Result<Vec<ObjectHandle>> {
     let mut field_refs = BTreeSet::new();
+    let mut candidate_fields = Vec::new();
     {
         let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;
         for &page_ref in pages {
@@ -74,10 +76,14 @@ fn collect_primary_fields(
             for widget in widgets {
                 let field = acroform.get_field_for_annotation_handle(widget)?;
                 if let Some(field_ref) = field.object_ref() {
-                    field_refs.insert(acroform.get_top_level_field(field_ref)?);
+                    candidate_fields.push(field_ref);
                 } // cov:ignore: structural brace has no LLVM executable counter
             }
         }
+    }
+    for field_ref in candidate_fields {
+        let (top_level, _) = FormFieldObjectHelper::new(field_ref, merged).get_top_level_field()?;
+        field_refs.insert(top_level);
     }
     let primary_order = {
         let mut acroform = AcroFormDocumentHelper::new_for_field_tree(merged)?;

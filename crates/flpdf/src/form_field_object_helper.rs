@@ -34,7 +34,6 @@
 //! already avoid via the `BTreeSet`.
 
 use crate::object_handle::ObjectHandle;
-use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -123,6 +122,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     /// Return the top-level field and whether it differs from this field.
+    ///
+    /// Mirrors qpdf's `QPDFFormFieldObjectHelper::getTopLevelField`
+    /// (`libqpdf/QPDFFormFieldObjectHelper.cc:35-46`), which climbs `/Parent`
+    /// until a cycle or a terminal node with no upper bound on depth (its
+    /// guard is `QPDFObjGen::set`, a pure cycle detector). This walk shares
+    /// that same cycle-only termination via `mark_field_node_seen` --
+    /// unlike `resolve_inherited_handle_from`, `current` here is always
+    /// indirect (this function stops rather than climbs into a direct
+    /// `/Parent`, since its `ObjectRef`-typed return cannot represent a
+    /// direct top field), so the module's separate direct-handle cycle guard
+    /// does not apply.
     pub fn get_top_level_field(&mut self) -> Result<(ObjectRef, bool)> {
         let Some(field_ref) = self.field_ref else {
             return Err(Error::Unsupported(
@@ -130,24 +140,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             ));
         };
         let mut current = self.field.clone();
-        let mut seen = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut top = field_ref;
         let mut is_different = false;
-        let mut depth = 0;
 
         loop {
-            if seen
-                .iter()
-                .any(|handle: &ObjectHandle| handle.is_same_object_as(&current))
-            {
+            if !mark_field_node_seen(&mut seen, &current) {
                 break;
-            }
-            seen.push(current.clone());
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "field tree depth exceeds maximum of {} at {}",
-                    DEFAULT_MAX_PAGE_TREE_DEPTH, field_ref
-                )));
             }
 
             let node = self.resolved(current.clone())?;
@@ -162,7 +161,6 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             top = parent_ref;
             current = parent;
             is_different = true;
-            depth += 1;
         }
 
         Ok((top, is_different))
