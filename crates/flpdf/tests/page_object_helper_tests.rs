@@ -1869,22 +1869,25 @@ fn externalize_inline_images_recurses_through_form_content_handles() {
 }
 
 // ---------------------------------------------------------------------------
-// resources()
+// get_resources()
 // ---------------------------------------------------------------------------
 
 #[test]
-fn resources_returns_direct_resources_on_page() {
+fn get_resources_returns_direct_resources_on_page() {
     // /Resources directly on the leaf page.
     let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "/Resources << /Font << >> >>");
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-    let res = helper.resources().unwrap();
-    assert!(res.is_some(), "expected /Resources on leaf page");
-    assert!(res.unwrap().get("Font").is_some(), "expected /Font key");
+    let res = helper.get_resources(false).unwrap();
+    assert!(
+        res.as_dictionary().is_some(),
+        "expected /Resources on leaf page"
+    );
+    assert!(res.has_key(b"/Font"), "expected /Font key");
 }
 
 #[test]
-fn resources_inherits_from_parent() {
+fn get_resources_inherits_from_parent() {
     // /Resources only on the /Pages node — must be inherited.
     let bytes = build_single_page_pdf(
         "/MediaBox [0 0 612 792] /Resources << /ProcSet [/PDF] >>",
@@ -1892,10 +1895,13 @@ fn resources_inherits_from_parent() {
     );
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-    let res = helper.resources().unwrap();
-    assert!(res.is_some(), "expected inherited /Resources from parent");
+    let res = helper.get_resources(false).unwrap();
     assert!(
-        res.unwrap().get("ProcSet").is_some(),
+        res.as_dictionary().is_some(),
+        "expected inherited /Resources from parent"
+    );
+    assert!(
+        res.has_key(b"/ProcSet"),
         "expected /ProcSet in inherited Resources"
     );
 }
@@ -1915,27 +1921,24 @@ fn get_resources_returns_the_live_inherited_handle() {
 }
 
 #[test]
-fn resources_returns_none_when_absent() {
+fn get_resources_returns_null_when_absent() {
     let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "");
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
-    let res = helper.resources().unwrap();
-    assert!(
-        res.is_none(),
-        "expected Ok(None) when no /Resources anywhere"
-    );
+    let res = helper.get_resources(false).unwrap();
+    assert!(res.is_null(), "expected null when no /Resources anywhere");
 }
 
 #[test]
-fn resources_rejects_a_non_dictionary_value() {
+fn get_resources_preserves_a_non_dictionary_value() {
     let bytes = build_single_page_pdf("/MediaBox [0 0 612 792]", "/Resources 42");
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
 
-    let error = helper
-        .resources()
-        .expect_err("resources() must reject a non-dictionary terminal value");
-    assert!(error.to_string().contains("unexpected type integer"));
+    let res = helper
+        .get_resources(false)
+        .expect("get_resources must return the live terminal value");
+    assert_eq!(res.as_integer(), Some(42));
 }
 
 // ---------------------------------------------------------------------------
@@ -2518,8 +2521,8 @@ fn accessors_reject_pages_tree_node() {
         "rotate() must reject a /Pages node"
     );
     assert!(
-        helper.resources().is_err(),
-        "resources() must reject a /Pages node"
+        helper.get_resources(false).is_err(),
+        "get_resources() must reject a /Pages node"
     );
     assert!(
         helper.get_annotations().is_err(),

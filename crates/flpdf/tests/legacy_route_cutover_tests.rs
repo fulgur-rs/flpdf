@@ -337,3 +337,52 @@ fn page_extract_production_uses_the_canonical_handle_route() {
         );
     }
 }
+
+#[test]
+fn page_object_helper_has_no_legacy_resources_projection() {
+    let source = include_str!("../src/page_object_helper.rs");
+    assert!(
+        !source.contains("pub fn resources("),
+        "PageObjectHelper must expose the live get_resources route only"
+    );
+    assert!(
+        !source.contains("fn object_type_name("),
+        "raw Object type-name helper should disappear with resources()"
+    );
+    assert!(
+        source.contains("pub fn get_resources("),
+        "PageObjectHelper canonical get_resources route must remain"
+    );
+}
+
+#[test]
+fn qtest_test_39_uses_the_canonical_page_resource_route() {
+    let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
+    let production: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for legacy in [
+        ".resources()",
+        "resolve_chain",
+        "Object::Dictionary",
+        "Dictionary,",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "qtest test_39 still contains the raw resource route marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "get_resources(false)",
+        "resolve_to_terminal",
+        "as_dictionary",
+    ] {
+        assert!(
+            production.contains(canonical),
+            "qtest test_39 must use the canonical handle route {canonical:?}"
+        );
+    }
+}

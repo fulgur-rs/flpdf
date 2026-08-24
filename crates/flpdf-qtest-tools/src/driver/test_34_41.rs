@@ -12,12 +12,11 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, Error, Object, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter,
+    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, PageObjectHelper, Pdf, PdfWriter,
     TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
-use super::handle::resolve_chain;
 use crate::output::write_bytes;
 
 // ---------------------------------------------------------------------------
@@ -709,42 +708,30 @@ pub(crate) fn run_test_39<R: Read + Seek>(
         // `/Resources /XObject` (inherited up `/Parent` when the leaf page
         // has none) without mutating the page tree
         // (`libqpdf/QPDFPageObjectHelper.cc:318-383`).
-        // `PageObjectHelper::resources` is the same non-mutating inherited
-        // walk (its own doc: "does not mutate"), so it is used here rather
+        // `PageObjectHelper::get_resources` is the same non-mutating inherited
+        // handle walk, so it is used here rather
         // than `push_inherited_attributes_to_pages`, which *would* write
         // `/Resources` down onto every page -- a side effect test_39's own
         // qpdf source never has.
-        let Some(resources) = PageObjectHelper::new(page_ref, pdf).resources()? else {
+        let resources = PageObjectHelper::new(page_ref, pdf).get_resources(false)?;
+        let resources = pdf.resolve_to_terminal(&resources)?;
+        if resources.is_null() {
             continue;
-        };
-        // `Dictionary` (the legacy `Object`-based map `resources()`
-        // returns) keys are stored without a leading `/`
-        // (`driver/handle.rs`'s own `resolve_stream_dictionary`, which reads
-        // `source.get(b"Filter")` the same way) -- contrast
-        // `ObjectHandle::get_key`, which requires the leading `/`.
-        let Some(xobject) = resources.get(b"XObject").cloned() else {
-            continue;
-        };
-        let (xobject, _, _) = resolve_chain(pdf, xobject)?;
-        let Object::Dictionary(xobject) = xobject else {
+        }
+        let xobject = pdf.resolve_to_terminal(&resources.get_key(b"/XObject"))?;
+        let Some(xobject) = xobject.as_dictionary() else {
             continue;
         };
 
         // `std::map<std::string, QPDFObjectHandle>` (`QPDFPageObjectHelper::getImages`,
-        // `:375-384`) iterates in ascending XObject-name order; `Dictionary`
-        // is `BTreeMap`-backed and does the same
-        // (`Dictionary::iter`'s own doc).
-        for (_key, value) in xobject.iter() {
-            // A PDF stream is always an indirect object by construction; a
-            // direct `Object::Stream` embedded straight into a resource
-            // dictionary is not a shape any real file (or this driver's own
-            // fixtures) produces, so it is skipped here the same way
-            // `driver/embedded_files.rs`'s own doc treats a non-reference
-            // name-tree value as out of scope.
-            let Object::Reference(object_ref) = value else {
+        // `:375-384`) iterates in ascending XObject-name order; the canonical
+        // handle dictionary snapshot is BTreeMap-ordered and does the same.
+        for (_key, value) in xobject {
+            let value = pdf.resolve_to_terminal(&value)?;
+            let Some(object_ref) = value.object_ref() else {
                 continue;
             };
-            let handle = pdf.get_object_handle(*object_ref);
+            let handle = pdf.get_object_handle(object_ref);
             if !handle.is_image(true)? {
                 continue;
             }
