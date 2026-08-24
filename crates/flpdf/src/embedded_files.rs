@@ -354,30 +354,16 @@ pub fn remove_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Result
 /// `/Root` mark-and-sweep, which drops every `/EF` stream of a removed
 /// filespec transitively.
 #[cfg(test)]
-fn resolve_embedded_file_stream_ref<R: Read + Seek>(
+fn embedded_file_stream_ref<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     filespec_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
-    let Some(fs_dict) = pdf.resolve_borrowed(filespec_ref)?.as_dict() else {
-        return Ok(None);
+    let candidate = {
+        let filespec = pdf.get_object_handle(filespec_ref);
+        let mut filespec = crate::filespec_helper::FileSpec::new(filespec, pdf)?;
+        filespec.get_embedded_file_stream("")?
     };
-    let ef_dict: Dictionary = match fs_dict.get("EF") {
-        Some(Object::Dictionary(d)) => d.clone(),
-        Some(Object::Reference(r)) => {
-            let r = *r;
-            match pdf.resolve_borrowed(r)? {
-                Object::Dictionary(d) => d.clone(),
-                _ => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
-    };
-    for key in &["UF", "F", "Unix", "Mac", "DOS"] {
-        if let Some(r) = ef_dict.get(key).and_then(Object::as_ref_id) {
-            return Ok(Some(r));
-        }
-    }
-    Ok(None)
+    Ok(candidate.object_ref())
 }
 
 // ── Writer constants ──────────────────────────────────────────────────────────
@@ -399,8 +385,9 @@ pub const DEFAULT_MAX_EMBEDDED_FILES_DEPTH: usize = 100;
 ///
 /// **Semantics:** name-tree values that are *direct* `/Filespec` dictionaries
 /// (rather than indirect references) are intentionally **skipped** — this
-/// reader only surfaces `(key, ObjectRef)` pairs. Mutation and copying use
-/// `collect_embedded_file_pairs_raw`, which preserves direct-dict values.
+/// reader only surfaces `(key, ObjectRef)` pairs. Mutation and copying use the
+/// handle-valued [`EmbeddedFileDocumentHelper::get_embedded_files`] projection,
+/// which preserves direct-dict values.
 // TODO(flpdf-9hc.10.6): consider exposing direct-dict entries via the public
 // list/show API (e.g. an `Object`-valued variant) once list/show land.
 ///
@@ -443,41 +430,6 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
                 .map(|object_ref| (key, object_ref))
         })
         .collect())
-}
-
-// ── Raw collector (writer source of truth) ────────────────────────────────────
-
-/// Enumerate `(name_key, value)` entries in the catalog's
-/// `/Names /EmbeddedFiles` name tree, preserving each value **verbatim** as an
-/// [`Object`] — indirect references *and* direct `/Filespec` dictionaries.
-///
-/// The public reader [`list_embedded_files`] intentionally filters to indirect
-/// references, while mutation and copying preserve direct-dict entries.
-#[cfg(test)]
-pub(crate) fn collect_embedded_file_pairs_raw<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    max_depth: usize,
-) -> Result<Vec<(Vec<u8>, Object)>> {
-    let Some(mut tree) = embedded_files_tree_with_options(pdf, false, Some(max_depth))? else {
-        return Ok(vec![]);
-    };
-    tree.entries(pdf)?
-        .into_iter()
-        .map(|(key, value)| Ok((key, raw_object_from_handle(&value)?)))
-        .collect()
-}
-
-/// Project a live handle into the legacy raw-object boundary retained by the
-/// attachment cleanup route until `flpdf-egzr.3.2.8`. Indirect values remain
-/// references without resolving their bodies; direct values are materialized
-/// in place, matching the old `NameTree::as_map` projection.
-#[cfg(test)]
-fn raw_object_from_handle(handle: &ObjectHandle) -> Result<Object> {
-    if let Some(object_ref) = handle.object_ref() {
-        Ok(Object::Reference(object_ref))
-    } else {
-        handle.materialize()
-    }
 }
 
 // ── Writer ────────────────────────────────────────────────────────────────────
@@ -1089,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_embedded_file_stream_ref_accepts_indirect_ef_dict() {
+    fn embedded_file_stream_ref_accepts_indirect_ef_dict() {
         let mut pdf = open_minimal();
         let fs_ref = FileSpecBuilder::new("indirect-ef.txt", b"payload")
             .build(&mut pdf)
@@ -1106,7 +1058,7 @@ mod tests {
         fs_dict.insert("EF", Object::Reference(ef_ref));
         pdf.set_object(fs_ref, Object::Dictionary(fs_dict));
 
-        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+        let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve stream")
             .expect("stream ref");
 
@@ -1125,7 +1077,7 @@ mod tests {
         let fs_ref = add_attachment_from_path(&mut pdf, b"gc.txt", &file).expect("add");
 
         // Resolve the stream ref before removal.
-        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+        let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve_stream_ref")
             .expect("stream ref must exist");
 
@@ -1156,7 +1108,7 @@ mod tests {
             .expect("build filespec");
         insert_embedded_file(&mut pdf, b"idx.txt", fs_ref).expect("insert");
 
-        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+        let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve stream ref")
             .expect("stream ref must exist");
 
@@ -1316,7 +1268,7 @@ mod tests {
             .expect("build filespec");
         insert_embedded_file(&mut pdf, b"shared.txt", fs_ref).expect("insert");
 
-        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+        let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve stream ref")
             .expect("stream ref must exist");
 
@@ -1400,7 +1352,7 @@ mod tests {
             .expect("build filespec");
         insert_embedded_file(&mut pdf, b"paired.txt", fs_ref).expect("insert");
 
-        let stream_ref = resolve_embedded_file_stream_ref(&mut pdf, fs_ref)
+        let stream_ref = embedded_file_stream_ref(&mut pdf, fs_ref)
             .expect("resolve stream ref")
             .expect("stream ref must exist");
 
@@ -1456,7 +1408,7 @@ mod tests {
             .build(&mut pdf)
             .expect("build a");
         insert_embedded_file(&mut pdf, b"a.txt", fs_a).expect("insert a");
-        let shared_stream = resolve_embedded_file_stream_ref(&mut pdf, fs_a)
+        let shared_stream = embedded_file_stream_ref(&mut pdf, fs_a)
             .expect("resolve stream a")
             .expect("stream a exists");
 
@@ -1812,22 +1764,20 @@ mod tests {
             "list_embedded_files must be empty when /EmbeddedFiles is absent"
         );
         assert!(
-            collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
-                .expect("raw")
+            pdf.embedded_files()
+                .get_embedded_files()
+                .expect("handle-valued entries")
                 .is_empty(),
-            "raw collector must be empty when /EmbeddedFiles is absent"
+            "handle-valued entries must be empty when /EmbeddedFiles is absent"
         );
     }
 
-    // ── Test: raw collector reads through a 2-hop /Names (flpdf-3x23) ─────────
+    // ── Test: handle-valued reader reads through a 2-hop /Names ────────────────
     //
-    // `collect_embedded_file_pairs_raw` resolves the catalog `/Names` value once.
-    // When /Names is reached through more than one indirect hop
-    // (`ref → ref → dict`), a single-hop resolve sees a Reference (not a dict)
-    // and returns an empty list, silently dropping every attachment. Following
-    // the holder chain to its terminal recovers them.
+    // The canonical helper follows the catalog `/Names` holder chain to the
+    // terminal name-tree dictionary while retaining the Filespec handle.
     #[test]
-    fn collect_pairs_reads_through_two_hop_names() {
+    fn handle_entries_read_through_two_hop_names() {
         let mut pdf = open_minimal();
 
         // Register an attachment so /Names /EmbeddedFiles holds a real entry.
@@ -1860,19 +1810,25 @@ mod tests {
         catalog.insert("Names", Object::Reference(carrier_ref));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
-        let pairs = collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
-            .expect("raw collector");
+        let entries = pdf
+            .embedded_files()
+            .get_embedded_files()
+            .expect("handle-valued entries");
         assert_eq!(
-            pairs.len(),
+            entries.len(),
             1,
-            "raw collector must enumerate the attachment behind a 2-hop /Names"
+            "handle-valued reader must enumerate the attachment behind a 2-hop /Names"
         );
-        assert_eq!(pairs[0].0, b"chain.txt");
-        assert_eq!(pairs[0].1, Object::Reference(fs_ref));
+        assert_eq!(
+            entries
+                .get(b"chain.txt".as_slice())
+                .and_then(ObjectHandle::object_ref),
+            Some(fs_ref)
+        );
     }
 
     #[test]
-    fn collect_pairs_preserves_direct_filespec_at_raw_boundary() {
+    fn handle_entries_preserve_direct_filespec_handles() {
         let mut pdf = open_minimal();
         let catalog_ref = pdf.root_ref().expect("root");
         let mut catalog = pdf
@@ -1897,9 +1853,18 @@ mod tests {
         catalog.insert("Names", Object::Dictionary(names));
         pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
-        let pairs = collect_embedded_file_pairs_raw(&mut pdf, DEFAULT_MAX_EMBEDDED_FILES_DEPTH)
-            .expect("collect direct filespec");
-        assert!(matches!(pairs.as_slice(), [(_, Object::Dictionary(_))]));
+        let entries = pdf
+            .embedded_files()
+            .get_embedded_files()
+            .expect("collect direct filespec handle");
+        let filespec = entries
+            .get(b"direct".as_slice())
+            .expect("direct Filespec entry");
+        assert!(filespec.as_dictionary().is_some());
+        assert_eq!(
+            filespec.get_key(b"/F").as_string(),
+            Some(b"direct.txt".to_vec())
+        );
     }
 
     // ── Test: empty removal preserves a 2-hop /Names holder chain (flpdf-3x23)
