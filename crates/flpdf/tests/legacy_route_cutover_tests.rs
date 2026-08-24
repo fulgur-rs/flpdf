@@ -113,6 +113,32 @@ fn acroform_field_prune_production_uses_the_canonical_handle_route() {
 }
 
 #[test]
+fn json_sections_production_uses_canonical_helper_routes() {
+    let source = include_str!("../src/job/json_sections.rs");
+    for legacy in [
+        "use crate::object::{Object",
+        "resolve_borrowed",
+        "set_object(",
+        "NameTree::new",
+        "lift_object_to_handle",
+        "Object::",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "job/json_sections.rs still contains the raw route marker {legacy:?}"
+        );
+    }
+    assert!(
+        source.contains("PageObjectHelper"),
+        "JSON pages must use the canonical PageObjectHelper route"
+    );
+    assert!(
+        source.contains("embedded_files"),
+        "JSON attachments must use the canonical EmbeddedFileDocumentHelper route"
+    );
+}
+
+#[test]
 fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
     let source = include_str!("../src/page_form_xobject.rs");
     for legacy in [
