@@ -309,6 +309,11 @@ struct Cli {
     #[arg(long)]
     show_linearization: bool,
 
+    /// Run a complete qpdf job JSON file through the production QPDFJob
+    /// lifecycle (qpdf `--job-json-file`).
+    #[arg(long = "job-json-file", value_name = "PATH", require_equals = true)]
+    job_json_file: Option<PathBuf>,
+
     // ── JSON inspection flags ─────────────────────────────────────────────
     // These mirror qpdf's --json / --json-output / --json-key / --json-object
     // / --json-stream-data / --json-stream-prefix flags.
@@ -1727,7 +1732,9 @@ fn main() {
     // such as --check and --show-pages on that same object.
     // For ordinary JSON output, the separate --json branch remains first among
     // the non-inspection modes and retains its existing validation boundary.
-    let result = if json_input_inspection {
+    let result = if let Some(path) = args.job_json_file.as_deref() {
+        run_job_json_file(path)
+    } else if json_input_inspection {
         run_json_input_inspection(&args)
     } else if args.json.is_some() {
         run_json(&args)
@@ -2044,6 +2051,26 @@ fn usage_exit(error: &UsageError) -> ! {
 {who} --help             general help and a topic list\n\n"
     ));
     std::process::exit(2);
+}
+
+fn run_job_json_file(path: &Path) -> CliResult<()> {
+    let json = std::fs::read_to_string(path)
+        .map_err(|error| error_with_file(path, Box::new(error) as Box<dyn std::error::Error>))?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+
+    job.initialize_from_json(&json).map_err(|error| {
+        Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: format!("error with job-json file {}: {error}", path.display()),
+        }) as Box<dyn std::error::Error>
+    })?;
+    // The library JSON entry point uses qpdfjob's C-helper prefix while the
+    // CLI's QPDFJob caller uses the ordinary qpdf prefix. Set the CLI
+    // boundary after initialization, before any input warning or completion
+    // summary is emitted.
+    job.set_message_prefix(progname());
+    finish_job_exit_status(job.run()?)
 }
 
 fn run_json(cli: &Cli) -> CliResult<()> {
