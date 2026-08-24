@@ -2175,31 +2175,6 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(Some(ObjectRef::new(number, 0)))
     }
 
-    /// Run an operation with qpdf's default stream-framing recovery enabled.
-    ///
-    /// This is the recovery scope used by full rewrites. It is also available
-    /// to consumers that must prepare live `ObjectHandle` streams before
-    /// invoking a writer, so malformed `/Length` entries produce the same
-    /// lazy recovery diagnostics as qpdf 11.9.0.
-    pub fn with_writer_stream_recovery<T, E>(
-        &mut self,
-        operation: impl FnOnce(&mut Self) -> std::result::Result<T, E>,
-    ) -> std::result::Result<T, E> {
-        let resolver = Rc::clone(&self.resolver);
-        resolver.with_writer_stream_recovery(|| operation(self))
-    }
-
-    /// Run the plain canonical writer with qpdf's default stream-framing
-    /// recovery enabled. This preserves the writer's historical behavior for
-    /// a document opened in flpdf's strict xref mode without changing the
-    /// strict semantics of ordinary `ObjectHandle` resolution.
-    pub(crate) fn with_plain_writer_stream_recovery<T>(
-        &mut self,
-        operation: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        self.with_writer_stream_recovery(operation)
-    }
-
     /// Resolve `handle` (via [`Pdf::resolve`]), then chase
     /// through a [`Pdf::set_object`]-driven bare-reference redirect (if any)
     /// to its terminal (non-reference) value. Every accessor (`type_code`,

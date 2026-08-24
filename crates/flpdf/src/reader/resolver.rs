@@ -300,12 +300,6 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// reconstruct that happened in a separate member
     /// (`m->reconstructed_xref`, `QPDF.hh:1480`).
     attempt_recovery: bool,
-    /// Writer-local recovery scope retained for the canonical writer's stream
-    /// framing walk. Normal document opening already defaults to qpdf's
-    /// recovery permission; an explicit strict open can still use this scoped
-    /// writer behavior until the writer-local bridge is removed at its
-    /// consumer cutover.
-    writer_stream_recovery: bool,
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
     ///
     /// Set to `true` when live resolution triggers cross-reference table
@@ -806,7 +800,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
                 attempt_recovery,
-                writer_stream_recovery: false,
                 // qpdf `m->reconstructed_xref` (`QPDF.cc:524`): set by
                 // `reconstruct_xref` which runs both at open time (`:464`) and
                 // during resolution (`:1617`). Carry open-time recovery state
@@ -1369,23 +1362,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().attempt_recovery
     }
 
-    /// Run a writer operation with qpdf's default stream-framing recovery
-    /// enabled, restoring the previous setting before returning.
-    pub(crate) fn with_writer_stream_recovery<T>(&self, operation: impl FnOnce() -> T) -> T {
-        let previous = {
-            let mut core = self.core.borrow_mut();
-            let previous = core.writer_stream_recovery;
-            core.writer_stream_recovery = true;
-            previous
-        };
-        let result = operation();
-        self.core.borrow_mut().writer_stream_recovery = previous;
-        result
-    }
-
     fn stream_recovery_enabled(&self) -> bool {
-        let core = self.core.borrow();
-        core.attempt_recovery || core.writer_stream_recovery
+        self.core.borrow().attempt_recovery
     }
 
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`

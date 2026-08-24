@@ -1178,12 +1178,8 @@ mod tests {
             newline_before_endstream: NewlineBeforeEndstream::Never,
             ..WriterOptions::default()
         };
-        let (bytes, _) = pdf
-            .with_plain_writer_stream_recovery(|pdf| {
-                let plan = PlainWritePlan::build(pdf, &options)?;
-                emit_bodies(pdf, &options, &plan)
-            })
-            .unwrap();
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let (bytes, _) = emit_bodies(&mut pdf, &options, &plan).unwrap();
         assert!(bytes
             .windows(b"missing-lf".len())
             .any(|window| window == b"missing-lf"));
@@ -1203,14 +1199,9 @@ mod tests {
             ..WriterOptions::default()
         };
 
-        let (_, data) = pdf
-            .with_plain_writer_stream_recovery(|pdf| {
-                let handle = pdf.get_object_handle(ObjectRef::new(5, 0));
-                pdf.resolve(&handle)?;
-                let (_, data, _) = canonical_stream_output(&handle, &options)?;
-                Ok((Vec::<u8>::new(), data))
-            })
-            .unwrap();
+        let handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&handle).unwrap();
+        let (_, data, _) = canonical_stream_output(&handle, &options).unwrap();
 
         assert_eq!(data, b"missing-lf\n");
     }

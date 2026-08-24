@@ -33,7 +33,7 @@ fn cli_transformation_order_matches_qpdf_job() {
         .find("flatten_rotation_on_pages(&mut pdf, &page_refs)?")
         .expect("rotation route");
     let normalize = source
-        .rfind("pdf.with_writer_stream_recovery(normalize_page_contents)?")
+        .rfind("normalize_page_contents(&mut pdf)?")
         .expect("plain rewrite normalization route");
 
     assert!(generate < flatten);

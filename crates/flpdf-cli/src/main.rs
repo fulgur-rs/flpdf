@@ -3237,7 +3237,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // Apply content normalization before the writer plans and emits the
         // linearized document.
         let normalization_last_bad = if normalize_content {
-            pdf.with_writer_stream_recovery(normalize_page_contents)?
+            normalize_page_contents(&mut pdf)?
         } else {
             Vec::new()
         };
@@ -3431,7 +3431,7 @@ fn run_rewrite_opened<R: Read + Seek + 'static>(
         // normalizer consumes the provider-backed coalesced route and writes
         // the normalized bytes through ObjectHandle.
         let normalization_last_bad = if normalize_content {
-            pdf.with_writer_stream_recovery(normalize_page_contents)?
+            normalize_page_contents(&mut pdf)?
         } else {
             Vec::new()
         };
