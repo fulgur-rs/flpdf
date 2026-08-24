@@ -2914,6 +2914,20 @@ pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
     source_permanent_id_value(trailer.get("ID"))
 }
 
+/// Extract the source trailer's non-empty `/ID[0]` through the live qpdf-shaped
+/// handle graph. This is the ObjectHandle counterpart of [`source_permanent_id`]
+/// for writer paths whose caller has already crossed the `QPDF::getTrailer`
+/// boundary.
+pub(crate) fn source_permanent_id_handle(trailer: &ObjectHandle) -> Option<Vec<u8>> {
+    let id = trailer.try_get_key(b"/ID").ok()?;
+    let first = id.try_array_item(0).ok()??;
+    first.try_dereference().ok()?;
+    match first.as_string() {
+        Some(bytes) if !bytes.is_empty() => Some(bytes),
+        _ => None,
+    }
+}
+
 /// Generate qpdf's ordinary/static two-element `/ID` array.
 ///
 /// qpdf creates the changing identifier once and then uses the non-empty
@@ -2921,12 +2935,25 @@ pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
 /// source permanent identifier falls back to that same changing identifier,
 /// so `/ID[0] == /ID[1]` for a first save or an empty source `/ID[0]`.
 pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> Object {
+    let source_id0 = source_permanent_id_value(source_id);
+    generate_id_array_from_source_id0(source_id0.as_deref(), static_id)
+}
+
+/// Generate qpdf's ordinary/static `/ID` array from a previously resolved
+/// source `/ID[0]`, without reconstructing a legacy [`Object`] trailer value.
+pub(crate) fn generate_id_array_from_source_id0(
+    source_id0: Option<&[u8]>,
+    static_id: bool,
+) -> Object {
     let changing_id = if static_id {
         QPDF_STATIC_ID.to_vec()
     } else {
         fresh_id_bytes().to_vec()
     };
-    let permanent_id = source_permanent_id_value(source_id).unwrap_or_else(|| changing_id.clone());
+    let permanent_id = source_id0
+        .filter(|id0| !id0.is_empty())
+        .map(<[u8]>::to_vec)
+        .unwrap_or_else(|| changing_id.clone());
     Object::Array(vec![
         Object::String(permanent_id),
         Object::String(changing_id),
