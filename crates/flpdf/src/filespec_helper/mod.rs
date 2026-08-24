@@ -96,7 +96,6 @@ pub use shared::{encode_utf16be, format_pdf_date, md5_checksum};
 mod tests {
     use super::*;
     use crate::embedded_files::{insert_embedded_file, list_embedded_files};
-    use crate::filters::test_dictionary_api::decode_stream_data;
     use crate::job::{
         add_attachment_from_path, extract_attachment, extract_attachment_to_path, write_attachment,
     };
@@ -308,30 +307,16 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Resolve the /EmbeddedFile stream dict for a filespec ref.
-    fn resolve_ef_stream(
+    /// Return the canonical `/EmbeddedFile` stream handle for a Filespec ref.
+    fn embedded_file_stream_handle(
         pdf: &mut Pdf<Cursor<Vec<u8>>>,
         fs_ref: ObjectRef,
-    ) -> crate::object::Stream {
-        let Some(fs_dict) = pdf
-            .resolve_borrowed(fs_ref)
-            .expect("resolve filespec")
-            .as_dict()
-        else {
-            panic!("expected dictionary");
-        };
-        let ef_sub = match fs_dict.get("EF") {
-            Some(Object::Dictionary(d)) => d.clone(),
-            _ => panic!("missing /EF"),
-        };
-        let stream_ref = match ef_sub.get("F") {
-            Some(Object::Reference(r)) => *r,
-            _ => panic!("missing /EF /F ref"),
-        };
-        match pdf.resolve_borrowed(stream_ref).expect("resolve stream") {
-            Object::Stream(s) => s.clone(),
-            _ => panic!("expected stream"),
-        }
+    ) -> ObjectHandle {
+        let filespec = pdf.get_object_handle(fs_ref);
+        let mut filespec = FileSpec::new(filespec, pdf).expect("Filespec handle");
+        filespec
+            .get_embedded_file_stream("")
+            .expect("embedded file stream handle")
     }
 
     // ── Tests: FileSpecBuilder with compress(false) — existing behaviour ───────
@@ -344,14 +329,17 @@ mod tests {
             .build(&mut pdf)
             .expect("build");
 
-        let stream = resolve_ef_stream(&mut pdf, fs_ref);
+        let stream = embedded_file_stream_handle(&mut pdf, fs_ref);
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
         // No /Filter in uncompressed stream
         assert!(
-            stream.dict.get("Filter").is_none(),
+            stream_dict.get_key(b"/Filter").is_null(),
             "uncompressed stream must have no /Filter"
         );
-        let decoded = decode_stream_data(&stream.dict, &stream.data).expect("decode");
-        assert_eq!(decoded, raw);
+        let decoded = stream
+            .get_stream_data(crate::DecodeLevel::Generalized)
+            .expect("decode");
+        assert_eq!(decoded.as_slice(), raw);
     }
 
     #[test]
@@ -484,13 +472,16 @@ mod tests {
 
         // qpdf's addAttachments delegates to createFileSpec/createEFStream;
         // stream compression is selected later by the writer, not this helper.
-        let stream = resolve_ef_stream(&mut pdf, fs_ref);
-        assert_eq!(
-            stream.dict.get("Filter"),
-            None,
+        let stream = embedded_file_stream_handle(&mut pdf, fs_ref);
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+        assert!(
+            stream_dict.get_key(b"/Filter").is_null(),
             "attachment construction must not install a helper-local filter"
         );
-        assert_eq!(stream.data, raw);
+        assert_eq!(
+            stream.get_raw_stream_data().expect("raw stream").as_slice(),
+            raw
+        );
     }
 
     #[test]
@@ -503,19 +494,17 @@ mod tests {
 
         let fs_ref = add_attachment_from_path(&mut pdf, b"data.bin", &file_path).expect("attach");
 
-        let stream = resolve_ef_stream(&mut pdf, fs_ref);
-        let params = match stream.dict.get("Params") {
-            Some(Object::Dictionary(d)) => d.clone(),
-            _ => panic!("missing /Params"),
-        };
-        let size = match params.get("Size") {
-            Some(Object::Integer(n)) => *n,
-            _ => panic!("missing /Params /Size"),
-        };
-        let checksum = match params.get("CheckSum") {
-            Some(Object::String(b)) => b.clone(),
-            _ => panic!("missing /Params /CheckSum"),
-        };
+        let stream = embedded_file_stream_handle(&mut pdf, fs_ref);
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+        let params = stream_dict.get_key(b"/Params");
+        let size = params
+            .get_key(b"/Size")
+            .as_integer()
+            .expect("missing /Params /Size");
+        let checksum = params
+            .get_key(b"/CheckSum")
+            .as_string()
+            .expect("missing /Params /CheckSum");
         assert_eq!(
             size,
             raw.len() as i64,
