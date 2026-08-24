@@ -258,6 +258,39 @@ fn top_level_encrypt_v4_aes_128_round_trips_via_qpdf() {
     );
 }
 
+/// qpdf treats a bare `-` inside the positional `--encrypt` password triple
+/// as a password value, not as an option. The CLI must preserve that value
+/// through writing so qpdf can authenticate the resulting document with `-`.
+#[test]
+fn top_level_encrypt_accepts_bare_hyphen_password() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("encrypted.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--allow-weak-crypto", "--encrypt", "-", "-", "128", "--"])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=-")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf must authenticate with bare-hyphen password: stdout={} stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
 /// `rewrite` subcommand surface: identical semantics to the top-level alias.
 #[test]
 fn rewrite_subcommand_encrypt_v4_aes_128_round_trips_via_qpdf() {
