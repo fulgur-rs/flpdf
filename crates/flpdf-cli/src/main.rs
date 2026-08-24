@@ -2285,6 +2285,12 @@ fn run_json_document<R: Read + Seek>(
     };
     match json_result {
         Ok(JobExitCode::Success) => {}
+        Ok(JobExitCode::Error) => {
+            return Err(Box::new(CliExitError {
+                code: ExitCode::Errors,
+                message: String::new(),
+            }))
+        }
         Ok(JobExitCode::Warning) => {
             return Err(Box::new(CliExitError {
                 code: ExitCode::Warnings,
@@ -6190,6 +6196,10 @@ fn finish_operation_warnings_with_prior<R: Read + Seek>(
 fn finish_job_exit_status(status: JobExitCode) -> CliResult<()> {
     match status {
         JobExitCode::Success => Ok(()),
+        JobExitCode::Error => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
         JobExitCode::Warning => Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
             message: String::new(),
@@ -6221,6 +6231,10 @@ fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<(
 
     match job.complete(creates_output)? {
         JobExitCode::Success => Ok(()),
+        JobExitCode::Error => Err(Box::new(CliExitError {
+            code: ExitCode::Errors,
+            message: String::new(),
+        })),
         JobExitCode::Warning => Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
             message: String::new(),
