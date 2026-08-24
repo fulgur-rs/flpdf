@@ -388,6 +388,62 @@ fn copy_annotations_from_validates_the_foreign_source_owner() {
 }
 
 #[test]
+fn copy_annotations_from_invalidates_a_warmed_cache_for_a_foreign_orphan_widget() {
+    let mut destination = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 10 10] /Contents 4 0 R",
+        &[make_stream_object(4, b"BT (dest) Tj ET")],
+    ));
+    let root_ref = destination.root_ref().expect("destination root");
+    let root = destination.get_object_handle(root_ref);
+    destination.resolve(&root).unwrap();
+    let acroform = destination
+        .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Fields".to_vec(),
+            ObjectHandle::array(Vec::<ObjectHandle>::new()),
+        )]))
+        .unwrap();
+    root.replace_key(b"/AcroForm", acroform).unwrap();
+    destination.mark_object_handle_dirty(&root).unwrap();
+
+    let mut source = open(build_pdf_with_extras(
+        "",
+        "/MediaBox [0 0 10 10] /Contents 4 0 R /Annots [5 0 R]",
+        &[
+            make_stream_object(4, b"BT (source) Tj ET"),
+            (
+                5,
+                b"5 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (orphan) /Rect [0 0 5 5] >>\nendobj\n"
+                    .to_vec(),
+            ),
+        ],
+    ));
+    let destination_page = pages::page_refs(&mut destination).unwrap()[0];
+    let source_page = pages::page_refs(&mut source).unwrap()[0];
+
+    {
+        let mut helper = destination.acroform().unwrap();
+        assert!(helper.annotation_to_field_map().unwrap().is_empty());
+    }
+
+    let source_page_handle = source.get_object_handle(source_page);
+    PageObjectHelper::new(destination_page, &mut destination)
+        .copy_annotations_from(source_page_handle, Matrix::default(), &mut source)
+        .expect("foreign orphan widget copy should succeed");
+
+    let associations = destination
+        .acroform()
+        .unwrap()
+        .annotation_to_field_map()
+        .unwrap();
+    assert_eq!(
+        associations.len(),
+        1,
+        "a fresh AcroForm analysis must self-associate the appended orphan widget"
+    );
+}
+
+#[test]
 fn copy_annotations_from_rejects_a_handle_owned_by_another_source() {
     let mut destination = open(build_pdf_with_extras(
         "",

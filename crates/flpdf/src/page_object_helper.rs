@@ -1190,6 +1190,14 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
             transformed
         };
         append_annotation_handles(self.pdf, &destination, transformed.new_annotations)?;
+        // qpdf's QPDFAcroFormDocumentHelper contract requires invalidateCache
+        // after manually changing a page's annotation dictionary when the
+        // association between widgets and fields may have changed
+        // (QPDFAcroFormDocumentHelper.hh:76-83). A foreign source without a
+        // /Fields tree contributes no new field through the transform above,
+        // so the shared destination cache cannot update itself via
+        // addFormField; the next lookup must rerun the orphan-widget fallback.
+        *self.pdf.acroform_cache.borrow_mut() = None;
         Ok(())
     }
 
