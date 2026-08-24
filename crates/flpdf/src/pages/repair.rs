@@ -64,6 +64,17 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Option<PreparedPages>> {
+    if max_depth == crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
+        if let Some(cached) = pdf.cached_page_list() {
+            pdf.mark_get_all_pages_called();
+            return Ok(Some(cached));
+        }
+    } else {
+        // The public qpdf path has one fixed traversal contract. A caller
+        // using flpdf's explicit test/depth variant may perform a different
+        // repair walk, so it must not leave the default page cache stale.
+        pdf.invalidate_page_list_cache();
+    }
     pdf.mark_get_all_pages_called();
 
     let Some(root_ref) = pdf.root_ref() else {
@@ -145,10 +156,14 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         Some(object_ref) => PageTreeRoot::Indirect(object_ref),
         None => PageTreeRoot::Direct { catalog: root_ref },
     };
-    Ok(Some(PreparedPages {
+    let prepared = PreparedPages {
         root,
         pages: state.pages,
-    }))
+    };
+    if max_depth == crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH {
+        pdf.cache_page_list(&prepared);
+    }
+    Ok(Some(prepared))
 }
 
 struct CanonicalRepairState {

@@ -476,8 +476,9 @@ pub(crate) fn run_test_16<R: Read + Seek>(
     kids.append_array_item(page)?;
     assert_eq!(all_pages.len(), 10);
 
-    // GAP(QPDF::updateAllPagesCache): see this function's own doc above. The
-    // remaining asserts and the `a.pdf` write depend on the refreshed cache.
+    // qpdf requires updateAllPagesCache after direct /Pages manipulation;
+    // refresh the canonical page-list cache before the remaining assertions.
+    pdf.update_all_pages_cache()?;
     Ok(())
 }
 

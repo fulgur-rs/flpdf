@@ -346,6 +346,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         root.replace_key(b"/Count", ObjectHandle::integer(0))?;
         root.remove_key(b"/Parent");
         self.pdf.mark_object_handle_dirty(&root)?;
+        self.pdf.invalidate_page_list_cache();
         // Final-page removal is the same page mutation as the non-empty
         // rebuild above; keep the shared AcroForm analysis from observing
         // the removed page on the next helper call.

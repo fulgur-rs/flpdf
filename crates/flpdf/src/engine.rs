@@ -185,6 +185,7 @@ impl<R: Read + Seek> Pdf<R> {
             qpdf_parsed_xref_stream_refs: BTreeSet::new(),
             qpdf_removed_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
+            page_list_cache: None,
             encryption,
         };
         pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
