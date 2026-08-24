@@ -168,7 +168,7 @@ pub(crate) fn collect_direct_refs(
     Ok(())
 }
 
-/// The set of terminal indirect page-content stream refs, matching the plain
+/// The set of indirect page-content stream refs, matching the plain
 /// writer's `contents_seq` identity gate
 /// (`writer.rs`'s `options.content_normalization && contents_seq.contains_key(old_ref)`).
 ///
@@ -185,8 +185,8 @@ fn linearization_content_normalize_refs<R: Read + Seek>(
     }
     let mut refs = BTreeSet::new();
     for page_ref in crate::pages::page_refs(pdf)? {
-        for terminal_ref in crate::writer::collect_content_stream_refs_tolerant(pdf, page_ref)? {
-            refs.insert(terminal_ref);
+        for content_ref in crate::writer::collect_content_stream_refs(pdf, page_ref)? {
+            refs.insert(content_ref);
         }
     }
     Ok(refs)
@@ -3131,7 +3131,7 @@ mod tests {
     }
 
     /// `linearization_content_normalize_refs` must select exactly the same
-    /// terminal indirect content-stream refs as the plain writer's
+    /// indirect content-stream refs as the plain writer's
     /// `contents_seq`/`normalized_stream_refs` (`writer.rs:4273-4306`,
     /// `writer.rs:3820-3828`) on the same document, since the linearization
     /// plan and the plain writer both gate `canonical_stream_output_*` on
@@ -3159,11 +3159,10 @@ mod tests {
             .get_all_pages()
             .unwrap()
         {
-            for terminal_ref in
-                crate::writer::collect_content_stream_refs_tolerant(&mut plain_pdf, page_ref)
-                    .unwrap()
+            for content_ref in
+                crate::writer::collect_content_stream_refs(&mut plain_pdf, page_ref).unwrap()
             {
-                theirs.insert(terminal_ref);
+                theirs.insert(content_ref);
             }
         }
 

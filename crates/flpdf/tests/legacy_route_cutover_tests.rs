@@ -615,6 +615,38 @@ fn page_content_bytes_uses_the_canonical_page_contents_route() {
 }
 
 #[test]
+fn page_content_stream_entries_legacy_route_is_removed() {
+    let source = include_str!("../src/pages.rs");
+    assert!(
+        !source.contains("pub fn page_content_stream_entries"),
+        "page content entries must not retain the obsolete raw snapshot facade"
+    );
+    assert!(
+        !source.contains("page_content_stream_entries_tolerant"),
+        "page content entries must not retain the tolerant compatibility alias"
+    );
+}
+
+#[test]
+fn writer_page_content_prescan_does_not_chase_holder_chains() {
+    let source = include_str!("../src/writer.rs");
+    assert!(
+        source.contains("pub(crate) fn collect_content_stream_refs"),
+        "writer must retain one canonical page-content pre-scan"
+    );
+    for legacy in [
+        "collect_content_stream_refs_tolerant",
+        "collect_content_array_holder_refs",
+        "resolve_to_terminal_ref",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "writer page-content pre-scan still contains the legacy route marker {legacy:?}"
+        );
+    }
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source
