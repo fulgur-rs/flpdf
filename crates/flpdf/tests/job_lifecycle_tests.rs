@@ -82,6 +82,15 @@ fn logger_with_warning_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
     (logger, state)
 }
 
+fn logger_with_info_sink() -> (QPDFLogger, Arc<Mutex<SinkState>>) {
+    let logger = QPDFLogger::create();
+    let state = Arc::new(Mutex::new(SinkState::default()));
+    logger.set_info(Some(PipelineHandle::new(RecordingSink {
+        state: Arc::clone(&state),
+    })));
+    (logger, state)
+}
+
 fn xref_stream_with_extra_data() -> Vec<u8> {
     let mut bytes = b"%PDF-1.5\n".to_vec();
     let xref_offset = bytes.len();
@@ -216,6 +225,102 @@ fn json_job_run_writes_output_with_static_id_and_generated_object_streams() {
     assert!(bytes
         .windows(b"/Type /ObjStm".len())
         .any(|window| { window == b"/Type /ObjStm" }));
+}
+
+#[test]
+fn json_job_partial_initialization_defers_missing_output_to_run() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({"inputFile": input}).to_string();
+    let mut job = QPDFJob::new();
+
+    job.initialize_from_json_partial(&json).unwrap();
+    assert_eq!(job.run().unwrap(), JobExitCode::Error);
+}
+
+#[test]
+fn json_job_partial_initialization_still_rejects_a_malformed_output_file() {
+    // qpdf's JSONHandler dispatches `outputFile` to a string-only handler
+    // (QPDFJob_json.cc:262-265) and rejects any other present type with a
+    // usage error (JSONHandler.cc:186), regardless of partial-init mode: a
+    // present-but-wrong-typed value is not the same as an absent key.
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({"inputFile": input, "outputFile": 42}).to_string();
+    let mut job = QPDFJob::new();
+
+    let error = job.initialize_from_json_partial(&json).unwrap_err();
+
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("outputFile") && message.contains("must be a string")));
+}
+
+#[test]
+fn json_job_rejects_a_malformed_output_file_outside_partial_mode() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({"inputFile": input, "outputFile": false}).to_string();
+    let mut job = QPDFJob::new();
+
+    let error = job.initialize_from_json(&json).unwrap_err();
+
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("outputFile") && message.contains("must be a string")));
+}
+
+#[test]
+fn json_job_progress_uses_the_qpdf_default_info_reporter() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("progress-output.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": output,
+        "progress": "",
+    })
+    .to_string();
+    let (logger, state) = logger_with_info_sink();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let info = state.lock().unwrap().bytes.clone();
+    assert!(info
+        .windows(b"write progress: 0%\n".len())
+        .any(|window| { window == b"write progress: 0%\n" }));
+    assert!(info
+        .windows(b"write progress: 100%\n".len())
+        .any(|window| { window == b"write progress: 100%\n" }));
+}
+
+#[test]
+fn json_job_progress_labels_dash_output_as_standard_output() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": "-",
+        "progress": "",
+    })
+    .to_string();
+    let (logger, info_state) = logger_with_info_sink();
+    let save_state = Arc::new(Mutex::new(SinkState::default()));
+    logger
+        .set_save(
+            Some(PipelineHandle::new(RecordingSink {
+                state: Arc::clone(&save_state),
+            })),
+            false,
+        )
+        .unwrap();
+    let mut job = QPDFJob::new();
+    job.set_logger(logger);
+    job.initialize_from_json(&json).unwrap();
+
+    assert_eq!(job.run().unwrap(), JobExitCode::Success);
+    let info = info_state.lock().unwrap().bytes.clone();
+    let output = save_state.lock().unwrap().bytes.clone();
+    assert!(info
+        .windows(b"standard output: write progress: 0%\n".len())
+        .any(|window| window == b"standard output: write progress: 0%\n"));
+    assert!(output.starts_with(b"%PDF-"));
 }
 
 #[test]
