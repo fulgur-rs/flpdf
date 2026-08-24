@@ -319,7 +319,8 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
         // cov:ignore-end
         let pages = catalog.try_get_key(b"/Pages")?;
-        let root = self.pdf.resolve_to_terminal(&pages)?;
+        let root = pages;
+        self.pdf.resolve(&root)?;
         if root.as_dictionary().is_none() {
             // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
             return Err(Error::Unsupported(

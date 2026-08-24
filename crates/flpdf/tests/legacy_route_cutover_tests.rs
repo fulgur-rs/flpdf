@@ -574,6 +574,28 @@ fn xobject_traversal_reads_resources_through_handles() {
 }
 
 #[test]
+fn clear_page_tree_resolves_the_pages_root_through_a_handle() {
+    let source = include_str!("../src/page_document_helper.rs");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("PageDocumentHelper source should have a production section");
+    let function = production
+        .split("fn clear_page_tree")
+        .nth(1)
+        .expect("clear_page_tree production function should remain present");
+
+    assert!(
+        !function.contains("resolve_to_terminal"),
+        "clear_page_tree must not use the non-qpdf terminal-resolution bridge"
+    );
+    assert!(
+        function.contains("self.pdf.resolve(&root)"),
+        "clear_page_tree must resolve the catalog /Pages handle once"
+    );
+}
+
+#[test]
 fn qtest_test_39_uses_the_canonical_page_resource_route() {
     let source = include_str!("../../flpdf-qtest-tools/src/driver/test_34_41.rs");
     let production: String = source
