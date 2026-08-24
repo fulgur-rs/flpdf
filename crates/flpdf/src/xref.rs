@@ -3119,11 +3119,13 @@ fn parse_xref_stream(
                 let count = usize::try_from(count)
                     .map_err(|_| Error::parse(xref_pos, "xref stream entry count overflow"))?;
                 let range_size = entry_size.checked_mul(count).ok_or_else(|| {
+                    // cov:ignore-start: 32-bit oversized xref stream arithmetic requires an unrepresentable input
                     Error::parse(xref_pos, "xref stream data size calculation overflow")
-                })?;
+                })?; // cov:ignore-end
                 total.checked_add(range_size).ok_or_else(|| {
+                    // cov:ignore-start: 32-bit oversized xref stream arithmetic requires an unrepresentable input
                     Error::parse(xref_pos, "xref stream data size calculation overflow")
-                })
+                }) // cov:ignore-end
             })?;
             let size_warning = if stream_data.len() < expected_size {
                 return Err(Error::parse(
@@ -3192,7 +3194,7 @@ fn parse_xref_stream(
                 for diagnostic in repair_diagnostics.entries() {
                     sink.push(diagnostic.clone());
                 }
-            }
+            } // cov:ignore: diagnostic forwarding closes only on a sink-backed xref build failure
             return Err(error);
         }
     };

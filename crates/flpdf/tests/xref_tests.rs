@@ -2664,9 +2664,8 @@ fn rejects_xref_stream_truncated_data() {
         .expect_err("truncated xref stream data should fail strict parse");
     let message = format!("{err}");
     assert!(
-        message.contains(
-            "Cross-reference stream data has the wrong size; expected = 10; actual = 5",
-        ),
+        message
+            .contains("Cross-reference stream data has the wrong size; expected = 10; actual = 5",),
         "got {message}"
     );
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");

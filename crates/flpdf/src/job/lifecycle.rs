@@ -735,4 +735,14 @@ mod tests {
             JobExitCode::Error
         );
     }
+
+    #[test]
+    fn job_error_message_strips_the_qpdf_usage_marker() {
+        assert_eq!(
+            QPDFJob::job_error_message(&Error::Unsupported(
+                "qpdfjob usage error: unknown option --bad".to_owned(),
+            )),
+            "unknown option --bad"
+        );
+    }
 }
