@@ -165,6 +165,348 @@ fn media_boxes_of(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Return page object references in output order. The page refs are read from
+/// the common flpdf inspection surface, but the objects themselves are then
+/// inspected without resolving inherited attributes.
+fn page_refs_of(path: &Path) -> Vec<String> {
+    let out = flpdf_ok(&["--show-pages", path.to_str().unwrap()]);
+    out.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("page ")
+                .and_then(|rest| rest.split_once(": "))
+                .map(|(_, object)| object.trim().to_owned())
+        })
+        .collect()
+}
+
+/// Return whether each page dictionary owns `/MediaBox` and `/Rotate`.
+///
+/// qpdf's `QPDFPageObjectHelper::getAttribute` (`QPDFPageObjectHelper.cc:
+/// 218-262`) deliberately resolves inherited values for page operations, so
+/// `--show-pages` cannot establish where a key is stored. `--show-object`
+/// prints the page dictionary itself and therefore preserves this structural
+/// distinction for the matrix.
+fn own_page_attributes_of(path: &Path) -> Vec<(bool, bool)> {
+    page_refs_of(path)
+        .into_iter()
+        .map(|object| {
+            let selector = format!("--show-object={object}");
+            let output = flpdf_ok(&[&selector, path.to_str().unwrap()]);
+            let keys = top_level_dict_keys(&output);
+            (keys.contains(&"/MediaBox"), keys.contains(&"/Rotate"))
+        })
+        .collect()
+}
+
+/// Return the key tokens that appear directly inside the outermost `<< >>`
+/// dictionary of `output` (as `--show-object` prints one object per
+/// invocation), skipping any nested dictionary or array. A `/Name` token
+/// nested inside a value (e.g. a `/Rotate` key inside a nested
+/// `/Resources`/`/XObject` dictionary) must not be mistaken for a key the
+/// outer dictionary itself owns, and a `/Name` that is itself some other
+/// key's *value* (e.g. `/Foo /Rotate`) must not be mistaken for a key
+/// either: PDF dictionaries strictly alternate key/value pairs, so only a
+/// token in key position at depth 1 is recorded. A literal-string value
+/// (`( ... )`) can contain embedded whitespace, so `split_whitespace`
+/// divides it into multiple tokens; those are consumed by tracking `(`/`)`
+/// balance until the string closes, not treated as one scalar token. This
+/// literal-string scan runs at every nesting depth, not only depth 1: a
+/// literal string nested inside an array or dictionary can itself contain a
+/// `[`, `]`, `<<`, or `>>` character (split into its own whitespace token,
+/// e.g. `(a ] b)` -> `"(a"`, `"]"`, `"b)"`), and that must not be
+/// reinterpreted as a real composite delimiter and shift the depth count.
+fn top_level_dict_keys(output: &str) -> Vec<&str> {
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+    let mut depth = 0i32;
+    let mut expect_key = false;
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i].starts_with('(') {
+            // A literal string. PDF syntax allows both balanced, unescaped
+            // nested parens and backslash-escaped `\(`/`\)` inside one
+            // (flpdf's own writer emits the latter, `write_literal_string`);
+            // consume whitespace tokens (which may include embedded spaces
+            // from a multi-word string, or delimiter-like characters split
+            // into their own tokens) until an *unescaped* paren balance
+            // returns to 0.
+            let mut paren_depth = 0i32;
+            let mut escaped = false;
+            loop {
+                for byte in tokens[i].bytes() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    match byte {
+                        b'\\' => escaped = true,
+                        b'(' => paren_depth += 1,
+                        b')' => paren_depth -= 1,
+                        _ => {}
+                    }
+                }
+                i += 1;
+                if paren_depth <= 0 || i >= tokens.len() {
+                    break;
+                }
+            }
+            if depth == 1 {
+                expect_key = true;
+            }
+            continue;
+        }
+        match tokens[i] {
+            "<<" => {
+                depth += 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            ">>" => {
+                depth -= 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            "[" => {
+                depth += 1;
+                i += 1;
+            }
+            "]" => {
+                depth -= 1;
+                if depth == 1 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            token if depth == 1 && expect_key => {
+                if token.starts_with('/') {
+                    keys.push(token);
+                }
+                expect_key = false;
+                i += 1;
+            }
+            _ if depth == 1 => {
+                // Consuming a top-level value. `<<`/`[` composite values and
+                // literal strings are handled by the arms above (expect_key
+                // stays false until the value closes); a remaining scalar
+                // value is either a 3-token indirect reference ("N G R") or
+                // a single token (Name/Number/Boolean/hex string).
+                let is_reference = i + 2 < tokens.len()
+                    && tokens[i].bytes().all(|b| b.is_ascii_digit())
+                    && tokens[i + 1].bytes().all(|b| b.is_ascii_digit())
+                    && tokens[i + 2] == "R";
+                i += if is_reference { 3 } else { 1 };
+                expect_key = true;
+            }
+            _ => i += 1,
+        }
+    }
+    keys
+}
+
+#[test]
+fn top_level_dict_keys_ignores_nested_names_with_the_same_key_name() {
+    // A page with a nested /Resources /XObject dictionary that happens to
+    // contain a key literally named /Rotate must not be reported as if the
+    // page dictionary itself owned /Rotate.
+    let output = "<< /Resources << /XObject << /Rotate 4 0 R >> >> /Type /Page >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        !keys.contains(&"/Rotate"),
+        "a /Rotate key nested inside /Resources/XObject must not count as an own key: {keys:?}"
+    );
+    assert!(keys.contains(&"/Resources"), "got {keys:?}");
+    assert!(keys.contains(&"/Type"), "got {keys:?}");
+}
+
+#[test]
+fn top_level_dict_keys_ignores_a_name_valued_extension_entry() {
+    // A page with an unrelated top-level entry whose *value* happens to be
+    // the bare Name /Rotate (e.g. /Foo /Rotate) must not be reported as if
+    // the page dictionary owned a /Rotate key: PDF dictionaries strictly
+    // alternate key/value, and /Rotate here is in value position.
+    let output = "<< /Foo /Rotate /Type /Page >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        !keys.contains(&"/Rotate"),
+        "a name-valued /Foo entry must not manufacture an owned /Rotate key: {keys:?}"
+    );
+    assert!(keys.contains(&"/Foo"), "got {keys:?}");
+    assert!(keys.contains(&"/Type"), "got {keys:?}");
+    assert!(
+        !keys.contains(&"/Page"),
+        "/Type's own value /Page must not be reported as a key either: {keys:?}"
+    );
+}
+
+#[test]
+fn top_level_dict_keys_consumes_a_multi_word_literal_string_value() {
+    // A literal-string value containing embedded whitespace splits into
+    // multiple `split_whitespace` tokens (e.g. "(two words)" -> "(two",
+    // "words)"). The real key that follows it must still be recognized as
+    // a key, not consumed as if it were a second value token.
+    let output = "<< /Foo (two words) /MediaBox [ 0 0 612 792 ] /Type /Page >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "a multi-word literal-string value before /MediaBox must not swallow the real key: {keys:?}"
+    );
+    assert!(keys.contains(&"/Foo"), "got {keys:?}");
+    assert!(keys.contains(&"/Type"), "got {keys:?}");
+}
+
+#[test]
+fn top_level_dict_keys_handles_a_literal_string_with_nested_parens() {
+    // PDF literal strings permit balanced, unescaped nested parens; the
+    // string must not be considered "closed" at the first inner `)`.
+    let output = "<< /Foo (a (nested) string) /MediaBox [ 0 0 612 792 ] >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "a nested-paren literal string must not swallow the real key: {keys:?}"
+    );
+}
+
+#[test]
+fn top_level_dict_keys_honors_escaped_parens_in_a_literal_string() {
+    // flpdf's own writer (`write_literal_string`) emits a literal paren as
+    // `\(`/`\)`. An escaped `\)` must not be mistaken for the string's
+    // terminator, or the scan stops early and shifts the rest of the
+    // key/value parsing, potentially dropping the real key that follows.
+    let output = r"<< /Foo (a \) words) /MediaBox [ 0 0 612 792 ] >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "an escaped close-paren inside a literal string must not swallow the real key: {keys:?}"
+    );
+}
+
+#[test]
+fn top_level_dict_keys_ignores_composite_delimiters_inside_a_nested_literal_string() {
+    // A literal string nested inside an array (depth 2) can itself contain
+    // `]` as a standalone whitespace token. Because literal-string scanning
+    // used to be gated on depth == 1, that `]` was reinterpreted as the
+    // array's own terminator, prematurely dropping to depth 1 and then to
+    // depth 0 at the real terminator — losing track of the real /MediaBox
+    // key that follows.
+    let output = "<< /Foo [ (a ] b) ] /MediaBox [ 0 0 612 792 ] >>";
+    let keys = top_level_dict_keys(output);
+    assert!(
+        keys.contains(&"/MediaBox"),
+        "a `]` character inside a nested literal string must not be mistaken \
+         for the array's real terminator: {keys:?}"
+    );
+    assert!(keys.contains(&"/Foo"), "got {keys:?}");
+}
+
+fn assert_own_page_attributes_match(qpdf_output: &Path, flpdf_output: &Path) {
+    assert_eq!(
+        own_page_attributes_of(flpdf_output),
+        own_page_attributes_of(qpdf_output),
+        "flpdf and qpdf must agree on page-dictionary own-key presence"
+    );
+}
+
+/// Build one page whose effective MediaBox/Rotate values are inherited when
+/// `materialize` is false and written directly on the page when it is true.
+fn page_attribute_presence_pdf(materialize: bool) -> tempfile::NamedTempFile {
+    use std::io::Write;
+
+    let page_attributes = if materialize {
+        " /MediaBox [0 0 612 792] /Rotate 90"
+    } else {
+        ""
+    };
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Rotate 90 >>".to_owned(),
+        format!("<< /Type /Page /Parent 2 0 R /Resources << >>{page_attributes} >>"),
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (number, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", number + 1).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    let mut output = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+    output.write_all(&bytes).unwrap();
+    output.flush().unwrap();
+    output
+}
+
+#[test]
+fn matrix_own_page_keys_do_not_use_inherited_show_pages_values() {
+    let inherited = page_attribute_presence_pdf(false);
+    let direct = page_attribute_presence_pdf(true);
+
+    assert_eq!(
+        media_boxes_of(inherited.path()),
+        media_boxes_of(direct.path())
+    );
+    assert_eq!(rotates_of(inherited.path()), rotates_of(direct.path()));
+    assert_eq!(
+        own_page_attributes_of(inherited.path()),
+        vec![(false, false)]
+    );
+    assert_eq!(own_page_attributes_of(direct.path()), vec![(true, true)]);
+}
+
+#[test]
+fn matrix_pages_materializes_inherited_own_keys_like_qpdf() {
+    // The static comparison above only checks the two source fixtures
+    // directly; it never sends the inherited variant through a page
+    // operation. `--pages` selection flattens the page tree
+    // (`QPDFPageObjectHelper::getAttribute`, `QPDFPageObjectHelper.cc:
+    // 218-262`), so both tools must materialize the inherited /MediaBox and
+    // /Rotate as *own* keys on the selected output page — a regression that
+    // dropped or mis-copied an inherited attribute during --pages would
+    // otherwise go undetected, since every other operation cell in this
+    // matrix uses fixtures whose pages already own these keys directly.
+    if !qpdf_available() {
+        return;
+    }
+    let src = page_attribute_presence_pdf(false);
+    let tmp = tempfile::tempdir().unwrap();
+    let q = tmp.path().join("q.pdf");
+    let f = tmp.path().join("f.pdf");
+
+    run_qpdf(&[
+        src.path().to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    flpdf_ok(&[
+        src.path().to_str().unwrap(),
+        "--pages",
+        ".",
+        "1",
+        "--",
+        f.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        own_page_attributes_of(&q),
+        vec![(true, true)],
+        "qpdf --pages must materialize the inherited attributes as own keys"
+    );
+    assert_own_page_attributes_match(&q, &f);
+}
+
 /// Write a structurally valid `n`-page PDF whose pages have *distinct*
 /// MediaBox widths (page `i` → `[0 0 (i*100) 200]`). The width uniquely
 /// identifies each source page, so a reordering op's output page sequence
@@ -447,6 +789,7 @@ fn pages_reverse_range_matches_qpdf() {
         q_boxes,
         "flpdf z-1 page order must match qpdf"
     );
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -529,6 +872,7 @@ fn pages_multi_input_same_file_repeated_matches_qpdf() {
         q_boxes,
         "flpdf repeated-same-file selection order must match qpdf"
     );
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -573,6 +917,7 @@ fn pages_cross_document_merge_matches_qpdf() {
     ]);
 
     assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -608,6 +953,7 @@ fn pages_cross_document_collate_matches_qpdf() {
     assert!(ok, "qpdf is expected to accept cross-document collate");
     flpdf_ok(&f_args);
     assert_eq!(media_boxes_of(&f), media_boxes_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 // ===========================================================================
@@ -631,6 +977,7 @@ fn rotate_plus_delta_matches_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![90, 90, 90]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -649,6 +996,7 @@ fn rotate_minus_delta_matches_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![270, 270, 270]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -678,6 +1026,7 @@ fn rotate_plus_delta_accumulates_on_nonzero_base_like_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![180, 180, 180]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -731,6 +1080,7 @@ fn rotate_with_range_matches_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![0, 90, 0]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
@@ -762,6 +1112,7 @@ fn rotate_repeated_specs_apply_in_order_like_qpdf() {
     // also numerically equal to an additive +180 here.
     assert_eq!(rotates_of(&q), vec![90, 0, 180]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 // ===========================================================================
@@ -1149,6 +1500,7 @@ fn pages_then_rotate_uses_output_page_numbering_like_qpdf() {
 
     assert_eq!(rotates_of(&q), vec![90, 0]);
     assert_eq!(rotates_of(&f), rotates_of(&q));
+    assert_own_page_attributes_match(&q, &f);
 }
 
 #[test]
