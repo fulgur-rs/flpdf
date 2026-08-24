@@ -2083,7 +2083,7 @@ fn run_job_json_file(path: &Path) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
 
-    job.initialize_from_json(&json).map_err(|error| {
+    job.initialize_from_json_partial(&json).map_err(|error| {
         Box::new(CliExitError {
             code: ExitCode::Errors,
             message: format!("error with job-json file {}: {error}", path.display()),

@@ -46,6 +46,58 @@ fn job_json_file_usage_errors_use_the_qpdf_job_file_boundary() {
 }
 
 #[test]
+fn job_json_file_missing_output_reports_one_diagnostic() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("missing-output.json"),
+        br#"{"inputFile":"input.pdf"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=missing-output.json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr
+            .matches("an output file name is required; use - for standard output")
+            .count(),
+        1
+    );
+    assert!(!stderr.contains("error with job-json file"));
+}
+
+#[test]
+fn job_json_file_progress_reports_qpdf_write_progress_to_stdout() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    fs::copy(fixture, directory.path().join("input.pdf")).unwrap();
+    fs::write(
+        directory.path().join("progress.json"),
+        br#"{"inputFile":"input.pdf","outputFile":"output.pdf","progress":""}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("--job-json-file=progress.json")
+        .assert()
+        .code(0)
+        .stdout(predicates::str::contains("write progress: 0%"))
+        .stdout(predicates::str::contains("write progress: 100%"));
+}
+
+#[test]
 fn job_json_file_preserves_qpdf_warning_status() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

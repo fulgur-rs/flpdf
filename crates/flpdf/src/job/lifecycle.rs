@@ -180,10 +180,32 @@ impl QPDFJob {
     where
         R: Read + Seek + 'static,
     {
-        let Some(reporter) = self.progress_handler.as_ref() else {
-            return;
+        // QPDFJob::setWriterOptions uses the custom handler when one was
+        // registered and otherwise constructs this default reporter from the
+        // job logger (`libqpdf/QPDFJob.cc:2926-2935`).
+        let reporter = match self.progress_handler.as_ref() {
+            Some(reporter) => Rc::clone(reporter),
+            None if self.configuration.progress => {
+                let logger = self.logger.clone();
+                let prefix = self.message_prefix.clone();
+                let output_name = self
+                    .configuration
+                    .output_file
+                    .as_deref()
+                    .filter(|path| *path != Path::new("-"))
+                    .map_or_else(
+                        || "standard output".to_owned(),
+                        |path| path.display().to_string(),
+                    );
+                let callback: ProgressHandler = Box::new(move |percent| {
+                    let _ = logger.info(format!(
+                        "{prefix}: {output_name}: write progress: {percent}%\n"
+                    ));
+                });
+                Rc::new(RefCell::new(callback))
+            }
+            None => return,
         };
-        let reporter = Rc::clone(reporter);
         writer.register_progress_reporter(Box::new(move |percent| {
             (reporter.borrow_mut())(percent);
         }));
@@ -274,6 +296,19 @@ impl QPDFJob {
     /// subset above (qpdf's full job JSON schema key, but not yet
     /// implemented by this crate).
     pub fn initialize_from_json(&mut self, json: &str) -> Result<()> {
+        self.initialize_from_json_with_partial(json, false)
+    }
+
+    /// Initialize a job JSON document for the CLI's partial job-json-file
+    /// route. Configuration checks that require command-line input/output
+    /// values are deferred to [`QPDFJob::run`], matching qpdf's
+    /// `QPDFJob::Config::jobJsonFile` call to `initializeFromJson(..., true)`
+    /// (`libqpdf/QPDFJob_config.cc:774-784`).
+    pub fn initialize_from_json_partial(&mut self, json: &str) -> Result<()> {
+        self.initialize_from_json_with_partial(json, true)
+    }
+
+    fn initialize_from_json_with_partial(&mut self, json: &str, partial: bool) -> Result<()> {
         // The qpdf C API sets this prefix before parsing JSON
         // (`libqpdf/qpdfjob-c.cc:79-87`), so initialization and run-time
         // configuration errors share the same observable source name.
@@ -357,11 +392,10 @@ impl QPDFJob {
             .as_ref()
             .map_or_else(String::new, |path| path.display().to_string());
         self.warnings = false;
-        if self.configuration.output_file.is_none() {
+        if !partial && self.configuration.output_file.is_none() {
             let error = Error::Unsupported(
                 "an output file name is required; use - for standard output".to_owned(),
             );
-            self.report_job_error(&error)?;
             return Err(error);
         }
         Ok(())
