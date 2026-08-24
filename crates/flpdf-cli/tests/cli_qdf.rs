@@ -424,6 +424,116 @@ fn qdf_object_streams_generate_matches_qpdf_at_the_batch_cap_boundary() {
 }
 
 #[test]
+fn qdf_object_streams_preserve_matches_qpdf_at_the_batch_cap_boundary() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/objstm-lin-cap-boundary-199-bearing.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_status = ShellCommand::new("qpdf")
+        .args([
+            "--qdf",
+            "--object-streams=preserve",
+            "--static-id",
+            input.to_str().unwrap(),
+            qpdf_output.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to spawn qpdf");
+    assert!(qpdf_status.success(), "qpdf QDF preservation failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--qdf",
+            "--object-streams=preserve",
+            "--static-id",
+            input.to_str().unwrap(),
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .args(["--check", flpdf_output.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn qpdf --check");
+    assert!(
+        check.status.success(),
+        "QDF Preserve output must pass qpdf --check:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "QDF Preserve output must match qpdf at the 100-member split boundary"
+    );
+}
+
+#[test]
+fn qdf_object_streams_preserve_keeps_a_source_container_over_100_members() {
+    if skip_if_qpdf_missing() {
+        return;
+    }
+
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/null-visible-preserve-over-100.pdf");
+    let temp = tempfile::tempdir().unwrap();
+    let qpdf_output = temp.path().join("qpdf.pdf");
+    let flpdf_output = temp.path().join("flpdf.pdf");
+
+    let qpdf_status = ShellCommand::new("qpdf")
+        .args([
+            "--qdf",
+            "--object-streams=preserve",
+            "--static-id",
+            input.to_str().unwrap(),
+            qpdf_output.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to spawn qpdf");
+    assert!(qpdf_status.success(), "qpdf QDF preservation failed");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--qdf",
+            "--object-streams=preserve",
+            "--static-id",
+            input.to_str().unwrap(),
+            flpdf_output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let check = ShellCommand::new("qpdf")
+        .args(["--check", flpdf_output.to_str().unwrap()])
+        .output()
+        .expect("failed to spawn qpdf --check");
+    assert!(
+        check.status.success(),
+        "QDF Preserve output must pass qpdf --check:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(&flpdf_output).unwrap(),
+        std::fs::read(&qpdf_output).unwrap(),
+        "QDF Preserve must retain a source ObjStm with more than 100 members"
+    );
+}
+
+#[test]
 fn qdf_object_streams_disable_matches_qpdf() {
     let input = fixture_with_stream();
     let temp = tempfile::tempdir().unwrap();

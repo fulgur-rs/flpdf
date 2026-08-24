@@ -4285,14 +4285,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // are never reachable from /Root, so they never appear here.
     let renumbered: Vec<(ObjectRef, ObjectRef)> = renumber.pairs().collect();
 
-    if planner_config.mode == ObjectStreamMode::Generate && !plan.batches.is_empty() {
-        // QPDFWriter assigns generated groups in getCompressibleObjGens order,
-        // but the standard enqueue walk determines the order in which their
-        // synthetic containers are first written. Each reverse map is a
-        // std::set<QPDFObjGen>, so members inside a container are emitted in
-        // object-number order. Reproduce both phases here: keep the planner's
-        // group membership and sort each group's members. The enqueue walk
-        // determines the physical order of the synthetic containers below.
+    if options.qdf && !plan.batches.is_empty() {
+        // QPDFWriter's reverse object-stream map is a std::set<QPDFObjGen>, so
+        // members inside both generated and preserved containers are emitted
+        // in object-number order. The standard enqueue walk below determines
+        // the physical order of the containers themselves.
         for batch in &mut plan.batches {
             batch.sort_unstable_by_key(|member| (member.number, member.generation));
         }
@@ -4302,35 +4299,34 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         crate::Error::Unsupported("full-rewrite: renumbered object count overflows u32".to_string())
     })?;
 
-    // A generated QDF container receives its number when the standard enqueue
-    // walk first reaches any member of its group. Other modes retain the
-    // existing contiguous allocation above the Catalog-first object range;
-    // QDF Preserve retains its established contiguous prefix allocation.
-    let mut container_refs: Vec<ObjectRef> =
-        if options.qdf && planner_config.mode == ObjectStreamMode::Generate {
-            vec![ObjectRef::new(0, 0); plan.batches.len()]
+    // A QDF container receives its number when the standard enqueue walk first
+    // reaches any member of its group. This applies to both generated and
+    // source-preserved groups; compact output retains its contiguous allocation
+    // above the Catalog-first object range.
+    let mut container_refs: Vec<ObjectRef> = if options.qdf {
+        if plan.batches.is_empty() {
+            Vec::new()
         } else {
-            (1..=plan.batches.len())
-                .map(|i| {
-                    let number = if options.qdf {
-                        i as u32
-                    } else {
-                        existing_max.checked_add(i as u32)?
-                    };
-                    Some(ObjectRef::new(number, 0))
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    // cov:ignore-start: a supported PDF cannot allocate more than u32::MAX ObjStm batches
-                    crate::Error::Unsupported(
-                        "full-rewrite: ObjStm container number overflows u32".to_string(),
-                    )
-                    // cov:ignore-end
-                })? // cov:ignore: batch-count overflow is impossible for a supported PDF
-        };
+            vec![ObjectRef::new(0, 0); plan.batches.len()]
+        }
+    } else {
+        (1..=plan.batches.len())
+            .map(|i| {
+                let number = existing_max.checked_add(i as u32)?;
+                Some(ObjectRef::new(number, 0))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                // cov:ignore-start: a supported PDF cannot allocate more than u32::MAX ObjStm batches
+                crate::Error::Unsupported(
+                    "full-rewrite: ObjStm container number overflows u32".to_string(),
+                )
+                // cov:ignore-end
+            })? // cov:ignore: batch-count overflow is impossible for a supported PDF
+    };
 
-    // Member-to-batch lookup by original reference. The generated QDF
-    // pre-scan needs the batch index before container numbers are known.
+    // Member-to-batch lookup by original reference. The QDF pre-scan needs the
+    // batch index before enqueue-order container numbers are known.
     let mut member_batch_index = BTreeMap::<ObjectRef, usize>::new();
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         for &member_ref in batch {
@@ -4375,92 +4371,20 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let mut qdf_max_emission: u32 = 0;
 
     if options.qdf {
-        if planner_config.mode == ObjectStreamMode::Generate {
-            // qpdf's standard enqueue walk assigns a synthetic container as
-            // soon as it first reaches one of that container's members, then
-            // reserves the complete sorted member set immediately
-            // (`QPDFWriter.cc:1057-1069,1088-1115`). Ordinary objects and
-            // their QDF length holders are numbered in the same walk.
-            let mut next_emission = 0_u32;
-            let mut assigned_batches = vec![false; plan.batches.len()];
-            for (cf_ref, old_ref) in &renumbered {
-                if old_ref.number == 0 || skip_refs.contains(old_ref) {
-                    continue; // cov:ignore: free/deleted refs don't appear in renumbered
-                }
-                if let Some(&batch_idx) = member_batch_index.get(old_ref) {
-                    if !assigned_batches[batch_idx] {
-                        next_emission = next_emission.checked_add(1).ok_or_else(|| {
-                            // cov:ignore-start: requires > 2^32 objects — impossible in practice
-                            crate::Error::Unsupported(
-                                "full-rewrite: QDF emission number overflows u32".to_string(),
-                            )
-                            // cov:ignore-end
-                        })?; // cov:ignore: the supported PDF object space cannot overflow u32
-                        container_refs[batch_idx] = ObjectRef::new(next_emission, 0);
-                        assigned_batches[batch_idx] = true;
-
-                        for member in &plan.batches[batch_idx] {
-                            next_emission = next_emission.checked_add(1).ok_or_else(|| {
-                                // cov:ignore-start: requires > 2^32 objects — impossible in practice
-                                crate::Error::Unsupported(
-                                    "full-rewrite: QDF emission number overflows u32".to_string(),
-                                )
-                                // cov:ignore-end
-                            })?; // cov:ignore: the supported PDF object space cannot overflow u32
-                            qdf_emission_renumber.insert(*member, ObjectRef::new(next_emission, 0));
-                        }
-                    }
-                    continue;
-                }
-
-                // Determine whether this object is a real stream (needs a
-                // holder), a non-stream object, or a structural stream that
-                // the main loop skips (XRef / ObjStm).
-                let object_handle = pdf.get_object_handle(*old_ref);
-                pdf.resolve(&object_handle)?;
-                let is_real_stream = if object_handle.as_stream_dict().is_some() {
-                    let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                        || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
-                    if is_structural {
-                        None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
-                    } else {
-                        Some(true)
-                    }
-                } else {
-                    Some(false)
-                };
-                let Some(is_stream) = is_real_stream else {
-                    continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
-                };
-
-                next_emission = next_emission.checked_add(1).ok_or_else(|| {
-                    // cov:ignore-start: requires > 2^32 objects — impossible in practice
-                    crate::Error::Unsupported(
-                        "full-rewrite: QDF emission number overflows u32".to_string(),
-                    )
-                })?; // cov:ignore-end
-                let emission_num = next_emission;
-                qdf_emission_renumber
-                    .insert(*old_ref, ObjectRef::new(emission_num, cf_ref.generation));
-
-                if is_stream {
-                    next_emission = next_emission.checked_add(1).ok_or_else(|| {
-                        // cov:ignore-start: requires > 2^32 objects — impossible in practice
-                        crate::Error::Unsupported(
-                            "full-rewrite: QDF holder number overflows u32".to_string(),
-                        )
-                    })?; // cov:ignore-end
-                    qdf_holder_map.insert(emission_num, next_emission);
-                }
+        // qpdf's standard enqueue walk assigns a container as soon as it first
+        // reaches one of that container's members, then reserves the complete
+        // sorted member set immediately (`QPDFWriter.cc:1057-1069,1088-1115`).
+        // The same rule applies to generated and source-preserved groups.
+        // Ordinary objects and their QDF length holders are numbered in this
+        // same walk.
+        let mut next_emission = 0_u32;
+        let mut assigned_batches = vec![false; plan.batches.len()];
+        for (cf_ref, old_ref) in &renumbered {
+            if old_ref.number == 0 || skip_refs.contains(old_ref) {
+                continue; // cov:ignore: free/deleted refs don't appear in renumbered
             }
-            qdf_max_emission = next_emission;
-        } else {
-            // Preserve retains the established prefix numbering. Its source
-            // groups are not regenerated and therefore do not use the
-            // Generate walk above.
-            let mut next_emission: u32 = plan.batches.len() as u32;
-            for batch in &plan.batches {
-                for old_ref in batch {
+            if let Some(&batch_idx) = member_batch_index.get(old_ref) {
+                if !assigned_batches[batch_idx] {
                     next_emission = next_emission.checked_add(1).ok_or_else(|| {
                         // cov:ignore-start: requires > 2^32 objects — impossible in practice
                         crate::Error::Unsupported(
@@ -4468,53 +4392,63 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         )
                         // cov:ignore-end
                     })?; // cov:ignore: the supported PDF object space cannot overflow u32
-                    qdf_emission_renumber.insert(*old_ref, ObjectRef::new(next_emission, 0));
-                }
-            }
-            for (cf_ref, old_ref) in &renumbered {
-                if old_ref.number == 0 || skip_refs.contains(old_ref) {
-                    continue; // cov:ignore: free/deleted refs don't appear in renumbered
-                }
-                if member_batch_index.contains_key(old_ref) {
-                    continue;
-                }
-                let object_handle = pdf.get_object_handle(*old_ref);
-                pdf.resolve(&object_handle)?;
-                let is_real_stream = if object_handle.as_stream_dict().is_some() {
-                    let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
-                        || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
-                    if is_structural {
-                        None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
-                    } else {
-                        Some(true)
+                    container_refs[batch_idx] = ObjectRef::new(next_emission, 0);
+                    assigned_batches[batch_idx] = true;
+
+                    for member in &plan.batches[batch_idx] {
+                        next_emission = next_emission.checked_add(1).ok_or_else(|| {
+                            // cov:ignore-start: requires > 2^32 objects — impossible in practice
+                            crate::Error::Unsupported(
+                                "full-rewrite: QDF emission number overflows u32".to_string(),
+                            )
+                            // cov:ignore-end
+                        })?; // cov:ignore: the supported PDF object space cannot overflow u32
+                        qdf_emission_renumber.insert(*member, ObjectRef::new(next_emission, 0));
                     }
+                }
+                continue;
+            }
+
+            // Determine whether this object is a real stream (needs a holder),
+            // a non-stream object, or a structural stream that the main loop
+            // skips (XRef / ObjStm).
+            let object_handle = pdf.get_object_handle(*old_ref);
+            pdf.resolve(&object_handle)?;
+            let is_real_stream = if object_handle.as_stream_dict().is_some() {
+                let is_structural = object_handle.try_is_dictionary_of_type(b"XRef", b"")?
+                    || object_handle.try_is_dictionary_of_type(b"ObjStm", b"")?;
+                if is_structural {
+                    None // cov:ignore: structural containers excluded from CF renumber by skip_length=true
                 } else {
-                    Some(false)
-                };
-                let Some(is_stream) = is_real_stream else {
-                    continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
-                };
+                    Some(true)
+                }
+            } else {
+                Some(false)
+            };
+            let Some(is_stream) = is_real_stream else {
+                continue; // cov:ignore: None only when is_structural; XRef/ObjStm excluded from renumbered by skip_length=true
+            };
+
+            next_emission = next_emission.checked_add(1).ok_or_else(|| {
+                // cov:ignore-start: requires > 2^32 objects — impossible in practice
+                crate::Error::Unsupported(
+                    "full-rewrite: QDF emission number overflows u32".to_string(),
+                )
+            })?; // cov:ignore-end
+            let emission_num = next_emission;
+            qdf_emission_renumber.insert(*old_ref, ObjectRef::new(emission_num, cf_ref.generation));
+
+            if is_stream {
                 next_emission = next_emission.checked_add(1).ok_or_else(|| {
                     // cov:ignore-start: requires > 2^32 objects — impossible in practice
                     crate::Error::Unsupported(
-                        "full-rewrite: QDF emission number overflows u32".to_string(),
+                        "full-rewrite: QDF holder number overflows u32".to_string(),
                     )
                 })?; // cov:ignore-end
-                let emission_num = next_emission;
-                qdf_emission_renumber
-                    .insert(*old_ref, ObjectRef::new(emission_num, cf_ref.generation));
-                if is_stream {
-                    next_emission = next_emission.checked_add(1).ok_or_else(|| {
-                        // cov:ignore-start: requires > 2^32 objects — impossible in practice
-                        crate::Error::Unsupported(
-                            "full-rewrite: QDF holder number overflows u32".to_string(),
-                        )
-                    })?; // cov:ignore-end
-                    qdf_holder_map.insert(emission_num, next_emission);
-                }
+                qdf_holder_map.insert(emission_num, next_emission);
             }
-            qdf_max_emission = next_emission;
         }
+        qdf_max_emission = next_emission;
     }
 
     // member_to_batch: ORIGINAL ObjectRef → (container_obj_num,
@@ -5042,13 +4976,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n'); // QDF inter-object blank line
             offsets.insert(hnum, (0, h_offset));
         }
-        if options.qdf && planner_config.mode == ObjectStreamMode::Generate {
+        if options.qdf {
             qdf_main_chunks.insert(*old_ref, (qdf_chunk_start, bytes.len()));
         }
     }
 
     // ── Step 5: emit each ObjStm container ───────────────────────────────────
-    let qdf_main_end = bytes.len();
     for (batch_idx, batch) in plan.batches.iter().enumerate() {
         let container_ref = container_refs[batch_idx];
         // Resolve each member as a live ObjectHandle and remap only its child
@@ -5306,18 +5239,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(container_ref.number, (0, emit_offset));
-        if options.qdf && planner_config.mode == ObjectStreamMode::Generate {
+        if options.qdf {
             qdf_container_chunks.insert(batch_idx, (emit_offset, bytes.len()));
         }
     }
 
-    // qpdf's standard enqueue walk interleaves generated ObjStm containers with
-    // ordinary objects: a container is written when the first member in its
-    // group is reached, and its sorted members receive numbers immediately.
-    // The coordinator materializes ordinary and container chunks separately so
-    // it can merge them in that same order and repair every xref offset.
-    if options.qdf && planner_config.mode == ObjectStreamMode::Generate && !plan.batches.is_empty()
-    {
+    // qpdf's standard enqueue walk interleaves ObjStm containers with ordinary
+    // objects: a container is written when the first member in its group is
+    // reached, and its sorted members receive numbers immediately. The
+    // coordinator materializes ordinary and container chunks separately so it
+    // can merge them in that same order and repair every xref offset.
+    if options.qdf && !plan.batches.is_empty() {
         let original_bytes = bytes.clone();
         let mut merged_body = Vec::new();
         let mut chunk_transforms = Vec::<(usize, usize, usize)>::new();
@@ -5339,7 +5271,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 append_chunk(start, end);
             }
         }
-        // Every Generate group is reachable by construction. Keep this
+        // Every planned group is reachable by construction. Keep this
         // defensive completion for malformed graphs so the output remains
         // structurally complete rather than silently dropping a container.
         for batch_idx in 0..plan.batches.len() {
@@ -5370,26 +5302,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 // cov:ignore-end
             };
             *offset = new_start + (old_offset - old_start);
-        }
-    } else if options.qdf && !plan.batches.is_empty() {
-        // Preserve's historical route still emits containers as a contiguous
-        // prefix. Keep its existing layout while Generate uses the qpdf
-        // enqueue-ordered merge above.
-        let container_bytes = bytes[qdf_main_end..].to_vec();
-        let main_bytes = bytes[qdf_body_start..qdf_main_end].to_vec();
-        bytes.truncate(qdf_body_start);
-        bytes.extend_from_slice(&container_bytes);
-        bytes.extend_from_slice(&main_bytes);
-        let container_len = container_bytes.len();
-        for (number, (_, offset)) in &mut offsets {
-            if container_refs
-                .iter()
-                .any(|reference| reference.number == *number)
-            {
-                *offset = qdf_body_start + (*offset - qdf_main_end);
-            } else {
-                *offset += container_len;
-            }
         }
     }
 
