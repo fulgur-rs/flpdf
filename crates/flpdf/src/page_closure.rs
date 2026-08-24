@@ -7,18 +7,18 @@
 //! and resources in isolation.
 
 use crate::object::MAX_INLINE_DEPTH;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
 /// Return the transitive closure of all [`ObjectRef`]s reachable from `page_ref`.
 ///
-/// Traverses the object graph breadth-first, following every
-/// [`Object::Reference`] encountered.  The page dictionary itself, its content
-/// streams, `/Resources` subtree (fonts, XObjects, colour spaces, patterns,
-/// ExtGStates, properties, shadings), annotations, and all nested references
-/// are included automatically — no special-casing per resource type is needed
-/// because the BFS follows every reference link regardless of semantic role.
+/// Traverses the live object graph breadth-first, following every indirect
+/// child handle encountered. The page dictionary itself, its content streams,
+/// `/Resources` subtree (fonts, XObjects, colour spaces, patterns, ExtGStates,
+/// properties, shadings), annotations, and all nested references are included
+/// automatically — no special-casing per resource type is needed because the
+/// BFS follows every reference link regardless of semantic role.
 ///
 /// Inherited page attributes (e.g. `/Resources`, `/MediaBox`, `/CropBox`,
 /// `/Rotate` on a parent `/Pages` node) are also included: the BFS follows
@@ -108,25 +108,22 @@ fn extend_closure_from_queue<R: Read + Seek>(
     // rather than once per node.
     let mut refs_found = Vec::new();
     while let Some(current_ref) = queue.pop_front() {
-        let obj = pdf.resolve_borrowed(current_ref)?;
+        let handle = pdf.get_object_handle(current_ref);
+        pdf.resolve(&handle)?;
 
         // Guard: when we reach a Page or Catalog object other than the
         // starting page (e.g. via a cross-page annotation destination), add
         // it to visited but do not traverse its contents.  This prevents
         // sibling-page resources from being pulled into the closure.
         if Some(current_ref) != top_page {
-            if let Object::Dictionary(dict) = obj {
-                let boundary = dict
-                    .get("Type")
-                    .and_then(Object::as_name)
-                    .is_some_and(|name| name == b"Page" || name == b"Catalog");
-                if boundary {
-                    continue;
-                }
+            let is_page = handle.try_is_dictionary_of_type(b"Page", b"")?;
+            let is_catalog = handle.try_is_dictionary_of_type(b"Catalog", b"")?;
+            if is_page || is_catalog {
+                continue;
             }
         }
 
-        collect_refs_in_object(obj, 0, &mut refs_found)?;
+        collect_refs_in_handle(pdf, &handle, 0, &mut refs_found, true)?;
         for r in refs_found.drain(..) {
             if visited.insert(r) {
                 queue.push_back(r);
@@ -137,7 +134,8 @@ fn extend_closure_from_queue<R: Read + Seek>(
     Ok(())
 }
 
-/// Recursively collect every [`ObjectRef`] embedded in `obj` into `out`.
+/// Recursively collect every indirect [`ObjectRef`] embedded in `handle` into
+/// `out`.
 ///
 /// Stream data bytes are opaque binary and cannot contain indirect references,
 /// so only the stream dictionary is traversed.
@@ -147,48 +145,61 @@ fn extend_closure_from_queue<R: Read + Seek>(
 /// hierarchy, while still allowing the BFS to follow `/Parent` references
 /// upward and collect inherited resources (e.g. `/Resources`, `/MediaBox`)
 /// from ancestor `/Pages` nodes.
-fn collect_refs_in_object(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
+fn collect_refs_in_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+    depth: usize,
+    out: &mut Vec<ObjectRef>,
+    root: bool,
+) -> Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "page closure: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
     }
-    match obj {
-        Object::Reference(r) => out.push(*r),
-        Object::Array(items) => {
-            for item in items {
-                collect_refs_in_object(item, depth + 1, out)?;
+
+    // A child indirect handle is a graph edge, not a value to dereference in
+    // this recursive walk. The BFS owns dereferencing each queued object once,
+    // preserving qpdf's canonical object identity and page-boundary behavior.
+    if !root {
+        if let Some(reference) = handle.object_ref() {
+            // qpdf treats the null object reference as a null value rather than
+            // as a traversable xref entry.
+            if reference.number != 0 {
+                out.push(reference);
             }
+            return Ok(());
         }
-        Object::Dictionary(dict) => {
-            let is_pages_node = dict
-                .get("Type")
-                .and_then(|o| o.as_name())
-                .map(|n| n == b"Pages")
-                .unwrap_or(false);
-            for (key, value) in dict.iter() {
-                if is_pages_node && key == b"Kids" {
-                    continue;
-                }
-                collect_refs_in_object(value, depth + 1, out)?;
-            }
-        }
-        Object::Stream(stream) => {
-            for (_key, value) in stream.dict.iter() {
-                collect_refs_in_object(value, depth + 1, out)?;
-            }
-        }
-        // Scalar types carry no references.
-        Object::Null
-        | Object::Boolean(_)
-        | Object::Integer(_)
-        | Object::Real(_)
-        | Object::RealLiteral { .. }
-        | Object::Name(_)
-        | Object::String(_)
-        | Object::Operator(_)
-        | Object::InlineImage(_) => {}
     }
+
+    pdf.resolve(handle)?;
+    if let Some(items) = handle.try_as_array()? {
+        for item in items {
+            collect_refs_in_handle(pdf, &item, depth + 1, out, false)?;
+        }
+        return Ok(());
+    }
+
+    let dictionary = if let Some(stream_dict) = handle.as_stream_dict() {
+        Some(stream_dict)
+    } else if handle.as_dictionary().is_some() {
+        Some(handle.clone())
+    } else {
+        None
+    };
+    let Some(dictionary) = dictionary else {
+        return Ok(());
+    };
+
+    let is_pages_node = dictionary.try_is_dictionary_of_type(b"Pages", b"")?;
+    for key in dictionary.try_get_keys()? {
+        if is_pages_node && key.as_slice() == b"/Kids" {
+            continue;
+        }
+        let value = dictionary.try_get_key(&key)?;
+        collect_refs_in_handle(pdf, &value, depth + 1, out, false)?;
+    }
+
     Ok(())
 }
 
@@ -275,6 +286,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn catalog_reference_is_a_boundary() {
+        let bytes = build_pdf(
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 6 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>"),
+                (4, "<< /Subtype /Link /Dest [1 0 R /Fit] >>"),
+                (6, "<< /Fields [7 0 R] >>"),
+                (7, "<< /T (outside closure) >>"),
+            ],
+            1,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let closure = page_object_closure(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+
+        assert!(closure.contains(&ObjectRef::new(1, 0)));
+        assert!(!closure.contains(&ObjectRef::new(6, 0)));
+        assert!(!closure.contains(&ObjectRef::new(7, 0)));
+    }
+
     /// The shared-visited union equals the independent per-page union: extending
     /// both pages into one set yields exactly `closure(p1) ∪ closure(p2)`.
     #[test]
@@ -312,43 +344,48 @@ mod tests {
         assert_eq!(shared, independent);
     }
 
-    fn nested_arrays(depth: usize) -> Object {
-        let mut o = Object::Null;
+    fn nested_arrays(depth: usize) -> ObjectHandle {
+        let mut o = ObjectHandle::null();
         for _ in 0..depth {
-            o = Object::Array(vec![o]);
+            o = ObjectHandle::array(vec![o]);
         }
         o
     }
 
     #[test]
-    fn collect_refs_in_object_errors_on_excessive_nesting() {
+    fn collect_refs_in_handle_errors_on_excessive_nesting() {
+        let mut pdf = Pdf::open_mem_owned(build_pdf(&[(1, "<< /Type /Catalog >>")], 1)).unwrap();
         let mut out = Vec::new();
-        let err = collect_refs_in_object(&nested_arrays(MAX_INLINE_DEPTH + 5), 0, &mut out);
+        let handle = nested_arrays(MAX_INLINE_DEPTH + 5);
+        let err = collect_refs_in_handle(&mut pdf, &handle, 0, &mut out, true);
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 
     #[test]
-    fn collect_refs_in_object_accepts_nesting_up_to_the_limit() {
+    fn collect_refs_in_handle_accepts_nesting_up_to_the_limit() {
+        let mut pdf = Pdf::open_mem_owned(build_pdf(&[(1, "<< /Type /Catalog >>")], 1)).unwrap();
         let mut out = Vec::new();
         // Bury one Reference so it is visited at exactly inline depth
         // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
         // guard); it must be collected, not errored.
-        let leaf = Object::Array(vec![Object::Reference(ObjectRef::new(7, 0))]);
+        let leaf = ObjectHandle::array(vec![pdf.get_object_handle(ObjectRef::new(7, 0))]);
         let mut o = leaf;
         for _ in 0..(MAX_INLINE_DEPTH - 1) {
-            o = Object::Array(vec![o]);
+            o = ObjectHandle::array(vec![o]);
         }
-        collect_refs_in_object(&o, 0, &mut out).unwrap();
+        collect_refs_in_handle(&mut pdf, &o, 0, &mut out, true).unwrap();
         assert_eq!(out, vec![ObjectRef::new(7, 0)]);
     }
 
     #[test]
-    fn collect_refs_in_object_rejects_one_past_the_limit() {
+    fn collect_refs_in_handle_rejects_one_past_the_limit() {
+        let mut pdf = Pdf::open_mem_owned(build_pdf(&[(1, "<< /Type /Catalog >>")], 1)).unwrap();
         let mut out = Vec::new();
         // The Null leaf of nested_arrays(MAX_INLINE_DEPTH + 1) is visited at
         // inline depth MAX_INLINE_DEPTH + 1 — one past the deepest accepted
         // level — so the strict `>` guard must reject it.
-        let err = collect_refs_in_object(&nested_arrays(MAX_INLINE_DEPTH + 1), 0, &mut out);
+        let handle = nested_arrays(MAX_INLINE_DEPTH + 1);
+        let err = collect_refs_in_handle(&mut pdf, &handle, 0, &mut out, true);
         assert!(matches!(err, Err(crate::Error::Unsupported(_))));
     }
 }
