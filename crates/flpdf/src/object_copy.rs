@@ -93,7 +93,45 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
             "QPDF::copyForeign called with object from this QPDF".to_owned(),
         ));
     }
+    copy_foreign_with_source_id(target, source_id, foreign, true)
+}
 
+/// Copy a direct or indirect value from a foreign document while retaining the
+/// destination's qpdf-shaped per-source copier map.
+///
+/// qpdf exposes this operation as the `replaceForeignIndirectObjects` half of
+/// `QPDF::copyForeignObject` rather than as a separate public method: page-merge
+/// metadata values are direct children of the primary Catalog or trailer, while
+/// their indirect descendants still belong to the same `ObjCopier` map as the
+/// selected pages. Keeping this boundary in `object_copy` lets callers copy a
+/// direct array/dictionary without materializing it through the legacy
+/// `Object` model (`QPDF.cc:2158-2213`).
+pub(crate) fn copy_foreign_value<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    source_id: u64,
+    foreign: &ObjectHandle,
+) -> Result<ObjectHandle> {
+    if source_id == target.unique_id() {
+        return Err(Error::System(
+            "QPDF::copyForeign called with object from this QPDF".to_owned(),
+        ));
+    }
+    if let Some(owner_id) = foreign.owning_pdf_unique_id() {
+        if owner_id != source_id {
+            return Err(Error::System(
+                "QPDF::copyForeign encountered an object owned by a different document".to_owned(),
+            ));
+        }
+    }
+    copy_foreign_with_source_id(target, source_id, foreign, false)
+}
+
+fn copy_foreign_with_source_id<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    source_id: u64,
+    foreign: &ObjectHandle,
+    require_indirect: bool,
+) -> Result<ObjectHandle> {
     let object_map = target.take_foreign_object_map(source_id);
     let visiting = target.take_foreign_object_visiting(source_id);
     if !visiting.is_empty() {
@@ -130,7 +168,11 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
         direct_visiting: Vec::new(),
         to_copy: Vec::new(),
     };
-    let result = copier.run(foreign);
+    let result = if require_indirect {
+        copier.run(foreign)
+    } else {
+        copier.run_value(foreign)
+    };
     let object_map = copier.object_map;
     let visiting = copier.visiting;
     copier.target.set_foreign_object_map(source_id, object_map);
@@ -170,6 +212,18 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
 
 impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
     fn run(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
+        self.run_value_inner(foreign, true)
+    }
+
+    fn run_value(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
+        self.run_value_inner(foreign, false)
+    }
+
+    fn run_value_inner(
+        &mut self,
+        foreign: &ObjectHandle,
+        require_indirect: bool,
+    ) -> Result<ObjectHandle> {
         self.reserve_objects(foreign.clone(), true)?;
         if !self.visiting.is_empty() {
             return Err(Error::Internal(
@@ -199,18 +253,21 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             }
         }
 
-        let Some(source_ref) = foreign.object_ref() else {
+        if let Some(source_ref) = foreign.object_ref() {
+            let Some(&target_ref) = self.object_map.get(&source_ref) else {
+                self.target.resolver.push_warning(
+                    "unexpected reference to /Pages object while copying foreign object; replacing with null",
+                )?;
+                return Ok(ObjectHandle::null());
+            };
+            return Ok(self.target.get_object_handle(target_ref));
+        }
+        if require_indirect {
             return Err(Error::System(
                 "QPDF::copyForeign called with direct object handle".to_owned(),
             ));
-        };
-        let Some(&target_ref) = self.object_map.get(&source_ref) else {
-            self.target.resolver.push_warning(
-                "unexpected reference to /Pages object while copying foreign object; replacing with null",
-            )?;
-            return Ok(ObjectHandle::null());
-        };
-        Ok(self.target.get_object_handle(target_ref))
+        }
+        self.replace_foreign_indirect_objects(foreign.clone(), true)
     }
 
     // `reserve_objects` is the sole recursion hub for reservation: every
@@ -1726,6 +1783,46 @@ mod tests {
             Some(b"Nested".to_vec())
         );
         assert_ne!(copied_shared_from_array.object_ref(), shared.object_ref());
+    }
+
+    #[test]
+    fn copy_foreign_value_reuses_the_persistent_map_for_direct_containers() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let shared = source
+            .make_indirect_object_handle(ObjectHandle::integer(11))
+            .expect("shared child");
+        let value = ObjectHandle::dictionary(vec![(b"/Shared".to_vec(), shared.clone())]);
+
+        let copied = copy_foreign_value(&mut target, source.unique_id(), &value)
+            .expect("copy direct foreign value");
+        let copied_again = copy_foreign_value(&mut target, source.unique_id(), &value)
+            .expect("reuse direct foreign value map");
+
+        assert!(copied
+            .get_key(b"/Shared")
+            .is_same_object_as(&copied_again.get_key(b"/Shared")));
+        assert_eq!(copied.get_key(b"/Shared").as_integer(), Some(11));
+        assert!(!copied.get_key(b"/Shared").is_same_object_as(&shared));
+    }
+
+    #[test]
+    fn copy_foreign_value_rejects_wrong_document_identity() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let foreign = source.get_object_handle(ObjectRef::new(3, 0));
+
+        let target_id = target.unique_id();
+        let same_document = copy_foreign_value(&mut target, target_id, &foreign)
+            .expect_err("a target-owned source id must be rejected");
+        assert!(matches!(same_document, Error::System(message)
+            if message == "QPDF::copyForeign called with object from this QPDF"));
+
+        let wrong_source_id = target_id.wrapping_add(1);
+        let wrong_owner = copy_foreign_value(&mut target, wrong_source_id, &foreign)
+            .expect_err("a foreign handle owned by another source id must be rejected");
+        assert!(matches!(wrong_owner, Error::System(message)
+            if message == "QPDF::copyForeign encountered an object owned by a different document"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Integration tests for [`flpdf::merge_documents`].
 
-use flpdf::{merge_documents, pages, MergeInput, Object, ObjectRef, Pdf};
+use flpdf::{merge_documents, pages, Error, MergeInput, Object, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -371,27 +371,40 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
             .and_then(|dict| dict.get("DisplayDocTitle").cloned()),
         Some(Object::Boolean(true))
     );
+    let info = merged.trailer_key_handle(b"Info");
+    let info = merged
+        .resolve_to_terminal(&info)
+        .unwrap()
+        .materialize()
+        .unwrap();
     assert_eq!(
-        merged
-            .trailer_dictionary()
-            .get_ref("Info")
-            .and_then(|reference| merged.resolve_object(reference).ok())
-            .and_then(|object| object.as_dict().cloned())
-            .and_then(|dict| dict.get("Producer").cloned()),
+        info.as_dict()
+            .and_then(|dict| dict.get("Producer"))
+            .cloned(),
         Some(Object::String(b"primary-info".to_vec()))
     );
+    let custom = merged.trailer_key_handle(b"Custom");
+    let custom = merged
+        .resolve_to_terminal(&custom)
+        .unwrap()
+        .materialize()
+        .unwrap();
     assert_eq!(
-        merged
-            .trailer_dictionary()
-            .get_ref("Custom")
-            .and_then(|reference| merged.resolve_object(reference).ok())
-            .and_then(|object| object.as_dict().cloned())
-            .and_then(|dict| dict.get("Marker").cloned()),
+        custom
+            .as_dict()
+            .and_then(|dict| dict.get("Marker"))
+            .cloned(),
         Some(Object::String(b"primary-trailer".to_vec()))
     );
+    let id = merged.trailer_key_handle(b"ID");
+    let id = merged
+        .resolve_to_terminal(&id)
+        .unwrap()
+        .materialize()
+        .unwrap();
     assert_eq!(
-        merged.trailer_dictionary().get("ID"),
-        Some(&Object::Array(vec![
+        id,
+        Object::Array(vec![
             Object::String(vec![
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
                 0xee, 0xff,
@@ -400,7 +413,7 @@ fn merge_preserves_primary_catalog_and_trailer_metadata() {
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
                 0xee, 0xff,
             ]),
-        ]))
+        ])
     );
 }
 
@@ -2365,32 +2378,12 @@ fn merge_inline_dest_holder_chain_leading_ref_remapped() {
         source: &mut a,
         pages: vec![0],
     }];
-    let mut doc = merge_documents(&mut inputs).unwrap();
-
-    let refs = pages::page_refs(&mut doc).unwrap();
-    assert_eq!(refs.len(), 1);
-    let page0 = refs[0];
-    let cat = catalog_dict(&mut doc);
-    let legacy = match cat.get("Dests") {
-        Some(Object::Dictionary(d)) => d.clone(),
-        other => panic!("expected inline legacy /Dests, got {other:?}"),
-    };
-    let d_holder = match legacy.get("d_holder") {
-        Some(Object::Dictionary(d)) => d.clone(),
-        other => panic!("expected /d_holder dict dest, got {other:?}"),
-    };
-    let arr = match d_holder.get("D") {
-        Some(Object::Array(a)) => a.clone(),
-        other => panic!("expected /d_holder /D array, got {other:?}"),
-    };
-    let (first, is_null) = dest_array_first(&mut doc, &arr);
-    assert_ne!(first, page0, "the copied holder remains an explicit object");
-    assert!(!is_null, "surviving holder object must not resolve to null");
-    assert_eq!(
-        doc.resolve_object(first).unwrap(),
-        Object::Reference(page0),
-        "copied holder remaps to the copied selected page"
-    );
+    let result = merge_documents(&mut inputs);
+    assert!(matches!(
+        result,
+        Err(Error::System(message))
+            if message == "QPDF::copyForeign encountered an object whose value is itself a reference"
+    ));
 }
 
 /// Direct catalog destination carriers keep indirect destination holders as
@@ -4944,12 +4937,12 @@ fn merge_inherits_names_tree_behind_holder_chain() {
         source: &mut a,
         pages: vec![0],
     }];
-    let mut doc = merge_documents(&mut inputs).unwrap();
-    let cat = catalog_dict(&mut doc);
-    assert!(
-        cat.get("Names").is_some(),
-        "the inherited /Names tree must not be dropped when /Names is behind a holder chain"
-    );
+    let result = merge_documents(&mut inputs);
+    assert!(matches!(
+        result,
+        Err(Error::System(message))
+            if message == "QPDF::copyForeign encountered an object whose value is itself a reference"
+    ));
 }
 
 /// 2-page doc whose primary `/Outlines` reaches its first item through a holder
@@ -5127,13 +5120,12 @@ fn merge_keeps_top_level_field_behind_element_chain() {
         source: &mut a,
         pages: vec![0],
     }];
-    let mut doc = merge_documents(&mut inputs).unwrap();
-    let names = acroform_field_names(&mut doc);
-    assert_eq!(
-        names,
-        vec![b"f1".to_vec()],
-        "a selected top-level field behind a /Fields element holder chain must survive in the merged form"
-    );
+    let result = merge_documents(&mut inputs);
+    assert!(matches!(
+        result,
+        Err(Error::System(message))
+            if message == "QPDF::copyForeign encountered an object whose value is itself a reference"
+    ));
 }
 
 /// L3 — destination page ref holder chain. Page 0's link annotation's

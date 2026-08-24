@@ -704,9 +704,10 @@ fresh merged document に明示的に伝播する。primary と全 secondary の
 base として in-place 更新する」責務と、`QPDFJob.cc:2590-2632` の
 `/Pages`・`/PageLabels`・AcroForm の選択ページ側更新を分離した。`job/page_merge.rs`
 は選択 page graph を `QPDFPageDocumentHelper::addPage` 相当の canonical
-`copyForeignObject` route で先にコピーし、primary Catalog/trailer の全 graph を
-残る merge-specific metadata closure に含め、
-`/Pages` と writer/xref-owned trailer keys だけを target 側で再構築する。
+`copyForeignObject` route で先にコピーし、primary Catalog/trailer の各値を
+`object_copy::copy_foreign_value`（`replaceForeignIndirectObjects` 相当）へ渡す。
+同じ per-source map を維持したまま `/Pages` と writer/xref-owned trailer keys だけを
+target 側で再構築する。
 その結果 `/Info`、`/ID[0]`、未知の trailer entries、`/ViewerPreferences` や
 その他の Catalog siblings は primary の値と indirect-reference identity を
 保ったまま remap され、secondary の Catalog/trailer metadata は継承されない。
@@ -721,7 +722,8 @@ CLI の qpdf 11.9.0 differential test、および fixture の live probe で確�
 | `qdf_fix.rs` | 1,219 | qpdf では `qpdf/fix-qdf.cc`（libqpdf 外の別バイナリ）。object stream (`/Type /ObjStm`) / cross-reference stream (`/Type /XRef`) 形式の QDF 入力にも対応（`st_in_ostream_*` / `st_in_xref_stream_dict` 相当、flpdf-9hc.43） |
 
 
-`object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
+`object_copy.rs` の `copy_foreign_object` / `copy_foreign_value` は `QPDF.cc` の
+`copyForeignObject` / `replaceForeignIndirectObjects` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
 
 なお、`object_copy.rs` の `copy_objects` / `page_closure.rs` は旧来の
@@ -738,10 +740,14 @@ destination-owned indirect null slot で表現する。
 qpdf の source-side inherited-attribute preparation と destination-side page-tree
 mutation を組み合わせる。`job/page_merge.rs` も `pushInheritedAttributesToPage` 相当の
 source preparation と live-handle による destination `/Parent` replacement を使い、
-選択 page graph の legacy pre-closed copy は削除した。primary の document-level /
-AcroForm / PageLabels merge と `--preserve-unreferenced` 用の primary orphan 保持には
-なお bounded raw metadata bridge が残るが、これは canonical page insertion の責務ではなく、
-次の consumer cutover で解消すべき技術的負債として扱う。
+選択 page graph の legacy pre-closed copy を削除した。primary の document-level /
+AcroForm / PageLabels merge は Catalog/trailer の各 direct value を同じ persistent
+foreign map でコピーし、`--preserve-unreferenced` は qpdf の live object cache を
+`copy_foreign_object` で列挙する。removed-page nulling と `/Pages` 再構築も canonical
+handle mutation で行うため、page merge に raw metadata closure bridge は残さない。
+`Object::Reference` を値として保持する `Pdf::set_object` holder chain は qpdf の
+`copyForeignObject` が拒否する shape であり、後方互換 adapter は追加せず明示的 rejection
+を維持する。
 
 ⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
 相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を

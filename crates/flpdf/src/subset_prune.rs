@@ -158,7 +158,12 @@ pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
     // /Encrypt and any other trailer-only references from the sweep), and
     // from every explicitly protected ref.
     let trailer_refs = {
-        let trailer_clone = Object::Dictionary(pdf.trailer_dictionary().clone());
+        // The canonical trailer handle is qpdf's live trailer graph. In
+        // particular, page merge may have copied `/Info` or unknown trailer
+        // entries into this handle after construction; the legacy
+        // `trailer_dictionary()` snapshot would make those objects look
+        // unreachable and delete them before the writer sees them.
+        let trailer_clone = pdf.trailer().materialize()?;
         let mut refs: Vec<ObjectRef> = Vec::new();
         walk_refs(&trailer_clone, 0, &mut refs)?;
         refs.extend(protect.iter().copied());
