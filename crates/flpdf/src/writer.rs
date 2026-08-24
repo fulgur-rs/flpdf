@@ -53,7 +53,7 @@ use crate::{
     filters, Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result, XrefEntry, XrefForm,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -4033,7 +4033,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             .as_ref()
             .expect("content normalization prepares page references");
         for page_ref in page_refs {
-            refs.extend(collect_content_stream_refs_tolerant(pdf, *page_ref)?);
+            refs.extend(collect_content_stream_refs(pdf, *page_ref)?);
         }
         refs
     } else {
@@ -4476,8 +4476,8 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // "%% Original object ID:" and are NOT suppressed by
     // no_original_object_ids. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
     //
-    // `contents_seq` contains only terminal indirect stream refs returned by
-    // the shared page-content resolver. `content_container_refs` identifies
+    // `contents_seq` contains only indirect stream refs returned by the
+    // canonical page-content resolver. `content_container_refs` identifies
     // page dictionaries and indirect array holders that contain direct Stream
     // values; those values have no ObjectRef of their own and must be
     // normalized in the containing object during emission.
@@ -4504,13 +4504,12 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             if options.qdf {
                 page_seq.insert(*page_ref, seq);
             }
-            // Follow the page's `/Contents` holders through the canonical
-            // ObjectHandle graph. The legacy page helper materializes the
-            // same chain and would make a damaged stream's parser warning
-            // appear twice when the emission loop later resolves its live
-            // handle; qpdf's writer stays on one object cache throughout.
-            for terminal_ref in collect_content_stream_refs_tolerant(pdf, *page_ref)? {
-                contents_seq.insert(terminal_ref, seq);
+            // Enumerate page content streams through the canonical
+            // ObjectHandle graph. Keep the live stream handle's original
+            // indirect identity for the emission loop; qpdf does not chase
+            // flpdf-only reference-holder chains here.
+            for content_ref in collect_content_stream_refs(pdf, *page_ref)? {
+                contents_seq.insert(content_ref, seq);
             }
             collect_content_container_refs(pdf, *page_ref, &mut content_container_refs)?;
         }
@@ -5500,81 +5499,53 @@ pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
     }
 }
 
-/// Collect indirect objects that can contain direct streams inside a page's
-/// `/Contents` value. Terminal indirect streams are tracked separately by
-/// [`crate::pages::page_content_stream_entries_tolerant`]; this helper only
-/// records page dictionaries and indirect array holders so the emission loop
-/// can replace their direct Stream values in place.
+/// Collect the immediate `/Contents` containers that can hold direct streams.
+/// Indirect streams are tracked separately by [`collect_content_stream_refs`].
+/// The qpdf writer inspects the page value and one array level; it does not
+/// follow flpdf-only reference-holder chains.
 fn collect_content_container_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     containers: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    enum ContentsValue {
-        DirectStream,
-        DirectArray(Vec<ObjectRef>),
-        Indirect(ObjectRef),
-    }
     let page_handle = pdf.get_object_handle(page_ref);
     pdf.resolve(&page_handle)?;
-    let contents_handle = page_handle.try_get_key(b"/Contents")?;
-    let contents = if let Some(reference) = contents_handle
-        .object_ref()
-        .or_else(|| contents_handle.as_reference())
-    {
-        // A resolved indirect stream/array remains an indirect object for
-        // writer ownership purposes. Only a direct stream/array nested in the
-        // page dictionary belongs to the containing page object.
-        Some(ContentsValue::Indirect(reference))
-    } else if contents_handle.as_stream_dict().is_some() {
-        Some(ContentsValue::DirectStream)
-    } else {
-        contents_handle.try_as_array()?.map(|items| {
-            ContentsValue::DirectArray(
-                items
-                    .iter()
-                    .filter_map(|item| item.object_ref().or_else(|| item.as_reference()))
-                    .collect(),
-            )
-        })
-    };
-    match contents {
-        Some(ContentsValue::DirectStream) => {
+    let contents = page_handle.try_get_key(b"/Contents")?;
+    if contents.type_code()? == 10 {
+        if contents.object_ref().is_none() {
             containers.insert(page_ref);
         }
-        Some(ContentsValue::DirectArray(refs)) => {
-            containers.insert(page_ref);
-            for reference in refs {
-                collect_content_array_holder_refs(pdf, reference, containers)?;
-            }
-        }
-        Some(ContentsValue::Indirect(reference)) => {
-            collect_content_array_holder_refs(pdf, reference, containers)?;
-        }
-        _ => {}
+        return Ok(());
     }
+
+    if contents.try_as_array()?.is_none() {
+        return Ok(());
+    }
+    containers.insert(contents.object_ref().unwrap_or(page_ref));
     Ok(())
 }
 
-/// Collect terminal indirect stream references from a page's `/Contents`
-/// value without materializing the page-content holder chain. Direct streams
-/// and non-stream values are intentionally omitted: the former have no object
-/// identity for `contents_seq`, and the latter are the tolerant writer shape
-/// qpdf skips while still rewriting valid sibling streams.
-pub(crate) fn collect_content_stream_refs_tolerant<R: Read + Seek>(
+/// Collect indirect page-content stream references through canonical
+/// `ObjectHandle` inspection. Direct streams and malformed non-stream values
+/// are omitted from the identity set: direct streams have no object identity
+/// for `contents_seq`, while qpdf only normalizes actual stream objects.
+///
+/// This mirrors `QPDFWriter::initializeSpecialStreams`
+/// (`libqpdf/QPDFWriter.cc:1914-1931`): resolve the page `/Contents` handle
+/// once, inspect an array's immediate children, and never chase a
+/// flpdf-only reference-holder chain. Unlike `ObjectHandle::get_page_contents`,
+/// the writer pre-scan deliberately does not issue the `getPageContents`
+/// damage warning for a non-stream array member, because qpdf's writer
+/// pre-scan only asks each child whether it is a stream.
+pub(crate) fn collect_content_stream_refs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<ObjectRef>> {
     let page_handle = pdf.get_object_handle(page_ref);
     pdf.resolve(&page_handle)?;
-    let contents_handle = page_handle.try_get_key(b"/Contents")?;
-    let (contents, contents_ref) = pdf.resolve_to_terminal_ref(&contents_handle)?;
-
-    if contents.try_is_null()? {
-        return Ok(Vec::new());
-    }
-    if contents.as_stream_dict().is_some() {
-        return Ok(contents_ref.into_iter().collect());
+    let contents = page_handle.try_get_key(b"/Contents")?;
+    if contents.type_code()? == 10 {
+        return Ok(contents.object_ref().into_iter().collect());
     }
 
     let Some(items) = contents.try_as_array()? else {
@@ -5582,47 +5553,13 @@ pub(crate) fn collect_content_stream_refs_tolerant<R: Read + Seek>(
     };
     let mut refs = Vec::with_capacity(items.len());
     for item in items {
-        let (item, item_ref) = pdf.resolve_to_terminal_ref(&item)?;
-        if item.as_stream_dict().is_some() {
-            if let Some(item_ref) = item_ref {
-                refs.push(item_ref);
+        if item.type_code()? == 10 {
+            if let Some(object_ref) = item.object_ref() {
+                refs.push(object_ref);
             }
         }
     }
     Ok(refs)
-}
-
-/// Follow one `/Contents` holder chain until it reaches an array or stream.
-/// When it reaches an array, retain the array holder and inspect its reference
-/// elements for nested array holders. Direct stream elements are handled when
-/// their containing array object is emitted.
-fn collect_content_array_holder_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    start: ObjectRef,
-    containers: &mut BTreeSet<ObjectRef>,
-) -> Result<()> {
-    let mut pending = VecDeque::from([(start, 0_usize)]);
-    let mut visited = BTreeSet::new();
-
-    while let Some((current, depth)) = pending.pop_front() {
-        if depth >= crate::ref_chain::MAX_REF_CHAIN_DEPTH || !visited.insert(current) {
-            continue;
-        }
-        let handle = pdf.get_object_handle(current);
-        pdf.resolve(&handle)?;
-        if let Some(next) = handle.as_reference() {
-            pending.push_back((next, depth + 1));
-        } else if let Some(items) = handle.try_as_array()? {
-            containers.insert(current);
-            pending.extend(
-                items
-                    .iter()
-                    .filter_map(|item| item.object_ref().or_else(|| item.as_reference()))
-                    .map(|reference| (reference, depth + 1)),
-            );
-        }
-    }
-    Ok(())
 }
 
 /// QDF variant of [`write_stream_to_buf`]: identical stream/endstream framing
@@ -5894,35 +5831,6 @@ mod tests {
             self.finishes += 1;
             Err(crate::pipeline::PipelineError::runtime("finish failed"))
         }
-    }
-
-    #[test]
-    fn content_array_holder_collection_uses_one_cumulative_ref_depth_budget() {
-        let mut pdf =
-            crate::Pdf::open_mem_owned(build_partition_fixture()).expect("fixture must open");
-        let refs: Vec<ObjectRef> = (0..=crate::ref_chain::MAX_REF_CHAIN_DEPTH)
-            .map(|i| ObjectRef::new(10_000 + i as u32, 0))
-            .collect();
-
-        for (index, reference) in refs.iter().enumerate() {
-            let value = if let Some(next) = refs.get(index + 1) {
-                Object::Reference(*next)
-            } else {
-                Object::Stream(crate::Stream::new(Dictionary::new(), b"q\rQ\n".to_vec()))
-            };
-            pdf.set_object(*reference, Object::Array(vec![value]));
-        }
-
-        let mut containers = BTreeSet::new();
-        collect_content_array_holder_refs(&mut pdf, refs[0], &mut containers)
-            .expect("bounded holder traversal must succeed");
-
-        assert_eq!(containers.len(), crate::ref_chain::MAX_REF_CHAIN_DEPTH);
-        assert!(containers.contains(&refs[0]));
-        assert!(
-            !containers.contains(refs.last().expect("non-empty chain")),
-            "the terminal holder beyond the shared reference-depth budget must not be visited"
-        );
     }
 
     #[test]

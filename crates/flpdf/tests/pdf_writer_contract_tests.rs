@@ -9,9 +9,9 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineResult};
 use flpdf::{
-    apply_stream_compress_policy, pages, CompressStreams, CopyEncryptionSource, DecodeLevel,
-    Dictionary, EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf,
-    PdfOpenOptions, PdfWriter, Stream, StreamDataMode, XrefEntry,
+    apply_stream_compress_policy, CompressStreams, CopyEncryptionSource, DecodeLevel, Dictionary,
+    EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions,
+    PdfWriter, Stream, StreamDataMode, XrefEntry,
 };
 
 mod common;
@@ -621,7 +621,7 @@ fn direct_content_stream_with_metadata_type(payload: &[u8]) -> Stream {
     Stream::new(dict, payload.to_vec())
 }
 
-fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
+fn synthetic_content_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
 
     // Page 3: direct /Contents Stream.
@@ -630,7 +630,15 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
         page_object(Object::Stream(direct_content_stream(b"P3\rD"))),
     );
 
-    // Page 5: direct /Contents array whose element is ref -> ref -> Stream.
+    // Page 4: direct /Contents array containing a direct Stream.
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        page_object(Object::Array(vec![Object::Stream(direct_content_stream(
+            b"P4\rD",
+        ))])),
+    );
+
+    // Page 5: direct /Contents array containing a single indirect Stream.
     pdf.set_object(
         ObjectRef::new(5, 0),
         page_object(Object::Array(vec![Object::Reference(ObjectRef::new(
@@ -639,69 +647,17 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
     );
     pdf.set_object(
         ObjectRef::new(11, 0),
-        Object::Reference(ObjectRef::new(12, 0)),
-    );
-    pdf.set_object(
-        ObjectRef::new(12, 0),
         Object::Stream(direct_content_stream(b"P5\rR")),
-    );
-
-    // Page 6: direct /Contents array containing a direct Stream.
-    pdf.set_object(
-        ObjectRef::new(6, 0),
-        page_object(Object::Array(vec![Object::Stream(direct_content_stream(
-            b"P6\rD",
-        ))])),
-    );
-
-    // Page 4: /Contents ref -> ref -> Stream.
-    pdf.set_object(
-        ObjectRef::new(4, 0),
-        page_object(Object::Reference(ObjectRef::new(8, 0))),
-    );
-    pdf.set_object(
-        ObjectRef::new(8, 0),
-        Object::Reference(ObjectRef::new(9, 0)),
-    );
-    pdf.set_object(
-        ObjectRef::new(9, 0),
-        Object::Stream(direct_content_stream(b"P4\rR")),
-    );
-
-    // Page 7: /Contents ref -> ref -> Array containing a direct Stream and
-    // an array element ref -> ref -> Stream.
-    pdf.set_object(
-        ObjectRef::new(7, 0),
-        page_object(Object::Reference(ObjectRef::new(13, 0))),
-    );
-    pdf.set_object(
-        ObjectRef::new(13, 0),
-        Object::Reference(ObjectRef::new(14, 0)),
-    );
-    pdf.set_object(
-        ObjectRef::new(14, 0),
-        Object::Array(vec![
-            Object::Stream(direct_content_stream(b"P7\rD")),
-            Object::Reference(ObjectRef::new(15, 0)),
-        ]),
-    );
-    pdf.set_object(
-        ObjectRef::new(15, 0),
-        Object::Reference(ObjectRef::new(16, 0)),
-    );
-    pdf.set_object(
-        ObjectRef::new(16, 0),
-        Object::Stream(direct_content_stream(b"P7\rR")),
     );
 
     let pages_ref = ObjectRef::new(2, 0);
     let mut pages = pdf.resolve_object(pages_ref)?.clone();
     let pages_dict = pages.as_dict_mut().expect("pages dictionary");
-    pages_dict.insert("Count", Object::Integer(5));
+    pages_dict.insert("Count", Object::Integer(3));
     pages_dict.insert(
         "Kids",
         Object::Array(
-            [3, 4, 5, 6, 7]
+            [3, 4, 5]
                 .into_iter()
                 .map(|number| Object::Reference(ObjectRef::new(number, 0)))
                 .collect(),
@@ -711,12 +667,9 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
     Ok(pdf)
 }
 
-// qpdf 11.9.0 accepts the direct-array and ref-to-array fixtures below.
-// Separate raw fixtures for ref -> ref -> stream and ref -> ref -> array were
-// probed during this follow-up; qpdf --check rejects both with `expected
-// endobj` and reports that the page Contents is neither a stream nor an array.
-// Those invalid graphs remain covered by synthetic_content_holder_shapes_pdf,
-// whose output is intentionally inspected as bytes without qpdf --check.
+// qpdf 11.9.0 accepts the direct-array and ref-to-array fixtures below; the
+// synthetic fixture above covers direct in-memory streams and arrays without
+// introducing a flpdf-only reference-holder shape.
 #[derive(Clone, Copy)]
 enum ValidContentsHolderShape {
     DirectArray,
@@ -1589,25 +1542,7 @@ fn pdf_writer_direct_content_stream_with_metadata_type_is_not_content_normalized
 #[test]
 fn pdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
-    let mut pdf = synthetic_content_holder_shapes_pdf()?;
-
-    let source_pages = pages::page_refs(&mut pdf)?;
-    let terminal_refs: Vec<_> = source_pages
-        .iter()
-        .map(|page_ref| {
-            pages::page_content_stream_entries_tolerant(&mut pdf, *page_ref).map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|(reference, _)| reference)
-                    .collect()
-            })
-        })
-        .collect::<flpdf::Result<Vec<Vec<_>>>>()?;
-    assert_eq!(terminal_refs[0], vec![None]);
-    assert_eq!(terminal_refs[1], vec![Some(ObjectRef::new(9, 0))]);
-    assert_eq!(terminal_refs[2], vec![Some(ObjectRef::new(12, 0))]);
-    assert_eq!(terminal_refs[3], vec![None]);
-    assert_eq!(terminal_refs[4], vec![None, Some(ObjectRef::new(16, 0))]);
+    let mut pdf = synthetic_content_shapes_pdf()?;
 
     let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
@@ -1616,21 +1551,13 @@ fn pdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     writer.write()?;
     let output = writer.get_buffer()?;
     // Direct Stream values are valid in flpdf's in-memory Object graph but
-    // cannot be reopened by qpdf as indirect PDF stream objects. This
-    // synthetic graph therefore covers direct streams/arrays and the
-    // ref -> ref -> stream/array cases as byte-level normalization checks;
-    // the ordinary indirect fixture tests above and below retain qpdf
-    // --check coverage for valid serialized PDFs.
+    // cannot be reopened by qpdf as indirect PDF stream objects. The ordinary
+    // indirect fixture tests above and below retain qpdf --check coverage for
+    // serialized PDFs.
     for (shape, normalized) in [
         ("direct Stream", b"P3\nD".as_slice()),
-        ("ref -> ref -> Stream", b"P4\nR".as_slice()),
-        ("array element ref -> ref -> Stream", b"P5\nR".as_slice()),
-        ("direct array element Stream", b"P6\nD".as_slice()),
-        ("ref -> ref -> Array direct Stream", b"P7\nD".as_slice()),
-        (
-            "ref -> ref -> Array element ref -> ref -> Stream",
-            b"P7\nR".as_slice(),
-        ),
+        ("direct array element Stream", b"P4\nD".as_slice()),
+        ("direct array element ref -> Stream", b"P5\nR".as_slice()),
     ] {
         assert!(
             contains_bytes(&output, normalized),
