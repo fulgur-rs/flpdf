@@ -578,7 +578,7 @@ struct Cli {
     // ── Overlay / underlay flags (flpdf-9hc.16), top-level alias ──────────
     // Mirror qpdf's top-level `qpdf in --overlay f -- out` form. Like the
     // `rewrite` subcommand fields, the per-group boundaries are extracted from
-    // raw argv by `extract_overlay_groups` before clap parses; these fields
+    // raw argv by `preprocess_qpdf_args` before clap parses; these fields
     // exist only for `--help` documentation and to accept a leaked token.
     /// Overlay pages from another file on top of the output (qpdf `--overlay`;
     /// top-level alias of `rewrite --overlay`). Repeatable; terminate each
@@ -1340,7 +1340,7 @@ struct RewriteCommand {
     //                          [--repeat=R] --
     //
     // The repeated occurrences and their per-group boundaries are extracted
-    // from the raw argv by `extract_overlay_groups` BEFORE clap parses (clap's
+    // from the raw argv by `preprocess_qpdf_args` BEFORE clap parses (clap's
     // derive flattens repeated `Vec<String>` occurrences, losing the group
     // boundary and the per-group declaration order needed for byte-identical
     // composition). These two fields exist only so `--help` documents the
@@ -1704,7 +1704,7 @@ fn main() {
     }
 
     // `--overlay`/`--underlay` groups are stripped from argv before clap by
-    // `extract_overlay_groups`, so a stripped group leaves no trace for the
+    // `preprocess_qpdf_args`, so a stripped group leaves no trace for the
     // dispatch chain. Only the rewrite paths (the `Rewrite` subcommand and the
     // top-level default/`--linearize` rewrite branches) consume `overlay_specs`;
     // every other command/mode would silently ignore it. Reject that here so an
