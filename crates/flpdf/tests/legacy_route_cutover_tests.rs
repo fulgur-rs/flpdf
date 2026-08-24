@@ -139,6 +139,27 @@ fn json_sections_production_uses_canonical_helper_routes() {
 }
 
 #[test]
+fn attachment_list_production_uses_one_hop_handle_resolution() {
+    let source = include_str!("../src/job/attachment_list.rs");
+    let production = source
+        .split_once("mod tests {")
+        .expect("attachment_list has a test module")
+        .0;
+    assert!(
+        !production.contains("resolve_to_terminal"),
+        "attachment_list production still chases the legacy terminal bridge"
+    );
+    assert!(
+        !production.contains("resolve_borrowed"),
+        "attachment_list production still reads the raw Object route"
+    );
+    assert!(
+        production.contains("pdf.resolve(&stream)"),
+        "attachment_list production must resolve EF entries through ObjectHandle"
+    );
+}
+
+#[test]
 fn page_form_xobject_test_helpers_use_the_canonical_handle_route() {
     let source = include_str!("../src/page_form_xobject.rs");
     for legacy in [
