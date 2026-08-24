@@ -530,11 +530,10 @@ pub(crate) fn canonical_trailer_entries(
     canonical_trailer_entries_with_visibility(pdf, map, removed_refs, true)
 }
 
-/// Snapshot trailer entries while preserving qpdf's mode-dependent top-level
-/// null visibility. The ordinary plain route suppresses null trailer values,
-/// while the specialized encrypted writer passes `false`, matching
-/// `QPDFWriter::writeTrailer` after `getTrimmedTrailer` (`QPDFWriter.cc:2009-
-/// 2027, 2917-2926`).
+/// Snapshot trailer entries while preserving qpdf's mode-independent
+/// top-level null visibility. `QPDFWriter::getTrimmedTrailer` applies the
+/// `getKeys()` rule before `writeTrailer` for plain, QDF, and encrypted output
+/// alike (`QPDFWriter.cc:1163-1192, 2009-2029, 2917-2926`).
 pub(crate) fn canonical_trailer_entries_with_visibility(
     pdf: &mut Pdf<impl Read + Seek>,
     map: &HashMap<ObjectRef, ObjectRef>,
