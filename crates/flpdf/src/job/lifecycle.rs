@@ -245,9 +245,17 @@ impl QPDFJob {
 
     /// Initialize the portable qpdf-job JSON surface used by qtest.
     ///
-    /// The accepted keys correspond to the complete JSON fields used by
-    /// `qpdfjob-ctest.c`: `inputFile`, `outputFile`, `password`, `staticId`,
-    /// `decrypt`, and `objectStreams`.
+    /// This implements a subset of qpdf's `--job-json-file` schema:
+    /// `inputFile`, `outputFile`, `password`, `staticId`, `deterministicId`,
+    /// `decrypt`, `objectStreams`, and `progress`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if `json` does not parse as a
+    /// dictionary, if `inputFile` is missing or empty, if `outputFile` is
+    /// missing, or if the dictionary contains a top-level key outside the
+    /// subset above (qpdf's full job JSON schema key, but not yet
+    /// implemented by this crate).
     pub fn initialize_from_json(&mut self, json: &str) -> Result<()> {
         // The qpdf C API sets this prefix before parsing JSON
         // (`libqpdf/qpdfjob-c.cc:79-87`), so initialization and run-time
@@ -259,6 +267,35 @@ impl QPDFJob {
             return Err(Error::Unsupported(
                 "qpdfjob JSON must contain a dictionary".to_owned(),
             ));
+        }
+        // qpdf validates the entire job JSON against `JOB_SCHEMA`
+        // (`libqpdf/QPDFJob_json.cc:615-624`) before handling any key, so an
+        // unrecognized key is a loud schema error rather than a silently
+        // ignored option. `JOB_SCHEMA` covers the full `--job-json-file`
+        // surface (`libqpdf/qpdf/auto_job_schema.hh`); this crate implements
+        // only the subset below, so reject anything else here rather than
+        // let it fall through to `job.run()` unapplied.
+        const SUPPORTED_TOP_LEVEL_KEYS: &[&[u8]] = &[
+            b"inputFile",
+            b"outputFile",
+            b"password",
+            b"staticId",
+            b"deterministicId",
+            b"decrypt",
+            b"objectStreams",
+            b"progress",
+        ];
+        let mut unsupported_key = None;
+        value.for_each_dict_item(|key, _item| {
+            if unsupported_key.is_none() && !SUPPORTED_TOP_LEVEL_KEYS.contains(&key) {
+                unsupported_key = Some(key.to_vec());
+            }
+        });
+        if let Some(key) = unsupported_key {
+            return Err(Error::Unsupported(format!(
+                "qpdfjob JSON key \"{}\" is not yet implemented",
+                String::from_utf8_lossy(&key)
+            )));
         }
 
         let input = value.get_dict_item(b"inputFile").get_string();

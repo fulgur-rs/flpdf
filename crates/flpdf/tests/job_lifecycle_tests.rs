@@ -230,6 +230,23 @@ fn json_job_without_output_is_a_usage_error() {
 }
 
 #[test]
+fn json_job_rejects_a_key_outside_the_implemented_schema_subset() {
+    let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
+    let json = serde_json::json!({
+        "inputFile": input,
+        "outputFile": "out.pdf",
+        "linearize": ""
+    })
+    .to_string();
+    let mut job = QPDFJob::new();
+
+    let error = job.initialize_from_json(&json).unwrap_err();
+
+    assert!(matches!(error, Error::Unsupported(_)));
+    assert!(error.to_string().contains("linearize"));
+}
+
+#[test]
 fn json_job_deterministic_id_repeats_identical_output() {
     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     let tempdir = tempfile::tempdir().unwrap();
