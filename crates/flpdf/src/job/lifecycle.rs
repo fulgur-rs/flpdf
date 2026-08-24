@@ -283,6 +283,9 @@ impl QPDFJob {
         if json_flag(&value, b"staticId") {
             configuration.writer.set_static_id(true);
         }
+        if json_flag(&value, b"deterministicId") {
+            configuration.writer.set_deterministic_id(true);
+        }
         if json_flag(&value, b"decrypt") {
             configuration.writer.set_preserve_encryption(false);
         }
