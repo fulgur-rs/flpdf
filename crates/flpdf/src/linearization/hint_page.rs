@@ -1074,6 +1074,146 @@ mod tests {
         );
     }
 
+    /// Two-page plan whose `part3_objects` list a higher-source-number object
+    /// (`50 0 R`) before a lower-source-number one (`8 0 R`). `RenumberMap`
+    /// assigns first-half output numbers in plan (list) order, so `50 0 R`
+    /// gets a *lower* output number than `8 0 R` despite its higher source
+    /// number — the two orderings disagree.
+    fn two_page_plan_with_reordered_shared_objects() -> LinearizationPlan {
+        LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
+            part3_objects: vec![ObjectRef::new(50, 0), ObjectRef::new(8, 0)],
+            part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+            total_object_count: 8,
+            page_hints: vec![
+                PageHintEntry {
+                    page_ref: ObjectRef::new(3, 0),
+                    first_object_index: 0,
+                    object_count: 4,
+                    byte_length: 0,
+                },
+                PageHintEntry {
+                    page_ref: ObjectRef::new(4, 0),
+                    first_object_index: 0,
+                    object_count: 5,
+                    byte_length: 0,
+                },
+            ],
+            shared_hints: vec![
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(3, 0),
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(6, 0),
+                    referencing_pages: vec![],
+                },
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(50, 0),
+                    referencing_pages: vec![1],
+                },
+                SharedObjectHintEntry {
+                    object_ref: ObjectRef::new(8, 0),
+                    referencing_pages: vec![1],
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn two_page_pre_optimization_plain_objects_sort_by_source_number_even_with_folded_container() {
+        let plan = two_page_plan_with_reordered_shared_objects();
+        let renumber = RenumberMap::from_plan(&plan);
+        // Fold `6 0 R` (referencing_pages = [], so it never appears in page
+        // 1's shared list) into a container purely to force
+        // has_objstm_members = true for the entries under test.
+        let mut member_to_container = std::collections::BTreeMap::new();
+        member_to_container.insert(ObjectRef::new(6, 0), (99, 0));
+        let mut container_shared_sort_key = std::collections::BTreeMap::new();
+        container_shared_sort_key.insert(99, (1u8, 0u32));
+
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &member_to_container,
+            &container_shared_sort_key,
+            &Default::default(),
+            &Default::default(),
+        );
+
+        // `canonical_shared_hints` folds and pre-sorts the first-page section
+        // by physical output number before this table is built, assigning
+        // `50 0 R` index 1 and `8 0 R` index 2 (50 is listed first in
+        // `part3_objects`, so `RenumberMap` gives it the lower output
+        // number). qpdf's obj_user_to_objects is keyed by the object's
+        // number BEFORE writer renumbering (QPDF_linearization.cc:
+        // 1354-1402), so `shared_sort_key` must still resort page 1's
+        // shared identifiers by source object number — 8 before 50 — even
+        // though this page also references a folded ObjStm container.
+        assert_eq!(
+            table.entries[1].shared_object_ids,
+            vec![2, 1],
+            "pre-optimization plain shared objects must sort by source \
+             object number, not physical output number, even when this \
+             page also references a folded ObjStm container"
+        );
+    }
+
+    /// Two-page plan where the second shared object (`8 0 R`) was minted by
+    /// optimization (absent from `pre_optimization_object_refs`), and the
+    /// first (`5 0 R`) is folded into a first-half ObjStm container.
+    fn two_page_plan_with_folded_container_and_post_optimization_mint() -> LinearizationPlan {
+        let mut plan = two_page_plan_with_shared();
+        let mut optimization = crate::optimization::Optimization::default();
+        optimization.set_pre_optimization_object_refs(
+            [
+                ObjectRef::new(3, 0),
+                ObjectRef::new(6, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(4, 0),
+                ObjectRef::new(7, 0),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        plan.optimization = Some(optimization);
+        plan
+    }
+
+    #[test]
+    fn two_page_post_optimization_mint_sorts_after_folded_container() {
+        let plan = two_page_plan_with_folded_container_and_post_optimization_mint();
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut member_to_container = std::collections::BTreeMap::new();
+        member_to_container.insert(ObjectRef::new(5, 0), (12, 0));
+        let mut container_shared_sort_key = std::collections::BTreeMap::new();
+        container_shared_sort_key.insert(12, (1u8, 0u32));
+
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &member_to_container,
+            &container_shared_sort_key,
+            &Default::default(),
+            &Default::default(),
+        );
+
+        // `canonical_shared_hints` folds member `5 0 R` into its container
+        // and, since the container is not itself a pre-optimization plain
+        // object, its pre-sort places the container after the mint by
+        // physical/raw number: [3 0R, 6 0R, 8 0R (idx 2), container(12,MAX)
+        // (idx 3)]. Page 1 references the mint (idx 2, tier 2, output-number
+        // comparison since qpdf allocates generated containers before
+        // optimization can mint an inherited attribute) and the container
+        // (idx 3, tier 1) — the container must still sort first.
+        assert_eq!(
+            table.entries[1].shared_object_ids,
+            vec![3, 2],
+            "the folded container must sort before the post-optimization mint"
+        );
+    }
+
     #[test]
     fn two_page_shared_numerators_are_zero() {
         let plan = two_page_plan_with_shared();
