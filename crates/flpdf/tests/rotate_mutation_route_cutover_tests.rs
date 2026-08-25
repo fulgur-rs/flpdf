@@ -51,6 +51,7 @@ fn rotate_fixture_mutations_use_live_handle_writeback() {
             "resolve_borrowed(",
             "Object::",
             "set_object(",
+            "materialize(",
         ] {
             assert!(
                 !block.contains(marker),
