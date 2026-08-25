@@ -4,7 +4,9 @@ use std::path::Path;
 #[test]
 fn rotate_pagebox_helper_uses_the_canonical_handle_route() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = fs::read_to_string(root.join("src/job/rotate.rs")).unwrap();
+    let source = fs::read_to_string(root.join("src/job/rotate.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let tests = source
         .split_once("mod tests {")
         .expect("rotate must keep its test module")
