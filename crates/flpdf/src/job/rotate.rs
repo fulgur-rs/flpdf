@@ -1042,14 +1042,16 @@ mod tests {
 
         // 90deg map (x,y)->(y, 200 - x): corners (10,20),(60,40) ->
         // (20,190),(40,140) -> bbox [20 140 40 190].
-        let page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
-        let annot = page_dict
-            .get("Annots")
-            .and_then(Object::as_array)
-            .and_then(|annots| annots.first())
-            .and_then(Object::as_ref_id)
+        let mut page_helper = PageObjectHelper::new(page, &mut pdf);
+        let annotations = page_helper
+            .get_annotation_handles(None)
             .expect("flattened annotation must remain on the page");
-        let r = pagebox_for(&mut pdf, annot, b"/Rect");
+        assert_eq!(annotations.len(), 1);
+        let annotation = &annotations[0];
+        pdf.resolve(annotation).unwrap();
+        let rect = annotation.get_key(b"/Rect");
+        pdf.resolve(&rect).unwrap();
+        let r = handle_to_pagebox(&mut pdf, &rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -1114,14 +1116,16 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
         // Same mapping as the direct-array case: [10 20 60 40] -> [20 140 40 190].
-        let page_dict = pdf.resolve_object(page).unwrap().into_dict().unwrap();
-        let annot = page_dict
-            .get("Annots")
-            .and_then(Object::as_array)
-            .and_then(|annots| annots.first())
-            .and_then(Object::as_ref_id)
+        let mut page_helper = PageObjectHelper::new(page, &mut pdf);
+        let annotations = page_helper
+            .get_annotation_handles(None)
             .expect("flattened annotation must be indirect");
-        let r = pagebox_for(&mut pdf, annot, b"/Rect");
+        assert_eq!(annotations.len(), 1);
+        let annotation = &annotations[0];
+        pdf.resolve(annotation).unwrap();
+        let rect = annotation.get_key(b"/Rect");
+        pdf.resolve(&rect).unwrap();
+        let r = handle_to_pagebox(&mut pdf, &rect).expect("annotation rectangle");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
