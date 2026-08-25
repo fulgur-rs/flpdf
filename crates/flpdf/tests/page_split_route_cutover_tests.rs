@@ -12,9 +12,18 @@ fn page_split_tests_do_not_keep_a_raw_object_route() {
 
     for marker in [
         "use crate::{Object,",
+        "use crate::Object;",
+        "use crate::{Dictionary, Object",
         "crate::Dictionary",
+        "root_ref(",
         "resolve_object(",
         "resolve_borrowed(",
+        "resolve_to_terminal(",
+        "resolve_to_terminal_ref(",
+        "resolve_ref_chain(",
+        "resolve_handle_chain(",
+        "terminal_ref_of_chain(",
+        "unparse(",
         "Object::",
         "materialize(",
         "set_object(",
