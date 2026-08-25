@@ -1690,6 +1690,35 @@ fn preprocess_qpdf_args(args: Vec<String>) -> CliResult<PreprocessedArgs> {
     })
 }
 
+/// Print qpdf's sole-option version response (`QPDFJob_argv.cc:99-105`).
+fn print_qpdf_version() {
+    println!(
+        "qpdf version {}\nRun qpdf --copyright to see copyright and license information.",
+        flpdf::qpdf_version()
+    );
+}
+
+/// Print qpdf's sole-option copyright response (`QPDFJob_argv.cc:108-135`).
+fn print_qpdf_copyright() {
+    println!(
+        "qpdf version {}\n\n\
+Copyright (c) 2005-2024 Jay Berkenbilt\n\
+QPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n\
+you may not use this file except in compliance with the License.\n\
+You may obtain a copy of the License at\n\n  http://www.apache.org/licenses/LICENSE-2.0\n\n\
+Unless required by applicable law or agreed to in writing, software\n\
+distributed under the License is distributed on an \"AS IS\" BASIS,\n\
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n\
+See the License for the specific language governing permissions and\n\
+limitations under the License.\n\n\
+Versions of qpdf prior to version 7 were released under the terms\n\
+of version 2.0 of the Artistic License. At your option, you may\n\
+continue to consider qpdf to be licensed under those terms. Please\n\
+see the manual for additional information.",
+        flpdf::qpdf_version()
+    );
+}
+
 fn main() {
     // One private qpdf-style logger owns all document routes for this
     // invocation. It is deliberately distinct from the library process
@@ -1698,11 +1727,26 @@ fn main() {
     // Parse qpdf's argv grammar before clap parses feature values. The parser
     // preserves named segment boundaries and returns feature-neutral raw
     // tokens to the existing semantic consumers below.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() == 2 {
+        match raw_args[1].as_str() {
+            "--version" | "-version" => {
+                print_qpdf_version();
+                return;
+            }
+            "--copyright" | "-copyright" => {
+                print_qpdf_copyright();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     let PreprocessedArgs {
         residual_args,
         overlay_specs,
         attachment_segments,
-    } = match preprocess_qpdf_args(std::env::args().collect()) {
+    } = match preprocess_qpdf_args(raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("flpdf: {error}");

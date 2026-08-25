@@ -36,3 +36,14 @@ fn qpdf_ctest_19_writes_the_same_deterministic_pdf_twice() {
         "qpdf-ctest test19 must preserve qpdf deterministic-ID repeatability"
     );
 }
+
+#[test]
+fn qpdf_ctest_version_reports_the_pinned_qpdf_version() {
+    Command::cargo_bin("qpdf-ctest")
+        .expect("qpdf-ctest binary")
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout("qpdf-ctest version 11.9.0\n")
+        .stderr("");
+}
