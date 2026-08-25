@@ -105,15 +105,18 @@ fn rewrite_linearize_then_check_passes() {
         .args(["check-linearization", output.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("linearization OK"));
+        .stdout(predicate::str::contains("no linearization errors"));
 }
 
 // ---------------------------------------------------------------------------
-// 2. check-linearization on a malformed file exits 1 with actionable stderr
+// 2. check-linearization on a file with a tampered /L reports "is not
+//    linearized" and exits 0, the same successful outcome as any other
+//    non-linearized file (qpdf's isLinearized predicate rejects it before
+//    any deeper structural check runs).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn check_linearization_tampered_l_exits_1() {
+fn check_linearization_tampered_l_reports_not_linearized() {
     // First produce a valid linearized file.
     let input = write_temp(&minimal_pdf_bytes());
     let outdir = tempfile::tempdir().unwrap();
@@ -157,14 +160,14 @@ fn check_linearization_tampered_l_exits_1() {
 
     // qpdf's isLinearized predicate rejects an incorrect integer /L before
     // deeper structural checks, so check-linearization reports the file as
-    // not linearized.
+    // not linearized -- the same successful, non-error outcome as a plain
+    // non-linearized file (QPDFJob.cc:1659-1661).
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["check-linearization", tampered_path.to_str().unwrap()])
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("not a linearized PDF"));
+        .success()
+        .stdout(predicate::str::contains("is not linearized"));
 }
 
 #[test]
@@ -212,20 +215,20 @@ fn check_reports_qpdf_linearization_parameter_offset() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. check-linearization on a non-linearized PDF exits 1
+// 3. check-linearization on a non-linearized PDF exits 0 (QPDFJob.cc:1659-1661:
+//    qpdf's doInspection prints "is not linearized" and sets no warning flag)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn check_linearization_non_linearized_exits_1() {
+fn check_linearization_non_linearized_exits_0() {
     let input = write_temp(&minimal_pdf_bytes());
 
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["check-linearization", input.path().to_str().unwrap()])
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("not a linearized PDF"));
+        .success()
+        .stdout(predicate::str::contains("is not linearized"));
 }
 
 // ---------------------------------------------------------------------------

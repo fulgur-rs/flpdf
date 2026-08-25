@@ -26,10 +26,7 @@ use flpdf::{
 };
 use flpdf::{
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
-    linearization::{
-        check_linearization_path, show_linearization_path_with_warnings, LinearizationCheckError,
-        ShowLinearizationError,
-    },
+    linearization::{show_linearization_path_with_warnings, ShowLinearizationError},
     normalize_content_stream, pages, parse_pdf_version, AcroFormDocumentHelper, CompressStreams,
     CopyEncryptionSource, EncryptMethod, EncryptParams, Error, NewlineBeforeEndstream,
     ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PageObjectHelper,
@@ -297,6 +294,54 @@ struct Cli {
     // Legacy options kept for compatibility.
     #[arg(long)]
     check: bool,
+    /// Check whether the input's linearization hint tables are correct
+    /// (qpdf --check-linearization).
+    #[arg(
+        long = "check-linearization",
+        conflicts_with_all = [
+            "check",
+            "show_object",
+            "show_npages",
+            "show_pages",
+            "show_xref",
+            "show_linearization",
+            "job_json_file",
+            "json",
+            "json_input",
+            "update_from_json",
+            "json_output",
+            "json_key",
+            "json_object",
+            "json_stream_data",
+            "json_stream_prefix",
+            "linearize",
+            "static_id",
+            "deterministic_id",
+            "static_aes_iv",
+            "remove_restrictions",
+            "decrypt",
+            "qdf",
+            "preserve_unreferenced",
+            "coalesce_contents",
+            "pages",
+            "rotate",
+            "split_pages",
+            "collate",
+            "empty",
+            "overlay",
+            "underlay",
+            "add_attachment",
+            "remove_attachment",
+            "list_attachments",
+            "show_attachment",
+            "copy_attachments_from",
+            "encrypt",
+            "copy_encryption",
+            "encryption_file_password",
+            "output",
+        ]
+    )]
+    check_linearization: bool,
     #[arg(long)]
     repair: bool,
     #[command(flatten)]
@@ -1816,6 +1861,7 @@ fn main() {
                     && !args.show_npages
                     && !args.show_pages
                     && !args.show_xref
+                    && !args.check_linearization
                     && !args.show_linearization
                     && !args.check
                     && !args.list_attachments
@@ -1866,6 +1912,8 @@ fn main() {
         run_show_pages(args.input, args.repair, &args.password)
     } else if args.show_xref {
         run_show_xref(args.input, args.repair, &args.password)
+    } else if args.check_linearization {
+        run_check_linearization(args.input, args.repair, &args.password)
     } else if args.show_linearization {
         run_show_linearization(args.input)
     } else if args.check {
@@ -2466,20 +2514,9 @@ fn run_json_document<R: Read + Seek>(
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
     match command {
         Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password),
-        Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
-            Ok(()) => logger_info("linearization OK\n"),
-            Err(LinearizationCheckError::NotLinearized) => {
-                logger_error(
-                    "flpdf: not a linearized PDF: the first object in the file has no /Linearized key\n",
-                )?; // cov:ignore: exercised by check-linearization subprocess integration tests
-                std::process::exit(1);
-            }
-            Err(LinearizationCheckError::InvalidParam { message }) => {
-                logger_error(format!("flpdf: linearization check failed: {message}\n"))?;
-                std::process::exit(1);
-            }
-            Err(LinearizationCheckError::Io(e)) => Err(e.to_string().into()),
-        },
+        Commands::CheckLinearization(cmd) => {
+            run_check_linearization(Some(cmd.input), false, &PasswordArgs::default())
+        }
         Commands::DumpObject(cmd) => {
             run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
         }
@@ -2735,6 +2772,23 @@ fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> C
         }
     };
     finish_check_job(job.check(&mut pdf))
+}
+
+fn run_check_linearization(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    let options = pdf_open_options(repair, password)?;
+    let mut pdf = job
+        .open(BufReader::new(file), input.display().to_string(), options)
+        .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
+    finish_job_exit_status(job.check_linearization(&mut pdf)?)
 }
 
 /// Wire `--encrypt` / `--copy-encryption` onto `options`, shared by the
