@@ -398,14 +398,12 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             return Ok(None); // non-dictionary: skip silently
         }
 
-        let node_type = self
-            .pdf
-            .resolve_to_terminal(&node_obj.try_get_key(b"/Type")?)?;
+        let node_type = node_obj.try_get_key(b"/Type")?;
+        self.pdf.resolve(&node_type)?;
 
         if node_type.as_name().as_deref() == Some(b"Pages") {
-            let kids = self
-                .pdf
-                .resolve_to_terminal(&node_obj.try_get_key(b"/Kids")?)?;
+            let kids = node_obj.try_get_key(b"/Kids")?;
+            self.pdf.resolve(&kids)?;
             if let Some(kids) = kids.as_array() {
                 // Push in reverse order so that the first kid is popped first.
                 for kid in kids.iter().rev() {
