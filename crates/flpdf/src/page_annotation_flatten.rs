@@ -1077,53 +1077,70 @@ mod tests {
         // getDefaultResources does not read /AcroForm/DR. A page Widget in
         // this shape must not receive the document default resources.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut font_category = Dictionary::new();
-        font_category.insert("F1", Object::Reference(ObjectRef::new(7, 0)));
-        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(font_category));
-        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(Dictionary::new()));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert("Font", Object::Reference(ObjectRef::new(6, 0)));
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
             .unwrap();
+        let font_category = ObjectHandle::dictionary(vec![(
+            b"/F1".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(7, 0)),
+        )]);
+        pdf.replace_object_handle(ObjectRef::new(6, 0), font_category)
+            .unwrap();
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Font".to_vec(),
+                    ObjectHandle::dictionary(Vec::new()),
+                )]),
+            )]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+            .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(6, 0)),
+        )]);
 
         // Keep `/AcroForm/DR` present while omitting `/Fields`, which is the
         // qpdf shape where `analyze()` skips the orphan-widget fallback.
-        let mut acroform = Dictionary::new();
-        acroform.insert("DR", Object::Reference(ObjectRef::new(6, 0)));
-        let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap()
-        else {
-            panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        catalog.insert("AcroForm", Object::Dictionary(acroform));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&catalog).unwrap();
+        catalog
+            .replace_key(
+                b"/AcroForm",
+                ObjectHandle::dictionary(vec![(
+                    b"/DR".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(6, 0)),
+                )]),
+            )
+            .unwrap();
+        pdf.mark_object_handle_dirty(&catalog).unwrap();
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(
-            resources.get("Font"),
-            Some(&Object::Dictionary(Dictionary::new())),
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let stream_dict = appearance.as_stream_dict().unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let font = resources.try_get_key(b"/Font").unwrap();
+        pdf.resolve(&font).unwrap();
+        assert!(
+            font.try_get_keys().unwrap().is_empty(),
             "an unassociated Widget must not inherit /AcroForm/DR"
         );
     }
