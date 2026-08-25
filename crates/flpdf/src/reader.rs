@@ -1413,15 +1413,11 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Promote and register an existing direct handle without cloning its
-    /// allocation or scheduling writer output. The writer-facing public
-    /// migration remains in `flpdf-25kg.3.6`; this method is the reusable
-    /// canonical primitive corresponding to qpdf's
-    /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`).
-    #[allow(dead_code)]
-    pub(crate) fn make_indirect_from_object_handle(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<ObjectHandle> {
+    /// allocation or scheduling writer output. This is qpdf's
+    /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`), exposed as
+    /// a document-owned canonical consumer boundary so callers do not fall
+    /// back to the legacy clone-based allocator.
+    pub fn make_indirect_from_object_handle(&self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.resolver.make_indirect_from_object_handle(handle)
     }
 
