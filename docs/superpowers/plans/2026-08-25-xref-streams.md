@@ -16,7 +16,7 @@
 - Modify: `crates/flpdf-cli/tests/cli_tests.rs`
 - Test: `crates/flpdf-cli/tests/cli_tests.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add one integration test that asserts the exact qpdf-formatted effective xref table for both a normal fixture and an object-stream fixture:
 
@@ -61,7 +61,7 @@ fn show_xref_prints_qpdf_effective_table() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `cargo test -p flpdf-cli --test cli_tests show_xref_prints_qpdf_effective_table`
 
@@ -74,7 +74,7 @@ Expected: FAIL because clap reports `unexpected argument '--show-xref'`.
 - Modify: `crates/flpdf-cli/src/main.rs`
 - Modify: `crates/flpdf-cli/src/arg_parser.rs`
 
-- [ ] **Step 1: Add `QPDFJob::show_xref`**
+- [x] **Step 1: Add `QPDFJob::show_xref`**
 
 Implement the public inspection method beside `show_npages`/`show_pages`:
 
@@ -101,7 +101,7 @@ pub fn show_xref<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitC
 
 The method must use the existing `inspect` completion boundary so open-time and operation-time qpdf warnings are emitted before the warning exit status. `Free` rows are not printed because qpdf's `QPDF::showXRefTable` iterates its effective `m->xref_table`, where type-0 entries are not ordinary output rows; no synthetic line or error is invented for them.
 
-- [ ] **Step 2: Register and dispatch `--show-xref`**
+- [x] **Step 2: Register and dispatch `--show-xref`**
 
 Add `show-xref` to the shared qpdf bare-long option list and add a `show_xref: bool` field to the top-level CLI inspection flags. Include it in the same inspection conflicts as `show-pages`, then add the ordered dispatch:
 
@@ -125,7 +125,7 @@ fn run_show_xref(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) 
 
 Update JSON-input inspection predicates only if the existing qpdf job path supports this inspection mode; ordinary file-backed qtest invocation must reach the same `run_show_xref` path as the other top-level inspection options.
 
-- [ ] **Step 3: Run the focused Rust test and verify GREEN**
+- [x] **Step 3: Run the focused Rust test and verify GREEN**
 
 Run: `cargo test -p flpdf-cli --test cli_tests show_xref_prints_qpdf_effective_table`
 
@@ -137,19 +137,44 @@ Expected: PASS.
 - No qpdf-qtest vendor files are copied into flpdf.
 - No expected qtest output is modified.
 
-- [ ] **Step 1: Build the CLI used by the isolated harness**
+- [x] **Step 1: Build the CLI used by the isolated harness**
 
 Run: `cargo build --workspace`
 
 Expected: exit 0.
 
-- [ ] **Step 2: Run only `xref-streams.test` with the real harness**
+- [x] **Step 2: Run only `xref-streams.test` with the real harness**
 
-Use a temporary copy of `/home/ubuntu/flpdf-qtest/vendor/qpdf-qtest`, set `FLPDF_CLI_BIN` to this worktree's `target/debug/flpdf`, set `FLPDF_QTEST_NORMALIZE` to the repository normalization rules, and run `TESTS=xref-streams` through `vendor/qtest/bin/qtest-driver`.
+Use a temporary copy of `/home/ubuntu/flpdf-qtest/vendor/qpdf-qtest`, the qtest worktree's synchronized `shim/qpdf`, set `FLPDF_CLI_BIN` to this worktree's `target/debug/flpdf`, set `FLPDF_QTEST_NORMALIZE` to the repository normalization rules, and run `TESTS=xref-streams` through `vendor/qtest/bin/qtest-driver`. The qtest shim must merge the child stdout/stderr stream before applying cosmetic normalization; filtering stderr through an asynchronous process substitution changes qpdf-observable write order.
 
 Expected: `Total tests: 5`, `Passes: 5`, `Failures: 0`, exit 0.
 
-- [ ] **Step 3: Run focused and workspace quality gates**
+### Task 4: Keep the qtest harness's observable stream boundary faithful
+
+**Files (in the separate `/tmp/flpdf-qtest-egzr-10-xref-shim` worktree):**
+- Modify: `shim/qpdf`
+- Test: `scripts/tests/test_qpdf_shim.py`
+
+- [x] **Step 1: Add the RED shim-order regression and verify it fails**
+
+The test runs a child that writes a warning to stderr before output to stdout, captures the shim with `stderr=STDOUT`, and asserts the normalized merged stream remains `warning` then `output`. The old process-substitution implementation produced the reverse order.
+
+- [x] **Step 2: Merge before normalization and preserve the child status**
+
+With `FLPDF_QTEST_NORMALIZE` set, run `"${FLPDF_CLI_BIN}" "$@" 2>&1 | sed -f ...`, enable `pipefail`, and exit with `${PIPESTATUS[0]}`. Without normalization, preserve the original direct `exec` channel behavior.
+
+- [x] **Step 3: Run the qtest repository contracts**
+
+Run: `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`
+
+Expected: 187 tests pass, and the targeted `xref-streams.test` run reports 5/5.
+
+### Task 5: Run focused and workspace quality gates
+
+**Files:**
+- No additional files; verify the changed Rust and qtest worktrees.
+
+- [ ] **Step 1: Run focused and workspace quality gates**
 
 Run, in order:
 
@@ -164,6 +189,6 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Expected: every command exits 0.
 
-- [ ] **Step 4: Read back the implementation diff and tracker state**
+- [ ] **Step 2: Read back the implementation diff and tracker state**
 
 Confirm `git diff --check`, `git status --short --branch`, `bd show flpdf-egzr.10`, and `bd dep cycles` are clean/acyclic. Keep the issue open until the qtest and full quality evidence is recorded; only then append the verification note and close/push according to the repository session protocol.

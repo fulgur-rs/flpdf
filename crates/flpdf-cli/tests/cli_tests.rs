@@ -3611,6 +3611,48 @@ fn show_pages_lists_each_page() {
         .stdout(predicate::str::contains("media-box: [ 0 0 200 100 ]"));
 }
 
+#[test]
+fn show_xref_prints_qpdf_effective_table() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-xref", "../../tests/fixtures/compat/one-page.pdf"])
+        .assert()
+        .success()
+        .stdout(concat!(
+            "1/0: uncompressed; offset = 61\n",
+            "2/0: uncompressed; offset = 92\n",
+            "3/0: uncompressed; offset = 199\n",
+            "4/0: uncompressed; offset = 392\n",
+            "5/0: uncompressed; offset = 460\n",
+            "6/0: uncompressed; offset = 721\n",
+            "7/0: uncompressed; offset = 780\n",
+        ));
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-xref",
+            "../../tests/fixtures/compat/three-page-objstm.pdf",
+        ])
+        .assert()
+        .success()
+        .stdout(concat!(
+            "1/0: uncompressed; offset = 15\n",
+            "2/0: compressed; stream = 1, index = 0\n",
+            "3/0: compressed; stream = 1, index = 1\n",
+            "4/0: compressed; stream = 1, index = 2\n",
+            "5/0: compressed; stream = 1, index = 3\n",
+            "6/0: compressed; stream = 1, index = 4\n",
+            "7/0: compressed; stream = 1, index = 5\n",
+            "8/0: compressed; stream = 1, index = 6\n",
+            "9/0: compressed; stream = 1, index = 7\n",
+            "10/0: uncompressed; offset = 532\n",
+            "11/0: uncompressed; offset = 685\n",
+            "12/0: uncompressed; offset = 838\n",
+            "13/0: uncompressed; offset = 991\n",
+        ));
+}
+
 fn fixture_with_short_first_name_tree_pair() -> tempfile::NamedTempFile {
     let mut fixture = tempfile::NamedTempFile::new().unwrap();
     let objects = [

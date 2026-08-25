@@ -43,6 +43,7 @@ const QPDF_BARE_LONG_OPTIONS: &[&str] = &[
     "show-linearization",
     "show-npages",
     "show-pages",
+    "show-xref",
     "static-aes-iv",
     "static-id",
     "suppress-password-recovery",
