@@ -3,10 +3,11 @@ use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
 use flpdf::{
-    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, Pdf, PdfWriter, Pipeline, PipelineResult,
-    StreamDataMode, StreamDataProvider,
+    DecodeLevel, Error, ObjectHandle, PageDocumentHelper, Pdf, PdfWriter, Pipeline, PipelineError,
+    PipelineResult, StreamDataMode, StreamDataProvider, STREAM_ENCODE_NORMALIZE,
 };
 
+use crate::driver::emit_new_diagnostics;
 use crate::output::write_bytes;
 
 // This file ports qpdf's `test_2` through `test_9` (`qpdf/test_driver.cc:287-519`).
@@ -108,35 +109,65 @@ pub(crate) fn run_test_2<R: Read + Seek>(
 
 /// qpdf source: `qpdf/test_driver.cc:310-322` (`test_3`).
 ///
-/// GAP(`QPDFObjectHandle::pipeStreamData` with `qpdf_ef_normalize`): qpdf's
-/// content-stream token normalization encode flag
-/// (`STREAM_ENCODE_NORMALIZE`, used via `libqpdf/QPDFObjectHandle.cc:1301-1325`)
-/// has no public flpdf entry point. `ObjectHandle::get_stream_data` -- the
-/// only public stream-reading accessor -- hardcodes `encode_flags = 0`
-/// internally; the raw `pipe_stream_data`/`pipe_stream_data_for_object_stream`
-/// that do accept `STREAM_ENCODE_NORMALIZE` are `pub(crate)`-only in flpdf,
-/// and `STREAM_ENCODE_NORMALIZE` itself is `pub(crate)`. The `-- stream N
-/// --` header and the loop over `/QStreams` are real, already-observable
-/// output that does not depend on the missing primitive, so they are kept;
-/// each item's normalized/filtered bytes are not emitted.
+/// qpdf source: `qpdf/test_driver.cc:311-322` (`test_3`).
+///
+/// qpdf flushes each stream header, then pipes the corresponding `/QStreams`
+/// member through `qpdf_ef_normalize` and `qpdf_dl_generalized`. The canonical
+/// ObjectHandle pipe owns both the decode chain and the ContentNormalizer; the
+/// driver only supplies qpdf's output pipeline and drains diagnostics after the
+/// pipe returns so warning bytes appear after the already-written stream data.
 pub(crate) fn run_test_3<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    _filename: &[u8],
+    filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
     stdout: &mut dyn Write,
-    _stderr: &mut dyn Write,
-    _diagnostics_written: &mut usize,
+    stderr: &mut dyn Write,
+    diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     let trailer = pdf.trailer();
     let streams = dict_key(pdf, &trailer, b"/QStreams")?;
     resolve_handle(pdf, &streams)?;
     let items = streams.as_array().unwrap_or_default();
-    for (index, _stream) in items.iter().enumerate() {
+    for (index, stream) in items.iter().enumerate() {
         writeln!(stdout, "-- stream {index} --")?;
-        // GAP(QPDFObjectHandle::pipeStreamData with qpdf_ef_normalize): see
-        // this function's own doc above.
+        stdout.flush()?;
+        {
+            let mut sink = StdoutPipeline { stdout };
+            let mut filtering_attempted = false;
+            let _ = stream.pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                STREAM_ENCODE_NORMALIZE,
+                DecodeLevel::Generalized,
+                false,
+                false,
+            )?;
+        }
+        emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
+            .map_err(Error::from)?;
     }
     Ok(())
+}
+
+/// A `Pl_StdioFile`-shaped pipeline over the test driver's injected stdout.
+struct StdoutPipeline<'a> {
+    stdout: &'a mut dyn Write,
+}
+
+impl Pipeline for StdoutPipeline<'_> {
+    fn identifier(&self) -> &str {
+        "tokenized stream"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.stdout
+            .write_all(data)
+            .map_err(|error| PipelineError::runtime(error.to_string()))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
 }
 
 /// qpdf source: `qpdf/test_driver.cc:324-372` (`test_4`).
@@ -549,4 +580,38 @@ pub(crate) fn run_test_9<R: Read + Seek>(
     writer.set_stream_data_mode(StreamDataMode::Preserve);
     writer.write()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_test_3;
+    use flpdf::{ObjectHandle, Pdf};
+    use std::rc::Rc;
+
+    #[test]
+    fn test_3_pipes_and_normalizes_each_qstreams_member() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"A\rB".to_vec()))
+            .expect("QStreams member");
+        pdf.trailer()
+            .replace_key(b"/QStreams", ObjectHandle::array(vec![stream]))
+            .expect("install QStreams");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        run_test_3(
+            &mut pdf,
+            b"fixture.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .expect("test_3 should pipe QStreams");
+
+        assert_eq!(stdout, b"-- stream 0 --\nA\nB");
+        assert!(stderr.is_empty());
+    }
 }

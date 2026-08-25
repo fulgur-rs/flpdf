@@ -5191,11 +5191,30 @@ impl ObjectHandle {
         if success {
             if let Some(warnings) = normalization_warnings {
                 for warning in warnings.borrow_mut().drain(..) {
-                    self.object_warning(&warning)?;
+                    self.stream_data_warning(&warning)?;
                 }
             }
         }
         Ok(success)
+    }
+
+    /// Report a warning raised by `QPDF_Stream::pipeStreamData` with the
+    /// stream-data location, not the generic object-warning description.
+    ///
+    /// qpdf's `QPDF_Stream::warn` (`libqpdf/QPDF_Stream.cc:695-698`) routes
+    /// these messages through `QPDF::warn(..., parsed_offset, ...)`, so a
+    /// parsed stream warning is rendered as `file (offset N): message` and
+    /// retains that offset in the document warning collection. Programmatic
+    /// streams have no parsed offset; they retain the ordinary
+    /// `QPDFObjectHandle::objectWarning` fallback.
+    fn stream_data_warning(&self, message: &str) -> Result<()> {
+        let offset = self.get_parsed_offset();
+        if offset >= 0 {
+            if let Some(context) = self.context() {
+                return context.warn_stream_data(offset as u64, None, message.to_owned());
+            }
+        }
+        self.object_warning(message)
     }
 
     fn prepare_stream_filter_plan(
@@ -13304,6 +13323,18 @@ mod mutation_tests {
             Ok(())
         }
 
+        fn warn_stream_data(
+            &self,
+            offset: u64,
+            _description_override: Option<&str>,
+            message: String,
+        ) -> crate::Result<()> {
+            self.warnings
+                .borrow_mut()
+                .push(format!("offset {offset}: {message}"));
+            Ok(())
+        }
+
         fn resolve_indirect(
             &self,
             _object_ref: ObjectRef,
@@ -13991,9 +14022,9 @@ mod mutation_tests {
         assert_eq!(
             resolver.warnings.borrow().as_slice(),
             &[
-                "object 20 0: content normalization encountered bad tokens",
-                "object 20 0: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents",
-                "object 20 0: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
+                "offset 9: content normalization encountered bad tokens",
+                "offset 9: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents",
+                "offset 9: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
             ]
         );
 
@@ -14012,6 +14043,41 @@ mod mutation_tests {
         assert!(filtering_attempted);
         assert_eq!(suppressed_sink.take_buffer().unwrap(), raw);
         assert!(resolver.warnings.borrow().is_empty());
+    }
+
+    #[test]
+    fn pipe_stream_data_normalizer_warnings_use_the_stream_data_offset() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"<0g".to_vec()))
+            .expect("stream");
+        stream.reset_parsed_offset();
+        stream.set_parsed_offset_if_unset(9);
+        pdf.set_suppress_warnings(true);
+
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                STREAM_ENCODE_NORMALIZE,
+                crate::writer::DecodeLevel::None,
+                false,
+                false,
+            )
+            .expect("normalize stream"));
+
+        let diagnostics = pdf.repair_diagnostics();
+        assert_eq!(diagnostics.entries().len(), 3);
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .all(|diagnostic| diagnostic.offset == Some(9)),
+            "diagnostics: {:?}",
+            diagnostics.entries()
+        );
     }
 
     #[test]
