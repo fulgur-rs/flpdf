@@ -297,6 +297,29 @@ fn materialize_cursor_value(handle: &ObjectHandle) -> Result<Object> {
     }
 }
 
+/// Reject a handle-native tree value that does not belong to `pdf`.
+///
+/// A foreign indirect handle stored into this tree would keep resolving
+/// through its original document's resolver, mixing object graphs and
+/// risking that document's object reference being serialized into `pdf`.
+/// This mirrors the check `EmbeddedFileDocumentHelper::replace_embedded_file`
+/// already performs before its own tree insert.
+fn ensure_value_owned_by_pdf<R: Read + Seek>(pdf: &Pdf<R>, value: &ObjectHandle) -> Result<()> {
+    if let Some(object_ref) = value.object_ref() {
+        if !pdf.is_canonical_object_handle(value) {
+            return Err(Error::Unsupported(
+                "name/number tree value belongs to a different Pdf".to_string(),
+            ));
+        }
+        debug_assert_eq!(value.object_ref(), Some(object_ref));
+    } else if !value.belongs_to_pdf(pdf.unique_id()) {
+        return Err(Error::Unsupported(
+            "name/number tree value belongs to a different Pdf".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// A dictionary facade over one live `ObjectHandle`. It intentionally exposes
 /// only handle values; callers cannot accidentally turn a canonical node into
 /// a raw `Dictionary` and write it back through `Pdf::set_object`.
@@ -1523,6 +1546,7 @@ impl<K: TreeKey> NNTree<K> {
         key: K::Key,
         value: ObjectHandle,
     ) -> Result<NNTreeCursor<K>> {
+        ensure_value_owned_by_pdf(pdf, &value)?;
         let mut allocator = ObjectAllocator::default();
         let result = self.insert_with_allocator(pdf, &mut allocator, key, value);
         self.finish_mutation(result)
@@ -1604,6 +1628,7 @@ impl<K: TreeKey> NNTree<K> {
         value: ObjectHandle,
     ) -> Result<()> {
         cursor.ensure_pdf(pdf)?;
+        ensure_value_owned_by_pdf(pdf, &value)?;
         let mut allocator = ObjectAllocator::default();
         let result = self.insert_after_raw_with_allocator(
             pdf,
@@ -3595,6 +3620,35 @@ mod tests {
             .expect("find inserted value")
             .expect("inserted value");
         assert!(inserted.is_same_object_as(&retained));
+    }
+
+    #[test]
+    fn handle_name_tree_rejects_inserting_a_value_owned_by_another_pdf() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let root = pdf_two
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![]),
+            )]))
+            .expect("allocate name-tree root in pdf_two");
+        let mut tree = NameTree::new(root, true);
+
+        // foreign_value is an indirect handle minted by pdf_one, not pdf_two.
+        let foreign_value = pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::string(b"one".to_vec()))
+            .expect("allocate value in pdf_one");
+
+        let error = tree
+            .insert(&mut pdf_two, b"a", foreign_value)
+            .err()
+            .expect("inserting pdf_one's handle into pdf_two's tree must be rejected");
+        assert!(error.to_string().contains("different Pdf"));
+        assert!(tree
+            .find_object(&mut pdf_two, b"a")
+            .expect("find after rejected insert")
+            .is_none());
     }
 
     #[test]
