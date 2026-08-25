@@ -501,19 +501,25 @@ impl PageOffsetHintTable {
 
         // Order each page's shared identifiers the way qpdf does: by the shared
         // object's number in qpdf's ObjGen-keyed `obj_user_to_objects`
-        // (QPDF_linearization.cc:1388-1402). A plain object keeps its source
-        // number; an ObjStm container uses `container_shared_sort_key`, which
-        // captures the container's pre-renumber object-number order per mode:
-        //   * Generate — containers are fresh `makeIndirectObject` objects
-        //     allocated AFTER every source object in even-split order, so all
-        //     plain shared objects sort before all containers (the `(0, ..)` vs
-        //     `(1, ..)` split), containers by even-split rank.
-        //   * Preserve — containers reuse the source ObjStm objects (their source
-        //     numbers), so both plain objects and containers use `(0, source
-        //     object number)`.
+        // (QPDF_linearization.cc:1388-1402). With ObjStm folding, a plain
+        // object uses its physical output number from `renumber`; an ObjStm
+        // container uses `container_shared_sort_key` keyed by its physical
+        // output number. The classic path retains source-object ordering.
+        // A plain object minted by optimization sorts AFTER the container:
+        // qpdf allocates generated containers before `QPDF::optimize` creates
+        // inherited attributes. The three phases are therefore source plain,
+        // container, post-optimization plain.
+        //   * Preserve — source ObjStm members and containers can have different
+        //     source/output numbers after the linearization plan is renumbered,
+        //     so both are compared in the output-number key space.
         // Without this the identifiers come out in shared-table-index
         // (physical-number) order, which differs when a page references two
         // containers whose pre-renumber order differs from their physical order.
+        let post_optimization_plain = plan
+            .optimization
+            .as_ref()
+            .and_then(|optimization| optimization.pre_optimization_object_refs());
+        let has_objstm_members = !member_to_container.is_empty();
         let shared_sort_key = |shared_idx: u32| -> (u8, u32) {
             let entry = &shared_hints[shared_idx as usize];
             if entry.object_ref.generation == u16::MAX {
@@ -522,7 +528,18 @@ impl PageOffsetHintTable {
                     .copied()
                     .unwrap_or((1, 0))
             } else {
-                (0, entry.object_ref.number)
+                let phase =
+                    post_optimization_plain.is_some_and(|refs| !refs.contains(&entry.object_ref));
+                let output_number = if has_objstm_members {
+                    renumber
+                        .new_for_original(entry.object_ref)
+                        .map_or(u32::MAX, |object_ref| object_ref.number)
+                } else {
+                    // The classic path has no folded container entries; retain
+                    // qpdf's source-object ordering there.
+                    entry.object_ref.number
+                };
+                (if phase { 2 } else { 0 }, output_number)
             }
         };
         for ids in &mut shared_ids_per_page {

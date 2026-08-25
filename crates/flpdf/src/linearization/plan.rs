@@ -1089,6 +1089,16 @@ impl LinearizationPlan {
             object_stream_mode,
             crate::writer::ObjectStreamMode::Generate
         );
+        let capture_pre_optimization_objects =
+            !matches!(object_stream_mode, crate::writer::ObjectStreamMode::Disable);
+        let pre_optimization_object_refs =
+            capture_pre_optimization_objects.then(|| pdf.live_object_refs().into_iter().collect());
+        // QPDFWriter::doWriteSetup fixes Generate's eligible object set before
+        // writeLinearized calls QPDF::optimize. The latter may mint indirect
+        // inherited-attribute objects, which must remain plain in the output.
+        let generate_objstm_eligible = use_generate_objstm
+            .then(|| crate::writer::object_streams::get_compressible_objgens(pdf))
+            .transpose()?;
         // qpdf optimization performs direct-outline normalization, page-tree
         // preparation, inherited-attribute push, and object-user traversal in
         // this order. It must run before object-ref capture because those
@@ -1114,7 +1124,7 @@ impl LinearizationPlan {
         let content_normalize_refs = linearization_content_normalize_refs(pdf, options)?;
         let skipped_stream_parameter_streams =
             stream_refs_to_skip_parameter_edges(pdf, options, &content_normalize_refs)?;
-        let optimization = crate::optimization::Optimization::optimize(
+        let mut optimization = crate::optimization::Optimization::optimize(
             pdf,
             &BTreeMap::new(),
             true,
@@ -1128,6 +1138,12 @@ impl LinearizationPlan {
                 }
             },
         )?;
+        if let Some(eligible) = generate_objstm_eligible {
+            optimization.set_generate_objstm_eligible(eligible);
+        }
+        if let Some(refs) = pre_optimization_object_refs {
+            optimization.set_pre_optimization_object_refs(refs);
+        }
         if pdf.root_ref().is_some()
             && optimization
                 .objects_for(&crate::optimization::ObjectUser::Page(0))
@@ -1890,13 +1906,35 @@ impl LinearizationPlan {
     /// drift from the three sub-partitions because there is no separate
     /// backing storage.
     pub fn part4_objects(&self) -> Vec<ObjectRef> {
-        self.part4_other_pages_private
+        let mut objects: Vec<ObjectRef> = self
+            .part4_other_pages_private
             .iter()
             .chain(&self.part4_other_pages_shared)
-            .chain(&self.part9_outline_objects)
-            .chain(&self.part4_rest)
             .copied()
-            .collect()
+            .collect();
+
+        // qpdf's root /Pages user can contain several nested Pages nodes. It
+        // places every such node that remains in lc_other before the rest of
+        // part9, not only the Catalog's direct /Pages object.
+        let part9_pages: BTreeSet<ObjectRef> = self
+            .optimization
+            .as_ref()
+            .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+            .filter(|pages| !pages.is_empty())
+            .unwrap_or_else(|| self.pages_tree_ref.into_iter().collect());
+        for pages_tree in part9_pages.iter().copied() {
+            if self.part4_rest.contains(&pages_tree) {
+                objects.push(pages_tree);
+            }
+        }
+        objects.extend(self.part9_outline_objects.iter().copied());
+        objects.extend(
+            self.part4_rest
+                .iter()
+                .copied()
+                .filter(|object| !part9_pages.contains(object)),
+        );
+        objects
     }
 
     /// Fold first-page-section ObjStm members into their containers to match
@@ -2486,7 +2524,11 @@ impl LinearizationPlan {
         // PDF every member is assigned, so the filter is a no-op and the batches
         // stay byte-identical.
         let assigned = self.renumber_assigned_refs();
-        let containers = objstm_membership_linearized(pdf, &assigned)?;
+        let containers = objstm_membership_linearized_with_eligibility(
+            pdf,
+            &assigned,
+            optimization.generate_objstm_eligible(),
+        )?;
         let routes = route_objstm_containers(
             optimization,
             !self.outline_first_page_members.is_empty(),
@@ -2786,15 +2828,27 @@ impl std::ops::Deref for RoutedObjStmBatch {
 ///
 /// Propagates reader errors from the compressible-set traversal or the page-tree
 /// walk used to build the erase set.
+#[cfg(test)]
 pub(crate) fn objstm_membership_linearized<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     assigned: &BTreeSet<ObjectRef>,
+) -> crate::Result<Vec<Vec<ObjectRef>>> {
+    objstm_membership_linearized_with_eligibility(pdf, assigned, None)
+}
+
+pub(crate) fn objstm_membership_linearized_with_eligibility<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    assigned: &BTreeSet<ObjectRef>,
+    eligibility_override: Option<&[ObjectRef]>,
 ) -> crate::Result<Vec<Vec<ObjectRef>>> {
     // qpdf's DFS already preserves the indirect identity of null-resolving
     // references reached from arrays. Do not append `resurrectable_null_refs`
     // here: that set remains a planner/all-refs aid, and appending it would give
     // array-null objects duplicate ObjStm membership.
-    let mut eligible = crate::writer::object_streams::get_compressible_objgens(pdf)?;
+    let mut eligible = match eligibility_override {
+        Some(eligible) => eligible.to_vec(),
+        None => crate::writer::object_streams::get_compressible_objgens(pdf)?,
+    };
     // Drop refs without a renumber slot before the split (see doc above).
     eligible.retain(|r| assigned.contains(r));
     let streams = crate::writer::object_streams::even_split_into_streams(&eligible);
@@ -7671,5 +7725,87 @@ mod tests {
 
         crate::linearization::writer::write_linearized_for_pdf_writer(&mut pdf, &options, None)
             .expect("shared stream parameters must be evaluated per referencing stream");
+    }
+
+    fn inherited_media_box_linearization_pdf_bytes() -> Vec<u8> {
+        let bodies = vec![
+            (1, "<< /Type /Catalog /Moo 2 0 R /Pages 3 0 R >>".to_owned()),
+            (2, "<< /One 1 /Two 8 0 R >>".to_owned()),
+            (
+                3,
+                "<< /Type /Pages /Count 2 /Kids [4 0 R 5 0 R] /MediaBox [0 0 576 792] >>"
+                    .to_owned(),
+            ),
+            (
+                4,
+                "<< /Type /Page /Parent 3 0 R /Contents 6 0 R >>".to_owned(),
+            ),
+            (
+                5,
+                "<< /Type /Page /Parent 3 0 R /Contents 7 0 R >>".to_owned(),
+            ),
+            (
+                6,
+                "<< /Length 18 >>\nstream\nBT (Page 1) Tj ET\nendstream".to_owned(),
+            ),
+            (
+                7,
+                "<< /Length 18 >>\nstream\nBT (Page 2) Tj ET\nendstream".to_owned(),
+            ),
+            (8, "<< /Producer (flpdf) >>".to_owned()),
+        ];
+        assemble_classic_pdf(bodies, 8, 8)
+    }
+
+    #[test]
+    fn part4_objects_places_pages_tree_before_other_objects() {
+        let pages = ObjectRef::new(3, 0);
+        let other = ObjectRef::new(2, 0);
+        let plan = LinearizationPlan {
+            pages_tree_ref: Some(pages),
+            part4_rest: vec![other, pages],
+            ..Default::default()
+        };
+
+        assert_eq!(plan.part4_objects(), vec![pages, other]);
+    }
+
+    #[test]
+    fn generated_objstm_membership_excludes_post_optimization_inherited_arrays() {
+        let mut pdf = Pdf::open(Cursor::new(inherited_media_box_linearization_pdf_bytes()))
+            .expect("inherited-media-box fixture parses");
+        let options = crate::writer::WriterOptions {
+            object_streams: crate::ObjectStreamMode::Generate,
+            ..crate::writer::WriterOptions::default()
+        };
+        let plan = LinearizationPlan::from_pdf_with_writer_options(&mut pdf, &options)
+            .expect("linearization plan should be buildable");
+        let assigned = plan.renumber_assigned_refs();
+        let batches = objstm_membership_linearized_with_eligibility(
+            &mut pdf,
+            &assigned,
+            plan.optimization
+                .as_ref()
+                .and_then(|optimization| optimization.generate_objstm_eligible()),
+        )
+        .expect("generated ObjStm membership should be computable");
+        let page_refs = crate::pages::page_refs(&mut pdf).expect("page refs");
+        let media_boxes: BTreeSet<ObjectRef> = page_refs
+            .into_iter()
+            .map(|page_ref| {
+                let page = pdf.get_object_handle(page_ref);
+                pdf.resolve(&page).expect("page should resolve");
+                page.try_get_key(b"/MediaBox")
+                    .expect("inherited MediaBox should be present")
+                    .object_ref()
+                    .expect("optimized inherited MediaBox should be indirect")
+            })
+            .collect();
+        assert!(
+            media_boxes
+                .iter()
+                .all(|media_box| !batches.iter().any(|batch| batch.contains(media_box))),
+            "objects minted by optimization must remain plain in qpdf's generated ObjStm map"
+        );
     }
 }

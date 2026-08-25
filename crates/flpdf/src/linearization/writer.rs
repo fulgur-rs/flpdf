@@ -2412,139 +2412,86 @@ fn do_write_pass<R: Read + Seek>(
     }
     let hint_stream_obj_total_len = bytes.len() - hint_stream_offset;
 
-    // Part 3 (Annex F): first-page body — Plan.part2_objects (page-0 private
-    // objects).  part2_objects can never be ObjStm members (the planner's
-    // invariant), but skip defensively via the membership map so a planner
-    // bug surfaces as a missing xref entry rather than a duplicate object.
-    for original_ref in &plan.part2_objects {
-        if objstm_layout.member_to_container.contains_key(original_ref) {
-            continue;
-        }
-        // The catalog is emitted early in the first-page section (classic path).
-        // If it is also reachable from the first-page closure (e.g. a page or
-        // annotation references back to it), it can appear in part2_objects;
-        // skip it here so it is not emitted a second time (which would leave a
-        // duplicate `N 0 obj` and point xref_offsets at the wrong copy).
-        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
+    // qpdf orders every first-page plain object and Part-3 ObjStm container by
+    // the object number assigned during its linearization setup. In particular,
+    // an optimization-minted inherited attribute can follow a container that
+    // was allocated before optimization. Build one emission list so physical
+    // order agrees with RenumberMap and the hint table.
+    enum FirstPageEmit<'a> {
+        Plain(ObjectRef),
+        Container(&'a ObjStmContainer),
+    }
+    let mut first_page_emits: Vec<(u32, FirstPageEmit<'_>)> = Vec::new();
+    for original_ref in plan
+        .part2_objects
+        .iter()
+        .chain(&plan.part3_objects)
+        .chain(&plan.part6_outline_objects)
+    {
+        if objstm_layout.member_to_container.contains_key(original_ref)
+            || (catalog_emitted_early && plan.root_ref == Some(*original_ref))
+        {
             continue;
         }
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
             return Err(crate::Error::Unsupported(format!(
-                "part2 object {} has no renumber entry",
+                "first-page object {} has no renumber entry",
                 original_ref
             )));
         };
-        let offset = append_body_object_for_ref(
-            &mut bytes,
-            pdf,
-            new_ref,
-            *original_ref,
-            options,
-            encrypt_ctx,
-            encrypted_string_emitter.as_deref_mut(),
-            renumber,
-            &plan.removed_refs,
-            &plan.content_normalize_refs,
-        )?; // cov:ignore: planner-produced Part-2 references are valid by construction.
-        xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options)?;
+        first_page_emits.push((new_ref.number, FirstPageEmit::Plain(*original_ref)));
     }
-
-    // Part 3 (Annex F) continued: shared objects sit INSIDE the first-page
-    // section.  qpdf's hint table validator counts page 0's object_count
-    // as Part-2 + Part-3 (all objects before /E), and /E itself is the
-    // byte after the last shared object.  Putting shared objects after /E
-    // causes "/E mismatch" and "object count for page 0 = N; computed = M"
-    // warnings.  ObjStm members are routed into a container instead of a
-    // plain indirect; their container is emitted below, still before /E.
-    for original_ref in &plan.part3_objects {
-        if objstm_layout.member_to_container.contains_key(original_ref) {
-            continue;
-        }
-        // Skip the catalog if it was emitted early (see the part2 loop above):
-        // a catalog reachable from the first-page closure could otherwise be
-        // emitted twice.
-        if catalog_emitted_early && plan.root_ref == Some(*original_ref) {
-            continue;
-        }
-        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
-            return Err(crate::Error::Unsupported(format!(
-                "part3 object {} has no renumber entry",
-                original_ref
-            )));
-        };
-        let offset = append_body_object_for_ref(
-            &mut bytes,
-            pdf,
-            new_ref,
-            *original_ref,
-            options,
-            encrypt_ctx,
-            encrypted_string_emitter.as_deref_mut(),
-            renumber,
-            &plan.removed_refs,
-            &plan.content_normalize_refs,
-        )?; // cov:ignore: planner-produced Part-3 references are valid by construction.
-        xref_offsets.insert(new_ref.number, offset);
-        report_progress_event(options)?;
-    }
-
-    // Part-3 ObjStm containers.  These hold shared/catalog members and MUST
-    // sit before /E so qpdf's first-page object count (and the observed
-    // qpdf 11.9 /E placement, which includes the Part-3 ObjStm) stays
-    // consistent.  The container itself is a plain indirect object.
     for container in &objstm_layout.part3 {
-        let offset = append_objstm_container_object(
-            &mut bytes,
-            container,
-            renumber,
-            pdf,
-            &plan.removed_refs,
-            structural_streams_filtered,
-            encrypt_ctx,
-        )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
-        xref_offsets.insert(container.container_new_num, offset);
-        for _ in &container.members {
-            if pass1_digest {
-                decrement_progress_event(options)?;
-            }
-            report_progress_event(options)?;
-            if pass1_digest {
+        first_page_emits.push((
+            container.container_new_num,
+            FirstPageEmit::Container(container),
+        ));
+    }
+    first_page_emits.sort_by_key(|(number, _)| *number);
+
+    for (_, emit) in first_page_emits {
+        match emit {
+            FirstPageEmit::Plain(original_ref) => {
+                let new_ref = renumber
+                    .new_for_original(original_ref)
+                    .expect("first-page plain object renumber entry checked above");
+                let offset = append_body_object_for_ref(
+                    &mut bytes,
+                    pdf,
+                    new_ref,
+                    original_ref,
+                    options,
+                    encrypt_ctx,
+                    encrypted_string_emitter.as_deref_mut(),
+                    renumber,
+                    &plan.removed_refs,
+                    &plan.content_normalize_refs,
+                )?; // cov:ignore: planner-produced first-page references are valid by construction.
+                xref_offsets.insert(new_ref.number, offset);
                 report_progress_event(options)?;
             }
+            FirstPageEmit::Container(container) => {
+                let offset = append_objstm_container_object(
+                    &mut bytes,
+                    container,
+                    renumber,
+                    pdf,
+                    &plan.removed_refs,
+                    structural_streams_filtered,
+                    encrypt_ctx,
+                )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
+                xref_offsets.insert(container.container_new_num, offset);
+                for _ in &container.members {
+                    if pass1_digest {
+                        decrement_progress_event(options)?;
+                    }
+                    report_progress_event(options)?;
+                    if pass1_digest {
+                        report_progress_event(options)?;
+                    }
+                }
+            }
         }
-    }
-
-    // Part 6 outline objects (classic path, UseOutlines): first-page outlines
-    // emitted before /E.  When /PageMode /UseOutlines is set, outline objects
-    // belong to the first-page section (Annex F §F.3.4).  On the ObjStm path
-    // these are already in a Part-3 ObjStm container emitted above; skip any
-    // that are ObjStm members to avoid writing them twice.
-    for original_ref in &plan.part6_outline_objects {
-        if objstm_layout.member_to_container.contains_key(original_ref) {
-            continue; // cov:ignore: ObjStm path handles via containers above
-        }
-        let Some(new_ref) = renumber.new_for_original(*original_ref) else {
-            // cov:ignore-start: planner/renumber inconsistency — impossible by construction
-            return Err(crate::Error::Unsupported(format!(
-                "part6 outline object {} has no renumber entry",
-                original_ref
-            )));
-            // cov:ignore-end
-        };
-        let offset = append_body_object_for_ref(
-            &mut bytes,
-            pdf,
-            new_ref,
-            *original_ref,
-            options,
-            encrypt_ctx,
-            encrypted_string_emitter.as_deref_mut(),
-            renumber,
-            &plan.removed_refs,
-            &plan.content_normalize_refs,
-        )?; // cov:ignore: planner-produced outline references are valid by construction.
-        xref_offsets.insert(new_ref.number, offset);
     }
 
     // /E: end of first-page section, AFTER Part-2, Part-3, the Part-3
@@ -3232,12 +3179,10 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     pass1_path: Option<&Path>,
 ) -> Result<(LinearizedDocument, WriterResult)> {
     // The canonical PdfWriter route plans the same live Pdf that it emits.
-    // qpdf's optimization prefix can materialize indirect graph nodes (for
-    // example direct `/Outlines` or repaired page-tree state), so it must run
-    // before planning rather than on a separate planning snapshot. The
-    // implementation below retains the idempotent call for the legacy public
-    // helpers, but this entry point establishes the source-faithful order.
-    crate::optimization::Optimization::prepare_for_linearized_write(pdf)?;
+    // QPDFWriter fixes the Generate ObjStm set before QPDF::optimize can
+    // materialize inherited page attributes, so preparation is owned by
+    // LinearizationPlan::from_pdf_with_writer_options below. The later
+    // write_linearized_impl call remains idempotent for legacy plan helpers.
     let mode = if crate::writer::force_version_below_1_5(options) {
         crate::writer::ObjectStreamMode::Disable
     } else {
@@ -3608,12 +3553,29 @@ fn write_linearized_impl<R: Read + Seek>(
         .flatten()
         .copied()
         .collect();
-    let first_half_post_plain: BTreeSet<ObjectRef> = plan
+    let mut first_half_post_plain: BTreeSet<ObjectRef> = plan
         .part6_outline_objects
         .iter()
         .copied()
-        .filter(|r| !first_half_member_set.contains(r))
+        .filter(|object| !first_half_member_set.contains(object))
         .collect();
+    if let Some(pre_objects) = plan
+        .optimization
+        .as_ref()
+        .and_then(|optimization| optimization.pre_optimization_object_refs())
+    {
+        first_half_post_plain.extend(
+            plan.part2_objects
+                .iter()
+                .chain(&plan.part3_objects)
+                .chain(&plan.part4_open_document_plain)
+                .chain(&plan.part6_outline_objects)
+                .copied()
+                .filter(|object| {
+                    !pre_objects.contains(object) && !first_half_member_set.contains(object)
+                }),
+        );
+    }
     // Open-document batches are numbered FIRST in the first half (right after
     // the catalog, before the hint); Part-3 batches are numbered last within
     // the first half (qpdf packs the first-page shared dicts + /Pages tree +
@@ -3870,9 +3832,9 @@ fn write_linearized_impl<R: Read + Seek>(
     //
     // - Generate: the containers are fresh `makeIndirectObject` objects numbered
     //   after every source object in even-split order, hence `(1, split_index)`.
-    // - Preserve: the containers reuse the source ObjStm objects and keep their
-    //   source numbers, hence `(0, source_container_number)` in the same key
-    //   space as plain source objects.
+    // - Preserve: source ObjStm containers are validated against their members,
+    //   but the hint table compares them in the physical output-number space,
+    //   hence `(0, container_new_num)` alongside renumbered plain objects.
     let container_shared_sort_key: std::collections::BTreeMap<u32, (u8, u32)> = match options
         .object_streams
     {
@@ -3892,16 +3854,25 @@ fn write_linearized_impl<R: Read + Seek>(
                 .chain(&objstm_layout.part3)
                 .chain(&objstm_layout.part4)
             {
-                let source_container_number =
+                let _source_container_number =
                     preserved_source_container_number(container, &source_container_by_member)?;
-                keys.insert(container.container_new_num, (0, source_container_number));
+                keys.insert(
+                    container.container_new_num,
+                    (0, container.container_new_num),
+                );
             }
             keys
         }
         _ => {
-            use crate::linearization::plan::objstm_membership_linearized;
+            use crate::linearization::plan::objstm_membership_linearized_with_eligibility;
             let assigned = plan.renumber_assigned_refs();
-            let membership = objstm_membership_linearized(pdf, &assigned)?;
+            let membership = objstm_membership_linearized_with_eligibility(
+                pdf,
+                &assigned,
+                plan.optimization
+                    .as_ref()
+                    .and_then(|optimization| optimization.generate_objstm_eligible()),
+            )?;
             let mut rank = std::collections::BTreeMap::new();
             for (split_index, members) in membership.iter().enumerate() {
                 // `objstm_membership_linearized` drops empty containers, so
