@@ -1149,27 +1149,32 @@ mod tests {
     fn qpdf_flatten_rejects_a_direct_stream_when_installing_a_missing_resource_category() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(Vec::new()),
+            )]),
+            Rc::new(Vec::new()),
         );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "Font",
-            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+        )]);
 
         let error = merge_widget_default_resources_on_page(
             &mut pdf,
