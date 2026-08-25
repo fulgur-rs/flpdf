@@ -3371,6 +3371,7 @@ impl ObjectHandle {
     /// Replace an existing array item with `value`, preserving `value`'s
     /// shared handle identity. Returns `false` when this handle is not an
     /// array or `index` is out of bounds.
+    #[allow(dead_code)] // retained for its focused primitive tests until the old NNTree test route is removed
     pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
         if self.would_create_direct_cycle(&value) {
             return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup

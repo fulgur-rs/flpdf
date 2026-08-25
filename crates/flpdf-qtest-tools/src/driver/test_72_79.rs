@@ -22,8 +22,8 @@ use std::io::{Read, Seek, Write};
 
 use flpdf::{
     DecodeLevel, EmbeddedFileDocumentHelper, EmbeddedFileStream, Error, FileSpec, NameTree,
-    NumberTree, Object, ObjectHandle, ObjectHandleParserCallbacks, PageDocumentHelper,
-    ParseControl, Pdf, PdfWriter, TokenFilter, TokenFilterOutput,
+    NumberTree, ObjectHandle, ObjectHandleParserCallbacks, PageDocumentHelper, ParseControl, Pdf,
+    PdfWriter, TokenFilter, TokenFilterOutput,
 };
 
 use super::emit_new_diagnostics;
@@ -286,15 +286,10 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
     writeln!(stdout, "/Split1")?;
-    let split1_root = pdf
-        .trailer_dictionary()
-        .get(b"Split1")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut split1 = NumberTree::new(split1_root, true);
+    let mut split1 = NumberTree::new(pdf.trailer_key_handle(b"Split1"), true);
     split1.set_split_threshold(4);
     for key in [15_i64, 35, 125] {
-        let value = Object::String(key.to_string().into_bytes());
+        let value = ObjectHandle::string(key.to_string().into_bytes());
         let inserted = split1.insert(pdf, key, value)?;
         assert_eq!(
             inserted
@@ -414,12 +409,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     assert!(iter1 == erase1.end());
 
     let erase2_handle = pdf.trailer_key_handle(b"Erase2");
-    let erase2_root = pdf
-        .trailer_dictionary()
-        .get(b"Erase2")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut erase2 = NumberTree::new(erase2_root, true);
+    let mut erase2 = NumberTree::new(erase2_handle.clone(), true);
     let mut iter2 = erase2.find(pdf, 250, false)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     iter2.remove(&mut erase2, pdf)?;
@@ -461,12 +451,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     let kid0_kids = chase_key(pdf, &kid0, b"/Kids")?;
     assert_eq!(kid0_kids.as_array().unwrap_or_default().len(), 1);
 
-    let erase3_root = pdf
-        .trailer_dictionary()
-        .get(b"Erase3")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut erase3 = NumberTree::new(erase3_root, true);
+    let mut erase3 = NumberTree::new(pdf.trailer_key_handle(b"Erase3"), true);
     let mut iter3 = erase3.find(pdf, 320, false)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     iter3.remove(&mut erase3, pdf)?;
@@ -474,12 +459,7 @@ pub(crate) fn run_test_75<R: Read + Seek>(
     erase3.remove(pdf, 310)?;
     assert!(erase3.begin(pdf)? == erase3.end());
 
-    let erase4_root = pdf
-        .trailer_dictionary()
-        .get(b"Erase4")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut erase4 = NumberTree::new(erase4_root, true);
+    let mut erase4 = NumberTree::new(pdf.trailer_key_handle(b"Erase4"), true);
     let mut iter4 = erase4.find(pdf, 420, false)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     iter4.remove(&mut erase4, pdf)?;
