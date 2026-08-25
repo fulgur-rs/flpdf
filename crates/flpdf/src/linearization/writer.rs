@@ -3530,15 +3530,24 @@ fn write_linearized_impl<R: Read + Seek>(
     // reachable from `/Outlines`, e.g. a shared /JS action stream) is emitted
     // plain and qpdf numbers it AFTER the outline container, not before.
     let part4_member_set: BTreeSet<ObjectRef> = part4_members.iter().flatten().copied().collect();
+    // qpdf's root /Pages user can contain several nested Pages nodes (see
+    // `LinearizationPlan::part4_objects`); every member remaining in
+    // `part4_rest` is promoted ahead of the rest of part9, not only the
+    // Catalog's direct /Pages object. Mirror that full set here so none of
+    // those promoted nodes is swept into the post-container pass below.
+    let part9_pages: BTreeSet<ObjectRef> = plan
+        .optimization
+        .as_ref()
+        .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+        .filter(|pages| !pages.is_empty())
+        .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
     let second_half_post_plain: BTreeSet<ObjectRef> = plan
         .part4_rest
         .iter()
         .chain(&plan.part9_outline_objects)
         .copied()
         .filter(|r| {
-            !part4_member_set.contains(r)
-                && Some(*r) != plan.pages_tree_ref
-                && Some(*r) != plan.info_ref
+            !part4_member_set.contains(r) && !part9_pages.contains(r) && Some(*r) != plan.info_ref
         })
         .collect();
     // First-half mirror of `second_half_post_plain`: under /PageMode /UseOutlines
