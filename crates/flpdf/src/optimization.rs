@@ -23,6 +23,12 @@ pub(crate) enum ObjectUser {
 pub(crate) struct Optimization {
     user_to_objects: BTreeMap<ObjectUser, BTreeSet<ObjectRef>>,
     object_to_users: BTreeMap<ObjectRef, BTreeSet<ObjectUser>>,
+    /// qpdf's Generate object-stream eligibility captured before optimization
+    /// can mint inherited-attribute objects.
+    generate_objstm_eligible: Option<Vec<ObjectRef>>,
+    /// Object identities present before optimization. Newly minted first-half
+    /// plain objects are emitted after qpdf's ObjStm containers.
+    pre_optimization_object_refs: Option<BTreeSet<ObjectRef>>,
 }
 
 impl Optimization {
@@ -44,6 +50,22 @@ impl Optimization {
         self.object_to_users
             .iter()
             .map(|(&object, users)| (object, users))
+    }
+
+    pub(crate) fn set_generate_objstm_eligible(&mut self, eligible: Vec<ObjectRef>) {
+        self.generate_objstm_eligible = Some(eligible);
+    }
+
+    pub(crate) fn generate_objstm_eligible(&self) -> Option<&[ObjectRef]> {
+        self.generate_objstm_eligible.as_deref()
+    }
+
+    pub(crate) fn set_pre_optimization_object_refs(&mut self, refs: BTreeSet<ObjectRef>) {
+        self.pre_optimization_object_refs = Some(refs);
+    }
+
+    pub(crate) fn pre_optimization_object_refs(&self) -> Option<&BTreeSet<ObjectRef>> {
+        self.pre_optimization_object_refs.as_ref()
     }
 
     pub(crate) fn referenced_pages(&self, object: ObjectRef) -> BTreeSet<u32> {
