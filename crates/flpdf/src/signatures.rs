@@ -9,8 +9,8 @@
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json_inspect::decode_pdf_text_string;
 use crate::object_handle::ObjectHandle;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
-use std::collections::BTreeSet;
+use crate::{Error, ObjectRef, Pdf, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 /// Maximum recursion depth for AcroForm signature field traversal.
@@ -76,25 +76,26 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
     let Some(catalog_ref) = pdf.root_ref() else {
         return Ok(Vec::new());
     };
-    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-    let Object::Dictionary(catalog_dict) = catalog_obj else {
+    let catalog_handle = pdf.get_object_handle(catalog_ref);
+    let catalog = resolve_handle(pdf, &catalog_handle)?;
+    if catalog.as_dictionary().is_none() {
         return Ok(Vec::new());
-    };
-    let Some(acroform_val) = catalog_dict.get("AcroForm").cloned() else {
+    }
+    let acroform_value = catalog.try_get_key(b"/AcroForm")?;
+    let acroform = resolve_handle(pdf, &acroform_value)?;
+    if acroform_value.is_null() || acroform.as_dictionary().is_none() {
         return Ok(Vec::new());
-    };
-    let Some(acroform_dict) = resolve_dictionary(pdf, acroform_val)? else {
-        return Ok(Vec::new());
-    };
+    }
 
-    let Some(fields_obj) = acroform_dict.get("Fields").cloned() else {
+    let fields_obj = acroform.try_get_key(b"/Fields")?;
+    if fields_obj.is_null() {
         return Ok(Vec::new());
-    };
+    }
     let fields = resolve_array(pdf, fields_obj)?;
     let mut output = Vec::new();
     let mut seen = BTreeSet::new();
     for field in fields {
-        if let Object::Reference(field_ref) = field {
+        if let Some(field_ref) = field.object_ref() {
             walk_signature_field(pdf, field_ref, "", &mut output, &mut seen, 0, max_depth)?;
         }
     }
@@ -112,8 +113,10 @@ pub fn signatures_with_max_depth<R: Read + Seek>(
 /// Propagates any error from resolving the catalog and `/AcroForm` objects (for
 /// example I/O or parse failures surfaced by [`Pdf::resolve`]).
 pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32>> {
-    Ok(resolve_catalog_acroform(pdf)?
-        .and_then(|(_, acroform)| sig_flags_from_acroform_dict(&acroform)))
+    let Some(acroform) = resolve_catalog_acroform(pdf)? else {
+        return Ok(None);
+    };
+    sig_flags_from_acroform(&acroform)
 }
 
 /// Clear the signature-related bits of `/AcroForm /SigFlags`.
@@ -129,13 +132,13 @@ pub fn acroform_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<u32
 /// Propagates any error from resolving the catalog and `/AcroForm` objects (for
 /// example I/O or parse failures surfaced by [`Pdf::resolve`]).
 pub fn clear_sig_flags<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let Some((home, mut acroform)) = resolve_catalog_acroform(pdf)? else {
+    let Some(acroform) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);
     };
-    if !clear_sig_flags_in_dict(&mut acroform) {
+    if !clear_sig_flags_in_handle(&acroform)? {
         return Ok(false);
     }
-    write_back_acroform(pdf, home, acroform);
+    pdf.mark_object_handle_dirty(&acroform)?;
     Ok(true)
 }
 
@@ -156,7 +159,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         return Ok(false);
     };
     let root = pdf.get_object_handle(root_ref);
-    let catalog = pdf.resolve_to_terminal(&root)?;
+    let catalog = resolve_handle(pdf, &root)?;
     if catalog.as_dictionary().is_none() {
         return Ok(false);
     }
@@ -173,7 +176,8 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         changed = true;
     }
 
-    let acroform = pdf.resolve_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
+    let acroform_value = catalog.try_get_key(b"/AcroForm")?;
+    let acroform = resolve_handle(pdf, &acroform_value)?;
     if acroform.as_dictionary().is_some() && acroform.try_has_key(b"/SigFlags")? {
         // QPDF::removeSecurityRestrictions replaces the key whenever qpdf's
         // visible hasKey test succeeds, including an already-zero integer.
@@ -188,7 +192,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
         // QPDF::removeSecurityRestrictions is void, so nothing classifies
         // the prior /SigFlags value.
         let previous = acroform.try_get_key(b"/SigFlags")?;
-        let previous_resolved = pdf.resolve_to_terminal(&previous)?;
+        let previous_resolved = resolve_handle(pdf, &previous)?;
         let already_zero =
             previous.object_ref().is_none() && previous_resolved.as_integer() == Some(0);
         // qpdf-deviation-end
@@ -295,26 +299,6 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
     Ok(changed)
 }
 
-/// Write an updated `/AcroForm` dictionary back to wherever it lives.
-///
-/// For an indirect `/AcroForm` the dictionary is stored to its own object; for
-/// an inline `/AcroForm` the carried catalog is patched and re-stored so the
-/// catalog is not clobbered.
-fn write_back_acroform<R: Read + Seek>(pdf: &mut Pdf<R>, home: AcroformHome, acroform: Dictionary) {
-    match home {
-        AcroformHome::Object(acroform_ref) => {
-            pdf.set_object(acroform_ref, Object::Dictionary(acroform));
-        }
-        AcroformHome::Inline {
-            root_ref,
-            mut catalog,
-        } => {
-            catalog.insert("AcroForm", Object::Dictionary(acroform));
-            pdf.set_object(root_ref, Object::Dictionary(catalog));
-        }
-    }
-}
-
 /// Remove signature values (`/V`) from AcroForm signature fields.
 ///
 /// The field dictionaries themselves are preserved so widgets and field names
@@ -327,17 +311,18 @@ fn write_back_acroform<R: Read + Seek>(pdf: &mut Pdf<R>, home: AcroformHome, acr
 /// field-tree objects (for example I/O or parse failures surfaced by
 /// [`Pdf::resolve`]).
 pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    let Some((_, mut acroform)) = resolve_catalog_acroform(pdf)? else {
+    let Some(acroform) = resolve_catalog_acroform(pdf)? else {
         return Ok(false);
     };
-    let Some(fields_obj) = acroform.remove("Fields") else {
+    let fields_obj = acroform.try_get_key(b"/Fields")?;
+    if fields_obj.is_null() {
         return Ok(false);
-    };
+    }
 
     let mut changed = false;
     let mut seen = BTreeSet::new();
     for field in resolve_array(pdf, fields_obj)? {
-        let Object::Reference(field_ref) = field else {
+        let Some(field_ref) = field.object_ref() else {
             continue;
         };
         strip_signature_values_from_field(pdf, field_ref, None, 0, &mut seen, &mut changed)?;
@@ -345,65 +330,48 @@ pub fn strip_signature_values<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> 
     Ok(changed)
 }
 
-/// Where the catalog `/AcroForm` dictionary lives, so an updated copy can be
-/// written back to the correct object.
-enum AcroformHome {
-    /// `/AcroForm` is an indirect object; write the updated dict to this ref.
-    Object(ObjectRef),
-    /// `/AcroForm` is an inline dictionary in the catalog; carries the catalog
-    /// so the entry can be replaced without re-resolving `/Root`.
-    Inline {
-        root_ref: ObjectRef,
-        catalog: Dictionary,
-    },
-}
+// The returned `ObjectHandle` from `resolve_catalog_acroform` is live, so
+// callers mutate it in place and mark the handle dirty. No copied dictionary
+// or raw-object write-back boundary is needed.
 
 /// Resolve the catalog `/AcroForm` to its dictionary plus where it lives,
 /// following one indirect reference. Returns `None` when there is no `/Root`
 /// dictionary, no `/AcroForm`, or `/AcroForm` is not a dictionary.
-fn resolve_catalog_acroform<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-) -> Result<Option<(AcroformHome, Dictionary)>> {
+fn resolve_catalog_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<ObjectHandle>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };
-    let Object::Dictionary(catalog) = pdf.resolve_object(root_ref)? else {
+    let catalog_handle = pdf.get_object_handle(root_ref);
+    let catalog = resolve_handle(pdf, &catalog_handle)?;
+    if catalog.as_dictionary().is_none() {
         return Ok(None);
-    };
-    let Some(acroform) = catalog.get("AcroForm").cloned() else {
-        return Ok(None);
-    };
-    match acroform {
-        Object::Reference(acroform_ref) => match pdf.resolve_object(acroform_ref)? {
-            Object::Dictionary(dict) => Ok(Some((AcroformHome::Object(acroform_ref), dict))),
-            _ => Ok(None),
-        },
-        Object::Dictionary(dict) => Ok(Some((AcroformHome::Inline { root_ref, catalog }, dict))),
-        _ => Ok(None),
     }
+    let acroform_value = catalog.try_get_key(b"/AcroForm")?;
+    let acroform = resolve_handle(pdf, &acroform_value)?;
+    Ok(acroform.as_dictionary().map(|_| acroform))
 }
 
 /// Extract `/SigFlags` as a `u32` bitfield from an already-resolved `/AcroForm`
 /// dictionary. Non-integer or out-of-range values read as absent.
-fn sig_flags_from_acroform_dict(acroform: &Dictionary) -> Option<u32> {
-    acroform
-        .get("SigFlags")
-        .and_then(Object::as_integer)
-        .and_then(|n| u32::try_from(n).ok())
+fn sig_flags_from_acroform(acroform: &ObjectHandle) -> Result<Option<u32>> {
+    Ok(acroform
+        .try_get_key(b"/SigFlags")?
+        .as_integer()
+        .and_then(|n| u32::try_from(n).ok()))
 }
 
 /// Mask off the signature bits of `/SigFlags` in place. Returns `true` if the
 /// value changed.
-fn clear_sig_flags_in_dict(acroform: &mut Dictionary) -> bool {
-    let Some(flags) = sig_flags_from_acroform_dict(acroform) else {
-        return false;
+fn clear_sig_flags_in_handle(acroform: &ObjectHandle) -> Result<bool> {
+    let Some(flags) = sig_flags_from_acroform(acroform)? else {
+        return Ok(false);
     };
     let cleared = flags & !(SIG_FLAGS_SIGNATURES_EXIST | SIG_FLAGS_APPEND_ONLY);
     if cleared == flags {
-        return false;
+        return Ok(false);
     }
-    acroform.insert("SigFlags", Object::Integer(i64::from(cleared)));
-    true
+    acroform.replace_key(b"/SigFlags", ObjectHandle::integer(i64::from(cleared)))?;
+    Ok(true)
 }
 
 fn strip_signature_values_from_field<R: Read + Seek>(
@@ -418,7 +386,9 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         return Ok(());
     }
 
-    let Object::Dictionary(mut dict) = pdf.resolve_object(field_ref)? else {
+    let field_handle = pdf.get_object_handle(field_ref);
+    let field = resolve_handle(pdf, &field_handle)?;
+    let Some(entries) = field.as_dictionary() else {
         return Ok(());
     };
 
@@ -426,12 +396,19 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         .field_type()?
         .map(|name| name.strip_prefix(b"/").unwrap_or(&name).to_vec())
         .or(inherited_type);
-    let kids_obj = dict.get("Kids").cloned();
+    let kids_obj = entries
+        .get(b"/Kids".as_slice())
+        .cloned()
+        .unwrap_or_else(ObjectHandle::null);
 
-    let signature_value_ref = dict.get("V").and_then(Object::as_ref_id);
+    let signature_value_ref = entries
+        .get(b"/V".as_slice())
+        .and_then(|value| value.object_ref().or_else(|| value.as_reference()));
+    let has_signature_value = entries.contains_key(b"/V".as_slice());
 
-    if field_type.as_deref() == Some(b"Sig") && dict.remove("V").is_some() {
-        pdf.set_object(field_ref, Object::Dictionary(dict));
+    if field_type.as_deref() == Some(b"Sig") && has_signature_value {
+        field.remove_key(b"/V");
+        pdf.mark_object_handle_dirty(&field)?;
         if let Some(signature_ref) = signature_value_ref {
             pdf.delete_object(signature_ref);
         }
@@ -440,9 +417,9 @@ fn strip_signature_values_from_field<R: Read + Seek>(
             return Ok(());
         }
 
-        let Some(kids_obj) = kids_obj else {
+        if kids_obj.is_null() {
             return Ok(());
-        };
+        }
         return strip_signature_values_from_kids(pdf, kids_obj, field_type, depth, seen, changed);
     }
 
@@ -450,29 +427,29 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         return Ok(());
     }
 
-    let Some(kids_obj) = kids_obj else {
+    if kids_obj.is_null() {
         return Ok(());
-    };
+    }
     strip_signature_values_from_kids(pdf, kids_obj, field_type, depth, seen, changed)
 }
 
 fn strip_signature_values_from_kids<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    kids_obj: Object,
+    kids_obj: ObjectHandle,
     field_type: Option<Vec<u8>>,
     depth: usize,
     seen: &mut BTreeSet<ObjectRef>,
     changed: &mut bool,
 ) -> Result<()> {
     for kid in resolve_array(pdf, kids_obj)? {
-        let Object::Reference(kid_ref) = kid else {
+        let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
-        let kid_obj = pdf.resolve_borrowed(kid_ref)?;
-        let Object::Dictionary(kid_dict) = kid_obj else {
+        let kid_obj = resolve_handle(pdf, &kid)?;
+        let Some(kid_dict) = kid_obj.as_dictionary() else {
             continue;
         };
-        if is_pure_widget(kid_dict) {
+        if is_pure_widget(&kid_dict) {
             continue;
         }
         strip_signature_values_from_field(
@@ -501,11 +478,11 @@ fn walk_signature_field<R: Read + Seek>(
         return Ok(());
     }
 
-    let field_obj = pdf.resolve_borrowed(field_ref)?;
-    let Object::Dictionary(field_dict) = field_obj else {
+    let field_handle = pdf.get_object_handle(field_ref);
+    let field_obj = resolve_handle(pdf, &field_handle)?;
+    let Some(field_dict) = field_obj.as_dictionary() else {
         return Ok(());
     };
-    let field_dict = field_dict.clone();
 
     let (partial_name, is_signature) = {
         let mut field = FormFieldObjectHelper::new(field_ref, pdf);
@@ -525,18 +502,18 @@ fn walk_signature_field<R: Read + Seek>(
         return Ok(());
     }
 
-    let Some(kids_obj) = field_dict.get("Kids").cloned() else {
+    let Some(kids_obj) = field_dict.get(b"/Kids".as_slice()).cloned() else {
         return Ok(());
     };
     for kid in resolve_array(pdf, kids_obj)? {
-        let Object::Reference(kid_ref) = kid else {
+        let Some(kid_ref) = kid.object_ref() else {
             continue;
         };
-        let kid_obj = pdf.resolve_borrowed(kid_ref)?;
-        let Object::Dictionary(kid_dict) = kid_obj else {
+        let kid_obj = resolve_handle(pdf, &kid)?;
+        let Some(kid_dict) = kid_obj.as_dictionary() else {
             continue;
         };
-        if is_pure_widget(kid_dict) {
+        if is_pure_widget(&kid_dict) {
             continue;
         }
         walk_signature_field(
@@ -562,14 +539,11 @@ fn signature_info_for_field<R: Read + Seek>(
         return Ok(None);
     };
     let signature_ref = value.object_ref().or_else(|| value.as_reference());
-    let value = pdf.resolve_to_terminal(&value)?;
-    let value = value.materialize()?; // cov:ignore: field-value helper classifies only signature dictionaries
-                                      // cov:ignore-start: pre-existing non-dictionary fallback, unchanged by Result propagation
-    let Object::Dictionary(signature_dict) = value else {
+    let value = resolve_handle(pdf, &value)?;
+    let Some(signature_dict) = value.as_dictionary() else {
         return Ok(None);
     };
-    // cov:ignore-end
-    let Some(byte_range_obj) = signature_dict.get("ByteRange").cloned() else {
+    let Some(byte_range_obj) = signature_dict.get(b"/ByteRange".as_slice()).cloned() else {
         return Ok(None);
     };
     let byte_range = parse_byte_range(pdf, byte_range_obj)?;
@@ -579,56 +553,39 @@ fn signature_info_for_field<R: Read + Seek>(
         signature_ref,
         field_name: field_name.to_string(),
         byte_range,
-        sub_filter: name_entry(pdf, &signature_dict, "SubFilter")?,
-        signer_name: text_entry(pdf, &signature_dict, "Name")?,
-        signing_time: text_entry(pdf, &signature_dict, "M")?,
-        reason: text_entry(pdf, &signature_dict, "Reason")?,
-        location: text_entry(pdf, &signature_dict, "Location")?,
-        contact_info: text_entry(pdf, &signature_dict, "ContactInfo")?,
+        sub_filter: name_entry(pdf, &signature_dict, b"/SubFilter")?,
+        signer_name: text_entry(pdf, &signature_dict, b"/Name")?,
+        signing_time: text_entry(pdf, &signature_dict, b"/M")?,
+        reason: text_entry(pdf, &signature_dict, b"/Reason")?,
+        location: text_entry(pdf, &signature_dict, b"/Location")?,
+        contact_info: text_entry(pdf, &signature_dict, b"/ContactInfo")?,
         certificate: certificate_entry(pdf, &signature_dict)?,
     }))
 }
 
-fn resolve_dictionary<R: Read + Seek>(
+fn resolve_handle<R: Read + Seek>(pdf: &mut Pdf<R>, handle: &ObjectHandle) -> Result<ObjectHandle> {
+    pdf.resolve(handle)?;
+    Ok(handle.clone())
+}
+
+fn resolve_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    value: Object,
-) -> Result<Option<Dictionary>> {
-    match value {
-        Object::Dictionary(dict) => Ok(Some(dict)),
-        Object::Reference(object_ref) => match pdf.resolve_borrowed(object_ref)? {
-            Object::Dictionary(dict) => Ok(Some(dict.clone())),
-            _ => Ok(None),
-        },
-        _ => Ok(None),
-    }
+    value: ObjectHandle,
+) -> Result<Vec<ObjectHandle>> {
+    Ok(resolve_handle(pdf, &value)?.as_array().unwrap_or_default())
 }
 
-fn resolve_array<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Vec<Object>> {
-    match value {
-        Object::Array(values) => Ok(values),
-        Object::Reference(object_ref) => match pdf.resolve_object(object_ref)? {
-            Object::Array(values) => Ok(values),
-            _ => Ok(Vec::new()),
-        },
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn parse_byte_range<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<[u64; 4]> {
-    let values = match value {
-        Object::Array(values) => values,
-        Object::Reference(object_ref) => match pdf.resolve_borrowed(object_ref)? {
-            Object::Array(values) => values.clone(),
-            _ => return Err(invalid_byte_range("must be an array")),
-        },
-        _ => return Err(invalid_byte_range("must be an array")),
-    };
+fn parse_byte_range<R: Read + Seek>(pdf: &mut Pdf<R>, value: ObjectHandle) -> Result<[u64; 4]> {
+    let values = resolve_handle(pdf, &value)?
+        .as_array()
+        .ok_or_else(|| invalid_byte_range("must be an array"))?;
     if values.len() != 4 {
         return Err(invalid_byte_range("must contain exactly four integers"));
     }
 
     let mut out = [0; 4];
     for (idx, value) in values.iter().enumerate() {
+        let value = resolve_handle(pdf, value)?;
         let Some(n) = value.as_integer() else {
             return Err(invalid_byte_range("must contain only integers"));
         };
@@ -653,76 +610,76 @@ fn join_field_name(parent_name: &str, local_name: Option<String>) -> String {
     }
 }
 
-fn is_pure_widget(dict: &Dictionary) -> bool {
-    let is_widget = matches!(
-        dict.get("Subtype"),
-        Some(Object::Name(name)) if name.as_slice() == b"Widget"
-    );
-    let has_field_entries = dict.get("T").is_some()
-        || dict.get("FT").is_some()
-        || dict.get("Kids").is_some()
-        || dict.get("V").is_some()
-        || dict.get("DV").is_some()
-        || dict.get("Ff").is_some()
-        || dict.get("TU").is_some()
-        || dict.get("TM").is_some();
+fn is_pure_widget(dict: &BTreeMap<Vec<u8>, ObjectHandle>) -> bool {
+    let is_widget = dict
+        .get(b"/Subtype".as_slice())
+        .and_then(ObjectHandle::as_name)
+        .is_some_and(|name| name == b"Widget");
+    let has_field_entries = [
+        b"/T".as_slice(),
+        b"/FT".as_slice(),
+        b"/Kids".as_slice(),
+        b"/V".as_slice(),
+        b"/DV".as_slice(),
+        b"/Ff".as_slice(),
+        b"/TU".as_slice(),
+        b"/TM".as_slice(),
+    ]
+    .into_iter()
+    .any(|key| dict.contains_key(key));
 
     is_widget && !has_field_entries
 }
 
 fn resolve_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dict: &Dictionary,
-    key: &str,
-) -> Result<Option<Object>> {
-    match dict.get(key) {
-        Some(Object::Reference(object_ref)) => Ok(Some(pdf.resolve_object(*object_ref)?)),
-        Some(object) => Ok(Some(object.clone())),
-        None => Ok(None),
-    }
+    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
+    key: &[u8],
+) -> Result<Option<ObjectHandle>> {
+    dict.get(key)
+        .cloned()
+        .map(|value| resolve_handle(pdf, &value))
+        .transpose()
 }
 
 fn name_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dict: &Dictionary,
-    key: &str,
+    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
+    key: &[u8],
 ) -> Result<Option<String>> {
     match resolve_entry(pdf, dict, key)? {
-        Some(Object::Name(name)) => Ok(Some(String::from_utf8_lossy(&name).into_owned())),
+        Some(value) => Ok(value
+            .as_name()
+            .map(|name| String::from_utf8_lossy(&name).into_owned())),
         _ => Ok(None),
     }
 }
 
 fn text_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dict: &Dictionary,
-    key: &str,
+    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
+    key: &[u8],
 ) -> Result<Option<String>> {
     match resolve_entry(pdf, dict, key)? {
-        Some(Object::String(bytes)) => Ok(Some(
-            decode_pdf_text_string(&bytes)
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into()),
-        )),
+        Some(value) => Ok(value.as_string().map(|bytes| {
+            decode_pdf_text_string(&bytes).unwrap_or_else(|| String::from_utf8_lossy(&bytes).into())
+        })),
         _ => Ok(None),
     }
 }
 
 fn certificate_entry<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dict: &Dictionary,
+    dict: &BTreeMap<Vec<u8>, ObjectHandle>,
 ) -> Result<Option<Vec<u8>>> {
-    match resolve_entry(pdf, dict, "Cert")? {
-        Some(Object::String(bytes)) => Ok(Some(bytes)),
-        Some(Object::Array(values)) => {
+    match resolve_entry(pdf, dict, b"/Cert")? {
+        Some(value) if value.as_string().is_some() => Ok(value.as_string()),
+        Some(value) if value.as_array().is_some() => {
+            let values = value.as_array().unwrap_or_default();
             for value in values {
-                match value {
-                    Object::String(bytes) => return Ok(Some(bytes)),
-                    Object::Reference(object_ref) => {
-                        if let Object::String(bytes) = pdf.resolve_object(object_ref)? {
-                            return Ok(Some(bytes));
-                        }
-                    }
-                    _ => {}
+                let value = resolve_handle(pdf, &value)?;
+                if let Some(bytes) = value.as_string() {
+                    return Ok(Some(bytes));
                 }
             }
             Ok(None)
