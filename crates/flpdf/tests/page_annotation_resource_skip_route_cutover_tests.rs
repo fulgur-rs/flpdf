@@ -815,3 +815,45 @@ fn multiple_annotation_count_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn xobject_nondict_fallback_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn resources_xobject_indirect_ref_to_non_dict_does_not_block_flattening")
+        .expect("XObject non-dict fallback fixture must remain")
+        .1
+        .split_once("fn flatten_rotation_reanalyzes_after_flatten_annotations_removes_acroform")
+        .expect("XObject non-dict fallback fixture boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "XObject non-dict fallback fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::integer(",
+        "replace_object_handle(",
+        "resolve(",
+        "try_get_key(",
+        "as_integer()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "XObject non-dict fallback fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
