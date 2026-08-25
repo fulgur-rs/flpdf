@@ -734,3 +734,31 @@ fn update_from_json_check_does_not_duplicate_repair_warnings() {
         1
     );
 }
+
+/// `run_json_input_inspection` builds its own `QPDFJob` separately from
+/// `run_check`, so `--no-warn` must be wired onto it too -- otherwise a
+/// repaired `--update-from-json ... --check` input keeps printing every
+/// warning despite the flag, even though the exit status is already
+/// correctly suppressed-warnings-aware (status 3).
+#[test]
+fn update_from_json_check_no_warn_suppresses_warning_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let update = temp.path().join("noop-update.json");
+    fs::write(&update, NOOP_UPDATE_JSON).unwrap();
+    let damaged = "../../tests/fixtures/test_driver/repairable_input.pdf";
+
+    let via_update = Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--no-warn")
+        .arg("--repair")
+        .arg(format!("--update-from-json={}", update.display()))
+        .args(["--check", damaged])
+        .output()
+        .unwrap();
+
+    assert_eq!(via_update.status.code(), Some(3));
+    assert!(
+        via_update.stderr.is_empty(),
+        "--no-warn must suppress warning delivery on the JSON-update inspection route too"
+    );
+}
