@@ -537,9 +537,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let dict = obj.as_dict().expect("not a dict");
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
 
     #[test]
@@ -567,9 +565,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let dict = obj.as_dict().expect("not a dict");
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
 
     #[test]
@@ -597,9 +593,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let dict = obj.as_dict().expect("not a dict");
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
 
     #[test]
