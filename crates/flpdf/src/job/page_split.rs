@@ -430,7 +430,7 @@ mod tests {
     use super::*;
     use crate::pages::page_refs;
     use crate::pipeline::{Pipeline, PipelineHandle, PipelineResult};
-    use crate::{Object, Pdf, PdfOpenOptions, QPDFLogger};
+    use crate::{ObjectHandle, Pdf, PdfOpenOptions, QPDFLogger};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -637,12 +637,8 @@ mod tests {
         Pdf::open_mem_owned(bytes.to_vec()).expect("fixture must parse")
     }
 
-    fn catalog(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> crate::Dictionary {
-        let root = pdf.root_ref().expect("fixture has /Root");
-        pdf.resolve_object(root)
-            .expect("catalog resolves")
-            .into_dict()
-            .expect("catalog is a dictionary")
+    fn catalog(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+        pdf.root_handle().expect("catalog resolves")
     }
 
     fn first_page_annotation_count(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> usize {
@@ -651,14 +647,17 @@ mod tests {
             .into_iter()
             .next()
             .expect("fixture has a page");
-        let Object::Dictionary(page) = pdf.resolve_object(page_ref).expect("page resolves") else {
-            panic!("page is not a dictionary"); // cov:ignore: fixture pages are dictionaries
-        };
-        match page.get("Annots") {
-            Some(Object::Array(annots)) => annots.len(),
-            None => 0,
-            Some(other) => panic!("/Annots is not an array: {other:?}"), // cov:ignore: fixture /Annots is an array
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("page resolves");
+        if !page.has_key(b"/Annots") {
+            return 0;
         }
+        let annots = page.get_key(b"/Annots");
+        pdf.resolve(&annots).expect("/Annots resolves");
+        annots
+            .as_array()
+            .map(|annots| annots.len())
+            .unwrap_or_else(|| panic!("/Annots is not an array")) // cov:ignore: fixture /Annots is an array
     }
 
     #[test]
@@ -843,22 +842,17 @@ mod tests {
             Pdf::open_mem_owned(std::fs::read(&written[0]).expect("first chunk should be written"))
                 .expect("chunk should parse");
         let catalog = catalog(&mut chunk);
-        assert!(catalog.get("Outlines").is_none());
-        assert!(catalog.get("PageMode").is_none());
+        assert!(!catalog.has_key(b"/Outlines"));
+        assert!(!catalog.has_key(b"/PageMode"));
 
-        let Object::Dictionary(page_labels) = catalog
-            .get("PageLabels")
-            .expect("chunk should retain page labels")
-        else {
-            panic!("PageLabels must be a dictionary"); // cov:ignore: qpdf fixture shape is asserted by this test
-        };
-        let Object::Array(nums) = page_labels.get("Nums").expect("labels have /Nums") else {
-            panic!("PageLabels /Nums must be an array"); // cov:ignore: qpdf fixture shape is asserted by this test
-        };
-        let Object::Dictionary(label) = nums.get(1).expect("first label dictionary") else {
-            panic!("first label must be a dictionary"); // cov:ignore: qpdf fixture shape is asserted by this test
-        };
-        assert_eq!(label.get("P"), Some(&Object::String(Vec::new())));
+        let page_labels = catalog.get_key(b"/PageLabels");
+        chunk.resolve(&page_labels).expect("PageLabels resolves");
+        let nums = page_labels.get_key(b"/Nums");
+        chunk.resolve(&nums).expect("PageLabels /Nums resolves");
+        let labels = nums.as_array().expect("PageLabels /Nums must be an array");
+        let label = labels.get(1).expect("first label dictionary");
+        chunk.resolve(label).expect("label dictionary resolves");
+        assert_eq!(label.get_key(b"/P").as_string(), Some(Vec::new()));
     }
 
     #[test]
@@ -1109,33 +1103,23 @@ mod tests {
         pdf
     }
 
-    /// Read the catalog's `/PageLabels /Nums` entries as `(index, Dictionary)`
+    /// Read the catalog's `/PageLabels /Nums` entries as `(index, label handle)`
     /// pairs, for asserting the exact reconstructed shape of a chunk's labels.
-    fn read_nums(bytes: &[u8]) -> Vec<(i64, crate::Dictionary)> {
+    fn read_nums(bytes: &[u8]) -> Vec<(i64, ObjectHandle)> {
         let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("should parse");
-        let catalog_ref = pdf.root_ref().expect("/Root");
-        let catalog = pdf
-            .resolve_object(catalog_ref)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog is a dict");
-        let Some(Object::Dictionary(page_labels)) = catalog.get("PageLabels") else {
-            panic!("/PageLabels must be a direct dictionary, got {catalog:?}"); // cov:ignore: defensive — split always installs a direct dict when labels exist
-        };
-        let Some(Object::Array(nums)) = page_labels.get("Nums") else {
-            panic!("/Nums must be a direct array"); // cov:ignore: defensive — write_reconstructed_labels always installs a direct array
-        };
-        nums.chunks_exact(2)
+        let catalog = pdf.root_handle().expect("/Root");
+        let page_labels = catalog.get_key(b"/PageLabels");
+        pdf.resolve(&page_labels).expect("resolve PageLabels");
+        let nums = page_labels.get_key(b"/Nums");
+        pdf.resolve(&nums).expect("resolve /Nums");
+        nums.as_array()
+            .expect("/Nums must be a direct array")
+            .chunks_exact(2)
             .map(|pair| {
-                let idx = match &pair[0] {
-                    Object::Integer(n) => *n,
-                    other => panic!("expected an integer index, got {other:?}"), // cov:ignore: defensive — write_reconstructed_labels always emits an integer index
-                };
-                let dict = match &pair[1] {
-                    Object::Dictionary(d) => d.clone(),
-                    other => panic!("expected a label dictionary, got {other:?}"), // cov:ignore: defensive — write_reconstructed_labels always emits a label dictionary
-                };
-                (idx, dict)
+                let idx = pair[0]
+                    .as_integer()
+                    .expect("expected an integer label index");
+                (idx, pair[1].clone())
             })
             .collect()
     }
@@ -1334,28 +1318,28 @@ mod tests {
         let chunk2 = std::fs::read(tmpdir.path().join("out-3-4.pdf")).unwrap();
         let chunk3 = std::fs::read(tmpdir.path().join("out-5-5.pdf")).unwrap();
 
-        let s = |name: &str| Object::Name(name.as_bytes().to_vec());
+        let s = |name: &str| name.as_bytes().to_vec();
 
         let nums1 = read_nums(&chunk1);
         assert_eq!(nums1.len(), 1);
         assert_eq!(nums1[0].0, 0);
-        assert_eq!(nums1[0].1.get("S"), Some(&s("r")));
-        assert_eq!(nums1[0].1.get("St"), Some(&Object::Integer(1)));
+        assert_eq!(nums1[0].1.get_key(b"/S").as_name(), Some(s("r")));
+        assert_eq!(nums1[0].1.get_key(b"/St").as_integer(), Some(1));
 
         let nums2 = read_nums(&chunk2);
         assert_eq!(nums2.len(), 2, "roman continuation + decimal restart");
         assert_eq!(nums2[0].0, 0);
-        assert_eq!(nums2[0].1.get("S"), Some(&s("r")));
-        assert_eq!(nums2[0].1.get("St"), Some(&Object::Integer(3)));
+        assert_eq!(nums2[0].1.get_key(b"/S").as_name(), Some(s("r")));
+        assert_eq!(nums2[0].1.get_key(b"/St").as_integer(), Some(3));
         assert_eq!(nums2[1].0, 1);
-        assert_eq!(nums2[1].1.get("S"), Some(&s("D")));
-        assert_eq!(nums2[1].1.get("St"), Some(&Object::Integer(1)));
+        assert_eq!(nums2[1].1.get_key(b"/S").as_name(), Some(s("D")));
+        assert_eq!(nums2[1].1.get_key(b"/St").as_integer(), Some(1));
 
         let nums3 = read_nums(&chunk3);
         assert_eq!(nums3.len(), 1);
         assert_eq!(nums3[0].0, 0);
-        assert_eq!(nums3[0].1.get("S"), Some(&s("D")));
-        assert_eq!(nums3[0].1.get("St"), Some(&Object::Integer(2)));
+        assert_eq!(nums3[0].1.get_key(b"/S").as_name(), Some(s("D")));
+        assert_eq!(nums3[0].1.get_key(b"/St").as_integer(), Some(2));
     }
 
     #[test]
@@ -1367,14 +1351,9 @@ mod tests {
 
         let chunk = std::fs::read(tmpdir.path().join("out-1.pdf")).unwrap();
         let mut pdf = Pdf::open(Cursor::new(chunk)).expect("should parse");
-        let catalog_ref = pdf.root_ref().unwrap();
-        let catalog = pdf
-            .resolve_object(catalog_ref)
-            .unwrap()
-            .into_dict()
-            .expect("catalog is a dict");
+        let catalog = pdf.root_handle().unwrap();
         assert!(
-            catalog.get("PageLabels").is_none(),
+            !catalog.has_key(b"/PageLabels"),
             "a source with no /PageLabels must not gain one"
         );
     }
