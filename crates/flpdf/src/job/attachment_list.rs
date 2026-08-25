@@ -413,6 +413,31 @@ mod tests {
         pdf
     }
 
+    fn inline_non_dictionary_filespec_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(k.txt) (not-a-filespec)] >> >> >>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
     fn open_minimal() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
     }
@@ -470,6 +495,10 @@ mod tests {
     impl HandleDict {
         fn new() -> Self {
             Self(ObjectHandle::dictionary(Vec::new()))
+        }
+
+        fn from_entries(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
+            Self(ObjectHandle::dictionary(entries))
         }
 
         fn insert(&self, key: &str, value: ObjectHandle) {
@@ -738,9 +767,8 @@ mod tests {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
         let missing = ObjectRef::new(stream_ref.number + 40, 0);
-        let ef = HandleDict::new();
+        let ef = HandleDict::from_entries(vec![(b"/UF".to_vec(), ObjectHandle::null())]);
         ef.insert("F", object_ref(&mut pdf, stream_ref));
-        ef.insert("UF", ObjectHandle::null());
         ef.insert("Unix", object_ref(&mut pdf, missing));
         let filespec = HandleDict::new();
         filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
@@ -913,34 +941,40 @@ mod tests {
     fn non_dictionary_filespec_value_still_lists_the_key() {
         // qpdf warns ("Embedded file object is not a dictionary") and carries
         // on with empty values rather than failing the listing.
-        for value_kind in 0..2 {
-            let mut pdf = open_minimal();
-            let value = match value_kind {
-                0 => {
-                    let bad_ref = next_ref(&mut pdf);
-                    pdf.set_object_handle(
-                        bad_ref,
-                        ObjectHandle::string(b"not-a-filespec".to_vec()),
-                    )
-                    .expect("install non-dictionary Filespec fixture");
-                    object_ref(&mut pdf, bad_ref)
-                }
-                _ => object_ref(&mut pdf, ObjectRef::new(4096, 0)),
-            };
-            attach_raw_tree_value(&mut pdf, b"k.txt", value);
-            assert_eq!(
-                as_text(&listing(&mut pdf, true)),
-                "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
-            );
-            assert!(
-                pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-                    diagnostic
-                        .message
-                        .contains("Embedded file object is not a dictionary")
-                }),
-                "QPDFFileSpecObjectHelper must warn for a non-dictionary Filespec"
-            );
-        }
+        let mut direct_pdf = Pdf::open(Cursor::new(inline_non_dictionary_filespec_pdf_bytes()))
+            .expect("open direct non-dictionary Filespec fixture");
+        assert_eq!(
+            as_text(&listing(&mut direct_pdf, true)),
+            "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+        );
+        assert!(
+            direct_pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("Embedded file object is not a dictionary")),
+            "QPDFFileSpecObjectHelper must warn for a direct non-dictionary Filespec"
+        );
+
+        let mut dangling_pdf = open_minimal();
+        let dangling = object_ref(&mut dangling_pdf, ObjectRef::new(4096, 0));
+        attach_raw_tree_value(&mut dangling_pdf, b"k.txt", dangling);
+        assert_eq!(
+            as_text(&listing(&mut dangling_pdf, true)),
+            "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+        );
+        assert!(
+            dangling_pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("Embedded file object is not a dictionary")),
+            "QPDFFileSpecObjectHelper must warn for a dangling Filespec"
+        );
     }
 
     // ── Name-tree keys use qpdf's UTF-8 view ──────────────────────────────────
