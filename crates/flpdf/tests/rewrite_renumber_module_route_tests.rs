@@ -30,6 +30,57 @@ fn rewrite_renumber_is_owned_by_the_writer_module() {
     );
 }
 
+/// Find the end (one past the closing brace) of the item body starting at
+/// `body`'s leading `{`, treating braces inside `//` line comments and
+/// `"..."` / `b"..."` string literals as inert rather than counting them.
+/// `rewrite_renumber.rs` uses only line comments and (byte-)string literals
+/// today (no block comments, raw strings, or char literals in its
+/// `#[cfg(test)]` regions); this scan covers exactly those forms rather than
+/// a full Rust tokenizer.
+fn cfg_test_item_body_end(body: &str) -> Option<usize> {
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        LineComment,
+        StringLiteral,
+    }
+
+    let mut state = State::Code;
+    let mut depth: usize = 0;
+    let mut chars = body.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        match state {
+            State::Code => match ch {
+                '/' if chars.peek().map(|&(_, c)| c) == Some('/') => {
+                    state = State::LineComment;
+                }
+                '"' => state = State::StringLiteral,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + ch.len_utf8());
+                    }
+                }
+                _ => {}
+            },
+            State::LineComment => {
+                if ch == '\n' {
+                    state = State::Code;
+                }
+            }
+            State::StringLiteral => match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => state = State::Code,
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 /// Remove every `#[cfg(test)]`-attributed item's full body (not just the
 /// text before the first marker) so a scan of the remainder covers all
 /// production code, including any that follows an early test-only item.
@@ -43,26 +94,30 @@ fn strip_cfg_test_items(source: &str) -> String {
             .find('{')
             .expect("a #[cfg(test)] item must have a body");
         let body = &after_marker[brace_start..];
-        let mut depth: usize = 0;
-        let mut end = None;
-        for (i, ch) in body.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let end = end.expect("a #[cfg(test)] item must have a balanced body");
+        let end =
+            cfg_test_item_body_end(body).expect("a #[cfg(test)] item must have a balanced body");
         rest = &after_marker[brace_start + end..];
     }
     production.push_str(rest);
     production
+}
+
+/// True if `haystack` contains `needle` as a whole identifier/path token —
+/// not merely as a substring — so `CatalogFirstRenumber::` does not
+/// spuriously match inside `CanonicalCatalogFirstRenumber::`.
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
+    haystack.match_indices(needle).any(|(i, _)| {
+        let before_ok = haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let after_ok = haystack[i + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_ident_char(c));
+        before_ok && after_ok
+    })
 }
 
 #[test]
@@ -78,11 +133,11 @@ fn production_renumber_route_has_only_the_canonical_handle_engine() {
     for forbidden in [
         "struct CatalogFirstRenumber",
         "impl CatalogFirstRenumber",
-        "CatalogFirstRenumber::",
+        "CatalogFirstRenumber",
         "collect_qpdf_enqueue_refs",
     ] {
         assert!(
-            !production.contains(forbidden),
+            !contains_token(&production, forbidden),
             "production renumbering still contains obsolete raw engine token {forbidden:?}"
         );
     }
