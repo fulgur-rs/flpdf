@@ -2127,10 +2127,18 @@ mod tests {
         let resources = stream_dict
             .try_get_key(b"/Resources")
             .expect("appearance must retain resources");
+        assert!(
+            resources.is_direct(),
+            "flattening must privatize /Resources into a direct copy, not keep the shared {resources_ref:?} indirect reference"
+        );
         pdf.resolve(&resources).unwrap();
         let fonts = resources
             .try_get_key(b"/Font")
             .expect("appearance must retain Font resources");
+        assert!(
+            fonts.is_direct(),
+            "flattening must privatize /Font into a direct copy, not keep the shared {font_ref:?} indirect reference"
+        );
         pdf.resolve(&fonts).unwrap();
         let helv = fonts.try_get_key(b"/Helv").unwrap();
         pdf.resolve(&helv).unwrap();
@@ -2149,7 +2157,15 @@ mod tests {
 
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve(&root).unwrap();
-        assert!(root.try_get_key(b"/AcroForm").unwrap().is_null());
+        assert!(
+            !root
+                .as_dictionary()
+                .expect("fixture root must remain a dictionary")
+                .contains_key(b"/AcroForm".as_slice()),
+            "/AcroForm must be removed as a dictionary entry, not merely nulled -- \
+             try_get_key alone cannot distinguish an absent key from a present null \
+             value, matching qpdf's own key/null conflation"
+        );
     }
 
     // -----------------------------------------------------------------------
