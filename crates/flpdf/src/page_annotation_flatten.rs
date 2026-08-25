@@ -2227,17 +2227,30 @@ mod tests {
     /// for the `/AcroForm` dict so it never collides with a fixture's own
     /// numbering.
     fn register_acroform_fields<R: Read + Seek>(pdf: &mut Pdf<R>, widget_refs: &[ObjectRef]) {
-        let mut acroform = Dictionary::new();
-        acroform.insert(
-            "Fields",
-            Object::Array(widget_refs.iter().copied().map(Object::Reference).collect()),
-        );
-        pdf.set_object(ObjectRef::new(900, 0), Object::Dictionary(acroform));
-        let mut catalog = Dictionary::new();
-        catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.insert("Pages", Object::Reference(ObjectRef::new(2, 0)));
-        catalog.insert("AcroForm", Object::Reference(ObjectRef::new(900, 0)));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        let field_handles = widget_refs
+            .iter()
+            .copied()
+            .map(|widget_ref| pdf.get_object_handle(widget_ref))
+            .collect();
+        let acroform_ref = ObjectRef::new(900, 0);
+        pdf.replace_object_handle(
+            acroform_ref,
+            ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(field_handles),
+            )]),
+        )
+        .unwrap();
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).unwrap();
+        root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))
+            .unwrap();
+        root.replace_key(b"/Pages", pdf.get_object_handle(ObjectRef::new(2, 0)))
+            .unwrap();
+        root.replace_key(b"/AcroForm", pdf.get_object_handle(acroform_ref))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
     }
 
     /// Build a minimal Form XObject stream with given /BBox.
