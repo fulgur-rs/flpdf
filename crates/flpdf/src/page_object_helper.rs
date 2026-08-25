@@ -15,7 +15,7 @@
 //!
 //! - [`content_stream_objects`](PageObjectHelper::content_stream_objects) —
 //!   decode via the existing stream filter pipeline, then parse into
-//!   qpdf-shaped [`Object`] events.
+//!   qpdf-shaped [`ObjectHandle`] events.
 //! - [`get_resources`](PageObjectHelper::get_resources) — delegates to the
 //!   canonical ObjectHandle `/Parent`-chain lookup for `/Resources`.
 //! - [`rotate`](PageObjectHelper::rotate) — **getter** that uses the page-local
@@ -112,7 +112,7 @@ use crate::pipeline::{Pipeline, PipelineError, PlString};
 use crate::token_filter::TokenFilter;
 use crate::tokenizer::{Token, TokenType};
 use crate::writer::DecodeLevel;
-use crate::{Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result};
+use crate::{Error, Matrix, ObjectRef, Pdf, Rectangle, Result};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -125,7 +125,7 @@ use std::rc::Rc;
 /// An axis-aligned rectangle expressed as `[llx, lly, urx, ury]` in user-space
 /// units, corresponding to a PDF rectangle array `[x1 y1 x2 y2]`.
 ///
-/// PDF allows any combination of [`Object::Integer`] and [`Object::Real`]
+/// PDF allows any combination of [`crate::Object::Integer`] and [`crate::Object::Real`]
 /// elements; both are coerced to `f64`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageBox {
@@ -164,7 +164,7 @@ pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
 
 #[derive(Default)]
 struct ObjectRecordingCallbacks {
-    objects: Vec<Object>,
+    objects: Vec<ObjectHandle>,
 }
 
 struct ExternalizedInlineImage {
@@ -387,7 +387,7 @@ impl ObjectHandleParserCallbacks for ObjectRecordingCallbacks {
         _offset: usize,
         _length: usize,
     ) -> Result<ParseControl> {
-        self.objects.push(object.materialize()?);
+        self.objects.push(object);
         Ok(ParseControl::Continue)
     }
 
@@ -449,7 +449,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// `/Type`. This is the page-helper equivalent of qpdf's
     /// `QPDFPageObjectHelper` construction over a `QPDFObjectHandle`: all
     /// subsequent page attributes and mutations operate on the resolver-backed
-    /// object graph rather than on a legacy `Object` snapshot.
+    /// object graph rather than on a legacy raw snapshot.
     fn resolved_page_handle(&mut self) -> Result<ObjectHandle> {
         let (object, is_form) = self.resolved_attribute_target()?;
         if is_form {
@@ -857,7 +857,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// }
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn content_stream_objects(&mut self) -> Result<Vec<Object>> {
+    pub fn content_stream_objects(&mut self) -> Result<Vec<ObjectHandle>> {
         let mut callbacks = ObjectRecordingCallbacks::default();
         self.parse_contents(&mut callbacks)?;
         Ok(callbacks.objects)
@@ -868,7 +868,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// This is the direct `QPDFPageObjectHelper::getPageContents` route
     /// (`libqpdf/QPDFPageObjectHelper.cc:439-442`) and deliberately preserves
     /// each stream's identity and lazy provider instead of decoding it into a
-    /// byte buffer or legacy [`Object`] value.
+    /// byte buffer or legacy raw value.
     pub fn get_page_contents(&mut self) -> Result<Vec<ObjectHandle>> {
         let (target, _) = self.resolved_attribute_target()?;
         target.get_page_contents()
@@ -1537,7 +1537,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] when `page_ref` does not resolve to a
     ///   dictionary, when `/Annots` is not an array, or when an array element
-    ///   is not an [`Object::Reference`].
+    ///   is not a [`crate::Object::Reference`].
     /// - Any error from [`Pdf::resolve`].
     ///
     /// # Examples
