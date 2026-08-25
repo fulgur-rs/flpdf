@@ -85,7 +85,7 @@ impl QPDFJob {
         if !pdf.is_linearized()? {
             logger.info(format!("{input_name} is not linearized\n"))?;
             self.record_document_warnings(pdf);
-            return Ok(self.complete(false)?);
+            return self.complete(false);
         }
 
         let linearization_warnings =
@@ -97,7 +97,7 @@ impl QPDFJob {
             logger.info(format!("{input_name}: no linearization errors\n"))?;
         }
         self.record_document_warnings(pdf);
-        Ok(self.complete(false)?)
+        self.complete(false)
     }
 
     /// Replay qpdf repair diagnostics retained by a failed permissive open.
