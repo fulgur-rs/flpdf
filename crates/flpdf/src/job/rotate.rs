@@ -610,12 +610,8 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
         // The leaf itself must now carry /Rotate explicitly.
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(180)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
     }
 
     #[test]
@@ -632,11 +628,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(180)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
     }
 
     #[test]
@@ -652,11 +644,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(0)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(0));
     }
 
     #[test]
