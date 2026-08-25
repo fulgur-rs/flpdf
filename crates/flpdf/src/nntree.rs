@@ -304,6 +304,14 @@ fn materialize_cursor_value(handle: &ObjectHandle) -> Result<Object> {
 /// risking that document's object reference being serialized into `pdf`.
 /// This mirrors the check `EmbeddedFileDocumentHelper::replace_embedded_file`
 /// already performs before its own tree insert.
+///
+/// An indirect `value` is checked with the same canonical-registration
+/// strictness `replace_embedded_file` uses. A direct `value` is checked with
+/// [`ObjectHandle::belongs_exclusively_to_pdf`], not the shallower
+/// [`ObjectHandle::belongs_to_pdf`]: a freshly constructed direct wrapper
+/// (e.g. `ObjectHandle::dictionary`) always reports no owner of its own even
+/// when it nests an already-indirect handle from a different `Pdf`, so only
+/// a full descendant walk catches that case.
 fn ensure_value_owned_by_pdf<R: Read + Seek>(pdf: &Pdf<R>, value: &ObjectHandle) -> Result<()> {
     if let Some(object_ref) = value.object_ref() {
         if !pdf.is_canonical_object_handle(value) {
@@ -312,7 +320,7 @@ fn ensure_value_owned_by_pdf<R: Read + Seek>(pdf: &Pdf<R>, value: &ObjectHandle)
             ));
         }
         debug_assert_eq!(value.object_ref(), Some(object_ref));
-    } else if !value.belongs_to_pdf(pdf.unique_id()) {
+    } else if !value.belongs_exclusively_to_pdf(pdf.unique_id()) {
         return Err(Error::Unsupported(
             "name/number tree value belongs to a different Pdf".to_string(),
         ));
@@ -1390,12 +1398,15 @@ impl<K: TreeKey> NNTree<K> {
         let pdf_id = pdf.unique_id();
         if let Some(root) = &self.canonical_root {
             if self.canonical_root_pdf_id.is_none() {
-                if let Some(existing_owner) = root.owning_pdf_unique_id() {
-                    if existing_owner != pdf_id {
-                        return Err(Error::Unsupported(
-                            "name/number tree root belongs to a different Pdf".to_string(),
-                        ));
-                    }
+                // A contextless direct root (e.g. one handed to `NameTree::new`
+                // without ever passing through this Pdf) reports no owner of
+                // its own via `owning_pdf_unique_id`, but may still nest an
+                // already-indirect child from a different Pdf several direct
+                // hops down; only a full descendant walk catches that shape.
+                if !root.belongs_exclusively_to_pdf(pdf_id) {
+                    return Err(Error::Unsupported(
+                        "name/number tree root belongs to a different Pdf".to_string(),
+                    ));
                 }
                 self.canonical_root_pdf_id = Some(pdf_id);
                 return Ok(root.clone());
@@ -3620,6 +3631,51 @@ mod tests {
             .expect("find inserted value")
             .expect("inserted value");
         assert!(inserted.is_same_object_as(&retained));
+    }
+
+    #[test]
+    fn handle_name_tree_rejects_a_fresh_wrapper_nesting_a_foreign_indirect_value() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let mut tree = NameTree::new_empty(&mut pdf_two, true).expect("new_empty");
+
+        let foreign_indirect = pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::string(b"one".to_vec()))
+            .expect("allocate value in pdf_one");
+        // A fresh direct wrapper that was never itself promoted to indirect in
+        // any Pdf, but nests the pdf_one-owned indirect handle one hop down.
+        // The outer handle's own shallow ownership fields report no owner;
+        // only a full-graph walk catches the foreign descendant.
+        let wrapper = ObjectHandle::dictionary(vec![(b"/Held".to_vec(), foreign_indirect)]);
+        assert!(wrapper.object_ref().is_none());
+
+        let error = tree
+            .insert(&mut pdf_two, b"a", wrapper)
+            .err()
+            .expect("a wrapper nesting pdf_one's handle must be rejected in pdf_two's tree");
+        assert!(error.to_string().contains("different Pdf"));
+    }
+
+    #[test]
+    fn handle_name_tree_root_rejects_a_contextless_root_nesting_a_foreign_indirect_child() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let foreign_indirect = pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::array(vec![]))
+            .expect("allocate a /Names-shaped value in pdf_one");
+        // A fresh contextless direct root that nests the pdf_one-owned
+        // indirect handle under /Names -- never itself promoted to indirect,
+        // so its own shallow owning_pdf_unique_id() is None.
+        let root = ObjectHandle::dictionary(vec![(b"/Names".to_vec(), foreign_indirect)]);
+        assert!(root.object_ref().is_none());
+
+        let mut tree = NameTree::new(root, true);
+        let error = tree
+            .find_object(&mut pdf_two, b"anything")
+            .expect_err("a root nesting pdf_one's handle must be rejected as pdf_two's root");
+        assert!(error.to_string().contains("different Pdf"));
     }
 
     #[test]
