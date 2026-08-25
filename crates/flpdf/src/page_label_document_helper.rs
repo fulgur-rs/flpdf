@@ -367,10 +367,13 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         Ok(Some(catalog.try_get_key(b"/PageLabels")?))
     }
 
-    fn pagelabels_tree(&mut self) -> Result<Option<crate::nntree::HandleNumberTree>> {
-        Ok(self
-            .pagelabels_root_handle()?
-            .map(|root| crate::nntree::HandleNumberTree::new(root, DEFAULT_MAX_TREE_DEPTH)))
+    fn pagelabels_tree(&mut self) -> Result<Option<crate::nntree::NumberTree>> {
+        let Some(root) = self.pagelabels_root_handle()? else {
+            return Ok(None);
+        };
+        let mut tree = crate::nntree::NumberTree::new(root, true);
+        tree.set_max_depth(DEFAULT_MAX_TREE_DEPTH);
+        Ok(Some(tree))
     }
 
     /// Whether the document carries a `/PageLabels` tree with at least the root.
@@ -426,10 +429,10 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     ///   exceeded.
     /// - Any error from [`Pdf::resolve`].
     pub fn ranges(&mut self) -> Result<Vec<(i64, LabelRange)>> {
-        let Some(tree) = self.pagelabels_tree()? else {
+        let Some(mut tree) = self.pagelabels_tree()? else {
             return Ok(vec![]);
         };
-        let raw_entries = tree.entries(self.pdf)?;
+        let raw_entries = tree.as_map(self.pdf)?;
         let mut entries = Vec::with_capacity(raw_entries.len());
         for (index, value) in raw_entries {
             if let Some(range) = LabelRange::from_handle(self.pdf, &value)? {
@@ -468,10 +471,10 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// Returns errors from canonical object resolution, number-tree traversal,
     /// or checked `/St` offset arithmetic.
     pub fn get_label_for_page(&mut self, page_idx: i64) -> Result<Option<ObjectHandle>> {
-        let Some(tree) = self.pagelabels_tree()? else {
+        let Some(mut tree) = self.pagelabels_tree()? else {
             return Ok(None);
         };
-        self.get_label_for_page_from_tree(&tree, page_idx)
+        self.get_label_for_page_from_tree(&mut tree, page_idx)
     }
 
     /// Append qpdf's reconstructed label entries for an inclusive source page
@@ -499,8 +502,8 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let idx_offset = new_start_idx
             .checked_sub(start_idx)
             .ok_or_else(|| Error::Unsupported("page label index offset overflow".to_string()))?;
-        let tree = self.pagelabels_tree()?;
-        let first_label = match tree.as_ref() {
+        let mut tree = self.pagelabels_tree()?;
+        let first_label = match tree.as_mut() {
             Some(tree) => self
                 .get_label_for_page_from_tree(tree, start_idx)?
                 .unwrap_or_else(|| ObjectHandle::dictionary(Vec::new())),
@@ -541,7 +544,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             labels.push((new_start_idx, first_label));
         }
 
-        if let Some(tree) = tree.as_ref() {
+        if let Some(tree) = tree.as_mut() {
             let mut source_idx = start_idx;
             while source_idx < end_idx {
                 source_idx = source_idx.checked_add(1).ok_or_else(|| {
@@ -565,7 +568,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
 
     fn get_label_for_page_from_tree(
         &mut self,
-        tree: &crate::nntree::HandleNumberTree,
+        tree: &mut crate::nntree::NumberTree,
         page_idx: i64,
     ) -> Result<Option<ObjectHandle>> {
         let Some((label, offset)) = tree.find_object_at_or_below(self.pdf, page_idx)? else {
@@ -709,7 +712,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         src_indices: &[i64],
         out_start_idx: i64,
     ) -> Result<Vec<(i64, LabelRange, bool)>> {
-        let tree = self.pagelabels_tree()?;
+        let mut tree = self.pagelabels_tree()?;
         let mut out = Vec::with_capacity(src_indices.len());
         for (i, &src_idx) in src_indices.iter().enumerate() {
             let out_idx = out_start_idx
@@ -720,7 +723,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 .ok_or_else(|| {
                     Error::Unsupported("page label output index overflow".to_string())
                 })?;
-            let label = match tree.as_ref() {
+            let label = match tree.as_mut() {
                 Some(tree) => self.get_label_for_page_from_tree(tree, src_idx)?,
                 None => None,
             };
@@ -755,10 +758,10 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// dictionaries; the JSON representation renders an empty Unicode prefix
     /// as `u:` while an absent prefix is omitted.
     pub fn label_prefix_is_present(&mut self, page_idx: i64) -> Result<bool> {
-        let Some(tree) = self.pagelabels_tree()? else {
+        let Some(mut tree) = self.pagelabels_tree()? else {
             return Ok(false);
         };
-        let Some(label) = self.get_label_for_page_from_tree(&tree, page_idx)? else {
+        let Some(label) = self.get_label_for_page_from_tree(&mut tree, page_idx)? else {
             return Ok(false);
         };
         let label = self.pdf.resolve_to_terminal(&label)?;
@@ -1318,16 +1321,20 @@ mod tests {
     }
 
     #[test]
-    fn get_label_for_page_skips_dangling_number_tree_item() {
+    fn get_label_for_page_reports_qpdf_short_number_tree_error() {
         let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0)]);
-        assert!(pdf.page_labels().get_label_for_page(0).unwrap().is_none());
+        let error = pdf
+            .page_labels()
+            .get_label_for_page(0)
+            .expect_err("qpdf rejects a short /Nums pair during find");
+        assert!(error.to_string().contains("items array is too short"));
         assert!(pdf
             .repair_diagnostics()
             .entries()
             .iter()
             .any(|warning| warning
                 .message
-                .contains("items array doesn't have enough elements")));
+                .contains("update ivalue: items array is too short")));
     }
 
     #[test]

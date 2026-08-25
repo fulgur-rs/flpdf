@@ -1,4 +1,4 @@
-use flpdf::{Dictionary, NameTree, NumberTree, Object, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{NameTree, NumberTree, Object, ObjectHandle, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::process::Command;
@@ -250,50 +250,57 @@ fn empty_name_tree_root() -> ObjectHandle {
     ObjectHandle::dictionary(vec![(b"/Names".to_vec(), ObjectHandle::array(Vec::new()))])
 }
 
+fn empty_number_tree_root() -> ObjectHandle {
+    ObjectHandle::dictionary(vec![(b"/Nums".to_vec(), ObjectHandle::array(Vec::new()))])
+}
+
 #[test]
 fn number_tree_insert_exposes_value_through_find_object() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
 
-    tree.insert(&mut pdf, 7, Object::String(b"seven".to_vec()))
+    tree.insert(&mut pdf, 7, ObjectHandle::string(b"seven".to_vec()))
         .expect("insert");
 
     assert_eq!(
-        tree.find_object(&mut pdf, 7).expect("find"),
-        Some(Object::String(b"seven".to_vec()))
+        tree.find_object(&mut pdf, 7)
+            .expect("find")
+            .and_then(|value| value.as_string()),
+        Some(b"seven".to_vec())
     );
 }
 
 #[test]
 fn number_tree_set_max_depth_bounds_kids_chain_traversal() {
     let mut pdf = empty_pdf();
-    let leaf_ref = ObjectRef::new(3, 0);
-    let mut leaf = Dictionary::new();
-    leaf.insert(
-        "Nums",
-        Object::Array(vec![Object::Integer(0), Object::String(b"zero".to_vec())]),
-    );
-    leaf.insert(
-        "Limits",
-        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
-    );
-    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+    let leaf = pdf
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![
+            (
+                b"/Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::string(b"zero".to_vec()),
+                ]),
+            ),
+            (
+                b"/Limits".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(0)]),
+            ),
+        ]))
+        .expect("leaf");
+    let branch = pdf
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![
+            (b"/Kids".to_vec(), ObjectHandle::array(vec![leaf])),
+            (
+                b"/Limits".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(0), ObjectHandle::integer(0)]),
+            ),
+        ]))
+        .expect("branch");
+    let root =
+        ObjectHandle::dictionary(vec![(b"/Kids".to_vec(), ObjectHandle::array(vec![branch]))]);
 
-    let branch_ref = ObjectRef::new(2, 0);
-    let mut branch = Dictionary::new();
-    branch.insert("Kids", Object::Array(vec![Object::Reference(leaf_ref)]));
-    branch.insert(
-        "Limits",
-        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
-    );
-    pdf.set_object(branch_ref, Object::Dictionary(branch));
-
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(vec![Object::Reference(branch_ref)]));
-
-    let mut bounded = NumberTree::new(Object::Dictionary(root.clone()), true);
+    let mut bounded = NumberTree::new(root.clone(), true);
     bounded.set_max_depth(1);
     let error = bounded
         .find_object(&mut pdf, 0)
@@ -303,99 +310,100 @@ fn number_tree_set_max_depth_bounds_kids_chain_traversal() {
         "unexpected error: {error}"
     );
 
-    let mut unbounded_enough = NumberTree::new(Object::Dictionary(root), true);
+    let mut unbounded_enough = NumberTree::new(root, true);
     unbounded_enough.set_max_depth(flpdf::DEFAULT_MAX_TREE_DEPTH);
     assert_eq!(
         unbounded_enough
             .find_object(&mut pdf, 0)
-            .expect("within the default depth cap"),
-        Some(Object::String(b"zero".to_vec()))
+            .expect("within the default depth cap")
+            .and_then(|value| value.as_string()),
+        Some(b"zero".to_vec())
     );
 }
 
 #[test]
 fn number_tree_end_cursor_moves_to_first_or_last_entry() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
-    tree.insert(&mut pdf, 10, Object::String(b"ten".to_vec()))
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
+    tree.insert(&mut pdf, 10, ObjectHandle::string(b"ten".to_vec()))
         .expect("insert ten");
-    tree.insert(&mut pdf, 20, Object::String(b"twenty".to_vec()))
+    tree.insert(&mut pdf, 20, ObjectHandle::string(b"twenty".to_vec()))
         .expect("insert twenty");
 
     let mut forward = tree.end();
     assert!(!forward.valid());
     forward.next(&mut tree, &mut pdf).expect("next from end");
-    assert_eq!(
-        forward.current(),
-        Some((10, Object::String(b"ten".to_vec())))
-    );
+    let (key, value) = forward.current().expect("first entry");
+    assert_eq!(key, 10);
+    assert_eq!(value.as_string(), Some(b"ten".to_vec()));
 
     let mut backward = tree.end();
     backward
         .previous(&mut tree, &mut pdf)
         .expect("previous from end");
-    assert_eq!(
-        backward.current(),
-        Some((20, Object::String(b"twenty".to_vec())))
-    );
+    let (key, value) = backward.current().expect("last entry");
+    assert_eq!(key, 20);
+    assert_eq!(value.as_string(), Some(b"twenty".to_vec()));
 }
 
 #[test]
 fn number_tree_queries_match_qpdf_boundaries() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
-    tree.insert(&mut pdf, -3, Object::String(b"minus-three".to_vec()))
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
+    tree.insert(&mut pdf, -3, ObjectHandle::string(b"minus-three".to_vec()))
         .expect("insert -3");
-    tree.insert(&mut pdf, 6, Object::String(b"six".to_vec()))
+    tree.insert(&mut pdf, 6, ObjectHandle::string(b"six".to_vec()))
         .expect("insert 6");
 
     assert_eq!(tree.min(&mut pdf).expect("min"), -3);
     assert_eq!(tree.max(&mut pdf).expect("max"), 6);
     assert!(tree.has_index(&mut pdf, -3).expect("has -3"));
     assert!(!tree.has_index(&mut pdf, 5).expect("has 5"));
-    assert_eq!(
-        tree.find_object_at_or_below(&mut pdf, 5)
-            .expect("at or below"),
-        Some((Object::String(b"minus-three".to_vec()), 8))
-    );
-    assert_eq!(
-        tree.find_object_at_or_below(&mut pdf, -4)
-            .expect("below minimum"),
-        None
-    );
+    let (value, offset) = tree
+        .find_object_at_or_below(&mut pdf, 5)
+        .expect("at or below")
+        .expect("lower entry");
+    assert_eq!(value.as_string(), Some(b"minus-three".to_vec()));
+    assert_eq!(offset, 8);
+    assert!(tree
+        .find_object_at_or_below(&mut pdf, -4)
+        .expect("below minimum")
+        .is_none());
 }
 
 #[test]
 fn number_tree_cursor_insert_after_and_remove_advances() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
     let mut cursor = tree.end();
 
     cursor
-        .insert_after(&mut tree, &mut pdf, 10, Object::String(b"ten".to_vec()))
+        .insert_after(
+            &mut tree,
+            &mut pdf,
+            10,
+            ObjectHandle::string(b"ten".to_vec()),
+        )
         .expect("insert ten after end");
     cursor
-        .insert_after(&mut tree, &mut pdf, 20, Object::String(b"twenty".to_vec()))
+        .insert_after(
+            &mut tree,
+            &mut pdf,
+            20,
+            ObjectHandle::string(b"twenty".to_vec()),
+        )
         .expect("insert twenty after ten");
     cursor
         .previous(&mut tree, &mut pdf)
         .expect("move back to ten");
-    assert_eq!(
-        cursor.current(),
-        Some((10, Object::String(b"ten".to_vec())))
-    );
+    let (key, value) = cursor.current().expect("ten current");
+    assert_eq!(key, 10);
+    assert_eq!(value.as_string(), Some(b"ten".to_vec()));
 
     cursor.remove(&mut tree, &mut pdf).expect("remove ten");
-    assert_eq!(
-        cursor.current(),
-        Some((20, Object::String(b"twenty".to_vec())))
-    );
+    let (key, value) = cursor.current().expect("twenty current");
+    assert_eq!(key, 20);
+    assert_eq!(value.as_string(), Some(b"twenty".to_vec()));
 }
 
 #[test]
@@ -473,18 +481,17 @@ fn number_tree_new_empty_owns_an_indirect_root() {
     let mut pdf = empty_pdf();
 
     let tree = NumberTree::new_empty(&mut pdf, false).expect("new empty");
-    let root = tree.root().clone();
-    let root_ref = root.as_ref_id().expect("indirect root");
+    let root = tree.get_object_handle();
+    assert!(root.object_ref().is_some(), "root must be indirect");
+    pdf.resolve(&root).expect("resolve root");
+    let dictionary = root.as_dictionary().expect("root dictionary");
     assert_eq!(
-        pdf.resolve_object(root_ref).expect("resolve root"),
-        Object::Dictionary({
-            let mut dictionary = Dictionary::new();
-            dictionary.insert("Nums", Object::Array(Vec::new()));
-            dictionary
-        })
+        dictionary
+            .get(b"/Nums".as_slice())
+            .and_then(ObjectHandle::as_array)
+            .map(|items| items.len()),
+        Some(0)
     );
-
-    assert_eq!(tree.into_root(), root);
 }
 
 #[test]
@@ -540,84 +547,81 @@ fn name_tree_helper_exposes_sorted_find_map_and_remove() {
 #[test]
 fn number_tree_helper_exposes_sorted_find_map_and_remove() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
     tree.set_split_threshold(2);
-    tree.insert(&mut pdf, 20, Object::String(b"twenty".to_vec()))
+    tree.insert(&mut pdf, 20, ObjectHandle::string(b"twenty".to_vec()))
         .expect("insert twenty");
-    tree.insert(&mut pdf, 10, Object::String(b"ten".to_vec()))
+    tree.insert(&mut pdf, 10, ObjectHandle::string(b"ten".to_vec()))
         .expect("insert ten");
 
-    assert_eq!(
-        tree.begin(&mut pdf).expect("begin").current(),
-        Some((10, Object::String(b"ten".to_vec())))
-    );
-    assert_eq!(
-        tree.last(&mut pdf).expect("last").current(),
-        Some((20, Object::String(b"twenty".to_vec())))
-    );
-    assert_eq!(
-        tree.find(&mut pdf, 19, true)
-            .expect("find previous")
-            .current(),
-        Some((10, Object::String(b"ten".to_vec())))
-    );
+    let (key, value) = tree.begin(&mut pdf).expect("begin").current().unwrap();
+    assert_eq!(key, 10);
+    assert_eq!(value.as_string(), Some(b"ten".to_vec()));
+    let (key, value) = tree.last(&mut pdf).expect("last").current().unwrap();
+    assert_eq!(key, 20);
+    assert_eq!(value.as_string(), Some(b"twenty".to_vec()));
+    let (key, value) = tree
+        .find(&mut pdf, 19, true)
+        .expect("find previous")
+        .current()
+        .unwrap();
+    assert_eq!(key, 10);
+    assert_eq!(value.as_string(), Some(b"ten".to_vec()));
     assert!(!tree.find(&mut pdf, 19, false).expect("find exact").valid());
+    let map = tree.as_map(&mut pdf).expect("map");
     assert_eq!(
-        tree.as_map(&mut pdf).expect("map"),
-        BTreeMap::from([
-            (10, Object::String(b"ten".to_vec())),
-            (20, Object::String(b"twenty".to_vec())),
-        ])
+        map.get(&10).and_then(ObjectHandle::as_string),
+        Some(b"ten".to_vec())
     );
     assert_eq!(
-        tree.remove(&mut pdf, 20).expect("remove twenty"),
-        Some(Object::String(b"twenty".to_vec()))
+        map.get(&20).and_then(ObjectHandle::as_string),
+        Some(b"twenty".to_vec())
     );
-    assert_eq!(tree.remove(&mut pdf, 20).expect("remove missing"), None);
+    assert_eq!(
+        tree.remove(&mut pdf, 20)
+            .expect("remove twenty")
+            .and_then(|value| value.as_string()),
+        Some(b"twenty".to_vec())
+    );
+    assert!(tree.remove(&mut pdf, 20).expect("remove missing").is_none());
 }
 
 #[test]
 fn number_tree_threshold_two_keeps_all_entries_across_internal_split() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
     tree.set_split_threshold(2);
 
     for key in 0..5 {
-        tree.insert(&mut pdf, key, Object::Integer(key))
+        tree.insert(&mut pdf, key, ObjectHandle::integer(key))
             .expect("insert must survive an internal split");
     }
 
-    assert_eq!(
-        tree.as_map(&mut pdf).expect("map"),
-        BTreeMap::from([
-            (0, Object::Integer(0)),
-            (1, Object::Integer(1)),
-            (2, Object::Integer(2)),
-            (3, Object::Integer(3)),
-            (4, Object::Integer(4)),
-        ])
-    );
+    let map = tree.as_map(&mut pdf).expect("map");
+    assert_eq!(map.len(), 5);
+    for key in 0..5 {
+        assert_eq!(map.get(&key).and_then(ObjectHandle::as_integer), Some(key));
+    }
 }
 
 #[test]
 fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Nums", Object::Array(Vec::new()));
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    let mut tree = NumberTree::new(empty_number_tree_root(), true);
     tree.set_split_threshold(2);
-    tree.insert(&mut pdf, 0, Object::Integer(0))
+    tree.insert(&mut pdf, 0, ObjectHandle::integer(0))
         .expect("insert zero");
-    tree.insert(&mut pdf, 1, Object::Integer(1))
+    tree.insert(&mut pdf, 1, ObjectHandle::integer(1))
         .expect("insert one");
     pdf.set_object(ObjectRef::new(u32::MAX - 1, 0), Object::Null);
-    let before = tree.as_map(&mut pdf).expect("map before failed insert");
+    let before = tree
+        .as_map(&mut pdf)
+        .expect("map before failed insert")
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
 
-    let error = match tree.insert(&mut pdf, 2, Object::Integer(2)) {
+    let error = match tree.insert(&mut pdf, 2, ObjectHandle::integer(2)) {
         Err(error) => error,
         Ok(_) => panic!("root split needs two objects but only one remains"),
     };
@@ -627,7 +631,11 @@ fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
         "unsupported PDF feature: max object id is too high to create new objects"
     );
     assert_eq!(
-        tree.as_map(&mut pdf).expect("map after failed insert"),
+        tree.as_map(&mut pdf)
+            .expect("map after failed insert")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
         before
     );
     assert!(!pdf.object_refs().contains(&ObjectRef::new(u32::MAX, 0)));
@@ -658,18 +666,24 @@ fn canonical_name_reader_returns_qpdf_normalized_utf8_key() {
 #[test]
 fn canonical_number_reader_accepts_direct_kid() {
     let mut pdf = empty_pdf();
-    let mut kid = Dictionary::new();
-    kid.insert(
-        "Nums",
-        Object::Array(vec![Object::Integer(4), Object::String(b"four".to_vec())]),
-    );
-    let mut root = Dictionary::new();
-    root.insert("Kids", Object::Array(vec![Object::Dictionary(kid)]));
+    let root = ObjectHandle::dictionary(vec![(
+        b"/Kids".to_vec(),
+        ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(4),
+                ObjectHandle::string(b"four".to_vec()),
+            ]),
+        )])]),
+    )]);
 
-    let mut tree = NumberTree::new(Object::Dictionary(root), false);
+    let mut tree = NumberTree::new(root, false);
     let entries = tree.as_map(&mut pdf).expect("read");
 
-    assert_eq!(entries.get(&4), Some(&Object::String(b"four".to_vec())));
+    assert_eq!(
+        entries.get(&4).and_then(ObjectHandle::as_string),
+        Some(b"four".to_vec())
+    );
 }
 
 #[test]
@@ -695,12 +709,13 @@ fn typed_cursors_are_cloneable_and_compare_by_qpdf_position() {
     assert!(first != copy);
     assert!(tree.end() == tree.end());
 
-    let mut number_root = Dictionary::new();
-    number_root.insert(
-        "Nums",
-        Object::Array(vec![Object::Integer(3), Object::Integer(30)]),
+    let mut number_tree = NumberTree::new(
+        ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(3), ObjectHandle::integer(30)]),
+        )]),
+        true,
     );
-    let mut number_tree = NumberTree::new(Object::Dictionary(number_root), true);
     let number_first = number_tree.begin(&mut pdf).expect("number first");
     assert!(number_first == number_first.clone());
     assert!(number_first != number_tree.end());
@@ -718,15 +733,14 @@ fn new_empty_reports_exhausted_object_number_space() {
 #[test]
 fn number_tree_at_or_below_reports_offset_overflow() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert(
-        "Nums",
-        Object::Array(vec![
-            Object::Integer(i64::MIN),
-            Object::String(b"minimum".to_vec()),
+    let root = ObjectHandle::dictionary(vec![(
+        b"/Nums".to_vec(),
+        ObjectHandle::array(vec![
+            ObjectHandle::integer(i64::MIN),
+            ObjectHandle::string(b"minimum".to_vec()),
         ]),
-    );
-    let mut tree = NumberTree::new(Object::Dictionary(root), true);
+    )]);
+    let mut tree = NumberTree::new(root, true);
 
     let error = tree
         .find_object_at_or_below(&mut pdf, i64::MAX)
@@ -773,13 +787,14 @@ fn cursors_reject_other_trees_and_invalid_remove() {
     );
     assert!(left.end().remove(&mut left, &mut pdf).is_err());
 
-    let mut number_root = Dictionary::new();
-    number_root.insert(
-        "Nums",
-        Object::Array(vec![Object::Integer(1), Object::Integer(10)]),
+    let mut numbers = NumberTree::new(
+        ObjectHandle::dictionary(vec![(
+            b"/Nums".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(1), ObjectHandle::integer(10)]),
+        )]),
+        true,
     );
-    let mut numbers = NumberTree::new(Object::Dictionary(number_root), true);
-    let mut other_numbers = NumberTree::new(Object::Dictionary(Dictionary::new()), true);
+    let mut other_numbers = NumberTree::new(ObjectHandle::dictionary(Vec::new()), true);
     let mut number_cursor = numbers.begin(&mut pdf).expect("number cursor");
     assert!(number_cursor.next(&mut other_numbers, &mut pdf).is_err());
     assert!(numbers.end().remove(&mut numbers, &mut pdf).is_err());
