@@ -400,7 +400,7 @@ fn text_check_success_stays_on_info_route() {
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with(&format!("checking {MINIMAL}\n")));
-    assert!(stdout.ends_with("errors that flpdf cannot detect\n"));
+    assert!(stdout.ends_with("errors that qpdf cannot detect\n"));
 }
 
 #[test]
