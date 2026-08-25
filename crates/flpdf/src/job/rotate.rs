@@ -913,10 +913,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
-            panic!("not a dict")
-        };
-        assert!(d.get("Rotate").is_none());
+        assert_eq!(rotate_value(&mut pdf, page), None);
         let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
 
@@ -929,10 +926,7 @@ mod tests {
         let buf = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut pdf2 = Pdf::open(Cursor::new(buf)).unwrap();
         let p2 = pages::page_refs(&mut pdf2).unwrap()[0];
-        let Object::Dictionary(d2) = pdf2.resolve_object(p2).unwrap() else {
-            panic!("not a dict")
-        };
-        assert!(d2.get("Rotate").is_none());
+        assert_eq!(rotate_value(&mut pdf2, p2), None);
     }
 
     #[test]
@@ -955,10 +949,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
-            panic!("not a dict")
-        };
-        assert!(d.get("Rotate").is_none());
+        assert_eq!(rotate_value(&mut pdf, page), None);
         // 180 maps [0 0 200 300] back onto itself: dims unchanged.
         let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.llx, mb.lly, mb.urx, mb.ury), (0.0, 0.0, 200.0, 300.0));
@@ -1142,10 +1133,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         let before = pages::page_content_bytes(&mut pdf, page).unwrap();
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
-        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
-            panic!("not a dict")
-        };
-        assert!(d.get("Rotate").is_none());
+        assert_eq!(rotate_value(&mut pdf, page), None);
         assert_eq!(pages::page_content_bytes(&mut pdf, page).unwrap(), before);
         // The direct page box is untouched because qpdf's facade did not see a
         // direct `/Rotate` value.
