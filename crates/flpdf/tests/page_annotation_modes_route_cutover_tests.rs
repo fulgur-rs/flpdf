@@ -31,6 +31,7 @@ fn print_and_screen_annotation_assertions_use_live_handles() {
             "resolve_borrowed(",
             "Object::",
             "set_object(",
+            "materialize(",
         ] {
             assert!(
                 !block.contains(marker),
