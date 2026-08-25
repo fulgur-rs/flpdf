@@ -659,11 +659,7 @@ mod tests {
         apply_rotate_to_pages(&mut pdf, &[], &op).unwrap();
 
         // Page should still be 90.
-        let obj = pdf.resolve_borrowed(ObjectRef::new(3, 0)).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(rotate_value(&mut pdf, ObjectRef::new(3, 0)), Some(90));
     }
 
     #[test]
@@ -686,12 +682,8 @@ mod tests {
         );
 
         // The /Pages node must remain untouched (no /Rotate written).
-        let obj = pdf.resolve_borrowed(pages_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
         assert_eq!(
-            dict.get("Rotate"),
+            rotate_value(&mut pdf, pages_ref),
             None,
             "/Pages node must not gain /Rotate"
         );
@@ -722,14 +714,10 @@ mod tests {
         let page_refs = pages::page_refs(&mut pdf2).unwrap();
         assert_eq!(page_refs.len(), 1);
 
-        let obj2 = pdf2.resolve_borrowed(page_refs[0]).unwrap();
-        let Object::Dictionary(dict2) = obj2 else {
-            panic!("not a dict after round-trip")
-        };
         // The leaf must carry /Rotate 270 explicitly (not inherited).
         assert_eq!(
-            dict2.get("Rotate"),
-            Some(&Object::Integer(270)),
+            rotate_value(&mut pdf2, page_refs[0]),
+            Some(270),
             "expected /Rotate 270 explicitly on leaf after round-trip"
         );
     }
@@ -753,14 +741,10 @@ mod tests {
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
         let page_refs2 = pages::page_refs(&mut pdf2).unwrap();
 
-        let obj2 = pdf2.resolve_borrowed(page_refs2[0]).unwrap();
-        let Object::Dictionary(dict2) = obj2 else {
-            panic!("not a dict")
-        };
         // Must be materialized on leaf, not inherited.
         assert_eq!(
-            dict2.get("Rotate"),
-            Some(&Object::Integer(270)),
+            rotate_value(&mut pdf2, page_refs2[0]),
+            Some(270),
             "expected inherited+add materialized on leaf"
         );
     }
@@ -836,17 +820,8 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page1, page2], &op).unwrap();
 
-        let obj1 = pdf.resolve_borrowed(page1).unwrap();
-        let Object::Dictionary(dict1) = obj1 else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict1.get("Rotate"), Some(&Object::Integer(180)), "page 1");
-
-        let obj2 = pdf.resolve_borrowed(page2).unwrap();
-        let Object::Dictionary(dict2) = obj2 else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict2.get("Rotate"), Some(&Object::Integer(90)), "page 2");
+        assert_eq!(rotate_value(&mut pdf, page1), Some(180), "page 1");
+        assert_eq!(rotate_value(&mut pdf, page2), Some(90), "page 2");
     }
 
     // -----------------------------------------------------------------------
