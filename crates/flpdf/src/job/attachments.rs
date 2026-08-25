@@ -608,7 +608,6 @@ mod tests {
     use crate::job::attachment_list::list_attachment_info;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-    use crate::Object;
     use crate::{Pdf, PdfOpenOptions, QPDFLogger};
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
@@ -670,6 +669,13 @@ mod tests {
         let mut job = QPDFJob::new();
         job.set_logger(logger);
         (job, info, save)
+    }
+
+    fn page_mode(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Option<Vec<u8>> {
+        let root_ref = pdf.root_ref().expect("catalog root");
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root).expect("resolve catalog");
+        root.get_key(b"/PageMode").as_name()
     }
 
     #[test]
@@ -812,15 +818,11 @@ mod tests {
             )
             .expect("open fixture");
         let filespec_ref = crate::ObjectRef::new(5, 0);
-        let crate::Object::Dictionary(mut filespec) = pdf
-            .resolve_borrowed(filespec_ref)
-            .expect("resolve filespec")
-            .clone()
-        else {
-            panic!("fixture filespec must be a dictionary"); // cov:ignore: the committed fixture object 5 is a Filespec dictionary
-        };
-        filespec.remove("EF");
-        pdf.set_object(filespec_ref, crate::Object::Dictionary(filespec));
+        let filespec = pdf.get_object_handle(filespec_ref);
+        pdf.resolve(&filespec).expect("resolve filespec");
+        filespec.remove_key(b"/EF");
+        pdf.mark_object_handle_dirty(&filespec)
+            .expect("mark Filespec dirty");
 
         let error = job
             .show_attachment(&mut pdf, b"attachment.txt")
@@ -865,15 +867,7 @@ mod tests {
         )
         .expect("add attachment");
 
-        let root_ref = pdf.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
-        assert_eq!(
-            root.get("PageMode"),
-            Some(&Object::Name(b"UseAttachments".to_vec()))
-        );
+        assert_eq!(page_mode(&mut pdf), Some(b"UseAttachments".to_vec()));
 
         let attachments = list_attachment_info(&mut pdf).expect("list attachments");
         assert_eq!(attachments.len(), 1);
@@ -1000,14 +994,7 @@ mod tests {
         job.add_attachment(&mut pdf, options)
             .expect("add attachment");
 
-        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
-        assert_eq!(
-            root.get("PageMode"),
-            Some(&Object::Name(b"UseNone".to_vec()))
-        );
+        assert_eq!(page_mode(&mut pdf), Some(b"UseNone".to_vec()));
 
         let attachments = list_attachment_info(&mut pdf).expect("list attachments");
         assert!(attachments[0]
@@ -1186,13 +1173,8 @@ mod tests {
                 PdfOpenOptions::default(),
             )
             .expect("open fixture");
-        let root_ref = pdf.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
         assert_eq!(
-            root.get("PageMode"),
+            page_mode(&mut pdf),
             None,
             "fixture must start without /PageMode"
         );
@@ -1200,12 +1182,8 @@ mod tests {
         job.add_attachments(&mut pdf, &[])
             .expect("empty batch must be a no-op");
 
-        let Object::Dictionary(root) = pdf.resolve_object(root_ref).expect("resolve catalog")
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
         assert_eq!(
-            root.get("PageMode"),
+            page_mode(&mut pdf),
             None,
             "empty batch must not introduce /PageMode /UseAttachments"
         );
@@ -1363,14 +1341,9 @@ mod tests {
         )
         .expect("copy attachments");
 
-        let root_ref = target.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = target.resolve_object(root_ref).expect("resolve catalog")
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
         assert_eq!(
-            root.get("PageMode"),
-            Some(&Object::Name(b"UseAttachments".to_vec())),
+            page_mode(&mut target),
+            Some(b"UseAttachments".to_vec()),
             "copyAttachments always sets /PageMode, even for a single entry"
         );
 
@@ -1458,15 +1431,7 @@ mod tests {
         )
         .expect("empty source copies nothing but still succeeds");
 
-        let root_ref = target.root_ref().expect("catalog root");
-        let Object::Dictionary(root) = target.resolve_object(root_ref).expect("resolve catalog")
-        else {
-            panic!("catalog must be a dictionary"); // cov:ignore: test-fixture shape guard
-        };
-        assert_eq!(
-            root.get("PageMode"),
-            Some(&Object::Name(b"UseAttachments".to_vec()))
-        );
+        assert_eq!(page_mode(&mut target), Some(b"UseAttachments".to_vec()));
         assert!(!job.has_warnings());
     }
 
