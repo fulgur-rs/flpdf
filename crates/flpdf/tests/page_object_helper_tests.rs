@@ -16,6 +16,23 @@ use std::cell::RefCell;
 use std::io::Cursor;
 use std::rc::Rc;
 
+fn object_pdf_bytes(object: &Object) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    object.write_pdf(&mut bytes);
+    bytes
+}
+
+fn handle_pdf_bytes(object: &ObjectHandle) -> Vec<u8> {
+    object.unparse()
+}
+
+fn assert_content_events(events: &[ObjectHandle], expected: &[Object]) {
+    assert_eq!(
+        events.iter().map(handle_pdf_bytes).collect::<Vec<_>>(),
+        expected.iter().map(object_pdf_bytes).collect::<Vec<_>>()
+    );
+}
+
 mod common;
 use common::write_default;
 
@@ -516,12 +533,12 @@ fn content_stream_objects_parses_single_stream() {
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
     let objects = helper.content_stream_objects().unwrap();
-    assert_eq!(
-        objects,
-        vec![
+    assert_content_events(
+        &objects,
+        &[
             Object::Operator(b"q".to_vec()),
-            Object::Operator(b"Q".to_vec())
-        ]
+            Object::Operator(b"Q".to_vec()),
+        ],
     );
 }
 
@@ -1668,12 +1685,12 @@ fn content_stream_objects_concatenates_array_contents() {
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
     let objects = helper.content_stream_objects().unwrap();
-    assert_eq!(
-        objects,
-        vec![
+    assert_content_events(
+        &objects,
+        &[
             Object::Operator(b"q".to_vec()),
-            Object::Operator(b"Q".to_vec())
-        ]
+            Object::Operator(b"Q".to_vec()),
+        ],
     );
 }
 
@@ -1689,9 +1706,10 @@ fn content_stream_objects_preserves_inline_image_as_a_separate_event() {
     let mut pdf = open(bytes);
     let mut helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
 
-    assert_eq!(
-        helper.content_stream_objects().unwrap(),
-        vec![
+    let objects = helper.content_stream_objects().unwrap();
+    assert_content_events(
+        &objects,
+        &[
             Object::Operator(b"BI".to_vec()),
             Object::Name(b"W".to_vec()),
             Object::Integer(1),
@@ -1701,7 +1719,7 @@ fn content_stream_objects_preserves_inline_image_as_a_separate_event() {
             Object::InlineImage(b"x ".to_vec()),
             Object::Operator(b"EI".to_vec()),
             Object::Operator(b"Q".to_vec()),
-        ]
+        ],
     );
 }
 
@@ -1723,13 +1741,13 @@ fn externalize_inline_images_uses_canonical_stream_and_resource_handles() {
     let contents = helper
         .content_stream_objects()
         .expect("rewritten page contents should parse");
-    assert_eq!(
-        contents,
-        vec![
+    assert_content_events(
+        &contents,
+        &[
             Object::Name(b"IIm1".to_vec()),
             Object::Operator(b"Do".to_vec()),
             Object::Operator(b"Q".to_vec()),
-        ]
+        ],
     );
 
     let images = helper
@@ -1823,7 +1841,7 @@ fn externalize_inline_images_respects_minimum_payload_size() {
         .content_stream_objects()
         .unwrap()
         .iter()
-        .any(|object| matches!(object, Object::InlineImage(_))));
+        .any(|object| object.as_inline_image().is_some()));
 }
 
 #[test]
@@ -1856,13 +1874,14 @@ fn externalize_inline_images_recurses_through_form_content_handles() {
 
     let form_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
     let mut form_helper = PageObjectHelper::from_object_handle(form_handle, &mut pdf);
-    assert_eq!(
-        form_helper.content_stream_objects().unwrap(),
-        vec![
+    let contents = form_helper.content_stream_objects().unwrap();
+    assert_content_events(
+        &contents,
+        &[
             Object::Name(b"IIm1".to_vec()),
             Object::Operator(b"Do".to_vec()),
             Object::Operator(b"Q".to_vec()),
-        ]
+        ],
     );
     let images = form_helper.get_images().unwrap();
     assert_eq!(images.len(), 1);
