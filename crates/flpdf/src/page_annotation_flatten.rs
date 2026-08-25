@@ -942,7 +942,7 @@ mod tests {
     use super::*;
     use crate::pages::{page_content_bytes, page_refs};
     use crate::writer::write_qpdf_to_memory;
-    use crate::{Object, ObjectRef, Pdf};
+    use crate::{ObjectRef, Pdf};
     use std::io::Cursor;
 
     #[test]
@@ -3379,12 +3379,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: /XObject in resources is ref → non-dict → creates empty dict (line 206)
+    // Test: a non-dictionary /XObject resource does not block flattening.
     // -----------------------------------------------------------------------
     #[test]
-    fn resources_xobject_indirect_ref_to_non_dict_uses_empty_dict() {
-        // /Resources/XObject is an indirect ref to a non-dict object (e.g. Integer)
-        // This should fall back to an empty XObject dict
+    fn resources_xobject_indirect_ref_to_non_dict_does_not_block_flattening() {
+        // qpdf's mergeResources is a no-op for a destination category whose
+        // type does not match the source dictionary (QPDFObjectHandle.cc:
+        // 1066-1068). The malformed /XObject therefore remains untouched,
+        // but it must not prevent the appearance from being flattened.
         let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
         let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
         let (n4, obj4_bytes) = obj_dict(
@@ -3400,8 +3402,10 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-        // Override obj 6 to be a non-dict value to trigger the fallback path
-        pdf.set_object(ObjectRef::new(6, 0), Object::Integer(42));
+        // Override obj 6 to be a non-dict value to trigger the fallback path.
+        let non_dict_ref = ObjectRef::new(6, 0);
+        pdf.replace_object_handle(non_dict_ref, ObjectHandle::integer(42))
+            .unwrap();
 
         let page_ref = ObjectRef::new(3, 0);
         let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
@@ -3409,6 +3413,14 @@ mod tests {
 
         let content = page_content_bytes(&mut pdf, page_ref).unwrap();
         assert!(content.windows(2).any(|w| w == b"Do"));
+
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let xobject = resources.try_get_key(b"/XObject").unwrap();
+        pdf.resolve(&xobject).unwrap();
+        assert_eq!(xobject.as_integer(), Some(42));
     }
 
     #[test]
