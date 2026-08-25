@@ -634,3 +634,53 @@ fn unselected_appearance_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn document_flatten_widget_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn qpdf_document_flatten_covers_widget_resources_and_removal_paths")
+        .expect("document flatten fixture must remain")
+        .1
+        .split_once("fn build_pdf(")
+        .expect("document flatten fixture boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "document flatten fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::stream(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::array(",
+        "ObjectHandle::name(",
+        "ObjectHandle::integer(",
+        "replace_object_handle(",
+        "replace_key(",
+        "mark_object_handle_dirty(",
+        "resolve(",
+        "try_get_key(",
+        "as_stream_dict()",
+        "as_array()",
+        "as_integer()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "document flatten fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
