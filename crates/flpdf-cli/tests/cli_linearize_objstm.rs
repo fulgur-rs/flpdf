@@ -204,7 +204,7 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
         .code(0)
         .stdout(predicates::str::contains("File is linearized\n"))
         .stdout(predicates::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
         ))
         .stderr(predicates::str::is_empty());
 }
@@ -325,7 +325,7 @@ fn linearize_generate_qpdf_check_clean() {
         .args(["check-linearization", out.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicates::str::contains("linearization OK"));
+        .stdout(predicates::str::contains("no linearization errors"));
 }
 
 // ============================================================================

@@ -515,7 +515,12 @@ fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
 }
 
 #[test]
-fn previous_xref_sections_retain_distinct_generations() {
+fn previous_xref_sections_keep_only_the_highest_generation() {
+    // Object 1 is declared twice across the /Prev chain: generation 0 in the
+    // previous section, generation 2 in the latest section. QPDF::read_xref's
+    // post-chain cleanup (QPDF.cc:710-718) keeps only the highest generation
+    // for any object number once the full chain has been merged, discarding
+    // the lower one -- these are not two independently live objects.
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let object_offset = bytes.len() as u64;
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
@@ -545,10 +550,11 @@ fn previous_xref_sections_retain_distinct_generations() {
         loaded.entries.get(&ObjectRef::new(1, 2)),
         Some(XrefEntry::Uncompressed { .. })
     ));
-    assert!(matches!(
+    assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
-        Some(XrefEntry::Uncompressed { .. })
-    ));
+        None,
+        "the lower generation must be discarded once the /Prev chain is fully merged"
+    );
 }
 
 #[test]
