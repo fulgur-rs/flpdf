@@ -33,7 +33,7 @@ Run:
 
 ```bash
 cargo test -p flpdf-cli --test cli_check_exitcodes check_clean_pdf_emits_qpdf_block -- --exact
-cargo test -p flpdf-cli --test cli_check_exitcodes check_no_warn -- --exact
+cargo test -p flpdf-cli --test cli_check_exitcodes check_no_warn_suppresses_warning_delivery_but_keeps_exit_3 -- --exact
 ```
 
 Expected: the clean-note assertion fails on `flpdf`, and the no-warn test
@@ -73,7 +73,7 @@ Run:
 
 ```bash
 cargo test -p flpdf-cli --test cli_check_exitcodes check_clean_pdf_emits_qpdf_block -- --exact
-cargo test -p flpdf-cli --test cli_check_exitcodes check_no_warn -- --exact
+cargo test -p flpdf-cli --test cli_check_exitcodes check_no_warn_suppresses_warning_delivery_but_keeps_exit_3 -- --exact
 cargo test -p flpdf --lib job::check::tests
 ```
 
