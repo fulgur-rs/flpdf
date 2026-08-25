@@ -33,6 +33,18 @@ fn tree_string_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: &Object) -> flpdf:
     Ok(value.as_string().map(<[u8]>::to_vec).unwrap_or_default())
 }
 
+/// Read a NameTree value through its canonical `ObjectHandle` route. qpdf's
+/// name-tree iterator keeps the value handle live until the consumer asks for
+/// a typed value, so this helper resolves the handle once and applies the
+/// same empty-string fallback as the NumberTree adapter above.
+fn tree_string_handle_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+) -> flpdf::Result<Vec<u8>> {
+    let value = pdf.resolve_to_terminal(value)?;
+    Ok(value.as_string().unwrap_or_default())
+}
+
 /// Resolve `handle`, then read `key` from it — `ObjectHandle::get_key`
 /// never resolves on its own (`object_handle.rs:2769-2787`), matching
 /// `QPDFObjectHandle::getKey`'s own internal `dereference()` call
@@ -521,11 +533,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     // for `QPDFNumberTreeObjectHelper` in test_46 -- see that function's
     // header comment for the shared iterator-wrap and value-aliasing notes,
     // which apply identically here.
-    let qtest = pdf
-        .trailer_dictionary()
-        .get(b"QTest")
-        .cloned()
-        .unwrap_or(Object::Null);
+    let qtest = pdf.trailer_key_handle(b"QTest");
     let mut ntoh = NameTree::new(qtest, true);
 
     let mut cursor = ntoh.begin(pdf)?;
@@ -533,7 +541,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " -> ")?;
-        let text = tree_string_value(pdf, &value)?;
+        let text = tree_string_handle_value(pdf, &value)?;
         write_bytes(stdout, &text)?;
         writeln!(stdout)?;
         cursor.next(&mut ntoh, pdf)?;
@@ -544,7 +552,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     for (key, value) in &ntoh_map {
         write_bytes(stdout, key)?;
         write!(stdout, " -> ")?;
-        let text = tree_string_value(pdf, value)?;
+        let text = tree_string_handle_value(pdf, value)?;
         write_bytes(stdout, &text)?;
         writeln!(stdout)?;
     }
@@ -556,15 +564,15 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     let seven = ntoh
         .find_object(pdf, "07 sev\u{2022}n")?
         .expect("07 sev*n present");
-    assert_eq!(tree_string_value(pdf, &seven)?, b"seven!");
+    assert_eq!(tree_string_handle_value(pdf, &seven)?, b"seven!");
     let (last_key, last_value) = ntoh
         .last(pdf)?
         .current()
         .expect("name tree has a last entry");
     assert_eq!(last_key, b"29 twenty-nine");
-    let last_resolved = resolved(pdf, last_value)?;
+    let last_resolved = pdf.resolve_to_terminal(&last_value)?;
     let last_raw = last_resolved.as_string().unwrap_or_default();
-    assert_eq!(flpdf::pdf_string::utf8_value(last_raw), b"twenty-nine!");
+    assert_eq!(flpdf::pdf_string::utf8_value(&last_raw), b"twenty-nine!");
 
     let mut new1 = NameTree::new_empty(pdf, true)?;
     let mut iter1 = new1.begin(pdf)?;
@@ -573,7 +581,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     assert!(iter1 == new1.end());
     iter1.previous(&mut new1, pdf)?;
     assert!(iter1 == new1.end());
-    new1.insert(pdf, "1", Object::String(b"1".to_vec()))?;
+    new1.insert(pdf, "1", ObjectHandle::string(b"1".to_vec()))?;
     iter1.next(&mut new1, pdf)?;
     assert_eq!(iter1.current().expect("cursor at 1").0, b"1");
     // See test_46's header comment: `iter1_val` is a live alias to
@@ -583,7 +591,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     assert!(iter1 == new1.end());
     iter1.previous(&mut new1, pdf)?;
     assert_eq!(iter1.current().expect("cursor at 1").0, b"1");
-    new1.insert(pdf, "2", Object::String(b"2".to_vec()))?;
+    new1.insert(pdf, "2", ObjectHandle::string(b"2".to_vec()))?;
     iter1.next(&mut new1, pdf)?;
     assert_eq!(iter1.current().expect("cursor at 2").0, b"2");
     iter1.next(&mut new1, pdf)?;
@@ -600,15 +608,15 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     let mut new2 = NameTree::new_empty(pdf, true)?;
     let mut iter2 = new2.begin(pdf)?;
     assert!(iter2 == new2.end());
-    iter2.insert_after(&mut new2, pdf, "3", Object::String(b"3!".to_vec()))?;
+    iter2.insert_after(&mut new2, pdf, "3", ObjectHandle::string(b"3!".to_vec()))?;
     assert_eq!(iter2.current().expect("cursor at 3").0, b"3");
-    iter2.insert_after(&mut new2, pdf, "4", Object::String(b"4!".to_vec()))?;
+    iter2.insert_after(&mut new2, pdf, "4", ObjectHandle::string(b"4!".to_vec()))?;
     assert_eq!(iter2.current().expect("cursor at 4").0, b"4");
     let mut cursor = new2.begin(pdf)?;
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " ")?;
-        write_bytes(stdout, &write_object(&value))?;
+        write_bytes(stdout, &value.unparse())?;
         writeln!(stdout)?;
         cursor.next(&mut new2, pdf)?;
     }
@@ -617,54 +625,44 @@ pub(crate) fn run_test_48<R: Read + Seek>(
         write!(stdout, "/")?;
         write_bytes(stdout, key)?;
         writeln!(stdout)?;
-        let object = pdf
-            .trailer_dictionary()
-            .get(key)
-            .cloned()
-            .unwrap_or(Object::Null);
-        let mut empty = NameTree::new(object, true);
+        let mut empty = NameTree::new(pdf.trailer_key_handle(key), true);
         let empty_begin = empty.begin(pdf)?;
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
         assert!(empty_begin == empty.end());
         assert!(empty.last(pdf)? == empty.end());
 
-        let inserted = empty.insert(pdf, "five", Object::String(b"5".to_vec()))?;
+        let inserted = empty.insert(pdf, "five", ObjectHandle::string(b"5".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("key five present");
         assert_eq!(inserted_key, b"five");
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"5");
+        assert_eq!(tree_string_handle_value(pdf, &inserted_value)?, b"5");
         assert_eq!(
             empty.begin(pdf)?.current().expect("begin at five").0,
             b"five"
         );
         assert_eq!(empty.last(pdf)?.current().expect("last at five").0, b"five");
         let begin_value = empty.begin(pdf)?.current().expect("begin value at five").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5");
+        assert_eq!(tree_string_handle_value(pdf, &begin_value)?, b"5");
 
-        let inserted = empty.insert(pdf, "five", Object::String(b"5+".to_vec()))?;
+        let inserted = empty.insert(pdf, "five", ObjectHandle::string(b"5+".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("key five present");
         assert_eq!(inserted_key, b"five");
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"5+");
+        assert_eq!(tree_string_handle_value(pdf, &inserted_value)?, b"5+");
         let begin_value = empty.begin(pdf)?.current().expect("begin value at 5+").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5+");
+        assert_eq!(tree_string_handle_value(pdf, &begin_value)?, b"5+");
 
-        let inserted = empty.insert(pdf, "six", Object::String(b"6".to_vec()))?;
+        let inserted = empty.insert(pdf, "six", ObjectHandle::string(b"6".to_vec()))?;
         let (inserted_key, inserted_value) = inserted.current().expect("key six present");
         assert_eq!(inserted_key, b"six");
-        assert_eq!(tree_string_value(pdf, &inserted_value)?, b"6");
+        assert_eq!(tree_string_handle_value(pdf, &inserted_value)?, b"6");
         let begin_value = empty.begin(pdf)?.current().expect("begin still at 5+").1;
-        assert_eq!(tree_string_value(pdf, &begin_value)?, b"5+");
+        assert_eq!(tree_string_handle_value(pdf, &begin_value)?, b"5+");
         assert_eq!(empty.last(pdf)?.current().expect("last at six").0, b"six");
         let last_value = empty.last(pdf)?.current().expect("last value at six").1;
-        assert_eq!(tree_string_value(pdf, &last_value)?, b"6");
+        assert_eq!(tree_string_handle_value(pdf, &last_value)?, b"6");
     }
 
     writeln!(stdout, "/Bad1 -- wrong key type")?;
-    let bad1_object = pdf
-        .trailer_dictionary()
-        .get(b"Bad1")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut bad1 = NameTree::new(bad1_object, true);
+    let mut bad1 = NameTree::new(pdf.trailer_key_handle(b"Bad1"), true);
     let found = bad1.find(pdf, "G", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(found.current().expect("closest key below G").0, b"A");
@@ -676,12 +674,7 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad2 -- invalid kid")?;
-    let bad2_object = pdf
-        .trailer_dictionary()
-        .get(b"Bad2")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut bad2 = NameTree::new(bad2_object, true);
+    let mut bad2 = NameTree::new(pdf.trailer_key_handle(b"Bad2"), true);
     let found = bad2.find(pdf, "G", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(found.current().expect("closest key below G").0, b"B");
@@ -693,23 +686,13 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad3 -- invalid kid")?;
-    let bad3_object = pdf
-        .trailer_dictionary()
-        .get(b"Bad3")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut bad3 = NameTree::new(bad3_object, true);
+    let mut bad3 = NameTree::new(pdf.trailer_key_handle(b"Bad3"), true);
     let found = bad3.find(pdf, "G", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert!(found == bad3.end());
 
     writeln!(stdout, "/Bad4 -- invalid kid")?;
-    let bad4_object = pdf
-        .trailer_dictionary()
-        .get(b"Bad4")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut bad4 = NameTree::new(bad4_object, true);
+    let mut bad4 = NameTree::new(pdf.trailer_key_handle(b"Bad4"), true);
     let found = bad4.find(pdf, "F", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(found.current().expect("closest key below F").0, b"C");
@@ -721,24 +704,14 @@ pub(crate) fn run_test_48<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Bad5 -- loop in find")?;
-    let bad5_object = pdf
-        .trailer_dictionary()
-        .get(b"Bad5")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut bad5 = NameTree::new(bad5_object, true);
+    let mut bad5 = NameTree::new(pdf.trailer_key_handle(b"Bad5"), true);
     let found = bad5.find(pdf, "F", true)?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(found.current().expect("closest key below F").0, b"D");
 
     writeln!(stdout, "/Bad6 -- bad limits")?;
-    let bad6_object = pdf
-        .trailer_dictionary()
-        .get(b"Bad6")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut bad6 = NameTree::new(bad6_object, true);
-    let inserted = bad6.insert(pdf, "H", Object::Null)?;
+    let mut bad6 = NameTree::new(pdf.trailer_key_handle(b"Bad6"), true);
+    let inserted = bad6.insert(pdf, "H", ObjectHandle::null())?;
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     assert_eq!(inserted.current().expect("key H present").0, b"H");
 

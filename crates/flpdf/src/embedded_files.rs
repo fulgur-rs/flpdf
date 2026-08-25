@@ -77,7 +77,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::nntree::HandleNameTree;
+use crate::nntree::NameTree;
 #[cfg(test)]
 use crate::{Dictionary, Object};
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
@@ -97,7 +97,7 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     auto_repair: bool,
     max_depth: Option<usize>,
-) -> Result<Option<HandleNameTree>> {
+) -> Result<Option<NameTree>> {
     // cov:ignore-start: helper methods normally receive a parsed catalog root
     let Some(catalog_ref) = pdf.root_ref() else {
         return Ok(None); // cov:ignore: helper methods normally receive a parsed catalog root
@@ -124,7 +124,7 @@ fn embedded_files_tree_with_options<R: Read + Seek>(
         return Ok(None);
     }
 
-    let mut tree = HandleNameTree::new(root, pdf.unique_id(), auto_repair);
+    let mut tree = NameTree::new(root, auto_repair);
     if let Some(max_depth) = max_depth {
         tree.set_max_depth(max_depth);
     }
@@ -137,11 +137,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         Self { pdf }
     }
 
-    fn embedded_files_tree(&mut self) -> Result<Option<HandleNameTree>> {
+    fn embedded_files_tree(&mut self) -> Result<Option<NameTree>> {
         embedded_files_tree_with_options(self.pdf, true, None)
     }
 
-    fn ensure_embedded_files_tree(&mut self) -> Result<Option<HandleNameTree>> {
+    fn ensure_embedded_files_tree(&mut self) -> Result<Option<NameTree>> {
         if let Some(tree) = self.embedded_files_tree()? {
             return Ok(Some(tree));
         }
@@ -177,7 +177,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
 
         let root = self.new_empty_embedded_files_root(&names)?;
 
-        Ok(Some(HandleNameTree::new(root, self.pdf.unique_id(), true)))
+        Ok(Some(NameTree::new(root, true)))
     }
 
     fn new_empty_embedded_files_root(&mut self, names: &ObjectHandle) -> Result<ObjectHandle> {
@@ -206,7 +206,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.embedded_files_tree()? else {
             return Ok(BTreeMap::new());
         };
-        tree.entries(self.pdf)
+        tree.as_map(self.pdf)
     }
 
     /// Return the Filespec handle stored under `key`, if present.
@@ -214,7 +214,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.embedded_files_tree()? else {
             return Ok(None);
         };
-        tree.find(self.pdf, key)
+        tree.find_object(self.pdf, key)
     }
 
     /// Add or replace the Filespec stored under `key`.
@@ -238,7 +238,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.ensure_embedded_files_tree()? else {
             return Ok(());
         };
-        tree.insert(self.pdf, key, filespec)
+        tree.insert(self.pdf, key, filespec).map(|_| ())
     }
 
     /// Remove the Filespec stored under `key`.
@@ -421,7 +421,7 @@ pub fn list_embedded_files_with_max_depth<R: Read + Seek>(
         return Ok(vec![]);
     };
     Ok(tree
-        .entries(pdf)?
+        .as_map(pdf)?
         .into_iter()
         .filter_map(|(key, value)| {
             value

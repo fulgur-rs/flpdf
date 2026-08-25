@@ -6,9 +6,10 @@
 //! The traversal/mutation path is canonical `ObjectHandle` graph state: qpdf's
 //! `QPDFObjectHandle` nodes and arrays are kept live through lookup, cursor
 //! movement, repair, split, insert, and remove (`libqpdf/NNTree.cc:34-75,
-//! 106-168, 216-390, 391-520, 560-700`). The `Object` root is only a
-//! compatibility projection for the existing wrapper API; production tree
-//! mutations do not write nodes back through `Pdf::set_object`. Array replacement
+//! 106-168, 216-390, 391-520, 560-700`). The public `NameTree` facade is
+//! handle-native; the separate `NumberTree` wrapper still retains its raw
+//! root projection for the next bounded cutover. Production tree mutations do
+//! not write nodes back through `Pdf::set_object`. Array replacement
 //! follows qpdf's `QPDFObjectHandle` live-array mutators and
 //! `QPDF_Array::setFromVector` ownership/order boundary
 //! (`libqpdf/QPDFObjectHandle.cc:869-955`, `libqpdf/QPDF_Array.cc:220-313`),
@@ -296,6 +297,37 @@ fn materialize_cursor_value(handle: &ObjectHandle) -> Result<Object> {
     }
 }
 
+/// Reject a handle-native tree value that does not belong to `pdf`.
+///
+/// A foreign indirect handle stored into this tree would keep resolving
+/// through its original document's resolver, mixing object graphs and
+/// risking that document's object reference being serialized into `pdf`.
+/// This mirrors the check `EmbeddedFileDocumentHelper::replace_embedded_file`
+/// already performs before its own tree insert.
+///
+/// An indirect `value` is checked with the same canonical-registration
+/// strictness `replace_embedded_file` uses. A direct `value` is checked with
+/// [`ObjectHandle::belongs_exclusively_to_pdf`], not the shallower
+/// [`ObjectHandle::belongs_to_pdf`]: a freshly constructed direct wrapper
+/// (e.g. `ObjectHandle::dictionary`) always reports no owner of its own even
+/// when it nests an already-indirect handle from a different `Pdf`, so only
+/// a full descendant walk catches that case.
+fn ensure_value_owned_by_pdf<R: Read + Seek>(pdf: &Pdf<R>, value: &ObjectHandle) -> Result<()> {
+    if let Some(object_ref) = value.object_ref() {
+        if !pdf.is_canonical_object_handle(value) {
+            return Err(Error::Unsupported(
+                "name/number tree value belongs to a different Pdf".to_string(),
+            ));
+        }
+        debug_assert_eq!(value.object_ref(), Some(object_ref));
+    } else if !value.belongs_exclusively_to_pdf(pdf.unique_id()) {
+        return Err(Error::Unsupported(
+            "name/number tree value belongs to a different Pdf".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// A dictionary facade over one live `ObjectHandle`. It intentionally exposes
 /// only handle values; callers cannot accidentally turn a canonical node into
 /// a raw `Dictionary` and write it back through `Pdf::set_object`.
@@ -510,10 +542,13 @@ pub struct NameTree {
 }
 
 impl NameTree {
-    /// Wrap an existing name-tree root.
-    pub fn new(root: Object, auto_repair: bool) -> Self {
+    /// Wrap an existing name-tree root handle.
+    ///
+    /// The first PDF passed to an operation claims the handle's document
+    /// boundary; subsequent operations reject handles from another PDF.
+    pub fn new(root: ObjectHandle, auto_repair: bool) -> Self {
         Self {
-            inner: NNTree::new(root, auto_repair),
+            inner: NNTree::from_handle(root, auto_repair),
             cursor_owner: Arc::new(()),
         }
     }
@@ -529,20 +564,15 @@ impl NameTree {
             ObjectHandle::array(Vec::new()),
         )]);
         let root = pdf.make_indirect_from_object_handle(root)?;
-        let root_ref = root
-            .object_ref()
-            .expect("canonical empty name-tree root is indirect");
-        Ok(Self::new(Object::Reference(root_ref), auto_repair))
+        Ok(Self::new(root, auto_repair))
     }
 
-    /// Return the current tree root.
-    pub fn root(&self) -> &Object {
-        self.inner.root()
-    }
-
-    /// Consume the helper and return its current tree root.
-    pub fn into_root(self) -> Object {
-        self.inner.into_root()
+    /// Return the live root handle, matching qpdf's `getObjectHandle`.
+    pub fn get_object_handle(&self) -> ObjectHandle {
+        self.inner
+            .canonical_root
+            .clone()
+            .expect("handle-native name tree always has a root handle")
     }
 
     /// Return an invalid cursor representing the position past the tree.
@@ -606,10 +636,10 @@ impl NameTree {
         &mut self,
         pdf: &mut Pdf<R>,
         key: K,
-        value: Object,
+        value: ObjectHandle,
     ) -> Result<NameTreeCursor> {
         self.inner
-            .insert(pdf, key.as_ref().to_vec(), value)
+            .insert_handle(pdf, key.as_ref().to_vec(), value)
             .map(|inner| NameTreeCursor {
                 inner,
                 owner: Arc::clone(&self.cursor_owner),
@@ -638,11 +668,11 @@ impl NameTree {
         &mut self,
         pdf: &mut Pdf<R>,
         key: K,
-    ) -> Result<Option<Object>> {
+    ) -> Result<Option<ObjectHandle>> {
         Ok(self
             .inner
             .find(pdf, &key.as_ref().to_vec(), false)?
-            .cloned_current()
+            .cloned_current_handle()
             .map(|(_, value)| value))
     }
 
@@ -655,8 +685,8 @@ impl NameTree {
         &mut self,
         pdf: &mut Pdf<R>,
         key: K,
-    ) -> Result<Option<Object>> {
-        self.inner.remove(pdf, &key.as_ref().to_vec())
+    ) -> Result<Option<ObjectHandle>> {
+        self.inner.remove_handle(pdf, &key.as_ref().to_vec())
     }
 
     /// Materialize the tree as a sorted map.
@@ -667,10 +697,15 @@ impl NameTree {
     pub fn as_map<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
-    ) -> Result<BTreeMap<Vec<u8>, Object>> {
+    ) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
         let mut result = BTreeMap::new();
         let mut cursor = self.inner.begin(pdf)?;
-        while let Some((key, value)) = cursor.cloned_current() {
+        if cursor.positioned() && cursor.cloned_current_handle().is_none() {
+            return Err(Error::Internal(
+                "attempt made to dereference an invalid name/number tree iterator".to_string(),
+            ));
+        }
+        while let Some((key, value)) = cursor.cloned_current_handle() {
             result.insert(key, value);
             self.inner.next(pdf, &mut cursor)?;
         }
@@ -696,7 +731,7 @@ impl NameTree {
     }
 }
 
-/// Cursor over a [`NameTree`].
+/// Cursor over a [`NameTree`] whose values retain live `ObjectHandle` identity.
 pub struct NameTreeCursor {
     inner: NNTreeCursor<NameKey>,
     owner: Arc<()>,
@@ -722,12 +757,12 @@ impl Eq for NameTreeCursor {}
 impl NameTreeCursor {
     /// Whether the cursor points to a valid key/value pair.
     pub fn valid(&self) -> bool {
-        self.inner.current().is_some()
+        self.inner.cloned_current_handle().is_some()
     }
 
     /// Return a clone of the current key/value pair.
-    pub fn current(&self) -> Option<(Vec<u8>, Object)> {
-        self.inner.cloned_current()
+    pub fn current(&self) -> Option<(Vec<u8>, ObjectHandle)> {
+        self.inner.cloned_current_handle()
     }
 
     /// Advance to the next entry.
@@ -773,11 +808,11 @@ impl NameTreeCursor {
         tree: &mut NameTree,
         pdf: &mut Pdf<R>,
         key: K,
-        value: Object,
+        value: ObjectHandle,
     ) -> Result<()> {
         self.ensure_owner(tree)?;
         tree.inner
-            .insert_after(pdf, &mut self.inner, key.as_ref().to_vec(), value)
+            .insert_after_handle(pdf, &mut self.inner, key.as_ref().to_vec(), value)
     }
 
     /// Remove the current entry and advance to the next entry.
@@ -793,7 +828,9 @@ impl NameTreeCursor {
                 "attempted to remove an invalid name-tree cursor".to_string(),
             ));
         }
-        tree.inner.remove_at(pdf, &mut self.inner).map(|_| ())
+        tree.inner
+            .remove_at_handle(pdf, &mut self.inner)
+            .map(|_| ())
     }
 
     fn ensure_owner(&self, tree: &NameTree) -> Result<()> {
@@ -1212,78 +1249,6 @@ impl NumberTree {
     }
 }
 
-/// Handle-native name-tree facade for qpdf-shaped consumers.
-///
-/// Unlike [`NameTree`], this facade has no raw [`Object`] projection. The
-/// root, cursor values, insertions, and removals all remain live
-/// [`ObjectHandle`]s, so a direct child keeps its qpdf identity through tree
-/// repair and mutation. The shared [`NNTree`] implementation still owns the
-/// traversal, split, limits, and auto-repair rules.
-pub(crate) struct HandleNameTree {
-    inner: NNTree<NameKey>,
-}
-
-#[allow(dead_code)] // the facade is consumed by the next stacked consumer layer
-impl HandleNameTree {
-    pub(crate) fn new(root: ObjectHandle, pdf_id: u64, auto_repair: bool) -> Self {
-        Self {
-            inner: NNTree::from_handle(root, pdf_id, auto_repair),
-        }
-    }
-
-    pub(crate) fn set_max_depth(&mut self, max_depth: usize) {
-        self.inner.max_depth = Some(max_depth);
-    }
-
-    pub(crate) fn find<R: Read + Seek, K: AsRef<[u8]>>(
-        &mut self,
-        pdf: &mut Pdf<R>,
-        key: K,
-    ) -> Result<Option<ObjectHandle>> {
-        let cursor = self.inner.find(pdf, &key.as_ref().to_vec(), false)?;
-        Ok(cursor.cloned_current_handle().map(|(_, value)| value))
-    }
-
-    pub(crate) fn insert<R: Read + Seek, K: AsRef<[u8]>>(
-        &mut self,
-        pdf: &mut Pdf<R>,
-        key: K,
-        value: ObjectHandle,
-    ) -> Result<()> {
-        self.inner
-            .insert_handle(pdf, key.as_ref().to_vec(), value)
-            .map(|_| ())
-    }
-
-    #[allow(dead_code)] // consumed by the EmbeddedFileDocumentHelper cutover above this layer
-    pub(crate) fn remove<R: Read + Seek, K: AsRef<[u8]>>(
-        &mut self,
-        pdf: &mut Pdf<R>,
-        key: K,
-    ) -> Result<Option<ObjectHandle>> {
-        self.inner.remove_handle(pdf, &key.as_ref().to_vec())
-    }
-
-    #[allow(dead_code)] // consumed by the EmbeddedFileDocumentHelper cutover above this layer
-    pub(crate) fn entries<R: Read + Seek>(
-        &mut self,
-        pdf: &mut Pdf<R>,
-    ) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-        let mut result = BTreeMap::new();
-        let mut cursor = self.inner.begin(pdf)?;
-        if cursor.positioned() && cursor.cloned_current_handle().is_none() {
-            return Err(Error::Internal(
-                "attempt made to dereference an invalid name/number tree iterator".to_string(),
-            ));
-        }
-        while let Some((key, value)) = cursor.cloned_current_handle() {
-            result.insert(key, value);
-            self.inner.next(pdf, &mut cursor)?;
-        }
-        Ok(result)
-    }
-}
-
 /// Cursor over a [`NumberTree`].
 pub struct NumberTreeCursor {
     inner: NNTreeCursor<NumberKey>,
@@ -1413,11 +1378,10 @@ impl<K: TreeKey> NNTree<K> {
         }
     }
 
-    #[allow(dead_code)] // consumed by HandleNameTree in the next stacked layer
-    fn from_handle(root: ObjectHandle, pdf_id: u64, auto_repair: bool) -> Self {
+    fn from_handle(root: ObjectHandle, auto_repair: bool) -> Self {
         let mut tree = Self::new(Object::Null, auto_repair);
         tree.canonical_root = Some(root);
-        tree.canonical_root_pdf_id = Some(pdf_id);
+        tree.canonical_root_pdf_id = None;
         tree.legacy_projection = false;
         tree
     }
@@ -1433,6 +1397,20 @@ impl<K: TreeKey> NNTree<K> {
     fn ensure_canonical_root<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<ObjectHandle> {
         let pdf_id = pdf.unique_id();
         if let Some(root) = &self.canonical_root {
+            if self.canonical_root_pdf_id.is_none() {
+                // A contextless direct root (e.g. one handed to `NameTree::new`
+                // without ever passing through this Pdf) reports no owner of
+                // its own via `owning_pdf_unique_id`, but may still nest an
+                // already-indirect child from a different Pdf several direct
+                // hops down; only a full descendant walk catches that shape.
+                if !root.belongs_exclusively_to_pdf(pdf_id) {
+                    return Err(Error::Unsupported(
+                        "name/number tree root belongs to a different Pdf".to_string(),
+                    ));
+                }
+                self.canonical_root_pdf_id = Some(pdf_id);
+                return Ok(root.clone());
+            }
             if self.canonical_root_pdf_id == Some(pdf_id)
                 && (!self.legacy_projection || self.root == self.legacy_root_snapshot)
             {
@@ -1573,13 +1551,13 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
-    #[allow(dead_code)] // consumed by HandleNameTree in the next stacked layer
     fn insert_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
         key: K::Key,
         value: ObjectHandle,
     ) -> Result<NNTreeCursor<K>> {
+        ensure_value_owned_by_pdf(pdf, &value)?;
         let mut allocator = ObjectAllocator::default();
         let result = self.insert_with_allocator(pdf, &mut allocator, key, value);
         self.finish_mutation(result)
@@ -1653,6 +1631,26 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
+    fn insert_after_handle<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+        key: K::Key,
+        value: ObjectHandle,
+    ) -> Result<()> {
+        cursor.ensure_pdf(pdf)?;
+        ensure_value_owned_by_pdf(pdf, &value)?;
+        let mut allocator = ObjectAllocator::default();
+        let result = self.insert_after_raw_with_allocator(
+            pdf,
+            &mut allocator,
+            cursor,
+            K::to_handle(&key),
+            value,
+        );
+        self.finish_mutation(result)
+    }
+
     fn insert_after_raw_with_allocator<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1705,7 +1703,6 @@ impl<K: TreeKey> NNTree<K> {
         Ok(Some(value))
     }
 
-    #[allow(dead_code)] // consumed by HandleNameTree::remove in the next stack layer
     fn remove_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1729,7 +1726,6 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
-    #[allow(dead_code)] // consumed by HandleNameTree::remove in the next stack layer
     fn remove_at_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -3621,9 +3617,9 @@ mod tests {
             )]))
             .expect("allocate name-tree root");
 
-        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        let mut tree = NameTree::new(root, true);
         assert!(tree
-            .find(&mut pdf, b"a")
+            .find_object(&mut pdf, b"a")
             .expect("find existing value")
             .expect("existing value")
             .is_same_object_as(&retained));
@@ -3631,10 +3627,116 @@ mod tests {
         tree.insert(&mut pdf, b"b", retained.clone())
             .expect("insert direct value");
         let inserted = tree
-            .find(&mut pdf, b"b")
+            .find_object(&mut pdf, b"b")
             .expect("find inserted value")
             .expect("inserted value");
         assert!(inserted.is_same_object_as(&retained));
+    }
+
+    #[test]
+    fn handle_name_tree_rejects_a_fresh_wrapper_nesting_a_foreign_indirect_value() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let mut tree = NameTree::new_empty(&mut pdf_two, true).expect("new_empty");
+
+        let foreign_indirect = pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::string(b"one".to_vec()))
+            .expect("allocate value in pdf_one");
+        // A fresh direct wrapper that was never itself promoted to indirect in
+        // any Pdf, but nests the pdf_one-owned indirect handle one hop down.
+        // The outer handle's own shallow ownership fields report no owner;
+        // only a full-graph walk catches the foreign descendant.
+        let wrapper = ObjectHandle::dictionary(vec![(b"/Held".to_vec(), foreign_indirect)]);
+        assert!(wrapper.object_ref().is_none());
+
+        let error = tree
+            .insert(&mut pdf_two, b"a", wrapper)
+            .err()
+            .expect("a wrapper nesting pdf_one's handle must be rejected in pdf_two's tree");
+        assert!(error.to_string().contains("different Pdf"));
+    }
+
+    #[test]
+    fn handle_name_tree_root_rejects_a_contextless_root_nesting_a_foreign_indirect_child() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let foreign_indirect = pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::array(vec![]))
+            .expect("allocate a /Names-shaped value in pdf_one");
+        // A fresh contextless direct root that nests the pdf_one-owned
+        // indirect handle under /Names -- never itself promoted to indirect,
+        // so its own shallow owning_pdf_unique_id() is None.
+        let root = ObjectHandle::dictionary(vec![(b"/Names".to_vec(), foreign_indirect)]);
+        assert!(root.object_ref().is_none());
+
+        let mut tree = NameTree::new(root, true);
+        let error = tree
+            .find_object(&mut pdf_two, b"anything")
+            .expect_err("a root nesting pdf_one's handle must be rejected as pdf_two's root");
+        assert!(error.to_string().contains("different Pdf"));
+    }
+
+    #[test]
+    fn handle_name_tree_rejects_inserting_a_value_owned_by_another_pdf() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let root = pdf_two
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![]),
+            )]))
+            .expect("allocate name-tree root in pdf_two");
+        let mut tree = NameTree::new(root, true);
+
+        // foreign_value is an indirect handle minted by pdf_one, not pdf_two.
+        let foreign_value = pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::string(b"one".to_vec()))
+            .expect("allocate value in pdf_one");
+
+        let error = tree
+            .insert(&mut pdf_two, b"a", foreign_value)
+            .err()
+            .expect("inserting pdf_one's handle into pdf_two's tree must be rejected");
+        assert!(error.to_string().contains("different Pdf"));
+        assert!(tree
+            .find_object(&mut pdf_two, b"a")
+            .expect("find after rejected insert")
+            .is_none());
+    }
+
+    #[test]
+    fn handle_name_tree_rejects_inserting_a_direct_value_associated_with_another_pdf() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let root = pdf_two
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![]),
+            )]))
+            .expect("allocate name-tree root in pdf_two");
+        let mut tree = NameTree::new(root, true);
+
+        // `inner` stays direct (no object_ref), but the sibling wrapper that
+        // holds the same aliased handle is promoted to an indirect object of
+        // pdf_one, which recursively associates every still-direct
+        // descendant — including `inner` — with pdf_one's document identity.
+        let inner = ObjectHandle::string(b"one".to_vec());
+        pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Held".to_vec(),
+                inner.clone(),
+            )]))
+            .expect("promote wrapper to indirect in pdf_one");
+        assert!(inner.object_ref().is_none());
+
+        let error = tree.insert(&mut pdf_two, b"a", inner).err().expect(
+            "inserting a value associated with pdf_one into pdf_two's tree must be rejected",
+        );
+        assert!(error.to_string().contains("different Pdf"));
     }
 
     #[test]
@@ -3660,8 +3762,8 @@ mod tests {
             )]))
             .expect("allocate name-tree root");
 
-        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
-        let entries = tree.entries(&mut pdf).expect("enumerate live values");
+        let mut tree = NameTree::new(root, true);
+        let entries = tree.as_map(&mut pdf).expect("enumerate live values");
         assert!(entries
             .get(b"a".as_slice())
             .expect("first entry")
@@ -3677,7 +3779,7 @@ mod tests {
             .expect("existing value");
         assert!(removed.is_same_object_as(&first));
         assert!(tree
-            .find(&mut pdf, b"a")
+            .find_object(&mut pdf, b"a")
             .expect("lookup removed value")
             .is_none());
         assert!(tree
@@ -3685,7 +3787,7 @@ mod tests {
             .expect("remove missing value")
             .is_none());
         assert!(tree
-            .find(&mut pdf, b"b")
+            .find_object(&mut pdf, b"b")
             .expect("lookup surviving value")
             .expect("surviving value")
             .is_same_object_as(&second));
@@ -3704,9 +3806,9 @@ mod tests {
             )]))
             .expect("allocate malformed name-tree root");
 
-        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        let mut tree = NameTree::new(root, true);
         assert!(matches!(
-            tree.entries(&mut pdf),
+            tree.as_map(&mut pdf),
             Err(Error::Internal(message))
                 if message == "attempt made to dereference an invalid name/number tree iterator"
         ));
@@ -4005,9 +4107,9 @@ mod tests {
 
         let root_handle = pdf_one.get_object_handle(root_ref);
         let pdf_one_id = pdf_one.unique_id();
-        let mut tree = HandleNameTree::new(root_handle.clone(), pdf_one_id, false);
+        let mut tree = NameTree::new(root_handle.clone(), false);
         assert_eq!(
-            tree.find(&mut pdf_one, b"one")
+            tree.find_object(&mut pdf_one, b"one")
                 .unwrap()
                 .and_then(|value| value.as_integer()),
             Some(1)
@@ -4015,7 +4117,7 @@ mod tests {
 
         let mut pdf_two = empty_pdf();
         let error = tree
-            .find(&mut pdf_two, b"one")
+            .find_object(&mut pdf_two, b"one")
             .expect_err("a handle-native tree must reject a foreign Pdf");
         assert!(error.to_string().contains("different Pdf"));
         assert_eq!(tree.inner.canonical_root_pdf_id, Some(pdf_one_id));
@@ -4026,7 +4128,42 @@ mod tests {
             .is_some_and(|root| root.is_same_object_as(&root_handle)));
 
         assert_eq!(
-            tree.find(&mut pdf_one, b"one")
+            tree.find_object(&mut pdf_one, b"one")
+                .unwrap()
+                .and_then(|value| value.as_integer()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn handle_tree_rejects_a_foreign_pdf_on_its_first_operation() {
+        let root_ref = ObjectRef::new(80, 0);
+        let mut pdf_one = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"one".to_vec()), Object::Integer(1)]),
+        );
+        pdf_one.set_object(root_ref, Object::Dictionary(root));
+
+        // The handle already carries pdf_one's document identity (minted by
+        // Pdf::get_object_handle) before it is ever wrapped in a NameTree.
+        let root_handle = pdf_one.get_object_handle(root_ref);
+        let mut tree = NameTree::new(root_handle, false);
+
+        // The tree's first operation targets a *different* Pdf. Because the
+        // wrapped handle already has an owner, this must be rejected instead
+        // of silently claiming pdf_two's identity and reading pdf_one's data
+        // through it.
+        let mut pdf_two = empty_pdf();
+        let error = tree
+            .find_object(&mut pdf_two, b"one")
+            .expect_err("a handle already owned by pdf_one must reject pdf_two on first use");
+        assert!(error.to_string().contains("different Pdf"));
+
+        // The tree still resolves correctly against its actual owner.
+        assert_eq!(
+            tree.find_object(&mut pdf_one, b"one")
                 .unwrap()
                 .and_then(|value| value.as_integer()),
             Some(1)
@@ -4908,9 +5045,9 @@ mod tests {
         // ObjectHandle graphs are not serializable PDF nodes, so the
         // canonical flpdf route uses the live allocation identity here while
         // retaining qpdf's bounded warning behavior.
-        let mut tree = HandleNameTree::new(first, pdf.unique_id(), false);
+        let mut tree = NameTree::new(first, false);
         tree.inner.max_depth = Some(8);
-        assert!(tree.entries(&mut pdf).unwrap().is_empty());
+        assert!(tree.as_map(&mut pdf).unwrap().is_empty());
 
         assert!(pdf
             .repair_diagnostics()

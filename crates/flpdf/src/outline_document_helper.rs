@@ -46,7 +46,7 @@
 //! let _ = pdf.outline().get_root_with_max_depth(10);
 //! ```
 
-use crate::nntree::HandleNameTree;
+use crate::nntree::NameTree;
 use crate::outline_object_helper::{OutlineId, OutlineItem, OutlineTree};
 use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
@@ -133,7 +133,7 @@ pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     /// absent or malformed `/Names`/`/Names/Dests` leaves this `None`, so
     /// (matching qpdf's `nullptr ==` guard) every call keeps retrying the
     /// catalog lookup until a valid tree is found.
-    names_dest: Option<HandleNameTree>,
+    names_dest: Option<NameTree>,
 }
 
 impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
@@ -493,13 +493,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             if root.try_as_dictionary()?.is_none() {
                 return Ok(None);
             }
-            self.names_dest = Some(HandleNameTree::new(root, self.pdf.unique_id(), true));
+            self.names_dest = Some(NameTree::new(root, true));
         }
         let tree = self
             .names_dest
             .as_mut()
             .expect("populated by the check above");
-        let found = tree.find(&mut *self.pdf, lookup.as_slice())?;
+        let found = tree.find_object(&mut *self.pdf, lookup.as_slice())?;
         found
             .map(|value| self.resolve_value_handle(value))
             .transpose()

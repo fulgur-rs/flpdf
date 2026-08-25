@@ -1741,8 +1741,8 @@ fn outline_named_destination_lookup_uses_only_shared_nntree_engine() {
     const SOURCE: &str = include_str!("../src/outline_document_helper.rs");
 
     assert!(
-        SOURCE.contains("HandleNameTree::new("),
-        "outline named-destination lookup must construct the shared HandleNameTree"
+        SOURCE.contains("NameTree::new("),
+        "outline named-destination lookup must construct the shared canonical NameTree"
     );
 
     for private_algorithm in [
