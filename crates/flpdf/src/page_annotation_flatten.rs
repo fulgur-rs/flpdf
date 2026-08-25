@@ -1479,46 +1479,84 @@ mod tests {
         // dirty explicitly so the writer observes the merged content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        pdf.set_object(
+        pdf.replace_object_handle(
             ObjectRef::new(9, 0),
-            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )
+        .unwrap();
+        let appearance_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(9, 0)),
+        )]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("ProcSet", Object::Reference(ObjectRef::new(9, 0)));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Name(b"Text".to_vec())]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
+        )]);
+
+        // Setup's replace_object_handle calls already left object 9 dirty;
+        // clear that so the post-merge dirty assertion below can only pass
+        // because the merge itself marks the mutated array's indirect owner
+        // dirty, not because it was already dirty from construction.
+        pdf.clear_dirty(ObjectRef::new(9, 0));
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Array(proc_set) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap() else {
-            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
-        };
+        assert!(
+            pdf.is_dirty(ObjectRef::new(9, 0)),
+            "the mutated indirect array's owner must be marked dirty after the merge"
+        );
+
+        // Reach /ProcSet through the appearance's own resource dictionary,
+        // not by looking object 9 up directly, so a regression that rebinds
+        // the entry to a different (or direct) array would be caught.
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let stream_dict = appearance.as_stream_dict().unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources.try_get_key(b"/ProcSet").unwrap();
+        pdf.resolve(&proc_set).unwrap();
         assert_eq!(
-            proc_set,
-            vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ],
+            proc_set.object_ref(),
+            Some(ObjectRef::new(9, 0)),
+            "the merged array must retain its indirect owner identity"
+        );
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
+        assert_eq!(
+            proc_set_items.len(),
+            2,
+            "the merged array must contain exactly the original and appended items"
+        );
+        assert_eq!(
+            proc_set_items[0].as_name(),
+            Some(b"PDF".to_vec()),
+            "the existing indirect array item must remain in place"
+        );
+        assert_eq!(
+            proc_set_items[1].as_name(),
+            Some(b"Text".to_vec()),
             "the merged indirect array must be reachable through pdf.resolve after the merge"
         );
     }
@@ -1533,53 +1571,66 @@ mod tests {
         // then /XObject -- a direct stream, absent from the destination --
         // fails installation via shallow_copy's stream rejection.
         //
-        // mark_object_handle_mutated (reader.rs) evicts the object's
-        // legacy_materialized_memo entry as its cache-invalidation step; a
-        // prior pdf.resolve_object() populates that cache, so this test warms it
-        // *before* the merge and re-resolves *after* -- if the /ProcSet
-        // mutation that ran before the /XObject failure was never marked
-        // dirty, the second resolve would still return the pre-merge
-        // snapshot instead of live content.
+        // ObjectHandle reads are always live off the shared canonical
+        // handle graph, so a stale-content check alone cannot tell whether
+        // the /ProcSet merge's dirty mark survived the later failure --
+        // that must be asserted directly via pdf.is_dirty.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        pdf.set_object(
+        pdf.replace_object_handle(
             ObjectRef::new(9, 0),
-            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )
+        .unwrap();
+        let appearance_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(9, 0)),
+        )]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("ProcSet", Object::Reference(ObjectRef::new(9, 0)));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Name(b"Text".to_vec())]),
-        );
-        default_resources.insert(
-            "XObject",
-            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+            .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
             .unwrap();
 
-        // Warm pdf.resolve's cache with the pre-merge snapshot.
-        let Object::Array(proc_set_before) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
-        else {
-            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(proc_set_before, vec![Object::Name(b"PDF".to_vec())]);
+        let default_resources = ObjectHandle::dictionary(vec![
+            (
+                b"/ProcSet".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
+            ),
+            (
+                b"/XObject".to_vec(),
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ),
+        ]);
+
+        // Sanity-check the pre-merge fixture shape.
+        let proc_set_before = pdf.get_object_handle(ObjectRef::new(9, 0));
+        pdf.resolve(&proc_set_before).unwrap();
+        let proc_set_before_items = proc_set_before
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
+        assert_eq!(proc_set_before_items.len(), 1);
+        assert_eq!(proc_set_before_items[0].as_name(), Some(b"PDF".to_vec()));
+
+        // Setup's replace_object_handle calls already left object 9 dirty;
+        // clear that so the post-merge dirty assertion below can only pass
+        // because the /ProcSet merge itself marks object 9 dirty (and that
+        // mark survives the later /XObject failure), not because it was
+        // already dirty from construction.
+        pdf.clear_dirty(ObjectRef::new(9, 0));
 
         let error = merge_widget_default_resources_on_page(
             &mut pdf,
@@ -1592,18 +1643,51 @@ mod tests {
             Error::System(message) if message == "stream objects cannot be cloned"
         ));
 
-        let Object::Array(proc_set_after) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
-        else {
-            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
-        };
+        // qpdf's merge_resources documents that entries merged before a
+        // later category's failure stay installed and dirty in the live
+        // handle graph. ObjectHandle reads are always live regardless of
+        // dirty state (dirty only controls what the writer emits), so the
+        // dirty mark itself must be asserted directly rather than inferred
+        // from content still being visible through resolve.
+        assert!(
+            pdf.is_dirty(ObjectRef::new(9, 0)),
+            "the /ProcSet merge that ran before the /XObject failure must leave its \
+             indirect array owner dirty, not roll the dirty mark back"
+        );
+
+        // Reach /ProcSet through the appearance's own resource dictionary,
+        // not by looking object 9 up directly, so a regression that rebinds
+        // the entry to a different (or direct) array would be caught.
+        let appearance_after = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance_after).unwrap();
+        let resources_after = appearance_after.as_stream_dict().unwrap();
+        let proc_set_after = resources_after.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&proc_set_after).unwrap();
+        let proc_set_after = proc_set_after.try_get_key(b"/ProcSet").unwrap();
+        pdf.resolve(&proc_set_after).unwrap();
         assert_eq!(
-            proc_set_after,
-            vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ],
-            "the /ProcSet merge that ran before the /XObject failure must invalidate the \
-             pre-merge pdf.resolve_object() snapshot, not return it stale"
+            proc_set_after.object_ref(),
+            Some(ObjectRef::new(9, 0)),
+            "the merged array must retain its indirect owner identity"
+        );
+        let proc_set_after_items = proc_set_after
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
+        assert_eq!(
+            proc_set_after_items.len(),
+            2,
+            "the merged array must contain exactly the original and appended items"
+        );
+        assert_eq!(
+            proc_set_after_items[0].as_name(),
+            Some(b"PDF".to_vec()),
+            "the existing ProcSet item must remain after the later failure"
+        );
+        assert_eq!(
+            proc_set_after_items[1].as_name(),
+            Some(b"Text".to_vec()),
+            "the /ProcSet merge that ran before the /XObject failure must remain \
+             installed, not be rolled back"
         );
     }
 
@@ -1623,45 +1707,59 @@ mod tests {
         // `getKey("/Resources")` on an absent key returns a null handle, and
         // `mergeResources` returns immediately when the receiver isn't a
         // dictionary (QPDFObjectHandle.cc:1063-1069).
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(Vec::new()),
+            )]),
+            Rc::new(Vec::new()),
         );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec()),
-            ]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"PDF".to_vec()),
+                ObjectHandle::name(b"Text".to_vec()),
+            ]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must gain a resources dictionary"); // cov:ignore: fixture invariant
-        };
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let resources = appearance
+            .as_stream_dict()
+            .expect("fixture appearance must remain a stream")
+            .try_get_key(b"/Resources")
+            .expect("fixture appearance must gain a resources dictionary");
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources
+            .try_get_key(b"/ProcSet")
+            .expect("fixture appearance must gain ProcSet");
+        pdf.resolve(&proc_set).unwrap();
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("installed ProcSet category must be an array");
         assert_eq!(
-            resources.get("ProcSet"),
-            Some(&Object::Array(vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ]))
+            proc_set_items
+                .iter()
+                .map(|item| item.as_name())
+                .collect::<Vec<_>>(),
+            vec![Some(b"PDF".to_vec()), Some(b"Text".to_vec())]
         );
     }
 
@@ -1672,50 +1770,60 @@ mod tests {
         // the destination's own items untouched.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+        let appearance_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec()),
-            ]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"PDF".to_vec()),
+                ObjectHandle::name(b"Text".to_vec()),
+            ]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
-        };
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let resources = appearance
+            .as_stream_dict()
+            .expect("fixture appearance must remain a stream")
+            .try_get_key(b"/Resources")
+            .expect("fixture appearance must retain resources");
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources
+            .try_get_key(b"/ProcSet")
+            .expect("fixture appearance must retain ProcSet");
+        pdf.resolve(&proc_set).unwrap();
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("fixture ProcSet must remain an array");
         assert_eq!(
-            resources.get("ProcSet"),
-            Some(&Object::Array(vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ])),
+            proc_set_items
+                .iter()
+                .map(|item| item.as_name())
+                .collect::<Vec<_>>(),
+            vec![Some(b"PDF".to_vec()), Some(b"Text".to_vec())],
             "the existing /PDF entry must not duplicate, and /Text must be appended"
         );
     }
@@ -1728,39 +1836,47 @@ mod tests {
         // exactly as it already was.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("ProcSet", Object::Integer(7));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
+        let appearance_resources =
+            ObjectHandle::dictionary(vec![(b"/ProcSet".to_vec(), ObjectHandle::integer(7))]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(resources.get("ProcSet"), Some(&Object::Integer(7)));
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let resources = appearance
+            .as_stream_dict()
+            .expect("fixture appearance must remain a stream")
+            .try_get_key(b"/Resources")
+            .expect("fixture appearance must retain resources");
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources
+            .try_get_key(b"/ProcSet")
+            .expect("fixture appearance must retain ProcSet");
+        pdf.resolve(&proc_set).unwrap();
+        assert_eq!(proc_set.as_integer(), Some(7));
     }
 
     #[test]
@@ -1771,46 +1887,58 @@ mod tests {
         // from the merge entirely, on either side.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Array(vec![Object::Integer(1)])]),
+        let appearance_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::array(vec![ObjectHandle::integer(1)])]),
+        )]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Dictionary(Dictionary::new())]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(Vec::new())]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
-        };
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let resources = appearance
+            .as_stream_dict()
+            .expect("fixture appearance must remain a stream")
+            .try_get_key(b"/Resources")
+            .expect("fixture appearance must retain resources");
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources
+            .try_get_key(b"/ProcSet")
+            .expect("fixture appearance must retain ProcSet");
+        pdf.resolve(&proc_set).unwrap();
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("fixture ProcSet must remain an array");
+        assert_eq!(proc_set_items.len(), 1);
+        let nested = proc_set_items[0]
+            .as_array()
+            .expect("existing ProcSet item must remain a nested array");
         assert_eq!(
-            resources.get("ProcSet"),
-            Some(&Object::Array(vec![Object::Array(vec![Object::Integer(
-                1
-            )])])),
+            nested[0].as_integer(),
+            Some(1),
             "the existing non-scalar item survives; the source's non-scalar item is not appended"
         );
     }
