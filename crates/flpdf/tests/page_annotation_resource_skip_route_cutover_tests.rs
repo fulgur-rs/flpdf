@@ -227,7 +227,7 @@ fn indirect_scalar_resource_fixture_uses_live_handles() {
         .split_once("fn qpdf_flatten_appends_an_indirect_scalar_item_from_dr")
         .expect("indirect scalar resource test must remain")
         .1
-        .split_once("fn qpdf_flatten_terminal_chases_a_holder_redirect_category_and_array_item")
+        .split_once("fn qpdf_flatten_marks_an_indirect_array_category_dirty_after_merge")
         .expect("indirect scalar resource test boundary must remain")
         .0;
 
