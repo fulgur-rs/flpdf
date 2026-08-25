@@ -3652,6 +3652,38 @@ mod tests {
     }
 
     #[test]
+    fn handle_name_tree_rejects_inserting_a_direct_value_associated_with_another_pdf() {
+        let pdf_one = empty_pdf();
+        let mut pdf_two = empty_pdf();
+
+        let root = pdf_two
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![]),
+            )]))
+            .expect("allocate name-tree root in pdf_two");
+        let mut tree = NameTree::new(root, true);
+
+        // `inner` stays direct (no object_ref), but the sibling wrapper that
+        // holds the same aliased handle is promoted to an indirect object of
+        // pdf_one, which recursively associates every still-direct
+        // descendant — including `inner` — with pdf_one's document identity.
+        let inner = ObjectHandle::string(b"one".to_vec());
+        pdf_one
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Held".to_vec(),
+                inner.clone(),
+            )]))
+            .expect("promote wrapper to indirect in pdf_one");
+        assert!(inner.object_ref().is_none());
+
+        let error = tree.insert(&mut pdf_two, b"a", inner).err().expect(
+            "inserting a value associated with pdf_one into pdf_two's tree must be rejected",
+        );
+        assert!(error.to_string().contains("different Pdf"));
+    }
+
+    #[test]
     fn handle_name_tree_lists_and_removes_live_values_without_materializing() {
         let mut pdf = empty_pdf();
         let first = ObjectHandle::dictionary(vec![(
