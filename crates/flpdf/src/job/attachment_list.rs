@@ -384,8 +384,9 @@ mod tests {
     use crate::filespec_helper::{
         encode_utf16be, format_pdf_date, FileParamDates, FileSpecBuilder,
     };
-    use crate::Pdf;
+    use crate::{ObjectHandle, ObjectRef, Pdf};
     use std::io::Cursor;
+    use std::rc::Rc;
 
     // ── Minimal PDF fixture ───────────────────────────────────────────────────
 
@@ -394,6 +395,31 @@ mod tests {
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len() as u64;
         pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    fn inline_non_dictionary_filespec_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(k.txt) (not-a-filespec)] >> >> >>\nendobj\n",
+        );
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
         let off3 = pdf.len() as u64;
@@ -454,12 +480,39 @@ mod tests {
 
     // ── Filespec construction helpers ─────────────────────────────────────────
 
-    use crate::object::{Dictionary, Object, Stream};
-    use crate::ObjectRef;
-
     fn next_ref(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectRef {
         pdf.next_available_object_ref()
             .expect("object-number space must have room in the test fixture")
+    }
+
+    fn object_ref(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+        pdf.get_object_handle(object_ref)
+    }
+
+    #[derive(Clone)]
+    struct HandleDict(ObjectHandle);
+
+    impl HandleDict {
+        fn new() -> Self {
+            Self(ObjectHandle::dictionary(Vec::new()))
+        }
+
+        fn from_entries(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
+            Self(ObjectHandle::dictionary(entries))
+        }
+
+        fn insert(&self, key: &str, value: ObjectHandle) {
+            let mut key_bytes = Vec::with_capacity(key.len() + 1);
+            key_bytes.push(b'/');
+            key_bytes.extend_from_slice(key.as_bytes());
+            self.0
+                .replace_key(&key_bytes, value)
+                .expect("test fixture dictionary insertion");
+        }
+
+        fn into_handle(self) -> ObjectHandle {
+            self.0
+        }
     }
 
     /// Store an `/EmbeddedFile` stream and return its reference.
@@ -469,44 +522,52 @@ mod tests {
     /// producer that records no metadata looks like.
     fn add_ef_stream(
         pdf: &mut Pdf<Cursor<Vec<u8>>>,
-        params: Option<Dictionary>,
+        params: Option<HandleDict>,
         subtype: Option<&[u8]>,
     ) -> ObjectRef {
         let stream_ref = next_ref(pdf);
-        let mut dict = Dictionary::new();
-        dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        dict.insert("Length", Object::Integer(4));
+        let dict = HandleDict::new();
+        dict.insert("Type", ObjectHandle::name(b"EmbeddedFile".to_vec()));
+        dict.insert("Length", ObjectHandle::integer(4));
         if let Some(subtype) = subtype {
-            dict.insert("Subtype", Object::Name(subtype.to_vec()));
+            dict.insert("Subtype", ObjectHandle::name(subtype.to_vec()));
         }
         if let Some(params) = params {
-            dict.insert("Params", Object::Dictionary(params));
+            dict.insert("Params", params.into_handle());
         }
-        pdf.set_object(
+        pdf.set_object_handle(
             stream_ref,
-            Object::Stream(Stream::new(dict, b"data".to_vec())),
-        );
+            ObjectHandle::stream(dict.into_handle(), Rc::new(b"data".to_vec())),
+        )
+        .expect("install embedded-file stream fixture");
         stream_ref
     }
 
     /// Store `filespec` and register it in the EmbeddedFiles name tree.
-    fn attach(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], filespec: Dictionary) -> ObjectRef {
+    fn attach(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], filespec: HandleDict) -> ObjectRef {
         let filespec_ref = next_ref(pdf);
-        pdf.set_object(filespec_ref, Object::Dictionary(filespec));
+        pdf.set_object_handle(filespec_ref, filespec.into_handle())
+            .expect("install Filespec fixture");
         insert_embedded_file(pdf, key, filespec_ref).expect("insert");
         filespec_ref
     }
 
     /// Build `/Params` with the standard four entries.
-    fn full_params() -> Dictionary {
-        let mut params = Dictionary::new();
-        params.insert("Size", Object::Integer(4));
+    fn full_params() -> HandleDict {
+        let params = HandleDict::new();
+        params.insert("Size", ObjectHandle::integer(4));
         params.insert(
             "CreationDate",
-            Object::String(b"D:20240101000000Z".to_vec()),
+            ObjectHandle::string(b"D:20240101000000Z".to_vec()),
         );
-        params.insert("ModDate", Object::String(b"D:20240102000000Z".to_vec()));
-        params.insert("CheckSum", Object::String(vec![0x00, 0x1f, 0xa0, 0xff]));
+        params.insert(
+            "ModDate",
+            ObjectHandle::string(b"D:20240102000000Z".to_vec()),
+        );
+        params.insert(
+            "CheckSum",
+            ObjectHandle::string(vec![0x00, 0x1f, 0xa0, 0xff]),
+        );
         params
     }
 
@@ -526,13 +587,13 @@ mod tests {
     fn non_verbose_lists_only_the_header_line() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, Some(full_params()), Some(b"text/plain"));
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("Desc", Object::String(b"described".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("Type", ObjectHandle::name(b"Filespec".to_vec()));
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("Desc", ObjectHandle::string(b"described".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let out = listing(&mut pdf, false);
@@ -550,11 +611,11 @@ mod tests {
     fn header_objgen_is_the_stream_not_the_filespec() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         let filespec_ref = attach(&mut pdf, b"a.txt", filespec);
 
         assert_ne!(
@@ -575,14 +636,14 @@ mod tests {
     fn verbose_block_matches_qpdf_structure() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, Some(full_params()), Some(b"text/plain"));
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        ef.insert("UF", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("UF", Object::String(encode_utf16be("π.txt")));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        ef.insert("UF", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("Type", ObjectHandle::name(b"Filespec".to_vec()));
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("UF", ObjectHandle::string(encode_utf16be("π.txt")));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let n = stream_ref.number;
@@ -613,12 +674,12 @@ mod tests {
     fn description_precedes_preferred_name_and_only_when_present() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("Desc", Object::String(b"my description".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("Desc", ObjectHandle::string(b"my description".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let with_desc = as_text(&listing(&mut pdf, true));
@@ -629,12 +690,12 @@ mod tests {
         // An empty /Desc drops the line entirely rather than printing a label.
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("Desc", Object::String(Vec::new()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("Desc", ObjectHandle::string(Vec::new()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let without_desc = as_text(&listing(&mut pdf, true));
@@ -651,11 +712,11 @@ mod tests {
     fn absent_values_render_empty_after_the_label() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let out = as_text(&listing(&mut pdf, true));
@@ -679,13 +740,13 @@ mod tests {
     fn data_streams_list_every_ef_key_but_names_stay_recognized() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        ef.insert("Zed", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("Zed", Object::String(b"ignored.txt".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        ef.insert("Zed", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("Zed", ObjectHandle::string(b"ignored.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let out = as_text(&listing(&mut pdf, true));
@@ -706,13 +767,12 @@ mod tests {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
         let missing = ObjectRef::new(stream_ref.number + 40, 0);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        ef.insert("UF", Object::Null);
-        ef.insert("Unix", Object::Reference(missing));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"a.txt".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::from_entries(vec![(b"/UF".to_vec(), ObjectHandle::null())]);
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        ef.insert("Unix", object_ref(&mut pdf, missing));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"a.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"a.txt", filespec);
 
         let out = as_text(&listing(&mut pdf, true));
@@ -732,8 +792,8 @@ mod tests {
     #[test]
     fn filespec_without_ef_reports_zero_objgen() {
         let mut pdf = open_minimal();
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"c.txt".to_vec()));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"c.txt".to_vec()));
         attach(&mut pdf, b"c.txt", filespec);
 
         assert_eq!(
@@ -767,14 +827,15 @@ mod tests {
     fn ef_value_that_is_not_a_stream_fails_when_metadata_is_read() {
         let mut pdf = open_minimal();
         let dict_ref = next_ref(&mut pdf);
-        let mut not_a_stream = Dictionary::new();
-        not_a_stream.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        pdf.set_object(dict_ref, Object::Dictionary(not_a_stream));
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(dict_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"g.txt".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let not_a_stream = HandleDict::new();
+        not_a_stream.insert("Type", ObjectHandle::name(b"EmbeddedFile".to_vec()));
+        pdf.set_object_handle(dict_ref, HandleDict::into_handle(not_a_stream))
+            .expect("install non-stream fixture");
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, dict_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"g.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"g.txt", filespec);
 
         let error = format_attachment_list(&mut pdf, true)
@@ -803,17 +864,17 @@ mod tests {
     fn empty_name_tree_lists_nothing_but_is_not_none() {
         let mut pdf = open_minimal();
         let root = pdf.root_ref().expect("catalog");
-        let mut catalog = pdf
-            .resolve_object(root)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog dictionary");
-        let mut tree = Dictionary::new();
-        tree.insert("Names", Object::Array(Vec::new()));
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Dictionary(tree));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(root, Object::Dictionary(catalog));
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        let tree = HandleDict::new();
+        tree.insert("Names", ObjectHandle::array(Vec::new()));
+        let names = HandleDict::new();
+        names.insert("EmbeddedFiles", tree.into_handle());
+        catalog
+            .replace_key(b"/Names", names.into_handle())
+            .expect("install empty EmbeddedFiles tree");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
 
         assert_eq!(
             format_attachment_list(&mut pdf, true).expect("format"),
@@ -824,22 +885,22 @@ mod tests {
 
     /// Point `/Names /EmbeddedFiles` straight at `[key value]`, bypassing the
     /// name-tree writer so the value shape can be chosen freely.
-    fn attach_raw_tree_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: Object) {
+    fn attach_raw_tree_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: ObjectHandle) {
         let root = pdf.root_ref().expect("catalog");
-        let mut catalog = pdf
-            .resolve_object(root)
-            .expect("resolve catalog")
-            .into_dict()
-            .expect("catalog dictionary");
-        let mut tree = Dictionary::new();
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("resolve catalog");
+        let tree = HandleDict::new();
         tree.insert(
             "Names",
-            Object::Array(vec![Object::String(key.to_vec()), value]),
+            ObjectHandle::array(vec![ObjectHandle::string(key.to_vec()), value]),
         );
-        let mut names = Dictionary::new();
-        names.insert("EmbeddedFiles", Object::Dictionary(tree));
-        catalog.insert("Names", Object::Dictionary(names));
-        pdf.set_object(root, Object::Dictionary(catalog));
+        let names = HandleDict::new();
+        names.insert("EmbeddedFiles", tree.into_handle());
+        catalog
+            .replace_key(b"/Names", names.into_handle())
+            .expect("install raw EmbeddedFiles tree fixture");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog dirty");
     }
 
     // ── Name-tree value shapes ────────────────────────────────────────────────
@@ -848,15 +909,15 @@ mod tests {
     fn inline_filespec_value_is_listed() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
-        filespec.insert("F", Object::String(b"j.txt".to_vec()));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("Type", ObjectHandle::name(b"Filespec".to_vec()));
+        filespec.insert("F", ObjectHandle::string(b"j.txt".to_vec()));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         // A name-tree leaf may hold the /Filespec inline instead of by
         // reference; it must list exactly as an indirect one does.
-        attach_raw_tree_value(&mut pdf, b"j.txt", Object::Dictionary(filespec));
+        attach_raw_tree_value(&mut pdf, b"j.txt", HandleDict::into_handle(filespec));
 
         let n = stream_ref.number;
         assert_eq!(
@@ -880,25 +941,40 @@ mod tests {
     fn non_dictionary_filespec_value_still_lists_the_key() {
         // qpdf warns ("Embedded file object is not a dictionary") and carries
         // on with empty values rather than failing the listing.
-        for value in [
-            Object::String(b"not-a-filespec".to_vec()),
-            Object::Reference(ObjectRef::new(4096, 0)),
-        ] {
-            let mut pdf = open_minimal();
-            attach_raw_tree_value(&mut pdf, b"k.txt", value);
-            assert_eq!(
-                as_text(&listing(&mut pdf, true)),
-                "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
-            );
-            assert!(
-                pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
-                    diagnostic
-                        .message
-                        .contains("Embedded file object is not a dictionary")
-                }),
-                "QPDFFileSpecObjectHelper must warn for a non-dictionary Filespec"
-            );
-        }
+        let mut direct_pdf = Pdf::open(Cursor::new(inline_non_dictionary_filespec_pdf_bytes()))
+            .expect("open direct non-dictionary Filespec fixture");
+        assert_eq!(
+            as_text(&listing(&mut direct_pdf, true)),
+            "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+        );
+        assert!(
+            direct_pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("Embedded file object is not a dictionary")),
+            "QPDFFileSpecObjectHelper must warn for a direct non-dictionary Filespec"
+        );
+
+        let mut dangling_pdf = open_minimal();
+        let dangling = object_ref(&mut dangling_pdf, ObjectRef::new(4096, 0));
+        attach_raw_tree_value(&mut dangling_pdf, b"k.txt", dangling);
+        assert_eq!(
+            as_text(&listing(&mut dangling_pdf, true)),
+            "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+        );
+        assert!(
+            dangling_pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("Embedded file object is not a dictionary")),
+            "QPDFFileSpecObjectHelper must warn for a dangling Filespec"
+        );
     }
 
     // ── Name-tree keys use qpdf's UTF-8 view ──────────────────────────────────
@@ -914,11 +990,11 @@ mod tests {
             ("café.txt".as_bytes().to_vec(), b"cafe.txt".as_slice()),
         ] {
             let stream_ref = add_ef_stream(&mut pdf, None, None);
-            let mut ef = Dictionary::new();
-            ef.insert("F", Object::Reference(stream_ref));
-            let mut filespec = Dictionary::new();
-            filespec.insert("F", Object::String(filename.to_vec()));
-            filespec.insert("EF", Object::Dictionary(ef));
+            let ef = HandleDict::new();
+            ef.insert("F", object_ref(&mut pdf, stream_ref));
+            let filespec = HandleDict::new();
+            filespec.insert("F", ObjectHandle::string(filename.to_vec()));
+            filespec.insert("EF", HandleDict::into_handle(ef));
             attach(&mut pdf, &key, filespec);
         }
 
@@ -943,14 +1019,14 @@ mod tests {
 
         // Minimal EmbeddedFile stream (no /Params → missing size/dates/checksum).
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef_sub = Dictionary::new();
-        ef_sub.insert("F", Object::Reference(stream_ref));
+        let ef_sub = HandleDict::new();
+        ef_sub.insert("F", object_ref(&mut pdf, stream_ref));
 
         // Filespec with /F only (no /UF).
-        let mut fs_dict = Dictionary::new();
-        fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
-        fs_dict.insert("F", Object::String(b"only-f.txt".to_vec()));
-        fs_dict.insert("EF", Object::Dictionary(ef_sub));
+        let fs_dict = HandleDict::new();
+        fs_dict.insert("Type", ObjectHandle::name(b"Filespec".to_vec()));
+        fs_dict.insert("F", ObjectHandle::string(b"only-f.txt".to_vec()));
+        fs_dict.insert("EF", HandleDict::into_handle(ef_sub));
         attach(&mut pdf, b"only-f.txt", fs_dict);
 
         let infos = list_attachment_info(&mut pdf).expect("list");
@@ -1126,12 +1202,12 @@ mod tests {
     fn verbose_description_decodes_utf16be() {
         let mut pdf = open_minimal();
         let stream_ref = add_ef_stream(&mut pdf, None, None);
-        let mut ef = Dictionary::new();
-        ef.insert("F", Object::Reference(stream_ref));
-        let mut filespec = Dictionary::new();
-        filespec.insert("F", Object::String(b"k.txt".to_vec()));
-        filespec.insert("Desc", Object::String(encode_utf16be("dé")));
-        filespec.insert("EF", Object::Dictionary(ef));
+        let ef = HandleDict::new();
+        ef.insert("F", object_ref(&mut pdf, stream_ref));
+        let filespec = HandleDict::new();
+        filespec.insert("F", ObjectHandle::string(b"k.txt".to_vec()));
+        filespec.insert("Desc", ObjectHandle::string(encode_utf16be("dé")));
+        filespec.insert("EF", HandleDict::into_handle(ef));
         attach(&mut pdf, b"k.txt", filespec);
 
         let formatted = as_text(&listing(&mut pdf, true));
