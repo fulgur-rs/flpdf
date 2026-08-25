@@ -30,14 +30,46 @@ fn rewrite_renumber_is_owned_by_the_writer_module() {
     );
 }
 
+/// Remove every `#[cfg(test)]`-attributed item's full body (not just the
+/// text before the first marker) so a scan of the remainder covers all
+/// production code, including any that follows an early test-only item.
+fn strip_cfg_test_items(source: &str) -> String {
+    let mut production = String::new();
+    let mut rest = source;
+    while let Some(marker_pos) = rest.find("#[cfg(test)]") {
+        production.push_str(&rest[..marker_pos]);
+        let after_marker = &rest[marker_pos..];
+        let brace_start = after_marker
+            .find('{')
+            .expect("a #[cfg(test)] item must have a body");
+        let body = &after_marker[brace_start..];
+        let mut depth: usize = 0;
+        let mut end = None;
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.expect("a #[cfg(test)] item must have a balanced body");
+        rest = &after_marker[brace_start + end..];
+    }
+    production.push_str(rest);
+    production
+}
+
 #[test]
 fn production_renumber_route_has_only_the_canonical_handle_engine() {
     let source = fs::read_to_string(source_root().join("writer/rewrite_renumber.rs"))
         .expect("rewrite_renumber.rs must be readable");
-    let production = source
-        .split("#[cfg(test)]")
-        .next()
-        .expect("rewrite_renumber source has a production section");
+    let production = strip_cfg_test_items(&source);
 
     assert!(
         production.contains("CanonicalCatalogFirstRenumber"),
