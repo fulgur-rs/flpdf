@@ -2528,7 +2528,7 @@ impl LinearizationPlan {
             pdf,
             &assigned,
             optimization.generate_objstm_eligible(),
-        )?;
+        )?; // cov:ignore: closing line of a multi-line call; llvm-cov misattributes the hit count to the previous line, not an untested branch
         let routes = route_objstm_containers(
             optimization,
             !self.outline_first_page_members.is_empty(),

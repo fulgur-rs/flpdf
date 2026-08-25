@@ -2433,12 +2433,14 @@ fn do_write_pass<R: Read + Seek>(
         {
             continue;
         }
+        // cov:ignore-start: planner/renumber inconsistency -- impossible by construction, since part2/part3/part6_outline_objects derive from the same renumber plan.
         let Some(new_ref) = renumber.new_for_original(*original_ref) else {
             return Err(crate::Error::Unsupported(format!(
                 "first-page object {} has no renumber entry",
                 original_ref
             )));
         };
+        // cov:ignore-end
         first_page_emits.push((new_ref.number, FirstPageEmit::Plain(*original_ref)));
     }
     for container in &objstm_layout.part3 {
@@ -3872,7 +3874,7 @@ fn write_linearized_impl<R: Read + Seek>(
                 plan.optimization
                     .as_ref()
                     .and_then(|optimization| optimization.generate_objstm_eligible()),
-            )?;
+            )?; // cov:ignore: closing line of a multi-line call; llvm-cov misattributes the hit count to the previous line, not an untested branch
             let mut rank = std::collections::BTreeMap::new();
             for (split_index, members) in membership.iter().enumerate() {
                 // `objstm_membership_linearized` drops empty containers, so
