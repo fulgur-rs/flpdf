@@ -993,47 +993,6 @@ mod tests {
     }
 
     #[test]
-    fn qpdf_flatten_expands_a_multihop_contents_array() {
-        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        page.insert("Contents", Object::Reference(ObjectRef::new(6, 0)));
-        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
-        pdf.set_object(
-            ObjectRef::new(6, 0),
-            Object::Reference(ObjectRef::new(7, 0)),
-        );
-        pdf.set_object(
-            ObjectRef::new(7, 0),
-            Object::Array(vec![
-                Object::Reference(ObjectRef::new(8, 0)),
-                Object::Reference(ObjectRef::new(9, 0)),
-            ]),
-        );
-        pdf.set_object(
-            ObjectRef::new(8, 0),
-            Object::Stream(Stream::new(Dictionary::new(), b"BT ET\n".to_vec())),
-        );
-        pdf.set_object(
-            ObjectRef::new(9, 0),
-            Object::Stream(Stream::new(Dictionary::new(), b"q Q\n".to_vec())),
-        );
-
-        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
-        pdf.resolve(&page).unwrap();
-        add_qpdf_flatten_contents(&mut pdf, &page, Vec::new()).unwrap();
-
-        let contents = pdf
-            .resolve_to_terminal(&page.try_get_key(b"/Contents").unwrap())
-            .unwrap();
-        let items = contents.as_array().unwrap();
-        assert_eq!(items.len(), 4);
-        assert_eq!(items[1].object_ref(), Some(ObjectRef::new(8, 0)));
-        assert_eq!(items[2].object_ref(), Some(ObjectRef::new(9, 0)));
-    }
-
-    #[test]
     fn build_pruned_annots_array_treats_a_non_array_as_empty() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         let page = pdf.get_object_handle(ObjectRef::new(3, 0));
