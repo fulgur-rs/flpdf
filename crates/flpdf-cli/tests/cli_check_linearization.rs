@@ -103,6 +103,35 @@ fn top_level_check_linearization_warning_matches_qpdf() {
 }
 
 #[test]
+fn top_level_check_linearization_no_warn_matches_qpdf() {
+    if !qpdf_available() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temporary directory should exist");
+    let input = temp.path().join("o-mismatch.pdf");
+    let mut bytes = std::fs::read(fixture("linearized-one-page.pdf")).unwrap();
+    let marker = b"/O 6 /E";
+    let replacement = b"/O 7 /E";
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("linearization fixture should contain /O");
+    bytes[offset..offset + marker.len()].copy_from_slice(replacement);
+    std::fs::write(&input, bytes).expect("malformed fixture should be written");
+    let input = input.to_str().expect("temporary path should be UTF-8");
+
+    let expected = run_qpdf(&["--no-warn", "--check-linearization", input]);
+    let actual = run_flpdf(&["--no-warn", "--check-linearization", input]);
+
+    assert_eq!(expected.status.code(), Some(3));
+    assert_output_matches(&actual, &expected);
+    assert!(
+        String::from_utf8_lossy(&actual.stderr).is_empty(),
+        "--no-warn must suppress warning delivery while keeping exit status 3"
+    );
+}
+
+#[test]
 fn check_linearization_subcommand_uses_the_same_canonical_route() {
     let input = fixture("linearized-one-page.pdf");
     let input = input.to_str().expect("fixture path should be UTF-8");

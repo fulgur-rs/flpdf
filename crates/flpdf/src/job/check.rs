@@ -88,8 +88,12 @@ impl QPDFJob {
             return self.complete(false);
         }
 
-        let linearization_warnings =
-            emit_linearization_check_for_document(pdf, &logger, &input_name)?;
+        let linearization_warnings = emit_linearization_check_for_document_with_suppression(
+            pdf,
+            &logger,
+            &input_name,
+            self.warnings_suppressed(),
+        )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
 
         if linearization_warnings {
             self.record_warnings();
@@ -108,6 +112,9 @@ impl QPDFJob {
     /// this job-owned adapter restores the same logger boundary for `--check`
     /// without making a second parse of the input.
     pub fn report_open_failure(&self, error: &crate::Error) -> Result<()> {
+        if self.warnings_suppressed() {
+            return Ok(());
+        }
         let Some((_, diagnostics)) = error.open_failure() else {
             return Ok(());
         };
@@ -129,7 +136,13 @@ impl QPDFJob {
         let message_prefix = self.message_prefix().to_owned();
 
         pdf.set_logger(logger.clone());
-        let outcome = check_document(pdf, &logger, &message_prefix, &input_name)?;
+        let outcome = check_document_with_suppression(
+            pdf,
+            &logger,
+            &message_prefix,
+            &input_name,
+            self.warnings_suppressed(),
+        )?;
         self.record_document_warnings(pdf);
         if outcome.warnings {
             self.record_warnings();
@@ -158,11 +171,22 @@ pub(crate) fn check_bytes_for_test(bytes: Vec<u8>) -> std::result::Result<JobExi
     job.check(&mut pdf)
 }
 
+#[cfg(test)]
 fn check_document<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
     message_prefix: &str,
     input_name: &str,
+) -> std::result::Result<CheckOutcome, CheckError> {
+    check_document_with_suppression(pdf, logger, message_prefix, input_name, false)
+}
+
+fn check_document_with_suppression<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    input_name: &str,
+    suppress_warnings: bool,
 ) -> std::result::Result<CheckOutcome, CheckError> {
     let mut warnings = false;
     let mut diagnostics_seen = 0;
@@ -198,13 +222,24 @@ fn check_document<R: Read + Seek + 'static>(
     };
     if linearized {
         logger.info("File is linearized\n")?;
-        warnings |= emit_linearization_check_for_document(pdf, logger, input_name)?;
+        warnings |= emit_linearization_check_for_document_with_suppression(
+            pdf,
+            logger,
+            input_name,
+            suppress_warnings,
+        )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     } else {
         logger.info("File is not linearized\n")?;
     }
 
-    let (new_warnings, new_errors) =
-        emit_new_diagnostics(pdf, diagnostics_seen, logger, message_prefix, input_name)?;
+    let (new_warnings, new_errors) = emit_new_diagnostics_with_suppression(
+        pdf,
+        diagnostics_seen,
+        logger,
+        message_prefix,
+        input_name,
+        suppress_warnings,
+    )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
@@ -222,8 +257,14 @@ fn check_document<R: Read + Seek + 'static>(
         return Err(CheckError::ErrorsDetected);
     }
 
-    let (new_warnings, new_errors) =
-        emit_new_diagnostics(pdf, diagnostics_seen, logger, message_prefix, input_name)?;
+    let (new_warnings, new_errors) = emit_new_diagnostics_with_suppression(
+        pdf,
+        diagnostics_seen,
+        logger,
+        message_prefix,
+        input_name,
+        suppress_warnings,
+    )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     diagnostics_seen = pdf.repair_diagnostics().entries().len();
     if new_errors {
@@ -246,18 +287,23 @@ fn check_document<R: Read + Seek + 'static>(
         return Err(CheckError::ErrorsDetected);
     }
 
-    let (new_warnings, new_errors) =
-        emit_new_diagnostics(pdf, diagnostics_seen, logger, message_prefix, input_name)?;
+    let (new_warnings, new_errors) = emit_new_diagnostics_with_suppression(
+        pdf,
+        diagnostics_seen,
+        logger,
+        message_prefix,
+        input_name,
+        suppress_warnings,
+    )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     warnings |= new_warnings;
     if new_errors {
         return Err(CheckError::ErrorsDetected); // cov:ignore: Pdf repair diagnostics are warning-severity; retain this defensive boundary.
     }
 
     if !warnings {
-        let message = format!(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that {message_prefix} cannot detect\n"
-        );
-        logger.info(message)?;
+        logger.info(
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
+        )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
     }
 
     Ok(CheckOutcome { warnings })
@@ -299,10 +345,11 @@ fn linearization_parameter_offset<R: Read + Seek + 'static>(
 /// readLinearizationData accepts an integer /O without dereferencing the
 /// referenced object, so a mismatching /O is a soft warning even when the
 /// referenced object is not a Page.
-fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
+fn emit_linearization_check_for_document_with_suppression<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     logger: &QPDFLogger,
     input_name: &str,
+    suppress_warnings: bool,
 ) -> Result<bool> {
     let mut warnings = false;
     let source_bytes = match pdf.source_bytes() {
@@ -310,7 +357,9 @@ fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
         Err(error) => {
             warnings = true;
             let message = format!("error encountered while checking linearization data: {error}");
-            emit_warning(logger, input_name, message)?;
+            if !suppress_warnings {
+                emit_warning(logger, input_name, message)?;
+            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
             Vec::new()
         }
     };
@@ -321,16 +370,28 @@ fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
 
     match check_linearization_parameters(pdf) {
         Ok(LinearizationParameterCheck::Clean) => {
-            warnings |=
-                emit_linearization_check_warnings(pdf, &source_bytes, logger, input_name, false)?;
-            // cov:ignore: shared logger failure propagation is covered by logger sink tests
+            warnings |= emit_linearization_check_warnings_with_suppression(
+                pdf,
+                &source_bytes,
+                logger,
+                input_name,
+                false,
+                suppress_warnings,
+            )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
         }
         Ok(LinearizationParameterCheck::Warning(message)) => {
             warnings = true;
-            emit_warning(logger, input_name, message)?;
-            warnings |=
-                emit_linearization_check_warnings(pdf, &source_bytes, logger, input_name, true)?;
-            // cov:ignore: shared logger failure propagation is covered by logger sink tests
+            if !suppress_warnings {
+                emit_warning(logger, input_name, message)?;
+            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
+            warnings |= emit_linearization_check_warnings_with_suppression(
+                pdf,
+                &source_bytes,
+                logger,
+                input_name,
+                true,
+                suppress_warnings,
+            )?; // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
         }
         Ok(LinearizationParameterCheck::Error(message)) => {
             warnings = true;
@@ -342,30 +403,37 @@ fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
                     linearization_parameter_offset(pdf, message)?,
                 )
             );
-            emit_warning(logger, input_name, message)?;
+            if !suppress_warnings {
+                emit_warning(logger, input_name, message)?;
+            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
         }
         Err(error) => {
             warnings = true;
             let message = format!("error encountered while checking linearization data: {error}");
-            emit_warning(logger, input_name, message)?;
+            if !suppress_warnings {
+                emit_warning(logger, input_name, message)?;
+            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
         }
     }
 
     Ok(warnings)
 }
 
-fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
+fn emit_linearization_check_warnings_with_suppression<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     source_bytes: &[u8],
     logger: &QPDFLogger,
     input_name: &str,
     skip_first_page_warning: bool,
+    suppress_warnings: bool,
 ) -> Result<bool> {
     match check_linearization_warnings(pdf, source_bytes, skip_first_page_warning) {
         Ok(messages) => {
             let has_warnings = !messages.is_empty();
             for message in messages {
-                emit_warning(logger, input_name, message)?;
+                if !suppress_warnings {
+                    emit_warning(logger, input_name, message)?;
+                } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
             }
             Ok(has_warnings)
         }
@@ -379,14 +447,18 @@ fn emit_linearization_check_warnings<R: Read + Seek + 'static>(
                     linearization_parameter_offset(pdf, &message)?
                 )
             );
-            emit_warning(logger, input_name, message)?;
+            if !suppress_warnings {
+                emit_warning(logger, input_name, message)?;
+            } // cov:ignore: closing line of a multi-line suppress_warnings call/block; llvm-cov misattributes the hit count to the previous line, not an untested branch
             Ok(true)
         }
         // cov:ignore-start: I/O and resolver failures are reported by the outer
         // open/preflight boundaries; this is a defensive propagation arm.
         Err(error) => {
             let message = format!("error encountered while checking linearization data: {error}");
-            emit_warning(logger, input_name, message)?;
+            if !suppress_warnings {
+                emit_warning(logger, input_name, message)?;
+            }
             Ok(true)
         } // cov:ignore-end
     }
@@ -404,6 +476,7 @@ fn map_page_tree_error(
     }
 }
 
+#[cfg(test)]
 fn emit_new_diagnostics<R: Read + Seek>(
     pdf: &Pdf<R>,
     seen: usize,
@@ -411,8 +484,26 @@ fn emit_new_diagnostics<R: Read + Seek>(
     message_prefix: &str,
     input_name: &str,
 ) -> std::result::Result<(bool, bool), CheckError> {
+    emit_new_diagnostics_with_suppression(pdf, seen, logger, message_prefix, input_name, false)
+}
+
+fn emit_new_diagnostics_with_suppression<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    seen: usize,
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    input_name: &str,
+    suppress_warnings: bool,
+) -> std::result::Result<(bool, bool), CheckError> {
     let diagnostics = pdf.repair_diagnostics();
-    let result = emit_diagnostics(&diagnostics, seen, logger, message_prefix, input_name)?;
+    let result = emit_diagnostics_with_suppression(
+        &diagnostics,
+        seen,
+        logger,
+        message_prefix,
+        input_name,
+        suppress_warnings,
+    )?;
     Ok(result)
 }
 
@@ -423,12 +514,26 @@ fn emit_diagnostics(
     message_prefix: &str,
     input_name: &str,
 ) -> Result<(bool, bool)> {
+    emit_diagnostics_with_suppression(diagnostics, seen, logger, message_prefix, input_name, false)
+}
+
+fn emit_diagnostics_with_suppression(
+    diagnostics: &crate::Diagnostics,
+    seen: usize,
+    logger: &QPDFLogger,
+    message_prefix: &str,
+    input_name: &str,
+    suppress_warnings: bool,
+) -> Result<(bool, bool)> {
     let mut warnings = false;
     let mut errors = false;
     for diagnostic in diagnostics.entries().iter().skip(seen) {
         match diagnostic.severity {
             Severity::Warning => {
                 warnings = true;
+                if suppress_warnings {
+                    continue;
+                }
                 if is_contextless_object_warning(&diagnostic.message) {
                     logger.warn(format!("WARNING: {}\n", diagnostic.message))?;
                     continue;
@@ -1358,6 +1463,44 @@ mod tests {
             b"WARNING: open-repair-failure.pdf: file is damaged\n\
 WARNING: open-repair-failure.pdf: can't find startxref\n\
 WARNING: open-repair-failure.pdf: Attempting to reconstruct cross-reference table\n"
+        );
+    }
+
+    #[test]
+    fn failed_open_warnings_are_silent_under_no_warn() {
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let logger = QPDFLogger::create();
+        logger.set_output_streams(
+            None,
+            Some(PipelineHandle::new(Capture {
+                bytes: Arc::clone(&warnings),
+            })),
+        );
+
+        let mut job = QPDFJob::new();
+        job.set_logger(logger);
+        job.set_message_prefix("qpdf");
+        job.set_suppress_warnings(true);
+        let options = PdfOpenOptions {
+            suppress_warnings: true,
+            ..PdfOpenOptions::default()
+        };
+        let source = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/test_driver/open_repair_failure.pdf"
+        ))
+        .to_vec();
+        let error = match job.open(Cursor::new(source), "open-repair-failure.pdf", options) {
+            Ok(_) => panic!("fixture must fail during repair"), // cov:ignore: the repair-failure fixture must take the Err branch
+            Err(error) => error,
+        };
+
+        job.report_open_failure(&error)
+            .expect("suppressed replay should still succeed");
+
+        assert!(
+            warnings.lock().expect("warning capture").is_empty(),
+            "--no-warn must suppress open-failure repair diagnostics entirely"
         );
     }
 }

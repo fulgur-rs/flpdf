@@ -340,7 +340,7 @@ fn check_subcommand_clean_pdf_exits_0() {
 
 /// A clean plaintext PDF prints qpdf's full check block: the `checking <file>`
 /// banner, header version, encryption + linearization status, and the trailing
-/// reassurance note. The subject of that note is `progname()` (here `flpdf`).
+/// reassurance note. qpdf hard-codes the program name in this note.
 #[test]
 fn check_clean_pdf_emits_qpdf_block() {
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -357,7 +357,7 @@ fn check_clean_pdf_emits_qpdf_block() {
         .stdout(predicate::str::contains("File is not encrypted\n"))
         .stdout(predicate::str::contains("File is not linearized\n"))
         .stdout(predicate::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
         ))
         .stdout(predicate::str::contains("PDF check succeeded").not());
 }
@@ -416,7 +416,7 @@ fn check_linearized_pdf_reports_linearized_line() {
         .stdout(predicate::str::contains("File is linearized\n"))
         .stdout(predicate::str::contains("File is not linearized").not())
         .stdout(predicate::str::contains(
-            "No syntax or stream encoding errors found; the file may still contain\nerrors that flpdf cannot detect\n",
+            "No syntax or stream encoding errors found; the file may still contain\nerrors that qpdf cannot detect\n",
         ))
         .stderr(predicate::str::is_empty());
 }
@@ -529,6 +529,24 @@ fn check_warnings_only_pdf_exits_3() {
         .code(3)
         .stdout(predicate::str::contains("File is not encrypted\n"))
         .stderr(predicate::str::contains("WARNING: "));
+}
+
+#[test]
+fn check_no_warn_suppresses_warning_delivery_but_keeps_exit_3() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&warnings_only_corrupt_xref_bytes()).unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args([
+        "--no-warn",
+        "--check",
+        "--repair",
+        f.path().to_str().unwrap(),
+    ])
+    .assert()
+    .code(3)
+    .stdout(predicate::str::contains("checking "))
+    .stderr(predicate::str::contains("WARNING:").not());
 }
 
 #[test]
