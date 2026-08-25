@@ -2955,6 +2955,39 @@ fn preserved_source_container_number(
     Ok(source_container_number)
 }
 
+/// Reject a standard (non-ObjStm-generating) linearization plan that still
+/// contains multiple live objects sharing an object number with different
+/// generations.
+///
+/// qpdf's own linearization renumbering pass hits this exact limitation for
+/// files with a stale-generation reference alongside the object's real
+/// generation (e.g. a `/Candidates [4 0 R 4 1 R]`-shaped array referencing
+/// both a dangling `4 0 R` and the live `4 1 R`): `discard_lower_generations`
+/// only removes duplicate rows from the *raw xref table* at load time, so it
+/// does not resolve a reference to a generation that never had its own xref
+/// row in the first place. Verified against a live qpdf 11.9.0 probe: both
+/// `--object-streams=disable` and `--object-streams=preserve` reject
+/// `null-visible-stale-generation.pdf` with this exact message (exit 2),
+/// while `--object-streams=generate` succeeds because Generate's own
+/// planning already collapses stale generations before this point.
+fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
+    let mut previous_number = None;
+    for object_ref in plan.renumber_assigned_refs() {
+        if previous_number == Some(object_ref.number) {
+            return Err(crate::Error::Unsupported(
+                "QPDF cannot currently linearize files that contain multiple objects with the \
+                 same object ID and different generations.  If you see this error message, \
+                 please file a bug report and attach the file if possible.  As a workaround, \
+                 first convert the file with qpdf without linearizing, and then linearize the \
+                 result of that conversion."
+                    .to_string(),
+            ));
+        }
+        previous_number = Some(object_ref.number);
+    }
+    Ok(())
+}
+
 /// Resolved state of the destination Catalog's `/Extensions /ADBE` entry —
 /// gathered in a single Catalog/`/Extensions` resolve pass.
 struct CatalogAdbeStatus {
@@ -3477,6 +3510,16 @@ fn write_linearized_impl<R: Read + Seek>(
         None => (plan, renumber),
     };
     let options = normalized_options.as_ref().unwrap_or(options);
+
+    // qpdf's linearization maps discard generations only after asserting that
+    // every surviving object number is unique. Generate, and Preserve on an
+    // ObjStm source, have already removed stale generations while planning;
+    // standard Disable/Preserve retain them and must reject the file here.
+    // discard_lower_generations (xref.rs) only removes duplicate rows from
+    // the raw xref table at load time; it does not resolve a reference to a
+    // generation that never had its own xref row (see
+    // reject_multiple_generations's own doc).
+    reject_multiple_generations(plan)?;
 
     // ------------------------------------------------------------------
     // Pre-compute values that do not change across the two layout passes.
