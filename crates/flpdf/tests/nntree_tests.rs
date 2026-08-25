@@ -59,6 +59,21 @@ fn canonical_name_tree_probe_pdf() -> Vec<u8> {
     )
 }
 
+fn canonical_number_tree_probe_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /PageLabels 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Limits [0 3] /Nums [0 << /S /D /St 1 >> 3 << /S /R >>] >>",
+            ),
+        ],
+        1,
+    )
+}
+
 fn malformed_name_tree_probe_pdf() -> Vec<u8> {
     build_pdf(
         &[
@@ -226,6 +241,62 @@ fn canonical_name_tree_probe_matches_qpdf_warning_context() {
         assert!(
             qpdf_stderr.contains(fragment),
             "qpdf warning output is missing the shared context {fragment:?}: {qpdf_stderr}"
+        );
+    }
+}
+
+#[test]
+fn canonical_number_tree_probe_matches_qpdf_structure_and_output_bytes() {
+    if !qpdf_11_9_available() {
+        eprintln!("qpdf 11.9.0 not available; skipping number-tree differential probe");
+        return;
+    }
+
+    let bytes = canonical_number_tree_probe_pdf();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("open probe PDF");
+    let mut tree = NumberTree::new(pdf.get_object_handle(ObjectRef::new(4, 0)), false);
+    let entries = tree.as_map(&mut pdf).expect("read canonical number tree");
+    assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![0, 3]);
+    let first = pdf
+        .resolve_to_terminal(entries.get(&0).expect("index 0"))
+        .expect("resolve index 0");
+    assert_eq!(
+        first
+            .as_dictionary()
+            .and_then(|dictionary| dictionary.get(b"/S".as_slice()).cloned())
+            .and_then(|style| style.as_name()),
+        Some(b"D".to_vec())
+    );
+
+    let mut input = tempfile::NamedTempFile::new().expect("create qpdf probe input");
+    input.write_all(&bytes).expect("write qpdf probe input");
+
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(input.path())
+        .output()
+        .expect("run qpdf --check");
+    assert!(check.status.success(), "qpdf --check rejected number tree");
+    assert!(
+        check.stderr.is_empty(),
+        "canonical number tree should be warning-free: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let shown = Command::new("qpdf")
+        .arg("--show-object=4")
+        .arg(input.path())
+        .output()
+        .expect("run qpdf --show-object");
+    assert!(
+        shown.status.success(),
+        "qpdf --show-object failed: {shown:?}"
+    );
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    for fragment in ["/Limits", "/Nums", "0", "/S", "/D", "/R"] {
+        assert!(
+            shown.contains(fragment),
+            "qpdf structural output is missing {fragment:?}: {shown}"
         );
     }
 }
