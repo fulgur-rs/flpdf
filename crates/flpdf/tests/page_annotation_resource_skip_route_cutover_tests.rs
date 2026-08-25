@@ -684,3 +684,134 @@ fn document_flatten_widget_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn acroform_fixture_helper_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn register_acroform_fields")
+        .expect("AcroForm fixture helper must remain")
+        .1
+        .split_once("fn make_xobj_stream")
+        .expect("AcroForm fixture helper boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "AcroForm fixture helper must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::array(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::name(",
+        "replace_object_handle(",
+        "replace_key(",
+        "mark_object_handle_dirty(",
+        "resolve(",
+    ] {
+        assert!(
+            block.contains(marker),
+            "AcroForm fixture helper must use live handle accessor {marker:?}"
+        );
+    }
+}
+
+#[test]
+fn canonical_inline_appearance_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn flatten_annotations_uses_canonical_inline_appearance")
+        .expect("canonical inline appearance fixture must remain")
+        .1
+        .split_once("fn flatten_annotations_uses_canonical_indirect_appearance_dictionary")
+        .expect("canonical inline appearance fixture boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "canonical inline appearance fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::stream(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::array(",
+        "ObjectHandle::name(",
+        "ObjectHandle::integer(",
+        "replace_object_handle(",
+        "replace_key(",
+        "mark_object_handle_dirty(",
+        "resolve(",
+    ] {
+        assert!(
+            block.contains(marker),
+            "canonical inline appearance fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
+
+#[test]
+fn multiple_annotation_count_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn multiple_annotations_flattened_count")
+        .expect("multiple annotation count fixture must remain")
+        .1
+        .split_once("fn flatten_annotations_document_level")
+        .expect("multiple annotation count fixture boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "multiple annotation count fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "resolve(",
+        "try_get_key(",
+        "as_dictionary()",
+        "is_null()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "multiple annotation count fixture must use live handle accessor {marker:?}"
+        );
+    }
+}

@@ -942,7 +942,7 @@ mod tests {
     use super::*;
     use crate::pages::{page_content_bytes, page_refs};
     use crate::writer::write_qpdf_to_memory;
-    use crate::{Dictionary, Object, ObjectRef, Pdf, Stream};
+    use crate::{Object, ObjectRef, Pdf};
     use std::io::Cursor;
 
     #[test]
@@ -2227,17 +2227,30 @@ mod tests {
     /// for the `/AcroForm` dict so it never collides with a fixture's own
     /// numbering.
     fn register_acroform_fields<R: Read + Seek>(pdf: &mut Pdf<R>, widget_refs: &[ObjectRef]) {
-        let mut acroform = Dictionary::new();
-        acroform.insert(
-            "Fields",
-            Object::Array(widget_refs.iter().copied().map(Object::Reference).collect()),
-        );
-        pdf.set_object(ObjectRef::new(900, 0), Object::Dictionary(acroform));
-        let mut catalog = Dictionary::new();
-        catalog.insert("Type", Object::Name(b"Catalog".to_vec()));
-        catalog.insert("Pages", Object::Reference(ObjectRef::new(2, 0)));
-        catalog.insert("AcroForm", Object::Reference(ObjectRef::new(900, 0)));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        let field_handles = widget_refs
+            .iter()
+            .copied()
+            .map(|widget_ref| pdf.get_object_handle(widget_ref))
+            .collect();
+        let acroform_ref = ObjectRef::new(900, 0);
+        pdf.replace_object_handle(
+            acroform_ref,
+            ObjectHandle::dictionary(vec![(
+                b"/Fields".to_vec(),
+                ObjectHandle::array(field_handles),
+            )]),
+        )
+        .unwrap();
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).unwrap();
+        root.replace_key(b"/Type", ObjectHandle::name(b"Catalog".to_vec()))
+            .unwrap();
+        root.replace_key(b"/Pages", pdf.get_object_handle(ObjectRef::new(2, 0)))
+            .unwrap();
+        root.replace_key(b"/AcroForm", pdf.get_object_handle(acroform_ref))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
     }
 
     /// Build a minimal Form XObject stream with given /BBox.
@@ -2364,31 +2377,46 @@ mod tests {
     #[test]
     fn flatten_annotations_uses_canonical_inline_appearance() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        let mut appearance = Dictionary::new();
-        appearance.insert(
-            "BBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(100),
-                Object::Integer(20),
-            ]),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Stream(Stream::new(appearance, Vec::new())));
-        let mut annotation = Dictionary::new();
-        annotation.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        annotation.insert(
-            "Rect",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(100),
-                Object::Integer(20),
-            ]),
-        );
-        annotation.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        let annotation_ref = ObjectRef::new(4, 0);
+        pdf.replace_object_handle(annotation_ref, ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        let annotation = pdf.get_object_handle(annotation_ref);
+        pdf.resolve(&annotation).unwrap();
+        annotation
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Widget".to_vec()))
+            .unwrap();
+        annotation
+            .replace_key(
+                b"/Rect",
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(100),
+                    ObjectHandle::integer(20),
+                ]),
+            )
+            .unwrap();
+        annotation
+            .replace_key(
+                b"/AP",
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::stream(
+                        ObjectHandle::dictionary(vec![(
+                            b"/BBox".to_vec(),
+                            ObjectHandle::array(vec![
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(100),
+                                ObjectHandle::integer(20),
+                            ]),
+                        )]),
+                        Rc::new(Vec::new()),
+                    ),
+                )]),
+            )
+            .unwrap();
+        pdf.mark_object_handle_dirty(&annotation).unwrap();
 
         assert_eq!(
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
@@ -2796,20 +2824,29 @@ mod tests {
         assert_eq!(count, 2);
 
         // Both XObjects in /Resources.
-        let page_obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let page_dict = page_obj.as_dict().unwrap();
-        let resources = match page_dict.get("Resources").unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("expected dict"),
-        };
-        let xobj_dict = match resources.get("XObject").unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("expected dict"),
-        };
-        assert_eq!(xobj_dict.iter().count(), 2, "two XObject entries");
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let xobj_dict = resources.try_get_key(b"/XObject").unwrap();
+        pdf.resolve(&xobj_dict).unwrap();
+        assert_eq!(
+            xobj_dict.as_dictionary().unwrap().len(),
+            2,
+            "two XObject entries"
+        );
 
         // qpdf removes /Annots after every annotation has been flattened.
-        assert!(page_dict.get("Annots").is_none());
+        // try_get_key alone cannot distinguish an absent key from a present
+        // null value (qpdf's own key/null conflation), so check the raw
+        // dictionary entries instead of relying on is_null().
+        assert!(
+            !page
+                .as_dictionary()
+                .expect("fixture page must remain a dictionary")
+                .contains_key(b"/Annots".as_slice()),
+            "/Annots must be removed as a dictionary entry, not merely nulled"
+        );
     }
 
     // -----------------------------------------------------------------------
