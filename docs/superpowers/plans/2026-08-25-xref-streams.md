@@ -178,7 +178,7 @@ Expected: 187 tests pass, and the targeted `xref-streams.test` run reports 5/5.
 **Files:**
 - No additional files; verify the changed Rust and qtest worktrees.
 
-- [ ] **Step 1: Run focused and workspace quality gates**
+- [x] **Step 1: Run focused and workspace quality gates**
 
 Run, in order:
 
@@ -193,6 +193,6 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Expected: every command exits 0.
 
-- [ ] **Step 2: Read back the implementation diff and tracker state**
+- [x] **Step 2: Read back the implementation diff and tracker state**
 
 Confirm `git diff --check`, `git status --short --branch`, `bd show flpdf-egzr.10`, and `bd dep cycles` are clean/acyclic. Keep the issue open until the qtest and full quality evidence is recorded; only then append the verification note and close/push according to the repository session protocol.
