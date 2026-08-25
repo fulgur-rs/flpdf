@@ -20,6 +20,7 @@ fn empty_document_flatten_resources_assertion_uses_live_handles() {
         "resolve_borrowed(",
         "Object::",
         "set_object(",
+        "materialize(",
     ] {
         assert!(
             !block.contains(marker),
