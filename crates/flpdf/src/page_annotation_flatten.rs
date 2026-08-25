@@ -976,11 +976,18 @@ mod tests {
     #[test]
     fn acroform_need_appearances_reads_a_direct_boolean() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        let mut acroform = Dictionary::new();
-        acroform.insert("NeedAppearances", Object::Boolean(true));
-        let mut catalog = Dictionary::new();
-        catalog.insert("AcroForm", Object::Dictionary(acroform));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        let root_ref = pdf.root_ref().expect("fixture catalog must exist");
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root).unwrap();
+        root.replace_key(
+            b"/AcroForm",
+            ObjectHandle::dictionary(vec![(
+                b"/NeedAppearances".to_vec(),
+                ObjectHandle::boolean(true),
+            )]),
+        )
+        .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
 
         assert!(acroform_need_appearances(&mut pdf).unwrap());
     }
