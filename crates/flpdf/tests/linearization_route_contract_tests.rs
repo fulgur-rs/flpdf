@@ -58,6 +58,18 @@ fn reachable_production_slice() -> &'static str {
     &RENUMBER_SOURCE[start..end]
 }
 
+fn resurrectable_production_slice() -> &'static str {
+    let start_marker = "pub(crate) fn resurrectable_null_refs_excluding";
+    let end_marker = "/// Drop-aware handle walk for";
+    let start = RENUMBER_SOURCE
+        .find(start_marker)
+        .expect("resurrectable marker must remain present");
+    let end = RENUMBER_SOURCE
+        .find(end_marker)
+        .expect("resurrectable walk marker must remain present");
+    &RENUMBER_SOURCE[start..end]
+}
+
 #[test]
 fn linearization_body_stream_route_has_no_legacy_object_bridge() {
     let production = body_and_stream_production_slice();
@@ -133,6 +145,26 @@ fn linearization_reachability_route_uses_live_handles() {
         assert!(
             !production.contains(forbidden),
             "linearization reachability route still contains raw token {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn linearization_resurrectable_route_uses_live_handles() {
+    let production = resurrectable_production_slice();
+    assert!(
+        production.contains("get_object_handle"),
+        "resurrectable null references must use the canonical handle registry"
+    );
+    for forbidden in [
+        "resolve_object(",
+        "Object::",
+        "qpdf_null::value_is_null",
+        "walk_surviving",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "resurrectable route still contains raw token {forbidden:?}"
         );
     }
 }

@@ -755,21 +755,18 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
 
     // Seed from the trailer (dict context): visible roots are followed; a
     // null-resolving trailer ref is a dropped key, not resurrected.
-    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
+    let trailer_entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
     for (key, value) in trailer_entries {
-        if matches!(key.as_slice(), b"ID" | b"Prev" | b"Root" | b"Size") {
+        if matches!(key.as_slice(), b"/ID" | b"/Prev" | b"/Root" | b"/Size") {
             continue;
         }
         let mut follow: Vec<ObjectRef> = Vec::new();
-        walk_surviving(
-            pdf,
-            &value,
-            0,
-            false,
-            &mut follow,
-            &mut result,
+        let mut state = ResurrectableWalkState {
+            follow: &mut follow,
+            result: &mut result,
             removed_refs,
-        )?;
+        };
+        walk_resurrectable_handle(pdf, &value, 0, false, true, &mut state)?;
         queue.extend(follow);
     }
 
@@ -777,9 +774,15 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
         if !visited.insert(cur) {
             continue;
         }
-        let obj = pdf.resolve_object(cur)?;
+        let handle = pdf.get_object_handle(cur);
+        pdf.resolve(&handle)?;
         let mut follow: Vec<ObjectRef> = Vec::new();
-        walk_surviving(pdf, &obj, 0, false, &mut follow, &mut result, removed_refs)?;
+        let mut state = ResurrectableWalkState {
+            follow: &mut follow,
+            result: &mut result,
+            removed_refs,
+        };
+        walk_resurrectable_handle(pdf, &handle, 0, false, false, &mut state)?;
         for r in follow {
             if !visited.contains(&r) {
                 queue.push_back(r);
@@ -789,21 +792,25 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
     Ok(result)
 }
 
-/// Drop-aware structural walk for [`resurrectable_null_refs_excluding`].
-/// Distinguishes
-/// array position (`in_array`) from dict-value position: a null-resolving
-/// reference (`number > 0`) is collected into `result` only when it sits in an
-/// array (a surviving edge); a dict/stream value that is null-resolving is
-/// skipped entirely (qpdf drops that key). Non-null references are pushed to
-/// `follow` for the BFS to continue. Object 0 is ignored.
-fn walk_surviving<R: Read + Seek>(
+/// Drop-aware handle walk for [`resurrectable_null_refs_excluding`].
+/// Distinguishes array position (`in_array`) from dict-value position: a
+/// null-resolving reference (`number > 0`) is collected into `result` only
+/// when it sits in an array (a surviving edge); a dict/stream value that is
+/// null-resolving is skipped entirely (qpdf drops that key). Object 0 is
+/// ignored.
+struct ResurrectableWalkState<'a> {
+    follow: &'a mut Vec<ObjectRef>,
+    result: &'a mut BTreeSet<ObjectRef>,
+    removed_refs: &'a BTreeSet<ObjectRef>,
+}
+
+fn walk_resurrectable_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    obj: &Object,
+    handle: &crate::ObjectHandle,
     depth: usize,
     in_array: bool,
-    follow: &mut Vec<ObjectRef>,
-    result: &mut BTreeSet<ObjectRef>,
-    removed_refs: &BTreeSet<ObjectRef>,
+    edge_context: bool,
+    state: &mut ResurrectableWalkState<'_>,
 ) -> crate::Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(Error::Unsupported(
@@ -812,41 +819,62 @@ fn walk_surviving<R: Read + Seek>(
         ));
     }
 
-    if crate::qpdf_null::value_is_null(pdf, obj)? {
+    let own_ref = handle.object_ref();
+    let direct_ref = handle.as_reference();
+    let is_null = if own_ref.is_none() {
+        match direct_ref {
+            Some(reference) => pdf.get_object_handle(reference).try_is_null()?,
+            None => handle.try_is_null()?,
+        }
+    } else {
+        handle.try_is_null()?
+    };
+    let edge_ref = handle
+        .as_reference()
+        .or_else(|| edge_context.then_some(own_ref).flatten());
+
+    if is_null {
         if in_array {
-            if let Object::Reference(reference) = obj {
+            if let Some(reference) = edge_ref {
                 // Generate and source-ObjStm Preserve directize only refs the
                 // operation's compressible walk removed. Standard enqueue
                 // passes an empty set and retains the stale identity until the
                 // linearization duplicate-generation guard rejects it.
-                if reference.number > 0 && !removed_refs.contains(reference) {
-                    result.insert(*reference);
+                if reference.number > 0 && !state.removed_refs.contains(&reference) {
+                    state.result.insert(reference);
                 }
             }
         }
         return Ok(());
     }
 
-    match obj {
-        Object::Reference(r) => {
-            follow.push(*r);
+    if let Some(reference) = edge_ref {
+        if reference.number > 0 {
+            state.follow.push(reference);
         }
-        Object::Array(elements) => {
-            for e in elements {
-                walk_surviving(pdf, e, depth + 1, true, follow, result, removed_refs)?;
+        return Ok(());
+    }
+
+    if let Some(elements) = handle.try_as_array()? {
+        for element in elements {
+            walk_resurrectable_handle(pdf, &element, depth + 1, true, true, state)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(entries) = handle.try_as_dictionary()? {
+        for (_key, value) in entries {
+            walk_resurrectable_handle(pdf, &value, depth + 1, false, true, state)?;
+        }
+        return Ok(());
+    }
+
+    if let Some(stream_dict) = handle.as_stream_dict() {
+        if let Some(entries) = stream_dict.try_as_dictionary()? {
+            for (_key, value) in entries {
+                walk_resurrectable_handle(pdf, &value, depth + 1, false, true, state)?;
             }
         }
-        Object::Dictionary(dict) => {
-            for (_key, value) in dict.iter() {
-                walk_surviving(pdf, value, depth + 1, false, follow, result, removed_refs)?;
-            }
-        }
-        Object::Stream(stream) => {
-            for (_key, value) in stream.dict.iter() {
-                walk_surviving(pdf, value, depth + 1, false, follow, result, removed_refs)?;
-            }
-        }
-        _ => {}
     }
     Ok(())
 }
