@@ -41,8 +41,11 @@ replace completed component work or duplicate open issues.
 ### API boundary
 
 - C and C++ ABI or symbol compatibility is out of scope.
-- `qpdf-ctest` itself is not ported and its 53 C-API invocations do not count in
-  the applicable qtest denominator.
+- `qpdf-ctest` itself is not ported and its C-API invocations do not count in
+  the applicable qtest denominator, except for the bounded
+  `deterministic-id.test` `qpdf-ctest 19` adapter. That case asserts portable
+  writer behavior rather than C ABI compatibility and is implemented through
+  the Rust-native `flpdf-qtest-tools` boundary.
 - The underlying PDF behaviors exercised only through `qpdf-ctest` must be
   mapped to equivalent Rust API oracle tests or explicitly shown to be covered
   elsewhere.
@@ -90,8 +93,9 @@ Current observability gaps include:
 - `test_driver` implements only test 1; upstream uses additional IDs including
   0, 2, 3, 28, 33–36, 39, 52–71, 76–77, 80, 81, and 85;
 - `flpdf-egzr` inventories 13 missing helpers and 88 invocations, of which
-  `qpdf-ctest` contributes 53 C-API invocations that are now excluded from
-  direct porting; and
+  `qpdf-ctest` contributes 53 C-API invocations that are excluded from direct
+  porting, with the portable deterministic-ID test19 adapter as the explicit
+  exception; and
 - helper absence, CLI-surface absence, and actual PDF behavior differences are
   not yet represented as separate machine-readable states.
 
@@ -188,7 +192,9 @@ Deliverables:
   implementation acceptance template; it blocks the inventory task and
   therefore Phase 1 closure;
 - implement the 11 Linux-applicable non-C helpers remaining after removing
-  `qpdf-ctest` and Windows-only `test_shell_glob` from `flpdf-egzr`;
+  `qpdf-ctest` and Windows-only `test_shell_glob` from `flpdf-egzr`; the
+  deterministic-ID test19 adapter remains a bounded Rust-native qtest helper
+  rather than a C ABI port;
 - map `qpdf-ctest` underlying behavior to Rust oracle tests and eliminate all
   provisional mapping-Bead references from the manifest. Every uncovered
   portable behavior becomes a Phase 1 child implementation issue with the
