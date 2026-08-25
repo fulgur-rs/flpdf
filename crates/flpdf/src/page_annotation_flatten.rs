@@ -959,17 +959,18 @@ mod tests {
     #[test]
     fn direct_page_rotate_resolves_an_indirect_integer() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        let Object::Dictionary(mut page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        page.insert("Rotate", Object::Reference(ObjectRef::new(4, 0)));
-        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Integer(270));
+        let page_ref = ObjectRef::new(3, 0);
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let rotate = pdf.get_object_handle(ObjectRef::new(4, 0));
+        page.replace_key(b"/Rotate", rotate)
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
+        pdf.replace_object_handle(ObjectRef::new(4, 0), ObjectHandle::integer(270))
+            .expect("indirect rotate value must be replaceable");
 
-        assert_eq!(
-            direct_page_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
-            270
-        );
+        assert_eq!(direct_page_rotate(&mut pdf, page_ref).unwrap(), 270);
     }
 
     #[test]
