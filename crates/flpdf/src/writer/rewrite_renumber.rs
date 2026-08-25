@@ -667,7 +667,7 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
     for (key, value) in trailer_entries {
         // /Encrypt is intentionally NOT skipped: it is part of the live universe.
         // /Prev, /Size, /ID, /Root are not object roots of the document graph.
-        if matches!(key.as_slice(), b"ID" | b"Prev" | b"Root" | b"Size") {
+        if matches!(key.as_slice(), b"/ID" | b"/Prev" | b"/Root" | b"/Size") {
             continue;
         }
         // Recurse into direct dict/array trailer values so a nested indirect ref
