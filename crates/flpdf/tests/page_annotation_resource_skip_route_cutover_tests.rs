@@ -88,3 +88,45 @@ fn direct_stream_resource_error_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn document_flatten_resource_error_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn qpdf_document_flatten_propagates_default_resource_merge_error")
+        .expect("document flatten resource error test must remain")
+        .1
+        .split_once("fn qpdf_flatten_privatizes_an_indirect_appearance_resources_before_merging")
+        .expect("document flatten resource error test boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "document flatten resource error fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::stream(",
+        "ObjectHandle::dictionary(",
+        "replace_object_handle(",
+        "replace_key(",
+        "mark_object_handle_dirty(",
+    ] {
+        assert!(
+            block.contains(marker),
+            "document flatten resource error fixture must use live handle accessor {marker:?}"
+        );
+    }
+}

@@ -1191,33 +1191,40 @@ mod tests {
     #[test]
     fn qpdf_document_flatten_propagates_default_resource_merge_error() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(Vec::new()),
+            )]),
+            Rc::new(Vec::new()),
         );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+            .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
 
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "Font",
-            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
-        );
-        let mut acroform = Dictionary::new();
-        acroform.insert("Fields", Object::Array(Vec::new()));
-        acroform.insert("DR", Object::Dictionary(default_resources));
-        let Object::Dictionary(mut catalog) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap()
-        else {
-            panic!("fixture catalog must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        catalog.insert("AcroForm", Object::Dictionary(acroform));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+        )]);
+        let acroform = ObjectHandle::dictionary(vec![
+            (b"/Fields".to_vec(), ObjectHandle::array(Vec::new())),
+            (b"/DR".to_vec(), default_resources),
+        ]);
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&catalog).unwrap();
+        catalog.replace_key(b"/AcroForm", acroform).unwrap();
+        pdf.mark_object_handle_dirty(&catalog).unwrap();
 
         let error = flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3)
             .expect_err("production flatten must propagate the DR merge failure");
