@@ -1512,18 +1512,42 @@ mod tests {
             ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
         )]);
 
+        // Setup's replace_object_handle calls already left object 9 dirty;
+        // clear that so the post-merge dirty assertion below can only pass
+        // because the merge itself marks the mutated array's indirect owner
+        // dirty, not because it was already dirty from construction.
+        pdf.clear_dirty(ObjectRef::new(9, 0));
+
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let proc_set = pdf.get_object_handle(ObjectRef::new(9, 0));
+        assert!(
+            pdf.is_dirty(ObjectRef::new(9, 0)),
+            "the mutated indirect array's owner must be marked dirty after the merge"
+        );
+
+        // Reach /ProcSet through the appearance's own resource dictionary,
+        // not by looking object 9 up directly, so a regression that rebinds
+        // the entry to a different (or direct) array would be caught.
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let stream_dict = appearance.as_stream_dict().unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources.try_get_key(b"/ProcSet").unwrap();
         pdf.resolve(&proc_set).unwrap();
-        let proc_set_items = proc_set
-            .as_array()
-            .expect("shared ProcSet array must remain an array");
         assert_eq!(
             proc_set.object_ref(),
             Some(ObjectRef::new(9, 0)),
             "the merged array must retain its indirect owner identity"
+        );
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
+        assert_eq!(
+            proc_set_items.len(),
+            2,
+            "the merged array must contain exactly the original and appended items"
         );
         assert_eq!(
             proc_set_items[0].as_name(),
