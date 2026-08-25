@@ -309,11 +309,8 @@ fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
         Ok(bytes) => bytes,
         Err(error) => {
             warnings = true;
-            emit_warning(
-                logger,
-                input_name,
-                format!("error encountered while checking linearization data: {error}"),
-            )?;
+            let message = format!("error encountered while checking linearization data: {error}");
+            emit_warning(logger, input_name, message)?;
             Vec::new()
         }
     };
@@ -349,11 +346,8 @@ fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
         }
         Err(error) => {
             warnings = true;
-            emit_warning(
-                logger,
-                input_name,
-                format!("error encountered while checking linearization data: {error}"),
-            )?;
+            let message = format!("error encountered while checking linearization data: {error}");
+            emit_warning(logger, input_name, message)?;
         }
     }
 
