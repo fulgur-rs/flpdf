@@ -155,13 +155,15 @@ mod tests {
     use crate::{pages, ObjectHandle, PageBox, Pdf};
     use std::io::Cursor;
 
-    fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
+    fn handle_to_pagebox(pdf: &mut Pdf<Cursor<Vec<u8>>>, obj: &ObjectHandle) -> Option<PageBox> {
+        pdf.resolve(obj).ok()?;
         let values = obj.as_array()?;
         if values.len() != 4 {
             return None;
         }
         let mut numbers = [0.0; 4];
         for (index, value) in values.iter().enumerate() {
+            pdf.resolve(value).ok()?;
             numbers[index] = value
                 .as_integer()
                 .map(|value| value as f64)
@@ -189,29 +191,61 @@ mod tests {
 
     fn pagebox_for(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &[u8]) -> PageBox {
         let value = object_key_handle(pdf, object_ref, key);
-        handle_to_pagebox(&value).expect("page box must be a four-number array")
+        handle_to_pagebox(pdf, &value).expect("page box must be a four-number array")
     }
 
     #[test]
     fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
-        assert!(handle_to_pagebox(&ObjectHandle::integer(1)).is_none());
-        assert!(handle_to_pagebox(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none());
+        let mut pdf = Pdf::empty().unwrap();
+        assert!(handle_to_pagebox(&mut pdf, &ObjectHandle::integer(1)).is_none());
+        assert!(handle_to_pagebox(
+            &mut pdf,
+            &ObjectHandle::array(vec![ObjectHandle::integer(1)])
+        )
+        .is_none());
         assert_eq!(
-            handle_to_pagebox(&ObjectHandle::array(vec![
-                ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
-                ObjectHandle::integer(2),
-                ObjectHandle::real(11.5),
-                ObjectHandle::integer(22),
-            ])),
+            handle_to_pagebox(
+                &mut pdf,
+                &ObjectHandle::array(vec![
+                    ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
+                    ObjectHandle::integer(2),
+                    ObjectHandle::real(11.5),
+                    ObjectHandle::integer(22),
+                ])
+            ),
             Some(PageBox::new(1.5, 2.0, 11.5, 22.0))
         );
-        assert!(handle_to_pagebox(&ObjectHandle::array(vec![
-            ObjectHandle::integer(1),
-            ObjectHandle::null(),
-            ObjectHandle::integer(11),
-            ObjectHandle::integer(22),
-        ]))
+        assert!(handle_to_pagebox(
+            &mut pdf,
+            &ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::null(),
+                ObjectHandle::integer(11),
+                ObjectHandle::integer(22),
+            ])
+        )
         .is_none());
+    }
+
+    #[test]
+    fn handle_to_pagebox_resolves_indirect_numeric_items() {
+        let bytes = assemble_pdf(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_owned()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_owned()),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [1 4 0 R 3 4] >>".to_owned(),
+            ),
+            (4, "7".to_owned()),
+        ]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let page = pages::page_refs(&mut pdf).unwrap()[0];
+        let media_box = object_key_handle(&mut pdf, page, b"/MediaBox");
+
+        assert_eq!(
+            handle_to_pagebox(&mut pdf, &media_box),
+            Some(PageBox::new(1.0, 4.0, 3.0, 7.0))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1085,7 +1119,7 @@ mod tests {
                 pdf.resolve(annotation).unwrap();
                 let rect = annotation.get_key(b"/Rect");
                 pdf.resolve(&rect).unwrap();
-                let rectangle = handle_to_pagebox(&rect).expect("annotation rectangle");
+                let rectangle = handle_to_pagebox(&mut pdf, &rect).expect("annotation rectangle");
                 (rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
             })
             .collect::<Vec<_>>();
@@ -1096,7 +1130,7 @@ mod tests {
         );
         let original = object_key_handle(&mut pdf, indirect_annot, b"/Rect");
         assert_eq!(
-            handle_to_pagebox(&original),
+            handle_to_pagebox(&mut pdf, &original),
             Some(PageBox::new(20.0, 30.0, 70.0, 50.0))
         );
     }
