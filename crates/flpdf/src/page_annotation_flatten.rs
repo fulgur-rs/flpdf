@@ -942,7 +942,7 @@ mod tests {
     use super::*;
     use crate::pages::{page_content_bytes, page_refs};
     use crate::writer::write_qpdf_to_memory;
-    use crate::{Dictionary, Object, ObjectRef, Pdf, Stream};
+    use crate::{Object, ObjectRef, Pdf};
     use std::io::Cursor;
 
     #[test]
@@ -2361,31 +2361,46 @@ mod tests {
     #[test]
     fn flatten_annotations_uses_canonical_inline_appearance() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        let mut appearance = Dictionary::new();
-        appearance.insert(
-            "BBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(100),
-                Object::Integer(20),
-            ]),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Stream(Stream::new(appearance, Vec::new())));
-        let mut annotation = Dictionary::new();
-        annotation.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        annotation.insert(
-            "Rect",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(100),
-                Object::Integer(20),
-            ]),
-        );
-        annotation.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        let annotation_ref = ObjectRef::new(4, 0);
+        pdf.replace_object_handle(annotation_ref, ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        let annotation = pdf.get_object_handle(annotation_ref);
+        pdf.resolve(&annotation).unwrap();
+        annotation
+            .replace_key(b"/Subtype", ObjectHandle::name(b"Widget".to_vec()))
+            .unwrap();
+        annotation
+            .replace_key(
+                b"/Rect",
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(100),
+                    ObjectHandle::integer(20),
+                ]),
+            )
+            .unwrap();
+        annotation
+            .replace_key(
+                b"/AP",
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::stream(
+                        ObjectHandle::dictionary(vec![(
+                            b"/BBox".to_vec(),
+                            ObjectHandle::array(vec![
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(100),
+                                ObjectHandle::integer(20),
+                            ]),
+                        )]),
+                        Rc::new(Vec::new()),
+                    ),
+                )]),
+            )
+            .unwrap();
+        pdf.mark_object_handle_dirty(&annotation).unwrap();
 
         assert_eq!(
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),

@@ -728,3 +728,49 @@ fn acroform_fixture_helper_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn canonical_inline_appearance_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn flatten_annotations_uses_canonical_inline_appearance")
+        .expect("canonical inline appearance fixture must remain")
+        .1
+        .split_once("fn flatten_annotations_uses_canonical_indirect_appearance_dictionary")
+        .expect("canonical inline appearance fixture boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "canonical inline appearance fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::stream(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::array(",
+        "ObjectHandle::name(",
+        "ObjectHandle::integer(",
+        "replace_object_handle(",
+        "replace_key(",
+        "mark_object_handle_dirty(",
+        "resolve(",
+    ] {
+        assert!(
+            block.contains(marker),
+            "canonical inline appearance fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
