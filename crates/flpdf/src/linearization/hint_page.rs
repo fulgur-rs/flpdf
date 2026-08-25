@@ -530,13 +530,21 @@ impl PageOffsetHintTable {
             } else {
                 let phase =
                     post_optimization_plain.is_some_and(|refs| !refs.contains(&entry.object_ref));
-                let output_number = if has_objstm_members {
+                // qpdf's obj_user_to_objects is keyed by the object's number
+                // BEFORE writer renumbering (QPDF_linearization.cc:1354-1402
+                // populates it from `oh.getObjectID()` during
+                // calculateLinearizationData, which runs ahead of the
+                // writer's own renumbering pass). A pre-optimization plain
+                // object therefore always retains its source-object number,
+                // whether or not this page also references a folded ObjStm
+                // container. Only a post-optimization mint — which has no
+                // meaningful pre-optimization source number to compare — is
+                // compared against folded containers in output-number space.
+                let output_number = if phase && has_objstm_members {
                     renumber
                         .new_for_original(entry.object_ref)
                         .map_or(u32::MAX, |object_ref| object_ref.number)
                 } else {
-                    // The classic path has no folded container entries; retain
-                    // qpdf's source-object ordering there.
                     entry.object_ref.number
                 };
                 (if phase { 2 } else { 0 }, output_number)

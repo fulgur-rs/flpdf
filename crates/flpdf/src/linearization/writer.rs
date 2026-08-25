@@ -3843,9 +3843,9 @@ fn write_linearized_impl<R: Read + Seek>(
     //
     // - Generate: the containers are fresh `makeIndirectObject` objects numbered
     //   after every source object in even-split order, hence `(1, split_index)`.
-    // - Preserve: source ObjStm containers are validated against their members,
-    //   but the hint table compares them in the physical output-number space,
-    //   hence `(0, container_new_num)` alongside renumbered plain objects.
+    // - Preserve: the containers reuse the source ObjStm objects and keep their
+    //   source numbers, hence `(0, source_container_number)` in the same key
+    //   space as plain source objects.
     let container_shared_sort_key: std::collections::BTreeMap<u32, (u8, u32)> = match options
         .object_streams
     {
@@ -3865,12 +3865,9 @@ fn write_linearized_impl<R: Read + Seek>(
                 .chain(&objstm_layout.part3)
                 .chain(&objstm_layout.part4)
             {
-                let _source_container_number =
+                let source_container_number =
                     preserved_source_container_number(container, &source_container_by_member)?;
-                keys.insert(
-                    container.container_new_num,
-                    (0, container.container_new_num),
-                );
+                keys.insert(container.container_new_num, (0, source_container_number));
             }
             keys
         }
