@@ -367,7 +367,9 @@ fn missing_array_resource_category_fixture_uses_live_handles() {
         )
         .expect("missing array resource category test must remain")
         .1
-        .split_once("fn qpdf_flatten_merges_an_array_default_resource_category_deduping_existing_scalars")
+        .split_once(
+            "fn qpdf_flatten_merges_an_array_default_resource_category_deduping_existing_scalars",
+        )
         .expect("missing array resource category test boundary must remain")
         .0;
 
@@ -398,6 +400,53 @@ fn missing_array_resource_category_fixture_uses_live_handles() {
         assert!(
             block.contains(marker),
             "missing array resource category fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
+
+#[test]
+fn dedup_existing_scalars_array_resource_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once(
+            "fn qpdf_flatten_merges_an_array_default_resource_category_deduping_existing_scalars",
+        )
+        .expect("dedup existing scalars test must remain")
+        .1
+        .split_once("fn qpdf_flatten_leaves_a_type_mismatched_default_resource_category_untouched")
+        .expect("dedup existing scalars test boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "dedup existing scalars fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::array(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::stream(",
+        "replace_object_handle(",
+        "resolve(",
+        "as_stream_dict()",
+        "try_get_key(",
+        "as_array()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "dedup existing scalars fixture must use live handle accessor {marker:?}"
         );
     }
 }
