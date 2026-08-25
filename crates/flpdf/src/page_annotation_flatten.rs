@@ -1547,53 +1547,62 @@ mod tests {
         // then /XObject -- a direct stream, absent from the destination --
         // fails installation via shallow_copy's stream rejection.
         //
-        // mark_object_handle_mutated (reader.rs) evicts the object's
+        // mark_object_handle_dirty (reader.rs) evicts the object's
         // legacy_materialized_memo entry as its cache-invalidation step; a
-        // prior pdf.resolve_object() populates that cache, so this test warms it
-        // *before* the merge and re-resolves *after* -- if the /ProcSet
+        // prior handle resolution populates that cache, so this test warms it
+        // *before* the merge and resolves *after* -- if the /ProcSet
         // mutation that ran before the /XObject failure was never marked
-        // dirty, the second resolve would still return the pre-merge
+        // dirty, the second resolution would still return the pre-merge
         // snapshot instead of live content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        pdf.set_object(
+        pdf.replace_object_handle(
             ObjectRef::new(9, 0),
-            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )
+        .unwrap();
+        let appearance_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(9, 0)),
+        )]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("ProcSet", Object::Reference(ObjectRef::new(9, 0)));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Name(b"Text".to_vec())]),
-        );
-        default_resources.insert(
-            "XObject",
-            Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+            .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
             .unwrap();
 
-        // Warm pdf.resolve's cache with the pre-merge snapshot.
-        let Object::Array(proc_set_before) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
-        else {
-            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(proc_set_before, vec![Object::Name(b"PDF".to_vec())]);
+        let default_resources = ObjectHandle::dictionary(vec![
+            (
+                b"/ProcSet".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
+            ),
+            (
+                b"/XObject".to_vec(),
+                ObjectHandle::stream(ObjectHandle::dictionary(Vec::new()), Rc::new(Vec::new())),
+            ),
+        ]);
+
+        // Warm the resolver cache with the pre-merge snapshot.
+        let proc_set_before = pdf.get_object_handle(ObjectRef::new(9, 0));
+        pdf.resolve(&proc_set_before).unwrap();
+        let proc_set_before_items = proc_set_before
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
+        assert_eq!(proc_set_before_items.len(), 1);
+        assert_eq!(proc_set_before_items[0].as_name(), Some(b"PDF".to_vec()));
 
         let error = merge_widget_default_resources_on_page(
             &mut pdf,
@@ -1606,18 +1615,26 @@ mod tests {
             Error::System(message) if message == "stream objects cannot be cloned"
         ));
 
-        let Object::Array(proc_set_after) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
-        else {
-            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
-        };
+        let proc_set_after = pdf.get_object_handle(ObjectRef::new(9, 0));
+        pdf.resolve(&proc_set_after).unwrap();
+        let proc_set_after_items = proc_set_after
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
         assert_eq!(
-            proc_set_after,
-            vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ],
+            proc_set_after.object_ref(),
+            Some(ObjectRef::new(9, 0)),
+            "the merged array must retain its indirect owner identity"
+        );
+        assert_eq!(
+            proc_set_after_items[0].as_name(),
+            Some(b"PDF".to_vec()),
+            "the existing ProcSet item must remain after the later failure"
+        );
+        assert_eq!(
+            proc_set_after_items[1].as_name(),
+            Some(b"Text".to_vec()),
             "the /ProcSet merge that ran before the /XObject failure must invalidate the \
-             pre-merge pdf.resolve_object() snapshot, not return it stale"
+             pre-merge handle snapshot, not return it stale"
         );
     }
 
