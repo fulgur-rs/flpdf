@@ -2348,21 +2348,21 @@ mod tests {
         assert_eq!(count, 1);
 
         // Page /Resources/XObject should have one entry pointing to the xobj.
-        let page_obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let page_dict = page_obj.as_dict().unwrap();
-
-        let resources = page_dict
-            .get("Resources")
-            .and_then(Object::as_dict)
-            .expect("Resources should be a dict");
-        let xobj_dict = resources
-            .get("XObject")
-            .and_then(Object::as_dict)
-            .expect("XObject should be a dict");
-        assert_eq!(xobj_dict.iter().count(), 1, "exactly one XObject entry");
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let resources = page.get_key(b"/Resources");
+        pdf.resolve(&resources).unwrap();
+        let xobj = resources.get_key(b"/XObject");
+        pdf.resolve(&xobj).unwrap();
+        let xobj_dict = xobj.as_dictionary().expect("XObject should be a dict");
+        assert_eq!(xobj_dict.len(), 1, "exactly one XObject entry");
         // The value should reference obj 5.
-        let xobj_val = xobj_dict.iter().next().unwrap().1;
-        assert_eq!(xobj_val, &Object::Reference(ObjectRef::new(5, 0)));
+        let xobj_val = xobj_dict.values().next().unwrap();
+        assert_eq!(
+            xobj_val.object_ref(),
+            Some(ObjectRef::new(5, 0)),
+            "XObject should reference the source Form XObject"
+        );
 
         // Page content should contain "cm" and "Do".
         let content = page_content_bytes(&mut pdf, page_ref).unwrap();
@@ -2373,9 +2373,7 @@ mod tests {
         assert!(content_str.contains('Q'), "content should contain Q");
 
         // qpdf removes /Annots after every annotation has been flattened.
-        let page_obj2 = pdf.resolve_borrowed(page_ref).unwrap();
-        let page_dict2 = page_obj2.as_dict().unwrap();
-        assert!(page_dict2.get("Annots").is_none());
+        assert!(!page.has_key(b"/Annots"));
     }
 
     // -----------------------------------------------------------------------
