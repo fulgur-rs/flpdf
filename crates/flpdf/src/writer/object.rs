@@ -884,9 +884,11 @@ impl ObjectWriterEmission for ObjectHandle {
     /// `unparseObject`: it does not apply ordinary dictionary null
     /// suppression, but its child values still have to be emitted from the
     /// live handle graph and rewritten into the output-number space.  The
-    /// `qdf` flag selects qpdf's line-oriented classic-trailer spelling; the
-    /// values deliberately remain compact because qpdf hand-writes trailer
-    /// values in both modes (`QPDFWriter.cc:1160-1236`).
+    /// `qdf` flag selects qpdf's line-oriented classic-trailer spelling and
+    /// passes that mode through to direct child containers, as
+    /// `writeTrailer`'s `unparseChild(..., 1, 0)` does
+    /// (`QPDFWriter.cc:1160-1236`). Indirect child handles remain references in
+    /// either mode.
     #[allow(clippy::too_many_arguments)] // qpdf keeps trailer layout, ID, mapping, and visibility controls orthogonal
     fn write_trailer_with_ref_map(
         &self,
@@ -3106,7 +3108,13 @@ fn unparse_trailer_entries_with_ref_map(
             // emission and already carry output-space references. Every other
             // trailer reference still belongs to the source graph and must go
             // through the caller's old-to-new map.
-            write_child(value, out)?;
+            if qdf {
+                write_child_qdf(value, 2, out)?;
+            } else {
+                write_child(value, out)?;
+            }
+        } else if qdf {
+            write_child_qdf_with_ref_map(value, 2, out, map, removed_refs)?;
         } else {
             write_child_with_ref_map(value, out, map, removed_refs)?;
         }
