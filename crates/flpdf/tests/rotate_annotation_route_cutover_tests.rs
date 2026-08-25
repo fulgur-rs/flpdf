@@ -31,6 +31,7 @@ fn flatten_annotation_rect_tests_use_qpdf_annotation_handles() {
             "resolve_borrowed(",
             "Object::",
             "set_object(",
+            "materialize(",
         ] {
             assert!(
                 !block.contains(marker),
