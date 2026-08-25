@@ -496,3 +496,50 @@ fn type_mismatched_resource_category_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn array_non_scalar_resource_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn qpdf_flatten_array_merge_excludes_non_scalar_items")
+        .expect("array non-scalar merge test must remain")
+        .1
+        .split_once("fn qpdf_flatten_ignores_direct_widget_inline_appearance_for_resource_merge")
+        .expect("array non-scalar merge test boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "array non-scalar fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::array(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::stream(",
+        "ObjectHandle::integer(",
+        "replace_object_handle(",
+        "resolve(",
+        "as_stream_dict()",
+        "try_get_key(",
+        "as_array()",
+        "as_integer()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "array non-scalar fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
