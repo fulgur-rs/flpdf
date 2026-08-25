@@ -1359,43 +1359,53 @@ mod tests {
         // malformed value would be touched even though qpdf never would be.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
-        appearance_resources.insert("ColorSpace", Object::Reference(ObjectRef::new(8, 0)));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
+        let appearance_resources = ObjectHandle::dictionary(vec![
+            (b"/Font".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            (
+                b"/ColorSpace".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(8, 0)),
+            ),
+        ]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+            .unwrap();
         // Object 8 is never a valid PDF object body -- if this ever gets
         // resolved, the read fails.
-        pdf.set_object(ObjectRef::new(8, 0), Object::Name(Vec::new()));
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-
-        let mut default_resources = Dictionary::new();
-        default_resources.insert("Font", Object::Dictionary(Dictionary::new()));
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(8, 0), ObjectHandle::name(Vec::new()))
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::dictionary(Vec::new()),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .expect("an unrelated destination-only category must never be touched");
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
-        };
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let stream_dict = appearance.as_stream_dict().unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let colorspace = resources.try_get_key(b"/ColorSpace").unwrap();
         assert_eq!(
-            resources.get("ColorSpace"),
-            Some(&Object::Reference(ObjectRef::new(8, 0))),
+            colorspace.object_ref(),
+            Some(ObjectRef::new(8, 0)),
             "the unrelated malformed category must be left exactly as-is"
         );
     }
