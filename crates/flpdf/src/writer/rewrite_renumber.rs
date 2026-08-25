@@ -820,15 +820,7 @@ fn walk_resurrectable_handle<R: Read + Seek>(
     }
 
     let own_ref = handle.object_ref();
-    let direct_ref = handle.as_reference();
-    let is_null = if own_ref.is_none() {
-        match direct_ref {
-            Some(reference) => pdf.get_object_handle(reference).try_is_null()?,
-            None => handle.try_is_null()?,
-        }
-    } else {
-        handle.try_is_null()?
-    };
+    let is_null = handle.try_is_null()?;
     let edge_ref = handle
         .as_reference()
         .or_else(|| edge_context.then_some(own_ref).flatten());
