@@ -40,4 +40,11 @@ fn tree_compatibility_route_is_removed_after_cutover() {
     let nntree = include_str!("../src/nntree.rs");
     assert!(nntree.contains("pub struct NameTree"));
     assert!(nntree.contains("pub struct NumberTree"));
+    let name_start = nntree.find("pub struct NameTree").expect("NameTree");
+    let number_start = nntree.find("pub struct NumberTree").expect("NumberTree");
+    let name_surface = &nntree[name_start..number_start];
+    assert!(name_surface.contains("pub fn new(root: ObjectHandle"));
+    assert!(!name_surface.contains("pub fn new(root: Object,"));
+    assert!(!name_surface.contains("value: Object,"));
+    assert!(!name_surface.contains("Result<Option<Object>>"));
 }

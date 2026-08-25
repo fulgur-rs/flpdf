@@ -312,14 +312,9 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Split2")?;
-    let split2_root = pdf
-        .trailer_dictionary()
-        .get(b"Split2")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut split2 = NameTree::new(split2_root, true);
+    let mut split2 = NameTree::new(pdf.trailer_key_handle(b"Split2"), true);
     split2.set_split_threshold(4);
-    let value = Object::String(flpdf::pdf_string::new_unicode_string(b"C"));
+    let value = ObjectHandle::string(flpdf::pdf_string::new_unicode_string(b"C"));
     let inserted = split2.insert(pdf, b"C", value)?;
     assert_eq!(
         inserted
@@ -338,12 +333,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     }
 
     writeln!(stdout, "/Split3")?;
-    let split3_root = pdf
-        .trailer_dictionary()
-        .get(b"Split3")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut split3 = NameTree::new(split3_root, true);
+    let mut split3 = NameTree::new(pdf.trailer_key_handle(b"Split3"), true);
     split3.set_split_threshold(4);
     // "\xcf\x80" is the raw UTF-8 bytes qpdf's C++ string literal
     // holds -- the two-byte encoding of U+03C0 (pi) -- passed as-is as the
@@ -351,7 +341,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     // transcodes `k` before using it as the tree key (only the *value*
     // goes through `newUnicodeString`).
     for key in [&b"P"[..], &b"\xcf\x80"[..]] {
-        let value = Object::String(flpdf::pdf_string::new_unicode_string(key));
+        let value = ObjectHandle::string(flpdf::pdf_string::new_unicode_string(key));
         let inserted = split3.insert(pdf, key, value)?;
         assert_eq!(
             inserted
@@ -367,7 +357,7 @@ pub(crate) fn run_test_74<R: Read + Seek>(
     while let Some((key, value)) = cursor.current() {
         write_bytes(stdout, &key)?;
         write!(stdout, " ")?;
-        write_bytes(stdout, &super::handle::write_object(&value))?;
+        write_bytes(stdout, &value.unparse())?;
         writeln!(stdout)?;
         cursor.next(&mut split3, pdf)?;
     }
@@ -394,17 +384,13 @@ pub(crate) fn run_test_75<R: Read + Seek>(
 ) -> flpdf::Result<()> {
     // qpdf's own function has no `std::cout` calls at all -- its entire
     // observable surface is assertions plus the closing `QPDFWriter` write.
-    let erase1_root = pdf
-        .trailer_dictionary()
-        .get(b"Erase1")
-        .cloned()
-        .unwrap_or(Object::Null);
-    let mut erase1 = NameTree::new(erase1_root, true);
+    let mut erase1 = NameTree::new(pdf.trailer_key_handle(b"Erase1"), true);
     assert!(erase1.remove(pdf, b"1X")?.is_none());
     let removed = erase1.remove(pdf, b"1C")?.expect("1C must be present");
     emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
     let removed_text = removed
         .as_string()
+        .as_deref()
         .map(flpdf::pdf_string::utf8_value)
         .unwrap_or_default();
     assert_eq!(removed_text, b"c");

@@ -1,4 +1,4 @@
-use flpdf::{Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf};
+use flpdf::{Dictionary, NameTree, NumberTree, Object, ObjectHandle, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::process::Command;
@@ -86,13 +86,19 @@ fn canonical_name_tree_probe_matches_qpdf_structure_and_output_bytes() {
 
     let bytes = canonical_name_tree_probe_pdf();
     let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("open probe PDF");
-    let mut tree = NameTree::new(Object::Reference(ObjectRef::new(4, 0)), true);
+    let mut tree = NameTree::new(pdf.get_object_handle(ObjectRef::new(4, 0)), true);
+    let entries = tree.as_map(&mut pdf).expect("read canonical name tree");
     assert_eq!(
-        tree.as_map(&mut pdf).expect("read canonical name tree"),
-        BTreeMap::from([
-            (b"alpha".to_vec(), Object::String(b"A".to_vec())),
-            (b"beta".to_vec(), Object::String(b"B".to_vec())),
-        ])
+        entries
+            .get(b"alpha".as_slice())
+            .and_then(ObjectHandle::as_string),
+        Some(b"A".to_vec())
+    );
+    assert_eq!(
+        entries
+            .get(b"beta".as_slice())
+            .and_then(ObjectHandle::as_string),
+        Some(b"B".to_vec())
     );
 
     let mut input = tempfile::NamedTempFile::new().expect("create qpdf probe input");
@@ -238,6 +244,10 @@ fn empty_pdf() -> Pdf<Cursor<Vec<u8>>> {
         .as_bytes(),
     );
     Pdf::open(Cursor::new(bytes)).expect("open")
+}
+
+fn empty_name_tree_root() -> ObjectHandle {
+    ObjectHandle::dictionary(vec![(b"/Names".to_vec(), ObjectHandle::array(Vec::new()))])
 }
 
 #[test]
@@ -391,26 +401,24 @@ fn number_tree_cursor_insert_after_and_remove_advances() {
 #[test]
 fn name_tree_insert_exposes_value_through_exact_lookup() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Names", Object::Array(Vec::new()));
-    let mut tree = NameTree::new(Object::Dictionary(root), true);
+    let mut tree = NameTree::new(empty_name_tree_root(), true);
+    let value = ObjectHandle::string(b"destination".to_vec());
 
-    tree.insert(&mut pdf, "café", Object::String(b"destination".to_vec()))
+    tree.insert(&mut pdf, "café", value.clone())
         .expect("insert");
 
     assert!(tree.has_name(&mut pdf, "café").expect("has name"));
-    assert_eq!(
-        tree.find_object(&mut pdf, b"caf\xc3\xa9").expect("find"),
-        Some(Object::String(b"destination".to_vec()))
-    );
+    let found = tree
+        .find_object(&mut pdf, b"caf\xc3\xa9")
+        .expect("find")
+        .expect("value");
+    assert!(found.is_same_object_as(&value));
 }
 
 #[test]
 fn name_tree_cursor_insert_after_and_remove_advances() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Names", Object::Array(Vec::new()));
-    let mut tree = NameTree::new(Object::Dictionary(root), true);
+    let mut tree = NameTree::new(empty_name_tree_root(), true);
     let mut cursor = tree.end();
 
     cursor
@@ -418,7 +426,7 @@ fn name_tree_cursor_insert_after_and_remove_advances() {
             &mut tree,
             &mut pdf,
             "alpha",
-            Object::String(b"first".to_vec()),
+            ObjectHandle::string(b"first".to_vec()),
         )
         .expect("insert alpha");
     cursor
@@ -426,22 +434,20 @@ fn name_tree_cursor_insert_after_and_remove_advances() {
             &mut tree,
             &mut pdf,
             b"beta",
-            Object::String(b"second".to_vec()),
+            ObjectHandle::string(b"second".to_vec()),
         )
         .expect("insert beta");
     cursor
         .previous(&mut tree, &mut pdf)
         .expect("move back to alpha");
-    assert_eq!(
-        cursor.current(),
-        Some((b"alpha".to_vec(), Object::String(b"first".to_vec())))
-    );
+    let (key, value) = cursor.current().expect("alpha current");
+    assert_eq!(key, b"alpha".to_vec());
+    assert_eq!(value.as_string(), Some(b"first".to_vec()));
 
     cursor.remove(&mut tree, &mut pdf).expect("remove alpha");
-    assert_eq!(
-        cursor.current(),
-        Some((b"beta".to_vec(), Object::String(b"second".to_vec())))
-    );
+    let (key, value) = cursor.current().expect("beta current");
+    assert_eq!(key, b"beta".to_vec());
+    assert_eq!(value.as_string(), Some(b"second".to_vec()));
 }
 
 #[test]
@@ -449,18 +455,17 @@ fn name_tree_new_empty_owns_an_indirect_root() {
     let mut pdf = empty_pdf();
 
     let tree = NameTree::new_empty(&mut pdf, true).expect("new empty");
-    let root = tree.root().clone();
-    let root_ref = root.as_ref_id().expect("indirect root");
+    let root = tree.get_object_handle();
+    assert!(root.object_ref().is_some(), "root must be indirect");
+    pdf.resolve(&root).expect("resolve root");
+    let dictionary = root.as_dictionary().expect("root dictionary");
     assert_eq!(
-        pdf.resolve_object(root_ref).expect("resolve root"),
-        Object::Dictionary({
-            let mut dictionary = Dictionary::new();
-            dictionary.insert("Names", Object::Array(Vec::new()));
-            dictionary
-        })
+        dictionary
+            .get(b"/Names".as_slice())
+            .and_then(ObjectHandle::as_array)
+            .map(|items| items.len()),
+        Some(0)
     );
-
-    assert_eq!(tree.into_root(), root);
 }
 
 #[test]
@@ -485,45 +490,51 @@ fn number_tree_new_empty_owns_an_indirect_root() {
 #[test]
 fn name_tree_helper_exposes_sorted_find_map_and_remove() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert("Names", Object::Array(Vec::new()));
-    let mut tree = NameTree::new(Object::Dictionary(root), true);
+    let mut tree = NameTree::new(empty_name_tree_root(), true);
     tree.set_split_threshold(2);
-    tree.insert(&mut pdf, "beta", Object::Integer(2))
+    tree.insert(&mut pdf, "beta", ObjectHandle::integer(2))
         .expect("insert beta");
-    tree.insert(&mut pdf, "alpha", Object::Integer(1))
+    tree.insert(&mut pdf, "alpha", ObjectHandle::integer(1))
         .expect("insert alpha");
 
-    assert_eq!(
-        tree.begin(&mut pdf).expect("begin").current(),
-        Some((b"alpha".to_vec(), Object::Integer(1)))
-    );
-    assert_eq!(
-        tree.last(&mut pdf).expect("last").current(),
-        Some((b"beta".to_vec(), Object::Integer(2)))
-    );
-    assert_eq!(
-        tree.find(&mut pdf, "be", true)
-            .expect("find previous")
-            .current(),
-        Some((b"alpha".to_vec(), Object::Integer(1)))
-    );
+    let (key, value) = tree.begin(&mut pdf).expect("begin").current().unwrap();
+    assert_eq!(key, b"alpha".to_vec());
+    assert_eq!(value.as_integer(), Some(1));
+    let (key, value) = tree.last(&mut pdf).expect("last").current().unwrap();
+    assert_eq!(key, b"beta".to_vec());
+    assert_eq!(value.as_integer(), Some(2));
+    let (key, value) = tree
+        .find(&mut pdf, "be", true)
+        .expect("find previous")
+        .current()
+        .unwrap();
+    assert_eq!(key, b"alpha".to_vec());
+    assert_eq!(value.as_integer(), Some(1));
     assert!(!tree
         .find(&mut pdf, "be", false)
         .expect("find exact")
         .valid());
+    let map = tree.as_map(&mut pdf).expect("map");
     assert_eq!(
-        tree.as_map(&mut pdf).expect("map"),
-        BTreeMap::from([
-            (b"alpha".to_vec(), Object::Integer(1)),
-            (b"beta".to_vec(), Object::Integer(2)),
-        ])
+        map.get(b"alpha".as_slice())
+            .and_then(ObjectHandle::as_integer),
+        Some(1)
     );
     assert_eq!(
-        tree.remove(&mut pdf, "beta").expect("remove beta"),
-        Some(Object::Integer(2))
+        map.get(b"beta".as_slice())
+            .and_then(ObjectHandle::as_integer),
+        Some(2)
     );
-    assert_eq!(tree.remove(&mut pdf, "beta").expect("remove missing"), None);
+    assert_eq!(
+        tree.remove(&mut pdf, "beta")
+            .expect("remove beta")
+            .and_then(|value| value.as_integer()),
+        Some(2)
+    );
+    assert!(tree
+        .remove(&mut pdf, "beta")
+        .expect("remove missing")
+        .is_none());
 }
 
 #[test]
@@ -625,16 +636,23 @@ fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
 #[test]
 fn canonical_name_reader_returns_qpdf_normalized_utf8_key() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert(
-        "Names",
-        Object::Array(vec![Object::String(vec![0x80]), Object::Integer(7)]),
-    );
+    let root = ObjectHandle::dictionary(vec![(
+        b"/Names".to_vec(),
+        ObjectHandle::array(vec![
+            ObjectHandle::string(vec![0x80]),
+            ObjectHandle::integer(7),
+        ]),
+    )]);
 
-    let mut tree = NameTree::new(Object::Dictionary(root), false);
+    let mut tree = NameTree::new(root, false);
     let entries = tree.as_map(&mut pdf).expect("read");
 
-    assert_eq!(entries.get("•".as_bytes()), Some(&Object::Integer(7)));
+    assert_eq!(
+        entries
+            .get("•".as_bytes())
+            .and_then(ObjectHandle::as_integer),
+        Some(7)
+    );
 }
 
 #[test]
@@ -657,17 +675,18 @@ fn canonical_number_reader_accepts_direct_kid() {
 #[test]
 fn typed_cursors_are_cloneable_and_compare_by_qpdf_position() {
     let mut pdf = empty_pdf();
-    let mut root = Dictionary::new();
-    root.insert(
-        "Names",
-        Object::Array(vec![
-            Object::String(b"a".to_vec()),
-            Object::Integer(1),
-            Object::String(b"b".to_vec()),
-            Object::Integer(2),
-        ]),
+    let mut tree = NameTree::new(
+        ObjectHandle::dictionary(vec![(
+            b"/Names".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(b"a".to_vec()),
+                ObjectHandle::integer(1),
+                ObjectHandle::string(b"b".to_vec()),
+                ObjectHandle::integer(2),
+            ]),
+        )]),
+        true,
     );
-    let mut tree = NameTree::new(Object::Dictionary(root), true);
 
     let first = tree.begin(&mut pdf).expect("first");
     let mut copy = first.clone();
@@ -721,25 +740,36 @@ fn number_tree_at_or_below_reports_offset_overflow() {
 #[test]
 fn cursors_reject_other_trees_and_invalid_remove() {
     let mut pdf = empty_pdf();
-    let mut left_root = Dictionary::new();
-    left_root.insert(
-        "Names",
-        Object::Array(vec![Object::String(b"left".to_vec()), Object::Integer(1)]),
+    let mut left = NameTree::new(
+        ObjectHandle::dictionary(vec![(
+            b"/Names".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(b"left".to_vec()),
+                ObjectHandle::integer(1),
+            ]),
+        )]),
+        true,
     );
-    let mut right_root = Dictionary::new();
-    right_root.insert(
-        "Names",
-        Object::Array(vec![Object::String(b"right".to_vec()), Object::Integer(2)]),
+    let mut right = NameTree::new(
+        ObjectHandle::dictionary(vec![(
+            b"/Names".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(b"right".to_vec()),
+                ObjectHandle::integer(2),
+            ]),
+        )]),
+        true,
     );
-    let mut left = NameTree::new(Object::Dictionary(left_root), true);
-    let mut right = NameTree::new(Object::Dictionary(right_root), true);
     let mut left_cursor = left.begin(&mut pdf).expect("left cursor");
 
     assert!(left_cursor.next(&mut right, &mut pdf).is_err());
     assert!(left_cursor.remove(&mut right, &mut pdf).is_err());
     assert_eq!(
-        right.find_object(&mut pdf, b"right").expect("right lookup"),
-        Some(Object::Integer(2))
+        right
+            .find_object(&mut pdf, b"right")
+            .expect("right lookup")
+            .and_then(|value| value.as_integer()),
+        Some(2)
     );
     assert!(left.end().remove(&mut left, &mut pdf).is_err());
 
