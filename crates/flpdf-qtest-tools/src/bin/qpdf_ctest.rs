@@ -26,7 +26,7 @@ fn main() -> ExitCode {
 
 fn run(args: &[std::ffi::OsString]) -> Result<()> {
     if args.len() == 2 && args[1] == "--version" {
-        println!("qpdf-ctest version {}", flpdf::version());
+        println!("qpdf-ctest version {}", flpdf::qpdf_version());
         return Ok(());
     }
     if args.len() != 5 || args[1] != "19" {

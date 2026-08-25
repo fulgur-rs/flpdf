@@ -253,3 +253,11 @@ pub use xref_entry::XrefEntry;
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// Return the pinned qpdf library version exposed by qpdf's
+/// `QPDF::QPDFVersion` (`libqpdf/QPDF.cc:178-181`). This is deliberately
+/// separate from [`version`], which reports flpdf's Cargo package version.
+/// qpdf-shaped CLI and helper-process output must use this value.
+pub fn qpdf_version() -> &'static str {
+    "11.9.0"
+}
