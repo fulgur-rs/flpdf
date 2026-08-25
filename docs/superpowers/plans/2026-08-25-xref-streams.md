@@ -90,7 +90,11 @@ pub fn show_xref<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitC
                 XrefEntry::Compressed { stream, index } => {
                     format!("{}/{}: compressed; stream = {stream}, index = {index}\n", object_ref.number, object_ref.generation)
                 }
-                XrefEntry::Free { .. } => continue,
+                XrefEntry::Free { .. } => {
+                    return Err(Error::Internal(
+                        "unknown cross-reference table type while showing xref_table".to_owned(),
+                    ));
+                }
             };
             logger.info(line)?;
         }
@@ -99,7 +103,7 @@ pub fn show_xref<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitC
 }
 ```
 
-The method must use the existing `inspect` completion boundary so open-time and operation-time qpdf warnings are emitted before the warning exit status. `Free` rows are not printed because qpdf's `QPDF::showXRefTable` iterates its effective `m->xref_table`, where type-0 entries are not ordinary output rows; no synthetic line or error is invented for them.
+The method must use the existing `inspect` completion boundary so open-time and operation-time qpdf warnings are emitted before the warning exit status. A type-0 row must return qpdf's `std::logic_error` equivalent (`Error::Internal("unknown cross-reference table type while showing xref_table")`), matching `QPDF::showXRefTable` rather than silently hiding a resolver-created free row.
 
 - [x] **Step 2: Register and dispatch `--show-xref`**
 

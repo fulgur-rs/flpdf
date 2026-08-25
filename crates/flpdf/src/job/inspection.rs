@@ -154,7 +154,12 @@ impl QPDFJob {
         self.inspect(pdf, |pdf| {
             for (object_ref, entry) in pdf.get_xref_table() {
                 let line = match entry {
-                    XrefEntry::Free { .. } => continue,
+                    XrefEntry::Free { .. } => {
+                        return Err(Error::Internal(
+                            "unknown cross-reference table type while showing xref_table"
+                                .to_owned(),
+                        ));
+                    }
                     XrefEntry::Uncompressed { offset } => format!(
                         "{}/{}: uncompressed; offset = {offset}\n",
                         object_ref.number, object_ref.generation
@@ -458,5 +463,21 @@ mod tests {
         logger.set_info(Some(logger.discard()));
         write_page_attribute(&logger, "missing", &ObjectHandle::null()).unwrap();
         write_page_attribute(&logger, "value", &ObjectHandle::integer(7)).unwrap();
+    }
+
+    #[test]
+    fn show_xref_rejects_a_type_zero_entry_like_qpdf() {
+        let mut pdf = recovered_pdf();
+        pdf.resolver
+            .insert_default_xref_entry_for_test(ObjectRef::new(99, 0));
+
+        let error = quiet_job()
+            .show_xref(&mut pdf)
+            .expect_err("qpdf rejects a type-zero entry while showing xref");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "unknown cross-reference table type while showing xref_table"
+        ));
     }
 }
