@@ -949,10 +949,11 @@ mod tests {
     fn qpdf_document_flatten_empty_page_exercises_public_contract() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
-        let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must remain a dictionary"); // cov:ignore: fixture invariant
-        };
-        assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        let resources = page.get_key(b"/Resources");
+        pdf.resolve(&resources).unwrap();
+        assert!(resources.as_dictionary().is_some());
     }
 
     #[test]
