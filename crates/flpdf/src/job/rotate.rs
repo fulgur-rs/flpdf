@@ -152,24 +152,20 @@ pub fn flatten_rotation_on_pages<R: Read + Seek>(
 mod tests {
     use super::*;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{pages, PageBox, Pdf};
+    use crate::{pages, ObjectHandle, PageBox, Pdf};
     use std::io::Cursor;
 
-    fn object_to_pagebox(obj: &Object) -> Option<PageBox> {
-        let Object::Array(values) = obj else {
-            return None;
-        };
+    fn handle_to_pagebox(obj: &ObjectHandle) -> Option<PageBox> {
+        let values = obj.as_array()?;
         if values.len() != 4 {
             return None;
         }
         let mut numbers = [0.0; 4];
         for (index, value) in values.iter().enumerate() {
-            numbers[index] = match value {
-                Object::Integer(value) => *value as f64,
-                Object::Real(value) => *value,
-                Object::RealLiteral { value, .. } => *value,
-                _ => return None,
-            };
+            numbers[index] = value
+                .as_integer()
+                .map(|value| value as f64)
+                .or_else(|| value.as_real())?;
         }
         Some(PageBox::new(
             numbers[0].min(numbers[2]),
@@ -179,27 +175,41 @@ mod tests {
         ))
     }
 
+    fn object_key_handle(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        object_ref: ObjectRef,
+        key: &[u8],
+    ) -> ObjectHandle {
+        let owner = pdf.get_object_handle(object_ref);
+        pdf.resolve(&owner).expect("object resolves");
+        let value = owner.get_key(key);
+        pdf.resolve(&value).expect("object key resolves");
+        value
+    }
+
+    fn pagebox_for(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef, key: &[u8]) -> PageBox {
+        let value = object_key_handle(pdf, object_ref, key);
+        handle_to_pagebox(&value).expect("page box must be a four-number array")
+    }
+
     #[test]
-    fn object_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
-        assert!(object_to_pagebox(&Object::Integer(1)).is_none());
-        assert!(object_to_pagebox(&Object::Array(vec![Object::Integer(1)])).is_none());
+    fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
+        assert!(handle_to_pagebox(&ObjectHandle::integer(1)).is_none());
+        assert!(handle_to_pagebox(&ObjectHandle::array(vec![ObjectHandle::integer(1)])).is_none());
         assert_eq!(
-            object_to_pagebox(&Object::Array(vec![
-                Object::RealLiteral {
-                    value: 1.5,
-                    literal: b"1.5".to_vec(),
-                },
-                Object::Integer(2),
-                Object::Real(11.5),
-                Object::Integer(22),
+            handle_to_pagebox(&ObjectHandle::array(vec![
+                ObjectHandle::real_literal(1.5, b"1.5".to_vec()),
+                ObjectHandle::integer(2),
+                ObjectHandle::real(11.5),
+                ObjectHandle::integer(22),
             ])),
             Some(PageBox::new(1.5, 2.0, 11.5, 22.0))
         );
-        assert!(object_to_pagebox(&Object::Array(vec![
-            Object::Integer(1),
-            Object::Null,
-            Object::Integer(11),
-            Object::Integer(22),
+        assert!(handle_to_pagebox(&ObjectHandle::array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::null(),
+            ObjectHandle::integer(11),
+            ObjectHandle::integer(22),
         ]))
         .is_none());
     }
@@ -922,7 +932,7 @@ mod tests {
             panic!("not a dict")
         };
         assert!(d.get("Rotate").is_none());
-        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
 
         let content = pages::page_content_bytes(&mut pdf, page).unwrap();
@@ -949,10 +959,7 @@ mod tests {
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
         let after = pages::page_content_bytes(&mut pdf, page).unwrap();
         assert_eq!(before, after, "content must be untouched when rotate==0");
-        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
-            panic!("not a dict")
-        };
-        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx, mb.ury), (200.0, 300.0));
     }
 
@@ -968,7 +975,7 @@ mod tests {
         };
         assert!(d.get("Rotate").is_none());
         // 180 maps [0 0 200 300] back onto itself: dims unchanged.
-        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.llx, mb.lly, mb.urx, mb.ury), (0.0, 0.0, 200.0, 300.0));
         let content = pages::page_content_bytes(&mut pdf, page).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -988,15 +995,12 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let Object::Dictionary(d) = pdf.resolve_object(page).unwrap() else {
-            panic!("not a dict")
-        };
         // 90deg map (x,y)->(y, 200 - x): corners (10,10),(190,290) ->
         // (10,190),(290,10) -> bbox [10 10 290 190].
-        let cb = object_to_pagebox(d.get("CropBox").unwrap()).unwrap();
+        let cb = pagebox_for(&mut pdf, page, b"/CropBox");
         assert_eq!((cb.llx, cb.lly, cb.urx, cb.ury), (10.0, 10.0, 290.0, 190.0));
         // And MediaBox is still swapped, independently.
-        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
     }
 
@@ -1056,10 +1060,7 @@ mod tests {
             .and_then(|annots| annots.first())
             .and_then(Object::as_ref_id)
             .expect("flattened annotation must remain on the page");
-        let Object::Dictionary(ad) = pdf.resolve_object(annot).unwrap() else {
-            panic!("not a dict")
-        };
-        let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
+        let r = pagebox_for(&mut pdf, annot, b"/Rect");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -1071,24 +1072,20 @@ mod tests {
         let indirect_annot = ObjectRef::new(5, 0);
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        let page_dict = pdf
-            .resolve_object(page)
-            .unwrap()
-            .into_dict()
-            .expect("not a page dict");
-        let annots = page_dict
-            .get("Annots")
-            .and_then(Object::as_array)
+        let page_handle = pdf.get_object_handle(page);
+        pdf.resolve(&page_handle).unwrap();
+        let annots_handle = page_handle.get_key(b"/Annots");
+        pdf.resolve(&annots_handle).unwrap();
+        let annots = annots_handle
+            .as_array()
             .expect("/Annots must remain an array");
         let mut rects = annots
             .iter()
             .map(|annotation| {
-                let annotation = match annotation {
-                    Object::Reference(reference) => pdf.resolve_object(*reference).unwrap(),
-                    direct => direct.clone(), // cov:ignore: qpdf transformAnnotations materializes every transformed annotation as an indirect object; retain this malformed-fixture fallback.
-                };
-                let annotation = annotation.into_dict().expect("annotation dictionary");
-                let rectangle = object_to_pagebox(annotation.get("Rect").unwrap()).unwrap();
+                pdf.resolve(annotation).unwrap();
+                let rect = annotation.get_key(b"/Rect");
+                pdf.resolve(&rect).unwrap();
+                let rectangle = handle_to_pagebox(&rect).expect("annotation rectangle");
                 (rectangle.llx, rectangle.lly, rectangle.urx, rectangle.ury)
             })
             .collect::<Vec<_>>();
@@ -1097,13 +1094,9 @@ mod tests {
             rects,
             vec![(20.0, 140.0, 40.0, 190.0), (30.0, 130.0, 50.0, 180.0)]
         );
-        let original = pdf
-            .resolve_object(indirect_annot)
-            .unwrap()
-            .into_dict()
-            .unwrap();
+        let original = object_key_handle(&mut pdf, indirect_annot, b"/Rect");
         assert_eq!(
-            object_to_pagebox(original.get("Rect").unwrap()),
+            handle_to_pagebox(&original),
             Some(PageBox::new(20.0, 30.0, 70.0, 50.0))
         );
     }
@@ -1139,10 +1132,7 @@ mod tests {
             .and_then(|annots| annots.first())
             .and_then(Object::as_ref_id)
             .expect("flattened annotation must be indirect");
-        let Object::Dictionary(ad) = pdf.resolve_object(annot).unwrap() else {
-            panic!("not a dict")
-        };
-        let r = object_to_pagebox(ad.get("Rect").unwrap()).unwrap();
+        let r = pagebox_for(&mut pdf, annot, b"/Rect");
         assert_eq!((r.llx, r.lly, r.urx, r.ury), (20.0, 140.0, 40.0, 190.0));
     }
 
@@ -1174,7 +1164,7 @@ mod tests {
         assert_eq!(pages::page_content_bytes(&mut pdf, page).unwrap(), before);
         // The direct page box is untouched because qpdf's facade did not see a
         // direct `/Rotate` value.
-        let mb = object_to_pagebox(d.get("MediaBox").unwrap()).unwrap();
+        let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (200.0, 300.0));
     }
 }
