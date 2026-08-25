@@ -149,10 +149,18 @@ impl XrefRegistration {
 /// Keep only the effective highest-generation row for each object number
 /// after the complete cross-reference chain has been registered.
 ///
-/// This is QPDF::read_xref's post-chain loop at QPDF.cc:710-718; the
-/// corresponding cache/xref removal primitive is QPDF::removeObject at
-/// QPDF.cc:1996-2005.
-fn discard_lower_generations(entries: &mut BTreeMap<ObjectRef, XrefEntry>) {
+/// This is QPDF::read_xref's post-chain loop at QPDF.cc:710-718, discarding
+/// the same way QPDF::removeObject does at QPDF.cc:1996-2005: erase the
+/// xref-table row (`entries`) and, for a discarded generation that was
+/// already read and cached while walking the chain, the object-cache entry
+/// too. `parsed_xref_streams` is flpdf's pre-`Pdf`-construction stand-in for
+/// `m->obj_cache` (see `install_parsed_xref_stream_handles`'s doc) --
+/// leaving a discarded xref-stream object there would let it resurface as a
+/// live handle even though its xref row is gone.
+fn discard_lower_generations(
+    entries: &mut BTreeMap<ObjectRef, XrefEntry>,
+    parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
+) {
     let mut previous: Option<ObjectRef> = None;
     let mut lower_generations = Vec::new();
     for &object_ref in entries.keys() {
@@ -165,6 +173,7 @@ fn discard_lower_generations(entries: &mut BTreeMap<ObjectRef, XrefEntry>) {
     }
     for object_ref in lower_generations {
         entries.remove(&object_ref);
+        parsed_xref_streams.remove(&object_ref);
     }
 }
 
@@ -1478,7 +1487,10 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 initial_diagnostics,
                 observed_first_xref_item_offset,
             )?;
-            discard_lower_generations(&mut recovered.loaded.entries);
+            discard_lower_generations(
+                &mut recovered.loaded.entries,
+                &mut recovered.parsed_xref_streams,
+            );
             recovered.header_offset = header_offset;
             return Ok(recovered);
         }
@@ -1511,7 +1523,10 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 observed_first_xref_item_offset,
             )?;
             let mut recovered = merge_recovered_qpdf_state(recovered, loaded, &deleted_objects);
-            discard_lower_generations(&mut recovered.loaded.entries);
+            discard_lower_generations(
+                &mut recovered.loaded.entries,
+                &mut recovered.parsed_xref_streams,
+            );
             recovered.header_offset = header_offset;
             return Ok(recovered);
         }
@@ -1596,7 +1611,10 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
             &BTreeSet::new(),
             &mut recovered.loaded.repair_diagnostics,
         );
-        discard_lower_generations(&mut recovered.loaded.entries);
+        discard_lower_generations(
+            &mut recovered.loaded.entries,
+            &mut recovered.parsed_xref_streams,
+        );
         return Ok(recovered);
     }
 
@@ -1618,7 +1636,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         push_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, &error, startxref);
     }
 
-    discard_lower_generations(&mut loaded.loaded.entries);
+    discard_lower_generations(&mut loaded.loaded.entries, &mut loaded.parsed_xref_streams);
     loaded.header_offset = header_offset;
     Ok(loaded)
 }
@@ -8197,8 +8215,17 @@ mod tests {
             (ObjectRef::new(7, 1), XrefEntry::Uncompressed { offset: 20 }),
             (ObjectRef::new(8, 0), XrefEntry::Uncompressed { offset: 30 }),
         ]);
+        // Object 7's discarded generation was already read as an xref stream
+        // while walking the /Prev chain (QPDF::removeObject, QPDF.cc:1996-2005,
+        // erases both m->xref_table and m->obj_cache; parsed_xref_streams is
+        // flpdf's pre-Pdf-construction stand-in for the latter).
+        let mut parsed_xref_streams = BTreeMap::from([
+            (ObjectRef::new(7, 0), Object::Null),
+            (ObjectRef::new(7, 1), Object::Null),
+            (ObjectRef::new(8, 0), Object::Null),
+        ]);
 
-        discard_lower_generations(&mut entries);
+        discard_lower_generations(&mut entries, &mut parsed_xref_streams);
 
         assert!(!entries.contains_key(&ObjectRef::new(7, 0)));
         assert_eq!(
@@ -8206,6 +8233,14 @@ mod tests {
             Some(&XrefEntry::Uncompressed { offset: 20 })
         );
         assert!(entries.contains_key(&ObjectRef::new(8, 0)));
+
+        assert!(
+            !parsed_xref_streams.contains_key(&ObjectRef::new(7, 0)),
+            "the discarded generation's already-parsed xref stream must not \
+             survive to resurface as a live handle"
+        );
+        assert!(parsed_xref_streams.contains_key(&ObjectRef::new(7, 1)));
+        assert!(parsed_xref_streams.contains_key(&ObjectRef::new(8, 0)));
     }
 
     #[test]
