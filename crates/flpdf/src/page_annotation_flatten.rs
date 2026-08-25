@@ -2837,7 +2837,16 @@ mod tests {
         );
 
         // qpdf removes /Annots after every annotation has been flattened.
-        assert!(page.try_get_key(b"/Annots").unwrap().is_null());
+        // try_get_key alone cannot distinguish an absent key from a present
+        // null value (qpdf's own key/null conflation), so check the raw
+        // dictionary entries instead of relying on is_null().
+        assert!(
+            !page
+                .as_dictionary()
+                .expect("fixture page must remain a dictionary")
+                .contains_key(b"/Annots".as_slice()),
+            "/Annots must be removed as a dictionary entry, not merely nulled"
+        );
     }
 
     // -----------------------------------------------------------------------
