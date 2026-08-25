@@ -1990,20 +1990,24 @@ mod tests {
     #[test]
     fn qpdf_flatten_wraps_content_when_dropping_an_unselected_appearance() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        let mut annotation = Dictionary::new();
-        annotation.insert("AP", Object::Dictionary(Dictionary::new()));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+        let annotation_ref = ObjectRef::new(4, 0);
+        pdf.replace_object_handle(annotation_ref, ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        let annotation = pdf.get_object_handle(annotation_ref);
+        pdf.resolve(&annotation).unwrap();
+        annotation
+            .replace_key(b"/AP", ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        pdf.mark_object_handle_dirty(&annotation).unwrap();
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
 
-        let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must remain a dictionary"); // cov:ignore: fixture invariant
-        };
-        assert!(page.get("Annots").is_none());
-        assert!(matches!(
-            page.get("Contents"),
-            Some(Object::Array(items)) if items.len() == 2
-        ));
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        assert!(page.try_get_key(b"/Annots").unwrap().is_null());
+        let contents = page.try_get_key(b"/Contents").unwrap();
+        pdf.resolve(&contents).unwrap();
+        assert_eq!(contents.as_array().map(|items| items.len()), Some(2));
     }
 
     #[test]

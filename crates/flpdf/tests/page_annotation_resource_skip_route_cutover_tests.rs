@@ -590,3 +590,47 @@ fn direct_inline_widget_resource_merge_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn unselected_appearance_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn qpdf_flatten_wraps_content_when_dropping_an_unselected_appearance")
+        .expect("unselected appearance test must remain")
+        .1
+        .split_once("fn qpdf_document_flatten_covers_widget_resources_and_removal_paths")
+        .expect("unselected appearance test boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "unselected appearance fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::dictionary(",
+        "replace_object_handle(",
+        "replace_key(",
+        "mark_object_handle_dirty(",
+        "resolve(",
+        "try_get_key(",
+        "as_array()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "unselected appearance fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
