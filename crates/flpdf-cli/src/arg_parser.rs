@@ -357,6 +357,20 @@ mod tests {
     }
 
     #[test]
+    fn parser_discards_attached_value_for_check_linearization() {
+        let command = clap::Command::new("flpdf").arg(
+            clap::Arg::new("check-linearization")
+                .long("check-linearization")
+                .action(clap::ArgAction::SetTrue),
+        );
+        let parsed = ArgParser::from_command(command)
+            .parse(vec!["flpdf".into(), "--check-linearization=ignored".into()])
+            .expect("bare option should accept qpdf's attached value form");
+
+        assert_eq!(parsed.residual_args, ["flpdf", "--check-linearization"]);
+    }
+
+    #[test]
     fn parser_captures_pages_segment_and_resumes_after_terminator() {
         let command = clap::Command::new("flpdf").arg(clap::Arg::new("qdf").long("qdf"));
         let parsed = ArgParser::from_command(command)
