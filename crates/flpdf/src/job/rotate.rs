@@ -194,6 +194,14 @@ mod tests {
         handle_to_pagebox(pdf, &value).expect("page box must be a four-number array")
     }
 
+    fn rotate_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> Option<i64> {
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("page resolves");
+        let rotate = page.get_key(b"/Rotate");
+        pdf.resolve(&rotate).expect("/Rotate resolves");
+        rotate.as_integer()
+    }
+
     #[test]
     fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
         let mut pdf = Pdf::empty().unwrap();
@@ -452,11 +460,7 @@ mod tests {
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
         // The leaf should now carry /Rotate 180 explicitly.
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(180)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
     }
 
     #[test]
@@ -471,11 +475,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(180)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(180));
     }
 
     #[test]
@@ -490,11 +490,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let Object::Dictionary(dict) = obj else {
-            panic!("not a dict")
-        };
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(0)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(0));
     }
 
     #[test]
@@ -511,9 +507,7 @@ mod tests {
         };
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
-        let obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let dict = obj.as_dict().expect("not a dict");
-        assert_eq!(dict.get("Rotate"), Some(&Object::Integer(90)));
+        assert_eq!(rotate_value(&mut pdf, page_ref), Some(90));
     }
 
     #[test]
