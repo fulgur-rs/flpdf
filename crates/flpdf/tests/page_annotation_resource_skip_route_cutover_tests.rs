@@ -173,3 +173,47 @@ fn indirect_appearance_resources_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn indirect_scalar_resource_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn qpdf_flatten_appends_an_indirect_scalar_item_from_dr")
+        .expect("indirect scalar resource test must remain")
+        .1
+        .split_once("fn qpdf_flatten_terminal_chases_a_holder_redirect_category_and_array_item")
+        .expect("indirect scalar resource test boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "indirect scalar resource fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::stream(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::array(",
+        "ObjectHandle::name(",
+        "replace_object_handle(",
+        "as_stream_dict()",
+        "try_get_key(",
+    ] {
+        assert!(
+            block.contains(marker),
+            "indirect scalar resource fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
