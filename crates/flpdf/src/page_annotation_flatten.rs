@@ -1479,46 +1479,60 @@ mod tests {
         // dirty explicitly so the writer observes the merged content.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        pdf.set_object(
+        pdf.replace_object_handle(
             ObjectRef::new(9, 0),
-            Object::Array(vec![Object::Name(b"PDF".to_vec())]),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )
+        .unwrap();
+        let appearance_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(9, 0)),
+        )]);
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"/Resources".to_vec(), appearance_resources)]),
+            Rc::new(Vec::new()),
         );
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("ProcSet", Object::Reference(ObjectRef::new(9, 0)));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![Object::Name(b"Text".to_vec())]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"Text".to_vec())]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Array(proc_set) = pdf.resolve_object(ObjectRef::new(9, 0)).unwrap() else {
-            panic!("shared ProcSet array must remain an array"); // cov:ignore: fixture invariant
-        };
+        let proc_set = pdf.get_object_handle(ObjectRef::new(9, 0));
+        pdf.resolve(&proc_set).unwrap();
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
         assert_eq!(
-            proc_set,
-            vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ],
+            proc_set.object_ref(),
+            Some(ObjectRef::new(9, 0)),
+            "the merged array must retain its indirect owner identity"
+        );
+        assert_eq!(
+            proc_set_items[0].as_name(),
+            Some(b"PDF".to_vec()),
+            "the existing indirect array item must remain in place"
+        );
+        assert_eq!(
+            proc_set_items[1].as_name(),
+            Some(b"Text".to_vec()),
             "the merged indirect array must be reachable through pdf.resolve after the merge"
         );
     }

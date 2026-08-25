@@ -260,3 +260,49 @@ fn indirect_scalar_resource_fixture_uses_live_handles() {
         );
     }
 }
+
+#[test]
+fn indirect_array_category_dirty_fixture_uses_live_handles() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(root.join("src/page_annotation_flatten.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let block = source
+        .split_once("fn qpdf_flatten_marks_an_indirect_array_category_dirty_after_merge")
+        .expect("indirect array category dirty test must remain")
+        .1
+        .split_once(
+            "fn qpdf_flatten_keeps_an_earlier_indirect_array_merge_dirty_after_a_later_category_fails",
+        )
+        .expect("indirect array category dirty test boundary must remain")
+        .0;
+
+    for marker in [
+        "resolve_object(",
+        "resolve_borrowed(",
+        "Object::",
+        "set_object(",
+        "materialize(",
+        "lift_object_to_handle(",
+    ] {
+        assert!(
+            !block.contains(marker),
+            "indirect array category dirty fixture must not keep raw route marker {marker:?}"
+        );
+    }
+    for marker in [
+        "get_object_handle(",
+        "ObjectHandle::array(",
+        "ObjectHandle::dictionary(",
+        "ObjectHandle::stream(",
+        "replace_object_handle(",
+        "resolve(",
+        "as_array()",
+        "object_ref()",
+    ] {
+        assert!(
+            block.contains(marker),
+            "indirect array category dirty fixture must use live handle accessor {marker:?}"
+        );
+    }
+}
