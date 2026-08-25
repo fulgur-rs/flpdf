@@ -1916,7 +1916,7 @@ fn main() {
     } else if args.show_xref {
         run_show_xref(args.input, args.repair, &args.password)
     } else if args.check_linearization {
-        run_check_linearization(args.input, args.repair, &args.password)
+        run_check_linearization(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_linearization {
         run_show_linearization(args.input)
     } else if args.check {
@@ -2391,6 +2391,7 @@ fn run_json_input_inspection(cli: &Cli) -> CliResult<()> {
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(cli.no_warn);
 
     let file = File::open(input).map_err(|error| {
         if cli.json_input {
@@ -2518,7 +2519,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
     match command {
         Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password, false),
         Commands::CheckLinearization(cmd) => {
-            run_check_linearization(Some(cmd.input), false, &PasswordArgs::default())
+            run_check_linearization(Some(cmd.input), false, &PasswordArgs::default(), false)
         }
         Commands::DumpObject(cmd) => {
             run_dump_object(Some(cmd.input), cmd.repair, &cmd.password, &cmd.object_ref)
@@ -2787,12 +2788,14 @@ fn run_check_linearization(
     input: Option<PathBuf>,
     repair: bool,
     password: &PasswordArgs,
+    no_warn: bool,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     let options = pdf_open_options(repair, password)?;
     let mut pdf = job
         .open(BufReader::new(file), input.display().to_string(), options)
