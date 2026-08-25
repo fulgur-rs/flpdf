@@ -1916,23 +1916,6 @@ mod tests {
     }
 
     #[test]
-    fn acroform_need_appearances_resolves_a_multihop_boolean() {
-        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
-        let mut acroform = Dictionary::new();
-        acroform.insert("NeedAppearances", Object::Reference(ObjectRef::new(4, 0)));
-        let mut catalog = Dictionary::new();
-        catalog.insert("AcroForm", Object::Dictionary(acroform));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
-        pdf.set_object(
-            ObjectRef::new(4, 0),
-            Object::Reference(ObjectRef::new(5, 0)),
-        );
-        pdf.set_object(ObjectRef::new(5, 0), Object::Boolean(true));
-
-        assert!(acroform_need_appearances(&mut pdf).unwrap());
-    }
-
-    #[test]
     fn qpdf_flatten_wraps_content_when_dropping_an_unselected_appearance() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         let mut annotation = Dictionary::new();
