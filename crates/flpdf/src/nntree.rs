@@ -3705,6 +3705,35 @@ mod tests {
     }
 
     #[test]
+    fn promoting_an_already_claimed_root_to_indirect_in_another_pdf_is_rejected() {
+        let root =
+            ObjectHandle::dictionary(vec![(b"/Names".to_vec(), ObjectHandle::array(Vec::new()))]);
+        let mut tree = NameTree::new(root.clone(), false);
+        let mut pdf_one = empty_pdf();
+        let pdf_two = empty_pdf();
+
+        assert!(tree
+            .find_object(&mut pdf_one, b"missing")
+            .expect("pdf_one's operation should claim the contextless root")
+            .is_none());
+
+        // A caller reaching for the raw promotion primitive on the same
+        // handle, targeting a *different* Pdf than the tree already claimed,
+        // must be rejected -- not silently re-owned, which would leave
+        // pdf_one's tree still able to mutate what is now pdf_two's object.
+        let error = pdf_two
+            .make_indirect_from_object_handle(root)
+            .expect_err("promoting a root already claimed by pdf_one must fail for pdf_two");
+        assert!(error.to_string().contains("different Pdf"));
+
+        // pdf_one's tree still works correctly afterward.
+        assert!(tree
+            .find_object(&mut pdf_one, b"missing")
+            .expect("pdf_one's claim survives the rejected foreign promotion")
+            .is_none());
+    }
+
+    #[test]
     fn handle_name_tree_rejects_inserting_a_value_owned_by_another_pdf() {
         let pdf_one = empty_pdf();
         let mut pdf_two = empty_pdf();

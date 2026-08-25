@@ -1222,6 +1222,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "cannot make an already-indirect ObjectHandle indirect".to_string(),
             ));
         }
+        // A contextless direct root already claimed by a name/number tree
+        // wrapper for a different Pdf must not be silently re-owned here:
+        // that wrapper's existing (cached) claim would otherwise go stale,
+        // letting it keep operating on what is now this Pdf's object.
+        handle.claim_tree_pdf(self.pdf_unique_id)?;
 
         let object_ref = self.next_obj_gen()?;
         let promoted =
