@@ -20,6 +20,7 @@ fn flatten_widget_resource_assertions_use_live_handle_accessors() {
         "resolve_borrowed(",
         "Object::",
         "set_object(",
+        "materialize(",
     ] {
         assert!(
             !block.contains(marker),
