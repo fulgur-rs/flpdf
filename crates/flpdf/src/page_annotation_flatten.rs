@@ -2012,104 +2012,160 @@ mod tests {
 
     #[test]
     fn qpdf_document_flatten_covers_widget_resources_and_removal_paths() {
+        let selected_ref = ObjectRef::new(4, 0);
+        let unselected_ref = ObjectRef::new(5, 0);
+        let link_ref = ObjectRef::new(6, 0);
+        let resources_ref = ObjectRef::new(7, 0);
+        let font_ref = ObjectRef::new(8, 0);
+        let acroform_ref = ObjectRef::new(9, 0);
+        let default_resources_ref = ObjectRef::new(10, 0);
+        let appearance_ref = ObjectRef::new(12, 0);
         let mut pdf = Pdf::open(Cursor::new(build_pdf(
             "/Rotate 90 /Annots [4 0 R 5 0 R 6 0 R]",
             &[],
         )))
         .unwrap();
 
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("Font", Object::Reference(ObjectRef::new(8, 0)));
-        let mut appearance = Dictionary::new();
-        appearance.insert(
-            "BBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(100),
-                Object::Integer(20),
+        let font_handle = pdf.get_object_handle(font_ref);
+        pdf.replace_object_handle(
+            resources_ref,
+            ObjectHandle::dictionary(vec![(b"/Font".to_vec(), font_handle)]),
+        )
+        .unwrap();
+        pdf.replace_object_handle(font_ref, ObjectHandle::dictionary(Vec::new()))
+            .unwrap();
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/BBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(100),
+                        ObjectHandle::integer(20),
+                    ]),
+                ),
+                (b"/Resources".to_vec(), pdf.get_object_handle(resources_ref)),
             ]),
+            Rc::new(Vec::new()),
         );
-        appearance.insert("Resources", Object::Reference(ObjectRef::new(7, 0)));
-        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(Dictionary::new()));
-        pdf.set_object(
-            ObjectRef::new(7, 0),
-            Object::Dictionary(appearance_resources),
-        );
-        pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(Dictionary::new()));
-        pdf.set_object(
-            ObjectRef::new(12, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
+        pdf.replace_object_handle(appearance_ref, appearance)
+            .unwrap();
 
-        let mut selected_ap = Dictionary::new();
-        selected_ap.insert("N", Object::Reference(ObjectRef::new(12, 0)));
-        let mut selected = Dictionary::new();
-        selected.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        selected.insert("F", Object::Integer(0x10));
-        selected.insert(
-            "Rect",
-            Object::Array(vec![
-                Object::Integer(10),
-                Object::Integer(20),
-                Object::Integer(110),
-                Object::Integer(40),
+        let appearance_handle = pdf.get_object_handle(appearance_ref);
+        pdf.replace_object_handle(
+            selected_ref,
+            ObjectHandle::dictionary(vec![
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/F".to_vec(), ObjectHandle::integer(0x10)),
+                (
+                    b"/Rect".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(10),
+                        ObjectHandle::integer(20),
+                        ObjectHandle::integer(110),
+                        ObjectHandle::integer(40),
+                    ]),
+                ),
+                (
+                    b"/AP".to_vec(),
+                    ObjectHandle::dictionary(vec![(b"/N".to_vec(), appearance_handle)]),
+                ),
             ]),
-        );
-        selected.insert("AP", Object::Dictionary(selected_ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(selected));
+        )
+        .unwrap();
+        pdf.replace_object_handle(
+            unselected_ref,
+            ObjectHandle::dictionary(vec![
+                (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+                (b"/AP".to_vec(), ObjectHandle::dictionary(Vec::new())),
+            ]),
+        )
+        .unwrap();
+        pdf.replace_object_handle(
+            link_ref,
+            ObjectHandle::dictionary(vec![(
+                b"/Subtype".to_vec(),
+                ObjectHandle::name(b"Link".to_vec()),
+            )]),
+        )
+        .unwrap();
 
-        let mut unselected = Dictionary::new();
-        unselected.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        unselected.insert("AP", Object::Dictionary(Dictionary::new()));
-        pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(unselected));
-        let mut link = Dictionary::new();
-        link.insert("Subtype", Object::Name(b"Link".to_vec()));
-        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(link));
-
-        let mut dr_fonts = Dictionary::new();
-        dr_fonts.insert("Helv", Object::Integer(42));
-        let mut dr = Dictionary::new();
-        dr.insert("Font", Object::Dictionary(dr_fonts));
-        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(dr));
-        let mut acroform = Dictionary::new();
-        acroform.insert(
-            "Fields",
-            Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
-        );
-        acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
-        pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
-        let Object::Dictionary(mut root) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("fixture root must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        root.insert("AcroForm", Object::Reference(ObjectRef::new(9, 0)));
-        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(root));
+        pdf.replace_object_handle(
+            default_resources_ref,
+            ObjectHandle::dictionary(vec![(
+                b"/Font".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Helv".to_vec(), ObjectHandle::integer(42))]),
+            )]),
+        )
+        .unwrap();
+        let selected_handle = pdf.get_object_handle(selected_ref);
+        let default_resources_handle = pdf.get_object_handle(default_resources_ref);
+        pdf.replace_object_handle(
+            acroform_ref,
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Fields".to_vec(),
+                    ObjectHandle::array(vec![selected_handle]),
+                ),
+                (b"/DR".to_vec(), default_resources_handle),
+            ]),
+        )
+        .unwrap();
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).unwrap();
+        let acroform_handle = pdf.get_object_handle(acroform_ref);
+        root.replace_key(b"/AcroForm", acroform_handle).unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(12, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("appearance must retain privatized resources"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
-            panic!("appearance must retain Font resources"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
-        let Object::Dictionary(page) = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(
-            page.get("Annots"),
-            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
-                6, 0
-            ))]))
+        let appearance = pdf.get_object_handle(appearance_ref);
+        pdf.resolve(&appearance).unwrap();
+        let stream_dict = appearance
+            .as_stream_dict()
+            .expect("fixture appearance must remain a stream");
+        let resources = stream_dict
+            .try_get_key(b"/Resources")
+            .expect("appearance must retain resources");
+        assert!(
+            resources.is_direct(),
+            "flattening must privatize /Resources into a direct copy, not keep the shared {resources_ref:?} indirect reference"
         );
-        assert!(page.get("Contents").is_some());
-        let Object::Dictionary(root) = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("fixture root must be a dictionary"); // cov:ignore: fixture invariant
-        };
-        assert!(root.get("AcroForm").is_none());
+        pdf.resolve(&resources).unwrap();
+        let fonts = resources
+            .try_get_key(b"/Font")
+            .expect("appearance must retain Font resources");
+        assert!(
+            fonts.is_direct(),
+            "flattening must privatize /Font into a direct copy, not keep the shared {font_ref:?} indirect reference"
+        );
+        pdf.resolve(&fonts).unwrap();
+        let helv = fonts.try_get_key(b"/Helv").unwrap();
+        pdf.resolve(&helv).unwrap();
+        assert_eq!(helv.as_integer(), Some(42));
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        let annots = page.try_get_key(b"/Annots").unwrap();
+        pdf.resolve(&annots).unwrap();
+        let annots = annots.as_array().expect("retained annotations array");
+        assert_eq!(annots.len(), 1);
+        assert_eq!(annots[0].object_ref(), Some(link_ref));
+        let contents = page.try_get_key(b"/Contents").unwrap();
+        pdf.resolve(&contents).unwrap();
+        assert!(contents.as_array().is_some());
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).unwrap();
+        assert!(
+            !root
+                .as_dictionary()
+                .expect("fixture root must remain a dictionary")
+                .contains_key(b"/AcroForm".as_slice()),
+            "/AcroForm must be removed as a dictionary entry, not merely nulled -- \
+             try_get_key alone cannot distinguish an absent key from a present null \
+             value, matching qpdf's own key/null conflation"
+        );
     }
 
     // -----------------------------------------------------------------------
