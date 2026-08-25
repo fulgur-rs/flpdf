@@ -2,44 +2,74 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Document and test the qpdf-compatible lifetime contract for provider-backed Catalog/trailer streams copied by `merge_documents`, including the existing `set_immediate_copy_from` escape hatch.
+**Goal:** Preserve lazy provider-backed stream behavior through merge reachability cleanup, then document and test the precise source-lifetime contract exposed by `merge_documents`.
 
-**Architecture:** Keep `ForeignObjectCopier`, `ResolverHandle::copy_stream_data`, and the writer unchanged. Add public API documentation at the `MergeInput`/`merge_documents` boundary, correct the stale `copy_foreign_object` rustdoc, and add integration tests that construct a real provider-backed `/Metadata` stream through public APIs.
+**Architecture:** First consume the existing `flpdf-3yn9.39` prerequisite, which moves xref reachability out of the mixed `subset_prune` module into a writer-owned canonical ObjectHandle walker that never materializes stream payloads. Then keep `flpdf-098i` focused on `MergeInput`/`merge_documents` documentation, the stale immediate-copy rustdoc, and public integration coverage. Do not add a merge-local walker or a Catalog/trailer-only eager-copy branch.
 
-**Tech Stack:** Rust 2021, `Pdf`, `MergeInput`, `ObjectHandle` stream providers, `PdfWriter`, pinned qpdf 11.9.0 source, Cargo tests, rustdoc, Clippy, and patch coverage.
+**Tech Stack:** Rust 2021, `ObjectHandle`, `Pdf`, `MergeInput`, writer-owned reachability, stream providers, `PdfWriter`, pinned qpdf 11.9.0 source, Cargo tests, strict rustdoc, Clippy, and patch coverage.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-flpdf-098i-merge-stream-lifetime-design.md`
 
 ## Global constraints
 
 - qpdf 11.9.0 source and observed behavior are authoritative.
+- `flpdf-098i` depends on `flpdf-3yn9.39`; do not implement the same reachability responsibility in both issues.
+- qpdf writer reachability follows handles and visible dictionary/array edges without reading stream bytes.
 - Keep provider-backed streams lazy by default.
 - `Pdf::set_immediate_copy_from(true)` is source-side and must be called before merge/copy.
 - Do not eagerly materialize only Catalog/trailer streams.
-- Do not add resolver, copier, writer, ownership, or error branches.
+- Do not add resolver, copier, writer stream-source, or error branches in `flpdf-098i`.
 - Use only public APIs from `crates/flpdf/tests/page_merge_tests.rs`.
-- Existing page-merge and foreign-copy behavior must remain unchanged.
 
-### Task 1: Add merge-level provider lifetime tests
+### Task 1: Consume the canonical reachability prerequisite
+
+**Files:**
+- Dependency: `flpdf-3yn9.39`
+- Downstream: `crates/flpdf/src/job/page_merge.rs`
+
+- [ ] **Step 1: Verify the prerequisite is available before implementation**
+
+Run:
+
+```bash
+bd show flpdf-3yn9.39
+bd blocked
+```
+
+Expected: `flpdf-3yn9.39` is closed or its writer-owned reachability implementation is available on the branch being stacked. At the current base it is blocked by `flpdf-egzr.3.2.8` and `flpdf-egzr.3.2.6`; do not bypass those blockers or duplicate its work in this issue.
+
+- [ ] **Step 2: After the prerequisite lands, rebase this branch onto its merged/base commit**
+
+Run:
+
+```bash
+git fetch origin
+git rebase origin/main
+cargo test -p flpdf --test page_merge_tests
+```
+
+Expected: the existing page-merge suite passes before adding the new provider tests.
+
+### Task 2: Add merge-level provider lifetime tests after the canonical sweep exists
 
 **Files:**
 - Modify: `crates/flpdf/tests/page_merge_tests.rs` imports and test helpers
 - Test: `crates/flpdf/tests/page_merge_tests.rs`
 
-- [ ] **Step 1: Add public test helpers and the failing/behavior-locking tests before documentation edits**
+- [ ] **Step 1: Add public test helpers and tests first**
 
 Add these imports:
 
 ```rust
 use flpdf::{
-    merge_documents, pages, Error, MergeInput, Object, ObjectHandle, ObjectRef, Pdf, PdfWriter,
-    Pipeline,
+    merge_documents, pages, Error, MergeInput, Object, ObjectRef, Pdf, PdfWriter,
 };
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 ```
 
-Add a helper that opens the existing one-page fixture, installs an indirect provider-backed stream on the primary Catalog, and returns the provider call counter:
+Add a helper that opens the existing page fixture, installs an indirect provider-backed stream on the primary Catalog, and returns the provider call counter:
 
 ```rust
 const PROVIDER_METADATA: &[u8] = b"provider-backed catalog metadata";
@@ -89,7 +119,7 @@ fn metadata_payload(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<u8> {
 }
 ```
 
-Add three integration tests immediately after the existing primary Catalog/trailer metadata test:
+Add three tests:
 
 ```rust
 #[test]
@@ -155,32 +185,32 @@ fn merge_provider_catalog_stream_with_immediate_copy_survives_source_drop() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests before changing production documentation**
+- [ ] **Step 2: Run the focused tests and verify the expected red state**
 
 Run:
 
 ```bash
-cargo test -p flpdf --test page_merge_tests merge_provider_catalog_stream -- --exact --nocapture
+cargo test -p flpdf --test page_merge_tests merge_provider_catalog_stream -- --nocapture
 ```
 
-Expected: the three tests compile and pass on the existing canonical copier. This confirms that the requested behavior is already implemented and that this slice needs no production behavior change. If a test fails, fix only the test setup until it exercises the intended public boundary; do not weaken the assertions.
+Expected before `flpdf-3yn9.39`: the default-lazy and retained-source tests fail because the old `subset_prune` sweep invokes the provider during merge; the immediate-copy test passes. The failure must identify `page_merge.rs:1122` -> `subset_prune.rs:166`/`:229` -> `materialize`. After rebasing onto the prerequisite, rerun the same command and expect all three tests to pass.
 
-- [ ] **Step 3: Commit the test-only behavior coverage**
+- [ ] **Step 3: Commit the merge tests after the prerequisite-backed green run**
 
 ```bash
 git add crates/flpdf/tests/page_merge_tests.rs
 git commit -m "test: cover merge provider stream lifetime contract"
 ```
 
-### Task 2: Document the public lifetime contract and correct stale rustdoc
+### Task 3: Document the precise contract
 
 **Files:**
 - Modify: `crates/flpdf/src/job/page_merge.rs:50-57,630-649`
 - Modify: `crates/flpdf/src/reader.rs:1478-1487`
 
-- [ ] **Step 1: Document the precise provider-only source rule on `MergeInput` and `merge_documents`**
+- [ ] **Step 1: Document the provider-only source rule on `MergeInput`**
 
-Extend the `MergeInput::source` documentation with:
+Add to `MergeInput::source`:
 
 ```rust
 /// A provider-backed stream copied from this source is read lazily. Keep this
@@ -191,7 +221,9 @@ Extend the `MergeInput::source` documentation with:
 /// this `Pdf` lifetime.
 ```
 
-Add the same rule to the `merge_documents` rustdoc after the paragraph describing the persistent foreign-copy route, including qpdf citations:
+- [ ] **Step 2: Document merge reachability and source lifetime**
+
+Add after the persistent foreign-copy paragraph in `merge_documents`:
 
 ```rust
 /// Provider-backed streams reachable from selected pages or primary
@@ -206,17 +238,9 @@ Add the same rule to the `merge_documents` rustdoc after the paragraph describin
 /// streams capture their input independently.
 ```
 
-- [ ] **Step 2: Correct `copy_foreign_object`'s stale immediate-copy statement**
+- [ ] **Step 3: Correct `copy_foreign_object`'s stale immediate-copy statement**
 
-Replace the final sentence at `reader.rs:1485-1487`:
-
-```rust
-/// source. qpdf's escape hatch, `setImmediateCopyFrom` (materializing
-/// provider-backed stream data into memory at copy time so the source
-/// need not survive), has no flpdf counterpart yet.
-```
-
-with:
+Replace the stale final sentence at `reader.rs:1485-1487` with:
 
 ```rust
 /// source. flpdf exposes qpdf's source-side escape hatch as
@@ -225,33 +249,29 @@ with:
 /// not survive the copy.
 ```
 
-- [ ] **Step 3: Run rustfmt and the focused tests**
-
-Run:
+- [ ] **Step 4: Run focused formatting, docs, and tests**
 
 ```bash
 cargo fmt --all -- --check
-cargo test -p flpdf --test page_merge_tests merge_provider_catalog_stream -- --exact --nocapture
+cargo test -p flpdf --test page_merge_tests merge_provider_catalog_stream -- --nocapture
 cargo test -p flpdf --test page_merge_tests
 ```
 
-Expected: formatting exits 0; all three new tests pass; all existing page-merge tests pass with 0 failures.
+Expected: all three provider tests and all page-merge tests pass with zero failures.
 
-- [ ] **Step 4: Commit the documentation update**
+- [ ] **Step 5: Commit the documentation update**
 
 ```bash
 git add crates/flpdf/src/job/page_merge.rs crates/flpdf/src/reader.rs
 git commit -m "docs: state merge provider stream lifetime"
 ```
 
-### Task 3: Run implementation verification and review gates
+### Task 4: Run implementation verification and review gates
 
 **Files:**
 - No additional files.
 
-- [ ] **Step 1: Run the core quality gates**
-
-Run:
+- [ ] **Step 1: Run core quality gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -261,31 +281,27 @@ cargo test -p flpdf
 cargo test --workspace
 ```
 
-Expected: every command exits 0; tests report 0 failures; rustdoc emits no broken or private-link errors; Clippy emits no warnings.
+Expected: every command exits 0; tests report 0 failures; rustdoc emits no broken/private-link errors; Clippy emits no warnings.
 
-- [ ] **Step 2: Run qpdf/documentation checks**
-
-Run:
+- [ ] **Step 2: Run qpdf and marker checks**
 
 ```bash
 scripts/qpdf-stream-data-provider-probe.sh
 python3 scripts/check-qpdf-deviation-markers.py --check
 ```
 
-Expected: the provider probe prints `qpdf stream data provider probe: ok`; deviation-marker validation exits 0.
+Expected: the provider probe prints `qpdf stream data provider probe: ok`; marker validation exits 0.
 
-- [ ] **Step 3: Inspect the final diff and status**
-
-Run:
+- [ ] **Step 3: Inspect the final diff**
 
 ```bash
-git diff --check HEAD~2..HEAD
-git diff --stat HEAD~2..HEAD
+git diff --check origin/main...HEAD
+git diff --stat origin/main...HEAD
 git status --short
 ```
 
-Expected: only the design/plan commits and the intended three source/test files are present; no generated files or unrelated changes appear.
+Expected: only the approved design/plan documents, the canonical prerequisite integration, the merge docs, and the merge tests are present. No generated files or merge-local reachability duplicate appears.
 
 - [ ] **Step 4: Request code review before handoff**
 
-Provide the reviewer the two implementation commits, the qpdf contract, the spec, and the verification output. Resolve any Critical or Important findings before handoff.
+Provide the reviewer the qpdf citations, the design/plan files, the prerequisite relationship, the red-state backtrace, and the final verification output. Resolve every Critical or Important finding before handoff.
