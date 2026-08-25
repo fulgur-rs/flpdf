@@ -2490,7 +2490,7 @@ impl LinearizationPlan {
     /// Generate mode: reproduce qpdf's linearized `generateObjectStreams`.
     ///
     /// A GLOBAL even split over the compressible set
-    /// ([`objstm_membership_linearized`]), with the page dictionaries + root
+    /// ([`objstm_membership_linearized_with_eligibility`]), with the page dictionaries + root
     /// Catalog erased, then each container routed to a linearization part by the
     /// union of its members' page users ([`route_objstm_containers`]). Containers
     /// routed to part 6 ([`ContainerPart::FirstPagePrivate`],
