@@ -29,8 +29,6 @@ use crate::page_object_helper::PageObjectHelper;
 use crate::page_object_helper::{
     resolve_inherited_rotate, resolve_inherited_rotate_with_max_depth,
 };
-#[cfg(test)]
-use crate::Object;
 use crate::{Error, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -351,13 +349,14 @@ mod tests {
     fn resolve_defaults_to_zero_for_a_parent_cycle() {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let mut parent = pdf
-            .resolve_object(ObjectRef::new(2, 0))
-            .unwrap()
-            .into_dict()
-            .expect("parent must be a dictionary");
-        parent.insert("Parent", Object::Reference(ObjectRef::new(3, 0)));
-        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(parent));
+        let parent = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve(&parent).unwrap();
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        parent
+            .replace_key(b"/Parent", page)
+            .expect("parent must be mutable");
+        pdf.mark_object_handle_dirty(&parent)
+            .expect("parent mutation must be dirty");
 
         assert_eq!(
             resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
@@ -369,13 +368,12 @@ mod tests {
     fn resolve_defaults_to_zero_for_a_non_dictionary_parent() {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let mut page = pdf
-            .resolve_object(ObjectRef::new(3, 0))
-            .unwrap()
-            .into_dict()
-            .expect("page must be a dictionary");
-        page.insert("Parent", Object::Integer(42));
-        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Parent", ObjectHandle::integer(42))
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
 
         assert_eq!(
             resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
@@ -398,15 +396,14 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
-        let mut page = pdf
-            .resolve_object(page_ref)
-            .unwrap()
-            .into_dict()
-            .expect("page must be a dictionary");
-        let mut parent = crate::Dictionary::new();
-        parent.insert("Rotate", Object::Integer(90));
-        page.insert("Parent", Object::Dictionary(parent));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let parent =
+            ObjectHandle::dictionary(vec![(b"/Rotate".to_vec(), ObjectHandle::integer(90))]);
+        page.replace_key(b"/Parent", parent)
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
 
         let error = resolve_inherited_rotate_with_max_depth(&mut pdf, page_ref, 1).unwrap_err();
         assert!(matches!(
@@ -422,13 +419,12 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
-        let mut page = pdf
-            .resolve_object(page_ref)
-            .unwrap()
-            .into_dict()
-            .expect("page must be a dictionary");
-        page.insert("Rotate", Object::Name(b"Bad".to_vec()));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Rotate", ObjectHandle::name(b"Bad".to_vec()))
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
 
         let error = resolve_inherited_rotate(&mut pdf, page_ref).unwrap_err();
         assert!(matches!(
@@ -536,13 +532,12 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
-        let mut page = pdf
-            .resolve_object(page_ref)
-            .unwrap()
-            .into_dict()
-            .expect("page must be a dictionary");
-        page.insert("Rotate", Object::Integer(2_147_483_700));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Rotate", ObjectHandle::integer(2_147_483_700))
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
 
         let op = RotateOp {
             mode: RotateMode::Add,
@@ -564,13 +559,12 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
-        let mut page = pdf
-            .resolve_object(page_ref)
-            .unwrap()
-            .into_dict()
-            .expect("page must be a dictionary");
-        page.insert("Rotate", Object::Integer(-2_147_483_700));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Rotate", ObjectHandle::integer(-2_147_483_700))
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
 
         let op = RotateOp {
             mode: RotateMode::Add,
@@ -592,13 +586,12 @@ mod tests {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
-        let mut page = pdf
-            .resolve_object(page_ref)
-            .unwrap()
-            .into_dict()
-            .expect("page must be a dictionary");
-        page.insert("Rotate", Object::Integer(9_223_372_036_854_775_800));
-        pdf.set_object(page_ref, Object::Dictionary(page));
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Rotate", ObjectHandle::integer(9_223_372_036_854_775_800))
+            .expect("page must be mutable");
+        pdf.mark_object_handle_dirty(&page)
+            .expect("page mutation must be dirty");
 
         let op = RotateOp {
             mode: RotateMode::Add,
