@@ -952,7 +952,10 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     if let Err(error) = result {
         return write_error(stdout, stderr, &error.to_string());
     }
-    if writeln!(stdout, "test {n} done").is_err() {
+    // qpdf's test_4 exits immediately after writing its QDF output so the
+    // ordinary driver footer is not appended to the binary comparison stream
+    // (`qpdf/test_driver.cc:368-372`).
+    if n != 4 && writeln!(stdout, "test {n} done").is_err() {
         return 2;
     }
     0

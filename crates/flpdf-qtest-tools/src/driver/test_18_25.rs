@@ -276,10 +276,10 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     // input"), so this reproduces the qpdf source's own key text exactly
     // rather than "fixing" it to "/Array1"/"/Array2". Per this file's
     // module doc, neither entry ever reaches a `PdfWriter` in this port
-    // regardless (the `makeDirect` gap below stops this test before qpdf's
+    // regardless (the `replaceReserved`/writer gap below stops this test before qpdf's
     // own `QPDFWriter` call) -- unlike `run_test_20`/`run_test_25`'s
     // trailer mutations, this pair is genuinely inert either way, but is
-    // translated here because it precedes the gap.
+    // translated here because it precedes the remaining replacement gap.
     trailer.replace_key(b"Array1", res1.clone())?;
     trailer.replace_key(b"Array2", res2.clone())?;
 
@@ -335,24 +335,16 @@ pub(crate) fn run_test_24<R: Read + Seek>(
         Err(error) => writeln!(stdout, "logic error: {error}")?,
     }
 
-    // GAP(QPDFObjectHandle::makeDirect): qpdf recursively flattens indirect
-    // references into a direct value tree
-    // (`libqpdf/QPDFObjectHandle.cc:2091-2131`), throwing
-    // `std::logic_error("QPDFObjectHandle: attempting to make a reserved
-    // object handle direct")` for a still-reserved handle. flpdf has no
-    // equivalent primitive (confirmed by grepping every `fn make_direct`/
-    // `fn to_direct` in `crates/flpdf/src/*.rs`: no hit). Per the port's
-    // stop-at-gap rule, nothing past this point in qpdf's test_24 is
-    // translated here: the `res2.makeDirect()` try/catch's own print,
-    // `pdf.replaceReserved(res2, array2)`, `res2.assertArray()`, the
-    // circular `i1`/`i2` resolution check (the actual point of this test --
-    // confirming that a reserved object embedded as another's array item
-    // resolves lazily once it too is replaced), and the final `QPDFWriter`
-    // write are all unimplemented below this comment. `array2` above is
-    // real, faithfully-translated qpdf source that precedes this gap (its
-    // construction has real, observable side effects on `res1`'s would-be
-    // owners via `append_array_item`'s ownership checks); it simply has no
-    // remaining consumer once `replaceReserved(res2, array2)` is cut.
+    // GAP(QPDF::replaceReserved): `ObjectHandle::make_direct` now ports the
+    // recursive conversion and reserved-handle error above
+    // (`libqpdf/QPDFObjectHandle.cc:2091-2131`). The remaining qpdf sequence
+    // after `res2.makeDirect()` needs the document-owned
+    // `replaceReserved(res2, array2)` transition and its writer-visible
+    // reserved-slot identity. Per the port's stop-at-gap rule, the
+    // `res2.makeDirect()` try/catch's own print, `res2.assertArray()`, the
+    // circular `i1`/`i2` resolution check, and the final `QPDFWriter` write
+    // remain outside this helper slice. `array2` above is real,
+    // faithfully-translated qpdf source that precedes the replacement gap.
     Ok(())
 }
 

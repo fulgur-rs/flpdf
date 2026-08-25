@@ -3644,6 +3644,124 @@ impl ObjectHandle {
         })
     }
 
+    /// Convert this handle to a direct copy of its reachable object graph,
+    /// mirroring qpdf's `QPDFObjectHandle::makeDirect`
+    /// (`libqpdf/QPDFObjectHandle.cc:2091-2133,2154-2157`). The receiver is
+    /// rebound to the new handle; aliases retained before this call continue
+    /// to observe the original object, just as qpdf's assignment to the
+    /// receiver's `shared_ptr<QPDFObject>` does.
+    ///
+    /// Arrays and dictionaries are copied recursively through every indirect
+    /// boundary. Each occurrence is copied independently, so two references
+    /// that used to identify the same indirect object no longer alias in the
+    /// resulting direct graph. A per-call identity set detects an indirect
+    /// cycle while it is being traversed.
+    ///
+    /// When `allow_streams` is true, stream handles are retained as-is and
+    /// are not converted to direct values. When it is false, encountering a
+    /// stream returns qpdf's exact runtime-error text.
+    pub fn make_direct(&mut self, allow_streams: bool) -> Result<()> {
+        #[allow(
+            clippy::mutable_key_type,
+            reason = "identity key compares only Rc pointer identity and retains the slot deliberately"
+        )]
+        let mut visited = std::collections::HashSet::new();
+        let replacement =
+            stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+                self.make_direct_copy(&mut visited, allow_streams)
+            })?;
+        *self = replacement;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "identity key compares only Rc pointer identity and retains the slot deliberately"
+    )]
+    fn make_direct_copy(
+        &self,
+        visited: &mut std::collections::HashSet<ObjectHandleIdentity>,
+        allow_streams: bool,
+    ) -> Result<Self> {
+        self.try_dereference()?;
+        let identity = self.identity_key();
+        if !visited.insert(identity.clone()) {
+            return Err(Error::System(
+                "loop detected while converting object from indirect to direct".to_owned(),
+            ));
+        }
+
+        let result = self.make_direct_copy_value(visited, allow_streams);
+        visited.remove(&identity);
+        result
+    }
+
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "identity key compares only Rc pointer identity and retains the slot deliberately"
+    )]
+    fn make_direct_copy_value(
+        &self,
+        visited: &mut std::collections::HashSet<ObjectHandleIdentity>,
+        allow_streams: bool,
+    ) -> Result<Self> {
+        // Snapshot the value before descending. Resolving a child may re-enter
+        // the same document resolver, so no RefCell borrow may span the
+        // recursive call.
+        let value = self
+            .with_value(|value| value.cloned())
+            .expect("resolved ObjectHandle always exposes its value");
+
+        match value {
+            ObjectValue::Boolean(_)
+            | ObjectValue::Integer(_)
+            | ObjectValue::Name(_)
+            | ObjectValue::Null
+            | ObjectValue::Real(_)
+            | ObjectValue::RealLiteral { .. }
+            | ObjectValue::String(_) => Ok(Self::from_value(value)),
+            ObjectValue::Array(items) => {
+                let mut copied = Vec::with_capacity(items.len());
+                for item in items {
+                    copied.push(item.make_direct_copy(visited, allow_streams)?);
+                }
+                Ok(Self::new_direct(
+                    ObjectValue::Array(copied),
+                    NO_PARSED_OFFSET,
+                ))
+            }
+            ObjectValue::Dictionary(entries) => {
+                let mut copied = std::collections::BTreeMap::new();
+                for (key, item) in entries {
+                    copied.insert(key, item.make_direct_copy(visited, allow_streams)?);
+                }
+                Ok(Self::new_direct(
+                    ObjectValue::Dictionary(copied),
+                    NO_PARSED_OFFSET,
+                ))
+            }
+            ObjectValue::Stream { .. } => {
+                if allow_streams {
+                    Ok(self.clone())
+                } else {
+                    Err(Error::System(
+                        "attempt to make a stream into a direct object".to_owned(),
+                    ))
+                }
+            }
+            ObjectValue::Reserved => Err(Error::System(
+                "QPDFObjectHandle: attempting to make a reserved object handle direct".to_owned(),
+            )),
+            ObjectValue::Unresolved
+            | ObjectValue::Destroyed
+            | ObjectValue::Operator(_)
+            | ObjectValue::InlineImage(_)
+            | ObjectValue::Reference(_) => Err(Error::System(
+                "QPDFObjectHandle::makeDirectInternal: unknown object type".to_owned(),
+            )),
+        }
+    }
+
     /// Create a new stream in this handle's owning document, copying its
     /// dictionary across indirect boundaries and retaining its data through
     /// qpdf's buffer/provider source boundary. This is
@@ -13051,6 +13169,125 @@ mod unparse_object_tests {
 #[cfg(test)]
 mod mutation_tests {
     use super::*;
+
+    #[test]
+    fn make_direct_rebinds_only_the_receiver_and_isolates_repeated_indirect_children() {
+        let shared_array = ObjectHandle::new_indirect_unresolved(ObjectRef::new(11, 0), -1);
+        shared_array.set_resolved(ObjectValue::Array(vec![
+            ObjectHandle::integer(1),
+            ObjectHandle::integer(2),
+            ObjectHandle::integer(3),
+        ]));
+        let original = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), shared_array.clone()),
+            (
+                b"B".to_vec(),
+                ObjectHandle::dictionary(vec![(b"A".to_vec(), shared_array.clone())]),
+            ),
+        ]);
+        let original_alias = original.clone();
+        let mut direct = original;
+
+        direct.make_direct(false).expect("direct conversion");
+
+        assert!(original_alias.as_dictionary().is_some());
+        assert!(original_alias.get_key(b"/A").is_indirect());
+        let first = direct.get_key(b"/A");
+        let second = direct.get_key(b"/B").get_key(b"/A");
+        assert!(first.is_direct());
+        assert!(second.is_direct());
+        assert!(!first.is_same_object_as(&second));
+
+        first
+            .set_array_item(1, ObjectHandle::integer(5))
+            .expect("mutate first copied array");
+        assert_eq!(
+            first.try_array_item(1).unwrap().unwrap().as_integer(),
+            Some(5)
+        );
+        assert_eq!(
+            second.try_array_item(1).unwrap().unwrap().as_integer(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn make_direct_stops_at_streams_only_when_allowed() {
+        let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(12, 0), -1);
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: Some(Rc::new(b"salad".to_vec())),
+            stream_provider: None,
+            stream_length: 0,
+        });
+        let original = ObjectHandle::dictionary(vec![(b"Stream".to_vec(), stream.clone())]);
+
+        let mut rejects_stream = original.clone();
+        let error = rejects_stream
+            .make_direct(false)
+            .expect_err("makeDirect must reject a stream without allow_streams");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "attempt to make a stream into a direct object"
+        ));
+        assert!(rejects_stream.get_key(b"/Stream").is_indirect());
+
+        let mut stops_at_stream = original;
+        stops_at_stream
+            .make_direct(true)
+            .expect("allow_streams must preserve the stream reference");
+        assert!(stops_at_stream.get_key(b"/Stream").is_indirect());
+        assert!(stops_at_stream
+            .get_key(b"/Stream")
+            .is_same_object_as(&stream));
+    }
+
+    #[test]
+    fn make_direct_reports_an_indirect_cycle_without_rebinding_the_receiver() {
+        let first = ObjectHandle::new_indirect_unresolved(ObjectRef::new(8, 0), -1);
+        let second = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        first.set_resolved(ObjectValue::Dictionary(
+            [(b"/A".to_vec(), second.clone())].into_iter().collect(),
+        ));
+        second.set_resolved(ObjectValue::Array(vec![first.clone()]));
+        let alias = first.clone();
+        let mut candidate = first;
+
+        let error = candidate
+            .make_direct(false)
+            .expect_err("recursive indirect graph must be rejected");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "loop detected while converting object from indirect to direct"
+        ));
+        assert!(candidate.is_indirect());
+        assert!(candidate.is_same_object_as(&alias));
+    }
+
+    #[test]
+    fn make_direct_rejects_reserved_and_non_pdf_object_values() {
+        let mut reserved = ObjectHandle::new_reserved_direct();
+        let reserved_error = reserved
+            .make_direct(false)
+            .expect_err("reserved handles cannot become direct values");
+        assert!(matches!(
+            reserved_error,
+            Error::System(message)
+                if message == "QPDFObjectHandle: attempting to make a reserved object handle direct"
+        ));
+
+        let mut operator = ObjectHandle::operator(b"q".to_vec());
+        let operator_error = operator
+            .make_direct(false)
+            .expect_err("content operators are not PDF object values");
+        assert!(matches!(
+            operator_error,
+            Error::System(message)
+                if message == "QPDFObjectHandle::makeDirectInternal: unknown object type"
+        ));
+    }
 
     struct SourcePipeResolver {
         value: ObjectValue,

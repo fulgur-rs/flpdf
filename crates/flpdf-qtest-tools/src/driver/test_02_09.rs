@@ -141,26 +141,64 @@ pub(crate) fn run_test_3<R: Read + Seek>(
 
 /// qpdf source: `qpdf/test_driver.cc:324-372` (`test_4`).
 ///
-/// GAP(`QPDFObjectHandle::makeDirect`): qpdf recursively converts `/QTest`'s
-/// whole object graph from indirect to direct references in place, cycle
-/// -checked via a visited set (`libqpdf/QPDFObjectHandle.cc:2091-2160`).
-/// Every remaining statement in this test -- the array/string mutations, the
-/// conditional `/QTest2` `makeDirect(true)`, the copy into `/Info`, and the
-/// QDF-mode static-ID write -- operates on the now-direct graph that call
-/// produces, so all of it depends on the missing primitive. flpdf has no
-/// `make_direct`/`makeDirect` equivalent on `ObjectHandle` (confirmed: no
-/// `pub fn` on `ObjectHandle` matching `*direct*` besides the read-only
-/// `is_direct`/`is_indirect`). `makeDirect()` itself produces no observable
-/// output, so there is no real, already-produced output to keep here.
+/// `ObjectHandle::make_direct` is the canonical port of qpdf's recursive
+/// `QPDFObjectHandle::makeDirect` (`libqpdf/QPDFObjectHandle.cc:2091-2160`).
+/// The driver owns only qpdf's call order and writer configuration; graph
+/// copying, cycle detection, stream stopping, and indirect promotion remain
+/// in the core ObjectHandle/Pdf APIs.
 pub(crate) fn run_test_4<R: Read + Seek>(
-    _pdf: &mut Pdf<R>,
+    pdf: &mut Pdf<R>,
     _filename: &[u8],
     _arg2: Option<&std::ffi::OsStr>,
-    _stdout: &mut dyn Write,
+    stdout: &mut dyn Write,
     _stderr: &mut dyn Write,
     _diagnostics_written: &mut usize,
 ) -> flpdf::Result<()> {
-    // GAP(QPDFObjectHandle::makeDirect): see this function's own doc above.
+    let trailer = pdf.trailer();
+    let mut qtest = trailer.get_key(b"/QTest");
+    qtest.make_direct(false)?;
+    qtest.remove_key(b"/Subject");
+    qtest.replace_key(
+        b"/Author",
+        ObjectHandle::string(b"Mr. Potato Head".to_vec()),
+    )?;
+
+    let array = qtest.get_key(b"/A");
+    if array
+        .as_array()
+        .and_then(|items| items.into_iter().next())
+        .is_some_and(|item| item.as_integer() == Some(1))
+    {
+        array.set_array_item(1, ObjectHandle::integer(5))?;
+        array.insert_array_item(2, ObjectHandle::integer(10))?;
+        array.append_array_item(ObjectHandle::integer(12))?;
+        array.erase_array_item(3)?;
+        array.insert_array_item(4, ObjectHandle::integer(6))?;
+        array.insert_array_item(0, ObjectHandle::integer(9))?;
+    } else {
+        array.set_array_items(vec![
+            ObjectHandle::integer(14),
+            ObjectHandle::integer(15),
+            ObjectHandle::integer(9),
+        ])?;
+    }
+
+    let mut qtest2 = trailer.get_key(b"/QTest2");
+    if !qtest2.is_null() {
+        qtest2.make_direct(true)?;
+        trailer.replace_key(b"/QTest2", qtest2)?;
+    }
+
+    let info = pdf.make_indirect_from_object_handle(qtest)?;
+    trailer.replace_key(b"/Info", info.clone())?;
+    pdf.mark_object_handle_dirty(&info)?;
+
+    let mut writer = PdfWriter::new(pdf);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    write_bytes(stdout, &writer.get_buffer()?)?;
     Ok(())
 }
 
