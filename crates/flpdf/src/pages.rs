@@ -1326,6 +1326,41 @@ mod tests {
     // PageWalk tests
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn page_walk_propagates_a_node_read_failure() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let fail = Rc::new(Cell::new(false));
+        let reader = ToggleReadFailure {
+            cursor: Cursor::new(bytes),
+            fail: Rc::clone(&fail),
+        };
+        let mut pdf = Pdf::open(reader).expect("PDF should parse");
+        let mut walk = PageWalk::new(&mut pdf).expect("catalog should be readable");
+        fail.set(true);
+
+        let error = walk
+            .next()
+            .expect("node read must produce an item")
+            .expect_err("node read failure must propagate");
+        assert!(
+            error
+                .to_string()
+                .contains("boundary parent read unexpectedly"),
+            "expected underlying node read failure, got {error}"
+        );
+        assert!(
+            walk.next().is_none(),
+            "PageWalk must be fused after an error"
+        );
+    }
+
     /// Build a minimal valid PDF from a list of (object_number, body_literal) pairs.
     /// `catalog_ref` is the object number of the /Catalog object.
     fn pdf_from_objects(catalog_ref: u32, objects: &[(u32, &str)]) -> Vec<u8> {
