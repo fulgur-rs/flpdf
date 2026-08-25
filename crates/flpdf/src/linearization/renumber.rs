@@ -229,6 +229,12 @@ impl RenumberMap {
         // Promotion targets (pages tree, info, catalog) must come from
         // part4_rest to avoid double-counting with part7/part8 objects.
         let part4_rest_membership: BTreeSet<ObjectRef> = plan.part4_rest.iter().copied().collect();
+        let part9_pages: BTreeSet<ObjectRef> = plan
+            .optimization
+            .as_ref()
+            .map(|optimization| optimization.objects_for_root_key(b"Pages"))
+            .filter(|pages| !pages.is_empty())
+            .unwrap_or_else(|| plan.pages_tree_ref.into_iter().collect());
         let promote = |slot_owner: Option<ObjectRef>,
                        by_new_number: &mut Vec<ObjectRef>,
                        by_original: &mut BTreeMap<ObjectRef, ObjectRef>| {
@@ -265,15 +271,19 @@ impl RenumberMap {
             push_real(original, &mut by_new_number, &mut by_original);
         }
 
-        // 3. pages_tree — the sole "part9 head" promotion from part4_rest.
-        // qpdf places the pages tree first in part9 (QPDF_linearization.cc:1286),
-        // ahead of the remaining lc_other set regardless of object number.
+        // 3. pages_tree — the part9 head promotion from part4_rest. qpdf's
+        // root /Pages user includes nested Pages nodes; every member that
+        // remains in lc_other is placed first in ascending QPDFObjGen order
+        // (QPDF_linearization.cc:1286-1315), ahead of the remaining lc_other
+        // set regardless of object number.
         // /Info is NOT promoted here: qpdf treats it as an ordinary member of the
         // number-sorted remaining lc_other set (QPDF_linearization.cc:1335,
         // `for (auto const& og: lc_other)` over a std::set<QPDFObjGen>), so it flows
         // through the part4_rest loop below (step 3c) in original-object-number
         // order — behind any lc_other sibling with a lower object number.
-        promote(plan.pages_tree_ref, &mut by_new_number, &mut by_original);
+        for pages_tree in part9_pages {
+            promote(Some(pages_tree), &mut by_new_number, &mut by_original);
+        }
 
         // 3b. part9 outline objects (classic, !UseOutlines).
         // qpdf places lc_outlines after the pages tree / thumbnails and before the
