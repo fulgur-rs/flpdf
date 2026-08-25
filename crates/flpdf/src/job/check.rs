@@ -66,6 +66,40 @@ impl ObjectHandleParserCallbacks for DiscardContents {
 }
 
 impl QPDFJob {
+    /// Run qpdf's standalone linearization inspection on the already-open
+    /// document and complete the shared warning/status boundary.
+    ///
+    /// This is the QPDFJob::doInspection branch for
+    /// --check-linearization (libqpdf/QPDFJob.cc:1646-1674). qpdf first
+    /// asks QPDF::isLinearized, then calls QPDF::checkLinearization on the
+    /// same document. Linearization damage is accumulated as a warning by the
+    /// document checker; it is not a CLI exception or a second file open.
+    pub fn check_linearization<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<JobExitCode> {
+        let logger = self.logger();
+        let input_name = self.input_name().to_owned();
+        pdf.set_logger(logger.clone());
+
+        if !pdf.is_linearized()? {
+            logger.info(format!("{input_name} is not linearized\n"))?;
+            self.record_document_warnings(pdf);
+            return self.complete(false);
+        }
+
+        let linearization_warnings =
+            emit_linearization_check_for_document(pdf, &logger, &input_name)?;
+
+        if linearization_warnings {
+            self.record_warnings();
+        } else {
+            logger.info(format!("{input_name}: no linearization errors\n"))?;
+        }
+        self.record_document_warnings(pdf);
+        self.complete(false)
+    }
+
     /// Replay qpdf repair diagnostics retained by a failed permissive open.
     ///
     /// `QPDF::processFile` emits these warnings before returning its terminal
@@ -164,58 +198,7 @@ fn check_document<R: Read + Seek + 'static>(
     };
     if linearized {
         logger.info("File is linearized\n")?;
-        let source_bytes = match pdf.source_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                warnings = true;
-                let message =
-                    format!("error encountered while checking linearization data: {error}");
-                emit_warning(logger, input_name, message)?;
-                Vec::new()
-            }
-        };
-        if !source_bytes.is_empty() {
-            match check_linearization_parameters(pdf) {
-                Ok(LinearizationParameterCheck::Clean) => {
-                    warnings |= emit_linearization_check_warnings(
-                        pdf,
-                        &source_bytes,
-                        logger,
-                        input_name,
-                        false,
-                    )?; // cov:ignore: shared logger failure propagation is covered by logger sink tests
-                }
-                Ok(LinearizationParameterCheck::Warning(message)) => {
-                    warnings = true;
-                    emit_warning(logger, input_name, message)?;
-                    warnings |= emit_linearization_check_warnings(
-                        pdf,
-                        &source_bytes,
-                        logger,
-                        input_name,
-                        true,
-                    )?; // cov:ignore: shared logger failure propagation is covered by logger sink tests
-                }
-                Ok(LinearizationParameterCheck::Error(message)) => {
-                    warnings = true;
-                    let message = format!(
-                        "error encountered while checking linearization data: {}",
-                        linearization_parameter_error_message(
-                            input_name,
-                            message,
-                            linearization_parameter_offset(pdf, message)?
-                        )
-                    );
-                    emit_warning(logger, input_name, message)?;
-                }
-                Err(error) => {
-                    warnings = true;
-                    let message =
-                        format!("error encountered while checking linearization data: {error}");
-                    emit_warning(logger, input_name, message)?;
-                }
-            }
-        }
+        warnings |= emit_linearization_check_for_document(pdf, logger, input_name)?;
     } else {
         logger.info("File is not linearized\n")?;
     }
@@ -307,6 +290,68 @@ fn linearization_parameter_offset<R: Read + Seek + 'static>(
         } // cov:ignore: candidate is guaranteed for a linearization parameter error
     }
     Ok(pdf.source_last_offset())
+}
+
+/// Run qpdf's linearization-data loading and warning-producing check once for
+/// either the generic document check or standalone --check-linearization.
+///
+/// The parameter preflight is required before the deep checker: qpdf's
+/// readLinearizationData accepts an integer /O without dereferencing the
+/// referenced object, so a mismatching /O is a soft warning even when the
+/// referenced object is not a Page.
+fn emit_linearization_check_for_document<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    logger: &QPDFLogger,
+    input_name: &str,
+) -> Result<bool> {
+    let mut warnings = false;
+    let source_bytes = match pdf.source_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warnings = true;
+            let message = format!("error encountered while checking linearization data: {error}");
+            emit_warning(logger, input_name, message)?;
+            Vec::new()
+        }
+    };
+
+    if source_bytes.is_empty() {
+        return Ok(warnings);
+    }
+
+    match check_linearization_parameters(pdf) {
+        Ok(LinearizationParameterCheck::Clean) => {
+            warnings |=
+                emit_linearization_check_warnings(pdf, &source_bytes, logger, input_name, false)?;
+            // cov:ignore: shared logger failure propagation is covered by logger sink tests
+        }
+        Ok(LinearizationParameterCheck::Warning(message)) => {
+            warnings = true;
+            emit_warning(logger, input_name, message)?;
+            warnings |=
+                emit_linearization_check_warnings(pdf, &source_bytes, logger, input_name, true)?;
+            // cov:ignore: shared logger failure propagation is covered by logger sink tests
+        }
+        Ok(LinearizationParameterCheck::Error(message)) => {
+            warnings = true;
+            let message = format!(
+                "error encountered while checking linearization data: {}",
+                linearization_parameter_error_message(
+                    input_name,
+                    message,
+                    linearization_parameter_offset(pdf, message)?,
+                )
+            );
+            emit_warning(logger, input_name, message)?;
+        }
+        Err(error) => {
+            warnings = true;
+            let message = format!("error encountered while checking linearization data: {error}");
+            emit_warning(logger, input_name, message)?;
+        }
+    }
+
+    Ok(warnings)
 }
 
 fn emit_linearization_check_warnings<R: Read + Seek + 'static>(

@@ -325,7 +325,7 @@ fn linearize_generate_qpdf_check_clean() {
         .args(["check-linearization", out.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicates::str::contains("linearization OK"));
+        .stdout(predicates::str::contains("no linearization errors"));
 }
 
 // ============================================================================
