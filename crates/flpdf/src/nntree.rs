@@ -1367,6 +1367,13 @@ impl<K: TreeKey> NNTree<K> {
         let pdf_id = pdf.unique_id();
         if let Some(root) = &self.canonical_root {
             if self.canonical_root_pdf_id.is_none() {
+                if let Some(existing_owner) = root.owning_pdf_unique_id() {
+                    if existing_owner != pdf_id {
+                        return Err(Error::Unsupported(
+                            "name/number tree root belongs to a different Pdf".to_string(),
+                        ));
+                    }
+                }
                 self.canonical_root_pdf_id = Some(pdf_id);
                 return Ok(root.clone());
             }
@@ -3978,6 +3985,41 @@ mod tests {
             .as_ref()
             .is_some_and(|root| root.is_same_object_as(&root_handle)));
 
+        assert_eq!(
+            tree.find_object(&mut pdf_one, b"one")
+                .unwrap()
+                .and_then(|value| value.as_integer()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn handle_tree_rejects_a_foreign_pdf_on_its_first_operation() {
+        let root_ref = ObjectRef::new(80, 0);
+        let mut pdf_one = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"one".to_vec()), Object::Integer(1)]),
+        );
+        pdf_one.set_object(root_ref, Object::Dictionary(root));
+
+        // The handle already carries pdf_one's document identity (minted by
+        // Pdf::get_object_handle) before it is ever wrapped in a NameTree.
+        let root_handle = pdf_one.get_object_handle(root_ref);
+        let mut tree = NameTree::new(root_handle, false);
+
+        // The tree's first operation targets a *different* Pdf. Because the
+        // wrapped handle already has an owner, this must be rejected instead
+        // of silently claiming pdf_two's identity and reading pdf_one's data
+        // through it.
+        let mut pdf_two = empty_pdf();
+        let error = tree
+            .find_object(&mut pdf_two, b"one")
+            .expect_err("a handle already owned by pdf_one must reject pdf_two on first use");
+        assert!(error.to_string().contains("different Pdf"));
+
+        // The tree still resolves correctly against its actual owner.
         assert_eq!(
             tree.find_object(&mut pdf_one, b"one")
                 .unwrap()
