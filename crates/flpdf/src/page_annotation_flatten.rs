@@ -2311,9 +2311,16 @@ mod tests {
             flatten_annotations_on_page(&mut pdf, ObjectRef::new(3, 0), FlattenMode::All).unwrap(),
             1
         );
-        let page_object = pdf.resolve_object(ObjectRef::new(3, 0)).unwrap();
-        let page = page_object.as_dict().unwrap();
-        assert!(page.get("Annots").is_none());
+        let annotations = {
+            let mut page_helper = PageObjectHelper::new(ObjectRef::new(3, 0), &mut pdf);
+            page_helper
+                .get_annotation_handles(None)
+                .expect("annotation list should be readable after flattening")
+        };
+        assert!(annotations.is_empty());
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        pdf.resolve(&page).unwrap();
+        assert!(!page.has_key(b"/Annots"));
         assert!(page_content_bytes(&mut pdf, ObjectRef::new(3, 0))
             .unwrap()
             .windows(2)
