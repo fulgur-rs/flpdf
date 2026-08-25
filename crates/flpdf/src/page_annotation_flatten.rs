@@ -1247,82 +1247,104 @@ mod tests {
         // shared object must be untouched.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R 6 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
-        let mut shared_resources = Dictionary::new();
-        shared_resources.insert("Font", Object::Reference(ObjectRef::new(20, 0)));
-        pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(shared_resources));
-        let mut shared_font = Dictionary::new();
-        shared_font.insert("F1", Object::Integer(41));
-        pdf.set_object(ObjectRef::new(20, 0), Object::Dictionary(shared_font));
-
-        let mut appearance1 = Dictionary::new();
-        appearance1.insert("Resources", Object::Reference(ObjectRef::new(9, 0)));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance1, Vec::new())),
-        );
-        let mut ap1 = Dictionary::new();
-        ap1.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget1 = Dictionary::new();
-        widget1.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget1.insert("AP", Object::Dictionary(ap1));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget1));
-
-        let mut appearance2 = Dictionary::new();
-        appearance2.insert("Resources", Object::Reference(ObjectRef::new(9, 0)));
-        pdf.set_object(
-            ObjectRef::new(7, 0),
-            Object::Stream(Stream::new(appearance2, Vec::new())),
-        );
-        let mut ap2 = Dictionary::new();
-        ap2.insert("N", Object::Reference(ObjectRef::new(7, 0)));
-        let mut widget2 = Dictionary::new();
-        widget2.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget2.insert("AP", Object::Dictionary(ap2));
-        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(widget2));
-
-        let mut fonts = Dictionary::new();
-        fonts.insert("Helv", Object::Integer(42));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert("Font", Object::Dictionary(fonts));
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        let shared_font =
+            ObjectHandle::dictionary(vec![(b"/F1".to_vec(), ObjectHandle::integer(41))]);
+        pdf.replace_object_handle(ObjectRef::new(20, 0), shared_font)
             .unwrap();
+        let shared_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(20, 0)),
+        )]);
+        pdf.replace_object_handle(ObjectRef::new(9, 0), shared_resources)
+            .unwrap();
+
+        let appearance1 = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(9, 0)),
+            )]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance1)
+            .unwrap();
+        let widget1 = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget1)
+            .unwrap();
+
+        let appearance2 = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                pdf.get_object_handle(ObjectRef::new(9, 0)),
+            )]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object_handle(ObjectRef::new(7, 0), appearance2)
+            .unwrap();
+        let widget2 = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(7, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(6, 0), widget2)
+            .unwrap();
+
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            ObjectHandle::dictionary(vec![(b"/Helv".to_vec(), ObjectHandle::integer(42))]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
+        let mut privatized_resource_ids = Vec::new();
         for appearance_ref in [ObjectRef::new(5, 0), ObjectRef::new(7, 0)] {
-            let Object::Stream(appearance) = pdf.resolve_object(appearance_ref).unwrap() else {
-                panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-            };
-            let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-                panic!("resources must be privatized"); // cov:ignore: fixture invariant
-            };
-            let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
-                panic!("resources must retain merged fonts"); // cov:ignore: fixture invariant
-            };
-            assert_eq!(fonts.get("F1"), Some(&Object::Integer(41)));
-            assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
+            let appearance = pdf.get_object_handle(appearance_ref);
+            pdf.resolve(&appearance).unwrap();
+            let stream_dict = appearance.as_stream_dict().unwrap();
+            let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+            assert!(
+                resources.object_ref().is_none(),
+                "appearance resources must be privatized as a direct copy"
+            );
+            privatized_resource_ids.push(resources.identity_key());
+            pdf.resolve(&resources).unwrap();
+            let fonts = resources.try_get_key(b"/Font").unwrap();
+            pdf.resolve(&fonts).unwrap();
+            let f1 = fonts.try_get_key(b"/F1").unwrap();
+            assert_eq!(f1.as_integer(), Some(41));
+            let helv = fonts.try_get_key(b"/Helv").unwrap();
+            assert_eq!(helv.as_integer(), Some(42));
         }
+        assert!(privatized_resource_ids[0] != privatized_resource_ids[1]);
 
-        let Object::Dictionary(original_resources) =
-            pdf.resolve_object(ObjectRef::new(9, 0)).unwrap()
-        else {
-            panic!("original shared resources must remain a dictionary"); // cov:ignore: fixture invariant
-        };
+        let original_resources = pdf.get_object_handle(ObjectRef::new(9, 0));
+        pdf.resolve(&original_resources).unwrap();
+        let original_font = original_resources.try_get_key(b"/Font").unwrap();
         assert_eq!(
-            original_resources.get("Font"),
-            Some(&Object::Reference(ObjectRef::new(20, 0))),
+            original_font.object_ref(),
+            Some(ObjectRef::new(20, 0)),
             "shared resources object must keep its own indirect Font reference, unmerged"
         );
-        let Object::Dictionary(original_font) = pdf.resolve_object(ObjectRef::new(20, 0)).unwrap()
-        else {
-            panic!("original shared font dictionary must remain a dictionary"); // cov:ignore: fixture invariant
-        };
-        let mut expected_original_font = Dictionary::new();
-        expected_original_font.insert("F1", Object::Integer(41));
+        pdf.resolve(&original_font).unwrap();
+        let original_f1 = original_font.try_get_key(b"/F1").unwrap();
+        assert_eq!(original_f1.as_integer(), Some(41));
         assert_eq!(
-            original_font, expected_original_font,
+            original_font.try_get_keys().unwrap().len(),
+            1,
             "shared font dictionary must not gain DR's Helv entry"
         );
     }
