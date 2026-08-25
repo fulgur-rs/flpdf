@@ -3271,7 +3271,7 @@ fn source_objstm_container_for_batch(
 /// Translate a source ObjStm's `/Extends` target into the output container
 /// number. qpdf resolves this relation through the source object-stream map;
 /// only when the target is not itself preserved does it fall back to the
-/// ordinary output renumber map (`QPDFWriter.cc:1621-1639`).
+/// ordinary output renumber map (`QPDFWriter.cc:1731-1738`).
 fn remap_source_objstm_extends(
     extends: ObjectRef,
     source_container_to_batch: &HashMap<ObjectRef, usize>,
