@@ -161,7 +161,6 @@
 | `crates/flpdf/src/writer/plain/plan.rs` | correspondence | QPDFWriter.cc standard-write object placement and renumber planning |
 | `crates/flpdf/src/writer/plain/xref.rs` | correspondence | QPDFWriter.cc classic and stream xref emission for the plain writer |
 | `crates/flpdf/src/writer/rewrite_renumber.rs` | correspondence | QPDFWriter.cc object renumbering shared by plain and linearized writers |
-| `crates/flpdf/src/writer/rewrite_renumber_tests.rs` | correspondence | test-only coverage for QPDFWriter trailer reference renumbering |
 | `crates/flpdf/src/writer/serialize.rs` | correspondence | QPDFWriter.cc shared object, stream, trailer, and xref serialization primitives |
 | `crates/flpdf/src/writer/settings.rs` | correspondence | QPDFWriter.cc writer-setting state and conversion to emission options |
 | `crates/flpdf/src/xref.rs` | correspondence | QPDF.cc xref loading and repair |

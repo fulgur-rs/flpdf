@@ -13,9 +13,6 @@ pub(crate) mod pclm;
 pub(crate) mod plain;
 #[path = "writer/rewrite_renumber.rs"]
 pub(crate) mod rewrite_renumber;
-#[cfg(test)]
-#[path = "writer/rewrite_renumber_tests.rs"]
-mod rewrite_renumber_tests;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
 mod settings;
@@ -2227,68 +2224,6 @@ fn strip_writer_trailer_history_keys(trailer: &mut Dictionary) {
     trailer.remove("Prev");
 }
 
-/// Remap the trailer's surviving indirect references to their Catalog-first
-/// (new) numbers.
-///
-/// `/Root` is overwritten by the caller with the new root ref and `/Encrypt`
-/// is written by [`apply_encrypt_trailer_handle_entries`], so both are left untouched
-/// here. Every other indirect value (notably `/Info`, which the renumber walk
-/// always seeds) is rewritten through `map`; a value absent from the map is an
-/// error rather than a stale number leaking into the output.
-#[cfg(test)]
-fn remap_trailer_refs<M: crate::writer::rewrite_renumber::NewNumberLookup>(
-    trailer: &mut Dictionary,
-    map: &M,
-    deleted: &[ObjectRef],
-) -> Result<()> {
-    // Collect the (key, old_ref) pairs first; the trailer holds only a handful
-    // of entries, so the small Vec is cheaper than threading a mutable iterator.
-    let to_remap: Vec<(Vec<u8>, ObjectRef)> = trailer
-        .iter()
-        .filter(|(key, _)| *key != b"Root" && *key != b"Encrypt")
-        .filter_map(|(key, value)| match value {
-            Object::Reference(r) => Some((key.to_vec(), *r)),
-            _ => None,
-        })
-        .collect();
-    for (key, old) in to_remap {
-        // A trailer reference to a deleted object (e.g. `/Info` pointing at a
-        // freed entry in malformed/edited input) has no body in the output and
-        // is not in the renumber map. Remapping it would leave the trailer
-        // pointing at a free xref row, corrupting the file on reopen — so drop
-        // the key entirely instead (the object is gone; the reference is moot).
-        if deleted.contains(&old) {
-            trailer.remove(&key);
-            continue;
-        }
-        let new = map.new_for_original(old).ok_or_else(|| {
-            crate::Error::Unsupported(format!(
-                "renumber: trailer /{} reference {old} absent from map",
-                String::from_utf8_lossy(&key)
-            ))
-        })?;
-        trailer.insert(key, Object::Reference(new));
-    }
-
-    // Pass 2: remap indirect references nested inside a DIRECT dict/array trailer
-    // value (e.g. a direct `/Info << /Held 5 0 R >>`). qpdf's `enqueueObjectsStandard`
-    // enqueues each trimmed-trailer value "handling direct objects recursively",
-    // so the renumber walk seeds these nested holders and the trailer must rewrite
-    // them to their new numbers too. Real trailers carry their references at the
-    // top level (`/Root`, `/Info`, `/Encrypt`) — already handled above and excluded
-    // here by the dict/array type filter — plus scalars (`/Size`/`/Prev` integers)
-    // and the direct `/ID` byte-string array (recursed as a no-op). Only the
-    // (spec-violating) direct dict/array trailer value carries nested references;
-    // `renumber_refs_in_place` errors on an unmapped one, refusing to emit a
-    // dangling trailer reference.
-    for value in trailer.values_mut() {
-        if matches!(value, Object::Dictionary(_) | Object::Array(_)) {
-            crate::writer::rewrite_renumber::renumber_refs_in_place(value, map)?;
-        }
-    }
-    Ok(())
-}
-
 fn remap_qpdf_trailer_refs_with_removed<
     R: Read + Seek,
     M: crate::writer::rewrite_renumber::NewNumberLookup,
@@ -4343,7 +4278,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         // in object-number order. The standard enqueue walk determines the
         // physical order of the containers themselves. Use the same
         // ObjStm-aware walk for QDF's source-object order: the old
-        // CatalogFirstRenumber walk cannot see references nested in compressed
+        // The canonical handle walk cannot see references nested in compressed
         // members, so it visits page-tree children before outline destinations
         // (`QPDFWriter.cc:1057-1118`).
         for batch in &mut plan.batches {
@@ -4460,7 +4395,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // stream object (numbered in emission order), so file positions are strictly
     // ascending 1..N with holders interleaved. Build:
     //   • qdf_emission_renumber: old_ref → emission ObjectRef (replaces CF
-    //     renumber in QDF mode for renumber_refs_in_place and remap_trailer_refs,
+    //     renumber in QDF mode for qpdf reference rewriting and trailer remapping,
     //     including members routed into an ObjStm)
     //   • qdf_holder_map: emission_stream_num → emission_holder_num
     // Prior-QDF-pass holder objects (bare integers reachable only via /Length
@@ -4739,7 +4674,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     };
 
     // In QDF mode, /Root's ref in the trailer is in emission-space; rebind
-    // new_root from the qdf_emission_renumber map so remap_trailer_refs and the
+    // new_root from the qdf_emission_renumber map so trailer rewriting and the
     // explicit trailer.insert("Root", ...) both use the same emission number.
     let new_root = if options.qdf {
         qdf_emission_renumber
@@ -6191,7 +6126,7 @@ fn write_qdf_trailer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::rewrite_renumber::CatalogFirstRenumber;
+    use crate::writer::rewrite_renumber::CanonicalCatalogFirstRenumber;
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -6628,59 +6563,10 @@ mod tests {
     }
 
     #[test]
-    fn remap_trailer_refs_remaps_live_and_drops_deleted() {
-        // /Info points at a live object (10 -> new 3); /Meta points at a
-        // deleted object (20). The live ref must be remapped; the deleted ref's
-        // key must be dropped (not remapped to a free xref row). /Root and
-        // /Encrypt are left for the caller and must be untouched here.
-        let map = CatalogFirstRenumber::from_pairs_for_test(&[
-            (ObjectRef::new(1, 0), ObjectRef::new(1, 0)),
-            (ObjectRef::new(10, 0), ObjectRef::new(3, 0)),
-        ]);
-        let mut trailer = Dictionary::new();
-        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
-        trailer.insert("Info", Object::Reference(ObjectRef::new(10, 0)));
-        trailer.insert("Meta", Object::Reference(ObjectRef::new(20, 0)));
-        trailer.insert("Size", Object::Integer(4));
-
-        let deleted = [ObjectRef::new(20, 0)];
-        remap_trailer_refs(&mut trailer, &map, &deleted).expect("remap");
-
-        assert_eq!(
-            trailer.get("Info"),
-            Some(&Object::Reference(ObjectRef::new(3, 0))),
-            "live /Info must be remapped to its new number"
-        );
-        assert!(
-            trailer.get("Meta").is_none(),
-            "/Meta pointing at a deleted object must be dropped, not remapped"
-        );
-        // /Root is filtered from remapping (caller owns it) and stays as-is.
-        assert_eq!(
-            trailer.get("Root"),
-            Some(&Object::Reference(ObjectRef::new(1, 0)))
-        );
-    }
-
-    #[test]
-    fn remap_trailer_refs_errors_on_unmapped_live_ref() {
-        // A non-deleted trailer ref absent from the map is a real
-        // inconsistency and must surface as an error, not a stale number.
-        let map = CatalogFirstRenumber::from_pairs_for_test(&[(
-            ObjectRef::new(1, 0),
-            ObjectRef::new(1, 0),
-        )]);
-        let mut trailer = Dictionary::new();
-        trailer.insert("Info", Object::Reference(ObjectRef::new(99, 0)));
-        let err = remap_trailer_refs(&mut trailer, &map, &[]).unwrap_err();
-        assert!(matches!(err, crate::Error::Unsupported(_)));
-    }
-
-    #[test]
     fn remap_qpdf_trailer_refs_propagates_unmapped_nested_live_ref() {
         let fixture = build_partition_fixture();
         let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
-        let map = CatalogFirstRenumber::from_pairs_for_test(&[(
+        let map = CanonicalCatalogFirstRenumber::from_pairs_for_test(&[(
             ObjectRef::new(1, 0),
             ObjectRef::new(1, 0),
         )]);

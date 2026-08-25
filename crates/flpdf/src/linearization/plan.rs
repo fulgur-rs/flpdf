@@ -1169,7 +1169,7 @@ impl LinearizationPlan {
         // emission rule.
         // qpdf garbage-collects objects unreachable from the trailer roots (it
         // only enqueues reachable objects). The plain full-rewrite path does this
-        // via CatalogFirstRenumber's trailer-seeded BFS; the linearize universe
+        // via the canonical handle renumber walk's trailer-seeded BFS; the linearize universe
         // must too, or re-linearizing an already-linearized source leaks its old
         // /Linearized parameter dict + hint stream — both unreachable structural
         // artifacts — into the second half (flpdf-phfu).

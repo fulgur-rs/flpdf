@@ -2964,7 +2964,7 @@ struct CatalogAdbeStatus {
     ///
     /// `crate::writer::emit_canonical_pdf_inner` can absorb any such
     /// case safely: it mutates the Catalog and THEN builds its
-    /// `CatalogFirstRenumber` from the SAME (now-mutated) handle
+    /// the canonical catalog-first renumber map from the SAME (now-mutated) handle
     /// (`writer.rs:3154-3238`), so a dropped object simply never gets a
     /// slot. [`write_linearized_for_pdf_writer`] cannot: its `plan`/`renumber` are built
     /// by the CALLER from a SEPARATE `Pdf` handle BEFORE this function ever
