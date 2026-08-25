@@ -141,7 +141,7 @@ pub(crate) fn run_test_3<R: Read + Seek>(
                 DecodeLevel::Generalized,
                 false,
                 false,
-            )?;
+            )?; // cov:ignore: llvm-cov maps the tested pipeline-error continuation to this terminator
         }
         emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)
             .map_err(Error::from)?;
@@ -654,6 +654,7 @@ mod tests {
             &mut diagnostics_written,
         )
         .is_err());
+        assert!(stdout.flush().is_ok());
     }
 
     #[test]

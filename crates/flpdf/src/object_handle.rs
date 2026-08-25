@@ -5212,7 +5212,7 @@ impl ObjectHandle {
         if offset >= 0 {
             if let Some(context) = self.context() {
                 return context.warn_stream_data(offset as u64, None, message.to_owned());
-            }
+            } // cov:ignore: the return above makes this LLVM closing-branch artifact unreachable
         }
         self.object_warning(message)
     }
