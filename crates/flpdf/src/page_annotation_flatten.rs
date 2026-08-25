@@ -2446,14 +2446,18 @@ mod tests {
         );
 
         // The non-Print annotation (obj 7) should still be in /Annots.
-        let page_obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let page_dict = page_obj.as_dict().unwrap();
-        let annots = match page_dict.get("Annots").unwrap() {
-            Object::Array(a) => a.clone(),
-            _ => panic!("expected array"),
+        let annotations = {
+            let mut page_helper = PageObjectHelper::new(page_ref, &mut pdf);
+            page_helper
+                .get_annotation_handles(None)
+                .expect("remaining annotation list should be readable")
         };
-        assert_eq!(annots.len(), 1, "one annotation should remain");
-        assert_eq!(annots[0], Object::Reference(ObjectRef::new(7, 0)));
+        assert_eq!(annotations.len(), 1, "one annotation should remain");
+        assert_eq!(
+            annotations[0].object_ref(),
+            Some(ObjectRef::new(7, 0)),
+            "the non-Print annotation should remain"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2492,14 +2496,18 @@ mod tests {
         assert_eq!(count, 1, "only the no-Print annotation should be flattened");
 
         // The Print annotation (obj 4) should still be in /Annots.
-        let page_obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let page_dict = page_obj.as_dict().unwrap();
-        let annots = match page_dict.get("Annots").unwrap() {
-            Object::Array(a) => a.clone(),
-            _ => panic!("expected array"),
+        let annotations = {
+            let mut page_helper = PageObjectHelper::new(page_ref, &mut pdf);
+            page_helper
+                .get_annotation_handles(None)
+                .expect("remaining annotation list should be readable")
         };
-        assert_eq!(annots.len(), 1);
-        assert_eq!(annots[0], Object::Reference(ObjectRef::new(4, 0)));
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(
+            annotations[0].object_ref(),
+            Some(ObjectRef::new(4, 0)),
+            "the Print annotation should remain"
+        );
     }
 
     // -----------------------------------------------------------------------
