@@ -1654,45 +1654,59 @@ mod tests {
         // `getKey("/Resources")` on an absent key returns a null handle, and
         // `mergeResources` returns immediately when the receiver isn't a
         // dictionary (QPDFObjectHandle.cc:1063-1069).
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(Dictionary::new()));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(Vec::new()),
+            )]),
+            Rc::new(Vec::new()),
         );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert(
-            "ProcSet",
-            Object::Array(vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec()),
-            ]),
-        );
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
             .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/ProcSet".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"PDF".to_vec()),
+                ObjectHandle::name(b"Text".to_vec()),
+            ]),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must gain a resources dictionary"); // cov:ignore: fixture invariant
-        };
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let resources = appearance
+            .as_stream_dict()
+            .expect("fixture appearance must remain a stream")
+            .try_get_key(b"/Resources")
+            .expect("fixture appearance must gain a resources dictionary");
+        pdf.resolve(&resources).unwrap();
+        let proc_set = resources
+            .try_get_key(b"/ProcSet")
+            .expect("fixture appearance must gain ProcSet");
+        pdf.resolve(&proc_set).unwrap();
+        let proc_set_items = proc_set
+            .as_array()
+            .expect("installed ProcSet category must be an array");
         assert_eq!(
-            resources.get("ProcSet"),
-            Some(&Object::Array(vec![
-                Object::Name(b"PDF".to_vec()),
-                Object::Name(b"Text".to_vec())
-            ]))
+            proc_set_items
+                .iter()
+                .map(|item| item.as_name())
+                .collect::<Vec<_>>(),
+            vec![Some(b"PDF".to_vec()), Some(b"Text".to_vec())]
         );
     }
 
