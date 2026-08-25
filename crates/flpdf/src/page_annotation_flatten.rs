@@ -2808,20 +2808,20 @@ mod tests {
         assert_eq!(count, 2);
 
         // Both XObjects in /Resources.
-        let page_obj = pdf.resolve_borrowed(page_ref).unwrap();
-        let page_dict = page_obj.as_dict().unwrap();
-        let resources = match page_dict.get("Resources").unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("expected dict"),
-        };
-        let xobj_dict = match resources.get("XObject").unwrap() {
-            Object::Dictionary(d) => d.clone(),
-            _ => panic!("expected dict"),
-        };
-        assert_eq!(xobj_dict.iter().count(), 2, "two XObject entries");
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let resources = page.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let xobj_dict = resources.try_get_key(b"/XObject").unwrap();
+        pdf.resolve(&xobj_dict).unwrap();
+        assert_eq!(
+            xobj_dict.as_dictionary().unwrap().len(),
+            2,
+            "two XObject entries"
+        );
 
         // qpdf removes /Annots after every annotation has been flattened.
-        assert!(page_dict.get("Annots").is_none());
+        assert!(page.try_get_key(b"/Annots").unwrap().is_null());
     }
 
     // -----------------------------------------------------------------------
