@@ -1547,13 +1547,10 @@ mod tests {
         // then /XObject -- a direct stream, absent from the destination --
         // fails installation via shallow_copy's stream rejection.
         //
-        // mark_object_handle_dirty (reader.rs) evicts the object's
-        // legacy_materialized_memo entry as its cache-invalidation step; a
-        // prior handle resolution populates that cache, so this test warms it
-        // *before* the merge and resolves *after* -- if the /ProcSet
-        // mutation that ran before the /XObject failure was never marked
-        // dirty, the second resolution would still return the pre-merge
-        // snapshot instead of live content.
+        // ObjectHandle reads are always live off the shared canonical
+        // handle graph, so a stale-content check alone cannot tell whether
+        // the /ProcSet merge's dirty mark survived the later failure --
+        // that must be asserted directly via pdf.is_dirty.
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
         register_acroform_fields(&mut pdf, &[]);
         pdf.replace_object_handle(
@@ -1595,7 +1592,7 @@ mod tests {
             ),
         ]);
 
-        // Warm the resolver cache with the pre-merge snapshot.
+        // Sanity-check the pre-merge fixture shape.
         let proc_set_before = pdf.get_object_handle(ObjectRef::new(9, 0));
         pdf.resolve(&proc_set_before).unwrap();
         let proc_set_before_items = proc_set_before
@@ -1603,6 +1600,13 @@ mod tests {
             .expect("shared ProcSet array must remain an array");
         assert_eq!(proc_set_before_items.len(), 1);
         assert_eq!(proc_set_before_items[0].as_name(), Some(b"PDF".to_vec()));
+
+        // Setup's replace_object_handle calls already left object 9 dirty;
+        // clear that so the post-merge dirty assertion below can only pass
+        // because the /ProcSet merge itself marks object 9 dirty (and that
+        // mark survives the later /XObject failure), not because it was
+        // already dirty from construction.
+        pdf.clear_dirty(ObjectRef::new(9, 0));
 
         let error = merge_widget_default_resources_on_page(
             &mut pdf,
@@ -1615,15 +1619,40 @@ mod tests {
             Error::System(message) if message == "stream objects cannot be cloned"
         ));
 
-        let proc_set_after = pdf.get_object_handle(ObjectRef::new(9, 0));
+        // qpdf's merge_resources documents that entries merged before a
+        // later category's failure stay installed and dirty in the live
+        // handle graph. ObjectHandle reads are always live regardless of
+        // dirty state (dirty only controls what the writer emits), so the
+        // dirty mark itself must be asserted directly rather than inferred
+        // from content still being visible through resolve.
+        assert!(
+            pdf.is_dirty(ObjectRef::new(9, 0)),
+            "the /ProcSet merge that ran before the /XObject failure must leave its \
+             indirect array owner dirty, not roll the dirty mark back"
+        );
+
+        // Reach /ProcSet through the appearance's own resource dictionary,
+        // not by looking object 9 up directly, so a regression that rebinds
+        // the entry to a different (or direct) array would be caught.
+        let appearance_after = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance_after).unwrap();
+        let resources_after = appearance_after.as_stream_dict().unwrap();
+        let proc_set_after = resources_after.try_get_key(b"/Resources").unwrap();
         pdf.resolve(&proc_set_after).unwrap();
-        let proc_set_after_items = proc_set_after
-            .as_array()
-            .expect("shared ProcSet array must remain an array");
+        let proc_set_after = proc_set_after.try_get_key(b"/ProcSet").unwrap();
+        pdf.resolve(&proc_set_after).unwrap();
         assert_eq!(
             proc_set_after.object_ref(),
             Some(ObjectRef::new(9, 0)),
             "the merged array must retain its indirect owner identity"
+        );
+        let proc_set_after_items = proc_set_after
+            .as_array()
+            .expect("shared ProcSet array must remain an array");
+        assert_eq!(
+            proc_set_after_items.len(),
+            2,
+            "the merged array must contain exactly the original and appended items"
         );
         assert_eq!(
             proc_set_after_items[0].as_name(),
@@ -1633,8 +1662,8 @@ mod tests {
         assert_eq!(
             proc_set_after_items[1].as_name(),
             Some(b"Text".to_vec()),
-            "the /ProcSet merge that ran before the /XObject failure must invalidate the \
-             pre-merge handle snapshot, not return it stale"
+            "the /ProcSet merge that ran before the /XObject failure must remain \
+             installed, not be rolled back"
         );
     }
 
