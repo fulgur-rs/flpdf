@@ -29,3 +29,29 @@ fn rewrite_renumber_is_owned_by_the_writer_module() {
         "writer.rs must declare the writer-owned module"
     );
 }
+
+#[test]
+fn production_renumber_route_has_only_the_canonical_handle_engine() {
+    let source = fs::read_to_string(source_root().join("writer/rewrite_renumber.rs"))
+        .expect("rewrite_renumber.rs must be readable");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("rewrite_renumber source has a production section");
+
+    assert!(
+        production.contains("CanonicalCatalogFirstRenumber"),
+        "production renumbering must retain the canonical handle engine"
+    );
+    for forbidden in [
+        "struct CatalogFirstRenumber",
+        "impl CatalogFirstRenumber",
+        "CatalogFirstRenumber::",
+        "collect_qpdf_enqueue_refs",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "production renumbering still contains obsolete raw engine token {forbidden:?}"
+        );
+    }
+}

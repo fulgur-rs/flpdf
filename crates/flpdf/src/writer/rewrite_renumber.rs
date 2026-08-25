@@ -43,19 +43,13 @@ pub(crate) type StreamParametersRemoved<'a> =
 
 /// Maps an original object reference to its assigned new reference.
 ///
-/// Implemented by both renumber schemes ([`CatalogFirstRenumber`] for plain
+/// Implemented by both renumber schemes ([`CanonicalCatalogFirstRenumber`] for plain
 /// rewrite, [`ObjectStreamRenumber`] for object-stream output) so that
-/// `renumber_refs_in_place` can rewrite an object's internal references under
-/// either numbering without duplication.
+/// `renumber_qpdf_refs_in_place` can rewrite an object's internal references
+/// under either numbering without duplication.
 pub(crate) trait NewNumberLookup {
     /// Return the new reference assigned to `original`, if it was reachable.
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef>;
-}
-
-impl NewNumberLookup for CatalogFirstRenumber {
-    fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
-        self.old_to_new.get(&original).copied()
-    }
 }
 
 impl NewNumberLookup for ObjectStreamRenumber {
@@ -84,162 +78,12 @@ fn qpdf_source_objstm_containers<R: Read + Seek>(pdf: &Pdf<R>) -> BTreeSet<Objec
         .collect()
 }
 
-/// A map from original object references to their qpdf-style Catalog-first
-/// numbers, plus the visitation order that produced them.
-#[allow(dead_code)]
-pub(crate) struct CatalogFirstRenumber {
-    old_to_new: HashMap<ObjectRef, ObjectRef>,
-    /// Index `i` holds the original ref assigned new number `i + 1`.
-    order: Vec<ObjectRef>,
-}
-
-#[allow(dead_code)]
-impl CatalogFirstRenumber {
-    /// Return the new reference assigned to `original`, if it was reachable.
-    pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
-        self.old_to_new.get(&original).copied()
-    }
-
-    /// The number of objects that received a new number.
-    pub(crate) fn len(&self) -> usize {
-        self.order.len()
-    }
-
-    /// Iterate `(new_ref, old_ref)` pairs in ascending new-number order.
-    pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
-        self.order
-            .iter()
-            .enumerate()
-            .map(|(i, &old)| (ObjectRef::new(i as u32 + 1, 0), old))
-    }
-
-    /// Compute the Catalog-first renumbering for `pdf`.
-    ///
-    /// When `skip_length` is set, the walk does not follow a stream's indirect
-    /// `/Length` edge, so a holder reachable only through it receives no number
-    /// (matching qpdf's reachability GC of a stream whose `/Length` it directizes
-    /// — `QPDFWriter::unparseObject` removes `/Length` before enqueueing
-    /// children). Pass `false` in qdf mode, which keeps the indirect holder.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Unsupported`] when the trailer has no `/Root` entry.
-    /// Propagates [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] if an
-    /// object fails to load during the walk.
-    pub(crate) fn build<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        skip_length: bool,
-    ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, false, false, &BTreeSet::new())
-    }
-
-    /// Compute Catalog-first numbering with qpdf's null-aware dictionary
-    /// visibility for plain, unencrypted, non-QDF output.
-    #[allow(dead_code)] // compatibility wrapper retained for non-policy callers and tests
-    pub(crate) fn build_qpdf<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        skip_length: bool,
-    ) -> crate::Result<Self> {
-        Self::build_qpdf_excluding(pdf, skip_length, &BTreeSet::new())
-    }
-
-    /// Compute qpdf-visible Catalog-first numbering while directizing the
-    /// operation's explicitly removed identities before they enter the queue.
-    pub(crate) fn build_qpdf_excluding<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        skip_length: bool,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, true, false, removed_refs)
-    }
-
-    fn build_with_visibility<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        skip_length: bool,
-        qpdf_visibility: bool,
-        preserve_unreferenced_objects: bool,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> crate::Result<Self> {
-        let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
-        let mut order: Vec<ObjectRef> = Vec::new();
-        let mut queue: VecDeque<ObjectRef> = VecDeque::new();
-
-        // Collect the seed refs before the BFS so we do not hold the immutable
-        // `trailer()` borrow across the `&mut resolve` calls below.
-        let root = pdf
-            .root_ref()
-            .ok_or_else(|| Error::Unsupported("plain rewrite: trailer has no /Root".to_string()))?;
-        let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
-            pdf.live_object_refs()
-                .into_iter()
-                .filter(|object_ref| !removed_refs.contains(object_ref))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        seeds.push(root);
-        let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
-        let trailer_entries = if qpdf_visibility {
-            crate::qpdf_null::visible_entries(pdf, trailer_entries)?
-        } else {
-            trailer_entries
-        };
-        for (key, value) in trailer_entries {
-            if matches!(
-                key.as_slice(),
-                b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size"
-            ) {
-                continue;
-            }
-            // qpdf's `enqueueObjectsStandard` enqueues each trimmed-trailer value,
-            // "handling direct objects recursively", so a nested indirect ref inside
-            // a DIRECT dict/array trailer value (e.g. a direct `/Info` dict) is a
-            // seed too — not just a top-level `Object::Reference`. A bare reference
-            // value yields exactly one seed, matching the previous behaviour.
-            if qpdf_visibility {
-                collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
-            } else {
-                collect_refs(&value, 0, skip_length, &mut |r| seeds.push(r))?;
-            }
-        }
-
-        for seed in seeds {
-            if !removed_refs.contains(&seed) {
-                enqueue(seed, &mut old_to_new, &mut order, &mut queue);
-            }
-        }
-
-        while let Some(cur) = queue.pop_front() {
-            if qpdf_visibility {
-                let obj = pdf.resolve_object(cur)?;
-                let mut found = Vec::new();
-                collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
-                for reference in found {
-                    if !removed_refs.contains(&reference) {
-                        enqueue(reference, &mut old_to_new, &mut order, &mut queue);
-                    }
-                }
-            } else {
-                let obj = pdf.resolve_borrowed(cur)?;
-                collect_refs(obj, 0, skip_length, &mut |r| {
-                    if !removed_refs.contains(&r) {
-                        enqueue(r, &mut old_to_new, &mut order, &mut queue);
-                    }
-                })?;
-            }
-        }
-
-        Ok(Self { old_to_new, order })
-    }
-}
-
 /// Catalog-first numbering over the live [`crate::ObjectHandle`] graph.
 ///
-/// This is the writer's canonical traversal boundary: unlike
-/// [`CatalogFirstRenumber`], it never calls `Pdf::resolve` or
-/// `resolve_borrowed`, so an in-place handle mutation is observed directly and
-/// no legacy `Object` snapshot is created. The enqueue order and null-visible
-/// edge rules mirror `QPDFWriter::enqueueObject` and
+/// This is the writer's canonical traversal boundary. It never calls
+/// `Pdf::resolve_borrowed`, so an in-place handle mutation is observed directly
+/// and no legacy `Object` snapshot is created. The enqueue order and
+/// null-visible edge rules mirror `QPDFWriter::enqueueObject` and
 /// `enqueueObjectsStandard` (`QPDFWriter.cc:1072-1141,2916-2924`).
 pub(crate) struct CanonicalCatalogFirstRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
@@ -268,6 +112,14 @@ impl CanonicalCatalogFirstRenumber {
             .iter()
             .enumerate()
             .map(|(index, &source)| (ObjectRef::new(index as u32 + 1, 0), source))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pairs_for_test(pairs: &[(ObjectRef, ObjectRef)]) -> Self {
+        Self {
+            old_to_new: pairs.iter().copied().collect(),
+            order: pairs.iter().map(|(old, _new)| *old).collect(),
+        }
     }
 
     #[allow(dead_code)] // compatibility wrapper retained for non-policy callers and tests
@@ -517,105 +369,6 @@ fn ensure_canonical_owner<R: Read + Seek>(
     Ok(())
 }
 
-fn collect_qpdf_enqueue_refs<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    obj: &Object,
-    depth: usize,
-    skip_length: bool,
-    found: &mut Vec<ObjectRef>,
-) -> crate::Result<()> {
-    collect_qpdf_enqueue_refs_with_stream_parameters(pdf, obj, depth, skip_length, found, false)
-}
-
-fn collect_qpdf_enqueue_refs_with_stream_parameters<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    obj: &Object,
-    depth: usize,
-    skip_length: bool,
-    found: &mut Vec<ObjectRef>,
-    skip_stream_parameters: bool,
-) -> crate::Result<()> {
-    if depth > MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(
-            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
-             qpdf enqueue collection"
-                .to_string(),
-        ));
-    }
-    match obj {
-        Object::Reference(reference) => {
-            if reference.number != 0 {
-                found.push(*reference);
-            }
-        }
-        Object::Array(items) => {
-            for item in items {
-                collect_qpdf_enqueue_refs_with_stream_parameters(
-                    pdf,
-                    item,
-                    depth + 1,
-                    skip_length,
-                    found,
-                    false,
-                )?;
-            }
-        }
-        Object::Dictionary(dict) => {
-            let entries = crate::qpdf_null::snapshot_entries(dict, false);
-            for (_, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                collect_qpdf_enqueue_refs_with_stream_parameters(
-                    pdf,
-                    &value,
-                    depth + 1,
-                    skip_length,
-                    found,
-                    false,
-                )?; // cov:ignore: LLVM maps this covered dictionary-child call terminator to a zero-count continuation region
-            }
-        }
-        Object::Stream(stream) => {
-            let entries = crate::qpdf_null::snapshot_entries(&stream.dict, skip_length);
-            let entries = entries
-                .into_iter()
-                .filter(|(key, _)| {
-                    !(skip_stream_parameters
-                        && matches!(key.as_slice(), b"Filter" | b"DecodeParms"))
-                })
-                .collect();
-            for (_, value) in crate::qpdf_null::visible_entries(pdf, entries)? {
-                collect_qpdf_enqueue_refs_with_stream_parameters(
-                    pdf,
-                    &value,
-                    depth + 1,
-                    skip_length,
-                    found,
-                    false,
-                )?; // cov:ignore: LLVM maps this covered stream-child call terminator to a zero-count continuation region
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn object_contains_reference(object: &Object, references: &BTreeSet<ObjectRef>) -> bool {
-    match object {
-        Object::Reference(reference) => references.contains(reference),
-        Object::Array(items) => items
-            .iter()
-            .any(|item| object_contains_reference(item, references)),
-        Object::Dictionary(dict) => dict
-            .iter()
-            .any(|(_, value)| object_contains_reference(value, references)),
-        Object::Stream(stream) => stream
-            .dict
-            .iter()
-            .any(|(_, value)| object_contains_reference(value, references)),
-        _ => false,
-    }
-}
-
 /// Compute the set of object references reachable from the trailer roots,
 /// matching qpdf's reachability garbage collection of the linearized object
 /// universe.
@@ -630,15 +383,15 @@ fn object_contains_reference(object: &Object, references: &BTreeSet<ObjectRef>) 
 /// ONLY through that dead edge is correctly absent — matching qpdf's
 /// reachability GC.
 ///
-/// Unlike [`CatalogFirstRenumber`], `/Encrypt` IS part of the seed set: the
-/// linearized object universe must retain the encryption dictionary and its
-/// closure (the plain rewrite numbers `/Encrypt` in a separate slot, hence its
-/// omission there).
+/// Unlike the plain rewrite's Catalog-first numbering, `/Encrypt` IS part of
+/// the seed set: the linearized object universe must retain the encryption
+/// dictionary and its closure (the plain rewrite numbers `/Encrypt` in a
+/// separate slot, hence its omission there).
 ///
 /// # Errors
 ///
 /// Returns [`Error::Unsupported`] when the trailer has no `/Root` or inline
-/// nesting exceeds [`MAX_INLINE_DEPTH`] (via [`collect_qpdf_enqueue_refs`]), and propagates
+/// nesting exceeds [`MAX_INLINE_DEPTH`] (via the canonical enqueue collector), and propagates
 /// [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`] from resolving
 /// objects during the walk.
 #[allow(dead_code)] // compatibility wrapper retained for existing reachability tests
@@ -868,18 +621,6 @@ fn walk_resurrectable_handle(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-impl CatalogFirstRenumber {
-    /// Build a map directly from `(old, new)` pairs (test-only). Used by writer
-    /// unit tests that need a known mapping without parsing a PDF.
-    pub(crate) fn from_pairs_for_test(pairs: &[(ObjectRef, ObjectRef)]) -> Self {
-        Self {
-            old_to_new: pairs.iter().copied().collect(),
-            order: pairs.iter().map(|(old, _)| *old).collect(),
-        }
-    }
 }
 
 /// Object-stream renumbering: the Catalog-first BFS extended with qpdf's
@@ -1256,65 +997,6 @@ fn enqueue(
     queue.push_back(original);
 }
 
-/// Invoke `f` for every indirect reference found inline in `obj`, descending
-/// into dictionary entries (lexicographic key order via the dictionary's
-/// ordered iteration) and array elements in order. Stream data bytes are not
-/// inspected.
-///
-/// When `skip_length` is set, a stream's `/Length` entry is not descended into.
-/// qpdf removes `/Length` from a stream dict before enqueueing its children
-/// (`QPDFWriter::unparseObject`: `object.removeKey("/Length")`), so with direct
-/// stream lengths the indirect `/Length` edge is dead in the output and must not
-/// contribute to numbering or reachability. `skip_length` carries that
-/// `direct_stream_lengths` state — it is false only in qdf mode, which keeps the
-/// indirect holder and re-emits `/Length H 0 R`.
-///
-/// # Errors
-///
-/// Returns [`Error::Unsupported`] when inline structural nesting exceeds
-/// [`MAX_INLINE_DEPTH`]. Silently stopping would leave references in the
-/// over-deep region uncollected, so they would never be numbered — emitting a
-/// corrupt renumbered PDF as if it succeeded. Refusing is the safe choice
-/// (real PDFs never nest inline structures that deeply).
-#[allow(dead_code)]
-fn collect_refs(
-    obj: &Object,
-    depth: usize,
-    skip_length: bool,
-    f: &mut impl FnMut(ObjectRef),
-) -> crate::Result<()> {
-    if depth > MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(
-            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
-             reference collection"
-                .to_string(),
-        ));
-    }
-    match obj {
-        Object::Reference(r) => f(*r),
-        Object::Array(elements) => {
-            for element in elements {
-                collect_refs(element, depth + 1, skip_length, f)?;
-            }
-        }
-        Object::Dictionary(dict) => {
-            for (_key, value) in dict.iter() {
-                collect_refs(value, depth + 1, skip_length, f)?;
-            }
-        }
-        Object::Stream(stream) => {
-            for (key, value) in stream.dict.iter() {
-                if skip_length && key == b"Length" {
-                    continue;
-                }
-                collect_refs(value, depth + 1, skip_length, f)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// Rewrite every [`Object::Reference`] inside `obj` to its new reference from
 /// `map`, in place.
 ///
@@ -1325,14 +1007,6 @@ fn collect_refs(
 /// inline structural nesting exceeds [`MAX_INLINE_DEPTH`] (leaving an over-deep
 /// reference un-rewritten would point it at the wrong renumbered object, so we
 /// refuse rather than emit a corrupt PDF).
-#[cfg(test)]
-pub(crate) fn renumber_refs_in_place<M: NewNumberLookup>(
-    obj: &mut Object,
-    map: &M,
-) -> crate::Result<()> {
-    rewrite(obj, 0, map)
-}
-
 pub(crate) fn renumber_qpdf_refs_in_place<R: Read + Seek, M: NewNumberLookup>(
     pdf: &mut Pdf<R>,
     obj: &mut Object,
@@ -1423,91 +1097,50 @@ fn rewrite_qpdf<R: Read + Seek, M: NewNumberLookup>(
 }
 
 #[cfg(test)]
-fn rewrite<M: NewNumberLookup>(obj: &mut Object, depth: usize, map: &M) -> crate::Result<()> {
-    if depth > MAX_INLINE_DEPTH {
-        return Err(Error::Unsupported(
-            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during \
-             reference rewriting"
-                .to_string(),
-        ));
-    }
-    match obj {
-        Object::Reference(r) => {
-            *r = map.new_for_original(*r).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "plain rewrite: reference {r} absent from renumber map (dangling ref)"
-                ))
-            })?;
-        }
-        Object::Array(elements) => {
-            for element in elements {
-                rewrite(element, depth + 1, map)?;
-            }
-        }
-        Object::Dictionary(dict) => {
-            for value in dict.values_mut() {
-                rewrite(value, depth + 1, map)?;
-            }
-        }
-        Object::Stream(stream) => {
-            // A dropped orphan `/Length` holder (flpdf-sqkq) leaves the stream's
-            // indirect `/Length` pointing at an object that received no new
-            // number. qpdf re-emits every stream's `/Length` as a direct integer
-            // anyway (here `reencode_stream_for_compress` overwrites this
-            // placeholder), so direct-ize the dangling `/Length` to the raw byte
-            // count instead of tripping the unmapped-ref error below — every
-            // OTHER unmapped reference still errors as a genuine dangling ref.
-            let drop_length = matches!(
-                stream.dict.get("Length"),
-                Some(Object::Reference(r)) if map.new_for_original(*r).is_none()
-            );
-            if drop_length {
-                let data_len = stream.data.len() as i64;
-                stream.dict.insert("Length", Object::Integer(data_len));
-            }
-            for value in stream.dict.values_mut() {
-                rewrite(value, depth + 1, map)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{Dictionary, Stream};
     use crate::writer::object_streams::ObjectStreamGroup;
     use std::io::Cursor;
     use std::sync::Arc;
 
-    /// Classify a resolved object into the oracle's tag vocabulary.
+    /// Classify a resolved live handle into the oracle's tag vocabulary.
     ///
     /// Streams are always `"stream"`. A dictionary whose `/Type` resolves to a
-    /// Name is tagged with that name (e.g. `/Catalog`); any other dictionary is
+    /// name is tagged with that name (e.g. `/Catalog`); any other dictionary is
     /// `"dict"`.
     fn type_tag<R: Read + Seek>(pdf: &mut Pdf<R>, r: ObjectRef) -> String {
-        let obj = pdf.resolve_object(r).expect("resolve");
-        match &obj {
-            Object::Stream(_) => "stream".to_string(),
-            Object::Dictionary(dict) => match dict.get("Type") {
-                Some(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(name)),
-                // cov:ignore-start: test-only type-tag oracle; no writer-renumber fixture gives an object an indirect /Type
-                Some(Object::Reference(tref)) => match pdf.resolve_object(*tref) {
-                    Ok(Object::Name(name)) => format!("/{}", String::from_utf8_lossy(&name)),
-                    _ => "dict".to_string(),
-                },
-                // cov:ignore-end
-                _ => "dict".to_string(),
-            },
-            _ => "other".to_string(),
+        let handle = pdf.get_object_handle(r);
+        pdf.resolve(&handle).expect("resolve");
+        if handle.as_stream_dict().is_some() {
+            return "stream".to_string();
+        }
+        let Some(_entries) = handle.try_as_dictionary().expect("dictionary") else {
+            return "other".to_string();
+        };
+        match handle
+            .try_get_key(b"/Type")
+            .expect("dictionary key")
+            .try_as_name()
+            .expect("name")
+        {
+            Some(name) => format!("/{}", String::from_utf8_lossy(&name)),
+            None => "dict".to_string(),
         }
     }
 
-    fn tag_sequence<R: Read + Seek>(pdf: &mut Pdf<R>, map: &CatalogFirstRenumber) -> Vec<String> {
+    fn tag_sequence<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        map: &CanonicalCatalogFirstRenumber,
+    ) -> Vec<String> {
         let olds: Vec<ObjectRef> = map.pairs().map(|(_new, old)| old).collect();
         olds.into_iter().map(|old| type_tag(pdf, old)).collect()
+    }
+
+    fn canonical_build_for_test<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        skip_length: bool,
+    ) -> crate::Result<CanonicalCatalogFirstRenumber> {
+        CanonicalCatalogFirstRenumber::build_qpdf(pdf, skip_length, false, &BTreeSet::new())
     }
 
     /// Assemble a minimal classic (table-xref) PDF from `(object_number, body)`
@@ -1713,62 +1346,6 @@ mod tests {
     }
 
     #[test]
-    fn qpdf_stream_policy_walks_nested_containers_and_skips_parameters() {
-        let mut pdf = Pdf::open(Cursor::new(include_bytes!(
-            "../../../../tests/fixtures/compat/one-page.pdf"
-        )))
-        .expect("open fixture");
-        let kept = ObjectRef::new(2, 0);
-        let dropped = ObjectRef::new(3, 0);
-
-        let mut dictionary = Dictionary::new();
-        dictionary.insert("Kept", Object::Reference(kept));
-        let mut found = Vec::new();
-        collect_qpdf_enqueue_refs_with_stream_parameters(
-            &mut pdf,
-            &Object::Dictionary(dictionary),
-            0,
-            true,
-            &mut found,
-            false,
-        )
-        .expect("dictionary walk");
-        assert_eq!(found, vec![kept]);
-
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert("Filter", Object::Reference(dropped));
-        stream_dict.insert("Kept", Object::Reference(kept));
-        let stream = Object::Stream(Stream::new(stream_dict, Vec::new()));
-        found.clear();
-        collect_qpdf_enqueue_refs_with_stream_parameters(
-            &mut pdf, &stream, 0, true, &mut found, true,
-        )
-        .expect("stream walk");
-        assert_eq!(found, vec![kept]);
-    }
-
-    #[test]
-    fn stream_parameter_reference_detection_descends_through_containers() {
-        let dropped = ObjectRef::new(42, 0);
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert("Nested", Object::Reference(dropped));
-        let nested = Object::Array(vec![Object::Dictionary({
-            let mut dictionary = Dictionary::new();
-            dictionary.insert(
-                "Stream",
-                Object::Stream(Stream::new(stream_dict, Vec::new())),
-            );
-            dictionary
-        })]);
-
-        assert!(object_contains_reference(
-            &nested,
-            &BTreeSet::from([dropped])
-        ));
-        assert!(!object_contains_reference(&nested, &BTreeSet::new()));
-    }
-
-    #[test]
     fn preserving_unreferenced_objects_does_not_seed_object_zero() {
         let mut pdf = Pdf::open_mem_owned(build_raw_pdf(&[(1, b"<< /Type /Catalog >>")]))
             .expect("minimal PDF must open");
@@ -1959,12 +1536,20 @@ mod tests {
     fn one_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/one-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 7);
         assert_eq!(
             tag_sequence(&mut pdf, &map),
             vec!["/Catalog", "dict", "/Pages", "/Page", "stream", "dict", "/Font"]
         );
+    }
+
+    #[test]
+    fn type_tag_classifies_a_non_dictionary_handle() {
+        let bytes = build_raw_pdf(&[(1, b"<< /Type /Catalog /Pages 2 0 R >>"), (2, b"17")]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+
+        assert_eq!(type_tag(&mut pdf, ObjectRef::new(2, 0)), "other");
     }
 
     #[test]
@@ -1974,7 +1559,7 @@ mod tests {
         let root = pdf.root_ref().expect("root");
         let original_root = pdf.resolve_object(root).expect("resolve root");
 
-        let map = CatalogFirstRenumber::build_qpdf(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
 
         assert_eq!(
             map.pairs().collect::<Vec<_>>(),
@@ -2005,7 +1590,7 @@ mod tests {
         let bytes = build_raw_pdf(&[(1, catalog), (2, pages), (3, page), (5, b"null")]);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
 
-        let map = CatalogFirstRenumber::build_qpdf(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
 
         assert_eq!(
             map.new_for_original(ObjectRef::new(5, 0)),
@@ -2166,7 +1751,7 @@ mod tests {
     fn two_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/two-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 9);
         assert_eq!(
             tag_sequence(&mut pdf, &map),
@@ -2180,7 +1765,7 @@ mod tests {
     fn three_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 11);
         assert_eq!(
             tag_sequence(&mut pdf, &map),
@@ -2195,7 +1780,7 @@ mod tests {
     fn pairs_yield_ascending_new_numbers_from_one() {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/one-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         let news: Vec<u32> = map.pairs().map(|(new, _old)| new.number).collect();
         assert_eq!(news, vec![1, 2, 3, 4, 5, 6, 7]);
         assert!(map.pairs().all(|(new, _)| new.generation == 0));
@@ -2214,7 +1799,7 @@ mod tests {
         let bytes =
             include_bytes!("../../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
         let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
 
         // Six live objects remain (holder dropped), numbered contiguously 1..=6.
         assert_eq!(map.len(), 6);
@@ -2232,7 +1817,7 @@ mod tests {
         let bytes =
             include_bytes!("../../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
         let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, false).expect("build");
+        let map = canonical_build_for_test(&mut pdf, false).expect("build");
         assert!(
             map.new_for_original(ObjectRef::new(7, 0)).is_some(),
             "with skip_length=false the /Length holder stays numbered"
@@ -2262,7 +1847,7 @@ mod tests {
         ]);
 
         let mut pdf = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         assert!(
             map.new_for_original(ObjectRef::new(6, 0)).is_none(),
             "holder reached only via /Length plus an unreachable referrer must be dropped"
@@ -2319,7 +1904,7 @@ mod tests {
         // skip_length=true (qpdf-faithful): holder kept, numbered at the late
         // non-/Length position (7), AFTER the stream's other child obj 8 (6).
         let mut pdf = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         assert_eq!(
             map.new_for_original(ObjectRef::new(6, 0)),
             Some(ObjectRef::new(7, 0)),
@@ -2335,7 +1920,7 @@ mod tests {
         // obj 8 take the OPPOSITE numbers — proving the skip actually moves the
         // holder's position (this is the divergence qdf intentionally keeps).
         let mut pdf_qdf = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
-        let map_qdf = CatalogFirstRenumber::build(&mut pdf_qdf, false).expect("build");
+        let map_qdf = canonical_build_for_test(&mut pdf_qdf, false).expect("build");
         assert_eq!(
             map_qdf.new_for_original(ObjectRef::new(6, 0)),
             Some(ObjectRef::new(6, 0))
@@ -2371,7 +1956,7 @@ mod tests {
             ),
         ]);
         let mut pdf = Pdf::open_mem_owned(pdf_bytes).expect("open");
-        let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
+        let map = canonical_build_for_test(&mut pdf, true).expect("build");
         assert!(
             map.new_for_original(ObjectRef::new(6, 0)).is_none(),
             "holder referenced only from an unreachable source ObjStm must be dropped"
@@ -2484,115 +2069,10 @@ mod tests {
     }
 
     #[test]
-    fn renumber_refs_in_place_directizes_dropped_length_holder() {
-        // The /Length holder (40,0) is absent from the map (dropped as an
-        // orphan); the stream's other ref (10,0) is mapped.
-        let map = CatalogFirstRenumber {
-            old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
-            order: vec![ObjectRef::new(10, 0)],
-        };
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert("Length", Object::Reference(ObjectRef::new(40, 0)));
-        stream_dict.insert("S", Object::Reference(ObjectRef::new(10, 0)));
-        let mut obj = Object::Stream(Stream::new(stream_dict, b"hello".to_vec()));
-
-        renumber_refs_in_place(&mut obj, &map).expect("rewrite");
-
-        let strm = obj.as_stream().unwrap();
-        // The dangling /Length is direct-ized to the raw byte count (5), not
-        // errored; the genuinely-mapped /S is renumbered normally.
-        assert_eq!(strm.dict.get("Length"), Some(&Object::Integer(5)));
-        assert_eq!(
-            strm.dict.get("S"),
-            Some(&Object::Reference(ObjectRef::new(1, 0)))
-        );
-    }
-
-    #[test]
-    fn renumber_refs_in_place_renumbers_mapped_length_holder() {
-        // A /Length holder that IS in the map (not dropped) must be renumbered as
-        // an ordinary reference, never direct-ized.
-        let map = CatalogFirstRenumber {
-            old_to_new: HashMap::from([(ObjectRef::new(40, 0), ObjectRef::new(3, 0))]),
-            order: vec![ObjectRef::new(40, 0)],
-        };
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert("Length", Object::Reference(ObjectRef::new(40, 0)));
-        let mut obj = Object::Stream(Stream::new(stream_dict, b"x".to_vec()));
-
-        renumber_refs_in_place(&mut obj, &map).expect("rewrite");
-
-        assert_eq!(
-            obj.as_stream().unwrap().dict.get("Length"),
-            Some(&Object::Reference(ObjectRef::new(3, 0)))
-        );
-    }
-
-    #[test]
-    fn renumber_refs_in_place_rewrites_nested_refs() {
-        // Build a map directly: original (10,0)->new(1,0), (20,5)->new(2,0).
-        let map = CatalogFirstRenumber {
-            old_to_new: HashMap::from([
-                (ObjectRef::new(10, 0), ObjectRef::new(1, 0)),
-                (ObjectRef::new(20, 5), ObjectRef::new(2, 0)),
-            ]),
-            order: vec![ObjectRef::new(10, 0), ObjectRef::new(20, 5)],
-        };
-
-        let mut inner = Dictionary::new();
-        inner.insert("Ref", Object::Reference(ObjectRef::new(20, 5)));
-        let mut stream_dict = Dictionary::new();
-        stream_dict.insert("S", Object::Reference(ObjectRef::new(10, 0)));
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "Arr",
-            Object::Array(vec![
-                Object::Reference(ObjectRef::new(10, 0)),
-                Object::Dictionary(inner),
-                Object::Integer(7),
-            ]),
-        );
-        dict.insert(
-            "Strm",
-            Object::Stream(Stream::new(stream_dict, b"opaque".to_vec())),
-        );
-        let mut obj = Object::Dictionary(dict);
-
-        renumber_refs_in_place(&mut obj, &map).expect("rewrite");
-
-        let dict = obj.as_dict().unwrap();
-        let arr = dict.get("Arr").unwrap().as_array().unwrap();
-        assert_eq!(arr[0], Object::Reference(ObjectRef::new(1, 0)));
-        let inner = arr[1].as_dict().unwrap();
-        assert_eq!(
-            inner.get("Ref"),
-            Some(&Object::Reference(ObjectRef::new(2, 0)))
-        );
-        assert_eq!(arr[2], Object::Integer(7));
-        let strm = dict.get("Strm").unwrap().as_stream().unwrap();
-        assert_eq!(
-            strm.dict.get("S"),
-            Some(&Object::Reference(ObjectRef::new(1, 0)))
-        );
-        assert_eq!(strm.data, b"opaque");
-    }
-
-    #[test]
-    fn renumber_refs_in_place_errors_on_unmapped_ref() {
-        let map = CatalogFirstRenumber {
-            old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
-            order: vec![ObjectRef::new(10, 0)],
-        };
-        let mut obj = Object::Reference(ObjectRef::new(99, 0));
-        let err = renumber_refs_in_place(&mut obj, &map).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    #[test]
     fn renumber_qpdf_refs_in_place_errors_on_unmapped_ref() {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/one-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber {
+        let map = CanonicalCatalogFirstRenumber {
             old_to_new: HashMap::new(),
             order: Vec::new(),
         };
@@ -2614,27 +2094,10 @@ mod tests {
     }
 
     #[test]
-    fn renumber_refs_in_place_errors_on_excessive_nesting() {
-        // A reference buried deeper than MAX_INLINE_DEPTH must NOT be silently
-        // left un-rewritten (which would point it at the wrong object); the
-        // rewrite must refuse with an error instead.
-        let map = CatalogFirstRenumber {
-            old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
-            order: vec![ObjectRef::new(10, 0)],
-        };
-        let mut obj = nest_in_arrays(
-            Object::Reference(ObjectRef::new(10, 0)),
-            MAX_INLINE_DEPTH + 5,
-        );
-        let err = renumber_refs_in_place(&mut obj, &map).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    #[test]
     fn renumber_qpdf_refs_in_place_errors_on_excessive_nesting() {
         let bytes = include_bytes!("../../../../tests/fixtures/compat/one-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let map = CatalogFirstRenumber {
+        let map = CanonicalCatalogFirstRenumber {
             old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
             order: vec![ObjectRef::new(10, 0)],
         };
@@ -2646,43 +2109,5 @@ mod tests {
         let err = renumber_qpdf_refs_in_place(&mut pdf, &mut obj, &map).unwrap_err();
 
         assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    #[test]
-    fn collect_refs_errors_on_excessive_nesting() {
-        // The numbering walk must refuse over-deep inline nesting rather than
-        // silently skipping references it cannot reach.
-        let obj = nest_in_arrays(
-            Object::Reference(ObjectRef::new(10, 0)),
-            MAX_INLINE_DEPTH + 5,
-        );
-        let err = collect_refs(&obj, 0, true, &mut |_| {}).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    #[test]
-    fn collect_qpdf_enqueue_refs_errors_on_excessive_nesting() {
-        let bytes = include_bytes!("../../../../tests/fixtures/compat/one-page.pdf");
-        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
-        let obj = nest_in_arrays(
-            Object::Reference(ObjectRef::new(10, 0)),
-            MAX_INLINE_DEPTH + 5,
-        );
-        let mut found = Vec::new();
-
-        let err = collect_qpdf_enqueue_refs(&mut pdf, &obj, 0, true, &mut found).unwrap_err();
-
-        assert!(matches!(err, Error::Unsupported(_)));
-    }
-
-    #[test]
-    fn collect_refs_accepts_nesting_up_to_the_limit() {
-        // The buried Reference sits at exactly inline depth MAX_INLINE_DEPTH,
-        // the deepest level accepted under the strict `>` guard; it is walked
-        // normally and collected, not errored.
-        let obj = nest_in_arrays(Object::Reference(ObjectRef::new(10, 0)), MAX_INLINE_DEPTH);
-        let mut collected: Vec<ObjectRef> = Vec::new();
-        collect_refs(&obj, 0, true, &mut |r| collected.push(r)).expect("within limit");
-        assert_eq!(collected, vec![ObjectRef::new(10, 0)]);
     }
 }
