@@ -1948,49 +1948,42 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         let page_ref = ObjectRef::new(3, 0);
 
-        let mut appearance_dict = Dictionary::new();
-        appearance_dict.insert("Type", Object::Name(b"XObject".to_vec()));
-        appearance_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
-        appearance_dict.insert(
-            "BBox",
-            Object::Array(vec![
-                Object::Integer(0),
-                Object::Integer(0),
-                Object::Integer(1),
-                Object::Integer(1),
-            ]),
-        );
-        let mut appearance = Dictionary::new();
-        appearance.insert(
-            "N",
-            Object::Stream(Stream::new(appearance_dict, Vec::new())),
-        );
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(appearance));
+        let appearance_dict = ObjectHandle::dictionary(vec![
+            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+            (
+                b"/BBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(1),
+                    ObjectHandle::integer(1),
+                ]),
+            ),
+        ]);
+        let appearance = ObjectHandle::dictionary(vec![(
+            b"/N".to_vec(),
+            ObjectHandle::stream(appearance_dict, Rc::new(Vec::new())),
+        )]);
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (b"/AP".to_vec(), appearance),
+        ]);
 
-        let mut page = pdf
-            .resolve_object(page_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        page.insert("Annots", Object::Array(vec![Object::Dictionary(widget)]));
-        pdf.set_object(page_ref, Object::Dictionary(page));
-
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(Dictionary::new()))
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        page.replace_key(b"/Annots", ObjectHandle::array(vec![widget]))
             .unwrap();
+        pdf.mark_object_handle_dirty(&page).unwrap();
+
+        let default_resources = ObjectHandle::dictionary(Vec::new());
         merge_widget_default_resources_on_page(&mut pdf, page_ref, &default_resources).unwrap();
 
-        let page = pdf.resolve_object(page_ref).unwrap();
-        let annots = page
-            .as_dict()
-            .unwrap()
-            .get("Annots")
-            .unwrap()
-            .as_array()
-            .unwrap();
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).unwrap();
+        let annots = page.try_get_key(b"/Annots").unwrap();
+        pdf.resolve(&annots).unwrap();
+        let annots = annots.as_array().unwrap();
         assert_eq!(annots.len(), 1);
     }
 
