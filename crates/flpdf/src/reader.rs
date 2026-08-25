@@ -9755,6 +9755,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_make_indirect_at_int_max_does_not_leave_a_stale_tree_claim() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
+        let direct = ObjectHandle::integer(42);
+        let alias = direct.clone();
+
+        pdf.make_indirect_from_object_handle(direct)
+            .expect_err("allocation must fail at INT_MAX");
+
+        // A failed promotion must leave `alias` fully untouched, including
+        // the tree-claim token this Pdf's attempt would have set on success
+        // -- an unrelated Pdf must still be free to claim it as a
+        // name/number tree root afterward.
+        let other_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open other pdf");
+        alias
+            .claim_tree_pdf(other_pdf.unique_id())
+            .expect("a failed promotion must not leave a stale tree claim behind");
+    }
+
+    #[test]
     fn replace_object_handle_preserves_target_identity_and_shares_payload() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
