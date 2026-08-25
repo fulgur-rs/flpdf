@@ -389,6 +389,40 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             done: false,
         })
     }
+
+    fn visit_node(&mut self, node: ObjectRef, depth: usize) -> Result<Option<ObjectRef>> {
+        let node_obj = self.pdf.get_object_handle(node);
+        self.pdf.resolve(&node_obj)?;
+
+        if node_obj.as_dictionary().is_none() {
+            return Ok(None); // non-dictionary: skip silently
+        }
+
+        let node_type = self
+            .pdf
+            .resolve_to_terminal(&node_obj.try_get_key(b"/Type")?)?;
+
+        if node_type.as_name().as_deref() == Some(b"Pages") {
+            let kids = self
+                .pdf
+                .resolve_to_terminal(&node_obj.try_get_key(b"/Kids")?)?;
+            if let Some(kids) = kids.as_array() {
+                // Push in reverse order so that the first kid is popped first.
+                for kid in kids.iter().rev() {
+                    if let Some(r) = kid.object_ref() {
+                        self.stack.push((r, depth + 1));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        if node_type.as_name().as_deref() == Some(b"Page") {
+            return Ok(Some(node));
+        }
+
+        Ok(None)
+    }
 }
 
 impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
@@ -414,56 +448,14 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
                 continue; // cycle guard: already visited
             }
 
-            let node_obj = self.pdf.get_object_handle(node);
-            if let Err(e) = self.pdf.resolve(&node_obj) {
-                self.done = true;
-                return Some(Err(e));
-            }
-
-            if node_obj.as_dictionary().is_none() {
-                continue; // non-dictionary: skip silently
-            }
-
-            let node_type = match node_obj.try_get_key(b"/Type") {
-                Ok(value) => value,
-                Err(e) => {
+            match self.visit_node(node, depth) {
+                Ok(Some(page)) => return Some(Ok(page)),
+                Ok(None) => continue,
+                Err(error) => {
                     self.done = true;
-                    return Some(Err(e));
+                    return Some(Err(error));
                 }
-            };
-            if let Err(e) = self.pdf.resolve(&node_type) {
-                self.done = true;
-                return Some(Err(e));
             }
-
-            if node_type.as_name().as_deref() == Some(b"Pages") {
-                let kids = match node_obj.try_get_key(b"/Kids") {
-                    Ok(value) => value,
-                    Err(e) => {
-                        self.done = true;
-                        return Some(Err(e));
-                    }
-                };
-                if let Err(e) = self.pdf.resolve(&kids) {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-                if let Some(kids) = kids.as_array() {
-                    // Push in reverse order so that the first kid is popped first.
-                    for kid in kids.iter().rev() {
-                        if let Some(r) = kid.object_ref() {
-                            self.stack.push((r, depth + 1));
-                        }
-                    }
-                }
-                continue;
-            }
-
-            if node_type.as_name().as_deref() == Some(b"Page") {
-                return Some(Ok(node));
-            }
-
-            // Unknown or absent /Type: skip silently.
         }
     }
 }
