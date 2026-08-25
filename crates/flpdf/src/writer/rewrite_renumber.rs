@@ -766,7 +766,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
             result: &mut result,
             removed_refs,
         };
-        walk_resurrectable_handle(pdf, &value, 0, false, true, &mut state)?;
+        walk_resurrectable_handle(&value, 0, false, true, &mut state)?;
         queue.extend(follow);
     }
 
@@ -782,7 +782,7 @@ pub(crate) fn resurrectable_null_refs_excluding<R: Read + Seek>(
             result: &mut result,
             removed_refs,
         };
-        walk_resurrectable_handle(pdf, &handle, 0, false, false, &mut state)?;
+        walk_resurrectable_handle(&handle, 0, false, false, &mut state)?;
         for r in follow {
             if !visited.contains(&r) {
                 queue.push_back(r);
@@ -804,8 +804,7 @@ struct ResurrectableWalkState<'a> {
     removed_refs: &'a BTreeSet<ObjectRef>,
 }
 
-fn walk_resurrectable_handle<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn walk_resurrectable_handle(
     handle: &crate::ObjectHandle,
     depth: usize,
     in_array: bool,
@@ -849,14 +848,14 @@ fn walk_resurrectable_handle<R: Read + Seek>(
 
     if let Some(elements) = handle.try_as_array()? {
         for element in elements {
-            walk_resurrectable_handle(pdf, &element, depth + 1, true, true, state)?;
+            walk_resurrectable_handle(&element, depth + 1, true, true, state)?;
         }
         return Ok(());
     }
 
     if let Some(entries) = handle.try_as_dictionary()? {
         for (_key, value) in entries {
-            walk_resurrectable_handle(pdf, &value, depth + 1, false, true, state)?;
+            walk_resurrectable_handle(&value, depth + 1, false, true, state)?;
         }
         return Ok(());
     }
@@ -864,7 +863,7 @@ fn walk_resurrectable_handle<R: Read + Seek>(
     if let Some(stream_dict) = handle.as_stream_dict() {
         if let Some(entries) = stream_dict.try_as_dictionary()? {
             for (_key, value) in entries {
-                walk_resurrectable_handle(pdf, &value, depth + 1, false, true, state)?;
+                walk_resurrectable_handle(&value, depth + 1, false, true, state)?;
             }
         }
     }
