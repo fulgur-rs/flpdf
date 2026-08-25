@@ -2,6 +2,40 @@ use flpdf::Pdf;
 use std::io::Cursor;
 
 #[test]
+fn final_legacy_object_route_is_absent() {
+    let sources = [
+        ("lib.rs", include_str!("../src/lib.rs")),
+        ("reader.rs", include_str!("../src/reader.rs")),
+        ("pdf.rs", include_str!("../src/pdf.rs")),
+        ("object_handle.rs", include_str!("../src/object_handle.rs")),
+    ];
+    let forbidden = [
+        ("public Object export", "pub use object::{Dictionary, Object"),
+        ("resolve_object", "pub fn resolve_object("),
+        ("resolve_borrowed", "pub fn resolve_borrowed("),
+        ("materialization memo", "legacy_materialized_memo"),
+        (
+            "materialization replacement set",
+            "legacy_materialized_replacement_refs",
+        ),
+        ("resolve_to_cache", "fn resolve_to_cache("),
+        (
+            "ObjectHandle materialize",
+            "pub fn materialize(&self) -> Result<Object>",
+        ),
+    ];
+
+    for (file, source) in sources {
+        for (name, marker) in forbidden {
+            assert!(
+                !source.contains(marker),
+                "final legacy {name} marker {marker:?} remains in {file}"
+            );
+        }
+    }
+}
+
+#[test]
 fn qpdf_named_handle_enumeration_has_no_legacy_alias() {
     let production = include_str!("../src/reader.rs");
     assert!(!production.contains("pub fn get_all_object_handles"));
