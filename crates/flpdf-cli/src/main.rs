@@ -294,6 +294,9 @@ struct Cli {
     // Legacy options kept for compatibility.
     #[arg(long)]
     check: bool,
+    /// Suppress warning delivery while retaining qpdf's warning exit status.
+    #[arg(long)]
+    no_warn: bool,
     /// Check whether the input's linearization hint tables are correct
     /// (qpdf --check-linearization).
     #[arg(
@@ -1917,7 +1920,7 @@ fn main() {
     } else if args.show_linearization {
         run_show_linearization(args.input)
     } else if args.check {
-        run_check(args.input, args.repair, &args.password)
+        run_check(args.input, args.repair, &args.password, args.no_warn)
     } else if args.list_attachments {
         run_list_attachments(args.input, args.repair, &args.password, args.verbose)
     } else if let Some(key) = args.show_attachment {
@@ -2513,7 +2516,7 @@ fn run_json_document<R: Read + Seek>(
 
 fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()> {
     match command {
-        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password),
+        Commands::Check(cmd) => run_check(Some(cmd.input), cmd.repair, &cmd.password, false),
         Commands::CheckLinearization(cmd) => {
             run_check_linearization(Some(cmd.input), false, &PasswordArgs::default())
         }
@@ -2754,12 +2757,18 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
     }
 }
 
-fn run_check(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+fn run_check(
+    input: Option<PathBuf>,
+    repair: bool,
+    password: &PasswordArgs,
+    no_warn: bool,
+) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let file = File::open(&input).map_err(|error| error_with_file(&input, error.into()))?;
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
+    job.set_suppress_warnings(no_warn);
     let mut options = pdf_open_options(repair, password)?;
     // The job emits the collected diagnostics once, after the qpdf check
     // banner, and owns the shared warning completion boundary.
