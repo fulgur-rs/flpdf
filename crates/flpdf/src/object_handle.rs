@@ -791,6 +791,12 @@ struct ObjectSlot {
     end_before_space: i64,
     end_after_space: i64,
     pdf_unique_ids: BTreeSet<u64>,
+    /// The document identity claimed by a handle-native name/number-tree
+    /// wrapper while this shared root is still contextless. qpdf's tree
+    /// helper retains its owning `QPDF` alongside the shared object handle;
+    /// this token preserves that single-document boundary for flpdf's
+    /// per-call `&mut Pdf` API without introducing a raw-object bridge.
+    tree_pdf_unique_id: Option<u64>,
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
     description: Option<ObjectDescription>,
     /// qpdf's `QPDF_Stream::token_filters` list. It is attached to the
@@ -1221,6 +1227,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
+            tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
@@ -1253,6 +1260,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
+            tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
@@ -1310,6 +1318,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
+            tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
@@ -1340,6 +1349,7 @@ impl ObjectHandle {
             end_before_space: NO_PARSED_OFFSET,
             end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
+            tree_pdf_unique_id: None,
             containment_parents: Vec::new(),
             description: None,
             stream_token_filters: Rc::new(RefCell::new(Vec::new())),
@@ -1568,6 +1578,7 @@ impl ObjectHandle {
         let mut slot = self.0.borrow_mut();
         slot.object_ref = None;
         slot.active_pdf_unique_id = None;
+        slot.tree_pdf_unique_id = None;
         slot.resolver = None;
         slot.description = None;
         slot.parsed_offset = NO_PARSED_OFFSET;
@@ -1884,6 +1895,25 @@ impl ObjectHandle {
         true
     }
 
+    /// Claim this shared handle as the root of a name/number tree in one
+    /// document. A wrapper stores its own fast-path claim, but clones of the
+    /// same contextless root must observe the first wrapper's claim as well.
+    /// This is the Rust-side equivalent of qpdf's helper retaining its owning
+    /// `QPDF` next to the shared `QPDFObjectHandle`.
+    pub(crate) fn claim_tree_pdf(&self, pdf_unique_id: u64) -> Result<()> {
+        let mut slot = self.0.borrow_mut();
+        match slot.tree_pdf_unique_id {
+            None => {
+                slot.tree_pdf_unique_id = Some(pdf_unique_id);
+                Ok(())
+            }
+            Some(owner) if owner == pdf_unique_id => Ok(()),
+            Some(_) => Err(Error::Unsupported(
+                "name/number tree root belongs to a different Pdf".to_string(),
+            )),
+        }
+    }
+
     /// Sever this indirect handle's resolved value, dropping any `ObjectHandle`
     /// children it holds. A no-op for a direct handle.
     ///
@@ -1924,6 +1954,7 @@ impl ObjectHandle {
         let mut slot = self.0.borrow_mut();
         slot.object_ref = None;
         slot.active_pdf_unique_id = None;
+        slot.tree_pdf_unique_id = None;
         slot.resolver = None;
         if should_destroy {
             slot.description = None;
