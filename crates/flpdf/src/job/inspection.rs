@@ -7,7 +7,9 @@
 
 use super::lifecycle::{JobExitCode, QPDFJob};
 use crate::writer::DecodeLevel;
-use crate::{Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, Result};
+use crate::{
+    Error, ObjectHandle, ObjectRef, PageDocumentHelper, PageObjectHelper, Pdf, Result, XrefEntry,
+};
 use std::io::{Read, Seek};
 
 impl QPDFJob {
@@ -139,6 +141,37 @@ impl QPDFJob {
             let pages = root.try_get_key(b"/Pages")?;
             let count = pages.try_get_key(b"/Count")?.try_get_int_value()?;
             logger.info(format!("{count}\n"))
+        })
+    }
+
+    /// Show the effective cross-reference table through qpdf's inspection
+    /// lifecycle (`QPDF::showXRefTable`, `libqpdf/QPDF.cc:1213-1240`). The
+    /// reader-owned snapshot is the same table qpdf exposes through
+    /// `QPDF::getXRefTable` (`QPDF.cc:2370-2377`), so this consumer does not
+    /// inspect raw xref-stream bytes or reconstruct a second table.
+    pub fn show_xref<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<JobExitCode> {
+        let logger = self.logger();
+        self.inspect(pdf, |pdf| {
+            for (object_ref, entry) in pdf.get_xref_table() {
+                let line = match entry {
+                    XrefEntry::Free { .. } => {
+                        return Err(Error::Internal(
+                            "unknown cross-reference table type while showing xref_table"
+                                .to_owned(),
+                        ));
+                    }
+                    XrefEntry::Uncompressed { offset } => format!(
+                        "{}/{}: uncompressed; offset = {offset}\n",
+                        object_ref.number, object_ref.generation
+                    ),
+                    XrefEntry::Compressed { stream, index } => format!(
+                        "{}/{}: compressed; stream = {stream}, index = {index}\n",
+                        object_ref.number, object_ref.generation
+                    ),
+                };
+                logger.info(line)?;
+            }
+            Ok(())
         })
     }
 
@@ -430,5 +463,21 @@ mod tests {
         logger.set_info(Some(logger.discard()));
         write_page_attribute(&logger, "missing", &ObjectHandle::null()).unwrap();
         write_page_attribute(&logger, "value", &ObjectHandle::integer(7)).unwrap();
+    }
+
+    #[test]
+    fn show_xref_rejects_a_type_zero_entry_like_qpdf() {
+        let mut pdf = recovered_pdf();
+        pdf.resolver
+            .insert_default_xref_entry_for_test(ObjectRef::new(99, 0));
+
+        let error = quiet_job()
+            .show_xref(&mut pdf)
+            .expect_err("qpdf rejects a type-zero entry while showing xref");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "unknown cross-reference table type while showing xref_table"
+        ));
     }
 }

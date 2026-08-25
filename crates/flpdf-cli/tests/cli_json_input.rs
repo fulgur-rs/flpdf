@@ -109,7 +109,7 @@ fn json_input_inspection_modes_match_qpdf_11_9() {
         return;
     }
 
-    for option in ["--check", "--show-npages", "--show-pages"] {
+    for option in ["--check", "--show-npages", "--show-pages", "--show-xref"] {
         let qpdf = ShellCommand::new("qpdf")
             .args(["--json-input", option, COMPLETE_JSON])
             .output()
@@ -124,7 +124,7 @@ fn json_input_inspection_modes_match_qpdf_11_9() {
         assert_eq!(flpdf.status.code(), qpdf.status.code(), "{option}");
         assert_eq!(flpdf.stderr, qpdf.stderr, "{option} stderr");
         match option {
-            "--check" | "--show-npages" => assert_eq!(
+            "--check" | "--show-npages" | "--show-xref" => assert_eq!(
                 normalize_program_prefix(&flpdf.stdout),
                 normalize_program_prefix(&qpdf.stdout),
                 "{option}"

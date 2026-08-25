@@ -314,6 +314,8 @@ struct Cli {
     #[arg(long)]
     show_pages: bool,
     #[arg(long)]
+    show_xref: bool,
+    #[arg(long)]
     show_linearization: bool,
 
     /// Run a complete qpdf job JSON file through the production QPDFJob
@@ -340,7 +342,7 @@ struct Cli {
           conflicts_with_all = [
               "check", "linearize", "static_id", "deterministic_id", "static_aes_iv",
               "show_object",
-              "show_npages", "show_pages", "show_linearization", "output",
+              "show_npages", "show_pages", "show_xref", "show_linearization", "output",
               "compress_streams", "linearize_pass1", "remove_restrictions",
               "decrypt", "encrypt", "copy_encryption",
               "add_attachment", "remove_attachment", "list_attachments",
@@ -491,7 +493,7 @@ struct Cli {
     #[arg(long = "remove-restrictions",
           conflicts_with_all = [
               "check", "show_object",
-              "show_npages", "show_pages", "show_linearization",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
           ])]
     remove_restrictions: bool,
     /// Strip the `/Encrypt` dictionary from the output (top-level alias of
@@ -511,7 +513,7 @@ struct Cli {
     #[arg(long = "decrypt",
           conflicts_with_all = [
               "check", "show_object",
-              "show_npages", "show_pages", "show_linearization",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
           ])]
     decrypt: bool,
     /// `qpdf --compress-streams=y|n` compatibility flag.  Accepted but
@@ -586,7 +588,7 @@ struct Cli {
     #[arg(long = "coalesce-contents",
           conflicts_with_all = [
               "check", "show_object",
-              "show_npages", "show_pages", "show_linearization",
+              "show_npages", "show_pages", "show_xref", "show_linearization",
               "list_attachments", "show_attachment", "remove_attachment",
               "add_attachment", "copy_attachments_from",
               "linearize", "pages", "rotate", "split_pages", "empty",
@@ -742,7 +744,7 @@ struct Cli {
         // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
             "check", "show_object",
-            "show_npages", "show_pages", "show_linearization",
+            "show_npages", "show_pages", "show_xref", "show_linearization",
             "remove_restrictions", "decrypt",
             "copy_encryption",
         ],
@@ -767,7 +769,7 @@ struct Cli {
         conflicts_with_all = [
             "encrypt",
             "check", "show_object",
-            "show_npages", "show_pages", "show_linearization",
+            "show_npages", "show_pages", "show_xref", "show_linearization",
             "remove_restrictions", "decrypt",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption); \
@@ -1769,6 +1771,7 @@ fn main() {
                     && args.show_object.is_none()
                     && !args.show_npages
                     && !args.show_pages
+                    && !args.show_xref
                     && !args.show_linearization
                     && !args.check
                     && !args.list_attachments
@@ -1788,7 +1791,7 @@ fn main() {
     }
 
     let json_input_inspection = (args.json_input || args.update_from_json.is_some())
-        && (args.check || args.show_npages || args.show_pages);
+        && (args.check || args.show_npages || args.show_pages || args.show_xref);
 
     // JSON-input/update inspection is routed through the already-created job
     // document before the ordinary file-backed inspection branches. qpdf
@@ -1817,6 +1820,8 @@ fn main() {
         run_show_npages(args.input, args.repair, &args.password)
     } else if args.show_pages {
         run_show_pages(args.input, args.repair, &args.password)
+    } else if args.show_xref {
+        run_show_xref(args.input, args.repair, &args.password)
     } else if args.show_linearization {
         run_show_linearization(args.input)
     } else if args.check {
@@ -2337,6 +2342,9 @@ fn run_job_inspection_on_pdf<R: Read + Seek + 'static>(
     }
     if cli.show_pages {
         return finish_job_exit_status(job.show_pages(pdf)?);
+    }
+    if cli.show_xref {
+        return finish_job_exit_status(job.show_xref(pdf)?);
     }
     Err("JSON input/update inspection mode is missing a consumer".into())
 }
@@ -5265,6 +5273,15 @@ fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs)
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
     finish_job_exit_status(job.show_pages(&mut pdf)?)
+}
+
+fn run_show_xref(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
+    let input = input.ok_or("missing input file")?;
+    let mut pdf = open_pdf(&input, repair, password)?;
+    let mut job = QPDFJob::new();
+    job.set_logger(cli_logger());
+    job.set_message_prefix(progname());
+    finish_job_exit_status(job.show_xref(&mut pdf)?)
 }
 
 fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
