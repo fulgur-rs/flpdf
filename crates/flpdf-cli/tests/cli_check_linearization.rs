@@ -97,7 +97,9 @@ fn top_level_check_linearization_warning_matches_qpdf() {
     assert_eq!(expected.status.code(), Some(3));
     assert_output_matches(&actual, &expected);
     assert!(String::from_utf8_lossy(&actual.stderr).contains("first page object (/O) mismatch"));
-    assert!(String::from_utf8_lossy(&actual.stderr).contains("qpdf: operation succeeded with warnings"));
+    assert!(
+        String::from_utf8_lossy(&actual.stderr).contains("qpdf: operation succeeded with warnings")
+    );
 }
 
 #[test]
