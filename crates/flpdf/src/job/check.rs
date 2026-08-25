@@ -66,6 +66,61 @@ impl ObjectHandleParserCallbacks for DiscardContents {
 }
 
 impl QPDFJob {
+    /// Run qpdf's standalone linearization inspection on the already-open
+    /// document and complete the shared warning/status boundary.
+    ///
+    /// This is the QPDFJob::doInspection branch for
+    /// --check-linearization (libqpdf/QPDFJob.cc:1646-1674). qpdf first
+    /// asks QPDF::isLinearized, then calls QPDF::checkLinearization on the
+    /// same document. Linearization damage is accumulated as a warning by the
+    /// document checker; it is not a CLI exception or a second file open.
+    pub fn check_linearization<R: Read + Seek + 'static>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<JobExitCode> {
+        let logger = self.logger();
+        let input_name = self.input_name().to_owned();
+        pdf.set_logger(logger.clone());
+
+        if !pdf.is_linearized()? {
+            logger.info(format!("{input_name} is not linearized\n"))?;
+            self.record_document_warnings(pdf);
+            return Ok(self.complete(false)?);
+        }
+
+        let mut linearization_warnings = false;
+        let source_bytes = match pdf.source_bytes() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                linearization_warnings = true;
+                emit_warning(
+                    &logger,
+                    &input_name,
+                    format!("error encountered while checking linearization data: {error}"),
+                )?;
+                Vec::new()
+            }
+        };
+
+        if !source_bytes.is_empty() {
+            linearization_warnings = emit_linearization_check_warnings(
+                pdf,
+                &source_bytes,
+                &logger,
+                &input_name,
+                false,
+            )?;
+        }
+
+        if linearization_warnings {
+            self.record_warnings();
+        } else {
+            logger.info(format!("{input_name}: no linearization errors\n"))?;
+        }
+        self.record_document_warnings(pdf);
+        Ok(self.complete(false)?)
+    }
+
     /// Replay qpdf repair diagnostics retained by a failed permissive open.
     ///
     /// `QPDF::processFile` emits these warnings before returning its terminal
