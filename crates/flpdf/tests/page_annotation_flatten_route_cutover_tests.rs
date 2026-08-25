@@ -20,6 +20,7 @@ fn flatten_annotation_removal_assertion_uses_the_live_handle_route() {
         "resolve_borrowed(",
         "Object::",
         "set_object(",
+        "materialize(",
     ] {
         assert!(
             !block.contains(marker),
