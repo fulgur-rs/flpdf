@@ -8,9 +8,7 @@ const QPDF_COPYRIGHT_OUTPUT: &str = "qpdf version 11.9.0\n\
 Copyright (c) 2005-2024 Jay Berkenbilt\n\
 QPDF is licensed under the Apache License, Version 2.0 (the \"License\");\n\
 you may not use this file except in compliance with the License.\n\
-You may obtain a copy of the License at\n\
-\n\
-  http://www.apache.org/licenses/LICENSE-2.0\n\
+You may obtain a copy of the License at\n\n  http://www.apache.org/licenses/LICENSE-2.0\n\
 \n\
 Unless required by applicable law or agreed to in writing, software\n\
 distributed under the License is distributed on an \"AS IS\" BASIS,\n\
