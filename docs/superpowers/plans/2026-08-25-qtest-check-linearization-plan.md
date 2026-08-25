@@ -164,7 +164,43 @@ git add crates/flpdf-cli/src/main.rs crates/flpdf-cli/src/arg_parser.rs crates/f
 git commit -m "feat: wire top-level check-linearization"
 ```
 
-### Task 4: Verify the qtest target and update only evidence-backed attribution
+### Task 4: Cut over qpdf's post-chain generation cleanup
+
+**Files:**
+- Modify: crates/flpdf/src/xref.rs
+- Modify: crates/flpdf/src/linearization/writer.rs
+- Test: crates/flpdf/src/xref.rs unit tests and qtest linearization.test
+
+- [ ] **Step 1: Add the reader-side highest-generation filter**
+
+After the completed ordinary or recovered xref chain has passed the qpdf
+/Size validation, remove every lower-generation row for an object number
+from LoadedXref.entries. Follow the ascending ObjectRef order used by qpdf
+and retain the highest generation. Keep historical xref-stream cache objects
+on their separate cache path; this filter owns only the effective live xref.
+
+- [ ] **Step 2: Run the reader regression tests**
+
+Run cargo test -p flpdf --lib xref::tests.
+
+Expected: all xref tests pass, including explicit coverage that object 7
+generation 0 is removed while generation 1 remains.
+
+- [ ] **Step 3: Remove the obsolete writer-side preemptive rejection**
+
+Delete the linearization plan scan that rejects duplicate source generations.
+The qpdf-shaped reader state now prevents stale generations from entering the
+plan; any remaining writer error must come from the actual emitted-map
+invariant, not from a plan-only bridge that runs before qpdf's writer call
+order.
+
+- [ ] **Step 4: Verify gen1 through all writer modes**
+
+Build the release workspace and run the qtest linearization suite. Confirm the
+gen1 disable, preserve, and generate commands create output and their
+check-linearization rows pass.
+
+### Task 5: Verify the qtest target and update only evidence-backed attribution
 
 **Files:**
 - Create outside the repository: paired temporary qtest artifacts under a
