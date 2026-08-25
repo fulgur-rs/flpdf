@@ -202,6 +202,19 @@ mod tests {
         rotate.as_integer()
     }
 
+    /// True when the page dictionary carries no `/Rotate` key at all.
+    /// `QPDFPageObjectHelper::flattenRotation` calls `removeKey("/Rotate")`
+    /// (`libqpdf/QPDFPageObjectHelper.cc:965`), so a flattened page must fail
+    /// `has_key`, not merely resolve to a non-integer value — `rotate_value`'s
+    /// `as_integer()` collapses "absent" and "present but wrong type" into the
+    /// same `None`, which would not catch a regression that left a malformed
+    /// `/Rotate` behind instead of removing it.
+    fn rotate_key_absent(pdf: &mut Pdf<Cursor<Vec<u8>>>, page_ref: ObjectRef) -> bool {
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page).expect("page resolves");
+        !page.has_key(b"/Rotate")
+    }
+
     #[test]
     fn handle_to_pagebox_rejects_bad_shapes_and_accepts_real_literals() {
         let mut pdf = Pdf::empty().unwrap();
@@ -913,7 +926,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        assert_eq!(rotate_value(&mut pdf, page), None);
+        assert!(rotate_key_absent(&mut pdf, page));
         let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.urx - mb.llx, mb.ury - mb.lly), (300.0, 200.0));
 
@@ -926,7 +939,7 @@ mod tests {
         let buf = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut pdf2 = Pdf::open(Cursor::new(buf)).unwrap();
         let p2 = pages::page_refs(&mut pdf2).unwrap()[0];
-        assert_eq!(rotate_value(&mut pdf2, p2), None);
+        assert!(rotate_key_absent(&mut pdf2, p2));
     }
 
     #[test]
@@ -949,7 +962,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
 
-        assert_eq!(rotate_value(&mut pdf, page), None);
+        assert!(rotate_key_absent(&mut pdf, page));
         // 180 maps [0 0 200 300] back onto itself: dims unchanged.
         let mb = pagebox_for(&mut pdf, page, b"/MediaBox");
         assert_eq!((mb.llx, mb.lly, mb.urx, mb.ury), (0.0, 0.0, 200.0, 300.0));
@@ -1133,7 +1146,7 @@ mod tests {
         let page = pages::page_refs(&mut pdf).unwrap()[0];
         let before = pages::page_content_bytes(&mut pdf, page).unwrap();
         flatten_rotation_on_pages(&mut pdf, &[page]).unwrap();
-        assert_eq!(rotate_value(&mut pdf, page), None);
+        assert!(rotate_key_absent(&mut pdf, page));
         assert_eq!(pages::page_content_bytes(&mut pdf, page).unwrap(), before);
         // The direct page box is untouched because qpdf's facade did not see a
         // direct `/Rotate` value.

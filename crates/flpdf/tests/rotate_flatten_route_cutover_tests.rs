@@ -33,6 +33,7 @@ fn flatten_rotation_rotate_assertions_use_the_live_handle_route() {
             "resolve_borrowed(",
             "Object::",
             "set_object(",
+            "materialize(",
         ] {
             assert!(
                 !block.contains(marker),
@@ -40,8 +41,9 @@ fn flatten_rotation_rotate_assertions_use_the_live_handle_route() {
             );
         }
         assert!(
-            block.contains("rotate_value("),
-            "flatten rotation inspection must use the live rotate_value helper"
+            block.contains("rotate_key_absent("),
+            "flatten rotation inspection must use the live rotate_key_absent helper to \
+             verify /Rotate was removed, not merely resolved to a non-integer value"
         );
     }
 }
