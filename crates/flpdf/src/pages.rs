@@ -16,7 +16,9 @@ pub mod tree_rebuild;
 use crate::pipeline::buffer::Buffer;
 #[cfg(test)]
 use crate::pipeline::test_support::ascii85_fixture_bytes;
-use crate::{Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+#[cfg(test)]
+use crate::Object;
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{Read, Seek};
@@ -368,13 +370,17 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     /// - Any [`Error`] propagated from [`Pdf::resolve`] while resolving the catalog.
     pub fn with_max_depth(pdf: &'a mut Pdf<R>, max_depth: usize) -> Result<Self> {
         let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let catalog = pdf.resolve_borrowed(catalog_ref)?;
-        let Some(catalog) = catalog.as_dict() else {
+        let catalog = pdf.get_object_handle(catalog_ref);
+        pdf.resolve(&catalog)?;
+        if catalog.as_dictionary().is_none() {
             return Err(Error::Unsupported(format!(
                 "document catalog {catalog_ref} is not a dictionary"
             )));
-        };
-        let pages_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
+        }
+        let pages_ref = catalog
+            .try_get_key(b"/Pages")?
+            .object_ref()
+            .ok_or(Error::Missing("/Pages"))?;
         Ok(PageWalk {
             pdf,
             stack: vec![(pages_ref, 0)],
@@ -382,6 +388,38 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
             max_depth,
             done: false,
         })
+    }
+
+    fn visit_node(&mut self, node: ObjectRef, depth: usize) -> Result<Option<ObjectRef>> {
+        let node_obj = self.pdf.get_object_handle(node);
+        self.pdf.resolve(&node_obj)?;
+
+        if node_obj.as_dictionary().is_none() {
+            return Ok(None); // non-dictionary: skip silently
+        }
+
+        let node_type = node_obj.try_get_key(b"/Type")?;
+        self.pdf.resolve(&node_type)?;
+
+        if node_type.as_name().as_deref() == Some(b"Pages") {
+            let kids = node_obj.try_get_key(b"/Kids")?;
+            self.pdf.resolve(&kids)?;
+            if let Some(kids) = kids.as_array() {
+                // Push in reverse order so that the first kid is popped first.
+                for kid in kids.iter().rev() {
+                    if let Some(r) = kid.object_ref() {
+                        self.stack.push((r, depth + 1));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        if node_type.as_name().as_deref() == Some(b"Page") {
+            return Ok(Some(node));
+        }
+
+        Ok(None)
     }
 }
 
@@ -408,43 +446,14 @@ impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
                 continue; // cycle guard: already visited
             }
 
-            let node_obj = match self.pdf.resolve_borrowed(node) {
-                Ok(o) => o,
-                Err(e) => {
+            match self.visit_node(node, depth) {
+                Ok(Some(page)) => return Some(Ok(page)),
+                Ok(None) => continue,
+                Err(error) => {
                     self.done = true;
-                    return Some(Err(e));
+                    return Some(Err(error));
                 }
-            };
-
-            let Some(dict) = node_obj.as_dict() else {
-                continue; // non-dictionary: skip silently
-            };
-
-            let node_type = dict
-                .get("Type")
-                .and_then(|value| match value {
-                    Object::Name(value) => Some(value.as_slice()),
-                    _ => None,
-                })
-                .unwrap_or(&[]);
-
-            if node_type == b"Pages" {
-                if let Some(kids) = dict.get("Kids").and_then(Object::as_array) {
-                    // Push in reverse order so that the first kid is popped first.
-                    for kid in kids.iter().rev() {
-                        if let Object::Reference(r) = kid {
-                            self.stack.push((*r, depth + 1));
-                        }
-                    }
-                }
-                continue;
             }
-
-            if node_type == b"Page" {
-                return Some(Ok(node));
-            }
-
-            // Unknown or absent /Type: skip silently.
         }
     }
 }
@@ -1314,6 +1323,41 @@ mod tests {
     // -----------------------------------------------------------------------
     // PageWalk tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn page_walk_propagates_a_node_read_failure() {
+        let bytes = pdf_from_objects(
+            1,
+            &[
+                (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            ],
+        );
+        let fail = Rc::new(Cell::new(false));
+        let reader = ToggleReadFailure {
+            cursor: Cursor::new(bytes),
+            fail: Rc::clone(&fail),
+        };
+        let mut pdf = Pdf::open(reader).expect("PDF should parse");
+        let mut walk = PageWalk::new(&mut pdf).expect("catalog should be readable");
+        fail.set(true);
+
+        let error = walk
+            .next()
+            .expect("node read must produce an item")
+            .expect_err("node read failure must propagate");
+        assert!(
+            error
+                .to_string()
+                .contains("boundary parent read unexpectedly"),
+            "expected underlying node read failure, got {error}"
+        );
+        assert!(
+            walk.next().is_none(),
+            "PageWalk must be fused after an error"
+        );
+    }
 
     /// Build a minimal valid PDF from a list of (object_number, body_literal) pairs.
     /// `catalog_ref` is the object number of the /Catalog object.
