@@ -323,8 +323,6 @@ impl PlainWritePlan {
             ;
         let trailer_handle = crate::writer::build_writer_trailer_handle(
             pdf,
-            pdf.last_xref_form() == XrefForm::Stream,
-            form == XrefForm::Stream,
             trailer_size,
             root,
             options,

@@ -3200,8 +3200,6 @@ fn apply_encrypt_trailer_handle_entries<R: Read + Seek>(
 #[allow(clippy::too_many_arguments)] // qpdf keeps source form, output form, ID, and encryption independent
 fn build_writer_trailer_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    source_xref_stream: bool,
-    output_xref_stream: bool,
     size: usize,
     root: ObjectRef,
     options: &WriterOptions,
@@ -3213,21 +3211,24 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     for key in [b"/ID".as_slice(), b"/Encrypt", b"/Prev"] {
         trailer.remove_key(key);
     }
-    if source_xref_stream || output_xref_stream {
-        for key in [
-            b"/Type".as_slice(),
-            b"/F",
-            b"/FFilter",
-            b"/FDecodeParms",
-            b"/W",
-            b"/Index",
-            b"/Length",
-            b"/Filter",
-            b"/DecodeParms",
-            b"/XRefStm",
-        ] {
-            trailer.remove_key(key);
-        }
+    // qpdf's getTrimmedTrailer removes every key that may describe an input
+    // cross-reference stream, even when the input's active xref section is a
+    // classic table with a hybrid /XRefStm link
+    // (`libqpdf/QPDFWriter.cc:2009-2031`). These are writer-owned structural
+    // values, not source trailer metadata to preserve.
+    for key in [
+        b"/Type".as_slice(),
+        b"/F",
+        b"/FFilter",
+        b"/FDecodeParms",
+        b"/W",
+        b"/Index",
+        b"/Length",
+        b"/Filter",
+        b"/DecodeParms",
+        b"/XRefStm",
+    ] {
+        trailer.remove_key(key);
     }
     trailer.replace_key(
         b"/Size",
@@ -3250,6 +3251,45 @@ fn build_writer_trailer_handle<R: Read + Seek>(
         generated_id,
     )?; // cov:ignore: validated writer-owned trailer entries; LLVM attributes this continuation to the call setup
     Ok(trailer)
+}
+
+/// Recover the source ObjStm identity qpdf obtains from a compressed xref
+/// entry, rather than from the source stream's dictionary type
+/// (`QPDF.cc:2381-2390`).
+fn source_objstm_container_for_batch(
+    batch: &[ObjectRef],
+    source_xref_entries: &BTreeMap<ObjectRef, XrefEntry>,
+) -> Option<ObjectRef> {
+    batch
+        .iter()
+        .find_map(|member| match source_xref_entries.get(member) {
+            Some(XrefEntry::Compressed { stream, .. }) => Some(ObjectRef::new(*stream, 0)),
+            Some(XrefEntry::Free { .. } | XrefEntry::Uncompressed { .. }) | None => None,
+        })
+}
+
+/// Translate a source ObjStm's `/Extends` target into the output container
+/// number. qpdf resolves this relation through the source object-stream map;
+/// only when the target is not itself preserved does it fall back to the
+/// ordinary output renumber map (`QPDFWriter.cc:1731-1738`).
+fn remap_source_objstm_extends(
+    extends: ObjectRef,
+    source_container_to_batch: &HashMap<ObjectRef, usize>,
+    container_refs: &[ObjectRef],
+    qdf: bool,
+    qdf_emission_renumber: &HashMap<ObjectRef, ObjectRef>,
+    renumber: &dyn crate::writer::rewrite_renumber::NewNumberLookup,
+) -> Option<ObjectRef> {
+    source_container_to_batch
+        .get(&extends)
+        .and_then(|batch_idx| container_refs.get(*batch_idx).copied())
+        .or_else(|| {
+            if qdf {
+                qdf_emission_renumber.get(&extends).copied()
+            } else {
+                renumber.new_for_original(extends)
+            }
+        })
 }
 
 /// Whether `cipher` needs an AES CBC initialization vector: `true` for both
@@ -4297,23 +4337,50 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         }
     }
 
-    // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
-    // Drive emission from the Catalog-first map: `(new_ref, old_ref)` pairs in
-    // ascending new-number order. The new numbers are a contiguous `1..=N`, so
-    // `existing_max` is simply `N` and aux objects (ObjStm containers,
-    // /Encrypt, qdf length-holders) allocate above it. Object 0 / deleted refs
-    // are never reachable from /Root, so they never appear here.
-    let renumbered: Vec<(ObjectRef, ObjectRef)> = renumber.pairs().collect();
-
     if options.qdf && !plan.batches.is_empty() {
         // QPDFWriter's reverse object-stream map is a std::set<QPDFObjGen>, so
         // members inside both generated and preserved containers are emitted
-        // in object-number order. The standard enqueue walk below determines
-        // the physical order of the containers themselves.
+        // in object-number order. The standard enqueue walk determines the
+        // physical order of the containers themselves. Use the same
+        // ObjStm-aware walk for QDF's source-object order: the old
+        // CatalogFirstRenumber walk cannot see references nested in compressed
+        // members, so it visits page-tree children before outline destinations
+        // (`QPDFWriter.cc:1057-1118`).
         for batch in &mut plan.batches {
             batch.sort_unstable_by_key(|member| (member.number, member.generation));
         }
     }
+
+    // ── Step 2 & 3: build member→batch lookup and allocate container numbers ─
+    // Drive emission from the qpdf enqueue order: `(new_ref, old_ref)` pairs in
+    // ascending reservation order. QDF must include the extra reservation made
+    // for each ObjStm container and its sorted members before ordinary page
+    // descendants are assigned. Non-QDF specialized routes retain the existing
+    // Catalog-first map; the plain route already owns its container-aware plan.
+    let renumbered: Vec<(ObjectRef, ObjectRef)> = if options.qdf && !plan.batches.is_empty() {
+        use crate::writer::object_streams::ObjectStreamGroup;
+        use crate::writer::rewrite_renumber::ObjectStreamRenumber;
+
+        let groups = plan
+            .batches
+            .iter()
+            .cloned()
+            .map(|members| ObjectStreamGroup::Synthetic { members })
+            .collect::<Vec<_>>();
+        let object_stream_renumber = ObjectStreamRenumber::build_with_stream_policy(
+            pdf,
+            &groups,
+            true,
+            &removed_refs,
+            options.preserve_unreferenced_objects,
+            Some(&stream_parameters_removed),
+        )?; // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
+        let mut pairs = object_stream_renumber.pairs().collect::<Vec<_>>();
+        pairs.sort_unstable_by_key(|(new_ref, _)| (new_ref.number, new_ref.generation));
+        pairs
+    } else {
+        renumber.pairs().collect()
+    };
 
     let existing_max: u32 = u32::try_from(renumber.len()).map_err(|_| {
         crate::Error::Unsupported("full-rewrite: renumbered object count overflows u32".to_string())
@@ -4353,6 +4420,27 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             member_batch_index.insert(member_ref, batch_idx);
         }
     }
+    // Preserve the source ObjStm identity for qpdf's `/Extends` relation.
+    // `PackingPlan` carries member batches for the specialized route, so
+    // recover each source container from the compressed xref entry rather
+    // than guessing from `/Type /ObjStm` (qpdf derives this relation from the
+    // xref table, `QPDF.cc:2381-2390`). Generated batches have no source
+    // container and therefore no `/Extends` value.
+    let source_xref_entries = pdf.source_xref_entries();
+    let source_container_for_batch: Vec<Option<ObjectRef>> =
+        if options.object_streams == ObjectStreamMode::Preserve {
+            plan.batches
+                .iter()
+                .map(|batch| source_objstm_container_for_batch(batch, &source_xref_entries))
+                .collect()
+        } else {
+            vec![None; plan.batches.len()]
+        };
+    let source_container_to_batch: HashMap<ObjectRef, usize> = source_container_for_batch
+        .iter()
+        .enumerate()
+        .filter_map(|(batch_idx, source)| source.map(|source| (source, batch_idx)))
+        .collect();
     // Resolve /Metadata stream ref up front for --cleartext-metadata support.
     let metadata_ref = if options
         .encrypt
@@ -5163,8 +5251,30 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         } else {
             options.compress_streams
         };
+        let extends = if let Some(source_container) = source_container_for_batch[batch_idx] {
+            let source_handle = pdf.get_object_handle(source_container);
+            pdf.resolve(&source_handle)?;
+            let extends = source_handle
+                .as_stream_dict()
+                .map(|dict| dict.try_get_key(b"/Extends"))
+                .transpose()?
+                .and_then(|handle| handle.object_ref());
+            extends.map(|extends| {
+                remap_source_objstm_extends(
+                    extends,
+                    &source_container_to_batch,
+                    &container_refs,
+                    options.qdf,
+                    &qdf_emission_renumber,
+                    &renumber,
+                )
+            })
+        } else {
+            None
+        }
+        .flatten();
         let (stream_handle, stream_data) =
-            object_streams::wrap_objstm_body_as_handle(&body, objstm_compression, None)?;
+            object_streams::wrap_objstm_body_as_handle(&body, objstm_compression, extends)?;
         let objstm_first = if options.qdf {
             body.first_offset
                 .checked_add(qdf_first_member_body_offset.unwrap_or(0))
@@ -5238,7 +5348,13 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             bytes.extend_from_slice(b"<<\n  /Type /ObjStm\n");
             bytes.extend_from_slice(format!("  /Length {stream_length}\n").as_bytes());
             bytes.extend_from_slice(format!("  /N {}\n", body.n_members).as_bytes());
-            bytes.extend_from_slice(format!("  /First {objstm_first}\n>>").as_bytes());
+            bytes.extend_from_slice(format!("  /First {objstm_first}\n").as_bytes());
+            if let Some(extends) = extends {
+                bytes.extend_from_slice(
+                    format!("  /Extends {} {} R\n", extends.number, extends.generation).as_bytes(),
+                );
+            }
+            bytes.extend_from_slice(b">>");
             serialize::write_stream_payload_with_qdf(
                 &mut bytes,
                 &stream_data,
@@ -5399,8 +5515,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // Trailer — start from the document trailer, strip incremental keys.
             let trailer = build_writer_trailer_handle(
                 pdf,
-                pdf.last_xref_form() == XrefForm::Stream,
-                false,
                 object_count,
                 new_root,
                 options,
@@ -5545,8 +5659,6 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             };
             let trailer_handle = build_writer_trailer_handle(
                 pdf,
-                pdf.last_xref_form() == XrefForm::Stream,
-                true,
                 xref_size,
                 new_root,
                 options,
@@ -6109,6 +6221,329 @@ mod tests {
             writer.settings.newline_before_endstream,
             NewlineBeforeEndstream::Yes
         );
+    }
+
+    #[test]
+    fn trimmed_trailer_drops_xref_stream_metadata_from_a_hybrid_table_source() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        pdf.trailer()
+            .replace_key(b"/XRefStm", ObjectHandle::integer(123))
+            .expect("install hybrid trailer key");
+        let root = pdf.root_ref().expect("empty PDF root");
+        let options = WriterOptions {
+            deterministic_id: true,
+            ..WriterOptions::default()
+        };
+
+        let trimmed = build_writer_trailer_handle(&mut pdf, 4, root, &options, None, true, None)
+            .expect("trim hybrid trailer");
+
+        assert!(trimmed.get_key(b"/XRefStm").is_null());
+    }
+
+    #[test]
+    fn source_objstm_container_lookup_uses_compressed_xref_entries_only() {
+        let compressed_member = ObjectRef::new(5, 0);
+        let uncompressed_member = ObjectRef::new(6, 0);
+        let free_member = ObjectRef::new(7, 0);
+        let source_entries = BTreeMap::from([
+            (
+                compressed_member,
+                XrefEntry::Compressed {
+                    stream: 12,
+                    index: 0,
+                },
+            ),
+            (uncompressed_member, XrefEntry::Uncompressed { offset: 42 }),
+            (free_member, XrefEntry::Free { next: 0 }),
+        ]);
+
+        assert_eq!(
+            source_objstm_container_for_batch(
+                &[uncompressed_member, compressed_member],
+                &source_entries,
+            ),
+            Some(ObjectRef::new(12, 0))
+        );
+        assert_eq!(
+            source_objstm_container_for_batch(&[free_member, uncompressed_member], &source_entries),
+            None
+        );
+        assert_eq!(
+            source_objstm_container_for_batch(&[], &source_entries),
+            None
+        );
+    }
+
+    #[test]
+    fn remap_source_objstm_extends_prefers_preserved_then_qdf_or_compact_targets() {
+        let source = ObjectRef::new(7, 0);
+        let preserved_target = ObjectRef::new(8, 0);
+        let qdf_target = ObjectRef::new(9, 0);
+        let compact_target = ObjectRef::new(10, 0);
+        let source_to_batch = HashMap::from([(source, 1)]);
+        let container_refs = vec![ObjectRef::new(3, 0), preserved_target];
+        let qdf_map = HashMap::from([(qdf_target, ObjectRef::new(19, 0))]);
+        let compact_map = HashMap::from([(compact_target, ObjectRef::new(20, 0))]);
+
+        assert_eq!(
+            remap_source_objstm_extends(
+                source,
+                &source_to_batch,
+                &container_refs,
+                true,
+                &qdf_map,
+                &compact_map,
+            ),
+            Some(preserved_target)
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                qdf_target,
+                &HashMap::new(),
+                &[],
+                true,
+                &qdf_map,
+                &compact_map,
+            ),
+            Some(ObjectRef::new(19, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                compact_target,
+                &HashMap::new(),
+                &[],
+                false,
+                &qdf_map,
+                &compact_map,
+            ),
+            Some(ObjectRef::new(20, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                ObjectRef::new(99, 0),
+                &HashMap::new(),
+                &[],
+                true,
+                &qdf_map,
+                &compact_map,
+            ),
+            None
+        );
+    }
+
+    fn preserved_outline_destination_fixture() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let mut add_object = |number: u32, body: &[u8]| {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        };
+
+        add_object(1, b"<< /Type /Catalog /Outlines 6 0 R /Pages 2 0 R >>");
+        add_object(2, b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>");
+        add_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
+        add_object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
+
+        let members = [
+            (
+                5_u32,
+                b"<< /Dest [4 0 R /Fit] /Parent 6 0 R /Type /Outline >>".as_slice(),
+            ),
+            (
+                6_u32,
+                b"<< /Count 1 /First 5 0 R /Last 5 0 R /Type /Outlines >>".as_slice(),
+            ),
+        ];
+        let mut header = String::new();
+        let mut body = Vec::new();
+        for (index, (number, member)) in members.iter().enumerate() {
+            header.push_str(&format!("{number} {} ", body.len()));
+            body.extend_from_slice(member);
+            if index + 1 != members.len() {
+                body.push(b'\n');
+            }
+        }
+        let mut decoded = header.into_bytes();
+        decoded.extend_from_slice(&body);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&decoded).expect("compress ObjStm body");
+        let encoded = encoder.finish().expect("finish ObjStm body");
+        let first = decoded.len() - body.len();
+        offsets.insert(7, bytes.len());
+        bytes.extend_from_slice(b"7 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /ObjStm /N 2 /First {first} /Length {} /Filter /FlateDecode >>\nstream\n",
+                encoded.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&encoded);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = bytes.len();
+        let mut xref = Vec::new();
+        let append = |out: &mut Vec<u8>, kind: u8, field1: u32, field2: u8| {
+            out.push(kind);
+            out.extend_from_slice(&field1.to_be_bytes()[1..]);
+            out.push(field2);
+        };
+        append(&mut xref, 0, 0, 0);
+        for number in 1..=4 {
+            append(&mut xref, 1, offsets[&number] as u32, 0);
+        }
+        append(&mut xref, 2, 7, 0);
+        append(&mut xref, 2, 7, 1);
+        append(&mut xref, 1, offsets[&7] as u32, 0);
+        append(&mut xref, 1, xref_offset as u32, 0);
+        offsets.insert(8, bytes.len());
+        bytes.extend_from_slice(b"8 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /Size 9 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
+                xref.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    fn preserved_chained_objstm_fixture() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let mut add_object = |number: u32, body: &[u8]| {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        };
+
+        add_object(1, b"<< /Type /Catalog /Outlines 6 0 R /Pages 2 0 R >>");
+        add_object(2, b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>");
+        add_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
+        add_object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
+
+        let mut add_objstm = |container: u32, member: u32, body: &[u8], extends: Option<u32>| {
+            let header = format!("{member} 0 ");
+            let first = header.len();
+            let mut decoded = header.into_bytes();
+            decoded.extend_from_slice(body);
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&decoded).expect("compress ObjStm body");
+            let encoded = encoder.finish().expect("finish ObjStm body");
+            let extends = extends
+                .map(|source| format!(" /Extends {source} 0 R"))
+                .unwrap_or_default();
+
+            offsets.insert(container, bytes.len());
+            bytes.extend_from_slice(format!("{container} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(
+                format!(
+                    "<< /Type /ObjStm /N 1 /First {first} /Length {} /Filter /FlateDecode{extends} >>\nstream\n",
+                    encoded.len()
+                )
+                .as_bytes(),
+            );
+            bytes.extend_from_slice(&encoded);
+            bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        };
+
+        add_objstm(
+            7,
+            5,
+            b"<< /Dest [4 0 R /Fit] /Parent 6 0 R /Type /Outline >>",
+            None,
+        );
+        add_objstm(
+            8,
+            6,
+            b"<< /Count 1 /First 5 0 R /Last 5 0 R /Type /Outlines >>",
+            Some(7),
+        );
+
+        let xref_offset = bytes.len();
+        let mut xref = Vec::new();
+        let append = |out: &mut Vec<u8>, kind: u8, field1: u32, field2: u8| {
+            out.push(kind);
+            out.extend_from_slice(&field1.to_be_bytes()[1..]);
+            out.push(field2);
+        };
+        append(&mut xref, 0, 0, 0);
+        for number in 1..=4 {
+            append(&mut xref, 1, offsets[&number] as u32, 0);
+        }
+        append(&mut xref, 2, 7, 0);
+        append(&mut xref, 2, 8, 0);
+        append(&mut xref, 1, offsets[&7] as u32, 0);
+        append(&mut xref, 1, offsets[&8] as u32, 0);
+        append(&mut xref, 1, xref_offset as u32, 0);
+        bytes.extend_from_slice(b"9 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /Size 10 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
+                xref.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn qdf_preserve_objstm_reserves_outline_destination_before_page_tree_children() {
+        let mut pdf = crate::Pdf::open_mem_owned(preserved_outline_destination_fixture())
+            .expect("open preserved ObjStm fixture");
+        let options = WriterOptions {
+            qdf: true,
+            object_streams: ObjectStreamMode::Preserve,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("write QDF");
+        let output = String::from_utf8_lossy(&output);
+
+        assert!(
+            output.contains("/Dest [\n    6 0 R\n    /Fit"),
+            "qpdf reserves the second page while emitting the ObjStm; output was:\n{output}"
+        );
+    }
+
+    #[test]
+    fn qdf_preserve_objstm_emits_source_extends_relation() {
+        let mut pdf = crate::Pdf::open_mem_owned(preserved_chained_objstm_fixture())
+            .expect("open chained preserved ObjStm fixture");
+        let options = WriterOptions {
+            qdf: true,
+            object_streams: ObjectStreamMode::Preserve,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("write chained QDF");
+        let output = String::from_utf8_lossy(&output);
+
+        let extends_line = output
+            .lines()
+            .find(|line| line.contains("/Extends"))
+            .expect("preserved ObjStm chain must retain /Extends");
+        assert!(extends_line.trim_end().ends_with(" R"), "{extends_line}");
     }
 
     #[test]
