@@ -1008,47 +1008,64 @@ mod tests {
     #[test]
     fn qpdf_flatten_merges_an_indirect_default_resource_category() {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
-        register_acroform_fields(&mut pdf, &[]);
-        let mut appearance_resources = Dictionary::new();
-        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
-        let mut appearance = Dictionary::new();
-        appearance.insert("Resources", Object::Dictionary(appearance_resources));
-        pdf.set_object(
-            ObjectRef::new(5, 0),
-            Object::Stream(Stream::new(appearance, Vec::new())),
-        );
-        let mut ap = Dictionary::new();
-        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
-        let mut widget = Dictionary::new();
-        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
-        widget.insert("AP", Object::Dictionary(ap));
-        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
-        let mut font_category = Dictionary::new();
-        font_category.insert("F1", Object::Reference(ObjectRef::new(7, 0)));
-        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(font_category));
-        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(Dictionary::new()));
-        let mut default_resources = Dictionary::new();
-        default_resources.insert("Font", Object::Reference(ObjectRef::new(6, 0)));
-        let default_resources = pdf
-            .lift_object_to_handle(&Object::Dictionary(default_resources))
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).unwrap();
+        root.replace_key(
+            b"/AcroForm",
+            ObjectHandle::dictionary(vec![(b"/Fields".to_vec(), ObjectHandle::array(Vec::new()))]),
+        )
+        .unwrap();
+        pdf.mark_object_handle_dirty(&root).unwrap();
+
+        pdf.replace_object_handle(ObjectRef::new(7, 0), ObjectHandle::dictionary(Vec::new()))
             .unwrap();
+        let font_category = ObjectHandle::dictionary(vec![(
+            b"/F1".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(7, 0)),
+        )]);
+        pdf.replace_object_handle(ObjectRef::new(6, 0), font_category)
+            .unwrap();
+        let appearance = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"/Resources".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/Font".to_vec(),
+                    ObjectHandle::dictionary(Vec::new()),
+                )]),
+            )]),
+            Rc::new(Vec::new()),
+        );
+        pdf.replace_object_handle(ObjectRef::new(5, 0), appearance)
+            .unwrap();
+        let widget = ObjectHandle::dictionary(vec![
+            (b"/Subtype".to_vec(), ObjectHandle::name(b"Widget".to_vec())),
+            (
+                b"/AP".to_vec(),
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    pdf.get_object_handle(ObjectRef::new(5, 0)),
+                )]),
+            ),
+        ]);
+        pdf.replace_object_handle(ObjectRef::new(4, 0), widget)
+            .unwrap();
+        let default_resources = ObjectHandle::dictionary(vec![(
+            b"/Font".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(6, 0)),
+        )]);
 
         merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
             .unwrap();
 
-        let Object::Stream(appearance) = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap() else {
-            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
-            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
-        };
-        let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
-            panic!("fixture appearance must retain Font resources"); // cov:ignore: fixture invariant
-        };
-        assert_eq!(
-            fonts.get("F1"),
-            Some(&Object::Reference(ObjectRef::new(7, 0)))
-        );
+        let appearance = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve(&appearance).unwrap();
+        let stream_dict = appearance.as_stream_dict().unwrap();
+        let resources = stream_dict.try_get_key(b"/Resources").unwrap();
+        pdf.resolve(&resources).unwrap();
+        let fonts = resources.try_get_key(b"/Font").unwrap();
+        pdf.resolve(&fonts).unwrap();
+        let f1 = fonts.try_get_key(b"/F1").unwrap();
+        assert_eq!(f1.object_ref(), Some(ObjectRef::new(7, 0)));
     }
 
     #[test]
