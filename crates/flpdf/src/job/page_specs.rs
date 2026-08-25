@@ -609,7 +609,7 @@ mod tests {
     use super::*;
     use crate::job::QPDFJob;
     use crate::page_label_document_helper::LabelStyle;
-    use crate::Object;
+    use crate::ObjectHandle;
     use std::io::Cursor;
 
     fn three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
@@ -700,6 +700,22 @@ mod tests {
             .len()
     }
 
+    fn resolved_object(pdf: &mut Pdf<Cursor<Vec<u8>>>, object_ref: ObjectRef) -> ObjectHandle {
+        let object = pdf.get_object_handle(object_ref);
+        pdf.resolve(&object).expect("resolve object handle");
+        object
+    }
+
+    fn resolved_key(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        owner: &ObjectHandle,
+        key: &[u8],
+    ) -> ObjectHandle {
+        let value = owner.get_key(key);
+        pdf.resolve(&value).expect("resolve child handle");
+        value
+    }
+
     fn pdf_without_root() -> Pdf<Cursor<Vec<u8>>> {
         let mut pdf = Pdf::empty().expect("empty PDF");
         pdf.trailer().remove_key(b"/Root");
@@ -728,13 +744,10 @@ mod tests {
         replace_merged_fields(&mut merged, Vec::new(), true)
             .expect("an empty survivor list removes /AcroForm");
         let root_ref = merged.root_ref().expect("root");
-        let root = merged
-            .resolve_object(root_ref)
-            .expect("resolve root")
-            .into_dict()
-            .expect("root dictionary");
         assert!(
-            root.get("AcroForm").is_none(),
+            resolved_object(&mut merged, root_ref)
+                .get_key(b"/AcroForm")
+                .is_null(),
             "qpdf removes /AcroForm entirely once the filtered field count reaches zero"
         );
     }
@@ -807,30 +820,11 @@ mod tests {
         let page_refs = crate::pages::page_refs(&mut merged).expect("read merged page tree");
         assert_eq!(page_refs.len(), 2);
         for page_ref in page_refs {
-            let page = merged
-                .resolve_object(page_ref)
-                .expect("resolve merged page")
-                .into_dict()
-                .expect("merged page dictionary");
+            let page = resolved_object(&mut merged, page_ref);
             assert!(
-                matches!(page.get("Resources"), Some(Object::Dictionary(_))),
-                "qpdf --pages default copies inherited /Resources directly onto the page: {page:?}"
+                page.get_key(b"/Resources").as_dictionary().is_some(),
+                "qpdf --pages default copies inherited /Resources directly onto the page"
             );
-        }
-    }
-
-    /// Resolve `value` one level: follow an `Object::Reference` through
-    /// `pdf`, or return a non-reference value unchanged. Defensive against
-    /// `/AcroForm` becoming an indirect object under other merge paths; the
-    /// fixture this helper serves keeps it direct.
-    fn resolve_one_level(pdf: &mut Pdf<Cursor<Vec<u8>>>, value: Object) -> Object {
-        match value {
-            // cov:ignore-start: this fixture's /AcroForm is never re-indirected
-            Object::Reference(reference) => {
-                pdf.resolve_object(reference).expect("resolve reference")
-            }
-            // cov:ignore-end
-            other => other,
         }
     }
 
@@ -852,24 +846,14 @@ mod tests {
         )
         .expect("merge across a fields-less-AcroForm primary and a secondary source");
         let root_ref = merged.root_ref().expect("merged root");
-        let root = merged
-            .resolve_object(root_ref)
-            .expect("resolve merged root")
-            .into_dict()
-            .expect("merged root dictionary");
-        let acroform_value = root
-            .get("AcroForm")
-            .cloned()
-            .expect("qpdf leaves an /AcroForm with no /Fields array untouched, not removed");
-        let acroform = resolve_one_level(&mut merged, acroform_value)
-            .into_dict()
-            .expect("/AcroForm dictionary");
+        let root = resolved_object(&mut merged, root_ref);
+        let acroform = resolved_key(&mut merged, &root, b"/AcroForm");
         assert_eq!(
-            acroform.get("NeedAppearances"),
-            Some(&Object::Boolean(true))
+            resolved_key(&mut merged, &acroform, b"/NeedAppearances").as_boolean(),
+            Some(true)
         );
         assert!(
-            acroform.get("Fields").is_none(),
+            acroform.get_key(b"/Fields").is_null(),
             "no /Fields array existed originally; the merge must not manufacture one"
         );
     }
@@ -893,13 +877,10 @@ mod tests {
         )
         .expect("merge with the only AcroForm field on an unselected page");
         let root_ref = merged.root_ref().expect("merged root");
-        let root = merged
-            .resolve_object(root_ref)
-            .expect("resolve merged root")
-            .into_dict()
-            .expect("merged root dictionary");
         assert!(
-            root.get("AcroForm").is_none(),
+            resolved_object(&mut merged, root_ref)
+                .get_key(b"/AcroForm")
+                .is_null(),
             "qpdf removes /AcroForm entirely once its filtered field count reaches zero"
         );
     }
@@ -915,13 +896,10 @@ mod tests {
             .expect("job-owned AcroForm pruning");
 
         let root_ref = pdf.root_ref().expect("root");
-        let root = pdf
-            .resolve_object(root_ref)
-            .expect("resolve root")
-            .into_dict()
-            .expect("root dictionary");
         assert!(
-            root.get("AcroForm").is_none(),
+            resolved_object(&mut pdf, root_ref)
+                .get_key(b"/AcroForm")
+                .is_null(),
             "the job boundary must remove an empty AcroForm after page selection"
         );
     }
@@ -1059,22 +1037,16 @@ mod tests {
         .unwrap();
 
         let catalog_ref = output.root_ref().unwrap();
-        let catalog = output
-            .resolve_borrowed(catalog_ref)
-            .unwrap()
-            .as_dict()
-            .unwrap()
-            .clone();
-        let Object::Dictionary(page_labels) = catalog.get("PageLabels").unwrap() else {
-            panic!("merged PageLabels must be a direct dictionary"); // cov:ignore: test-shape guard, the helper always installs a dictionary
-        };
-        let Object::Array(nums) = page_labels.get("Nums").unwrap() else {
-            panic!("merged PageLabels /Nums must be an array"); // cov:ignore: test-shape guard, the helper always installs an array
-        };
-        let Object::Dictionary(first_label) = &nums[1] else {
-            panic!("first reconstructed label must be a dictionary"); // cov:ignore: test-shape guard, the fixture yields dictionaries
-        };
-        assert_eq!(first_label.get("P"), Some(&Object::String(Vec::new())));
+        let catalog = resolved_object(&mut output, catalog_ref);
+        let page_labels = resolved_key(&mut output, &catalog, b"/PageLabels");
+        let nums = resolved_key(&mut output, &page_labels, b"/Nums")
+            .as_array()
+            .expect("merged PageLabels /Nums must be an array");
+        let first_label = nums.get(1).cloned().expect("first reconstructed label");
+        output
+            .resolve(&first_label)
+            .expect("resolve first reconstructed label");
+        assert_eq!(first_label.get_key(b"/P").as_string(), Some(Vec::new()));
     }
 
     #[test]
