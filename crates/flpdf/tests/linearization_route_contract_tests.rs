@@ -6,6 +6,7 @@
 //! through the live ObjectHandle writer boundary instead of a legacy bridge.
 
 const WRITER_SOURCE: &str = include_str!("../src/linearization/writer.rs");
+const RENUMBER_SOURCE: &str = include_str!("../src/writer/rewrite_renumber.rs");
 
 fn body_and_stream_production_slice() -> &'static str {
     let start_marker = "fn append_object";
@@ -43,6 +44,18 @@ fn hint_production_slice() -> &'static str {
         .find(end_marker)
         .expect("linearization outline-hint marker must remain present");
     &WRITER_SOURCE[start..end]
+}
+
+fn reachable_production_slice() -> &'static str {
+    let start_marker = "pub(crate) fn reachable_object_set_with_stream_parameters";
+    let end_marker = "/// Indirect references that qpdf";
+    let start = RENUMBER_SOURCE
+        .find(start_marker)
+        .expect("reachable-object marker must remain present");
+    let end = RENUMBER_SOURCE
+        .find(end_marker)
+        .expect("null-resurrection marker must remain present");
+    &RENUMBER_SOURCE[start..end]
 }
 
 #[test]
@@ -100,6 +113,26 @@ fn linearization_hint_route_uses_canonical_pipeline() {
         assert!(
             !production.contains(forbidden),
             "canonical linearization hint route still contains legacy token {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn linearization_reachability_route_uses_live_handles() {
+    let production = reachable_production_slice();
+    assert!(
+        production.contains("get_object_handle"),
+        "linearization reachability must resolve objects through the canonical handle registry"
+    );
+    for forbidden in [
+        "resolve_object(",
+        "Object::",
+        "qpdf_null::snapshot_entries",
+        "collect_qpdf_enqueue_refs",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "linearization reachability route still contains raw token {forbidden:?}"
         );
     }
 }

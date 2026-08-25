@@ -598,14 +598,6 @@ fn collect_qpdf_enqueue_refs_with_stream_parameters<R: Read + Seek>(
     Ok(())
 }
 
-fn object_stream_should_skip_parameters(
-    object_ref: ObjectRef,
-    object: &Object,
-    skipped_stream_parameter_streams: &BTreeSet<ObjectRef>,
-) -> bool {
-    matches!(object, Object::Stream(_)) && skipped_stream_parameter_streams.contains(&object_ref)
-}
-
 #[cfg(test)]
 fn object_contains_reference(object: &Object, references: &BTreeSet<ObjectRef>) -> bool {
     match object {
@@ -666,17 +658,31 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         .root_ref()
         .ok_or_else(|| Error::Unsupported("reachability: trailer has no /Root".to_string()))?;
     let mut seeds: Vec<ObjectRef> = vec![root];
-    let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer_dictionary(), false);
-    for (key, value) in crate::qpdf_null::visible_entries(pdf, trailer_entries)? {
+    let trailer_entries = pdf.trailer().try_as_dictionary()?.unwrap_or_default();
+    let skip_stream_parameters = |handle: &crate::ObjectHandle| -> crate::Result<bool> {
+        Ok(handle
+            .object_ref()
+            .is_some_and(|object_ref| skipped_stream_parameter_streams.contains(&object_ref)))
+    };
+    for (key, value) in trailer_entries {
         // /Encrypt is intentionally NOT skipped: it is part of the live universe.
         // /Prev, /Size, /ID, /Root are not object roots of the document graph.
-        if matches!(key.as_slice(), b"ID" | b"Prev" | b"Root" | b"Size") {
+        if matches!(key.as_slice(), b"/ID" | b"/Prev" | b"/Root" | b"/Size") {
             continue;
         }
         // Recurse into direct dict/array trailer values so a nested indirect ref
         // (e.g. inside a direct `/Info` dict) is seeded, matching qpdf's recursive
         // trailer enqueue. A bare reference yields exactly one seed as before.
-        collect_qpdf_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+        if !value.try_is_null()? {
+            collect_canonical_enqueue_refs_with_stream_policy(
+                pdf,
+                &value,
+                0,
+                skip_length,
+                &mut seeds,
+                Some(&skip_stream_parameters),
+            )?; // cov:ignore: LLVM maps this covered canonical trailer traversal terminator to a zero-count continuation region
+        }
     }
 
     let mut reachable: BTreeSet<ObjectRef> = BTreeSet::new();
@@ -687,16 +693,17 @@ pub(crate) fn reachable_object_set_with_stream_parameters<R: Read + Seek>(
         }
     }
     while let Some(cur) = queue.pop_front() {
-        let obj = pdf.resolve_object(cur)?;
+        let handle = pdf.get_object_handle(cur);
+        pdf.resolve(&handle)?;
         let mut found = Vec::new();
-        collect_qpdf_enqueue_refs_with_stream_parameters(
+        collect_canonical_children_with_stream_policy(
             pdf,
-            &obj,
+            &handle,
             0,
             skip_length,
             &mut found,
-            object_stream_should_skip_parameters(cur, &obj, skipped_stream_parameter_streams),
-        )?; // cov:ignore: LLVM maps this covered reachability call terminator to a zero-count continuation region
+            Some(&skip_stream_parameters),
+        )?; // cov:ignore: LLVM maps this covered canonical reachability traversal terminator to a zero-count continuation region
         for r in found {
             if reachable.insert(r) {
                 queue.push_back(r);
