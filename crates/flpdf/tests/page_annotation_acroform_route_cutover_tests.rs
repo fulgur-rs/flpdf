@@ -11,7 +11,7 @@ fn direct_need_appearances_fixture_uses_live_handle_mutation() {
         .split_once("fn acroform_need_appearances_reads_a_direct_boolean")
         .expect("direct NeedAppearances test must remain")
         .1
-        .split_once("fn qpdf_flatten_expands_a_multihop_contents_array")
+        .split_once("fn build_pruned_annots_array_treats_a_non_array_as_empty")
         .expect("direct NeedAppearances test boundary must remain")
         .0;
 
