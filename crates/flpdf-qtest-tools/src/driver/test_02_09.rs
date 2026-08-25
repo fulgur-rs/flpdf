@@ -584,9 +584,26 @@ pub(crate) fn run_test_9<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
-    use super::run_test_3;
-    use flpdf::{ObjectHandle, Pdf};
+    use super::{run_test_3, StdoutPipeline};
+    use flpdf::{ObjectHandle, Pdf, Pipeline};
+    use std::io::{self, Write};
     use std::rc::Rc;
+
+    struct FailAfterHeader;
+
+    impl Write for FailAfterHeader {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if data.starts_with(b"-- stream") {
+                Ok(data.len())
+            } else {
+                Err(io::Error::other("synthetic stream-output failure"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_3_pipes_and_normalizes_each_qstreams_member() {
@@ -613,5 +630,38 @@ mod tests {
 
         assert_eq!(stdout, b"-- stream 0 --\nA\nB");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn test_3_propagates_stream_pipeline_failures() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"payload".to_vec()))
+            .expect("QStreams member");
+        pdf.trailer()
+            .replace_key(b"/QStreams", ObjectHandle::array(vec![stream]))
+            .expect("install QStreams");
+
+        let mut stdout = FailAfterHeader;
+        let mut stderr = Vec::new();
+        let mut diagnostics_written = 0;
+        assert!(run_test_3(
+            &mut pdf,
+            b"fixture.pdf",
+            None,
+            &mut stdout,
+            &mut stderr,
+            &mut diagnostics_written,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stdout_pipeline_reports_qpdf_tokenized_identifier() {
+        let mut stdout = Vec::new();
+        let pipeline = StdoutPipeline {
+            stdout: &mut stdout,
+        };
+        assert_eq!(pipeline.identifier(), "tokenized stream");
     }
 }

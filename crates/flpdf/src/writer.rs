@@ -3253,6 +3253,45 @@ fn build_writer_trailer_handle<R: Read + Seek>(
     Ok(trailer)
 }
 
+/// Recover the source ObjStm identity qpdf obtains from a compressed xref
+/// entry, rather than from the source stream's dictionary type
+/// (`QPDF.cc:2381-2390`).
+fn source_objstm_container_for_batch(
+    batch: &[ObjectRef],
+    source_xref_entries: &BTreeMap<ObjectRef, XrefEntry>,
+) -> Option<ObjectRef> {
+    batch
+        .iter()
+        .find_map(|member| match source_xref_entries.get(member) {
+            Some(XrefEntry::Compressed { stream, .. }) => Some(ObjectRef::new(*stream, 0)),
+            Some(XrefEntry::Free { .. } | XrefEntry::Uncompressed { .. }) | None => None,
+        })
+}
+
+/// Translate a source ObjStm's `/Extends` target into the output container
+/// number. qpdf resolves this relation through the source object-stream map;
+/// only when the target is not itself preserved does it fall back to the
+/// ordinary output renumber map (`QPDFWriter.cc:1621-1639`).
+fn remap_source_objstm_extends(
+    extends: ObjectRef,
+    source_container_to_batch: &HashMap<ObjectRef, usize>,
+    container_refs: &[ObjectRef],
+    qdf: bool,
+    qdf_emission_renumber: &HashMap<ObjectRef, ObjectRef>,
+    renumber: &dyn crate::writer::rewrite_renumber::NewNumberLookup,
+) -> Option<ObjectRef> {
+    source_container_to_batch
+        .get(&extends)
+        .and_then(|batch_idx| container_refs.get(*batch_idx).copied())
+        .or_else(|| {
+            if qdf {
+                qdf_emission_renumber.get(&extends).copied()
+            } else {
+                renumber.new_for_original(extends)
+            }
+        })
+}
+
 /// Whether `cipher` needs an AES CBC initialization vector: `true` for both
 /// AES variants (V=4 AESV2 `PerObject(Aes)` and V=5 AESV3 `FileKeyAes256`),
 /// `false` for RC4 (a stream cipher with no IV concept).
@@ -4335,7 +4374,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             &removed_refs,
             options.preserve_unreferenced_objects,
             Some(&stream_parameters_removed),
-        )?;
+        )?; // cov:ignore: the canonical ObjStm plan validates this shared walk before QDF emission
         let mut pairs = object_stream_renumber.pairs().collect::<Vec<_>>();
         pairs.sort_unstable_by_key(|(new_ref, _)| (new_ref.number, new_ref.generation));
         pairs
@@ -4388,27 +4427,15 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // xref table, `QPDF.cc:2381-2390`). Generated batches have no source
     // container and therefore no `/Extends` value.
     let source_xref_entries = pdf.source_xref_entries();
-    let source_container_for_batch: Vec<Option<ObjectRef>> = if options.object_streams
-        == ObjectStreamMode::Preserve
-    {
-        plan.batches
-            .iter()
-            .map(|batch| {
-                batch.iter().find_map(|member| {
-                    matches!(
-                        source_xref_entries.get(member),
-                        Some(XrefEntry::Compressed { .. })
-                    )
-                    .then(|| match source_xref_entries.get(member) {
-                        Some(XrefEntry::Compressed { stream, .. }) => ObjectRef::new(*stream, 0),
-                        _ => unreachable!("compressed xref match must carry a container"),
-                    })
-                })
-            })
-            .collect()
-    } else {
-        vec![None; plan.batches.len()]
-    };
+    let source_container_for_batch: Vec<Option<ObjectRef>> =
+        if options.object_streams == ObjectStreamMode::Preserve {
+            plan.batches
+                .iter()
+                .map(|batch| source_objstm_container_for_batch(batch, &source_xref_entries))
+                .collect()
+        } else {
+            vec![None; plan.batches.len()]
+        };
     let source_container_to_batch: HashMap<ObjectRef, usize> = source_container_for_batch
         .iter()
         .enumerate()
@@ -5233,16 +5260,14 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 .transpose()?
                 .and_then(|handle| handle.object_ref());
             extends.map(|extends| {
-                source_container_to_batch
-                    .get(&extends)
-                    .and_then(|batch_idx| container_refs.get(*batch_idx).copied())
-                    .or_else(|| {
-                        if options.qdf {
-                            qdf_emission_renumber.get(&extends).copied()
-                        } else {
-                            renumber.new_for_original(extends)
-                        }
-                    })
+                remap_source_objstm_extends(
+                    extends,
+                    &source_container_to_batch,
+                    &container_refs,
+                    options.qdf,
+                    &qdf_emission_renumber,
+                    &renumber,
+                )
             })
         } else {
             None
@@ -6216,6 +6241,97 @@ mod tests {
         assert!(trimmed.get_key(b"/XRefStm").is_null());
     }
 
+    #[test]
+    fn source_objstm_container_lookup_uses_compressed_xref_entries_only() {
+        let compressed_member = ObjectRef::new(5, 0);
+        let uncompressed_member = ObjectRef::new(6, 0);
+        let free_member = ObjectRef::new(7, 0);
+        let source_entries = BTreeMap::from([
+            (
+                compressed_member,
+                XrefEntry::Compressed {
+                    stream: 12,
+                    index: 0,
+                },
+            ),
+            (uncompressed_member, XrefEntry::Uncompressed { offset: 42 }),
+            (free_member, XrefEntry::Free { next: 0 }),
+        ]);
+
+        assert_eq!(
+            source_objstm_container_for_batch(
+                &[uncompressed_member, compressed_member],
+                &source_entries,
+            ),
+            Some(ObjectRef::new(12, 0))
+        );
+        assert_eq!(
+            source_objstm_container_for_batch(&[free_member, uncompressed_member], &source_entries),
+            None
+        );
+        assert_eq!(
+            source_objstm_container_for_batch(&[], &source_entries),
+            None
+        );
+    }
+
+    #[test]
+    fn remap_source_objstm_extends_prefers_preserved_then_qdf_or_compact_targets() {
+        let source = ObjectRef::new(7, 0);
+        let preserved_target = ObjectRef::new(8, 0);
+        let qdf_target = ObjectRef::new(9, 0);
+        let compact_target = ObjectRef::new(10, 0);
+        let source_to_batch = HashMap::from([(source, 1)]);
+        let container_refs = vec![ObjectRef::new(3, 0), preserved_target];
+        let qdf_map = HashMap::from([(qdf_target, ObjectRef::new(19, 0))]);
+        let compact_map = HashMap::from([(compact_target, ObjectRef::new(20, 0))]);
+
+        assert_eq!(
+            remap_source_objstm_extends(
+                source,
+                &source_to_batch,
+                &container_refs,
+                true,
+                &qdf_map,
+                &compact_map,
+            ),
+            Some(preserved_target)
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                qdf_target,
+                &HashMap::new(),
+                &[],
+                true,
+                &qdf_map,
+                &compact_map,
+            ),
+            Some(ObjectRef::new(19, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                compact_target,
+                &HashMap::new(),
+                &[],
+                false,
+                &qdf_map,
+                &compact_map,
+            ),
+            Some(ObjectRef::new(20, 0))
+        );
+        assert_eq!(
+            remap_source_objstm_extends(
+                ObjectRef::new(99, 0),
+                &HashMap::new(),
+                &[],
+                true,
+                &qdf_map,
+                &compact_map,
+            ),
+            None
+        );
+    }
+
     fn preserved_outline_destination_fixture() -> Vec<u8> {
         use flate2::write::ZlibEncoder;
         use flate2::Compression;
@@ -6302,6 +6418,93 @@ mod tests {
         bytes
     }
 
+    fn preserved_chained_objstm_fixture() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        let mut add_object = |number: u32, body: &[u8]| {
+            offsets.insert(number, bytes.len());
+            bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        };
+
+        add_object(1, b"<< /Type /Catalog /Outlines 6 0 R /Pages 2 0 R >>");
+        add_object(2, b"<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>");
+        add_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
+        add_object(4, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] >>");
+
+        let mut add_objstm = |container: u32, member: u32, body: &[u8], extends: Option<u32>| {
+            let header = format!("{member} 0 ");
+            let first = header.len();
+            let mut decoded = header.into_bytes();
+            decoded.extend_from_slice(body);
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&decoded).expect("compress ObjStm body");
+            let encoded = encoder.finish().expect("finish ObjStm body");
+            let extends = extends
+                .map(|source| format!(" /Extends {source} 0 R"))
+                .unwrap_or_default();
+
+            offsets.insert(container, bytes.len());
+            bytes.extend_from_slice(format!("{container} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(
+                format!(
+                    "<< /Type /ObjStm /N 1 /First {first} /Length {} /Filter /FlateDecode{extends} >>\nstream\n",
+                    encoded.len()
+                )
+                .as_bytes(),
+            );
+            bytes.extend_from_slice(&encoded);
+            bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        };
+
+        add_objstm(
+            7,
+            5,
+            b"<< /Dest [4 0 R /Fit] /Parent 6 0 R /Type /Outline >>",
+            None,
+        );
+        add_objstm(
+            8,
+            6,
+            b"<< /Count 1 /First 5 0 R /Last 5 0 R /Type /Outlines >>",
+            Some(7),
+        );
+
+        let xref_offset = bytes.len();
+        let mut xref = Vec::new();
+        let append = |out: &mut Vec<u8>, kind: u8, field1: u32, field2: u8| {
+            out.push(kind);
+            out.extend_from_slice(&field1.to_be_bytes()[1..]);
+            out.push(field2);
+        };
+        append(&mut xref, 0, 0, 0);
+        for number in 1..=4 {
+            append(&mut xref, 1, offsets[&number] as u32, 0);
+        }
+        append(&mut xref, 2, 7, 0);
+        append(&mut xref, 2, 8, 0);
+        append(&mut xref, 1, offsets[&7] as u32, 0);
+        append(&mut xref, 1, offsets[&8] as u32, 0);
+        append(&mut xref, 1, xref_offset as u32, 0);
+        bytes.extend_from_slice(b"9 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /Size 10 /Root 1 0 R /W [1 3 1] /Length {} >>\nstream\n",
+                xref.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
     #[test]
     fn qdf_preserve_objstm_reserves_outline_destination_before_page_tree_children() {
         let mut pdf = crate::Pdf::open_mem_owned(preserved_outline_destination_fixture())
@@ -6320,6 +6523,27 @@ mod tests {
             output.contains("/Dest [\n    6 0 R\n    /Fit"),
             "qpdf reserves the second page while emitting the ObjStm; output was:\n{output}"
         );
+    }
+
+    #[test]
+    fn qdf_preserve_objstm_emits_source_extends_relation() {
+        let mut pdf = crate::Pdf::open_mem_owned(preserved_chained_objstm_fixture())
+            .expect("open chained preserved ObjStm fixture");
+        let options = WriterOptions {
+            qdf: true,
+            object_streams: ObjectStreamMode::Preserve,
+            static_id: true,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("write chained QDF");
+        let output = String::from_utf8_lossy(&output);
+
+        let extends_line = output
+            .lines()
+            .find(|line| line.contains("/Extends"))
+            .expect("preserved ObjStm chain must retain /Extends");
+        assert!(extends_line.trim_end().ends_with(" R"), "{extends_line}");
     }
 
     #[test]

@@ -14070,14 +14070,42 @@ mod mutation_tests {
 
         let diagnostics = pdf.repair_diagnostics();
         assert_eq!(diagnostics.entries().len(), 3);
-        assert!(
-            diagnostics
-                .entries()
-                .iter()
-                .all(|diagnostic| diagnostic.offset == Some(9)),
-            "diagnostics: {:?}",
-            diagnostics.entries()
-        );
+        let offsets: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.offset)
+            .collect();
+        assert_eq!(offsets, vec![Some(9); 3]);
+    }
+
+    #[test]
+    fn pipe_stream_data_programmatic_normalizer_warnings_use_object_fallback() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"<0g".to_vec()))
+            .expect("stream");
+        stream.reset_parsed_offset();
+        pdf.set_suppress_warnings(true);
+
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                STREAM_ENCODE_NORMALIZE,
+                crate::writer::DecodeLevel::None,
+                false,
+                false,
+            )
+            .expect("normalize programmatic stream"));
+
+        let diagnostics = pdf.repair_diagnostics();
+        assert_eq!(diagnostics.entries().len(), 3);
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .all(|diagnostic| diagnostic.offset.is_none()));
     }
 
     #[test]
