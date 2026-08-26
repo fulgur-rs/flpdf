@@ -1427,6 +1427,8 @@ mod tests {
     #[test]
     fn resource_callbacks_reject_malformed_inline_image_protocol() {
         let malformed: &[&[u8]] = &[
+            // ID outside an inline-image header is incomplete.
+            b"ID payload",
             // Header keys must be names.
             b"BI 1 /Foo ID payload EI",
             // Header objects must form key/value pairs.
