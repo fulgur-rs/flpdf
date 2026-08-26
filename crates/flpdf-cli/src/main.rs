@@ -292,7 +292,7 @@ struct Cli {
     command: Option<Commands>,
 
     // Legacy options kept for compatibility.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     check: bool,
     /// Suppress warning delivery while retaining qpdf's warning exit status.
     #[arg(long)]
@@ -350,7 +350,7 @@ struct Cli {
     repair: bool,
     #[command(flatten)]
     password: PasswordArgs,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     show_object: Option<String>,
     /// Emit stored stream bytes for `--show-object` (qpdf --raw-stream-data).
     #[arg(long = "raw-stream-data", requires = "show_object")]
@@ -358,13 +358,13 @@ struct Cli {
     /// Emit decoded stream bytes for `--show-object` (qpdf --filtered-stream-data).
     #[arg(long = "filtered-stream-data", requires = "show_object")]
     filtered_stream_data: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     show_npages: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     show_pages: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     show_xref: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output")]
     show_linearization: bool,
     /// Show encryption parameters on the qpdf-compatible top-level surface.
     /// This is the argv form used by qtest (`qpdf --show-encryption FILE`);
@@ -741,6 +741,7 @@ struct Cli {
     /// List all embedded-file attachments (qpdf --list-attachments compatible).
     #[arg(
         long = "list-attachments",
+        conflicts_with = "output",
         help = "List all embedded-file attachments (qpdf --list-attachments)"
     )]
     list_attachments: bool,
@@ -759,6 +760,7 @@ struct Cli {
     /// bytes are written to stdout.
     #[arg(
         long = "show-attachment",
+        conflicts_with = "output",
         value_name = "KEY",
         help = "Extract the embedded file with the given key to stdout \
                 (qpdf --show-attachment)"
