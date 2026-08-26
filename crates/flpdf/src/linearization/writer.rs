@@ -3570,10 +3570,15 @@ fn write_linearized_impl<R: Read + Seek>(
         .as_ref()
         .and_then(|optimization| optimization.pre_optimization_object_refs())
     {
+        // qpdf's `lc_first_page_private` sequence emits a plain object that
+        // optimization minted for page 0 before the first-half ObjStm
+        // container. Keep Part-2 objects in that ordinary first-page sequence.
+        // The post-container rule remains for Part-3 shared objects,
+        // open-document plain objects, and outlines; their qpdf placement is
+        // independently pinned by the corresponding hint/container fixtures.
         first_half_post_plain.extend(
-            plan.part2_objects
+            plan.part3_objects
                 .iter()
-                .chain(&plan.part3_objects)
                 .chain(&plan.part4_open_document_plain)
                 .chain(&plan.part6_outline_objects)
                 .copied()
