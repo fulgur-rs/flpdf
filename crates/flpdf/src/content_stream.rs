@@ -218,9 +218,7 @@ fn parse_content_stream_data_impl(
             // qpdf discards exactly one byte after ID, asks the same tokenizer
             // to scan to EI, and leaves EI for the normal parser.
             // libqpdf/QPDFObjectHandle.cc:1820-1843.
-            if let Err(error) = tokenizer.consume_one_byte() {
-                return Err(error);
-            }
+            tokenizer.consume_one_byte()?;
             let inline_offset = tokenizer.position();
             tokenizer.expect_inline_image().map_err(|error| {
                 // cov:ignore-start: consume_one_byte resets the shared tokenizer, so this
