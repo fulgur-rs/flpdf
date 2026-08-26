@@ -3,14 +3,12 @@ use std::ffi::OsStr;
 use std::io::{Read, Seek, Write};
 use std::rc::Rc;
 
-use flpdf::{
-    CopyEncryptionSource, DecodeLevel, ObjectHandle, ObjectKeyAlg, ObjectRef, PageDocumentHelper,
-    PageInput, Pdf, PdfOpenOptions, PdfWriter, Pipeline, PipelineResult, StreamDataMode,
-};
-
-use super::handle::resolve_chain;
 use super::{emit_new_diagnostics, os_str_diagnostic_bytes};
 use crate::output::write_bytes;
+use flpdf::{
+    DecodeLevel, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf, PdfOpenOptions,
+    PdfWriter, Pipeline, PipelineResult, StreamDataMode,
+};
 
 /// Open `path` as a secondary document the way qpdf's own `QPDF::processFile`
 /// does for every test in this file that takes a foreign document via
@@ -345,47 +343,11 @@ pub(crate) fn run_test_30<R: Read + Seek>(
 
     // qpdf's `QPDFWriter::copyEncryptionParameters(QPDF&)` snapshots the
     // donor's authenticated file key, `/Encrypt` dictionary, and permanent
-    // `/ID[0]`. flpdf mirrors that exact recipe in
-    // `Pdf::writer_copy_encryption_source` (`reader.rs:606-630`), but that
-    // helper is `pub(crate)` only. This is not a missing primitive -- every
-    // piece it reads is separately public (`Pdf::trailer`,
-    // `Pdf::encryption_file_key`, `Pdf::encryption_info`) -- so its recipe
-    // is reproduced here from those public accessors instead of a GAP.
-    let encrypt_value = encrypted
-        .trailer_dictionary()
-        .get("Encrypt")
-        .cloned()
-        .unwrap_or(flpdf::Object::Null);
-    let (encrypt_value, _, _) = resolve_chain(&mut encrypted, encrypt_value)?;
-    let encrypt_dict = encrypt_value.as_dict().cloned().ok_or_else(|| {
-        flpdf::Error::System("authenticated input has no /Encrypt dictionary".to_string())
-    })?;
-    let id0 = encrypted
-        .trailer_dictionary()
-        .get("ID")
-        .and_then(flpdf::Object::as_array)
-        .and_then(|items| items.first())
-        .and_then(flpdf::Object::as_string)
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| flpdf::Error::System("encrypted input has no /ID[0]".to_string()))?;
-    let file_key = encrypted.encryption_file_key().ok_or_else(|| {
-        flpdf::Error::System("encrypted input has no authenticated file key".to_string())
-    })?;
-    // qpdf's copy path forces AES for V>=4 regardless of the donor's own
-    // per-object algorithm, and RC4 below that -- the same rule
-    // `writer_copy_encryption_source` applies.
-    let encryption_v = encrypted.encryption_info()?.map(|info| info.v).unwrap_or(0);
-    let object_key_alg = if encryption_v >= 4 {
-        ObjectKeyAlg::Aes
-    } else {
-        ObjectKeyAlg::Rc4
-    };
-    let source = CopyEncryptionSource {
-        encrypt_dict,
-        file_key,
-        id0,
-        object_key_alg,
-    };
+    // `/ID[0]`. The library owns that boundary, so the qtest driver consumes
+    // the same canonical source instead of rebuilding a raw object snapshot.
+    let source = encrypted
+        .writer_copy_encryption_source()?
+        .ok_or_else(|| flpdf::Error::System("encrypted input is not encrypted".to_string()))?;
 
     let mut w = PdfWriter::new(pdf);
     w.set_output_file("b.pdf")?;

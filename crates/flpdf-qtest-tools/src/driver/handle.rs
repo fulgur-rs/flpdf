@@ -1,10 +1,14 @@
 use std::io::{Read, Seek};
 
-use flpdf::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf};
+#[cfg(test)]
+use flpdf::{Dictionary, Object};
+use flpdf::{Error, ObjectHandle, ObjectRef, Pdf};
 
+#[cfg(test)]
 const MAX_REF_CHAIN_DEPTH: usize = 64;
 
-pub(crate) struct ResolvedStreamDictionary {
+#[cfg(test)]
+pub(crate) struct LegacyResolvedStreamDictionary {
     dictionary: Dictionary,
     filterable: bool,
     decode_param_type_warnings: Vec<DecodeParamTypeWarning>,
@@ -39,7 +43,8 @@ pub(crate) enum DecodeParmsWarningSource {
     ArrayItem(ObjectRef, usize),
 }
 
-impl ResolvedStreamDictionary {
+#[cfg(test)]
+impl LegacyResolvedStreamDictionary {
     pub(crate) fn is_filterable(&self) -> bool {
         self.filterable
     }
@@ -74,6 +79,7 @@ impl ResolvedStreamDictionary {
     }
 }
 
+#[cfg(test)]
 fn decode_params_handle(value: &Object) -> ObjectHandle {
     match value {
         Object::Null => ObjectHandle::null(),
@@ -98,6 +104,7 @@ fn decode_params_handle(value: &Object) -> ObjectHandle {
     }
 }
 
+#[cfg(test)]
 fn filter_value_handle(value: &Object) -> ObjectHandle {
     match value {
         Object::Null => ObjectHandle::null(),
@@ -127,7 +134,8 @@ fn filter_value_handle(value: &Object) -> ObjectHandle {
     }
 }
 
-impl std::ops::Deref for ResolvedStreamDictionary {
+#[cfg(test)]
+impl std::ops::Deref for LegacyResolvedStreamDictionary {
     type Target = Dictionary;
 
     fn deref(&self) -> &Self::Target {
@@ -135,12 +143,14 @@ impl std::ops::Deref for ResolvedStreamDictionary {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write_object(object: &Object) -> Vec<u8> {
     let mut bytes = Vec::new();
     object.write_pdf(&mut bytes);
     bytes
 }
 
+#[cfg(test)]
 pub(crate) fn write_qpdf_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
@@ -150,6 +160,7 @@ pub(crate) fn write_qpdf_object<R: Read + Seek>(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn write_qpdf_object_into<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
@@ -187,6 +198,7 @@ fn write_qpdf_object_into<R: Read + Seek>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut value: Object,
@@ -211,10 +223,11 @@ pub(crate) fn resolve_chain<R: Read + Seek>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     source: &Dictionary,
-) -> flpdf::Result<ResolvedStreamDictionary> {
+) -> flpdf::Result<LegacyResolvedStreamDictionary> {
     let filter = source
         .get(b"Filter")
         .cloned()
@@ -278,13 +291,14 @@ pub(crate) fn resolve_stream_dictionary<R: Read + Seek>(
             }
         }
     }
-    Ok(ResolvedStreamDictionary {
+    Ok(LegacyResolvedStreamDictionary {
         dictionary: resolved,
         filterable,
         decode_param_type_warnings,
     })
 }
 
+#[cfg(test)]
 fn aligned_decode_params<'a>(
     filters: &[&[u8]],
     decode_params: Option<&'a Object>,
@@ -303,6 +317,7 @@ fn aligned_decode_params<'a>(
     }
 }
 
+#[cfg(test)]
 fn crypt_decode_params_filterable(decode_params: Option<&Object>) -> bool {
     let Some(decode_params) = decode_params else {
         return true;
@@ -328,6 +343,7 @@ fn crypt_decode_params_filterable(decode_params: Option<&Object>) -> bool {
             .all(|(key, _)| matches!(*key, b"Type" | b"Name"))
 }
 
+#[cfg(test)]
 fn qpdf_object_type_name(object: &Object) -> &'static str {
     match object {
         Object::Null => "null",
@@ -345,6 +361,7 @@ fn qpdf_object_type_name(object: &Object) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn remove_identity_crypt_stages(dictionary: &mut Dictionary, filters: &[&[u8]]) {
     let crypt_indices: Vec<usize> = filters
         .iter()
@@ -382,6 +399,7 @@ fn remove_identity_crypt_stages(dictionary: &mut Dictionary, filters: &[&[u8]]) 
     }
 }
 
+#[cfg(test)]
 fn resolved_filter_names(filter: &Object) -> Option<Vec<&[u8]>> {
     match filter {
         Object::Null => Some(Vec::new()),
@@ -434,6 +452,7 @@ fn filter_consumes_decode_key(filter: &[u8], key: &[u8]) -> bool {
     }
 }
 
+#[cfg(test)]
 fn resolve_decode_param_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[&[u8]],
@@ -467,6 +486,7 @@ fn resolve_decode_param_dict<R: Read + Seek>(
 /// against `filters`, returning the resolved value plus the indirect object
 /// (if any) whose own bytes directly hold it — i.e. the terminal reference
 /// of *this* value's own chain, not any enclosing container's.
+#[cfg(test)]
 fn resolve_decode_param_for_filters<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[&[u8]],
@@ -490,6 +510,7 @@ fn resolve_decode_param_for_filters<R: Read + Seek>(
 /// item inherits the enclosing array's own indirect object — as one item
 /// inside that array — when the array itself was reached through a
 /// reference, rather than reporting no indirection at all.
+#[cfg(test)]
 fn resolve_decode_params<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     filters: &[&[u8]],
@@ -529,6 +550,7 @@ fn resolve_decode_params<R: Read + Seek>(
     }
 }
 
+#[cfg(test)]
 fn resolve_filter_structure<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Object,
@@ -544,6 +566,382 @@ fn resolve_filter_structure<R: Read + Seek>(
         }
         other => Ok(other),
     }
+}
+
+/// The resolved stream-dictionary view consumed by qtest's filter diagnostics
+/// and decode path. The dictionary remains a live handle graph; no owned raw
+/// object snapshot is retained.
+pub(crate) struct ResolvedStreamDictionary {
+    dictionary: ObjectHandle,
+    filterable: bool,
+    decode_param_type_warnings: Vec<DecodeParamTypeWarning>,
+}
+
+impl ResolvedStreamDictionary {
+    pub(crate) fn is_filterable(&self) -> bool {
+        self.filterable
+    }
+
+    pub(crate) fn decode_param_type_warnings(&self) -> &[DecodeParamTypeWarning] {
+        &self.decode_param_type_warnings
+    }
+
+    pub(crate) fn filter_input_handle(&self) -> ObjectHandle {
+        self.dictionary.clone()
+    }
+}
+
+/// Resolve a handle chain through the canonical qpdf cache, retaining both the
+/// first and terminal indirect identities used by qtest warning attribution.
+pub(crate) fn resolve_handle_chain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+) -> flpdf::Result<(ObjectHandle, Option<ObjectRef>, Option<ObjectRef>)> {
+    let first_ref = value.object_ref();
+    let (terminal, terminal_ref) = pdf.resolve_to_terminal_ref(value)?;
+    Ok((terminal, first_ref, terminal_ref))
+}
+
+/// Write a resolved handle using qpdf's dictionary null-visibility and child
+/// indirect-identity rules. This is the qtest driver's diagnostic serializer,
+/// not a second PDF writer.
+pub(crate) fn write_qpdf_object_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+) -> flpdf::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_qpdf_handle_into(pdf, value, false, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_qpdf_handle_into<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+    preserve_indirect: bool,
+    bytes: &mut Vec<u8>,
+) -> flpdf::Result<()> {
+    if preserve_indirect && value.object_ref().is_some() {
+        bytes.extend_from_slice(&value.unparse());
+        return Ok(());
+    }
+
+    let value = pdf.resolve_to_terminal(value)?;
+    if let Some(items) = value.as_array() {
+        bytes.extend_from_slice(b"[ ");
+        for item in items {
+            write_qpdf_handle_into(pdf, &item, true, bytes)?;
+            bytes.push(b' ');
+        }
+        bytes.push(b']');
+        return Ok(());
+    }
+    if let Some(entries) = value.as_dictionary() {
+        bytes.extend_from_slice(b"<< ");
+        for (key, child) in entries {
+            let child = pdf.resolve_to_terminal(&child)?;
+            if child.is_null() {
+                continue;
+            }
+            let name = key.strip_prefix(b"/").unwrap_or(&key);
+            bytes.extend_from_slice(&ObjectHandle::name(name.to_vec()).unparse_resolved());
+            bytes.push(b' ');
+            write_qpdf_handle_into(pdf, &child, true, bytes)?;
+            bytes.push(b' ');
+        }
+        bytes.extend_from_slice(b">>");
+        return Ok(());
+    }
+    if let Some(stream_dict) = value.as_stream_dict() {
+        return write_qpdf_handle_into(pdf, &stream_dict, false, bytes);
+    }
+    bytes.extend_from_slice(&value.unparse_resolved());
+    Ok(())
+}
+
+pub(crate) fn resolve_stream_dictionary_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    source: &ObjectHandle,
+) -> flpdf::Result<ResolvedStreamDictionary> {
+    let source = pdf.resolve_to_terminal(source)?;
+    let filter_value = source.get_key(b"/Filter");
+    let filter = if filter_value.is_null() {
+        None
+    } else {
+        Some(resolve_filter_structure_handle(pdf, &filter_value)?)
+    };
+    let filter_names = filter.as_ref().and_then(resolved_filter_names_handle);
+    let mut filterable = filter_names
+        .as_deref()
+        .is_none_or(|names| names.iter().all(|name| qpdf_filter_factory_exists(name)));
+
+    let decode_params_value = source.get_key(b"/DecodeParms");
+    let mut decode_parms_sources = Vec::new();
+    let resolved_decode_params = if filterable {
+        match filter_names.as_deref() {
+            Some(names) => {
+                let (value, sources) =
+                    resolve_decode_params_handle(pdf, names, &decode_params_value)?;
+                decode_parms_sources = sources;
+                value
+            }
+            None => decode_params_value.clone(),
+        }
+    } else {
+        decode_params_value.clone()
+    };
+
+    let mut entries = source
+        .as_dictionary()
+        .ok_or_else(|| Error::System("stream dictionary access on non-dictionary object".into()))?;
+    if filter.is_some() {
+        entries.insert(b"/Filter".to_vec(), filter.expect("filter checked above"));
+    }
+    if !decode_params_value.is_null() || !resolved_decode_params.is_null() {
+        entries.insert(b"/DecodeParms".to_vec(), resolved_decode_params);
+    }
+    let resolved = ObjectHandle::dictionary(entries.into_iter().collect());
+
+    let mut warnings = Vec::new();
+    if filterable {
+        if let Some(names) = filter_names.as_deref() {
+            let params =
+                aligned_decode_params_handle(pdf, &resolved.get_key(b"/DecodeParms"), names)?;
+            for (filter_index, (filter_name, params)) in names.iter().zip(params).enumerate() {
+                let normalized = normalized_filter_name(filter_name);
+                if params.as_ref().is_some_and(|params| !params.is_null())
+                    && params
+                        .as_ref()
+                        .is_some_and(|params| params.as_dictionary().is_none())
+                    && matches!(normalized, b"Crypt" | b"FlateDecode" | b"LZWDecode")
+                {
+                    let params = params.as_ref().expect("non-null DecodeParms");
+                    warnings.push(DecodeParamTypeWarning {
+                        filter_index,
+                        object_type: params.type_name().unwrap_or("unresolved"),
+                        source: decode_parms_sources
+                            .get(filter_index)
+                            .copied()
+                            .unwrap_or(DecodeParmsWarningSource::StreamDictionary),
+                    });
+                }
+                if normalized == b"Crypt"
+                    && !crypt_decode_params_filterable_handle(pdf, params.as_ref())?
+                {
+                    filterable = false;
+                }
+            }
+            remove_identity_crypt_stages_handle(&resolved, names)?;
+        }
+    }
+    Ok(ResolvedStreamDictionary {
+        dictionary: resolved,
+        filterable,
+        decode_param_type_warnings: warnings,
+    })
+}
+
+fn resolved_filter_names_handle(filter: &ObjectHandle) -> Option<Vec<Vec<u8>>> {
+    if filter.is_null() {
+        return Some(Vec::new());
+    }
+    if let Some(name) = filter.as_name() {
+        return Some(vec![name]);
+    }
+    filter
+        .as_array()?
+        .into_iter()
+        .map(|value| value.as_name())
+        .collect()
+}
+
+fn resolve_filter_structure_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+) -> flpdf::Result<ObjectHandle> {
+    let value = pdf.resolve_to_terminal(value)?;
+    if let Some(values) = value.as_array() {
+        let values = values
+            .into_iter()
+            .map(|value| pdf.resolve_to_terminal(&value))
+            .collect::<flpdf::Result<Vec<_>>>()?;
+        return Ok(ObjectHandle::array(values));
+    }
+    Ok(value)
+}
+
+fn aligned_decode_params_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_params: &ObjectHandle,
+    filters: &[Vec<u8>],
+) -> flpdf::Result<Vec<Option<ObjectHandle>>> {
+    let decode_params = pdf.resolve_to_terminal(decode_params)?;
+    if decode_params.is_null() {
+        return Ok(vec![None; filters.len()]);
+    }
+    let Some(values) = decode_params.as_array() else {
+        return Ok(vec![Some(decode_params); filters.len()]);
+    };
+    if values.is_empty() {
+        return Ok(vec![None; filters.len()]);
+    }
+    if values.len() != filters.len() {
+        return Ok(Vec::new());
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let value = pdf.resolve_to_terminal(&value)?;
+            Ok((!value.is_null()).then_some(value))
+        })
+        .collect()
+}
+
+fn crypt_decode_params_filterable_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    decode_params: Option<&ObjectHandle>,
+) -> flpdf::Result<bool> {
+    let Some(decode_params) = decode_params else {
+        return Ok(true);
+    };
+    let decode_params = pdf.resolve_to_terminal(decode_params)?;
+    if decode_params.is_null() {
+        return Ok(true);
+    }
+    let Some(entries) = decode_params.as_dictionary() else {
+        return Ok(true);
+    };
+    let mut visible = Vec::new();
+    for (key, value) in entries {
+        let value = pdf.resolve_to_terminal(&value)?;
+        if !value.is_null() {
+            visible.push((key, value));
+        }
+    }
+    let type_is_valid = visible
+        .iter()
+        .find(|(key, _)| key.as_slice() == b"/Type")
+        .is_none_or(|(_, value)| value.as_name().as_deref() == Some(b"CryptFilterDecodeParms"));
+    Ok(type_is_valid
+        && visible
+            .iter()
+            .all(|(key, _)| matches!(key.as_slice(), b"/Type" | b"/Name")))
+}
+
+fn resolve_decode_param_dict_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filters: &[Vec<u8>],
+    dictionary: &ObjectHandle,
+) -> flpdf::Result<ObjectHandle> {
+    let Some(entries) = pdf.resolve_to_terminal(dictionary)?.as_dictionary() else {
+        return Ok(ObjectHandle::dictionary(Vec::new()));
+    };
+    let mut resolved = Vec::new();
+    for (key, value) in entries {
+        let consumed = filters.iter().any(|filter| {
+            filter_consumes_decode_key(filter, key.strip_prefix(b"/").unwrap_or(&key))
+        });
+        let value = if consumed {
+            pdf.resolve_to_terminal(&value)?
+        } else {
+            value
+        };
+        if !consumed || !value.is_null() {
+            resolved.push((key, value));
+        }
+    }
+    Ok(ObjectHandle::dictionary(resolved))
+}
+
+fn resolve_decode_param_for_filters_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filters: &[Vec<u8>],
+    value: &ObjectHandle,
+) -> flpdf::Result<(ObjectHandle, Option<ObjectRef>)> {
+    let (value, _, terminal_ref) = resolve_handle_chain(pdf, value)?;
+    let value = if value.as_dictionary().is_some() {
+        resolve_decode_param_dict_handle(pdf, filters, &value)?
+    } else {
+        value
+    };
+    Ok((value, terminal_ref))
+}
+
+fn resolve_decode_params_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    filters: &[Vec<u8>],
+    value: &ObjectHandle,
+) -> flpdf::Result<(ObjectHandle, Vec<DecodeParmsWarningSource>)> {
+    let (value, _, container_ref) = resolve_handle_chain(pdf, value)?;
+    let Some(values) = value.as_array() else {
+        let (value, _) = resolve_decode_param_for_filters_handle(pdf, filters, &value)?;
+        let source = container_ref
+            .map(DecodeParmsWarningSource::ObjectBody)
+            .unwrap_or(DecodeParmsWarningSource::StreamDictionary);
+        return Ok((value, vec![source; filters.len()]));
+    };
+    if values.len() != filters.len() {
+        return Ok((
+            value,
+            vec![DecodeParmsWarningSource::StreamDictionary; values.len()],
+        ));
+    }
+    let mut resolved_values = Vec::with_capacity(values.len());
+    let mut sources = Vec::with_capacity(values.len());
+    for (index, (value, filter)) in values.into_iter().zip(filters.iter()).enumerate() {
+        let (value, item_ref) =
+            resolve_decode_param_for_filters_handle(pdf, std::slice::from_ref(filter), &value)?;
+        resolved_values.push(value);
+        sources.push(match (item_ref, container_ref) {
+            (Some(item_ref), _) => DecodeParmsWarningSource::ObjectBody(item_ref),
+            (None, Some(container_ref)) => {
+                DecodeParmsWarningSource::ArrayItem(container_ref, index)
+            }
+            (None, None) => DecodeParmsWarningSource::StreamDictionary,
+        });
+    }
+    Ok((ObjectHandle::array(resolved_values), sources))
+}
+
+fn remove_identity_crypt_stages_handle(
+    dictionary: &ObjectHandle,
+    filters: &[Vec<u8>],
+) -> flpdf::Result<()> {
+    let crypt_indices: Vec<usize> = filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, filter)| (normalized_filter_name(filter) == b"Crypt").then_some(index))
+        .collect();
+    if crypt_indices.is_empty() {
+        return Ok(());
+    }
+    let filter = dictionary.get_key(b"/Filter");
+    if filter
+        .as_name()
+        .is_some_and(|name| normalized_filter_name(&name) == b"Crypt")
+    {
+        dictionary.remove_key(b"/Filter");
+    } else if let Some(values) = filter.as_array() {
+        dictionary.replace_key(
+            b"/Filter",
+            ObjectHandle::array(
+                values
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, value)| (!crypt_indices.contains(&index)).then_some(value))
+                    .collect(),
+            ),
+        )?;
+    }
+    let decode_params = dictionary.get_key(b"/DecodeParms");
+    if let Some(values) = decode_params.as_array() {
+        let values = values
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| (!crypt_indices.contains(&index)).then_some(value))
+            .collect();
+        dictionary.replace_key(b"/DecodeParms", ObjectHandle::array(values))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

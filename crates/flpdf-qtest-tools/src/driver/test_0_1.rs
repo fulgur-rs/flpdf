@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 use flpdf::filters::{DecodeLimits, StreamDecodeEvent};
-use flpdf::{Diagnostic, Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{Diagnostic, Error, ObjectHandle, ObjectRef, Pdf};
 
 use super::handle::{
-    resolve_chain, resolve_stream_dictionary, write_object, write_qpdf_object,
+    resolve_handle_chain, resolve_stream_dictionary_handle, write_qpdf_object_handle,
     DecodeParmsWarningSource,
 };
 use super::{emit_new_diagnostics, write_warning};
@@ -93,50 +93,20 @@ pub(crate) fn run_test_0_1<R: Read + Seek>(
     );
     details?;
 
-    // qpdf's `unparse()`/`unparseResolved()` for a dictionary omit any entry
-    // that resolves to null, eagerly re-resolving every entry (at every
-    // nesting depth) as they walk, regardless of what earlier steps above
-    // already resolved (`QPDF_Dictionary::unparse`,
-    // `libqpdf/QPDF_Dictionary.cc:59-69`). `write_qpdf_object` already
-    // implements exactly that eager, self-contained walk via `resolve_chain`
-    // — reused here via the legacy `Object` bridge rather than ported onto
-    // `ObjectHandle::unparse_resolved`, whose own null-omission depends on
-    // prior resolution state (`ObjectHandle::unparse_resolved`'s own doc)
-    // and would only coincidentally match for entries some earlier step
-    // happened to have already touched.
-    //
-    // `resolve_chain`'s own 64-hop count is spent starting from `original`'s
-    // *own* reference (its first loop iteration re-resolves it), while
-    // `resolve_to_terminal_ref` above already resolved
-    // `original` once for free before counting any redirects — so a chain
-    // landing exactly at that chase's own limit is one hop short of
-    // `resolve_chain`'s budget here and errors instead of completing
-    // (Codex Review on PR #610). Starting `resolve_chain` from `original`'s
-    // *content* — the same value its own first resolution already
-    // established — instead of re-spending that hop keeps both walks
-    // counting the same redirects.
-    let resolved = match original.object_ref() {
-        Some(reference) => {
-            let first_content = pdf.resolve_borrowed(reference)?.clone();
-            resolve_chain(pdf, first_content)?.0
-        }
-        None => {
-            let raw_qtest_value = pdf
-                .trailer_dictionary()
-                .get(b"QTest")
-                .cloned()
-                .unwrap_or(Object::Null);
-            resolve_chain(pdf, raw_qtest_value)?.0
-        }
+    // The canonical handle serializer performs qpdf's eager dictionary
+    // null-visibility walk while retaining indirect child identity. The
+    // terminal handle returned here is the same live object as `original` or
+    // the last reference-as-value redirect.
+    let (resolved, _, _) = resolve_handle_chain(pdf, &original)?;
+    let unparse_bytes = if original.is_indirect() {
+        original.unparse()
+    } else {
+        write_qpdf_object_handle(pdf, &original)?
     };
-    let unparse_bytes = match original.object_ref() {
-        Some(reference) => write_object(&Object::Reference(reference)),
-        None => write_qpdf_object(pdf, &resolved)?,
-    };
-    let unparse_resolved_bytes = if matches!(resolved, Object::Stream(_)) {
+    let unparse_resolved_bytes = if resolved.as_stream_dict().is_some() {
         unparse_bytes.clone()
     } else {
-        write_qpdf_object(pdf, &resolved)?
+        write_qpdf_object_handle(pdf, &resolved)?
     };
 
     write!(stdout, "unparse: ")?;
@@ -245,17 +215,10 @@ fn write_object_details<R: Read + Seek>(
             let dict_handle = chased
                 .as_stream_dict()
                 .expect("type_code confirmed a stream value");
-            let dict = match dict_handle.materialize()? {
-                Object::Dictionary(dict) => dict,
-                // A stream's own dictionary handle is always constructed as
-                // a direct dictionary value (`ObjectHandle::materialize`'s
-                // own doc).
-                _ => Dictionary::new(), // cov:ignore: unreachable per the invariant above
-            };
             let data = chased.get_raw_stream_data()?;
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
-            let dictionary = write_qpdf_object(pdf, &Object::Dictionary(dict.clone()))?;
-            let decode_dictionary = resolve_stream_dictionary(pdf, &dict)?;
+            let dictionary = write_qpdf_object_handle(pdf, &dict_handle)?;
+            let decode_dictionary = resolve_stream_dictionary_handle(pdf, &dict_handle)?;
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             write_bytes(stdout, &dictionary)?;
             writeln!(stdout)?;
