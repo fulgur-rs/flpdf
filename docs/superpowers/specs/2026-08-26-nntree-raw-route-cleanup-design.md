@@ -63,10 +63,10 @@ adapted.
 
 - Add a route-contract RED test before deleting production code. It must fail on
   the current `nntree.rs` because the raw constructor/projection tokens exist.
-- Retain the external canonical `NameTree`/`NumberTree` tests and the
-  in-module tests that exercise live handle behavior, converting only the
-  necessary fixtures/assertions to `ObjectHandle` constructors and typed
-  cursors.
+- Retain the external canonical `NameTree`/`NumberTree` tests. The former
+  in-module suite was coupled to private raw constructors and projections, so
+  delete it rather than preserve a second route; the external suite and
+  parser-owned consumer tests retain the live-handle behavior coverage.
 - Delete tests whose only assertion is about a synthetic raw `Object` route,
   path-only identity, legacy root synchronization, or materialization. Such
   behavior is not qpdf behavior and must not receive a compatibility adapter.
@@ -99,7 +99,7 @@ adapted.
 The slice is acceptable only when all of these have fresh evidence:
 
 - route-contract RED observed before the removal and GREEN afterward;
-- focused in-module and external NNTree tests pass;
+- focused external NNTree and parser-owned consumer tests pass;
 - `cargo fmt --all -- --check` passes;
 - strict private rustdoc passes with the CI flags;
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`

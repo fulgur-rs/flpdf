@@ -43,7 +43,7 @@ fn generic_nntree_uses_only_the_canonical_handle_route() {
             "nntree.rs still contains the raw route marker {forbidden:?}"
         );
     }
-    for canonical in ["ObjectHandle", "cloned_current_handle", "set_array_items"] {
+    for canonical in ["ObjectHandle", "cloned_current", "set_array_items"] {
         assert!(
             source.contains(canonical),
             "nntree.rs must retain the canonical route marker {canonical:?}"
@@ -95,20 +95,19 @@ normalization behavior.
 - [ ] **Step 2: Remove the raw cursor fields and accessors.**
 
 Change `NNTreeCursor<K>` so it contains `path`, `leaf`, `item_number`,
-`current_handle`, `pdf_id`, and `marker` only. Delete `raw`, `current`,
-`cloned_current`, `cloned_raw_current`, and all assignments to those fields.
-Keep `positioned`, `cloned_current_handle`, `current_key`, `clear_position`,
+`current`, `pdf_id`, and `marker` only. Delete `raw` and all raw projection
+fields and assignments. Keep `positioned`, `cloned_current`, `current_key`, `clear_position`,
 `same_position`, and `Clone` behavior for canonical cursors.
 
 - [ ] **Step 3: Remove `materialize_cursor_value` and simplify `update_current`.**
 
-`update_current` must clear and set only `current_handle`:
+`update_current` must clear and set only `current`:
 
 ```rust
-cursor.current_handle = None;
+cursor.current = None;
 // load and validate the current key/value pair
 let key = resolved_key::<K, _>(pdf, &raw_key)?;
-cursor.current_handle = key.map(|key| (key, raw_value));
+cursor.current = key.map(|key| (key, raw_value));
 ```
 
 Preserve the existing `allow_invalid` error and warning behavior. Do not turn
@@ -125,8 +124,8 @@ Change the struct to:
 
 ```rust
 pub(crate) struct NNTree<K: TreeKey> {
-    canonical_root: ObjectHandle,
-    canonical_root_pdf_id: Option<u64>,
+    root: ObjectHandle,
+    root_pdf_id: Option<u64>,
     auto_repair: bool,
     split_threshold: usize,
     max_depth: Option<usize>,
@@ -134,13 +133,12 @@ pub(crate) struct NNTree<K: TreeKey> {
 }
 ```
 
-Make `from_handle` construct this value directly. Delete `NNTree::new`,
-`root`, and `into_root`. `NameTree::new` and `NumberTree::new` continue to
-call `NNTree::from_handle`.
+Make `NNTree::new` construct this value directly. Keep the public
+`NameTree::new` and `NumberTree::new` wrappers as the only constructors.
 
 - [ ] **Step 2: Simplify root ownership and mutation completion.**
 
-Keep the contextless-root ownership claim in `ensure_canonical_root`, including
+Keep the root ownership claim in `ensure_root`, including
 the full descendant ownership check before claiming a direct root. Return the
 canonical root for the same PDF without comparing or rebuilding a raw snapshot.
 Delete `legacy_root_snapshot`, `legacy_projection`, `sync_legacy_root`, and
@@ -149,22 +147,18 @@ Delete `legacy_root_snapshot`, `legacy_projection`, `sync_legacy_root`, and
 - [ ] **Step 3: Delete raw mutation wrappers and use handle mutation paths.**
 
 Delete the raw `insert`, `insert_after`, `remove`, `remove_at`,
-`remove_at_inner`, and `lift_value` methods. Retain the handle versions used by
-the public wrappers. Rename helper methods whose `raw` name referred only to
-the old API (`insert_raw_pair_with_allocator`, `insert_resolved_raw_with_allocator`,
-`insert_first_raw`) to `insert_handle_pair_with_allocator`,
-`insert_resolved_handle_with_allocator`, and `insert_first_handle`, then update
-all internal callers.
+`remove_at_inner`, and `lift_value` methods. Retain the canonical versions used
+by the public wrappers. Remove the `raw` suffix from helper methods whose name
+referred only to the old API, then update all internal callers.
 
 - [ ] **Step 4: Keep qpdf live node handling and remove compatibility storage.**
 
 Retain `NodeHandle` live-handle traversal, direct-kid diagnostic paths,
 `resolved_array`, `LiveDictionary`, `load_node`, `load_anchor`, `repair`,
 `split_node_live`, allocator checks, and all canonical error/warning paths.
-Delete `NodeHandle::root`, `NodeHandle::indirect`, and `NodeHandle::direct_kid`
-only when their callers are raw tests; retain the `*_with_handle` constructors
-needed by canonical direct-kid traversal. Remove test-only `NodeReplacement` and
-`store_node` once their raw tests are deleted or converted.
+Keep the canonical `NodeHandle::root`, `NodeHandle::indirect`, and
+`NodeHandle::direct_kid` constructors needed by live direct-kid traversal.
+Remove test-only `NodeReplacement` and `store_node` with the raw tests.
 
 - [ ] **Step 5: Run a compile-focused test after the production cleanup.**
 
@@ -174,10 +168,10 @@ Run:
 cargo test -p flpdf --test name_number_tree_route_cutover_tests generic_nntree_uses_only_the_canonical_handle_route
 ```
 
-Expected: the route test passes, while compilation may identify remaining
-in-module raw tests. Do not add a compatibility API to make those tests compile.
+Expected: the route test passes and no private raw-test module remains. Do not
+add a compatibility API to make deleted raw tests compile.
 
-## Task 4: Remove or migrate in-module raw tests without losing canonical coverage
+## Task 4: Remove in-module raw tests without losing canonical coverage
 
 **Files:**
 - Modify: `crates/flpdf/src/nntree.rs`
@@ -191,17 +185,16 @@ materialization-failure cases), bare-reference legacy-terminal tests, and
 `cursor_raw_is_restored_cleared_for_empty_and_cleared_after_last_remove`.
 Delete fixture builders and helpers that become unused after those tests are
 removed, including raw `make_indirect`, `number_tree_shape` if it has no
-canonical caller, and raw `NodeHandle` constructors.
+canonical caller, and raw `NodeHandle` constructors. In this slice the entire
+former in-module suite is raw-route coupled, so no private test module remains.
 
-- [ ] **Step 2: Convert retained canonical tests to `ObjectHandle`.**
+- [ ] **Step 2: Confirm canonical coverage in external tests.**
 
-For each retained test that currently constructs `NNTree::<K>::new(Object...)`,
-construct the root using `ObjectHandle::dictionary`, `ObjectHandle::array`,
-`ObjectHandle::string`, and `ObjectHandle::integer`, then use
-`NNTree::from_handle` or the public `NameTree`/`NumberTree` wrapper. Replace
-`cursor.current()` assertions with `cursor.cloned_current_handle()` or the
-typed public cursor `current()` method. Inspect direct values through
-`ObjectHandle` accessors, never `Object` pattern matching.
+The external `NameTree`/`NumberTree` suite now constructs roots with
+`ObjectHandle::dictionary`, `ObjectHandle::array`, `ObjectHandle::string`, and
+`ObjectHandle::integer`, and uses typed public cursor `current()` accessors.
+Inspect direct values through `ObjectHandle` accessors, never `Object` pattern
+matching in the canonical route.
 
 - [ ] **Step 3: Preserve malformed and repair coverage through parser-owned handles.**
 
@@ -218,12 +211,11 @@ atomicity.
 Run:
 
 ```bash
-cargo test -p flpdf --lib nntree
 cargo test -p flpdf --test nntree_tests
 cargo test -p flpdf --test name_number_tree_route_cutover_tests
 ```
 
-Expected: all retained canonical tests pass, the route contract passes, and no
+Expected: the external canonical tests pass, the route contract passes, and no
 test refers to the deleted generic raw API.
 
 ## Task 5: Update qpdf documentation and inspect the complete diff

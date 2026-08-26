@@ -566,6 +566,38 @@ fn number_tree_new_empty_owns_an_indirect_root() {
 }
 
 #[test]
+fn trees_reject_reusing_a_root_with_another_pdf() {
+    let mut first_pdf = empty_pdf();
+    let mut second_pdf = empty_pdf();
+
+    let mut names = NameTree::new(empty_name_tree_root(), true);
+    assert!(names
+        .find_object(&mut first_pdf, b"missing")
+        .expect("first PDF claims the name-tree root")
+        .is_none());
+    let error = names
+        .find_object(&mut second_pdf, b"missing")
+        .expect_err("a name-tree root cannot be reused with another PDF");
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: name/number tree root belongs to a different Pdf"
+    );
+
+    let mut numbers = NumberTree::new(empty_number_tree_root(), true);
+    assert!(numbers
+        .find_object(&mut first_pdf, 0)
+        .expect("first PDF claims the number-tree root")
+        .is_none());
+    let error = numbers
+        .find_object(&mut second_pdf, 0)
+        .expect_err("a number-tree root cannot be reused with another PDF");
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: name/number tree root belongs to a different Pdf"
+    );
+}
+
+#[test]
 fn name_tree_helper_exposes_sorted_find_map_and_remove() {
     let mut pdf = empty_pdf();
     let mut tree = NameTree::new(empty_name_tree_root(), true);

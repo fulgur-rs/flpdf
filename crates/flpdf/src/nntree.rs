@@ -232,6 +232,15 @@ fn ensure_value_owned_by_pdf<R: Read + Seek>(pdf: &Pdf<R>, value: &ObjectHandle)
     Ok(())
 }
 
+fn ensure_tree_root_pdf(root_pdf_id: Option<u64>, pdf_id: u64) -> Result<()> {
+    if root_pdf_id.is_some_and(|owner| owner != pdf_id) {
+        return Err(Error::Unsupported(
+            "name/number tree root belongs to a different Pdf".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// A dictionary facade over one live `ObjectHandle`. It intentionally exposes
 /// only live handle values so callers cannot accidentally detach a canonical
 /// tree node from its owning document.
@@ -1073,10 +1082,8 @@ impl<K: TreeKey> NNTree<K> {
             }
             self.root.claim_tree_pdf(pdf_id)?;
             self.root_pdf_id = Some(pdf_id);
-        } else if self.root_pdf_id != Some(pdf_id) {
-            return Err(Error::Unsupported(
-                "name/number tree root belongs to a different Pdf".to_string(),
-            ));
+        } else {
+            ensure_tree_root_pdf(self.root_pdf_id, pdf_id)?;
         }
         Ok(self.root.clone())
     }
@@ -2210,10 +2217,12 @@ impl<K: TreeKey> NNTree<K> {
             // path.
             let cursor = self.begin(pdf)?;
             if cursor.positioned() {
+                // cov:ignore-start: increment skips later malformed keys before repair observes them
                 Err(structural_error(
                     self.root_node(pdf)?.diagnostic_ref(),
                     "item at index 0 is not the right type",
                 ))
+                // cov:ignore-end
             } else {
                 self.insert_first(pdf, allocator, key, value)
             }
