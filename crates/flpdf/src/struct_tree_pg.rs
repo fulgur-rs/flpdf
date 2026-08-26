@@ -39,8 +39,7 @@
 //! handling here.
 
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::ref_chain::terminal_ref_of_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -125,52 +124,49 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(Vec::new()), // No catalog, nothing to do.
     };
-    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-    let Some(catalog) = catalog_obj.as_dict() else {
+    let catalog = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog)?;
+    if catalog.as_dictionary().is_none() {
         return Ok(state.objr_obj_targets);
-    };
+    }
 
-    match catalog.get("StructTreeRoot").cloned() {
+    let struct_tree_root = catalog.try_get_key(b"/StructTreeRoot")?;
+    match struct_tree_root
+        .object_ref()
+        .or_else(|| struct_tree_root.as_reference())
+    {
         // Usual form: /StructTreeRoot is an indirect dictionary. The root
         // itself carries no /Pg; only its /K kids are walked.
-        Some(Object::Reference(root_ref)) => {
+        Some(root_ref) => {
             // Pre-mark the root so a malformed /K back-edge to the root object
             // is not re-walked as if it were a structure element.
             state.visited.insert(root_ref);
+            let root = pdf.get_object_handle(root_ref);
+            pdf.resolve(&root)?;
             let k = {
-                let root_obj = pdf.resolve_borrowed(root_ref)?;
-                let Some(root) = root_obj.as_dict() else {
+                let Some(_) = root.as_dictionary() else {
                     return Ok(state.objr_obj_targets);
                 };
-                root.get("K").cloned()
+                root.try_get_key(b"/K")?
             };
-            if let Some(k) = k {
-                let (new_k, changed) =
+            if !k.is_null() {
+                let (_, changed) =
                     walk_kids(pdf, k, &surviving, removed_pages, 0, max_depth, &mut state)?;
                 if changed {
-                    let root_obj = pdf.resolve_borrowed(root_ref)?;
-                    if let Some(root) = root_obj.as_dict() {
-                        let mut root = root.clone();
-                        root.insert("K", new_k);
-                        pdf.set_object(root_ref, Object::Dictionary(root));
-                    }
+                    pdf.mark_object_handle_dirty(&root)?;
                 }
             }
         }
         // Degenerate form: /StructTreeRoot held as a direct dictionary on the
         // catalog. The rebuilt /K is written back through the catalog.
-        Some(Object::Dictionary(mut root)) => {
-            if let Some(k) = root.remove("K") {
-                let (new_k, changed) =
+        _ if struct_tree_root.as_dictionary().is_some() => {
+            let root = struct_tree_root;
+            let k = root.try_get_key(b"/K")?;
+            if !k.is_null() {
+                let (_, changed) =
                     walk_kids(pdf, k, &surviving, removed_pages, 0, max_depth, &mut state)?;
-                root.insert("K", new_k);
                 if changed {
-                    let cat_obj = pdf.resolve_borrowed(catalog_ref)?;
-                    if let Some(cat) = cat_obj.as_dict() {
-                        let mut cat = cat.clone();
-                        cat.insert("StructTreeRoot", Object::Dictionary(root));
-                        pdf.set_object(catalog_ref, Object::Dictionary(cat));
-                    }
+                    pdf.mark_object_handle_dirty(&root)?;
                 }
             }
         }
@@ -189,60 +185,65 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
 /// its holder back.
 fn walk_kids<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    k: Object,
+    k: ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     removed_pages: &BTreeSet<ObjectRef>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
-) -> Result<(Object, bool)> {
+) -> Result<(ObjectHandle, bool)> {
     if depth >= max_depth {
         return Err(Error::Unsupported(format!(
             "structure tree depth exceeds maximum of {max_depth}"
         )));
     }
-    match k {
-        Object::Reference(r) => {
-            walk_kid_ref(pdf, r, surviving, removed_pages, depth, max_depth, state)?;
-            Ok((Object::Reference(r), false))
-        }
-        Object::Dictionary(dict) => {
-            let (dict, changed) =
-                process_elem_dict(pdf, dict, surviving, removed_pages, depth, max_depth, state)?;
-            Ok((Object::Dictionary(dict), changed))
-        }
-        Object::Array(items) => {
-            let mut changed = false;
-            let mut new_items = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    Object::Reference(r) => {
-                        walk_kid_ref(pdf, r, surviving, removed_pages, depth, max_depth, state)?;
-                        new_items.push(Object::Reference(r));
-                    }
-                    Object::Dictionary(d) => {
-                        let (new_dict, dict_changed) = process_elem_dict(
-                            pdf,
-                            d,
-                            surviving,
-                            removed_pages,
-                            depth,
-                            max_depth,
-                            state,
-                        )?;
-                        new_items.push(Object::Dictionary(new_dict));
-                        changed |= dict_changed;
-                    }
-                    // Integer kids are marked-content identifiers (MCIDs);
-                    // anything else is malformed — both are left unchanged.
-                    other => new_items.push(other),
-                }
-            }
-            Ok((Object::Array(new_items), changed))
-        }
-        // An integer kid is an MCID; any other type is malformed. Unchanged.
-        other => Ok((other, false)),
+    if let Some(r) = k.object_ref().or_else(|| k.as_reference()) {
+        walk_kid_ref(pdf, r, surviving, removed_pages, depth, max_depth, state)?;
+        return Ok((k, false));
     }
+    walk_kids_resolved(pdf, k, surviving, removed_pages, depth, max_depth, state)
+}
+
+fn walk_kids_resolved<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    k: ObjectHandle,
+    surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
+    depth: usize,
+    max_depth: usize,
+    state: &mut WalkState,
+) -> Result<(ObjectHandle, bool)> {
+    if let Some(items) = k.as_array() {
+        let mut changed = false;
+        for item in items {
+            if let Some(r) = item.object_ref().or_else(|| item.as_reference()) {
+                walk_kid_ref(pdf, r, surviving, removed_pages, depth, max_depth, state)?;
+            } else if item.as_dictionary().is_some() {
+                let dict_changed = process_elem_dict(
+                    pdf,
+                    &item,
+                    surviving,
+                    removed_pages,
+                    depth,
+                    max_depth,
+                    state,
+                )?;
+                changed |= dict_changed;
+            }
+        }
+        if changed {
+            pdf.mark_object_handle_dirty(&k)?;
+        }
+        return Ok((k, changed));
+    }
+    if k.as_dictionary().is_some() {
+        let changed =
+            process_elem_dict(pdf, &k, surviving, removed_pages, depth, max_depth, state)?;
+        if changed {
+            pdf.mark_object_handle_dirty(&k)?;
+        }
+    }
+    Ok((k, false))
 }
 
 /// Process an indirect kid: a structure element dictionary, or an indirect
@@ -265,29 +266,21 @@ fn walk_kid_ref<R: Read + Seek>(
     if !state.visited.insert(r) {
         return Ok(());
     }
-    match pdf.resolve_object(r)? {
-        Object::Dictionary(dict) => {
-            let (dict, changed) =
-                process_elem_dict(pdf, dict, surviving, removed_pages, depth, max_depth, state)?;
-            if changed {
-                pdf.set_object(r, Object::Dictionary(dict));
-            }
+    let handle = pdf.get_object_handle(r);
+    pdf.resolve(&handle)?;
+    if handle.as_dictionary().is_some() || handle.as_array().is_some() {
+        let (_, changed) = walk_kids_resolved(
+            pdf,
+            handle.clone(),
+            surviving,
+            removed_pages,
+            depth,
+            max_depth,
+            state,
+        )?;
+        if changed {
+            pdf.mark_object_handle_dirty(&handle)?;
         }
-        Object::Array(items) => {
-            let (new_k, changed) = walk_kids(
-                pdf,
-                Object::Array(items),
-                surviving,
-                removed_pages,
-                depth,
-                max_depth,
-                state,
-            )?;
-            if changed {
-                pdf.set_object(r, new_k);
-            }
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -304,28 +297,26 @@ fn walk_kid_ref<R: Read + Seek>(
 /// an OBJR's `/Obj` are not structure kids and must not be walked).
 fn process_elem_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    mut dict: Dictionary,
+    dict: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     removed_pages: &BTreeSet<ObjectRef>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
-) -> Result<(Dictionary, bool)> {
+) -> Result<bool> {
     let mut changed = false;
 
-    // /Pg is by spec an indirect reference to a page object; any other form is
-    // malformed and left unchanged. A surviving target is remapped to its new
-    // ref; only an original page-tree leaf in removed_pages is dropped.
-    if let Some(Object::Reference(pg)) = dict.get("Pg") {
-        match surviving.get(pg) {
+    let pg_handle = dict.try_get_key(b"/Pg")?;
+    if let Some(pg) = pg_handle.object_ref().or_else(|| pg_handle.as_reference()) {
+        match surviving.get(&pg) {
             Some(&new) => {
-                if new != *pg {
-                    dict.insert("Pg", Object::Reference(new));
+                if new != pg {
+                    dict.replace_key(b"/Pg", pdf.get_object_handle(new))?;
                     changed = true;
                 }
             }
-            None if removed_pages.contains(pg) => {
-                dict.remove("Pg");
+            None if removed_pages.contains(&pg) => {
+                dict.remove_key(b"/Pg");
                 changed = true;
             }
             None => {}
@@ -341,10 +332,15 @@ fn process_elem_dict<R: Read + Seek>(
     // private/extension /Obj key on any other dictionary (a plain structure
     // element, or even an /Type /MCR) is not pulled into the OBJR-only /P-drop
     // scope.
-    if let Some(Object::Reference(obj)) = dict.get("Obj") {
-        let obj = *obj;
-        if is_objr(pdf, &dict)? {
-            let terminal = terminal_ref_of_chain(pdf, obj)?;
+    let obj_handle = dict.try_get_key(b"/Obj")?;
+    if let Some(obj) = obj_handle
+        .object_ref()
+        .or_else(|| obj_handle.as_reference())
+    {
+        if is_objr(pdf, dict)? {
+            let obj_handle = pdf.get_object_handle(obj);
+            let (_, terminal) = pdf.resolve_to_terminal_ref(&obj_handle)?;
+            let terminal = terminal.unwrap_or(obj);
             state.objr_obj_targets.push(terminal);
         }
     }
@@ -353,60 +349,57 @@ fn process_elem_dict<R: Read + Seek>(
     // as MCR/OBJR resolves its /Type (possibly I/O-bound), so defer that check
     // until a /K is actually present to walk: a /K-less dictionary — which every
     // MCR/OBJR is — has nothing to recurse into regardless.
-    if let Some(k) = dict.remove("K") {
-        if is_mcr_or_objr(pdf, &dict)? {
-            // Not a structure element: keep /K verbatim, do not walk it.
-            dict.insert("K", k);
-        } else {
-            let (new_k, k_changed) = walk_kids(
-                pdf,
-                k,
-                surviving,
-                removed_pages,
-                depth + 1,
-                max_depth,
-                state,
-            )?;
-            dict.insert("K", new_k);
-            changed |= k_changed;
-        }
+    let k = dict.try_get_key(b"/K")?;
+    if !k.is_null() && !is_mcr_or_objr(pdf, dict)? {
+        let (_, k_changed) = walk_kids(
+            pdf,
+            k,
+            surviving,
+            removed_pages,
+            depth + 1,
+            max_depth,
+            state,
+        )?;
+        changed |= k_changed;
     }
 
-    Ok((dict, changed))
+    Ok(changed)
 }
 
 /// Whether `dict` is a marked-content reference (`/Type /MCR`) or object
 /// reference (`/Type /OBJR`) dictionary. `/Type` may itself be stored as an
 /// indirect reference, so it is resolved before matching.
-fn is_mcr_or_objr<R: Read + Seek>(pdf: &mut Pdf<R>, dict: &Dictionary) -> Result<bool> {
-    match dict.get("Type") {
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(*r)? {
-            Object::Name(n) => Ok(n == b"MCR" || n == b"OBJR"),
-            _ => Ok(false),
-        },
-        Some(Object::Name(n)) => Ok(n == b"MCR" || n == b"OBJR"),
-        _ => Ok(false),
+fn resolved_name<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+) -> Result<Option<Vec<u8>>> {
+    if handle.object_ref().is_some() {
+        pdf.resolve(handle)?;
     }
+    Ok(handle.as_name())
+}
+
+fn is_mcr_or_objr<R: Read + Seek>(pdf: &mut Pdf<R>, dict: &ObjectHandle) -> Result<bool> {
+    let type_handle = dict.try_get_key(b"/Type")?;
+    Ok(matches!(
+        resolved_name(pdf, &type_handle)?.as_deref(),
+        Some(b"MCR" | b"OBJR")
+    ))
 }
 
 /// Whether `dict`'s `/Type` resolves to `/OBJR`. `/Type` may be stored as an
 /// indirect reference, so it is resolved before matching. Gates `/Obj` target
 /// collection to true object-reference kids (only OBJR carries `/Obj`), keeping
 /// the follow-on `/P`-drop pass within its OBJR-only scope.
-fn is_objr<R: Read + Seek>(pdf: &mut Pdf<R>, dict: &Dictionary) -> Result<bool> {
-    match dict.get("Type") {
-        Some(Object::Name(n)) => Ok(n == b"OBJR"),
-        Some(Object::Reference(r)) => {
-            Ok(matches!(pdf.resolve_borrowed(*r)?, Object::Name(n) if n == b"OBJR"))
-        }
-        _ => Ok(false),
-    }
+fn is_objr<R: Read + Seek>(pdf: &mut Pdf<R>, dict: &ObjectHandle) -> Result<bool> {
+    let type_handle = dict.try_get_key(b"/Type")?;
+    Ok(resolved_name(pdf, &type_handle)?.as_deref() == Some(b"OBJR"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Pdf;
+    use crate::{Dictionary, Object, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
