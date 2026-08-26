@@ -136,7 +136,12 @@ fn structure_tree_removed_page_production_uses_object_handles() {
             "struct_tree_pg production still contains the raw route marker {legacy:?}"
         );
     }
-    for canonical in ["ObjectHandle", "get_object_handle", "replace_key", "remove_key"] {
+    for canonical in [
+        "ObjectHandle",
+        "get_object_handle",
+        "replace_key",
+        "remove_key",
+    ] {
         assert!(
             production.contains(canonical),
             "struct_tree_pg production must use the canonical handle marker {canonical:?}"
@@ -165,7 +170,12 @@ fn objr_annotation_removed_page_production_uses_object_handles() {
             "objr_obj_annot_p production still contains the raw route marker {legacy:?}"
         );
     }
-    for canonical in ["ObjectHandle", "resolve_to_terminal_ref", "replace_key", "remove_key"] {
+    for canonical in [
+        "ObjectHandle",
+        "resolve_to_terminal_ref",
+        "replace_key",
+        "remove_key",
+    ] {
         assert!(
             production.contains(canonical),
             "objr_obj_annot_p production must use the canonical handle marker {canonical:?}"

@@ -55,8 +55,7 @@
 //!   *is* treated as a removed page and dropped (see the note above).
 
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -85,7 +84,7 @@ use std::io::{Read, Seek};
 ///
 /// # Errors
 ///
-/// Any error propagated from [`Pdf::resolve`] / [`Pdf::resolve_borrowed`] while
+/// Any error propagated from [`Pdf::resolve`] while
 /// resolving a target annotation or its `/P` chain.
 pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
@@ -108,18 +107,19 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
         }
         // Normalize a reference chain so the visited key and the write-back
         // target are the terminal annotation ref, never an intermediate holder.
-        let (concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(start))?;
+        let start_handle = pdf.get_object_handle(start);
+        let (concrete, terminal) = pdf.resolve_to_terminal_ref(&start_handle)?;
         let annot_ref = terminal.unwrap_or(start);
         // A distinct start that resolves to an already-processed terminal is
         // skipped too (two OBJR /Obj entries can reach the same annotation).
         if annot_ref != start && !visited.insert(annot_ref) {
             continue;
         }
-        let Some(mut annot) = concrete.into_dict() else {
+        if concrete.as_dictionary().is_none() {
             continue;
-        };
-        if remap_or_drop_annot_p(pdf, &mut annot, &surviving, removed_pages)? {
-            pdf.set_object(annot_ref, Object::Dictionary(annot));
+        }
+        if remap_or_drop_annot_p(pdf, &concrete, &surviving, removed_pages)? {
+            pdf.mark_object_handle_mutated(annot_ref);
         }
     }
     Ok(())
@@ -136,16 +136,17 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
 /// is left unchanged, even if it resolves to a `/Type /Page` dictionary.
 fn remap_or_drop_annot_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    annot: &mut Dictionary,
+    annot: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
     removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
-    let p_ref = match annot.get("P") {
-        Some(Object::Reference(r)) => *r,
-        _ => return Ok(false),
+    let p = annot.try_get_key(b"/P")?;
+    let Some(p_ref) = p.object_ref().or_else(|| p.as_reference()) else {
+        return Ok(false);
     };
     // Normalize a possible reference-to-reference chain to the terminal page ref.
-    let (_, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
+    let p_handle = pdf.get_object_handle(p_ref);
+    let (_, terminal) = pdf.resolve_to_terminal_ref(&p_handle)?;
     let page_ref = terminal.unwrap_or(p_ref);
     if !surviving.contains_key(&page_ref) && !removed_pages.contains(&page_ref) {
         return Ok(false);
@@ -153,13 +154,13 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
     match surviving.get(&page_ref) {
         Some(&new) => {
             if new != page_ref {
-                annot.insert("P", Object::Reference(new));
+                annot.replace_key(b"/P", pdf.get_object_handle(new))?;
                 return Ok(true);
             }
             Ok(false)
         }
         None => {
-            annot.remove("P");
+            annot.remove_key(b"/P");
             Ok(true)
         }
     }
@@ -168,7 +169,7 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Pdf;
+    use crate::{Dictionary, Object, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
