@@ -616,6 +616,167 @@ fn trees_reject_reusing_a_root_with_another_pdf() {
 }
 
 #[test]
+fn handle_name_tree_rejects_a_fresh_wrapper_nesting_a_foreign_indirect_value() {
+    let pdf_one = empty_pdf();
+    let mut pdf_two = empty_pdf();
+
+    let mut tree = NameTree::new_empty(&mut pdf_two, true).expect("new_empty");
+
+    let foreign_indirect = pdf_one
+        .make_indirect_from_object_handle(ObjectHandle::string(b"one".to_vec()))
+        .expect("allocate value in pdf_one");
+    // A fresh direct wrapper that was never itself promoted to indirect in
+    // any Pdf, but nests the pdf_one-owned indirect handle one hop down.
+    // The outer handle's own shallow ownership fields report no owner;
+    // only a full-graph walk catches the foreign descendant.
+    let wrapper = ObjectHandle::dictionary(vec![(b"/Held".to_vec(), foreign_indirect)]);
+    assert!(wrapper.object_ref().is_none());
+
+    let error = tree
+        .insert(&mut pdf_two, b"a", wrapper)
+        .err()
+        .expect("a wrapper nesting pdf_one's handle must be rejected in pdf_two's tree");
+    assert!(error.to_string().contains("different Pdf"));
+}
+
+#[test]
+fn handle_name_tree_root_rejects_a_contextless_root_nesting_a_foreign_indirect_child() {
+    let pdf_one = empty_pdf();
+    let mut pdf_two = empty_pdf();
+
+    let foreign_indirect = pdf_one
+        .make_indirect_from_object_handle(ObjectHandle::array(vec![]))
+        .expect("allocate a /Names-shaped value in pdf_one");
+    // A fresh contextless direct root that nests the pdf_one-owned
+    // indirect handle under /Names -- never itself promoted to indirect,
+    // so its own shallow owning_pdf_unique_id() is None.
+    let root = ObjectHandle::dictionary(vec![(b"/Names".to_vec(), foreign_indirect)]);
+    assert!(root.object_ref().is_none());
+
+    let mut tree = NameTree::new(root, true);
+    let error = tree
+        .find_object(&mut pdf_two, b"anything")
+        .expect_err("a root nesting pdf_one's handle must be rejected as pdf_two's root");
+    assert!(error.to_string().contains("different Pdf"));
+}
+
+#[test]
+fn cloned_name_tree_wrappers_cannot_claim_one_contextless_root_for_different_pdfs() {
+    let root =
+        ObjectHandle::dictionary(vec![(b"/Names".to_vec(), ObjectHandle::array(Vec::new()))]);
+    let mut first_tree = NameTree::new(root.clone(), false);
+    let mut second_tree = NameTree::new(root, false);
+    let mut first_pdf = empty_pdf();
+    let mut second_pdf = empty_pdf();
+
+    assert!(first_tree
+        .find_object(&mut first_pdf, b"missing")
+        .expect("the first wrapper should claim the contextless root")
+        .is_none());
+
+    let error = second_tree
+        .find_object(&mut second_pdf, b"missing")
+        .expect_err("a shared root must reject a claim by a different Pdf");
+    assert!(error.to_string().contains("different Pdf"));
+
+    assert!(second_tree
+        .find_object(&mut first_pdf, b"missing")
+        .expect("wrappers sharing the same Pdf may share the root")
+        .is_none());
+}
+
+#[test]
+fn promoting_an_already_claimed_root_to_indirect_in_another_pdf_is_rejected() {
+    let root =
+        ObjectHandle::dictionary(vec![(b"/Names".to_vec(), ObjectHandle::array(Vec::new()))]);
+    let mut tree = NameTree::new(root.clone(), false);
+    let mut pdf_one = empty_pdf();
+    let pdf_two = empty_pdf();
+
+    assert!(tree
+        .find_object(&mut pdf_one, b"missing")
+        .expect("pdf_one's operation should claim the contextless root")
+        .is_none());
+
+    // A caller reaching for the raw promotion primitive on the same
+    // handle, targeting a *different* Pdf than the tree already claimed,
+    // must be rejected -- not silently re-owned, which would leave
+    // pdf_one's tree still able to mutate what is now pdf_two's object.
+    let error = pdf_two
+        .make_indirect_from_object_handle(root)
+        .expect_err("promoting a root already claimed by pdf_one must fail for pdf_two");
+    assert!(error.to_string().contains("different Pdf"));
+
+    // pdf_one's tree still works correctly afterward.
+    assert!(tree
+        .find_object(&mut pdf_one, b"missing")
+        .expect("pdf_one's claim survives the rejected foreign promotion")
+        .is_none());
+}
+
+#[test]
+fn handle_name_tree_rejects_inserting_a_value_owned_by_another_pdf() {
+    let pdf_one = empty_pdf();
+    let mut pdf_two = empty_pdf();
+
+    let root = pdf_two
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Names".to_vec(),
+            ObjectHandle::array(vec![]),
+        )]))
+        .expect("allocate name-tree root in pdf_two");
+    let mut tree = NameTree::new(root, true);
+
+    // foreign_value is an indirect handle minted by pdf_one, not pdf_two.
+    let foreign_value = pdf_one
+        .make_indirect_from_object_handle(ObjectHandle::string(b"one".to_vec()))
+        .expect("allocate value in pdf_one");
+
+    let error = tree
+        .insert(&mut pdf_two, b"a", foreign_value)
+        .err()
+        .expect("inserting pdf_one's handle into pdf_two's tree must be rejected");
+    assert!(error.to_string().contains("different Pdf"));
+    assert!(tree
+        .find_object(&mut pdf_two, b"a")
+        .expect("find after rejected insert")
+        .is_none());
+}
+
+#[test]
+fn handle_name_tree_rejects_inserting_a_direct_value_associated_with_another_pdf() {
+    let pdf_one = empty_pdf();
+    let mut pdf_two = empty_pdf();
+
+    let root = pdf_two
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Names".to_vec(),
+            ObjectHandle::array(vec![]),
+        )]))
+        .expect("allocate name-tree root in pdf_two");
+    let mut tree = NameTree::new(root, true);
+
+    // `inner` stays direct (no object_ref), but the sibling wrapper that
+    // holds the same aliased handle is promoted to an indirect object of
+    // pdf_one, which recursively associates every still-direct
+    // descendant -- including `inner` -- with pdf_one's document identity.
+    let inner = ObjectHandle::string(b"one".to_vec());
+    pdf_one
+        .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+            b"/Held".to_vec(),
+            inner.clone(),
+        )]))
+        .expect("promote wrapper to indirect in pdf_one");
+    assert!(inner.object_ref().is_none());
+
+    let error = tree
+        .insert(&mut pdf_two, b"a", inner)
+        .err()
+        .expect("inserting a value associated with pdf_one into pdf_two's tree must be rejected");
+    assert!(error.to_string().contains("different Pdf"));
+}
+
+#[test]
 fn name_tree_helper_exposes_sorted_find_map_and_remove() {
     let mut pdf = empty_pdf();
     let mut tree = NameTree::new(empty_name_tree_root(), true);
