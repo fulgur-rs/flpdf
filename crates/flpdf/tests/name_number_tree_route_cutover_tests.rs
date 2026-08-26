@@ -58,3 +58,38 @@ fn tree_compatibility_route_is_removed_after_cutover() {
     assert!(!number_surface.contains("value: Object,"));
     assert!(!number_surface.contains("Result<Option<Object>>"));
 }
+
+#[test]
+fn generic_nntree_uses_only_the_canonical_handle_route() {
+    let source = include_str!("../src/nntree.rs");
+    for forbidden in [
+        "fn from_object(",
+        "fn to_object(",
+        "pub(crate) fn new(root: Object,",
+        "materialize_cursor_value",
+        "legacy_root_snapshot",
+        "legacy_projection",
+        "sync_legacy_root",
+        "finish_mutation",
+        "lift_value",
+        "legacy_terminal_handle",
+        "qpdf-deviation",
+        "raw: Option<(Object",
+        "current: Option<(K::Key, Object)>",
+        "use crate::{Dictionary",
+        "Object::",
+        "resolve_to_terminal(",
+        "Result<Option<Object>>",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "nntree.rs still contains the raw route marker {forbidden:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "cloned_current", "set_array_items"] {
+        assert!(
+            source.contains(canonical),
+            "nntree.rs must retain the canonical route marker {canonical:?}"
+        );
+    }
+}
