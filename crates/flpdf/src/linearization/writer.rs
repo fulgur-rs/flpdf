@@ -2996,11 +2996,19 @@ fn prepare_linearization_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<boo
             // mutating it in place here would corrupt
             // `snapshot_catalog_extensions`'s pre-write capture, since
             // `ObjectHandle` clones share the same underlying cell.
-            // Shallow-copy before replacing /ADBE, matching the treatment
-            // already given to the indirect-/Extensions branch above, so
-            // the caller's original handle is left untouched.
-            let extensions = extensions.shallow_copy()?;
-            extensions.replace_key(b"/ADBE", adbe)?;
+            // Rebuild a fresh top-level dictionary from the current entries
+            // (an `ObjectHandle` clone, not a deep copy) instead of
+            // `shallow_copy()`: that recursively validates every direct
+            // descendant and rejects a direct stream sibling
+            // (`libqpdf/QPDF_Stream.cc:140-145`'s "stream objects cannot be
+            // cloned"), which would wrongly fail this qpdf-owned
+            // preparation step for an unrelated `/Extensions` entry qpdf
+            // itself never touches.
+            let mut entries = extensions
+                .try_as_dictionary()?
+                .expect("checked is_some above");
+            entries.insert(b"/ADBE".to_vec(), adbe);
+            let extensions = ObjectHandle::dictionary(entries.into_iter().collect());
             root.replace_key(b"/Extensions", extensions)?;
             changed = true;
         }
@@ -8299,6 +8307,50 @@ mod tests {
         assert!(extensions.is_direct());
         assert!(adbe.is_direct());
         assert_eq!(adbe.get_key(b"/ExtensionLevel").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn prepare_linearization_catalog_directizes_adbe_beside_a_direct_stream_sibling() {
+        // /Extensions is a DIRECT dictionary (so the ADBE-mutation branch
+        // never allocates a fresh handle for /Extensions itself) holding an
+        // indirect /ADBE alongside an unrelated DIRECT stream sibling.
+        // `ObjectHandle::shallow_copy` rejects a direct stream among any
+        // descendant it recursively copies -- rebuilding just the top-level
+        // dictionary entries (this test's regression target) must not
+        // trigger that rejection for a sibling qpdf itself never touches.
+        let mut pdf = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse");
+        let adbe_indirect = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/ExtensionLevel".to_vec(),
+                ObjectHandle::integer(2),
+            )]))
+            .expect("allocate an indirect /ADBE value");
+        let vendor_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            std::rc::Rc::new(b"stray stream".to_vec()),
+        );
+        let extensions = ObjectHandle::dictionary(vec![
+            (b"/ADBE".to_vec(), adbe_indirect),
+            (b"/Vendor".to_vec(), vendor_stream),
+        ]);
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).expect("Catalog resolves");
+        root.replace_key(b"/Extensions", extensions)
+            .expect("attach /Extensions to the Catalog");
+
+        assert!(
+            prepare_linearization_catalog(&mut pdf).expect("preparation must not error"),
+            "an indirect /ADBE must still be reported as changed"
+        );
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).expect("Catalog resolves");
+        let extensions = root.get_key(b"/Extensions");
+        assert!(extensions.get_key(b"/ADBE").is_direct());
+        assert!(
+            extensions.get_key(b"/Vendor").as_stream_dict().is_some(),
+            "the unrelated direct stream sibling must survive untouched"
+        );
     }
 
     #[test]
