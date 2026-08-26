@@ -3001,6 +3001,14 @@ fn prepare_linearization_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<boo
     Ok(changed)
 }
 
+fn finish_linearization_write<T>(result: Result<T>, restore: Result<()>) -> Result<T> {
+    match (result, restore) {
+        (Err(error), _) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 /// Resolve Catalog ADBE state from the live handle graph.
 fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<CatalogAdbeStatus> {
     const NONE: CatalogAdbeStatus = CatalogAdbeStatus { has_adbe: false };
@@ -3174,11 +3182,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     })();
 
     let restore = crate::writer::restore_catalog_extensions(pdf, catalog_snapshot);
-    match (result, restore) {
-        (Err(error), _) => Err(error),
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    finish_linearization_write(result, restore)
 }
 
 /// Write the pass-1 body through qpdf's stdio-shaped buffering boundary.
@@ -4717,6 +4721,20 @@ mod tests {
             format!("trailer\n<< /Size 2 >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
         );
         Pdf::open(Cursor::new(pdf)).expect("rootless PDF should parse")
+    }
+
+    fn pdf_with_non_dictionary_root() -> Pdf<Cursor<Vec<u8>>> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let object_offset = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n42\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{object_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        Pdf::open(Cursor::new(pdf)).expect("non-dictionary root PDF should parse")
     }
 
     fn build_linearized() -> LinearizedDocument {
@@ -8177,6 +8195,17 @@ mod tests {
         assert!(extensions.get_key(b"/ADBE").is_direct());
     }
 
+    #[test]
+    fn prepare_linearization_catalog_ignores_a_missing_root() {
+        let mut pdf = pdf_without_root();
+        assert!(!prepare_linearization_catalog(&mut pdf).expect("preparation"));
+        assert!(
+            !resolve_catalog_adbe_status(&mut pdf)
+                .expect("Catalog status")
+                .has_adbe
+        );
+    }
+
     /// Minimal one-page PDF whose Catalog carries `/Extensions` as a
     /// DIRECT dictionary, but whose `/ADBE` entry WITHIN that dictionary is
     /// itself an INDIRECT reference (object 4) to `<< /BaseVersion /1.6
@@ -8250,6 +8279,17 @@ mod tests {
         assert_eq!(adbe.get_key(b"/ExtensionLevel").as_integer(), Some(2));
     }
 
+    #[test]
+    fn catalog_helpers_ignore_a_non_dictionary_root() {
+        let mut pdf = pdf_with_non_dictionary_root();
+        assert!(!prepare_linearization_catalog(&mut pdf).expect("preparation"));
+        assert!(
+            !resolve_catalog_adbe_status(&mut pdf)
+                .expect("Catalog status")
+                .has_adbe
+        );
+    }
+
     /// Minimal one-page PDF whose Catalog carries `/Extensions` as an
     /// INDIRECT reference (object 4) to a value that is NOT a dictionary at
     /// all — a bare integer. The writer must leave this malformed value
@@ -8315,6 +8355,44 @@ mod tests {
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve(&root).expect("Catalog resolves");
         assert!(root.get_key(b"/Extensions").is_indirect());
+    }
+
+    #[test]
+    fn prepare_linearization_catalog_does_not_change_a_direct_extensions_without_adbe() {
+        let src =
+            include_bytes!("../../../../tests/fixtures/compat/one-page-xyzw-only.pdf").to_vec();
+        let mut pdf = Pdf::open(Cursor::new(src)).expect("source parses");
+
+        assert!(!prepare_linearization_catalog(&mut pdf).expect("preparation"));
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).expect("Catalog resolves");
+        assert!(root.get_key(b"/Extensions").is_direct());
+    }
+
+    #[test]
+    fn linearized_writer_propagates_progress_object_count_failure() {
+        let mut pdf = open_tiny_pdf();
+        let replacement_ref = ObjectRef::new(999, 0);
+        let mut replacement = Object::Null;
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.get_object_handle(replacement_ref);
+        pdf.legacy_materialized_memo
+            .insert(replacement_ref, replacement);
+        pdf.legacy_materialized_replacement_refs
+            .insert(replacement_ref);
+        let options = WriterOptions {
+            progress_reporter: Some(crate::writer::ProgressReporter::new(Box::new(|_| Ok(())))),
+            ..WriterOptions::default()
+        };
+
+        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect_err("progress setup must propagate object-count errors");
+        assert!(error
+            .to_string()
+            .contains("object handle lift: inline object nesting exceeds maximum"));
     }
 
     /// Minimal one-page PDF whose Catalog carries `/Extensions` as a DIRECT
@@ -8670,6 +8748,36 @@ mod tests {
             metadata_bytes, metadata_marker,
             "/Metadata stream must resolve to its original plaintext via /Crypt /Identity"
         );
+    }
+
+    #[test]
+    fn finish_linearization_write_preserves_primary_and_restore_errors() {
+        assert_eq!(
+            finish_linearization_write(Ok::<_, crate::Error>(7), Ok(()))
+                .expect("successful restore"),
+            7
+        );
+        assert!(matches!(
+            finish_linearization_write::<u8>(
+                Err(crate::Error::Internal("write".to_string())),
+                Ok(())
+            ),
+            Err(crate::Error::Internal(message)) if message == "write"
+        ));
+        assert!(matches!(
+            finish_linearization_write::<u8>(
+                Ok(7),
+                Err(crate::Error::Internal("restore".to_string()))
+            ),
+            Err(crate::Error::Internal(message)) if message == "restore"
+        ));
+        assert!(matches!(
+            finish_linearization_write::<u8>(
+                Err(crate::Error::Internal("write".to_string())),
+                Err(crate::Error::Internal("restore".to_string()))
+            ),
+            Err(crate::Error::Internal(message)) if message == "write"
+        ));
     }
 
     /// Locate object `number`'s raw byte range in `out` — from its `\n{number}
