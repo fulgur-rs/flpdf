@@ -149,7 +149,7 @@ git commit -m "fix: restrict drop family to removed page leaves"
 - Verify: `crates/flpdf/src/objr_obj_annot_p.rs`
 - Verify: `crates/flpdf/tests/page_extract_structtree_pg_tests.rs`
 
-- [ ] **Step 1: Run the qpdf differential and page-operation tests.**
+- [x] **Step 1: Run the qpdf differential and page-operation tests.**
 
 ```bash
 cargo test -p flpdf --test page_extract_structtree_pg_tests
@@ -162,7 +162,7 @@ scripts/qpdf-tokenizer-diff.sh
 Expected: qpdf-generated output and all page/drop-family assertions pass; no
 merge_documents behavior is changed by this issue.
 
-- [ ] **Step 2: Run static quality gates.**
+- [x] **Step 2: Run static quality gates.**
 
 ```bash
 cargo fmt --all -- --check
@@ -174,7 +174,7 @@ python3 -m unittest scripts/tests/test_qpdf_deviation_markers.py
 python3 scripts/check-qpdf-deviation-markers.py --check
 ```
 
-- [ ] **Step 3: Run workspace and changed-line coverage.**
+- [x] **Step 3: Run workspace and changed-line coverage.**
 
 ```bash
 cargo test --workspace --all-features
@@ -192,7 +192,7 @@ executable lines.
 - Modify: `docs/superpowers/plans/2026-08-26-drop-family-page-membership.md`
 - Modify: Beads issue `flpdf-hn1g.12`
 
-- [ ] **Step 1: Rebase onto current `origin/main` and rerun Task 3.**
+- [x] **Step 1: Rebase onto current `origin/main` and rerun Task 3.**
 
 ```bash
 git fetch --prune origin
