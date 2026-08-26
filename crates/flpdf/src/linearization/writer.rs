@@ -2990,7 +2990,18 @@ fn prepare_linearization_catalog<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<boo
         let mut adbe = extensions.try_get_key(b"/ADBE")?;
         if adbe.is_indirect() {
             adbe.make_direct(false)?;
+            // `extensions` may still be the exact handle stored in the
+            // source Pdf's /Extensions slot (when /Extensions itself was
+            // already direct, so the branch above never replaced it):
+            // mutating it in place here would corrupt
+            // `snapshot_catalog_extensions`'s pre-write capture, since
+            // `ObjectHandle` clones share the same underlying cell.
+            // Shallow-copy before replacing /ADBE, matching the treatment
+            // already given to the indirect-/Extensions branch above, so
+            // the caller's original handle is left untouched.
+            let extensions = extensions.shallow_copy()?;
             extensions.replace_key(b"/ADBE", adbe)?;
+            root.replace_key(b"/Extensions", extensions)?;
             changed = true;
         }
     }
@@ -3136,7 +3147,7 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
     let root_ref_before = pdf.root_ref();
     let root_was_dirty_before = root_ref_before.is_some_and(|root_ref| pdf.is_dirty(root_ref));
 
-    let result = (|| {
+    let plan_result = (|| {
         let catalog_prepared = prepare_linearization_catalog(pdf)?;
         // The directization is writer-owned preparation, not a caller edit.
         // Clear only its dirty bit when the Catalog started clean; the
@@ -3175,11 +3186,22 @@ pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
             true,
         )?;
         let renumber = RenumberMap::from_plan(&plan);
-        // Keep permanent graph preparation attached to the caller's Pdf, but
-        // restore only the output-only extension mutation after emission.
-        crate::writer::record_catalog_snapshot_dirty_baseline(pdf, &mut catalog_snapshot);
-        write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
+        Ok((plan, renumber))
     })();
+
+    // Refresh the dirty baseline exactly once, right after planning/setup
+    // above finishes, whether it succeeded or failed partway through (for
+    // example a malformed page tree discovered after `LinearizationPlan`
+    // has already run `Optimization::prepare_pdf`, which can make a direct
+    // `/Outlines` indirect). This is strictly before `write_linearized_impl`
+    // below, whose own output-only mutations (such as injecting a fresh
+    // `/Extensions /ADBE`) must NOT be folded into the baseline, since
+    // `restore_catalog_extensions` exists specifically to undo those.
+    crate::writer::record_catalog_snapshot_dirty_baseline(pdf, &mut catalog_snapshot);
+
+    let result = plan_result.and_then(|(plan, renumber)| {
+        write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
+    });
 
     let restore = crate::writer::restore_catalog_extensions(pdf, catalog_snapshot);
     finish_linearization_write(result, restore)
@@ -8280,6 +8302,36 @@ mod tests {
     }
 
     #[test]
+    fn prepare_linearization_catalog_snapshot_restore_leaves_source_adbe_indirect() {
+        // `/Extensions` is a DIRECT dictionary whose `/ADBE` entry is
+        // INDIRECT -- the exact shape where `prepare_linearization_catalog`
+        // never allocates a fresh handle for `/Extensions` itself (it only
+        // does that when `/Extensions` is indirect), so `extensions` here is
+        // the very same handle the snapshot below captures.
+        let src = tiny_pdf_with_indirect_adbe_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src)).expect("source parses");
+
+        // Mirror `write_linearized_for_pdf_writer`'s real ordering: snapshot
+        // before preparation, prepare, then restore.
+        let snapshot = crate::writer::snapshot_catalog_extensions(&mut pdf)
+            .expect("snapshot")
+            .expect("Catalog has a /Root");
+        assert!(prepare_linearization_catalog(&mut pdf).expect("preparation"));
+        crate::writer::restore_catalog_extensions(&mut pdf, Some(snapshot)).expect("restore");
+
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve(&root).expect("Catalog resolves");
+        let extensions = root.get_key(b"/Extensions");
+        let adbe = extensions.get_key(b"/ADBE");
+        assert!(
+            adbe.is_indirect(),
+            "the writer-only ADBE directization must not leak into the \
+             source Pdf: restoring the snapshot must leave the original \
+             indirect /ADBE reference in place, not the directized copy"
+        );
+    }
+
+    #[test]
     fn catalog_helpers_ignore_a_non_dictionary_root() {
         let mut pdf = pdf_with_non_dictionary_root();
         assert!(!prepare_linearization_catalog(&mut pdf).expect("preparation"));
@@ -8393,6 +8445,94 @@ mod tests {
         assert!(error
             .to_string()
             .contains("object handle lift: inline object nesting exceeds maximum"));
+    }
+
+    /// Minimal single-page PDF whose Catalog carries `/Outlines` as a DIRECT
+    /// dictionary. `Optimization::prepare_pdf` (`optimization.rs:136-143`)
+    /// makes this indirect and marks the Catalog dirty during planning,
+    /// permanently -- independent of whether the overall write succeeds.
+    fn tiny_pdf_with_direct_outlines_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines << /Count 0 >> >>\nendobj\n",
+        );
+
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 4\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            xref_start,
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn linearized_writer_keeps_catalog_dirty_after_a_planning_mutation_and_a_later_failure() {
+        // Reproduces the exact shape of `linearized_writer_propagates_progress_object_count_failure`
+        // above (planning succeeds, `configure_progress_for_pdf`'s later
+        // object-count computation fails), but with a Catalog that
+        // `Optimization::prepare_pdf` permanently mutates (direct
+        // `/Outlines` -> indirect) during that successful planning phase.
+        // The mid-closure `record_catalog_snapshot_dirty_baseline` call in
+        // `write_linearized_for_pdf_writer` runs only after planning and
+        // object-count computation both succeed, so this later failure
+        // exercises the unconditional refresh added after the closure.
+        let mut pdf = Pdf::open(Cursor::new(tiny_pdf_with_direct_outlines_bytes()))
+            .expect("tiny PDF should parse");
+        let root_ref = pdf.root_ref().expect("Catalog present");
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "a freshly parsed source document must start clean"
+        );
+
+        let replacement_ref = ObjectRef::new(999, 0);
+        let mut replacement = Object::Null;
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.get_object_handle(replacement_ref);
+        pdf.legacy_materialized_memo
+            .insert(replacement_ref, replacement);
+        pdf.legacy_materialized_replacement_refs
+            .insert(replacement_ref);
+        let options = WriterOptions {
+            progress_reporter: Some(crate::writer::ProgressReporter::new(Box::new(|_| Ok(())))),
+            ..WriterOptions::default()
+        };
+
+        write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect_err("progress setup must propagate object-count errors");
+
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve(&root).expect("Catalog resolves");
+        assert!(
+            root.get_key(b"/Outlines").is_indirect(),
+            "planning's direct-outline normalization is a permanent graph \
+             repair and must survive a later failure"
+        );
+        assert!(
+            pdf.is_dirty(root_ref),
+            "the permanent /Outlines mutation must keep the Catalog dirty \
+             even though the overall linearized write failed afterward; \
+             restore_catalog_extensions must not clear the dirty bit using \
+             a dirty baseline captured before planning ran"
+        );
     }
 
     /// Minimal one-page PDF whose Catalog carries `/Extensions` as a DIRECT

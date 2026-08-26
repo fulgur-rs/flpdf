@@ -9,8 +9,9 @@ and its acceptance of indirect document extensions.
 
 ## Oracle behavior
 
-The pinned qpdf source is `/home/ubuntu/.cache/flpdf/qpdf-11.9.0` and the live
-oracle is `/usr/bin/qpdf` 11.9.0.
+The pinned qpdf source is the repository-managed, read-only worktree printed
+by `scripts/fetch-qpdf-source.sh --print-path`, and the live oracle is
+`/usr/bin/qpdf` 11.9.0.
 
 `QPDFWriter::prepareFileForWrite` first calls `fixDanglingReferences`, gets the
 live root, shallow-copies an indirect dictionary-valued `/Extensions` onto the
