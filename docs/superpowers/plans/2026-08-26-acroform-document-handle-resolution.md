@@ -145,7 +145,7 @@ all existing field traversal, malformed input, and mutation tests pass.
 
 - [ ] **Step 1: Convert array and field traversal helpers to handles.**
 
-Change `resolve_array_value` to accept `Option<ObjectHandle>` and return
+Change `resolve_array_value` to accept an `ObjectHandle` and return
 `Option<Vec<ObjectHandle>>`, resolving the carrier through the existing
 canonical handle path. Update `fields`, `top_level_fields`, `has_fields_array`,
 `walk_field_tree_rec`, and `walk_field_info_tree` to use `object_ref()` and
@@ -159,7 +159,7 @@ Change `FieldInheritance.value`, `default_value`, and `default_appearance` to
 `inherited_name`, and `inherited_integer` with handle-based versions that
 return absent for resolved nulls and preserve the current terminal-chain
 behavior. Change `is_pure_widget_annotation` and field-info construction to
-use `try_has_key`, `try_as_name`, `try_as_string`, and `try_as_integer` on live
+use `try_has_key`, `try_as_name`, `as_string`, and `as_integer` on resolved
 handles.
 
 - [ ] **Step 3: Change `AcroFormFieldInfo` value fields and consumers.**
