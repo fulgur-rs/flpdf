@@ -370,7 +370,13 @@ struct Cli {
     /// This is the argv form used by qtest (`qpdf --show-encryption FILE`);
     /// the native `show-encryption` subcommand dispatches to the same
     /// inspection implementation below.
-    #[arg(long = "show-encryption")]
+    ///
+    /// qpdf marks `showEncryption()` as `require_outfile = false`
+    /// (`QPDFJob_config.cc:554-559`), so `checkConfiguration()`
+    /// (`QPDFJob.cc:593-594`) rejects an output file argument outright with
+    /// "no output file may be given for this option", regardless of what
+    /// other flags accompany it.
+    #[arg(long = "show-encryption", conflicts_with = "output")]
     show_encryption: bool,
 
     /// Run a complete qpdf job JSON file through the production QPDFJob

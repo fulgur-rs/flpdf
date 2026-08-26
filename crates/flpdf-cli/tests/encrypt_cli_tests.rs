@@ -3027,6 +3027,30 @@ fn top_level_overlay_rejected_with_show_encryption() {
         ));
 }
 
+/// `--show-encryption` must reject an output file argument outright, matching
+/// qpdf: `QPDFJob::Config::showEncryption()` sets `require_outfile = false`
+/// (`QPDFJob_config.cc:554-559`), and `checkConfiguration()`
+/// (`QPDFJob.cc:593-594`) turns any output filename into a hard usage error
+/// ("no output file may be given for this option", exit 2) regardless of
+/// what other flags accompany it -- verified directly against `qpdf
+/// --show-encryption --password=... in.pdf out.pdf` (exit 2, same message).
+/// Without this clap conflict, flpdf silently accepted and ignored the
+/// output argument (exit 0, no file written), which is the wrong axis: the
+/// gap is not specific to `--linearize` or any other rewrite-only flag, it
+/// is any output filename at all.
+#[test]
+fn top_level_show_encryption_rejects_output_file() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--show-encryption")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg("/tmp/flpdf-show-encryption-output-must-be-rejected.pdf")
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
 /// `--update-from-json` combined with `--show-encryption` must route through
 /// the JSON-input-inspection consumer (which applies the update before
 /// rendering the report), not the plain file-backed `--show-encryption`
