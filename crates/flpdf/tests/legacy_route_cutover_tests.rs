@@ -362,6 +362,89 @@ fn resources_form_pruning_production_uses_the_handle_route() {
 }
 
 #[test]
+fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
+    let resources = include_str!("../src/resources.rs");
+    let resource_callbacks = resources
+        .split_once("fn collect_used_names_for_form")
+        .expect("resources has the Form pre-pass")
+        .1
+        .split_once("#[cfg(test)]")
+        .expect("resources has a test module")
+        .0;
+    for legacy in [
+        "parse_content_stream_data",
+        "impl ParserCallbacks for ResourceCallbacks",
+        "use crate::content_stream::{parse_content_stream_data",
+        "Vec<Object>",
+        "object: Object,",
+        "Object::Operator",
+        "Object::InlineImage",
+        "struct ResourceCallbacks",
+        "finish_inline_header",
+        "is_builtin_inline_image_cs",
+    ] {
+        assert!(
+            !resource_callbacks.contains(legacy),
+            "resources Form callback still contains the raw parser marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "parse_content_stream_handles",
+        "ResourceFinder::default()",
+        "has_pending_operands",
+    ] {
+        assert!(
+            resource_callbacks.contains(canonical),
+            "resources Form callback must contain the handle parser marker {canonical:?}"
+        );
+    }
+
+    let finder = include_str!("../src/resource_finder.rs");
+    let finder_production = finder
+        .split_once("#[cfg(test)]")
+        .expect("resource_finder has a test module")
+        .0;
+    for legacy in [
+        "handle_object_borrowed",
+        "impl ParserCallbacks for ResourceFinder",
+        "use crate::{Object, Result}",
+        "last_operator_started_at_boundary",
+        "record_resource_name",
+    ] {
+        assert!(
+            !finder_production.contains(legacy),
+            "ResourceFinder still contains the raw parser marker {legacy:?}"
+        );
+    }
+    assert!(finder_production.contains("impl ObjectHandleParserCallbacks for ResourceFinder"));
+
+    let replacer = include_str!("../src/resource_replacer.rs");
+    let replacer_production = replacer
+        .split_once("#[cfg(test)]")
+        .expect("resource_replacer has a test module")
+        .0;
+    for legacy in [
+        "parse_content_stream_data",
+        "parse_content_stream_data_recovering_inline_image_eof",
+    ] {
+        assert!(
+            !replacer_production.contains(legacy),
+            "ResourceReplacer still contains the raw parser marker {legacy:?}"
+        );
+    }
+    assert!(
+        replacer_production.contains("parse_content_stream_handles"),
+        "ResourceReplacer must use the handle parser"
+    );
+
+    let content_stream = include_str!("../src/content_stream.rs");
+    assert!(
+        !content_stream.contains("parse_content_stream_data_recovering_inline_image_eof"),
+        "the raw recovering parser helper must not remain without a production caller"
+    );
+}
+
+#[test]
 fn page_closure_production_uses_the_canonical_handle_route() {
     let source = include_str!("../src/page_closure.rs");
     let production = source

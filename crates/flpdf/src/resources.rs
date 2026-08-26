@@ -4,7 +4,9 @@
 //! The canonical route parses one page or Form at a time, then shallow-copies
 //! and prunes only its `/Font` and `/XObject` dictionaries. Document-level
 //! callers own the page iteration; the `Auto` decision is the separate qpdf
-//! job-level `shouldRemoveUnreferencedResources` heuristic below.
+//! job-level `shouldRemoveUnreferencedResources` heuristic below. Both the
+//! Form pre-pass and the ResourceReplacer name scan use the canonical
+//! `ObjectHandleParserCallbacks` content route.
 //!
 //! Deviation: locating a Form XObject in a `/XObject` category chases
 //! through a [`Pdf::set_object`] bare-reference redirect to its terminal via
@@ -15,12 +17,12 @@
 //! compensation elsewhere in the crate, and the inline deviation-marker
 //! comments below for the exact call sites.
 
-use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+use crate::content_stream::parse_content_stream_handles;
 use crate::filters::{decode_stream_data_from_handle, DecodeLimits};
 use crate::object_handle::ObjectHandleIdentity;
 use crate::page_object_helper::PageObjectHelper;
 use crate::resource_finder::{ResourceFinder, ResourceNamesByType};
-use crate::{Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{Read, Seek};
 
@@ -403,17 +405,12 @@ fn form_xobjects_in_resources<R: Read + Seek>(
 /// own `/Font` or `/XObject` dictionaries.
 fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
     let mut used = BTreeMap::new();
-    let mut callbacks = ResourceCallbacks {
-        finder: ResourceFinder::default(),
-        inline_header: None,
-        valid_xobjects: BTreeMap::new(),
-        complete: true,
-    };
-    let complete = parse_content_stream_data(stream_bytes, &mut callbacks).is_ok()
-        && !callbacks.finder.had_diagnostics()
-        && callbacks.complete;
+    let mut finder = ResourceFinder::default();
+    let complete = parse_content_stream_handles(stream_bytes, None, &mut finder).is_ok()
+        && !finder.had_diagnostics()
+        && !finder.has_pending_operands();
     if complete {
-        record_direct_names(&mut used, callbacks.finder.names_by_resource_type(), true);
+        record_direct_names(&mut used, finder.names_by_resource_type(), true);
         Some(used)
     } else {
         None // cov:ignore: unit regression asserts malformed Form streams return None
@@ -489,27 +486,6 @@ fn is_builtin_color_space_cs_op(name: &[u8]) -> bool {
     matches!(
         name,
         b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK" | b"Pattern"
-    )
-}
-
-/// Names that are valid **inline-image** colour-space specifiers (ISO 32000-1
-/// Table 93) and do **not** correspond to entries in `/Resources/ColorSpace`.
-///
-/// This covers both the full Device names and the one-letter abbreviations
-/// permitted inside inline-image dictionaries (`BI … ID … EI`).
-fn is_builtin_inline_image_cs(name: &[u8]) -> bool {
-    matches!(
-        name,
-        // Full Device names are also valid in inline images.
-        b"DeviceGray"
-            | b"DeviceRGB"
-            | b"DeviceCMYK"
-            | b"Pattern"
-            // Abbreviated names (Table 93).
-            | b"G"
-            | b"RGB"
-            | b"CMYK"
-            | b"I"
     )
 }
 
@@ -613,112 +589,6 @@ pub fn should_remove_unreferenced_resources<R: Read + Seek>(pdf: &mut Pdf<R>) ->
     }
 
     Ok(false)
-}
-
-/// Parser callback that delegates ordinary resource classification to
-/// [`ResourceFinder`] and tracks the special `BI`...`ID` inline-image header
-/// scope.
-///
-/// Inline-image payload objects are deliberately ignored. Header names are
-/// ordinary parser object events, so `/CS` and `/ColorSpace` are interpreted
-/// here without recreating byte or token boundaries.
-struct ResourceCallbacks {
-    finder: ResourceFinder,
-    inline_header: Option<Vec<Object>>,
-    valid_xobjects: BTreeMap<Vec<u8>, usize>,
-    complete: bool,
-}
-
-impl ResourceCallbacks {
-    fn finish_inline_header(&mut self, header: Vec<Object>, offset: usize) -> bool {
-        let mut chunks = header.chunks_exact(2);
-        let mut color_space = None;
-        for pair in &mut chunks {
-            let Some(key) = pair[0].as_name() else {
-                return false;
-            };
-            if matches!(key, b"CS" | b"ColorSpace") {
-                color_space = pair[1].as_name().map(<[u8]>::to_vec);
-            }
-        }
-        if !chunks.remainder().is_empty() {
-            return false;
-        }
-
-        if let Some(name) = color_space.filter(|name| !is_builtin_inline_image_cs(name)) {
-            self.finder
-                .record_resource_name(b"ColorSpace", &name, offset);
-        } // cov:ignore: llvm-cov gap region after the covered ColorSpace insertion
-        true
-    }
-
-    fn stop_incomplete(&mut self) -> Result<ParseControl> {
-        self.complete = false;
-        Ok(ParseControl::Stop)
-    }
-}
-
-impl ParserCallbacks for ResourceCallbacks {
-    fn handle_diagnostic(&mut self, offset: usize, message: &str) -> Result<()> {
-        self.finder.handle_diagnostic(offset, message)?;
-        self.complete = false;
-        Ok(())
-    }
-
-    fn handle_object(
-        &mut self,
-        object: Object,
-        offset: usize,
-        length: usize,
-    ) -> Result<ParseControl> {
-        self.finder
-            .handle_object_borrowed(&object, offset, length)?;
-        match object {
-            Object::Operator(operator) if self.inline_header.is_some() => {
-                let header = self
-                    .inline_header
-                    .take()
-                    .expect("inline_header guard guarantees a header");
-                if operator != b"ID" || !self.finish_inline_header(header, offset) {
-                    return self.stop_incomplete();
-                }
-                Ok(ParseControl::Continue)
-            }
-            Object::Operator(operator) if operator == b"BI" => {
-                if !self.finder.last_operator_started_at_boundary() {
-                    return self.stop_incomplete();
-                }
-                self.inline_header = Some(Vec::new());
-                Ok(ParseControl::Continue)
-            }
-            Object::Operator(operator) if operator == b"ID" => self.stop_incomplete(),
-            Object::Operator(operator) => {
-                if operator == b"Do" && self.complete {
-                    if let Some(name) = self.finder.last_name() {
-                        if !self.valid_xobjects.contains_key(name) {
-                            self.valid_xobjects.insert(name.to_vec(), offset);
-                        }
-                    }
-                }
-                Ok(ParseControl::Continue)
-            }
-            Object::InlineImage(_) => Ok(ParseControl::Continue),
-            operand => {
-                if let Some(header) = &mut self.inline_header {
-                    header.push(operand);
-                }
-                Ok(ParseControl::Continue)
-            }
-        }
-    }
-
-    fn handle_eof(&mut self) -> Result<()> {
-        self.finder.handle_eof()?;
-        if self.inline_header.is_some() || self.finder.has_pending_operands() {
-            self.complete = false;
-        }
-        Ok(())
-    }
 }
 
 fn record_direct_names(used: &mut UsedNames, names: &ResourceNamesByType, record_direct: bool) {
@@ -1274,6 +1144,13 @@ mod tests {
     }
 
     #[test]
+    fn malformed_inline_header_does_not_veto_form_resource_scan_like_qpdf() {
+        let used = collect_used_names_for_form(b"BI 1 /Foo ID payload EI")
+            .expect("qpdf keeps scanning after a malformed inline-image header");
+        assert!(used.is_empty());
+    }
+
+    #[test]
     fn malformed_declared_xobject_does_not_abort_pruning_like_qpdf() {
         let bytes = remove_xref_for_recovery_probe(build_page_with_resources_carrier_pdf(
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
@@ -1399,54 +1276,5 @@ mod tests {
             color_spaces.is_some_and(|names| names.contains(b"Custom".as_slice())),
             "/Custom is not built-in and must be recorded as a used /ColorSpace name"
         );
-    }
-
-    // ISO 32000-1 Table 93: an inline image's /CS may be a built-in device name
-    // (full or abbreviated) with no /Resources/ColorSpace entry, or a resource
-    // reference. is_builtin_inline_image_cs excludes only the built-in set;
-    // record_direct_names must otherwise record the name from
-    // ResourceFinder::names_by_resource_type.
-    #[test]
-    fn inline_image_cs_excludes_only_the_builtin_names() {
-        let used = collect_used_names_for_form(b"BI /CS /DeviceGray /W 1 /H 1 /BPC 8 ID \x00 EI")
-            .expect("well-formed inline image should parse");
-        assert!(
-            used.get(b"ColorSpace".as_slice())
-                .is_none_or(|names| !names.contains(b"DeviceGray".as_slice())),
-            "a built-in inline-image /CS name is not a /Resources/ColorSpace reference"
-        );
-
-        let used = collect_used_names_for_form(b"BI /CS /Foo /W 1 /H 1 /BPC 8 ID \x00 EI")
-            .expect("well-formed inline image should parse");
-        assert!(
-            used.get(b"ColorSpace".as_slice())
-                .is_some_and(|names| names.contains(b"Foo".as_slice())),
-            "a non-built-in inline-image /CS name must be recorded as a used /ColorSpace name"
-        );
-    }
-
-    // ResourceCallbacks::stop_incomplete/finish_inline_header gate every
-    // malformed BI/ID/EI shape the same way regardless of Page or Form scope
-    // (collect_used_names_for_form and remove_unreferenced_resources_on_page
-    // share this callback machinery), so exercising the Form-scope entry
-    // point covers the same parser paths the removed Page-scope
-    // collect_test_content helper did.
-    #[test]
-    fn resource_callbacks_reject_malformed_inline_image_protocol() {
-        let malformed: &[&[u8]] = &[
-            // Header keys must be names.
-            b"BI 1 /Foo ID payload EI",
-            // Header objects must form key/value pairs.
-            b"BI /CS ID payload EI",
-            // BI starts only at an operation boundary.
-            b"1 BI /CS /Foo ID payload EI",
-        ];
-
-        for content in malformed {
-            assert!(
-                collect_used_names_for_form(content).is_none(),
-                "malformed content was accepted: {content:?}"
-            );
-        }
     }
 }
