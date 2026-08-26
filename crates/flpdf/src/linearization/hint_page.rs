@@ -505,10 +505,11 @@ impl PageOffsetHintTable {
         // object uses its physical output number from `renumber`; an ObjStm
         // container uses `container_shared_sort_key` keyed by its physical
         // output number. The classic path retains source-object ordering.
-        // A plain object minted by optimization sorts AFTER the container:
-        // qpdf allocates generated containers before `QPDF::optimize` creates
-        // inherited attributes. The three phases are therefore source plain,
-        // container, post-optimization plain.
+        // A plain object minted by optimization in a shared first-page route
+        // sorts AFTER the container: qpdf allocates generated containers before
+        // `QPDF::optimize` creates inherited attributes. The first-page-private
+        // (`part2`) route is different: qpdf emits that plain object before its
+        // first-half container, so it never enters this shared-identifier sort.
         //   * Preserve — source ObjStm members and containers can have different
         //     source/output numbers after the linearization plan is renumbered,
         //     so both are compared in the output-number key space.
