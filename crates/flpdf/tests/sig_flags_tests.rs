@@ -577,7 +577,7 @@ fn strip_signature_values_ignores_a_non_signature_field_without_kids() {
         (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
         (3, b"<< /Type /Page /Parent 2 0 R >>"),
         (4, b"<< /Fields [5 0 R] >>"),
-        (5, b"<< /FT /Tx /T (Text) >>"),
+        (5, b"<< /FT /Tx /T (Text) /Kids [] >>"),
     ]));
 
     assert!(!strip_signature_values(&mut pdf).unwrap());
