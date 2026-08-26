@@ -627,6 +627,57 @@ fn default_appearance_materializes_direct_catalog_acroform() {
 }
 
 #[test]
+fn default_appearance_creates_missing_acroform_handle() {
+    let mut pdf = Pdf::open_mem_owned(empty_pdf()).unwrap();
+    let da = b"/Helv 12 Tf 0 g".to_vec();
+
+    pdf.acroform()
+        .unwrap()
+        .set_default_appearance(da.clone())
+        .unwrap();
+
+    let catalog = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap();
+    let Object::Dictionary(catalog_dict) = catalog else {
+        panic!("catalog should be a dictionary");
+    };
+    let acroform_ref = catalog_dict
+        .get_ref("AcroForm")
+        .expect("missing AcroForm must be installed as an indirect object");
+    let acroform = pdf.resolve_object(acroform_ref).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("created AcroForm should be a dictionary");
+    };
+    assert_eq!(acroform_dict.get("DA"), Some(&Object::String(da)));
+    assert_eq!(
+        acroform_dict.get("Fields"),
+        Some(&Object::Array(Vec::new()))
+    );
+}
+
+#[test]
+fn default_appearance_rejects_a_non_dictionary_catalog() {
+    let bytes = build_pdf(
+        &[
+            (1, "42"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+    let error = pdf
+        .acroform()
+        .unwrap()
+        .set_default_appearance(Vec::new())
+        .expect_err("a non-dictionary Catalog must retain the labeled error");
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: catalog object 1 0 R is not a dictionary"
+    );
+}
+
+#[test]
 fn default_appearance_is_read_as_inherited_without_materializing_fields() {
     let bytes = form_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
