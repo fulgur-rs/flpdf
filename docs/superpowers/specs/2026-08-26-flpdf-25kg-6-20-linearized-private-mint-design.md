@@ -48,19 +48,22 @@ container because `first_half_post_plain` includes all post-optimization
 ## Test oracle
 
 Add a small valid classic-xref fixture and a qpdf 11.9.0
-`linearize-objstm.pdf` golden. The qpdf-zlib compatibility test must assert
-byte identity. The fixture isolates the discriminator: the inherited array is
-first-page-private, while the annotation dictionaries and font supply the
-first-half ObjStm container. Existing first-page shared/minted tests remain
-regression controls for the retained post-container path.
+`linearize-objstm-static.pdf` golden generated with `--static-id`. Using the
+fixed qpdf test ID keeps the regression focused on layout rather than the
+separate deterministic-ID seed behavior for a fixture with no source `/ID`.
+The qpdf-zlib compatibility test must assert byte identity. The fixture
+isolates the discriminator: the inherited array is first-page-private, while
+the annotation dictionaries and font supply the first-half ObjStm container.
+Existing first-page shared/minted tests remain regression controls for the
+retained post-container path.
 
 ## Acceptance criteria
 
 1. The new Generate linearization test is RED before the production change and
    GREEN afterward.
-2. The new fixture output is byte-identical to the committed qpdf 11.9.0
-   golden under `qpdf-zlib-compat`, including object numbering, ObjStm
-   membership, xref stream, hint stream, and `/ID[1]`.
+2. The new fixture output with `--static-id` is byte-identical to the committed
+   qpdf 11.9.0 golden under `qpdf-zlib-compat`, including object numbering,
+   ObjStm membership, xref stream, hint stream, and both `/ID` values.
 3. `qpdf --check-linearization` accepts the qpdf golden and the flpdf output.
 4. Existing linearization ObjStm tests, especially first-page private/shared
    ordering and post-optimization shared-object hint ordering, remain green.

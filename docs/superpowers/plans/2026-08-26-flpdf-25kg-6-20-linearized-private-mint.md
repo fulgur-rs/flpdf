@@ -6,16 +6,17 @@
   direct inherited `/Pages /MediaBox` array, one page, two page-private
   annotation dictionaries, a font, and a content stream.
 - Add the matching qpdf 11.9.0 generation command to
-  `tests/golden/regenerate.sh` and generate
-  `tests/golden/references/objstm-lin-firstpage-private-mint/linearize-objstm.pdf`.
+  `tests/golden/regenerate.sh` and generate the `--static-id` golden at
+  `tests/golden/references/objstm-lin-firstpage-private-mint/linearize-objstm-static.pdf`.
 - Run `qpdf --check` on the source and `qpdf --check-linearization` on the
   golden before adding the regression assertion.
 
 ## 2. RED regression test
 
-- Add structural and strict Generate tests to
+- Add structural and strict static-ID Generate tests to
   `crates/flpdf/tests/cmp_linearize_objstm_tests.rs` using the existing golden
-  comparison helper.
+  comparison helper. The source fixture has no `/ID`, so deterministic-ID seed
+  differences remain outside this layout regression.
 - Run the focused test against the current implementation and record the
   expected first diff: flpdf places the optimization-minted first-page-private
   plain object after the first-half ObjStm container, while qpdf places it
