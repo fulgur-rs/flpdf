@@ -2221,18 +2221,17 @@ impl<R: Read + Seek> Pdf<R> {
         handle.try_dereference()
     }
 
-    /// Read and cache an indirect object from its physical source offset.
-    ///
-    /// This is the canonical equivalent of qpdf's `readObjectAtOffset`: the
-    /// header at `offset`, rather than the effective xref row, determines the
-    /// returned [`ObjectHandle`] identity. It is used by linearization hint
-    /// streams, whose `/H[0]` value is a physical byte location.
-    pub(crate) fn resolve_at_offset(
+    /// Read a linearization hint object and retain qpdf's source position for
+    /// a following `damagedPDF` warning. The resolver distinguishes an already
+    /// cached object from a newly parsed one, matching qpdf's
+    /// `readObjectAtOffset`/`InputSource::getLastOffset` behavior.
+    pub(crate) fn resolve_at_offset_with_damage_offset(
         &self,
         offset: u64,
         expected: ObjectRef,
-    ) -> Result<ObjectHandle> {
-        self.resolver.resolve_at_offset(offset, expected)
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        self.resolver
+            .resolve_at_offset_with_damage_offset(offset, expected)
     }
 
     /// Return qpdf's first-1024-byte linearization candidate as an exact
