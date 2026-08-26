@@ -675,11 +675,8 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("non-page /Pg");
 
         let elem = elem_dict(&mut pdf, 20);
-        assert!(
-            matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 30),
-            "a /Pg resolving to a non-page object must be left unchanged, got {:?}",
-            elem.get("Pg")
-        );
+        let pg = elem.get("Pg");
+        assert!(matches!(pg, Some(Object::Reference(r)) if r.number == 30));
     }
 
     #[test]
@@ -695,11 +692,8 @@ mod tests {
         drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("orphan-page /Pg");
 
         let elem = elem_dict(&mut pdf, 20);
-        assert!(
-            matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 30),
-            "a page-like object outside the page tree must keep /Pg, got {:?}",
-            elem.get("Pg")
-        );
+        let pg = elem.get("Pg");
+        assert!(matches!(pg, Some(Object::Reference(r)) if r.number == 30));
     }
 
     #[test]
@@ -923,6 +917,26 @@ mod tests {
             matches!(&arr[1], Object::String(s) if s == b"noise"),
             "non-kid array entry must round-trip unchanged, got {:?}",
             arr[1]
+        );
+    }
+
+    #[test]
+    fn direct_dict_kid_error_propagates_from_array() {
+        // A direct dictionary inside a `/K` array can itself contain a nested
+        // `/K`; an error from that nested walk must propagate through the
+        // direct-dictionary array arm.
+        let mut objs = base_objs();
+        objs.insert(
+            10,
+            "<< /Type /StructTreeRoot /K [ << /Type /StructElem /S /P /K 42 >> ] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        let err = drop_struct_elem_dangling_pg_with_max_depth(&mut pdf, &keep_3_and_5(), 1)
+            .expect_err("nested direct array kid must hit the depth limit");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "over-deep direct array kid must surface Unsupported, got {err:?}"
         );
     }
 
