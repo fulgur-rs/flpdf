@@ -486,7 +486,6 @@ mod tests {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
             removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
-            ..Default::default()
         }
     }
 
