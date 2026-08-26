@@ -10,29 +10,29 @@
 
 ---
 
-### Task 1: Add the final route contract (RED)
+### Task 1: Migrate the signatures consumer slice (RED)
 
 **Files:**
 - Modify: `crates/flpdf/tests/legacy_route_cutover_tests.rs`
-- Read: `crates/flpdf/src/lib.rs`, `crates/flpdf/src/reader.rs`, `crates/flpdf/src/pdf.rs`, `crates/flpdf/src/object_handle.rs`
+- Read: `crates/flpdf/src/signatures.rs`, `crates/flpdf/tests/signature_tests.rs`, `crates/flpdf/tests/sig_flags_tests.rs`
 
 - [ ] **Step 1: Write the failing source contract test**
 
-Add `final_legacy_object_route_is_absent`. Read the four production files with `include_str!` and reject these markers: `pub use object::{Dictionary, Object`, `pub fn resolve_object(`, `pub fn resolve_borrowed(`, `legacy_materialized_memo`, `legacy_materialized_replacement_refs`, `fn resolve_to_cache(`, and `pub fn materialize(&self) -> Result<Object>`.
+Add `signatures_production_uses_the_canonical_handle_route`. Read `signatures.rs` with `include_str!` and reject raw resolver calls, `Object::`, raw `Dictionary` imports, `set_object`, and `materialize`; require `ObjectHandle`, a local one-hop `resolve_handle`, and `mark_object_handle_dirty`.
 
 - [ ] **Step 2: Verify RED**
 
 ```bash
-cargo test -p flpdf --test legacy_route_cutover_tests final_legacy_object_route_is_absent -- --exact
+cargo test -p flpdf --test legacy_route_cutover_tests signatures_production_uses_the_canonical_handle_route -- --exact
 ```
 
-Expected: an assertion failure naming a remaining legacy marker, not a compile error.
+Expected: an assertion failure naming a remaining signatures route marker, not a compile error.
 
 - [ ] **Step 3: Commit the contract**
 
 ```bash
 git add crates/flpdf/tests/legacy_route_cutover_tests.rs
-git commit -m "test: guard final legacy object route removal"
+git commit -m "test: guard signature legacy route removal"
 ```
 
 ### Task 2: Remove the reader-owned materialization bridge
