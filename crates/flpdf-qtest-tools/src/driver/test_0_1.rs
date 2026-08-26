@@ -568,8 +568,8 @@ mod tests {
         // limit (256) and the parser's own, higher, acceptance limit (500),
         // parses successfully and must be reported as the array it is, not
         // silently degraded to implicit/null by `trailer_key_handle`'s own
-        // lift bound being tighter than what `resolve_chain`/
-        // `resolve_borrowed` already accept for the same value.
+        // lift bound being tighter than what the canonical handle resolver
+        // already accepts for the same value.
         let mut deep = b"1".to_vec();
         for _ in 0..300 {
             deep = [b"[ ".as_slice(), &deep, b" ]".as_slice()].concat();
@@ -1414,10 +1414,10 @@ mod tests {
         // Codex Review on PR #610, follow-up: `resolve_to_terminal_ref`
         // (used for type inspection above) resolves `/QTest`'s own reference
         // once for free before counting any further `Pdf::set_object`
-        // redirects, but the legacy `resolve_chain` walk feeding the final
-        // unparse lines used to re-spend that first hop -- a chain landing
+        // redirects, but the old raw walk feeding the final unparse lines
+        // used to re-spend that first hop -- a chain landing
         // exactly at the ObjectHandle chase's own 64-redirect limit was one
-        // hop short of `resolve_chain`'s own budget, so `run_test_0_1`
+        // hop short of the old raw walk's own budget, so `run_test_0_1`
         // returned an error after printing the type-inspection lines but
         // before either unparse line.
         let bytes = pdf_with_qtest(b"1064 0 R", &[]);

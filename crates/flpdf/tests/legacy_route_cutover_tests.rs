@@ -1054,6 +1054,38 @@ fn qtest_test_39_uses_the_canonical_page_resource_route() {
 }
 
 #[test]
+fn qtest_raw_resolution_callers_use_canonical_handles() {
+    for (name, source) in [
+        (
+            "driver/test_0_1.rs",
+            include_str!("../../flpdf-qtest-tools/src/driver/test_0_1.rs"),
+        ),
+        (
+            "driver/test_26_33.rs",
+            include_str!("../../flpdf-qtest-tools/src/driver/test_26_33.rs"),
+        ),
+    ] {
+        for legacy in ["resolve_borrowed", "resolve_object(", "resolve_chain"] {
+            assert!(
+                !source.contains(legacy),
+                "{name} still contains the raw resolution route marker {legacy:?}"
+            );
+        }
+    }
+    let handle = include_str!("../../flpdf-qtest-tools/src/driver/handle.rs");
+    for canonical in [
+        "resolve_handle_chain",
+        "write_qpdf_object_handle",
+        "resolve_stream_dictionary_handle",
+    ] {
+        assert!(
+            handle.contains(canonical),
+            "qtest handle support must retain the canonical route {canonical:?}"
+        );
+    }
+}
+
+#[test]
 fn embedded_files_tests_do_not_keep_the_raw_projection_helpers() {
     let source = include_str!("../src/embedded_files.rs");
     for legacy in [
