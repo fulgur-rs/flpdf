@@ -529,10 +529,14 @@ mod tests {
             .err()
             .expect("a malformed /Encrypt dictionary must fail the open");
         let (source, diagnostics) = error.open_failure().unwrap_or_else(|| {
+            // cov:ignore-start: diagnostic panic reachable only if this
+            // regression test itself starts failing in an unexpected shape;
+            // the passing-suite path always takes `Some(..)` here.
             panic!(
                 "the terminal error must be wrapped with the repair diagnostics \
                  accumulated during xref reconstruction, not returned bare: {error}"
             )
+            // cov:ignore-end
         });
         assert!(
             !diagnostics.entries().is_empty(),
