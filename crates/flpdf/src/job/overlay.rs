@@ -31,7 +31,9 @@ use super::page_range::PageRange;
 use crate::page_document_helper::PageDocumentHelper;
 use crate::page_form_xobject::get_form_xobject_for_page;
 use crate::page_object_helper::{rectangle_from_handle, PageBox, PageObjectHelper};
-use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
+use crate::{
+    Dictionary, Error, Matrix, Object, ObjectHandle, ObjectRef, Pdf, Rectangle, Result, Stream,
+};
 
 /// Whether a source page is drawn beneath (`Underlay`) or above (`Overlay`) the
 /// destination page's own content.
@@ -220,21 +222,22 @@ fn apply_overlays_to_page_with_sources<R: Read + Seek, RS: Read + Seek>(
     // 2. Name the sources /Fx1.. in underlays-then-overlays order and build the
     //    new page /Resources /XObject mapping. /Fx0 is the page; the unique-name
     //    counter continues from there (getUniqueResourceName).
-    let mut xobject_dict = Dictionary::new();
-    xobject_dict.insert("Fx0", Object::Reference(fx0_ref));
+    let mut xobject_entries: Vec<(Vec<u8>, ObjectHandle)> =
+        Vec::with_capacity(1 + underlays.len() + overlays.len());
+    xobject_entries.push((b"/Fx0".to_vec(), dest.get_object_handle(fx0_ref)));
     let mut next_index = 1u32;
     type NamedPlacement = (String, ObjectRef, Option<(usize, ObjectRef)>);
     let mut underlay_names: Vec<NamedPlacement> = Vec::new();
     let mut overlay_names: Vec<NamedPlacement> = Vec::new();
     for (xref, template) in &underlays {
         let name = format!("Fx{next_index}");
-        xobject_dict.insert(name.as_bytes(), Object::Reference(*xref));
+        xobject_entries.push((name.as_bytes().to_vec(), dest.get_object_handle(*xref)));
         underlay_names.push((name, *xref, *template));
         next_index += 1;
     }
     for (xref, template) in &overlays {
         let name = format!("Fx{next_index}");
-        xobject_dict.insert(name.as_bytes(), Object::Reference(*xref));
+        xobject_entries.push((name.as_bytes().to_vec(), dest.get_object_handle(*xref)));
         overlay_names.push((name, *xref, *template));
         next_index += 1;
     }
@@ -330,24 +333,18 @@ fn apply_overlays_to_page_with_sources<R: Read + Seek, RS: Read + Seek>(
     let contents_stream = Stream::new(Dictionary::new(), content.into_bytes());
     dest.set_object(contents_ref, Object::Stream(contents_stream));
 
-    // 5. Rewrite the page dictionary: replace /Resources and /Contents, keep all
-    //    other keys (in particular, `/Annots` installed by the facade must
-    //    survive this step).
-    let mut page_dict = page_dictionary(dest, dest_page_ref)?;
-    // Fetch the `/Annots` value installed by the facade so it is carried onto
-    // the rewritten page dict below.
-    let live_annots = {
-        let obj = dest.resolve_borrowed(dest_page_ref)?;
-        obj.as_dict().and_then(|d| d.get("Annots").cloned())
-    };
-    let mut resources = Dictionary::new();
-    resources.insert("XObject", Object::Dictionary(xobject_dict));
-    page_dict.insert("Resources", Object::Dictionary(resources));
-    page_dict.insert("Contents", Object::Reference(contents_ref));
-    if let Some(annots) = live_annots {
-        page_dict.insert("Annots", annots);
-    }
-    dest.set_object(dest_page_ref, Object::Dictionary(page_dict));
+    // 5. Rewrite only /Resources and /Contents on the live page handle. qpdf's
+    // copyAnnotations has already appended to this same page's /Annots value;
+    // retaining the page handle means that annotation state survives without a
+    // raw page-dictionary snapshot or a second resolution route.
+    let overlay_page = overlay_page_handle(dest, dest_page_ref)?;
+    let resources = ObjectHandle::dictionary(vec![(
+        b"/XObject".to_vec(),
+        ObjectHandle::dictionary(xobject_entries),
+    )]);
+    overlay_page.replace_key(b"/Resources", resources)?;
+    overlay_page.replace_key(b"/Contents", dest.get_object_handle(contents_ref))?;
+    dest.mark_object_handle_dirty(&overlay_page)?;
 
     Ok(())
 }
@@ -1030,15 +1027,20 @@ fn fo_bbox_and_matrix<R: Read + Seek>(
     Ok((bbox, matrix))
 }
 
-/// Resolve `page_ref` to an owned page `Dictionary`, erroring when it is not a
-/// dictionary.
-fn page_dictionary<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<Dictionary> {
-    match pdf.resolve_object(page_ref)? {
-        Object::Dictionary(d) => Ok(d),
-        _ => Err(Error::Unsupported(format!(
+/// Resolve the destination page through the canonical handle registry and
+/// validate its dictionary shape before mutating it.
+fn overlay_page_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> Result<ObjectHandle> {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve(&page)?;
+    if page.try_as_dictionary()?.is_none() {
+        return Err(Error::Unsupported(format!(
             "page {page_ref} is not a dictionary"
-        ))),
+        )));
     }
+    Ok(page)
 }
 
 /// Allocate the next available object reference (`max(numbers) + 1`, generation
@@ -1632,6 +1634,49 @@ mod byte_gate {
             writer.set_minimum_pdf_version(version, max_ext);
         });
         assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
+    }
+
+    #[test]
+    fn overlay_destination_existing_annotation_is_byte_identical_qdf() {
+        let mut dest = fixture("link-annot-no-acroform.pdf");
+        let mut source = fixture("one-page.pdf");
+        let dest_page = page_refs(&mut dest).unwrap()[0];
+        let before = dest
+            .resolve_object(dest_page)
+            .unwrap()
+            .into_dict()
+            .unwrap()
+            .get("Annots")
+            .and_then(Object::as_array)
+            .expect("destination fixture must have an annotation array")
+            .to_vec();
+
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr("1"),
+            None,
+        )
+        .unwrap();
+
+        let after = dest
+            .resolve_object(dest_page)
+            .unwrap()
+            .into_dict()
+            .unwrap()
+            .get("Annots")
+            .and_then(Object::as_array)
+            .expect("destination annotations must survive the overlay rewrite")
+            .to_vec();
+        assert_eq!(
+            after, before,
+            "overlay must preserve destination annotations"
+        );
+
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(&actual, "overlay-destination-existing-annotation.pdf");
     }
 
     /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
@@ -3064,12 +3109,12 @@ mod tests {
     }
 
     #[test]
-    fn page_dictionary_rejects_non_dict() {
+    fn overlay_page_handle_rejects_non_dict() {
         let mut pdf = open(one_page_doc("x"));
         let r = next_object_ref(&pdf).unwrap();
         pdf.set_object(r, Object::Integer(7));
         assert!(matches!(
-            page_dictionary(&mut pdf, r),
+            overlay_page_handle(&mut pdf, r),
             Err(Error::Unsupported(_))
         ));
     }
@@ -4053,7 +4098,10 @@ mod tests {
         let page_refs_before = page_refs(&mut dest).unwrap();
         assert_eq!(page_refs_before.len(), 3);
         let page1_ref = page_refs_before[0];
-        let dict_before = page_dictionary(&mut dest, page1_ref).unwrap();
+        let page_before = dest.get_object_handle(page1_ref);
+        dest.resolve(&page_before).unwrap();
+        let contents_before = page_before.get_key(b"/Contents").unparse();
+        let resources_before = page_before.get_key(b"/Resources").unparse();
         let spec = OverlaySpec {
             source: open(n_page_doc(1)),
             kind: OverlayKind::Overlay,
@@ -4065,9 +4113,13 @@ mod tests {
         let _ = overlay_verbose_report(&mut dest, &mut specs).unwrap();
         let page_refs_after = page_refs(&mut dest).unwrap();
         assert_eq!(page_refs_before, page_refs_after);
-        let dict_after = page_dictionary(&mut dest, page1_ref).unwrap();
-        assert_eq!(dict_before.get("Contents"), dict_after.get("Contents"));
-        assert_eq!(dict_before.get("Resources"), dict_after.get("Resources"));
+        let page_after = dest.get_object_handle(page1_ref);
+        dest.resolve(&page_after).unwrap();
+        assert_eq!(contents_before, page_after.get_key(b"/Contents").unparse());
+        assert_eq!(
+            resources_before,
+            page_after.get_key(b"/Resources").unparse()
+        );
     }
 
     #[test]

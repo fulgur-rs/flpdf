@@ -566,6 +566,51 @@ fn overlay_appearance_stream_has_no_raw_snapshot_route() {
 }
 
 #[test]
+fn overlay_destination_page_rewrite_uses_live_handles() {
+    let source = include_str!("../src/job/overlay.rs");
+    let function = source
+        .split_once("fn apply_overlays_to_page_with_sources")
+        .and_then(|(_, rest)| rest.split_once("#[cfg(test)]").map(|(body, _)| body))
+        .expect("overlay page application function must remain present");
+    let rewrite = function
+        .split_once("// 5. Rewrite only")
+        .and_then(|(_, rest)| rest.split_once("    Ok(())"))
+        .map(|(body, _)| body)
+        .expect("overlay page rewrite boundary must remain present");
+    let page_helper = source
+        .split_once("fn overlay_page_handle")
+        .and_then(|(_, rest)| rest.split_once("/// Allocate the next available object reference"))
+        .map(|(body, _)| body)
+        .expect("overlay page handle helper must remain present");
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "live_annots",
+        "page_dictionary(",
+    ] {
+        assert!(
+            !rewrite.contains(legacy),
+            "overlay destination page rewrite still contains raw route marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "get_object_handle",
+        "replace_key(",
+        "mark_object_handle_dirty",
+    ] {
+        assert!(
+            rewrite.contains(canonical),
+            "overlay destination page rewrite must use canonical handle marker {canonical:?}"
+        );
+    }
+    assert!(
+        page_helper.contains("resolve(&"),
+        "overlay page handle helper must resolve the canonical page handle"
+    );
+}
+
+#[test]
 fn page_extract_production_uses_the_canonical_handle_route() {
     let source = include_str!("../src/page_extract.rs");
     let production = source
