@@ -266,7 +266,7 @@ fn collect_direct_refs_with_context(
 }
 
 /// Collect indirect references from a live qpdf-shaped handle graph without
-/// materializing the graph into the legacy [`Object`] enum.
+/// materializing the graph into the legacy [`crate::Object`] enum.
 ///
 /// An indirect child is recorded as one edge and expanded later by the
 /// closure queue. Direct arrays, dictionaries, and stream dictionaries are

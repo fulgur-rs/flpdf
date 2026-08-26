@@ -2015,6 +2015,7 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
     let Some(entries) = raw_extensions.try_as_dictionary()? else {
         return Ok(());
     };
+    let extensions_was_indirect = raw_extensions.is_indirect();
     let extensions = ObjectHandle::dictionary(entries.into_iter().collect());
     let keys = extensions.try_get_keys()?;
     if !keys.contains(b"/ADBE".as_slice()) {
@@ -2029,6 +2030,10 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
                 .try_is_name_and_equals(version.as_bytes())?
             && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()? == Some(extension_level);
         if valid_adbe {
+            if extensions_was_indirect {
+                catalog.replace_key(b"/Extensions", extensions)?;
+                pdf.set_object_handle(root_ref, catalog)?;
+            }
             return Ok(());
         }
     }
