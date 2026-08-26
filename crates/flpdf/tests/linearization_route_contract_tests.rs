@@ -46,6 +46,32 @@ fn hint_production_slice() -> &'static str {
     &WRITER_SOURCE[start..end]
 }
 
+fn catalog_resolution_production_slices() -> (&'static str, &'static str, &'static str) {
+    let preparation_start = WRITER_SOURCE
+        .find("fn prepare_linearization_catalog")
+        .expect("Catalog preparation marker must remain present");
+    let preparation_end = WRITER_SOURCE
+        .find("/// Resolve Catalog ADBE state")
+        .expect("Catalog ADBE marker must remain present");
+    let outline_start = WRITER_SOURCE
+        .find("fn compute_outline_hint_info")
+        .expect("outline-hint resolver marker must remain present");
+    let outline_end = WRITER_SOURCE
+        .find("fn build_outline_hint_table")
+        .expect("outline-hint table marker must remain present");
+    let adbe_start = WRITER_SOURCE
+        .find("fn resolve_catalog_adbe_status")
+        .expect("Catalog ADBE resolver marker must remain present");
+    let adbe_end = WRITER_SOURCE
+        .find("/// Write a complete linearized PDF")
+        .expect("linearized writer marker must remain present");
+    (
+        &WRITER_SOURCE[preparation_start..preparation_end],
+        &WRITER_SOURCE[outline_start..outline_end],
+        &WRITER_SOURCE[adbe_start..adbe_end],
+    )
+}
+
 fn reachable_production_slice() -> &'static str {
     let start_marker = "pub(crate) fn reachable_object_set_with_stream_parameters";
     let end_marker = "/// Indirect references that qpdf";
@@ -126,6 +152,66 @@ fn linearization_hint_route_uses_canonical_pipeline() {
             !production.contains(forbidden),
             "canonical linearization hint route still contains legacy token {forbidden:?}"
         );
+    }
+}
+
+#[test]
+fn linearization_catalog_resolution_uses_live_handles() {
+    let (preparation, outline, adbe) = catalog_resolution_production_slices();
+    for required in [
+        "get_object_handle",
+        "resolve(",
+        "shallow_copy",
+        "make_direct",
+    ] {
+        assert!(
+            preparation.contains(required),
+            "Catalog preparation must contain canonical marker {required:?}"
+        );
+    }
+    for forbidden in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::Dictionary",
+        "Object::Reference",
+    ] {
+        assert!(
+            !preparation.contains(forbidden),
+            "Catalog preparation still contains raw token {forbidden:?}"
+        );
+    }
+    assert!(
+        outline.contains("get_object_handle"),
+        "outline hint resolution must start from Pdf's canonical handle registry"
+    );
+    assert!(
+        outline.contains("try_get_key"),
+        "outline hint resolution must use the qpdf-shaped key accessor"
+    );
+    assert!(
+        adbe.contains("get_object_handle"),
+        "ADBE resolution must start from Pdf's canonical handle registry"
+    );
+    assert!(
+        adbe.contains("try_get_key"),
+        "ADBE resolution must use the qpdf-shaped key accessor"
+    );
+    assert!(
+        adbe.contains("try_as_dictionary"),
+        "ADBE resolution must use typed dictionary inspection"
+    );
+    for (name, production) in [("outline", outline), ("ADBE", adbe)] {
+        for forbidden in [
+            "resolve_borrowed",
+            "Object::Dictionary",
+            "Object::Reference",
+            ".as_dict()",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{name} Catalog resolution still contains raw token {forbidden:?}"
+            );
+        }
     }
 }
 

@@ -1944,7 +1944,7 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     // returned Missing("/Root")) and from
     // crate::linearization::writer::write_linearized (whose own
     // resolve_catalog_adbe_status pre-check treats a missing root as
-    // `has_adbe: false, orphans_indirect_object: false` rather than
+    // `has_adbe: false` rather than
     // erroring, so this is that caller's actual root check) -- unreachable
     // in every fixture in either test module.
     let (root_ref, catalog) = writer_catalog_copy(pdf)?;
@@ -1979,8 +1979,8 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     Ok(())
 }
 
-/// Strip `/Extensions /ADBE` from the destination Catalog when the effective
-/// extension level is 0. This complements [`inject_adbe_extension`] and
+/// Reconcile `/Extensions /ADBE` when the effective extension level is 0.
+/// This complements [`inject_adbe_extension`] and
 /// mirrors qpdf's removal branches (QPDFWriter.cc L1408 whole-`/Extensions`
 /// removal and L1432 `/ADBE`-only removal). Fires for two related cases:
 /// (1) a version race (min_version bump or ObjStm floor) drops the pairwise
@@ -1992,13 +1992,20 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
 ///
 /// Only touches `/ADBE`; any other developer-prefix keys under `/Extensions`
 /// are preserved (matching qpdf's per-prefix handling). Drops `/Extensions`
-/// itself when it becomes empty after ADBE removal.
+/// itself when it becomes empty after ADBE removal. If other developer keys
+/// remain and the existing `/ADBE` dictionary already matches the supplied
+/// version and extension level, qpdf preserves that entry and this function
+/// leaves the Catalog unchanged.
 ///
 /// # Errors
 ///
 /// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
-pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+pub(crate) fn strip_adbe_extension<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    version: &str,
+    extension_level: i64,
+) -> Result<()> {
     // cov:ignore-start: defensive /Root guard, mirroring
     // inject_adbe_extension's identical comment (same two callers:
     // emit_canonical_pdf and crate::linearization::writer::write_linearized).
@@ -2008,9 +2015,32 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(
     let Some(entries) = raw_extensions.try_as_dictionary()? else {
         return Ok(());
     };
+    let extensions_was_indirect = raw_extensions.is_indirect();
     let extensions = ObjectHandle::dictionary(entries.into_iter().collect());
-    if !extensions.try_get_keys()?.contains(b"/ADBE".as_slice()) {
+    let keys = extensions.try_get_keys()?;
+    if !keys.contains(b"/ADBE".as_slice()) {
         return Ok(());
+    }
+    let has_other = keys.iter().any(|key| key.as_slice() != b"/ADBE");
+    if has_other {
+        let mut adbe = extensions.try_get_key(b"/ADBE")?;
+        let adbe_was_indirect = adbe.is_indirect();
+        if adbe_was_indirect {
+            adbe.make_direct(false)?;
+            extensions.replace_key(b"/ADBE", adbe.clone())?;
+        }
+        let valid_adbe = adbe.try_as_dictionary()?.is_some()
+            && adbe
+                .try_get_key(b"/BaseVersion")?
+                .try_is_name_and_equals(version.as_bytes())?
+            && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()? == Some(extension_level);
+        if valid_adbe {
+            if extensions_was_indirect || adbe_was_indirect {
+                catalog.replace_key(b"/Extensions", extensions)?;
+                pdf.set_object_handle(root_ref, catalog)?;
+            }
+            return Ok(());
+        }
     }
 
     extensions.remove_key(b"/ADBE");
@@ -2057,6 +2087,21 @@ pub(crate) struct CatalogExtensionsSnapshot {
     root_ref: ObjectRef,
     extensions: Option<ObjectHandle>,
     was_dirty: bool,
+}
+
+/// Record the Catalog dirty state after permanent writer planning has run.
+///
+/// The linearization route captures the original extension handle before
+/// qpdf-shaped pre-plan directization, but planning may also perform permanent
+/// Catalog repairs. Those repairs must remain dirty after the output-only
+/// extension mutation is restored.
+pub(crate) fn record_catalog_snapshot_dirty_baseline<R: Read + Seek + 'static>(
+    pdf: &Pdf<R>,
+    snapshot: &mut Option<CatalogExtensionsSnapshot>,
+) {
+    if let Some(snapshot) = snapshot {
+        snapshot.was_dirty |= pdf.is_dirty(snapshot.root_ref);
+    }
 }
 
 /// Snapshot the live Catalog's output-only extension state.
@@ -3991,7 +4036,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // strip_adbe_extension handles both branches: it drops /Extensions
             // when nothing else remains, otherwise keeps it with the non-ADBE
             // developer prefixes intact.
-            strip_adbe_extension(pdf)?;
+            strip_adbe_extension(pdf, eff_ver, eff_ext)?;
         }
     }
 
@@ -9506,6 +9551,47 @@ mod tests {
     }
 
     #[test]
+    fn strip_adbe_extension_directizes_a_valid_indirect_adbe_with_other_prefix() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog)
+            .expect("canonical Catalog must resolve");
+        let adbe = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.3".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(0)),
+            ]))
+            .expect("indirect ADBE must be allocated");
+        let extensions = ObjectHandle::dictionary(vec![
+            (b"/ADBE".to_vec(), adbe),
+            (
+                b"/XYZW".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(7))]),
+            ),
+        ]);
+        catalog
+            .replace_key(b"/Extensions", extensions)
+            .expect("Extensions must be installed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        strip_adbe_extension(&mut pdf, "1.3", 0).expect("valid ADBE must be preserved");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        let extensions = catalog.get_key(b"/Extensions");
+        let adbe = extensions.get_key(b"/ADBE");
+        assert!(extensions.is_direct());
+        assert!(adbe.is_direct());
+        assert!(extensions.has_key(b"/XYZW"));
+    }
+
+    #[test]
     fn inject_adbe_extension_accepts_a_direct_catalog_stream() {
         let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
             .expect("fixture must open");
@@ -10296,6 +10382,40 @@ mod tests {
     }
 
     #[test]
+    fn linearized_pdf_writer_restores_an_indirect_extensions_handle() {
+        let source =
+            include_bytes!("../../../tests/fixtures/compat/linearize-indirect-extensions.pdf")
+                .to_vec();
+        let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
+        let root_ref = pdf.root_ref().expect("fixture must have a Catalog");
+        let catalog = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        let original_extensions = catalog.get_key(b"/Extensions");
+        assert!(original_extensions.is_indirect());
+        assert!(!pdf.is_dirty(root_ref), "fixture Catalog must start clean");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_linearization(true);
+        writer.set_static_id(true);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("linearized write");
+        let _ = writer.get_buffer().expect("linearized buffer");
+        drop(writer);
+
+        let catalog_after = pdf.get_object_handle(root_ref);
+        pdf.resolve(&catalog_after).expect("Catalog must resolve");
+        let restored_extensions = catalog_after.get_key(b"/Extensions");
+        assert!(
+            restored_extensions.is_same_object_as(&original_extensions),
+            "pre-plan directization must not leak into the caller Catalog"
+        );
+        assert!(
+            !pdf.is_dirty(root_ref),
+            "restoring the pre-plan extension must restore Catalog dirtiness"
+        );
+    }
+
+    #[test]
     fn linearized_pdf_writer_restores_catalog_state_after_write_error() {
         let source = include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec();
         let mut pdf = crate::Pdf::open_mem_owned(source).expect("fixture must open");
@@ -10375,14 +10495,9 @@ mod tests {
 
     #[test]
     fn restore_catalog_extensions_preserves_an_indirect_null_reference() {
-        // `write_linearized_impl` itself rejects any indirect reference
-        // reachable within a source `/Extensions` subtree whenever the
+        // This test exercises the snapshot/restore helpers directly: an
+        // indirect reference to a null object
         // effective Adobe extension level changes
-        // (`CatalogAdbeStatus::orphans_indirect_object`,
-        // `linearization/writer.rs:3805-3823`), so this shape cannot reach
-        // `snapshot_catalog_extensions`/`restore_catalog_extensions` through
-        // the full `PdfWriter` linearized pipeline today. Exercise the two
-        // functions directly instead: an indirect reference to a null object
         // is distinct from a missing key per the PDF spec -- qpdf's own
         // `QPDF_Dictionary::replaceKey` collapses only a *direct* null to key
         // removal and explicitly "allow[s] indirect nulls which are

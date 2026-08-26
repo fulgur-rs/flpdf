@@ -152,6 +152,18 @@ fn indirect_extensions_inlined_and_adbe_overwritten_preserving_non_adbe_prefix_b
     );
 }
 
+#[test]
+fn valid_zero_level_adbe_with_non_adbe_prefix_is_preserved_byte_identical_to_qpdf() {
+    // qpdf preserves a valid /ADBE entry at extension level 0 when another
+    // developer prefix remains under /Extensions. This also exercises the
+    // indirect /Extensions source shape through the plain writer route.
+    assert_parity(
+        "linearize-indirect-extensions.pdf",
+        "adbe-preserve.pdf",
+        &strip_options(),
+    );
+}
+
 mod common;
 #[allow(unused_imports)]
 use common::{write_default, write_with_settings, WriterTestSettings};
