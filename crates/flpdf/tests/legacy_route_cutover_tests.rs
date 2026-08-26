@@ -117,6 +117,63 @@ fn reader_production_has_no_raw_materialization_bridge() {
 }
 
 #[test]
+fn structure_tree_removed_page_production_uses_object_handles() {
+    let source = include_str!("../src/struct_tree_pg.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .expect("struct_tree_pg.rs has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+        "set_object(",
+        "Dictionary",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "struct_tree_pg production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "get_object_handle", "replace_key", "remove_key"] {
+        assert!(
+            production.contains(canonical),
+            "struct_tree_pg production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
+fn objr_annotation_removed_page_production_uses_object_handles() {
+    let source = include_str!("../src/objr_obj_annot_p.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .expect("objr_obj_annot_p.rs has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_ref_chain",
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+        "set_object(",
+        "Dictionary",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "objr_obj_annot_p production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "resolve_to_terminal_ref", "replace_key", "remove_key"] {
+        assert!(
+            production.contains(canonical),
+            "objr_obj_annot_p production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
 fn acroform_top_level_field_uses_the_canonical_form_field_helper() {
     let acroform = include_str!("../src/acroform_document_helper.rs");
     let page_specs = include_str!("../src/job/page_specs.rs");
