@@ -144,7 +144,7 @@ exits 0 with all gated flpdf executable changed lines covered.
 
 ### Task 4: Rebase, publish, and record
 
-- [ ] **Step 1: Re-fetch and rebase before publication.**
+- [x] **Step 1: Re-fetch and rebase before publication.**
 
     git fetch --prune origin
     git rebase origin/main
