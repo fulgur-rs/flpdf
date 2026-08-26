@@ -94,6 +94,29 @@ fn qpdf_cutover_has_no_legacy_handle_aliases() {
 }
 
 #[test]
+fn reader_production_has_no_raw_materialization_bridge() {
+    let source = include_str!("../src/reader.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .expect("reader.rs has a test module")
+        .0;
+
+    for legacy in [
+        "legacy_materialized_memo",
+        "legacy_materialized_replacement_refs",
+        "reconcile_legacy_materialized_memos",
+        "pub fn resolve_object(",
+        "pub fn resolve_borrowed(",
+        "lift_object_to_handle",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "reader production still contains the raw materialization bridge {legacy:?}"
+        );
+    }
+}
+
+#[test]
 fn acroform_top_level_field_uses_the_canonical_form_field_helper() {
     let acroform = include_str!("../src/acroform_document_helper.rs");
     let page_specs = include_str!("../src/job/page_specs.rs");
