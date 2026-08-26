@@ -85,8 +85,8 @@ use std::io::{Read, Seek};
 ///
 /// `result` is the [`RebuildResult`] returned by
 /// [`crate::pages::tree_rebuild::rebuild_page_tree`]. Its `ref_map` encodes the
-/// old → new page reference mapping: a page absent from the map was removed; a
-/// page present maps to `ref_map[old][0]` (first new occurrence).
+/// old → new page reference mapping, while `removed_pages` is the exact set of
+/// original page-tree leaves dropped by the rebuild.
 ///
 /// The walk is seeded from both the catalog `/Threads` article list and every
 /// surviving page's `/B` bead array, then follows the ring through `/N` and
@@ -114,6 +114,7 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
         .iter()
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
+    let removed_pages = &result.removed_pages;
 
     // Seed the bead walk from every entry point qpdf reaches a ring through:
     // the catalog /Threads article list and each surviving page's /B array.
@@ -142,7 +143,7 @@ pub fn drop_thread_bead_dangling_p<R: Read + Seek>(
                 queue.push(value);
             }
         }
-        remap_or_drop_bead_p(pdf, &concrete, &surviving)?;
+        remap_or_drop_bead_p(pdf, &concrete, &surviving, removed_pages)?;
     }
     Ok(())
 }
@@ -234,17 +235,14 @@ fn seed_from_surviving_pages<R: Read + Seek>(
 ///
 /// `/P` is by spec an indirect reference to the page the bead belongs to,
 /// possibly through a reference chain. The chain is resolved to its terminal
-/// page ref; a `/P` that resolves to a live non-page object (a non-reference,
-/// or a non-page target) is malformed and left unchanged. A `/P` resolving to
-/// `null` *is* treated as a removed page and dropped (a removed page kept alive
-/// by a surviving outline / named destination is nulled in place by the earlier
-/// null-out pass). A surviving target is remapped to its new ref when the
-/// rebuild changed it; a removed target has the key dropped so the page is
-/// garbage-collected.
+/// ref; surviving targets are remapped, and only refs in the exact
+/// `RebuildResult::removed_pages` set are dropped. Other targets, including
+/// non-page and page-tree-external objects, remain unchanged.
 fn remap_or_drop_bead_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     bead: &ObjectHandle,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
     let Some(p_val) = bead
         .as_dictionary()
@@ -252,20 +250,12 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
     else {
         return Ok(());
     };
-    let (p_concrete, p_terminal) = pdf.resolve_to_terminal_ref(&p_val)?;
+    let (_, p_terminal) = pdf.resolve_to_terminal_ref(&p_val)?;
     let Some(page_ref) = p_terminal else {
         return Ok(()); // Non-reference /P: malformed, left unchanged.
     };
-    // A removed page that a surviving outline / named destination still
-    // references is replaced with `null` *in place* by the earlier null-out pass
-    // ([`crate::outline_dest_remap`], Step 4) before this pass (Step 6) runs, so
-    // its /P resolves to `null` here rather than to a /Type /Page dict. That is
-    // still a removed page and its /P must be dropped (qpdf parity). Only the
-    // null-out pass nulls objects before this pass runs — the other extraction
-    // passes drop keys, not objects — so a `null` terminal here unambiguously
-    // means a removed page.
-    if !is_page_dict(&p_concrete) && !p_concrete.is_null() {
-        return Ok(()); // /P does not resolve to a page (or null): left unchanged.
+    if !surviving.contains_key(&page_ref) && !removed_pages.contains(&page_ref) {
+        return Ok(());
     }
     match surviving.get(&page_ref) {
         Some(&new) if new != page_ref => {
@@ -280,14 +270,6 @@ fn remap_or_drop_bead_p<R: Read + Seek>(
             Ok(())
         }
     }
-}
-
-/// Whether `obj` is a `<< /Type /Page ... >>` dictionary.
-fn is_page_dict(obj: &ObjectHandle) -> bool {
-    obj.as_dictionary()
-        .and_then(|d| d.get(b"/Type".as_slice()).cloned())
-        .and_then(|t| t.as_name())
-        .is_some_and(|name| name == b"Page")
 }
 
 /// Return an indirect reference carried by a handle without forcing a second
