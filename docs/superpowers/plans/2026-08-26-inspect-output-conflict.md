@@ -116,14 +116,14 @@ remain green.
 - Verify: crates/flpdf-cli/src/main.rs
 - Verify: crates/flpdf-cli/tests/cli_inspect_output_conflicts.rs
 
-- [ ] **Step 1: Run focused qpdf and CLI checks.**
+- [x] **Step 1: Run focused qpdf and CLI checks.**
 
     cargo test -p flpdf-cli --test cli_inspect_output_conflicts
     cargo test -p flpdf-cli --test cli_tests
     cargo test -p flpdf-cli --test compat_matrix_tests
     scripts/qpdf-tokenizer-diff.sh
 
-- [ ] **Step 2: Run static and workspace gates.**
+- [x] **Step 2: Run static and workspace gates.**
 
     cargo fmt --all -- --check
     RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links -D rustdoc::invalid_html_tags' cargo doc --workspace --no-deps --document-private-items
@@ -134,7 +134,7 @@ remain green.
     python3 scripts/check-qpdf-deviation-markers.py --check
     cargo test --workspace --all-features
 
-- [ ] **Step 3: Require fresh changed-line coverage.**
+- [x] **Step 3: Require fresh changed-line coverage.**
 
     cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail --lcov --output-path /tmp/flpdf-eyo0-inspect-output-conflict.lcov
     scripts/patch-coverage.sh --base origin/main --lcov /tmp/flpdf-eyo0-inspect-output-conflict.lcov
