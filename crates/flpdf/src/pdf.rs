@@ -45,7 +45,7 @@ pub(crate) struct CompressedMemberProvenance {
 ///
 /// let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
 /// println!("version {}", pdf.version());
-/// let catalog = pdf.resolve_object(pdf.root_ref().expect("root"))?;
+/// let catalog = pdf.root_handle()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
@@ -313,11 +313,16 @@ impl<R: Read + Seek> Pdf<R> {
     /// `--check` version banner and the extension level qpdf accumulates into
     /// its `max_input_version`.
     pub fn adobe_extension_level(&mut self) -> Option<i64> {
-        let root_ref = self.root_ref()?;
-        let catalog = self.resolve_object(root_ref).ok()?;
-        let extensions = resolve_object_value(self, catalog.as_dict()?.get("Extensions")?.clone())?;
-        let adbe = resolve_object_value(self, extensions.as_dict()?.get("ADBE")?.clone())?;
-        let level = resolve_object_value(self, adbe.as_dict()?.get("ExtensionLevel")?.clone())?;
+        let catalog = self.root_handle().ok()?;
+        let extensions = self
+            .resolve_to_terminal(&catalog.get_key(b"/Extensions"))
+            .ok()?;
+        let adbe = self
+            .resolve_to_terminal(&extensions.get_key(b"/ADBE"))
+            .ok()?;
+        let level = self
+            .resolve_to_terminal(&adbe.get_key(b"/ExtensionLevel"))
+            .ok()?;
         level.as_integer()
     }
 
@@ -459,14 +464,5 @@ impl<R: Read + Seek> Pdf<R> {
             return Err(Error::System("unable to find /Root dictionary".into()));
         }
         Ok(root)
-    }
-}
-
-// Resolve `value` one level: follow an `Object::Reference` through `pdf`,
-// or return a non-reference value unchanged.
-fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Option<Object> {
-    match value {
-        Object::Reference(reference) => pdf.resolve_object(reference).ok(),
-        other => Some(other),
     }
 }

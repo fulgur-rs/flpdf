@@ -3724,74 +3724,27 @@ pub(crate) fn emit_canonical_pdf<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
-    // Snapshot the source Catalog AND its dirty-flag state BEFORE any ADBE
-    // injection / strip mutates them, so those output-only mutations do not
-    // leak into the caller's Pdf handle. Restored below regardless of whether
-    // the write succeeds — the Pdf handle is safe to reuse for subsequent
-    // writes (or for read APIs like page enumeration) after this call
-    // returns. The dirty flag is captured too because `Pdf::set_object` used
-    // for the restore unconditionally marks its target dirty; without the
-    // dirty-flag restore a subsequent `write_pdf` incremental append would
-    // spuriously emit a Catalog delta.
-    let catalog_snapshot = pdf.root_ref().and_then(|r| {
-        let was_dirty = pdf.is_dirty(r);
-        pdf.resolve_object(r)
-            .ok()
-            .map(|catalog| (r, catalog, was_dirty))
-    });
+    // Snapshot the source Catalog's output-only extension handle AND its
+    // dirty-flag state before any ADBE injection/strip mutates it. The
+    // canonical snapshot is restored below regardless of whether the write
+    // succeeds, so the caller can reuse the live Pdf handle for later writes.
+    let catalog_snapshot = snapshot_catalog_extensions(pdf)?;
 
     // qpdf's full-rewrite writer resolves source streams through the document's
     // single `attempt_recovery` permission while emitting them. The canonical
     // handle route therefore does not need a writer-local recovery override.
     let result = emit_canonical_pdf_inner(pdf, out, options);
 
-    // Restore only the pre-write `/Extensions` value on top of whatever the
-    // write left behind, rather than the whole pre-call Catalog. A full-dict
-    // revert here would also undo the QDF/content-normalization page-tree
-    // repair above (`PageDocumentHelper::get_all_pages`) whenever the source
-    // Catalog holds a direct `/Pages` dictionary -- that repair writes its
-    // promoted/deduplicated `/Kids` back into the *same* Catalog object the
-    // ADBE injection/strip guard below reverts, so a blind whole-dict restore
-    // would silently discard the repair and re-mint a fresh promoted object
-    // on every subsequent write of the same `Pdf` (observed: object count
-    // climbing 1 -> 2 -> 3 across two writes, with the second write's output
-    // no longer byte-identical to the first). The repair is a genuine,
-    // permanent mutation -- matching qpdf's own `QPDF::getAllPages()`, which
-    // is not scoped to one write -- so it must survive this restore; only the
-    // output-only `/Extensions` injection/strip must not leak into the
-    // caller's Pdf handle. Runs on success and on error alike so partial
-    // injection state cannot leak either. `set_object` marks the ref dirty;
-    // if the ref was clean before this call, clear the dirty flag to leave
-    // the caller's Pdf byte-for-byte equivalent to its pre-call state absent
-    // any repair.
-    // cov:ignore-start: outer if-let and inner-if closing braces are
-    // llvm-cov region artifacts; the interior is exercised by
-    // emit_canonical_pdf_does_not_leave_root_dirty_flag_set and
-    // emit_canonical_pdf_preserves_pre_existing_root_dirty_flag.
-    if let Some((root_ref, original, was_dirty)) = catalog_snapshot {
-        let original_extensions = match &original {
-            Object::Dictionary(dict) => dict.get("Extensions").cloned(),
-            _ => None,
-        };
-        match pdf.resolve_object(root_ref) {
-            Ok(Object::Dictionary(mut current)) => {
-                match original_extensions {
-                    Some(extensions) => current.insert("Extensions", extensions),
-                    None => {
-                        current.remove("Extensions");
-                    }
-                }
-                pdf.set_object(root_ref, Object::Dictionary(current));
-            }
-            _ => pdf.set_object(root_ref, original),
-        }
-        if !was_dirty {
-            pdf.clear_dirty(root_ref);
-        }
+    // Restore only the pre-write `/Extensions` handle on top of whatever the
+    // write left behind. Restoring the whole Catalog would undo permanent
+    // page-tree preparation; the shared helper preserves that qpdf ordering
+    // and restores the pre-existing dirty state.
+    let restore = restore_catalog_extensions(pdf, catalog_snapshot);
+    match (result, restore) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
     }
-    // cov:ignore-end
-
-    result
 }
 
 /// Emit qpdf's page-oriented PCLm queue.
