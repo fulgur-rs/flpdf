@@ -2023,14 +2023,19 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(
     }
     let has_other = keys.iter().any(|key| key.as_slice() != b"/ADBE");
     if has_other {
-        let adbe = extensions.try_get_key(b"/ADBE")?;
+        let mut adbe = extensions.try_get_key(b"/ADBE")?;
+        let adbe_was_indirect = adbe.is_indirect();
+        if adbe_was_indirect {
+            adbe.make_direct(false)?;
+            extensions.replace_key(b"/ADBE", adbe.clone())?;
+        }
         let valid_adbe = adbe.try_as_dictionary()?.is_some()
             && adbe
                 .try_get_key(b"/BaseVersion")?
                 .try_is_name_and_equals(version.as_bytes())?
             && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()? == Some(extension_level);
         if valid_adbe {
-            if extensions_was_indirect {
+            if extensions_was_indirect || adbe_was_indirect {
                 catalog.replace_key(b"/Extensions", extensions)?;
                 pdf.set_object_handle(root_ref, catalog)?;
             }
@@ -9543,6 +9548,47 @@ mod tests {
             .expect("Extensions must remain a dictionary");
         assert!(keys.contains(b"/XYZW".as_slice()));
         assert!(keys.contains(b"/ADBE".as_slice()));
+    }
+
+    #[test]
+    fn strip_adbe_extension_directizes_a_valid_indirect_adbe_with_other_prefix() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog)
+            .expect("canonical Catalog must resolve");
+        let adbe = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.3".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(0)),
+            ]))
+            .expect("indirect ADBE must be allocated");
+        let extensions = ObjectHandle::dictionary(vec![
+            (b"/ADBE".to_vec(), adbe),
+            (
+                b"/XYZW".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(7))]),
+            ),
+        ]);
+        catalog
+            .replace_key(b"/Extensions", extensions)
+            .expect("Extensions must be installed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        strip_adbe_extension(&mut pdf, "1.3", 0).expect("valid ADBE must be preserved");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        let extensions = catalog.get_key(b"/Extensions");
+        let adbe = extensions.get_key(b"/ADBE");
+        assert!(extensions.is_direct());
+        assert!(adbe.is_direct());
+        assert!(extensions.has_key(b"/XYZW"));
     }
 
     #[test]
