@@ -13,6 +13,31 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
+/// Collapse a live qpdf subprocess's CRLF-terminated text lines to bare `\n`.
+/// On Windows, `qpdf.exe`'s own C-runtime stdout is opened in text mode and
+/// translates every `\n` write to `\r\n`; flpdf's CLI writes plain `\n`
+/// everywhere, matching qpdf's C++ source (`cout << "...\n"`) rather than
+/// that platform-specific translation. Comparing raw bytes on Windows would
+/// therefore flag a line-ending artifact of the oracle process, not a real
+/// content difference (see the identical pattern already established in
+/// `cli_logger_routing.rs`/`cli_attachment_lifecycle.rs`).
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+
+    normalized
+}
+
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
 // Exercise actual page/content traversal in qpdf's QDF + encryption oracle.
@@ -473,8 +498,19 @@ fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
         .arg("--password=user-pw")
         .assert()
         .success();
-    assert_eq!(show.get_output().stdout, qpdf.stdout);
-    assert_eq!(show.get_output().stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(show.get_output().stdout, qpdf.stdout);
+        assert_eq!(show.get_output().stderr, qpdf.stderr);
+    }
 }
 
 /// The qtest shim forwards qpdf's option-shaped inspection command unchanged.
@@ -506,8 +542,19 @@ fn top_level_show_encryption_matches_qpdf_for_user_password() {
         .expect("run flpdf --show-encryption");
 
     assert_eq!(flpdf.status, qpdf.status);
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
 }
 
 #[test]
@@ -536,8 +583,19 @@ fn top_level_show_encryption_recovers_v2_user_password_for_owner_password() {
         .expect("run flpdf --show-encryption with owner password");
 
     assert_eq!(flpdf.status, qpdf.status);
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
 }
 
 #[test]
@@ -566,8 +624,19 @@ fn top_level_show_encryption_reports_wrong_password_without_failing() {
         .expect("run flpdf --show-encryption with wrong password");
 
     assert_eq!(flpdf.status, qpdf.status);
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
 }
 
 #[test]
@@ -596,8 +665,19 @@ fn top_level_show_encryption_matches_qpdf_for_plaintext() {
         .expect("run flpdf --show-encryption on plaintext");
 
     assert_eq!(flpdf.status, qpdf.status);
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
 }
 
 #[test]
@@ -626,8 +706,19 @@ fn top_level_show_encryption_matches_qpdf_for_r5_without_write_opt_in() {
         .expect("run flpdf --show-encryption on R5 fixture");
 
     assert_eq!(flpdf.status, qpdf.status);
-    assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert_eq!(flpdf.stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout);
+        assert_eq!(flpdf.stderr, qpdf.stderr);
+    }
 }
 
 /// Owner password also authenticates against the same output.
@@ -2013,8 +2104,19 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
         .arg(&output)
         .assert()
         .success();
-    assert_eq!(show.get_output().stdout, qpdf.stdout);
-    assert_eq!(show.get_output().stderr, qpdf.stderr);
+    if cfg!(windows) {
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stdout),
+            normalize_text_newlines(&qpdf.stdout)
+        );
+        assert_eq!(
+            normalize_text_newlines(&show.get_output().stderr),
+            normalize_text_newlines(&qpdf.stderr)
+        );
+    } else {
+        assert_eq!(show.get_output().stdout, qpdf.stdout);
+        assert_eq!(show.get_output().stderr, qpdf.stderr);
+    }
 }
 
 /// `--force-R5` is a 256-bit-only flag; KEY-LEN=128 must be rejected with a

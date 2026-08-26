@@ -835,6 +835,47 @@ mod tests {
         trailer
     }
 
+    /// `/Length` is absent for V<5 per the PDF spec's default; V=5 always
+    /// uses a 256-bit key. Every existing fixture in this module supplies an
+    /// explicit `/Length`, so exercise the default arms directly.
+    #[test]
+    fn parse_inspection_state_defaults_length_bits_when_absent() {
+        // V=1 (implicitly RC4-40): the `v <= 1` arm.
+        let mut v1 = legacy_dictionary();
+        v1.insert("V", Object::Integer(1));
+        assert_eq!(
+            parse_inspection_state(&v1).expect("V=1 parses").length_bits,
+            40
+        );
+
+        // V=2/R=3 with no /Length: falls through to the catch-all default,
+        // matching the PDF spec's 40-bit default for the legacy RC4 handler.
+        assert_eq!(
+            parse_inspection_state(&legacy_dictionary())
+                .expect("V=2 parses")
+                .length_bits,
+            40
+        );
+
+        // V=4: the `v == 4` arm (128-bit default for the crypt-filter handler).
+        let mut v4 = legacy_dictionary();
+        v4.insert("V", Object::Integer(4));
+        v4.insert("R", Object::Integer(4));
+        assert_eq!(
+            parse_inspection_state(&v4).expect("V=4 parses").length_bits,
+            128
+        );
+
+        // V=5: the `v >= 5` arm (always 256-bit).
+        let mut v5 = legacy_dictionary();
+        v5.insert("V", Object::Integer(5));
+        v5.insert("R", Object::Integer(5));
+        assert_eq!(
+            parse_inspection_state(&v5).expect("V=5 parses").length_bits,
+            256
+        );
+    }
+
     #[test]
     fn dictionary_validation_reports_qpdf_error_shapes() {
         let mut unsupported = legacy_dictionary();

@@ -5778,6 +5778,53 @@ mod tests {
         );
     }
 
+    /// `permissions()`/`encryption_info()` prefer `encryption_inspection`,
+    /// which every real document population populates unconditionally
+    /// before authentication (`initialize_encryption_inspection` is called
+    /// once, in `engine.rs`, ahead of `authenticate_if_encrypted`). Their
+    /// fallback to `self.encryption` alone exists for a `Pdf` whose
+    /// encryption state was set directly rather than through that shared
+    /// construction path, matching how the rest of this test module already
+    /// injects `EncryptionState` to isolate encryption-dependent behavior
+    /// from full document parsing.
+    #[test]
+    fn permissions_and_encryption_info_fall_back_without_inspection_state() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        assert!(
+            pdf.encryption_inspection.borrow().is_none(),
+            "a plaintext-opened fixture has no /Encrypt to inspect"
+        );
+        // `encryption_info()`'s fallback still needs a real /Encrypt entry to
+        // read `/Filter` from (only `v`/`r`/`length_bits`/permissions/password
+        // fields come from `self.encryption` itself); inject a minimal direct
+        // dictionary so `encrypt_dictionary()` succeeds without going through
+        // `initialize_encryption_inspection`.
+        pdf.trailer.insert(
+            "Encrypt",
+            Object::Dictionary({
+                let mut dict = Dictionary::new();
+                dict.insert("Filter", Object::Name(b"Standard".to_vec()));
+                dict
+            }),
+        );
+        *pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
+
+        let permissions = pdf
+            .permissions()
+            .expect("the fallback must report permissions from self.encryption");
+        assert_eq!(permissions.raw(), -4);
+
+        let info = pdf
+            .encryption_info()
+            .expect("encryption_info must not error")
+            .expect("the fallback must report EncryptionInfo from self.encryption");
+        assert_eq!(info.v, 4);
+        assert_eq!(info.r, 4);
+        assert_eq!(info.filter, "Standard");
+        assert!(info.user_password_matched);
+        assert!(!info.owner_password_matched);
+    }
+
     #[test]
     fn decrypt_resolved_object_propagates_non_encrypted_explicit_filter_errors() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
