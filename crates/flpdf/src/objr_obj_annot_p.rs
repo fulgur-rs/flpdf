@@ -249,6 +249,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
             ..Default::default()
         }
     }
@@ -495,6 +496,28 @@ mod tests {
         assert!(
             matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
             "a /P resolving to a non-page object must be left unchanged",
+        );
+    }
+
+    #[test]
+    fn p_resolving_to_orphan_page_left_unchanged() {
+        let mut objs = base();
+        objs.insert(
+            30,
+            "<< /Type /Annot /Subtype /Text /P 60 0 R /Rect [0 0 10 10] >>".into(),
+        );
+        objs.insert(
+            60,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
+            .expect("orphan-page /P");
+
+        assert!(
+            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
+            "a /P to a page outside the original page tree must be left unchanged",
         );
     }
 

@@ -439,6 +439,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
             ..Default::default()
         }
     }
@@ -507,6 +508,7 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(7, 0), ObjectRef::new(5, 0)],
             ref_map,
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
             ..Default::default()
         };
 
@@ -550,6 +552,7 @@ mod tests {
                 ObjectRef::new(5, 0),
             ],
             ref_map,
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
             ..Default::default()
         };
 
@@ -595,6 +598,10 @@ mod tests {
         let result = RebuildResult {
             new_kids: vec![ObjectRef::new(6, 0)],
             ref_map,
+            removed_pages: [3, 4, 5]
+                .into_iter()
+                .map(|number| ObjectRef::new(number, 0))
+                .collect(),
             ..Default::default()
         };
 
@@ -871,6 +878,28 @@ mod tests {
     }
 
     #[test]
+    fn p_resolving_to_orphan_page_left_unchanged() {
+        let mut objs = base_objs();
+        objs.insert(
+            12,
+            "<< /Type /Bead /T 10 0 R /N 13 0 R /V 11 0 R /P 30 0 R /R [0 0 100 100] >>".into(),
+        );
+        objs.insert(
+            30,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        drop_thread_bead_dangling_p(&mut pdf, &keep_3_and_5()).expect("orphan-page /P");
+
+        let p12 = bead_dict(&mut pdf, 12).get("P").cloned();
+        assert!(
+            reference_number(p12.as_ref()) == Some(30),
+            "a bead /P to a page outside the original page tree must be left unchanged, got {p12:?}"
+        );
+    }
+
+    #[test]
     fn bead_p_to_nulled_removed_page_still_dropped() {
         // A removed page that a surviving outline / named destination still
         // references is replaced with `null` IN PLACE by the earlier null-out
@@ -1016,6 +1045,7 @@ mod tests {
                 ObjectRef::new(5, 0),
             ],
             ref_map,
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
             ..Default::default()
         };
 

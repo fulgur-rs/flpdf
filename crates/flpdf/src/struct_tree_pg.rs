@@ -460,6 +460,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
             ..Default::default()
         }
     }
@@ -637,6 +638,43 @@ mod tests {
         assert!(
             matches!(objr_pg, Some(Object::Reference(r)) if r.number == 7),
             "OBJR surviving /Pg must be remapped to the new ref, got {objr_pg:?}"
+        );
+    }
+
+    #[test]
+    fn pg_resolving_to_non_page_left_unchanged() {
+        let mut objs = base_objs();
+        objs.insert(20, "<< /Type /StructElem /S /P /Pg 30 0 R >>".into());
+        objs.insert(30, "<< /Type /Whatever >>".into());
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("non-page /Pg");
+
+        let elem = elem_dict(&mut pdf, 20);
+        assert!(
+            matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 30),
+            "a /Pg resolving to a non-page object must be left unchanged, got {:?}",
+            elem.get("Pg")
+        );
+    }
+
+    #[test]
+    fn pg_resolving_to_orphan_page_left_unchanged() {
+        let mut objs = base_objs();
+        objs.insert(20, "<< /Type /StructElem /S /P /Pg 30 0 R >>".into());
+        objs.insert(
+            30,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("orphan-page /Pg");
+
+        let elem = elem_dict(&mut pdf, 20);
+        assert!(
+            matches!(elem.get("Pg"), Some(Object::Reference(r)) if r.number == 30),
+            "a page-like object outside the page tree must keep /Pg, got {:?}",
+            elem.get("Pg")
         );
     }
 
