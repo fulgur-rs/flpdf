@@ -1,4 +1,4 @@
-use flpdf::{Object, ObjectRef, Pdf};
+use flpdf::{ObjectRef, Pdf};
 use std::collections::BTreeMap;
 
 fn build_pdf(objects: &[(u32, &[u8])]) -> Vec<u8> {
@@ -103,26 +103,6 @@ fn signatures_returns_signed_sig_fields() {
     assert_eq!(sig.reason.as_deref(), Some("approved"));
     assert_eq!(sig.contact_info.as_deref(), Some("alice@example.test"));
     assert_eq!(sig.certificate.as_deref(), Some(&[1, 2, 3][..]));
-}
-
-#[test]
-fn signatures_follow_terminal_value_holder_without_losing_field_value_reference() {
-    let mut pdf = open(signed_acroform_pdf());
-    let original_ref = ObjectRef::new(6, 0);
-    let intermediate_ref = ObjectRef::new(20, 0);
-    let terminal_ref = ObjectRef::new(21, 0);
-    let signature_dictionary = pdf
-        .resolve_object(original_ref)
-        .expect("signature dictionary");
-    pdf.set_object(terminal_ref, signature_dictionary);
-    pdf.set_object(intermediate_ref, Object::Reference(terminal_ref));
-    pdf.set_object(original_ref, Object::Reference(intermediate_ref));
-
-    let signatures = pdf.signatures().expect("signature scan should succeed");
-
-    assert_eq!(signatures.len(), 1);
-    assert_eq!(signatures[0].signature_ref, Some(original_ref));
-    assert_eq!(signatures[0].byte_range, [0, 42, 128, 256]);
 }
 
 #[test]

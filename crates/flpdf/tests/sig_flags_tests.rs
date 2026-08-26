@@ -564,6 +564,26 @@ fn clear_sig_flags_is_noop_when_acroform_has_no_bits() {
 }
 
 #[test]
+fn clear_sig_flags_is_noop_when_sigflags_is_already_zero() {
+    let mut pdf = open(build_acroform_sig_flags_already_zero_pdf());
+
+    assert!(!clear_sig_flags(&mut pdf).unwrap());
+}
+
+#[test]
+fn strip_signature_values_ignores_a_non_signature_field_without_kids() {
+    let mut pdf = open(build_pdf(&[
+        (1, b"<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (3, b"<< /Type /Page /Parent 2 0 R >>"),
+        (4, b"<< /Fields [5 0 R] >>"),
+        (5, b"<< /FT /Tx /T (Text) /Kids [] >>"),
+    ]));
+
+    assert!(!strip_signature_values(&mut pdf).unwrap());
+}
+
+#[test]
 fn handles_acroform_indirectly_referencing_non_dictionary() {
     let mut pdf = open(build_acroform_indirect_non_dict_pdf());
 

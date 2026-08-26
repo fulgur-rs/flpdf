@@ -2,6 +2,30 @@ use flpdf::Pdf;
 use std::io::Cursor;
 
 #[test]
+fn signatures_production_uses_the_canonical_handle_route() {
+    let source = include_str!("../src/signatures.rs");
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+        "use crate::{Dictionary",
+        "set_object(",
+        "materialize(",
+    ] {
+        assert!(
+            !source.contains(legacy),
+            "signatures production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "resolve_handle", "mark_object_handle_dirty"] {
+        assert!(
+            source.contains(canonical),
+            "signatures production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
 fn qpdf_named_handle_enumeration_has_no_legacy_alias() {
     let production = include_str!("../src/reader.rs");
     assert!(!production.contains("pub fn get_all_object_handles"));
