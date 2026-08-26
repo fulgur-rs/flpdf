@@ -1,8 +1,8 @@
 # flpdf threat model
 
 - Status: living document
-- Last reviewed: 2026-06-11 (initial version, audited against the source at
-  that date)
+- Last reviewed: 2026-08-26 (recovery defaults and suppression policy audited
+  against qpdf 11.9.0)
 
 flpdf is a pure-Rust PDF read/write library (`crates/flpdf`) with a
 qpdf-compatible CLI (`crates/flpdf-cli`). This document defines what flpdf
@@ -26,10 +26,11 @@ See [SECURITY.md](../SECURITY.md) for how to report a vulnerability.
 **Input PDFs are untrusted.** Every byte of an input document is treated as
 attacker-controlled: the header, xref tables and streams, object syntax,
 stream data, filter chains, encryption dictionaries, signature dictionaries,
-and everything reached through the repair paths (`Pdf::open_with_repair`,
-`Pdf::open_best_effort`). The repair paths exist precisely to accept damaged
-input, so they widen — not narrow — the attack surface and are held to the
-same guarantees.
+and everything reached through the default recovery paths or the explicit
+suppression path (`PdfOpenOptions::repair`, including the CLI
+`--suppress-recovery` option). qpdf enables recovery by default and only
+suppresses it when explicitly requested; either policy still processes
+attacker-controlled input and is held to the same guarantees.
 
 **The caller is trusted.** How the API is used (which operations are invoked,
 where output is written), the passwords supplied for decryption or
@@ -211,8 +212,8 @@ Entry points through which untrusted bytes reach flpdf:
 
 | Surface | Entry points |
 | --- | --- |
-| Document opening (strict) | `Pdf::open`, `Pdf::open_mem` |
-| Document opening (repair — widest surface) | `Pdf::open_with_repair`, `Pdf::open_best_effort`, `Pdf::open_with_options` and `open_mem*` variants |
+| Document opening (qpdf-style recovery enabled by default) | `Pdf::open`, `Pdf::open_with_repair`, `Pdf::open_best_effort`, `Pdf::open_with_options`, `Pdf::open_for_encryption_inspection`, `Pdf::open_mem`, `Pdf::open_mem_with_options`, `Pdf::open_mem_owned`, and `Pdf::open_mem_owned_with_options` |
+| Recovery policy | `PdfOpenOptions::repair` defaults to `true`, matching qpdf's `attempt_recovery=true`; `--suppress-recovery` is the explicit CLI opt-out and maps to `repair=false`. flpdf retains `--repair`, but it does not change the default-enabled policy and qpdf has no `--repair` option. |
 | Lazy object loading | `Pdf::resolve` / `resolve_borrowed` (xref offsets, object syntax, object streams) |
 | Stream decoding | filter pipeline in `filters.rs`: Flate, LZW, ASCII85, ASCIIHex, RunLength (+ pass-through DCT/JBIG2/JPX/CCITT) |
 | Decryption | standard security handler (`encryption/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); qpdf-compatible UTF-8 validation/raw password bytes and the reader-side V5 prefix boundary (qpdf does not apply SASLprep) |
