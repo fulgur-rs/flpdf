@@ -3591,12 +3591,17 @@ fn parse_qpdf_header_version(bytes: &[u8]) -> Option<String> {
 
 fn parse_startxref(bytes: &[u8]) -> Result<u64> {
     let marker = b"startxref";
-    let Some(pos) = bytes
+    // qpdf's QPDF::parse searches for the marker only in the final 1054
+    // bytes of the file (`QPDF.cc:440-464`). This preserves its recovery
+    // boundary for files with stale startxref markers in an earlier update.
+    let search_start = bytes.len().saturating_sub(1054);
+    let Some(relative_pos) = bytes[search_start..]
         .windows(marker.len())
         .rposition(|window| window == marker)
     else {
-        return Err(Error::parse(bytes.len(), "can't find startxref"));
+        return Err(Error::parse(0, "can't find startxref"));
     };
+    let pos = search_start + relative_pos;
 
     let mut cursor = ByteCursor::new(bytes, pos + marker.len());
     cursor.read_u64()
@@ -3756,6 +3761,20 @@ mod tests {
                 Diagnostic::warning("Attempting to reconstruct cross-reference table", None),
             ]
         );
+    }
+
+    #[test]
+    fn parse_startxref_ignores_markers_before_qpdf_tail_search_window() {
+        let mut bytes = b"%PDF-1.5\nstartxref\n42\n%%EOF\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'w', 1055));
+
+        let error = super::parse_startxref(&bytes).expect_err(
+            "qpdf only searches for startxref in the final 1054 bytes; an old marker must not win",
+        );
+        assert!(matches!(
+            error,
+            Error::Parse { offset: 0, message } if message == "can't find startxref"
+        ));
     }
 
     fn test_objstm_payload(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
