@@ -18,7 +18,7 @@
 - Modify: `tests/golden/regenerate.sh`
 - Create: `tests/golden/references/overlay/overlay-destination-existing-annotation.pdf`
 
-- [ ] **Step 1: Add the route-contract assertion before production edits.**
+- [x] **Step 1: Add the route-contract assertion before production edits.**
 
 Read `crates/flpdf/src/job/overlay.rs`, isolate the production body of
 `apply_overlays_to_page_with_sources` from its function marker to the next
@@ -27,7 +27,7 @@ Read `crates/flpdf/src/job/overlay.rs`, isolate the production body of
 `mark_object_handle_dirty`, and contains none of `resolve_borrowed`,
 `resolve_object`, `live_annots`, or `page_dictionary`.
 
-- [ ] **Step 2: Add the qpdf destination-annotation golden recipe and test.**
+- [x] **Step 2: Add the qpdf destination-annotation golden recipe and test.**
 
 Use `link-annot-no-acroform.pdf` as the destination and `one-page.pdf` as the
 content-only overlay. Add this command to `tests/golden/regenerate.sh`:
@@ -44,7 +44,7 @@ existing static-id helper and compares the output to that golden. The test
 must additionally inspect the destination page and assert that its annotation
 reference remains present after the overlay operation.
 
-- [ ] **Step 3: Run only the new route and behavior tests to verify RED.**
+- [x] **Step 3: Run only the new route and behavior tests to verify RED.**
 
 Run:
 
@@ -70,7 +70,7 @@ git commit -m "test: expose overlay destination page raw route"
 - Modify: `crates/flpdf/src/job/overlay.rs:178-352,1033-1042`
 - Modify: `crates/flpdf/src/job/overlay.rs` test module around the old `page_dictionary` test
 
-- [ ] **Step 1: Add the canonical destination-page resolver.**
+- [x] **Step 1: Add the canonical destination-page resolver.**
 
 Implement a private helper with the following behavior:
 
@@ -94,7 +94,7 @@ This preserves the current error boundary without materializing a raw
 dictionary. Add a unit test using an integer object that expects the same
 `Error::Unsupported` message.
 
-- [ ] **Step 2: Build the resource dictionary from destination-owned handles.**
+- [x] **Step 2: Build the resource dictionary from destination-owned handles.**
 
 Replace the raw `Dictionary`/`Object::Reference` construction for the page's
 XObject map with a `Vec<(Vec<u8>, ObjectHandle)>`. The first entry is
@@ -115,7 +115,7 @@ After `dest.set_object(contents_ref, Object::Stream(contents_stream))`, obtain
 `overlay_page.replace_key(b"/Resources", resources)?` and
 `overlay_page.replace_key(b"/Contents", contents)?`.
 
-- [ ] **Step 3: Remove the raw snapshot and mark the live page dirty.**
+- [x] **Step 3: Remove the raw snapshot and mark the live page dirty.**
 
 Delete the `page_dictionary` call and `live_annots` block. Obtain
 `let overlay_page = overlay_page_handle(dest, dest_page_ref)?;`, replace only
@@ -123,7 +123,7 @@ the two keys, call `dest.mark_object_handle_dirty(&overlay_page)?`, and leave
 `/Annots` untouched. Delete the obsolete `page_dictionary` helper and migrate
 its test to `overlay_page_handle_rejects_non_dict`.
 
-- [ ] **Step 4: Run the route and behavior tests to verify GREEN.**
+- [x] **Step 4: Run the route and behavior tests to verify GREEN.**
 
 Run:
 
