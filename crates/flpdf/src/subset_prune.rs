@@ -48,7 +48,7 @@
 use crate::object::MAX_INLINE_DEPTH;
 use crate::page_object_helper::PageObjectHelper;
 use crate::resources::RemoveUnreferencedResources;
-use crate::{Object, ObjectRef, Pdf, Result};
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -66,7 +66,7 @@ use std::io::{Read, Seek};
 ///    category before mutating it.
 ///
 /// 2. **xref-level GC** (`collect_reachable` + `delete_object`): walks every
-///    `Object::Reference` reachable from `/Root` (transitively), then calls
+///    indirect references reachable from `/Root` (transitively), then calls
 ///    [`Pdf::delete_object`] for every live object that was **not** reached.
 ///    This removes orphaned intermediate `/Pages` nodes left by
 ///    `rebuild_page_tree`, dropped-page content streams, and similar debris.
@@ -160,12 +160,12 @@ pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
     let trailer_refs = {
         // The canonical trailer handle is qpdf's live trailer graph. In
         // particular, page merge may have copied `/Info` or unknown trailer
-        // entries into this handle after construction; the legacy
-        // `trailer_dictionary()` snapshot would make those objects look
-        // unreachable and delete them before the writer sees them.
-        let trailer_clone = pdf.trailer().materialize()?;
+        // entries into this handle after construction; an owned snapshot
+        // would make those objects look unreachable and delete them before
+        // the writer sees them.
+        let trailer = pdf.trailer();
         let mut refs: Vec<ObjectRef> = Vec::new();
-        walk_refs(&trailer_clone, 0, &mut refs)?;
+        walk_handle_contents(&trailer, 0, &mut refs)?;
         refs.extend(protect.iter().copied());
         refs
     };
@@ -185,8 +185,8 @@ pub(crate) fn sweep_unreachable_objects_except<R: Read + Seek>(
 // ── Reachability walker ───────────────────────────────────────────────────────
 
 /// Transitively collect every `ObjectRef` reachable from `start` (and any
-/// additional seeds in `extra_seeds`) by following all `Object::Reference`
-/// values encountered while resolving objects.
+/// additional seeds in `extra_seeds`) by following all indirect child handles
+/// encountered while resolving objects.
 ///
 /// `extra_seeds` is used to protect objects referenced by the PDF trailer
 /// (e.g. `/Info`, `/Encrypt`) that are NOT reachable through `/Root`.
@@ -217,61 +217,73 @@ fn collect_reachable<R: Read + Seek>(
         }
 
         // If `current` lives inside an /ObjStm, that container object must
-        // survive the sweep too: walk_refs only follows Object::Reference and
-        // never sees the metadata-level compressed-parent link, so without
-        // this, delete_object would drop the /ObjStm and make every compressed
+        // survive the sweep too: the handle graph does not expose the
+        // metadata-level compressed-parent link, so without this,
+        // delete_object would drop the /ObjStm and make every compressed
         // member unrecoverable in the output.
         if let Some((objstm_ref, _)) = pdf.compressed_parent(current) {
             queue.push(objstm_ref);
         }
 
         // Resolve the object; skip on error (conservative — keeps the object).
-        let obj = match pdf.resolve_borrowed(current) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
+        let object = pdf.get_object_handle(current);
+        if pdf.resolve(&object).is_err() {
+            continue;
+        }
 
-        // Walk all ObjectRefs contained in the resolved object.
-        walk_refs(obj, 0, &mut queue)?;
+        // Walk all indirect child handles contained in the resolved object.
+        // The current handle itself is already in `visited`, so inspect its
+        // contents rather than enqueueing its own object number again.
+        walk_handle_contents(&object, 0, &mut queue)?;
     }
 
     Ok(visited)
 }
 
-/// Recursively push every `Object::Reference` found inside `obj` onto `queue`.
+/// Recursively push every indirect child handle found inside `obj` onto
+/// `queue`.
 ///
 /// This is a pure structural walk — it does not resolve any references; the
 /// caller drives resolution in the BFS/DFS loop.
-fn walk_refs(obj: &Object, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
+fn walk_refs(obj: &ObjectHandle, depth: usize, queue: &mut Vec<ObjectRef>) -> Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
         )));
     }
-    match obj {
-        Object::Reference(r) => {
-            queue.push(*r);
+    if let Some(object_ref) = obj.object_ref().or_else(|| obj.as_reference()) {
+        queue.push(object_ref);
+    } else {
+        walk_handle_contents(obj, depth, queue)?;
+    }
+    Ok(())
+}
+
+/// Walk the value held by an already-resolved handle without treating the
+/// handle's own indirect identity as a child reference.
+fn walk_handle_contents(
+    obj: &ObjectHandle,
+    depth: usize,
+    queue: &mut Vec<ObjectRef>,
+) -> Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(crate::Error::Unsupported(format!(
+            "subset prune: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
+        )));
+    }
+
+    if let Some(items) = obj.as_array() {
+        for item in items {
+            walk_refs(&item, depth + 1, queue)?;
         }
-        Object::Array(arr) => {
-            for item in arr {
-                walk_refs(item, depth + 1, queue)?;
-            }
+    } else if let Some(entries) = obj.as_dictionary() {
+        for value in entries.values() {
+            walk_refs(value, depth + 1, queue)?;
         }
-        Object::Dictionary(dict) => {
-            for (_, val) in dict.iter() {
-                walk_refs(val, depth + 1, queue)?;
-            }
-        }
-        Object::Stream(stream) => {
-            // Walk the stream dictionary; the stream data itself contains no
-            // nested PDF object references at the indirect-object level.
-            for (_, val) in stream.dict.iter() {
-                walk_refs(val, depth + 1, queue)?;
-            }
-        }
-        // Scalar values (null, boolean, integer, real, name, string) carry
-        // no references.
-        _ => {}
+    } else if let Some(stream_dict) = obj.as_stream_dict() {
+        // Stream data itself contains no indirect object references at the
+        // object-table level; only the stream dictionary participates here.
+        walk_handle_contents(&stream_dict, depth + 1, queue)?;
     }
     Ok(())
 }
@@ -286,16 +298,16 @@ mod tests {
     use crate::pages::page_refs;
     use crate::pages::tree_rebuild::rebuild_page_tree;
     use crate::writer::write_qpdf_to_memory;
-    use crate::{Object, ObjectRef, Pdf};
+    use crate::{Object, ObjectHandle, ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
 
     // ── Inline-depth guard ───────────────────────────────────────────────────
 
-    fn nested_arrays(depth: usize) -> Object {
-        let mut o = Object::Null;
+    fn nested_arrays(depth: usize) -> ObjectHandle {
+        let mut o = ObjectHandle::null();
         for _ in 0..depth {
-            o = Object::Array(vec![o]);
+            o = ObjectHandle::array(vec![o]);
         }
         o
     }
@@ -313,9 +325,12 @@ mod tests {
         // Bury one Reference so it is visited at exactly inline depth
         // MAX_INLINE_DEPTH (the deepest accepted level under the strict `>`
         // guard); it must be collected, not errored.
-        let mut o = Object::Array(vec![Object::Reference(ObjectRef::new(9, 0))]);
+        let mut o = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
+            ObjectRef::new(9, 0),
+            -1,
+        )]);
         for _ in 0..(MAX_INLINE_DEPTH - 1) {
-            o = Object::Array(vec![o]);
+            o = ObjectHandle::array(vec![o]);
         }
         walk_refs(&o, 0, &mut queue).unwrap();
         assert_eq!(queue, vec![ObjectRef::new(9, 0)]);
