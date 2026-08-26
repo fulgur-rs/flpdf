@@ -60,8 +60,7 @@
 //! Single-document only. Multi-input cross-document merge is a separate path.
 
 use crate::pages::tree_rebuild::RebuildResult;
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Error, Object, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -111,6 +110,12 @@ impl Surviving {
     fn is_surviving_target(&self, page_ref: ObjectRef) -> bool {
         self.map.contains_key(&page_ref) || self.new_refs.contains(&page_ref)
     }
+}
+
+/// Return the reference represented by a handle, whether it is an ordinary
+/// indirect child or a flpdf-only reference-as-value redirect.
+fn handle_object_ref(handle: &ObjectHandle) -> Option<ObjectRef> {
+    handle.object_ref().or_else(|| handle.as_reference())
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +172,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // only through a reference holder or a non-page wrapper dictionary, so its
     // contents cannot leak, while never touching a non-page object a malformed
     // destination happens to reference.
-    null_removed_pages(pdf, result);
+    null_removed_pages(pdf, result)?;
 
     // Step 1: build the surviving-page map (first new ref per surviving source)
     // together with the set of all rebuilt output refs, so a destination already
@@ -180,12 +185,13 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
         Some(r) => r,
         None => return Ok(()), // No catalog, nothing to do.
     };
-    let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-    let Some(catalog) = catalog_obj.as_dict() else {
+    let catalog = pdf.get_object_handle(catalog_ref);
+    pdf.resolve(&catalog)?;
+    if catalog.try_as_dictionary()?.is_none() {
         return Ok(());
-    };
+    }
 
-    let outlines_ref = catalog.get_ref("Outlines");
+    let outlines_ref = handle_object_ref(&catalog.try_get_key(b"/Outlines")?);
 
     // --- Step 2: Remap named destinations -------------------------------------
     // qpdf keeps every named destination: a surviving-page dest is remapped to
@@ -194,68 +200,23 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // then garbage-collected by the later subset sweep). /Names and /Dests are
     // never removed from the catalog, and /Limits is never recomputed.
 
-    // /Names may be an indirect reference OR a direct dictionary on the catalog;
-    // /Dests inside it likewise.
-    enum NamesLoc {
-        Indirect(ObjectRef),
-        DirectInCatalog,
-    }
-    let (names_loc, mut names_dict) = match catalog.get("Names").cloned() {
-        Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-            Object::Dictionary(d) => (Some(NamesLoc::Indirect(r)), d.clone()),
-            _ => (None, crate::Dictionary::default()),
-        },
-        Some(Object::Dictionary(d)) => (Some(NamesLoc::DirectInCatalog), d),
-        _ => (None, crate::Dictionary::default()),
-    };
-    if let Some(names_loc) = names_loc {
-        match names_dict.get("Dests").cloned() {
-            Some(Object::Reference(dr)) => {
-                // /Dests is an indirect name-tree root: nodes are remapped in
-                // place, so the /Names holder needs no rewrite.
-                let mut nt_visited: BTreeSet<ObjectRef> = BTreeSet::new();
-                remap_name_tree(pdf, dr, &surviving, 0, max_depth, &mut nt_visited)?;
-            }
-            Some(Object::Dictionary(node)) => {
-                // /Dests held as a direct dict: rebuild it and write the holder
-                // (the indirect /Names object, or the catalog) back.
-                let new_node = remap_name_tree_node_dict(pdf, node, &surviving, max_depth)?;
-                names_dict.insert("Dests", Object::Dictionary(new_node));
-                match names_loc {
-                    NamesLoc::Indirect(r) => pdf.set_object(r, Object::Dictionary(names_dict)),
-                    NamesLoc::DirectInCatalog => {
-                        let cat_obj = pdf.resolve_borrowed(catalog_ref)?;
-                        if let Some(mut cat) = cat_obj.as_dict().cloned() {
-                            cat.insert("Names", Object::Dictionary(names_dict));
-                            pdf.set_object(catalog_ref, Object::Dictionary(cat));
-                        }
-                    }
-                }
-            }
-            // No /Dests (other name-tree keys only) — nothing to remap here.
-            _ => {}
+    // /Names may be an indirect reference or a direct dictionary on the
+    // catalog; /Dests inside it likewise. Both are live handles, so mutations
+    // below are visible through every alias without rebuilding the parent.
+    let names = catalog.try_get_key(b"/Names")?;
+    if !names.is_null() {
+        let names = pdf.resolve_to_terminal(&names)?;
+        let dests = names.try_get_key(b"/Dests")?;
+        if !dests.is_null() {
+            let mut nt_visited: BTreeSet<ObjectRef> = BTreeSet::new();
+            remap_name_tree_handle(pdf, &dests, &surviving, 0, max_depth, &mut nt_visited)?;
         }
     }
 
     // 2b. Legacy /Catalog /Dests dictionary (PDF 1.1 style)
-    let catalog_obj2 = pdf.resolve_borrowed(catalog_ref)?;
-    let Some(catalog2) = catalog_obj2.as_dict() else {
-        return Ok(());
-    };
-    match catalog2.get("Dests").cloned() {
-        Some(Object::Reference(dests_obj_ref)) => {
-            remap_legacy_dests(pdf, dests_obj_ref, &surviving)?;
-        }
-        Some(Object::Dictionary(dests)) => {
-            // Legacy /Dests held as a direct dictionary on the catalog.
-            let new_dests = remap_dests_dict(pdf, dests, &surviving)?;
-            let catalog_obj3 = pdf.resolve_borrowed(catalog_ref)?;
-            if let Some(mut cat) = catalog_obj3.as_dict().cloned() {
-                cat.insert("Dests", Object::Dictionary(new_dests));
-                pdf.set_object(catalog_ref, Object::Dictionary(cat));
-            }
-        }
-        _ => {}
+    let dests = catalog.try_get_key(b"/Dests")?;
+    if !dests.is_null() {
+        remap_dests_dict(pdf, &dests, &surviving)?;
     }
 
     // --- Step 3: Remap the outline tree -----------------------------------
@@ -264,10 +225,9 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // is left referenced verbatim). Sibling links, /Count, and the /Outlines
     // catalog entry are all left unchanged.
     if let Some(outlines_obj_ref) = outlines_ref {
-        let first_ref = {
-            let outline_root_obj = pdf.resolve_borrowed(outlines_obj_ref)?;
-            outline_root_obj.as_dict().and_then(|d| d.get_ref("First"))
-        };
+        let outline_root = pdf.get_object_handle(outlines_obj_ref);
+        pdf.resolve(&outline_root)?;
+        let first_ref = handle_object_ref(&outline_root.try_get_key(b"/First")?);
         if let Some(first_ref) = first_ref {
             let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
             remap_outline_tree(pdf, first_ref, 0, max_depth, &surviving, &mut visited)?;
@@ -283,7 +243,7 @@ pub fn remap_outline_and_dests_with_max_depth<R: Read + Seek>(
     // /P or a struct element /Pg is a different, drop-and-GC family; struct elem
     // /Pg is handled by crate::struct_tree_pg, after this pass in the pipeline.)
     remap_annot_dests(pdf, result, &surviving)?;
-    remap_open_action_dest(pdf, catalog_ref, &surviving)?;
+    remap_open_action_dest(pdf, &catalog, &surviving)?;
 
     Ok(())
 }
@@ -320,94 +280,58 @@ fn remap_annot_dests<R: Read + Seek>(
     result: &RebuildResult,
     surviving: &Surviving,
 ) -> Result<()> {
-    let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut visited_arrays: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut visited_annots: BTreeSet<ObjectRef> = BTreeSet::new();
     for &page_ref in &result.new_kids {
         // /Annots may be an inline array (stored in the page dict) or an
         // indirect reference to an array object.
-        let annots_val = {
-            let page_obj = pdf.resolve_borrowed(page_ref)?;
-            let Some(page) = page_obj.as_dict() else {
-                continue;
-            };
-            page.get("Annots").cloned()
-        };
-        match annots_val {
-            // Inline /Annots array: process elements, write the array back into
-            // the page dict only if an inline annotation changed.
-            Some(Object::Array(arr)) => {
-                if let Some(new_arr) = remap_annot_array(pdf, arr, surviving, &mut visited)? {
-                    let page_obj = pdf.resolve_borrowed(page_ref)?;
-                    if let Some(mut page) = page_obj.as_dict().cloned() {
-                        page.insert("Annots", Object::Array(new_arr));
-                        pdf.set_object(page_ref, Object::Dictionary(page));
-                    }
-                }
-            }
-            // Indirect /Annots array: process elements, write the array back to
-            // the array object only if an inline annotation changed. A shared
-            // indirect array (duplicate-page selection) is processed once: a
-            // second pass would re-remap an inline annot's already-remapped /Dest
-            // (redundant work). Nulling a surviving page on that second pass is
-            // independently prevented by the surviving-target guard (a rebuilt
-            // output ref is never treated as a removed target).
-            Some(Object::Reference(r)) => {
-                // Follow the full reference chain (ref -> … -> array) so a
-                // double-indirect /Annots is not dropped, then dedup on the
-                // terminal array object so a shared array is processed once.
-                let (resolved, terminal) = resolve_ref_chain(pdf, &Object::Reference(r))?;
-                let array_ref = terminal.unwrap_or(r);
-                if !visited.insert(array_ref) {
-                    continue;
-                }
-                let Object::Array(arr) = resolved else {
-                    continue;
-                };
-                if let Some(new_arr) = remap_annot_array(pdf, arr, surviving, &mut visited)? {
-                    pdf.set_object(array_ref, Object::Array(new_arr));
-                }
-            }
-            _ => {}
+        let page = pdf.get_object_handle(page_ref);
+        pdf.resolve(&page)?;
+        let annots = page.try_get_key(b"/Annots")?;
+        if annots.is_null() {
+            continue;
         }
+
+        let (annots, array_ref) = pdf.resolve_to_terminal_ref(&annots)?;
+        if let Some(array_ref) = array_ref {
+            if !visited_arrays.insert(array_ref) {
+                continue;
+            }
+        }
+        remap_annot_array(pdf, &annots, surviving, &mut visited_annots)?;
     }
     Ok(())
 }
 
 /// Process every element of an `/Annots` array for destination remap.
 ///
-/// An indirect annotation (`Object::Reference`) is rewritten in place by the
+/// An indirect annotation handle is rewritten in place by the
 /// shared item helpers (deduplicated across duplicated pages via `visited`); an
 /// inline (direct-dict) annotation is remapped on a copy. Returns
-/// `Some(updated_array)` when an inline annotation changed — the caller stores
-/// it back into the page dict or the indirect array object — or `None` when
-/// only indirect annotations were touched (already rewritten in place) or
-/// nothing changed.
+/// after every array element has been inspected. All changes are made through
+/// the live array and annotation handles, so no parent write-back is needed.
 fn remap_annot_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    arr: Vec<Object>,
+    arr: &ObjectHandle,
     surviving: &Surviving,
     visited: &mut BTreeSet<ObjectRef>,
-) -> Result<Option<Vec<Object>>> {
-    let mut out: Vec<Object> = Vec::with_capacity(arr.len());
-    let mut changed = false;
-    for elem in arr {
-        match elem {
-            Object::Reference(r) => {
-                // A shared indirect annot reachable from several duplicated
-                // pages must be processed once (see remap_annot_dests).
-                if visited.insert(r) {
-                    remap_item_dest(pdf, r, surviving)?;
-                }
-                out.push(Object::Reference(r));
+) -> Result<()> {
+    let Some(elements) = arr.as_array() else {
+        return Ok(());
+    };
+    for element in elements {
+        if let Some(annotation_ref) = handle_object_ref(&element) {
+            // A shared indirect annotation reachable from several duplicated
+            // pages must be processed once (see remap_annot_dests).
+            if visited.insert(annotation_ref) {
+                let annotation = pdf.get_object_handle(annotation_ref);
+                remap_item_dest(pdf, &annotation, surviving)?;
             }
-            Object::Dictionary(annot) => {
-                let (new_annot, ch) = remap_inline_annot(pdf, annot, surviving)?;
-                changed |= ch;
-                out.push(Object::Dictionary(new_annot));
-            }
-            other => out.push(other),
+        } else {
+            remap_inline_annot(pdf, &element, surviving)?;
         }
     }
-    Ok(if changed { Some(out) } else { None })
+    Ok(())
 }
 
 /// Remap an inline (direct-dict) annotation's destinations.
@@ -421,21 +345,19 @@ fn remap_annot_array<R: Read + Seek>(
 /// whether a destination key was present and processed.
 fn remap_inline_annot<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    mut annot: crate::Dictionary,
+    annot: &ObjectHandle,
     surviving: &Surviving,
-) -> Result<(crate::Dictionary, bool)> {
-    let mut changed = false;
-    // `annot` is owned: take each value by `remove` and re-insert the processed
-    // result (no inner clone of the destination).
-    if let Some(dest) = annot.remove("Dest") {
-        annot.insert("Dest", remap_dest(pdf, dest, surviving)?);
-        changed = true;
+) -> Result<()> {
+    pdf.resolve(annot)?;
+    let dest = annot.try_get_key(b"/Dest")?;
+    if !dest.is_null() {
+        remap_dest(pdf, &dest, surviving)?;
     }
-    if let Some(action) = annot.remove("A") {
-        annot.insert("A", remap_action_dest(pdf, action, surviving)?);
-        changed = true;
+    let action = annot.try_get_key(b"/A")?;
+    if !action.is_null() {
+        remap_action_dest(pdf, &action, surviving)?;
     }
-    Ok((annot, changed))
+    Ok(())
 }
 
 /// Remap the catalog `/OpenAction` destination (qpdf `--pages` parity).
@@ -447,32 +369,14 @@ fn remap_inline_annot<R: Read + Seek>(
 /// local page destination).
 fn remap_open_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    catalog_ref: ObjectRef,
+    catalog: &ObjectHandle,
     surviving: &Surviving,
 ) -> Result<()> {
-    let oa = {
-        let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-        let Some(catalog) = catalog_obj.as_dict() else {
-            return Ok(());
-        };
-        catalog.get("OpenAction").cloned()
-    };
-    let Some(oa) = oa else {
+    let oa = catalog.try_get_key(b"/OpenAction")?;
+    if oa.is_null() {
         return Ok(());
-    };
-    // For an indirect /OpenAction the referenced object is rewritten in place
-    // and the same value returned; for a direct value a remapped destination
-    // comes back changed. Only rewrite the catalog when the value actually
-    // changed, so an unchanged (or in-place-updated indirect) /OpenAction does
-    // not needlessly mark the catalog dirty.
-    let updated = remap_action_dest(pdf, oa.clone(), surviving)?;
-    if updated != oa {
-        let catalog_obj = pdf.resolve_borrowed(catalog_ref)?;
-        if let Some(mut catalog) = catalog_obj.as_dict().cloned() {
-            catalog.insert("OpenAction", updated);
-            pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-        }
     }
+    remap_action_dest(pdf, &oa, surviving)?;
     Ok(())
 }
 
@@ -487,19 +391,21 @@ fn remap_open_action_dest<R: Read + Seek>(
 /// [`remap_item_dest`].
 fn remap_action_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    value: Object,
+    value: &ObjectHandle,
     surviving: &Surviving,
-) -> Result<Object> {
-    // Resolve to inspect /S without losing the original value form for the
-    // write-back (remap_dest handles an indirect value in place).
-    let (concrete, _) = resolve_ref_chain(pdf, &value)?;
-    if let Some(dict) = concrete.as_dict() {
+) -> Result<()> {
+    let concrete = pdf.resolve_to_terminal(value)?;
+    if concrete.try_as_dictionary()?.is_some() {
+        let action_type = concrete.try_get_key(b"/S")?;
         // A non-GoTo action: keep verbatim (its /D is not a local destination).
-        if matches!(dict.get("S"), Some(Object::Name(n)) if n != b"GoTo") {
-            return Ok(value);
+        if !action_type.is_null() {
+            let action_type = pdf.resolve_to_terminal(&action_type)?;
+            if action_type.as_name().as_deref() != Some(b"GoTo") {
+                return Ok(());
+            }
         }
     }
-    remap_dest(pdf, value, surviving)
+    remap_dest(pdf, &concrete, surviving)
 }
 
 // ---------------------------------------------------------------------------
@@ -519,10 +425,11 @@ fn remap_action_dest<R: Read + Seek>(
 /// cannot leak; a non-page object a malformed destination happens to reference
 /// is never in this set and is left untouched. The subsequent subset sweep
 /// drops any nulled page that no surviving destination still references.
-fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) {
+fn null_removed_pages<R: Read + Seek>(pdf: &mut Pdf<R>, result: &RebuildResult) -> Result<()> {
     for &removed in &result.removed_pages {
-        pdf.set_object(removed, Object::Null);
+        pdf.set_object_handle(removed, ObjectHandle::null())?;
     }
+    Ok(())
 }
 
 /// Remap a `/Names`-leaf name tree (or descend its `/Kids`) in place, keeping
@@ -537,63 +444,61 @@ fn remap_name_tree<R: Read + Seek>(
     max_depth: usize,
     visited: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
+    let node = pdf.get_object_handle(node_ref);
+    remap_name_tree_handle(pdf, &node, surviving, depth, max_depth, visited)
+}
+
+/// Remap a name-tree node represented by its live handle. Direct roots and
+/// indirect child nodes use the same accessor/mutation path.
+fn remap_name_tree_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    node: &ObjectHandle,
+    surviving: &Surviving,
+    depth: usize,
+    max_depth: usize,
+    visited: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
     if depth >= max_depth {
         return Err(Error::Unsupported(format!(
-            "outline_dest_remap: name-tree depth limit {max_depth} exceeded at {node_ref}"
+            "outline_dest_remap: name-tree depth limit {max_depth} exceeded"
         )));
     }
-    if !visited.insert(node_ref) {
-        return Ok(()); // Cycle: already processed.
-    }
-    let node_obj = pdf.resolve_borrowed(node_ref)?;
-    let Some(node) = node_obj.as_dict() else {
-        return Ok(()); // Malformed node.
-    };
-
-    if node.get("Names").is_some() {
-        if let Some(pairs) = node.get("Names").cloned().and_then(Object::into_array) {
-            let new_pairs = remap_name_pairs(pdf, pairs, surviving)?;
-            let node_obj2 = pdf.resolve_borrowed(node_ref)?;
-            if let Some(mut d) = node_obj2.as_dict().cloned() {
-                d.insert("Names", Object::Array(new_pairs));
-                pdf.set_object(node_ref, Object::Dictionary(d));
-            }
+    let node = pdf.resolve_to_terminal(node)?;
+    if let Some(node_ref) = node.object_ref() {
+        if !visited.insert(node_ref) {
+            return Ok(()); // Cycle: already processed.
         }
+    }
+    if node.try_as_dictionary()?.is_none() {
+        return Ok(()); // Malformed node.
+    }
+
+    let names = node.try_get_key(b"/Names")?;
+    if !names.is_null() {
+        remap_name_pairs(pdf, &names, surviving)?;
         return Ok(());
     }
 
-    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
-        let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
-        for child_ref in child_refs {
-            remap_name_tree(pdf, child_ref, surviving, depth + 1, max_depth, visited)?;
+    let kids = node.try_get_key(b"/Kids")?;
+    if !kids.is_null() {
+        let kids = pdf.resolve_to_terminal(&kids)?;
+        if let Some(kids) = kids.as_array() {
+            for child in kids {
+                if let Some(child_ref) = handle_object_ref(&child) {
+                    let child_handle = pdf.get_object_handle(child_ref);
+                    remap_name_tree_handle(
+                        pdf,
+                        &child_handle,
+                        surviving,
+                        depth + 1,
+                        max_depth,
+                        visited,
+                    )?;
+                }
+            }
         }
     }
     Ok(())
-}
-
-/// Like [`remap_name_tree`] but for a name-tree root held as a *direct*
-/// dictionary on the catalog's `/Names`. Child `/Kids` (always indirect)
-/// delegate to [`remap_name_tree`]. Returns the rebuilt node dict.
-fn remap_name_tree_node_dict<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    node: crate::Dictionary,
-    surviving: &Surviving,
-    max_depth: usize,
-) -> Result<crate::Dictionary> {
-    if let Some(Object::Array(pairs)) = node.get("Names").cloned() {
-        let new_pairs = remap_name_pairs(pdf, pairs, surviving)?;
-        let mut d = node;
-        d.insert("Names", Object::Array(new_pairs));
-        return Ok(d);
-    }
-    if let Some(kids) = node.get("Kids").and_then(Object::as_array) {
-        let child_refs: Vec<ObjectRef> = kids.iter().filter_map(Object::as_ref_id).collect();
-        let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
-        for child_ref in child_refs {
-            remap_name_tree(pdf, child_ref, surviving, 1, max_depth, &mut visited)?;
-        }
-    }
-    Ok(node)
 }
 
 /// Keep every `(name, dest)` pair of a flat name-pairs array, remapping a
@@ -602,19 +507,19 @@ fn remap_name_tree_node_dict<R: Read + Seek>(
 /// orphan key is dropped).
 fn remap_name_pairs<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    pairs: Vec<Object>,
+    pairs: &ObjectHandle,
     surviving: &Surviving,
-) -> Result<Vec<Object>> {
-    let mut result: Vec<Object> = Vec::with_capacity(pairs.len());
+) -> Result<()> {
+    pdf.resolve(pairs)?;
+    let Some(values) = pairs.as_array() else {
+        return Ok(());
+    };
     let mut i = 0;
-    while i + 1 < pairs.len() {
-        let name_obj = pairs[i].clone();
-        let dest_obj = pairs[i + 1].clone();
+    while i + 1 < values.len() {
+        remap_dest(pdf, &values[i + 1], surviving)?;
         i += 2;
-        result.push(name_obj);
-        result.push(remap_dest(pdf, dest_obj, surviving)?);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Remap a single dest value to its surviving target's new ref, or keep it
@@ -627,34 +532,18 @@ fn remap_name_pairs<R: Read + Seek>(
 /// verbatim.
 fn remap_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dest_obj: Object,
-    surviving: &Surviving,
-) -> Result<Object> {
-    match dest_page_ref_resolved(pdf, &dest_obj)? {
-        // A surviving source ref is remapped to its new ref; a ref that is
-        // already a rebuilt output ref stays verbatim (remap is a no-op, so
-        // `remap_dest_value` returns `None`).
-        Some(page_ref) if surviving.is_surviving_target(page_ref) => {
-            Ok(remap_dest_value(pdf, &dest_obj, surviving)?.unwrap_or(dest_obj))
-        }
-        // Removed page (already nulled), non-page object, or named/external
-        // dest — keep the destination value verbatim.
-        _ => Ok(dest_obj),
-    }
-}
-
-/// Remap a legacy (PDF 1.1) `/Dests` dictionary held as an indirect object.
-fn remap_legacy_dests<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dests_ref: ObjectRef,
+    dest: &ObjectHandle,
     surviving: &Surviving,
 ) -> Result<()> {
-    let dests_obj = pdf.resolve_borrowed(dests_ref)?;
-    let Some(dests) = dests_obj.as_dict().cloned() else {
-        return Ok(());
-    };
-    let new_dests = remap_dests_dict(pdf, dests, surviving)?;
-    pdf.set_object(dests_ref, Object::Dictionary(new_dests));
+    if let Some(page_ref) = dest_page_ref_resolved(pdf, dest)? {
+        // A surviving source ref is remapped to its new ref; a ref that is
+        // already a rebuilt output ref stays verbatim.
+        if surviving.is_surviving_target(page_ref) {
+            remap_dest_value(pdf, dest, surviving)?;
+        }
+    }
+    // Removed page (already nulled), non-page object, or named/external
+    // destination — keep the destination value verbatim.
     Ok(())
 }
 
@@ -663,19 +552,17 @@ fn remap_legacy_dests<R: Read + Seek>(
 /// Returns the rebuilt dictionary.
 fn remap_dests_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dests: crate::Dictionary,
+    dests: &ObjectHandle,
     surviving: &Surviving,
-) -> Result<crate::Dictionary> {
-    let mut new_dests = dests.clone();
-    let keys: Vec<Vec<u8>> = dests.iter().map(|(k, _)| k.to_vec()).collect();
-    for key in keys {
-        let Some(val) = dests.get(&key).cloned() else {
-            continue;
-        };
-        let updated = remap_dest(pdf, val, surviving)?;
-        new_dests.insert(key, updated);
+) -> Result<()> {
+    let dests = pdf.resolve_to_terminal(dests)?;
+    let Some(entries) = dests.try_as_dictionary()? else {
+        return Ok(());
+    };
+    for value in entries.values() {
+        remap_dest(pdf, value, surviving)?;
     }
-    Ok(new_dests)
+    Ok(())
 }
 
 /// Walk the outline sibling chain from `first_ref`, recursing into children,
@@ -701,18 +588,22 @@ fn remap_outline_tree<R: Read + Seek>(
         if !visited.insert(item_ref) {
             break; // Cycle guard (/Next or /First back-edge).
         }
+        let item = pdf.get_object_handle(item_ref);
+        pdf.resolve(&item)?;
         let (next_ref, first_child) = {
-            let item_obj = pdf.resolve_borrowed(item_ref)?;
-            let Some(item) = item_obj.as_dict() else {
+            if item.try_as_dictionary()?.is_none() {
                 break; // Malformed — stop this chain.
-            };
-            (item.get_ref("Next"), item.get_ref("First"))
+            }
+            (
+                handle_object_ref(&item.try_get_key(b"/Next")?),
+                handle_object_ref(&item.try_get_key(b"/First")?),
+            )
         };
 
         // Remap surviving-page refs in place. Removed target pages need no
         // action here — they were already replaced with `null` by
         // [`null_removed_pages`] (the destination reference is kept verbatim).
-        remap_item_dest(pdf, item_ref, surviving)?;
+        remap_item_dest(pdf, &item, surviving)?;
 
         if let Some(child_first) = first_child {
             remap_outline_tree(pdf, child_first, depth + 1, max_depth, surviving, visited)?;
@@ -729,22 +620,18 @@ fn remap_outline_tree<R: Read + Seek>(
 /// Remap the page reference in an outline item's `/Dest` or `/A /D` field.
 fn remap_item_dest<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    item_ref: ObjectRef,
+    item: &ObjectHandle,
     surviving: &Surviving,
 ) -> Result<()> {
-    let item_obj = pdf.resolve_borrowed(item_ref)?;
-    let Some(mut d) = item_obj.as_dict().cloned() else {
+    let item = pdf.resolve_to_terminal(item)?;
+    if item.try_as_dictionary()?.is_none() {
         return Ok(());
-    };
-
-    let mut changed = false;
+    }
 
     // /Dest — array, dict, or an indirect reference to either.
-    if let Some(dest) = d.get("Dest").cloned() {
-        if let Some(remapped) = remap_dest_value(pdf, &dest, surviving)? {
-            d.insert("Dest", remapped);
-            changed = true;
-        }
+    let dest = item.try_get_key(b"/Dest")?;
+    if !dest.is_null() {
+        remap_dest(pdf, &dest, surviving)?;
         // String/name-form dest: no page ref to remap here; the name tree was
         // already updated.
     }
@@ -752,36 +639,9 @@ fn remap_item_dest<R: Read + Seek>(
     // /A /GoTo /D (action form). /A may be an indirect reference to the
     // action dict; resolve one level so an indirect GoTo action's /D is
     // still pruned/remapped.
-    if let Some(a_val) = d.get("A").cloned() {
-        // /A may be a multi-level indirect chain; follow it to the terminal
-        // action object. action_target is the LAST ref in the chain so an
-        // in-place rewrite updates the object /A ultimately points at.
-        let (action_obj, action_target) = resolve_ref_chain(pdf, &a_val)?;
-        if let Some(mut action) = action_obj.into_dict() {
-            let is_goto = matches!(action.get("S"), Some(Object::Name(n)) if n == b"GoTo");
-            if is_goto {
-                if let Some(d_val) = action.get("D").cloned() {
-                    if let Some(remapped) = remap_dest_value(pdf, &d_val, surviving)? {
-                        action.insert("D", remapped);
-                        match action_target {
-                            Some(ar) => {
-                                // Rewrite the referenced action object in place;
-                                // /A keeps pointing at the same object number.
-                                pdf.set_object(ar, Object::Dictionary(action));
-                            }
-                            None => {
-                                d.insert("A", Object::Dictionary(action));
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if changed {
-        pdf.set_object(item_ref, Object::Dictionary(d));
+    let action = item.try_get_key(b"/A")?;
+    if !action.is_null() {
+        remap_action_dest(pdf, &action, surviving)?;
     }
     Ok(())
 }
@@ -795,9 +655,9 @@ fn remap_item_dest<R: Read + Seek>(
 /// pointing at the same object number).
 fn remap_dest_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dest: &Object,
+    dest: &ObjectHandle,
     surviving: &Surviving,
-) -> Result<Option<Object>> {
+) -> Result<()> {
     remap_dest_value_depth(pdf, dest, surviving, MAX_DEST_RESOLVE_DEPTH)
 }
 
@@ -809,49 +669,33 @@ const MAX_DEST_RESOLVE_DEPTH: usize = 64;
 
 fn remap_dest_value_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dest: &Object,
+    dest: &ObjectHandle,
     surviving: &Surviving,
     depth: usize,
-) -> Result<Option<Object>> {
+) -> Result<()> {
     if depth == 0 {
         // Cycle / pathological nesting — stop conservatively (no remap).
-        return Ok(None);
+        return Ok(());
     }
-    match dest {
-        // Indirect: resolve, recurse, and if the referenced object changed,
-        // rewrite it in place. The caller keeps pointing at the same ref.
-        Object::Reference(dr) => {
-            let concrete = pdf.resolve_object(*dr)?;
-            if let Some(updated) = remap_dest_value_depth(pdf, &concrete, surviving, depth - 1)? {
-                pdf.set_object(*dr, updated);
-            }
-            Ok(None)
-        }
-        // Array form `[pageRef /Fit ...]`.
-        Object::Array(arr) => {
-            if let Some(old) = arr.first().and_then(Object::as_ref_id) {
-                if let Some(new_ref) = surviving.remap(old) {
-                    let mut a = arr.clone();
-                    a[0] = Object::Reference(new_ref);
-                    return Ok(Some(Object::Array(a)));
+    let dest = pdf.resolve_to_terminal(dest)?;
+    if let Some(items) = dest.as_array() {
+        if let Some(old) = items.first().and_then(handle_object_ref) {
+            if let Some(new_ref) = surviving.remap(old) {
+                if new_ref != old {
+                    dest.set_array_item(0, pdf.get_object_handle(new_ref))?;
+                    pdf.mark_object_handle_dirty(&dest)?;
                 }
             }
-            Ok(None)
         }
-        // Dictionary form `<< /D <dest> >>` — /D may itself be inline or an
-        // indirect reference; recurse so either is remapped.
-        Object::Dictionary(d) => {
-            if let Some(d_val) = d.get("D").cloned() {
-                if let Some(updated) = remap_dest_value_depth(pdf, &d_val, surviving, depth - 1)? {
-                    let mut nd = d.clone();
-                    nd.insert("D", updated);
-                    return Ok(Some(Object::Dictionary(nd)));
-                }
-            }
-            Ok(None)
-        }
-        _ => Ok(None),
+        return Ok(());
     }
+    if dest.try_as_dictionary()?.is_some() {
+        let nested = dest.try_get_key(b"/D")?;
+        if !nested.is_null() {
+            remap_dest_value_depth(pdf, &nested, surviving, depth - 1)?;
+        }
+    }
+    Ok(())
 }
 
 /// pdf-aware page-ref extraction. Resolves one level at each indirection
@@ -861,14 +705,14 @@ fn remap_dest_value_depth<R: Read + Seek>(
 /// when a cyclic/over-deep structure is hit (handled conservatively).
 pub(crate) fn dest_page_ref_resolved<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dest: &Object,
+    dest: &ObjectHandle,
 ) -> Result<Option<ObjectRef>> {
     dest_page_ref_resolved_depth(pdf, dest, MAX_DEST_RESOLVE_DEPTH)
 }
 
 fn dest_page_ref_resolved_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    dest: &Object,
+    dest: &ObjectHandle,
     depth: usize,
 ) -> Result<Option<ObjectRef>> {
     if depth == 0 {
@@ -876,21 +720,17 @@ fn dest_page_ref_resolved_depth<R: Read + Seek>(
         // the entry is kept conservatively rather than overflowing the stack.
         return Ok(None);
     }
-    match dest {
-        Object::Reference(r) => {
-            let c = pdf.resolve_borrowed(*r)?.clone();
-            dest_page_ref_resolved_depth(pdf, &c, depth - 1)
-        }
-        Object::Array(arr) => Ok(match arr.first() {
-            Some(Object::Reference(r)) => Some(*r),
-            _ => None,
-        }),
-        Object::Dictionary(d) => match d.get("D").cloned() {
-            Some(v) => dest_page_ref_resolved_depth(pdf, &v, depth - 1),
-            None => Ok(None),
-        },
-        _ => Ok(None),
+    let dest = pdf.resolve_to_terminal(dest)?;
+    if let Some(items) = dest.as_array() {
+        return Ok(items.first().and_then(handle_object_ref));
     }
+    if dest.try_as_dictionary()?.is_some() {
+        let nested = dest.try_get_key(b"/D")?;
+        if !nested.is_null() {
+            return dest_page_ref_resolved_depth(pdf, &nested, depth - 1);
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

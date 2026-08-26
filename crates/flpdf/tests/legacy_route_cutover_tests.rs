@@ -213,6 +213,41 @@ fn subset_prune_production_uses_handle_reachability() {
 }
 
 #[test]
+fn outline_remap_production_uses_live_handles() {
+    let source = include_str!("../src/outline_dest_remap.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .expect("outline_dest_remap.rs has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "resolve_ref_chain",
+        "Object::",
+        "set_object(",
+        "Dictionary",
+        "materialize(",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "outline_dest_remap production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "ObjectHandle",
+        "resolve_to_terminal",
+        "try_get_key",
+        "set_object_handle",
+    ] {
+        assert!(
+            production.contains(canonical),
+            "outline_dest_remap production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
 fn acroform_top_level_field_uses_the_canonical_form_field_helper() {
     let acroform = include_str!("../src/acroform_document_helper.rs");
     let page_specs = include_str!("../src/job/page_specs.rs");
