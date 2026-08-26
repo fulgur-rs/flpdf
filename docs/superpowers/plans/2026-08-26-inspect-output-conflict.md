@@ -15,7 +15,7 @@
 **Files:**
 - Create: crates/flpdf-cli/tests/cli_inspect_output_conflicts.rs
 
-- [ ] **Step 1: Add one real-binary test per affected flag.**
+- [x] **Step 1: Add one real-binary test per affected flag.**
 
 Use a shared helper that creates a tempfile output path, invokes flpdf with
 tests/fixtures/minimal.pdf plus that path, and asserts code 2, empty stdout,
@@ -44,7 +44,7 @@ list_attachments_rejects_output_file, and show_attachment_rejects_output_file.
         assert!(!output.exists(), "inspection must not create output");
     }
 
-- [ ] **Step 2: Run the new tests and verify RED.**
+- [x] **Step 2: Run the new tests and verify RED.**
 
 Run:
 
@@ -55,7 +55,7 @@ accepts the output positional and dispatches the inspection route. The
 show-attachment case may independently report its missing key. Fix only test
 setup errors until the failure is specifically the absent output conflict.
 
-- [ ] **Step 3: Commit the RED tests.**
+- [x] **Step 3: Commit the RED tests.**
 
     git add crates/flpdf-cli/tests/cli_inspect_output_conflicts.rs
     git commit -m "test: reject output files for inspect-only flags"
@@ -65,7 +65,7 @@ setup errors until the failure is specifically the absent output conflict.
 **Files:**
 - Modify: crates/flpdf-cli/src/main.rs, Cli fields check through show_attachment
 
-- [ ] **Step 1: Add the existing clap conflict declaration to all eight fields.**
+- [x] **Step 1: Add the existing clap conflict declaration to all eight fields.**
 
 The affected declarations must have these attributes:
 
@@ -95,7 +95,7 @@ The affected declarations must have these attributes:
 Do not change check_linearization or show_encryption; both are already guarded.
 Do not alter the shared output field or any dispatch function.
 
-- [ ] **Step 2: Run the focused GREEN tests.**
+- [x] **Step 2: Run the focused GREEN tests.**
 
     cargo fmt --all
     cargo test -p flpdf-cli --test cli_inspect_output_conflicts
@@ -105,7 +105,7 @@ Do not alter the shared output field or any dispatch function.
 Expected: all eight new tests pass and existing inspection/attachment tests
 remain green.
 
-- [ ] **Step 3: Commit the implementation.**
+- [x] **Step 3: Commit the implementation.**
 
     git add crates/flpdf-cli/src/main.rs
     git commit -m "fix: reject output files for inspect-only flags"
