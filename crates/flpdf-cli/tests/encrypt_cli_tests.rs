@@ -437,10 +437,13 @@ fn top_level_encrypt_v5_r6_aes256_round_trips_via_qpdf() {
     );
 }
 
-/// flpdf's own `show-encryption` reports the V=5 R=6 AES-256 scheme for a
-/// `--encrypt … 256` output. No qpdf dependency — pins flpdf's self-view.
+/// The native `show-encryption` subcommand shares the qpdf-verbatim report
+/// route with the top-level qpdf-shaped flag.
 #[test]
 fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("encrypted-v5.pdf");
 
@@ -452,6 +455,17 @@ fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
         .assert()
         .success();
 
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-pw"])
+        .arg(&output)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
     let show = Command::cargo_bin("flpdf")
         .unwrap()
         .args(["show-encryption"])
@@ -459,13 +473,161 @@ fn encrypt_v5_r6_aes256_flpdf_show_encryption_reports_scheme() {
         .arg("--password=user-pw")
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
-    for needle in ["V = 5", "Length = 256", "R = 6", "AESv3"] {
-        assert!(
-            stdout.contains(needle),
-            "flpdf show-encryption must report {needle:?} for V=5 R=6 output: {stdout}"
-        );
+    assert_eq!(show.get_output().stdout, qpdf.stdout);
+    assert_eq!(show.get_output().stderr, qpdf.stderr);
+}
+
+/// The qtest shim forwards qpdf's option-shaped inspection command unchanged.
+/// This is the first RED test for the top-level QPDFJob route: the native
+/// `show-encryption` subcommand is not an equivalent parser surface.
+#[test]
+fn top_level_show_encryption_matches_qpdf_for_user_password() {
+    if !ensure_qpdf_or_skip() {
+        return;
     }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-v2"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=user-v2"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn top_level_show_encryption_recovers_v2_user_password_for_owner_password() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=owner-v2"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption with owner password");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=owner-v2"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption with owner password");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn top_level_show_encryption_reports_wrong_password_without_failing() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption with wrong password");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=wrong"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption with wrong password");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn top_level_show_encryption_matches_qpdf_for_plaintext() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture(UNENCRYPTED_FIXTURE);
+
+    let qpdf = ShellCommand::new("qpdf")
+        .arg("--show-encryption")
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption on plaintext");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption on plaintext");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+}
+
+#[test]
+fn top_level_show_encryption_matches_qpdf_for_r5_without_write_opt_in() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let input = fixture("../../tests/fixtures/encrypted/v5-aes-256-r5.pdf");
+
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-v5-r5"])
+        .arg(&input)
+        .output()
+        .expect("run qpdf --show-encryption on R5 fixture");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", "--password=user-v5-r5"])
+        .arg(&input)
+        .output()
+        .expect("run flpdf --show-encryption on R5 fixture");
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
 }
 
 /// Owner password also authenticates against the same output.
@@ -1804,10 +1966,12 @@ fn copy_encryption_wrong_password_is_rejected() {
 
 // ── --force-R5 tests (flpdf-9hc.4.15) ──────────────────────────────────────
 
-/// `--force-R5` produces V=5 R=5 AES-256 output as reported by flpdf's own
-/// `show-encryption` — no qpdf dependency, pins flpdf's self-view.
+/// `--force-R5` produces the qpdf-verbatim V=5 R=5 AES-256 report.
 #[test]
 fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("r5.pdf");
 
@@ -1828,6 +1992,17 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
         .assert()
         .success();
 
+    let qpdf = ShellCommand::new("qpdf")
+        .args(["--show-encryption", "--password=user-pw"])
+        .arg(&output)
+        .output()
+        .expect("run qpdf --show-encryption");
+    assert!(
+        qpdf.status.success(),
+        "qpdf oracle failed: {:?}",
+        qpdf.status
+    );
+
     let show = Command::cargo_bin("flpdf")
         .unwrap()
         .args([
@@ -1838,18 +2013,8 @@ fn encrypt_force_r5_flpdf_show_encryption_reports_r5() {
         .arg(&output)
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&show.get_output().stdout).into_owned();
-    for needle in ["V = 5", "R = 5", "Length = 256", "AESv3"] {
-        assert!(
-            stdout.contains(needle),
-            "flpdf show-encryption must report {needle:?} for --force-R5 output: {stdout}"
-        );
-    }
-    // Explicitly verify R=6 is NOT reported
-    assert!(
-        !stdout.contains("R = 6"),
-        "flpdf show-encryption must NOT report R=6 for --force-R5 output: {stdout}"
-    );
+    assert_eq!(show.get_output().stdout, qpdf.stdout);
+    assert_eq!(show.get_output().stderr, qpdf.stderr);
 }
 
 /// `--force-R5` is a 256-bit-only flag; KEY-LEN=128 must be rejected with a

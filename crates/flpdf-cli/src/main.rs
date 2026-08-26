@@ -365,6 +365,12 @@ struct Cli {
     show_xref: bool,
     #[arg(long)]
     show_linearization: bool,
+    /// Show encryption parameters on the qpdf-compatible top-level surface.
+    /// This is the argv form used by qtest (`qpdf --show-encryption FILE`);
+    /// the native `show-encryption` subcommand dispatches to the same
+    /// inspection implementation below.
+    #[arg(long = "show-encryption")]
+    show_encryption: bool,
 
     /// Run a complete qpdf job JSON file through the production QPDFJob
     /// lifecycle (qpdf `--job-json-file`).
@@ -974,17 +980,10 @@ Print a parseable, greppable encryption report for FILE.
 The qpdf `--show-encryption` lines are emitted verbatim (`R = `, `P = `,
 the `extract/print/modify ...: allowed|not allowed` block, and the
 `stream/string/file encryption method:` lines for V>=4) so scripts that
-grep qpdf output also work here. flpdf adds extra leading lines
-(`V = `, `Length = `, `Filter = `, `EncryptMetadata = `, and per-named
-`CF /<name> = <method>`) before the qpdf block.
-
-Divergences from qpdf, by design: flpdf does not recover
-the cleartext user password, so qpdf's `User password = <value>` line is
-omitted (a grep for it simply misses rather than getting wrong data).
-`Supplied password is owner/user password` is printed from the
-authenticated state. If FILE is not encrypted, prints qpdf's
-`File is not encrypted` and exits 0. Requires a correct password to open
-the document (same as the other inspection subcommands)."
+including `User password = ...` and V<5 owner-password recovery. If the
+password is wrong, qpdf's `Incorrect password supplied` line is emitted
+before the parsed encryption report. If FILE is not encrypted, prints qpdf's
+`File is not encrypted` and exits 0."
     )]
     ShowEncryption(EncryptionInspectCommand),
     #[command(
@@ -1919,6 +1918,11 @@ fn main() {
         run_check_linearization(args.input, args.repair, &args.password, args.no_warn)
     } else if args.show_linearization {
         run_show_linearization(args.input)
+    } else if args.show_encryption {
+        match args.input.as_ref() {
+            Some(input) => run_show_encryption(input, args.repair, &args.password),
+            None => Err("--show-encryption requires an input file".into()),
+        }
     } else if args.check {
         run_check(args.input, args.repair, &args.password, args.no_warn)
     } else if args.list_attachments {
@@ -5594,17 +5598,14 @@ fn run_show_encryption_key(
             logger_info(format!("{}\n", hex_lower(&key)))?;
             finish_operation_warnings(&pdf, false)
         }
-        None => {
-            // qpdf --show-encryption-key requires an encrypted file; exit 2.
-            Err("file is not encrypted; no encryption key to show".into())
-        }
+        None if pdf.is_encrypted() => Err("encrypted PDF: incorrect password".into()),
+        None => Err("file is not encrypted; no encryption key to show".into()),
     }
 }
 
 /// `show-encryption FILE [--password ...]`: qpdf `--show-encryption`.
 ///
-/// See the subcommand `long_about` for the exact format and the documented
-/// divergences from qpdf (no recovered cleartext user password). Weak-crypto
+/// The report is the qpdf `QPDFJob::showEncryption` format. Weak-crypto
 /// (RC4 / R=5) files are inspectable with the correct password and no
 /// `--allow-weak-crypto`, matching qpdf's read-only treatment (see
 /// [`open_pdf_for_inspection`]).
@@ -5620,36 +5621,22 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
 
     let mut output = String::new();
 
-    // ── flpdf-specific leading lines (placed BEFORE the qpdf block so a
-    //    qpdf-compatible grep still matches the qpdf lines verbatim) ──
-    output.push_str(&format!("V = {}\n", info.v));
-    output.push_str(&format!("Length = {}\n", info.length_bits));
-    output.push_str(&format!("Filter = {}\n", info.filter));
-    output.push_str(&format!(
-        "EncryptMetadata = {}\n",
-        if info.encrypt_metadata {
-            "true"
-        } else {
-            "false"
-        }
-    ));
-    let mut cf_names: Vec<_> = info.named_crypt_filters.clone();
-    cf_names.sort();
-    for (name, method) in &cf_names {
-        output.push_str(&format!("CF /{name} = {method}\n"));
+    if !info.user_password_matched && !info.owner_password_matched && !password.password_is_hex_key
+    {
+        output.push_str("Incorrect password supplied\n");
     }
 
-    // ── Verbatim qpdf `--show-encryption` lines (source:
-    //    qpdf libqpdf/QPDFJob.cc QPDFJob::showEncryption) ──
+    // Verbatim qpdf `--show-encryption` lines (source:
+    // libqpdf/QPDFJob.cc QPDFJob::showEncryption).
     output.push_str(&format!("R = {}\n", info.r));
     output.push_str(&format!("P = {}\n", info.permissions.raw()));
-    // qpdf prints `User password = <recovered cleartext>` here; flpdf does
-    // not recover the cleartext user password (documented divergence), so
-    // that line is intentionally omitted.
-    if pdf.owner_password_matched() {
+    output.push_str("User password = ");
+    output.push_str(&String::from_utf8_lossy(&info.user_password));
+    output.push('\n');
+    if info.owner_password_matched {
         output.push_str("Supplied password is owner password\n"); // cov:ignore: exercised by show-encryption subprocess integration tests
     }
-    if pdf.user_password_matched() {
+    if info.user_password_matched {
         output.push_str("Supplied password is user password\n");
     }
 
@@ -5819,7 +5806,7 @@ fn open_pdf_from_file(
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_file_impl(input, file, repair, password, false)
+    open_pdf_file_impl(input, file, repair, password, false, false)
 }
 
 /// Open for the read-only encryption inspections (`show-encryption`,
@@ -5828,14 +5815,15 @@ fn open_pdf_from_file(
 /// qpdf treats these as read-only inspections rather than a write policy: it
 /// derives and prints the key / encryption block for a weak file with the
 /// correct password and emits no weak-crypto warning (verified qpdf 11.9.0).
-/// Authentication still runs first, so a wrong password fails exactly as
-/// before.
+/// A wrong password retains qpdf's parsed encryption state so show-encryption
+/// can report it rather than failing before the report.
 fn open_pdf_for_inspection(
     input: &PathBuf,
     repair: bool,
     password: &PasswordArgs,
 ) -> CliResult<Pdf<BufReader<File>>> {
-    open_pdf_impl(input, repair, password, false)
+    let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
+    open_pdf_file_impl(input, file, repair, password, false, true)
 }
 
 /// Open for `--update-from-json --check`'s generic job-inspection route.
@@ -5863,7 +5851,7 @@ fn open_pdf_impl(
     suppress_warnings: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let file = File::open(input).map_err(|error| error_with_file(input, error.into()))?;
-    open_pdf_file_impl(input, file, repair, password, suppress_warnings)
+    open_pdf_file_impl(input, file, repair, password, suppress_warnings, false)
 }
 
 fn open_pdf_file_impl(
@@ -5872,6 +5860,7 @@ fn open_pdf_file_impl(
     repair: bool,
     password: &PasswordArgs,
     suppress_warnings: bool,
+    encryption_inspection: bool,
 ) -> CliResult<Pdf<BufReader<File>>> {
     let mut options = pdf_open_options(repair, password)?;
     if suppress_warnings {
@@ -5880,9 +5869,16 @@ fn open_pdf_file_impl(
     let mut job = QPDFJob::new();
     job.set_logger(cli_logger());
     job.set_message_prefix(progname());
-    let pdf = job
-        .open(BufReader::new(file), input.display().to_string(), options)
-        .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
+    let pdf = if encryption_inspection {
+        job.open_for_encryption_inspection(
+            BufReader::new(file),
+            input.display().to_string(),
+            options,
+        )
+    } else {
+        job.open(BufReader::new(file), input.display().to_string(), options)
+    }
+    .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
     Ok(pdf)
 }
 

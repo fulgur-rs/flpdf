@@ -2,7 +2,7 @@
 
 use crate::acroform_document_helper::AcroFormCache;
 use crate::cache::ObjectCache;
-use crate::encryption::state::EncryptionState;
+use crate::encryption::state::{EncryptionInspectionState, EncryptionState};
 use crate::pages::repair::PreparedPages;
 use crate::reader::resolver::ResolverHandle;
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefForm};
@@ -209,6 +209,9 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// populated only for a non-empty page list.
     pub(crate) page_list_cache: Option<PreparedPages>,
     pub(crate) encryption: Rc<RefCell<Option<EncryptionState>>>,
+    /// qpdf's parsed encryption parameters retained for read-only inspection,
+    /// including the partial state visible after a bad password.
+    pub(crate) encryption_inspection: Rc<RefCell<Option<EncryptionInspectionState>>>,
 }
 
 impl<R: Read + Seek> Drop for Pdf<R> {

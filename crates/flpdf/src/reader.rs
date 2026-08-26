@@ -19,7 +19,9 @@ use crate::encryption::standard::StringCipher;
 use crate::encryption::standard::{decrypt_cipher_bytes, decrypt_strings_in_object, ObjectKeyAlg};
 #[cfg(test)]
 use crate::encryption::state::aes128_object_key;
-use crate::encryption::state::{EncryptionInfo, EncryptionMode, EncryptionState};
+use crate::encryption::state::{
+    EncryptionInfo, EncryptionInspectionState, EncryptionMode, EncryptionState,
+};
 use crate::encryption::CopyEncryptionSource;
 use crate::error::EncryptedError;
 #[cfg(test)]
@@ -140,6 +142,26 @@ const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 // caller-owned Object tree merely because it is deeper than parsed input.
 const PROGRAMMATIC_LIFT_MAX_DEPTH: usize = usize::MAX;
 
+fn encryption_info_from_inspection(inspection: &EncryptionInspectionState) -> EncryptionInfo {
+    let mut named_crypt_filters = inspection.named_crypt_filters.clone();
+    named_crypt_filters.sort();
+    EncryptionInfo {
+        v: inspection.v,
+        r: inspection.r,
+        length_bits: inspection.length_bits,
+        filter: inspection.filter.clone(),
+        permissions: inspection.permissions,
+        encrypt_metadata: inspection.encrypt_metadata,
+        user_password: crate::encryption::standard::trim_user_password(&inspection.user_password),
+        user_password_matched: inspection.user_password_matched,
+        owner_password_matched: inspection.owner_password_matched,
+        stream_method: inspection.stream_method,
+        string_method: inspection.string_method,
+        eff_method: inspection.eff_method,
+        named_crypt_filters,
+    }
+}
+
 impl<R: Read + Seek> Pdf<R> {
     /// Return this document's current shared logger.
     pub fn logger(&self) -> crate::QPDFLogger {
@@ -255,9 +277,12 @@ impl<R: Read + Seek> Pdf<R> {
             .map(crate::parser::RecoveredStreamEol::as_bytes))
     }
 
-    /// Whether this document authenticated an `/Encrypt` dictionary while opening.
+    /// Whether this document has an `/Encrypt` dictionary and parsed
+    /// encryption state. The dedicated inspection open path returns `true`
+    /// even when password authentication failed, matching qpdf's
+    /// `isEncrypted()` partial-initialization behavior.
     pub fn is_encrypted(&self) -> bool {
-        self.encryption.borrow().is_some()
+        self.encryption.borrow().is_some() || self.encryption_inspection.borrow().is_some()
     }
 
     pub(crate) fn encryption_ref(&self) -> Option<ObjectRef> {
@@ -277,19 +302,30 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Advisory standard security handler permissions from `/P`, if the document is encrypted.
     pub fn permissions(&self) -> Option<Permissions> {
-        self.encryption
+        self.encryption_inspection
             .borrow()
             .as_ref()
-            .map(|encryption| encryption.permissions)
+            .map(|inspection| inspection.permissions)
+            .or_else(|| {
+                self.encryption
+                    .borrow()
+                    .as_ref()
+                    .map(|encryption| encryption.permissions)
+            })
     }
 
     /// Whether the password supplied at open time authenticated against the
     /// document's user password (`/U`). Always `false` for plaintext PDFs.
     pub fn user_password_matched(&self) -> bool {
-        self.encryption
+        self.encryption_inspection
             .borrow()
             .as_ref()
-            .is_some_and(|encryption| encryption.user_password_matched)
+            .is_some_and(|inspection| inspection.user_password_matched)
+            || self
+                .encryption
+                .borrow()
+                .as_ref()
+                .is_some_and(|encryption| encryption.user_password_matched)
     }
 
     /// Whether the password supplied at open time authenticated against the
@@ -297,10 +333,15 @@ impl<R: Read + Seek> Pdf<R> {
     /// Many PDFs use an empty password for both, so this can be true at the
     /// same time as [`Pdf::user_password_matched`].
     pub fn owner_password_matched(&self) -> bool {
-        self.encryption
+        self.encryption_inspection
             .borrow()
             .as_ref()
-            .is_some_and(|encryption| encryption.owner_password_matched)
+            .is_some_and(|inspection| inspection.owner_password_matched)
+            || self
+                .encryption
+                .borrow()
+                .as_ref()
+                .is_some_and(|encryption| encryption.owner_password_matched)
     }
 
     /// The derived file encryption key, if the document was opened as an
@@ -354,14 +395,14 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Read-only snapshot of the `/Encrypt` parameters for the
-    /// `show-encryption` inspection subcommand.
+    /// `show-encryption` inspection route. The snapshot is available after
+    /// successful authentication and through the dedicated inspection-open
+    /// path after `BadPassword`.
     ///
-    /// Returns `None` for plaintext PDFs. Version, revision and the
-    /// crypt-filter methods come from the authenticated `EncryptionState`;
-    /// only `/Length` and `/Filter`, which it does not retain, are re-read
-    /// from the `/Encrypt` dictionary. This does NOT re-run or alter
-    /// authentication (layer-2 owns that ordering); it only reflects state
-    /// from a document already opened successfully.
+    /// Returns `None` for plaintext PDFs. Parsed fields come from the
+    /// qpdf-shaped inspection state; authenticated fields are filled in when
+    /// authentication succeeds. This does NOT re-run or alter authentication
+    /// (layer-2 owns that ordering).
     ///
     /// # Errors
     ///
@@ -371,6 +412,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// - [`Error::Io`] / [`Error::Parse`] when the `/Encrypt` entry is an indirect
     ///   reference whose resolution fails.
     pub fn encryption_info(&mut self) -> Result<Option<EncryptionInfo>> {
+        if let Some(inspection) = self.encryption_inspection.borrow().as_ref().cloned() {
+            return Ok(Some(encryption_info_from_inspection(&inspection)));
+        }
         if self.encryption.borrow().is_none() {
             return Ok(None);
         }
@@ -402,6 +446,8 @@ impl<R: Read + Seek> Pdf<R> {
             .expect("checked is_some above; authenticate_if_encrypted set it");
         let permissions = encryption.permissions;
         let encrypt_metadata = encryption.encrypt_metadata;
+        let user_password =
+            crate::encryption::standard::trim_user_password(&encryption.user_password);
         // qpdf reports the stored crypt filter methods rather than re-reading
         // `/Encrypt`: "After we initialize encryption parameters, we must use
         // stored key information and never look at /Encrypt again"
@@ -422,6 +468,9 @@ impl<R: Read + Seek> Pdf<R> {
             filter,
             permissions,
             encrypt_metadata,
+            user_password,
+            user_password_matched: encryption.user_password_matched,
+            owner_password_matched: encryption.owner_password_matched,
             stream_method,
             string_method,
             eff_method,
@@ -483,6 +532,17 @@ impl<R: Read + Seek> Pdf<R> {
         Err(final_bad_password.expect("qpdf password recovery always has the original candidate"))
     }
 
+    /// Parse qpdf's encryption parameters before authentication so the
+    /// read-only `--show-encryption` path can report them after BadPassword.
+    pub(crate) fn initialize_encryption_inspection(&mut self) -> Result<()> {
+        let Some(encrypt) = self.encrypt_dictionary()? else {
+            return Ok(());
+        };
+        let inspection = crate::encryption::state::parse_inspection_state(&encrypt)?;
+        *self.encryption_inspection.borrow_mut() = Some(inspection);
+        Ok(())
+    }
+
     fn authenticate_if_encrypted_once(&mut self, options: &PdfOpenOptions) -> Result<()> {
         let encrypt_ref = self.trailer_dictionary().get_ref("Encrypt");
         let Some(encrypt) = self.encrypt_dictionary()? else {
@@ -496,7 +556,13 @@ impl<R: Read + Seek> Pdf<R> {
             options.password_mode,
             options.password_is_hex_key,
         )?;
-        *self.encryption.borrow_mut() = Some(authenticated.state);
+        let state = authenticated.state;
+        if let Some(inspection) = self.encryption_inspection.borrow_mut().as_mut() {
+            inspection.user_password = state.user_password.clone();
+            inspection.user_password_matched = state.user_password_matched;
+            inspection.owner_password_matched = state.owner_password_matched;
+        }
+        *self.encryption.borrow_mut() = Some(state);
         if let Some(warning) = authenticated.perms_warning {
             self.push_warning(warning)?;
         }
@@ -4829,6 +4895,7 @@ mod tests {
             permissions: Permissions::new(-4),
             user_password_matched: true,
             owner_password_matched: false,
+            user_password: Vec::new(),
             cached_object_encryption_key: Vec::new(),
             cached_key_og: None,
         }

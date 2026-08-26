@@ -634,6 +634,38 @@ impl QPDFJob {
         Ok(pdf)
     }
 
+    /// Open a file-backed document for qpdf's read-only encryption inspection
+    /// path. This is the Rust counterpart of `QPDFJob::createQPDF` retaining
+    /// the partially initialized document after `qpdf_e_password` so
+    /// `showEncryption` can report the parsed parameters.
+    pub fn open_for_encryption_inspection<R>(
+        &mut self,
+        source: R,
+        input_name: impl Into<String>,
+        mut options: PdfOpenOptions,
+    ) -> Result<Pdf<R>>
+    where
+        R: Read + Seek,
+    {
+        let input_name = input_name.into();
+        self.input_name = input_name.clone();
+        options.logger = Some(self.logger.clone());
+        options.description = input_name;
+        let mut pdf = Pdf::open_for_encryption_inspection(source, options)?;
+        let authentication_failed = pdf
+            .encryption_info()?
+            .is_some_and(|info| !info.user_password_matched && !info.owner_password_matched);
+        // qpdf's createQPDF returns from its password-error catch before the
+        // ordinary post-open root walk. Do not resolve an encrypted root in
+        // the same partial state; successful/plaintext opens keep the normal
+        // QPDFJob root initialization and warning boundary.
+        if !authentication_failed {
+            pdf.root_handle()?;
+        }
+        self.record_document_warnings(&pdf);
+        Ok(pdf)
+    }
+
     /// Apply a partial JSON update before the job's output or inspection
     /// stage, matching qpdf's update-before-transform order.
     pub fn update_from_json<R, S>(

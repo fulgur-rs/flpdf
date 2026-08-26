@@ -93,10 +93,25 @@ impl<R: Read + Seek> Pdf<R> {
     ///   encryption is readable; qpdf's `--allow-weak-crypto` is a write-only
     ///   policy.
     pub fn open_with_options(reader: R, options: PdfOpenOptions) -> Result<Self> {
-        Self::open_with_repair_mode(reader, options)
+        Self::open_with_repair_mode(reader, options, false)
     }
 
-    fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
+    /// Open a document for qpdf's read-only encryption inspection path.
+    ///
+    /// Unlike [`Pdf::open_with_options`], this retains the parsed encryption
+    /// parameters and returns a document when password authentication fails
+    /// with [`EncryptedError::BadPassword`]. The returned document is only
+    /// suitable for encryption inspection; its authenticated decryption state
+    /// remains absent.
+    pub fn open_for_encryption_inspection(reader: R, options: PdfOpenOptions) -> Result<Self> {
+        Self::open_with_repair_mode(reader, options, true)
+    }
+
+    fn open_with_repair_mode(
+        mut reader: R,
+        options: PdfOpenOptions,
+        allow_bad_password: bool,
+    ) -> Result<Self> {
         let warning_options = ResolverWarningOptions::new(
             options
                 .logger
@@ -187,8 +202,10 @@ impl<R: Read + Seek> Pdf<R> {
             ever_called_get_all_pages: false,
             page_list_cache: None,
             encryption,
+            encryption_inspection: Rc::new(RefCell::new(None)),
         };
         pdf.install_parsed_xref_stream_handles(parsed_xref_streams)?;
+        pdf.initialize_encryption_inspection()?;
         if let Err(error) = pdf.authenticate_if_encrypted(&options) {
             // qpdf reconstructs and records warnings before
             // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises
@@ -196,6 +213,10 @@ impl<R: Read + Seek> Pdf<R> {
             // Preserve that warning stream alongside the terminal
             // password/encryption error so file-backed helpers can emit it
             // before the final diagnostic.
+            if allow_bad_password && matches!(error, Error::Encrypted(EncryptedError::BadPassword))
+            {
+                return Ok(pdf);
+            }
             let diagnostics = pdf.repair_diagnostics();
             return Err(Error::with_open_diagnostics(error, diagnostics));
         }

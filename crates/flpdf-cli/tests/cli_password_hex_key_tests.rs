@@ -15,6 +15,7 @@
 //! the round-trip together.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 
 /// V=5 R=6 AES-256 fixture, user password `user-v5-r6`. Reference key
 /// captured from qpdf 11.9.0 (see cli_encryption_inspect.rs module header).
@@ -87,9 +88,8 @@ fn hex_key_v5_r6_check_succeeds_with_recovered_key() {
 fn hex_key_v5_r6_decrypts_equivalently_to_password() {
     // `show-encryption` decrypts and reports handler params. The hex-key path
     // must produce output equivalent to the real-password path EXCEPT for the
-    // `Supplied password is …` line: a raw key authenticates nothing, so
-    // user_password_matched / owner_password_matched are both false (qpdf
-    // does not report a password match for --password-is-hex-key).
+    // password-derived lines: a raw key authenticates nothing, so qpdf emits
+    // an empty `User password = ` line and no `Supplied password is …` line.
     let key = recover_key(V5_R6, V5_R6_PASSWORD, V5_R6_HEX_KEY);
 
     let pw_out = flpdf()
@@ -122,11 +122,11 @@ fn hex_key_v5_r6_decrypts_equivalently_to_password() {
     // Every line except the password-match line must be identical.
     let pw_filtered: Vec<&str> = pw_stdout
         .lines()
-        .filter(|l| !l.starts_with("Supplied password is"))
+        .filter(|l| !l.starts_with("Supplied password is") && !l.starts_with("User password ="))
         .collect();
     let hex_filtered: Vec<&str> = hex_stdout
         .lines()
-        .filter(|l| !l.starts_with("Supplied password is"))
+        .filter(|l| !l.starts_with("Supplied password is") && !l.starts_with("User password ="))
         .collect();
     assert_eq!(
         pw_filtered, hex_filtered,
@@ -139,9 +139,27 @@ fn hex_key_v5_r6_decrypts_equivalently_to_password() {
         "password path should report a password match"
     );
     assert!(
+        pw_stdout.contains("User password = user-v5-r6\n"),
+        "password path should report the supplied user password"
+    );
+    assert!(
         !hex_stdout.contains("Supplied password is"),
         "hex-key path must NOT report a password match (raw key auths nothing)"
     );
+    assert!(
+        hex_stdout.contains("User password = \n"),
+        "hex-key path must not report a user password"
+    );
+}
+
+#[test]
+fn show_encryption_key_wrong_password_is_not_reported_as_plaintext() {
+    flpdf()
+        .args(["show-encryption-key", "--password=wrong", V5_R6])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("incorrect password"))
+        .stderr(predicates::str::contains("not encrypted").not());
 }
 
 // ---------------------------------------------------------------------------
