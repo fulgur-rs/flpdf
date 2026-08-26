@@ -20,7 +20,6 @@ pub(crate) struct ResourceFinder {
     names_by_resource_type: ResourceNamesByType,
     had_diagnostics: bool,
     pending_operands: bool,
-    last_operator_started_at_boundary: bool,
 }
 
 impl ResourceFinder {
@@ -39,28 +38,8 @@ impl ResourceFinder {
         self.had_diagnostics
     }
 
-    pub(crate) fn last_operator_started_at_boundary(&self) -> bool {
-        self.last_operator_started_at_boundary
-    }
-
     pub(crate) fn has_pending_operands(&self) -> bool {
         self.pending_operands
-    }
-
-    pub(crate) fn record_resource_name(
-        &mut self,
-        resource_type: &[u8],
-        name: &[u8],
-        offset: usize,
-    ) -> bool {
-        let inserted = Self::insert_resource_name(
-            &mut self.names_by_resource_type,
-            resource_type,
-            name,
-            offset,
-        );
-        self.names.insert(name.to_vec());
-        inserted
     }
 
     fn insert_resource_name(
@@ -112,14 +91,13 @@ impl ResourceFinder {
             self.pending_operands = true;
             self.last_name = Some((name, offset));
         } else if let Some(operator) = object.as_operator() {
-            self.last_operator_started_at_boundary = !self.pending_operands;
             self.pending_operands = false;
             if let Some(resource_type) = operator_resource_type(&operator) {
                 self.record_last_name(resource_type);
             }
         } else if object.as_inline_image().is_some() {
-            // Inline-image payloads carry no resource operand semantics here;
-            // their `/CS` header is handled by the dedicated content scanner.
+            // Inline-image payloads carry no resource-operator semantics here;
+            // qpdf's ResourceFinder does not inspect inline-image headers.
         } else {
             self.pending_operands = true;
         }
@@ -408,14 +386,6 @@ mod tests {
             finder.names_by_resource_type()[b"Font".as_slice()][b"F1".as_slice()].len(),
             1
         );
-    }
-
-    #[test]
-    fn duplicate_resource_record_reports_no_insertion() {
-        let mut finder = ResourceFinder::default();
-
-        assert!(finder.record_resource_name(b"XObject", b"VeryLongFormName", 0));
-        assert!(!finder.record_resource_name(b"XObject", b"VeryLongFormName", 0));
     }
 
     #[test]

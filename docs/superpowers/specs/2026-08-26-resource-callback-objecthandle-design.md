@@ -35,7 +35,9 @@ the following one-to-one responsibilities:
 The live oracle is `/usr/bin/qpdf` 11.9.0. Existing ResourceFinder probe cases
 cover the operator table, escaped names, malformed content, inline-image
 events, and incomplete inline images; those cases remain the differential
-acceptance authority.
+acceptance authority. A real-PDF `--remove-unreferenced-resources=yes` probe
+also showed that a malformed inline-image header does not veto pruning: qpdf
+removed unused `/Font` entries and left the empty category dictionary.
 
 ## Current route inventory
 
@@ -48,7 +50,7 @@ The canonical route already exists:
 - The page pruning route in `resources.rs` already uses the canonical parser
   for the page and direct Form target.
 
-The remaining mixed route is the Form pre-pass:
+The remaining mixed routes are the Form pre-pass and ResourceReplacer scan:
 
 - `resources.rs::collect_used_names_for_form` calls the legacy
   `parse_content_stream_data`.
@@ -66,26 +68,25 @@ stops before `collect_used_names_for_form`, so it does not cover this gap.
 
 ## Design
 
-1. Change `ResourceCallbacks` to implement only
-   `ObjectHandleParserCallbacks`. Its inline-image header buffer becomes
-   `Vec<ObjectHandle>`, and header keys/values use `ObjectHandle` accessors.
-2. Change `collect_used_names_for_form` to call
-   `parse_content_stream_handles(bytes, None, &mut callbacks)`. The decoded
+1. Change `collect_used_names_for_form` to instantiate `ResourceFinder` and
+   call `parse_content_stream_handles(bytes, None, &mut finder)`. The decoded
    Form bytes have no document-owned references, so the context remains
    `None`; parser offsets and callback order are preserved.
-3. Keep the existing `BI`/`ID` state machine and custom non-built-in inline
-   `/CS` recording exactly at the callback boundary. Inline-image payload
-   handles remain ignored, while malformed/incomplete headers mark the Form
-   incomplete and leave its resource dictionaries unchanged.
-4. Change `ResourceReplacer` to use `parse_content_stream_handles` and the
+2. Delete `ResourceCallbacks`, its inline-image header validator, and the
+   unused inline-image `/CS` helper. qpdf's parser emits an inline-image handle
+   but `ResourceFinder` does not treat inline-image header names as resource
+   operators; qpdf's pruning scope mutates only `/Font` and `/XObject`.
+   Malformed inline headers therefore remain ordinary parser input and do not
+   create a flpdf-only pruning veto.
+3. Change `ResourceReplacer` to use `parse_content_stream_handles` and the
    canonical ResourceFinder callback. Then migrate its direct unit/probe
    helper from the raw parser and delete `handle_object_borrowed` plus the
    legacy `ParserCallbacks` implementation. Do not alter the shared raw parser
    or its unrelated consumers in this child.
-5. Delete the now-unused raw recovering helper from `content_stream.rs`; the
+4. Delete the now-unused raw recovering helper from `content_stream.rs`; the
    canonical handle parser already implements qpdf's warning-only inline-image
    EOF recovery.
-6. Leave the already documented `resolve_to_terminal` bare-reference
+5. Leave the already documented `resolve_to_terminal` bare-reference
    compensation in `resources.rs` untouched. It is a separate qpdf-unowned
    bridge and is not part of this parser callback cutover.
 
@@ -93,20 +94,24 @@ No new adapter, sentinel, duplicate parser, or public API is introduced.
 
 ## Test design
 
-- Add a source route-contract regression that inspects the production callback
-  sections of `resources.rs`, `resource_replacer.rs`, `resource_finder.rs`,
-  and `content_stream.rs`, and asserts the Form callback uses
-  `ObjectHandleParserCallbacks`, `parse_content_stream_handles`, and
-  `Vec<ObjectHandle>` without legacy `Object`/`ParserCallbacks` markers.
+- Add a source route-contract regression that inspects the production
+   sections of `resources.rs`, `resource_replacer.rs`, `resource_finder.rs`,
+   and `content_stream.rs`, and asserts the Form callback uses
+  `ResourceFinder` and `parse_content_stream_handles` without the deleted
+  `ResourceCallbacks`, inline-header validator, or legacy parser markers.
   Run it before the production change and record the expected RED failure.
 - Keep the existing ResourceFinder operator/offset tests and migrate their
   parser helper to the handle parser. Delete only raw-borrow ownership tests
   whose sole behavior is the removed qpdf-incompatible route.
 - Keep ResourceReplacer replacement-length, malformed-content, inline-image,
   and failure-path tests on the same canonical finder route.
+- Keep a regression proving malformed inline-image headers do not veto the
+  Form resource scan, matching the real qpdf pruning probe.
 - Preserve and run Form resource-pruning tests for direct/indirect resources,
-  nested Forms, shared-resource veto, malformed content, inline-image built-in
-  and non-built-in `/CS`, and incomplete `BI`/`ID` sequences.
+  nested Forms, shared-resource veto, malformed ordinary content, and
+  incomplete `BI`/`ID` sequences. Inline-image header `/CS` names are not
+  ResourceFinder resource references in qpdf and therefore are not recorded by
+  the Form pre-pass.
 - Run the live qpdf 11.9.0 ResourceFinder differential probe when its probe
   binary is available, plus the focused page/resource suite.
 

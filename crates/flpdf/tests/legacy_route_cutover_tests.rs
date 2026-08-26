@@ -379,6 +379,9 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
         "object: Object,",
         "Object::Operator",
         "Object::InlineImage",
+        "struct ResourceCallbacks",
+        "finish_inline_header",
+        "is_builtin_inline_image_cs",
     ] {
         assert!(
             !resource_callbacks.contains(legacy),
@@ -387,8 +390,8 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
     }
     for canonical in [
         "parse_content_stream_handles",
-        "ObjectHandleParserCallbacks",
-        "Vec<ObjectHandle>",
+        "ResourceFinder::default()",
+        "has_pending_operands",
     ] {
         assert!(
             resource_callbacks.contains(canonical),
@@ -405,6 +408,8 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
         "handle_object_borrowed",
         "impl ParserCallbacks for ResourceFinder",
         "use crate::{Object, Result}",
+        "last_operator_started_at_boundary",
+        "record_resource_name",
     ] {
         assert!(
             !finder_production.contains(legacy),

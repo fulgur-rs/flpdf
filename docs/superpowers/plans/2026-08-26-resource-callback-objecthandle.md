@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move the production Form-XObject resource-pruning and ResourceReplacer callbacks from the legacy raw `Object` parser boundary to the existing qpdf-shaped `ObjectHandle` parser boundary.
+**Goal:** Move the production Form-XObject resource-pruning and ResourceReplacer callbacks from the legacy raw `Object` parser boundary to the existing qpdf-shaped `ObjectHandle` parser boundary, deleting the qpdf-unowned inline-header scanner.
 
-**Architecture:** Keep `content_stream::ParserCallbacks` and its unrelated raw consumers unchanged. Make `resources.rs::ResourceCallbacks` and `resource_replacer.rs` consume `ObjectHandleParserCallbacks` and `parse_content_stream_handles`, using direct handle accessors for inline-image header inspection. Remove `ResourceFinder`'s raw callback adapter and the now-unused raw recovering helper after migrating their private tests and probe helper; the qpdf-deviation terminal chase remains untouched.
+**Architecture:** Keep `content_stream::ParserCallbacks` and its unrelated raw consumers unchanged. Make `resources.rs` call `parse_content_stream_handles` directly with the canonical `ResourceFinder`, and make `resource_replacer.rs` use the same handle parser. Remove the custom inline-header scanner, `ResourceFinder`'s raw callback adapter, and the now-unused raw recovering helper; the qpdf-deviation terminal chase remains untouched.
 
 **Tech Stack:** Rust workspace, `ObjectHandle`, `ObjectHandleParserCallbacks`, qpdf 11.9.0 pinned source/live probe, Cargo tests, rustdoc, Clippy, `cargo llvm-cov`, and repository qpdf/coverage scripts.
 
@@ -40,6 +40,9 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
         "object: Object,",
         "Object::Operator",
         "Object::InlineImage",
+        "struct ResourceCallbacks",
+        "finish_inline_header",
+        "is_builtin_inline_image_cs",
     ] {
         assert!(
             !resource_callbacks.contains(legacy),
@@ -48,8 +51,8 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
     }
     for canonical in [
         "parse_content_stream_handles",
-        "ObjectHandleParserCallbacks",
-        "Vec<ObjectHandle>",
+        "ResourceFinder::default()",
+        "has_pending_operands",
     ] {
         assert!(
             resource_callbacks.contains(canonical),
@@ -66,6 +69,8 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
         "handle_object_borrowed",
         "impl ParserCallbacks for ResourceFinder",
         "use crate::{Object, Result}",
+        "last_operator_started_at_boundary",
+        "record_resource_name",
     ] {
         assert!(
             !finder_production.contains(legacy),
@@ -115,88 +120,39 @@ Expected: FAIL because the current Form callback and ResourceReplacer contain
 the raw parser route, and the recovering helper still exists. The failure must
 identify one of those markers, not a compilation error or a test typo.
 
-### Task 2: Convert the Form pre-pass callback to live handles
+### Task 2: Route the Form pre-pass through ResourceFinder
 
 **Files:**
-- Modify: `crates/flpdf/src/resources.rs:18-23,404-421,625-722`
+- Modify: `crates/flpdf/src/resources.rs`
+- Test: `crates/flpdf/src/resources.rs`
 
-- [ ] **Step 1: Replace the parser imports and callback state.**
+- [ ] **Step 1: Route decoded Form bytes through the canonical parser.**
 
-Use the canonical imports and remove the production `Object` import:
-
-```rust
-use crate::content_stream::{parse_content_stream_handles, ObjectHandleParserCallbacks, ParseControl};
-use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-```
-
-Change `ResourceCallbacks` to retain only the state used by its Form scanner:
+Instantiate the existing `ResourceFinder` directly and parse the decoded Form
+bytes through the qpdf-shaped callback boundary:
 
 ```rust
-struct ResourceCallbacks {
-    finder: ResourceFinder,
-    inline_header: Option<Vec<ObjectHandle>>,
-    complete: bool,
-}
-```
-
-Delete `valid_xobjects`; it has no qpdf `ResourceFinder` counterpart and no
-consumer of its recorded offsets.
-
-- [ ] **Step 2: Port inline-header inspection without materialization.**
-
-Change `finish_inline_header` to accept `&[ObjectHandle]`. Read each key and
-value with `as_name()`, keep the even-pair check, preserve the existing
-non-built-in `/CS` call to `record_resource_name`, and return `false` for a
-non-name or trailing operand exactly as before:
-
-```rust
-fn finish_inline_header(&mut self, header: &[ObjectHandle], offset: usize) -> bool {
-    let mut chunks = header.chunks_exact(2);
-    let mut color_space = None;
-    for pair in &mut chunks {
-        let Some(key) = pair[0].as_name() else {
-            return false;
-        };
-        if key.as_slice() == b"CS" || key.as_slice() == b"ColorSpace" {
-            color_space = pair[1].as_name();
-        }
-    }
-    if !chunks.remainder().is_empty() {
-        return false;
-    }
-    if let Some(name) = color_space.filter(|name| !is_builtin_inline_image_cs(name)) {
-        self.finder.record_resource_name(b"ColorSpace", &name, offset);
-    }
-    true
-}
-```
-
-- [ ] **Step 3: Implement the handle callback and retain event order.**
-
-Replace the `ParserCallbacks` implementation with
-`ObjectHandleParserCallbacks`. Pass each ordinary handle to
-`ResourceFinder::handle_object_handle` before matching it. Match operators and
-inline-image handles through `as_operator()` and `as_inline_image()`; append
-ordinary operand handles to the inline header. Keep the existing `BI`/`ID`
-state transitions, `stop_incomplete` behavior, diagnostic propagation, and EOF
-completion check unchanged.
-
-- [ ] **Step 4: Route decoded Form bytes through the handle parser.**
-
-Construct `ResourceCallbacks` without `valid_xobjects` and replace the parser
-call in `collect_used_names_for_form` with:
-
-```rust
-let complete = parse_content_stream_handles(stream_bytes, None, &mut callbacks).is_ok()
-    && !callbacks.finder.had_diagnostics()
-    && callbacks.complete;
+let mut finder = ResourceFinder::default();
+let complete = parse_content_stream_handles(stream_bytes, None, &mut finder).is_ok()
+    && !finder.had_diagnostics()
+    && !finder.has_pending_operands();
 ```
 
 The decoded Form byte buffer has no document-owned indirect references, so the
-parser context is `None`. Keep `record_direct_names` and the `Some`/`None`
-result behavior unchanged.
+parser context remains `None`. Keep `record_direct_names` and the `Some`/`None`
+result behavior unchanged. Delete `ResourceCallbacks`, its inline-header state,
+and `is_builtin_inline_image_cs`; qpdf's `ResourceFinder` does not classify
+inline-image header names as resource-operator references.
 
-- [ ] **Step 5: Run the route contract and Form resource tests.**
+- [ ] **Step 2: Add the qpdf-derived malformed inline-header regression.**
+
+Keep a focused Form-scan test for `BI 1 /Foo ID payload EI`. The live qpdf
+11.9.0 pruning probe removes unused `/Font` entries and leaves the category
+dictionary present, so this malformed inline header must not create a
+flpdf-only veto. The existing malformed ordinary-content test continues to
+cover parser failures that do abort Form pruning.
+
+- [ ] **Step 3: Run the route contract and Form resource tests.**
 
 Run:
 
@@ -276,7 +232,9 @@ cargo test -p flpdf --test page_extract_tests
 ```
 
 Keep the existing qpdf-deviation terminal-chase comments and tests unchanged;
-the route contract must not silently expand to that separate bridge.
+the route contract must not silently expand to that separate bridge. The Form
+resource suite includes the qpdf-derived malformed inline-header regression;
+it does not treat inline-image `/CS` names as `/Resources/ColorSpace` uses.
 
 - [ ] **Step 2: Confirm the route census and docs.**
 
