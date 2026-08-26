@@ -199,6 +199,7 @@ impl Optimization {
         for (page_number, &page_ref) in page_refs.iter().enumerate() {
             let page = pdf.get_object_handle(page_ref);
             maps.update_object_maps(
+                pdf,
                 ObjectUser::Page(page_number as u32),
                 page,
                 &mut skip_stream_parameters,
@@ -210,6 +211,7 @@ impl Optimization {
             if key != b"/Root" {
                 let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
                 maps.update_object_maps(
+                    pdf,
                     ObjectUser::TrailerKey(user_key),
                     trailer.try_get_key(&key)?,
                     &mut skip_stream_parameters,
@@ -223,6 +225,7 @@ impl Optimization {
             for key in root.try_get_keys()? {
                 let user_key = key.strip_prefix(b"/").unwrap_or(&key).to_vec();
                 maps.update_object_maps(
+                    pdf,
                     ObjectUser::RootKey(user_key),
                     root.try_get_key(&key)?,
                     &mut skip_stream_parameters,
@@ -234,13 +237,15 @@ impl Optimization {
         Ok(maps)
     }
 
-    fn update_object_maps<F>(
+    fn update_object_maps<R, F>(
         &mut self,
+        pdf: &mut Pdf<R>,
         user: ObjectUser,
         object: ObjectHandle,
         skip_stream_parameters: &mut F,
     ) -> crate::Result<()>
     where
+        R: Read + Seek,
         F: FnMut(Option<ObjectRef>, &ObjectHandle) -> u8,
     {
         let mut visited = BTreeSet::new();
@@ -248,6 +253,7 @@ impl Optimization {
             object,
             user,
             top: true,
+            via_array: false,
             inline_depth: 0,
         }];
 
@@ -259,6 +265,44 @@ impl Optimization {
             }
 
             pending.object.try_dereference()?;
+            if pending.object.try_is_null()? {
+                if pending.via_array {
+                    if let Some(object_ref) = pending.object.object_ref() {
+                        if object_ref.number > 0 && visited.insert(object_ref) {
+                            self.record(pending.user, object_ref);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // A parsed PDF cannot contain a top-level reference-valued object:
+            // qpdf's parser only forms `N G R` while parsing array/dictionary
+            // elements. `Pdf::set_object`, however, intentionally preserves a
+            // caller-supplied reference value in the canonical indirect slot.
+            // Re-dispatch that value through the same stack so every
+            // redirect hop remains an object-user, matching the pre-handle
+            // traversal and keeping in-memory page maps stable.
+            if let Some(reference) = pending.object.as_reference() {
+                if let Some(object_ref) = pending.object.object_ref() {
+                    if !visited.insert(object_ref) {
+                        continue;
+                    }
+                    self.record(pending.user.clone(), object_ref);
+                }
+                stack.push(Pending {
+                    object: pdf.get_object_handle(reference),
+                    user: pending.user,
+                    top: pending.top,
+                    // A redirect hop is no longer the original array edge.
+                    // This matches the old reference arm, which re-dispatched
+                    // its resolved value with `via_array = false`.
+                    via_array: pending.object.object_ref().is_none() && pending.via_array,
+                    inline_depth: 0,
+                });
+                continue;
+            }
+
             if is_page(&pending.object)? && !pending.top {
                 continue;
             }
@@ -267,9 +311,6 @@ impl Optimization {
                     continue;
                 }
                 self.record(pending.user.clone(), object_ref);
-            }
-            if pending.object.try_is_null()? {
-                continue;
             }
             // The inline-depth guard counts only direct container nesting.
             // Crossing an indirect handle resets that count, matching the
@@ -286,6 +327,7 @@ impl Optimization {
                         object: item,
                         user: pending.user.clone(),
                         top: false,
+                        via_array: true,
                         inline_depth: inline_depth + 1,
                     });
                 }
@@ -306,6 +348,7 @@ impl Optimization {
                         object: stream_dict.try_get_key(&key)?,
                         user: pending.user.clone(),
                         top: false,
+                        via_array: false,
                         inline_depth: inline_depth + 1,
                     });
                 }
@@ -327,6 +370,7 @@ impl Optimization {
                         object: pending.object.try_get_key(&key)?,
                         user: child_user,
                         top: false,
+                        via_array: false,
                         inline_depth: inline_depth + 1,
                     });
                 }
@@ -350,6 +394,7 @@ struct Pending {
     object: ObjectHandle,
     user: ObjectUser,
     top: bool,
+    via_array: bool,
     inline_depth: usize,
 }
 
@@ -370,7 +415,8 @@ fn empty_object_users() -> &'static BTreeSet<ObjectUser> {
 #[cfg(test)]
 mod tests {
     use super::{ObjectUser, Optimization};
-    use crate::{ObjectHandle, ObjectRef, Pdf};
+    use crate::object_handle::ObjectValue;
+    use crate::{Object, ObjectHandle, ObjectRef, Pdf};
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
@@ -680,6 +726,162 @@ mod tests {
                 ObjectRef::new(5, 0),
             ])
         );
+    }
+
+    #[test]
+    fn set_object_reference_redirect_chain_records_every_hop_for_page_user() {
+        let mut pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                      /Resources 4 0 R >>",
+                ),
+                (4, b"<< /Marker 5 0 R >>"),
+                (5, b"<< /Marker 6 0 R >>"),
+                (6, b"<< /Marker true >>"),
+            ],
+            b"",
+        );
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(6, 0)),
+        );
+
+        let maps = build_maps(&mut pdf, 1);
+        assert_eq!(
+            maps.objects_for(&ObjectUser::Page(0)),
+            &BTreeSet::from([
+                ObjectRef::new(3, 0),
+                ObjectRef::new(4, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(6, 0),
+            ])
+        );
+    }
+
+    #[test]
+    fn set_object_reference_redirect_does_not_cross_non_top_page_boundary() {
+        let mut pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                      /Resources 4 0 R >>",
+                ),
+                (4, b"<< /Marker 5 0 R >>"),
+                (5, b"<< /Type /Page /Parent 2 0 R >>"),
+            ],
+            b"",
+        );
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
+
+        let maps = build_maps(&mut pdf, 1);
+        let page = maps.objects_for(&ObjectUser::Page(0));
+        assert!(page.contains(&ObjectRef::new(4, 0)));
+        assert!(!page.contains(&ObjectRef::new(5, 0)));
+    }
+
+    #[test]
+    fn direct_null_is_not_recorded_without_an_array_edge() {
+        let mut pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+            ],
+            b"",
+        );
+        let mut maps = Optimization::default();
+        let mut skip_stream_parameters = |_: Option<ObjectRef>, _: &ObjectHandle| 1;
+        maps.update_object_maps(
+            &mut pdf,
+            ObjectUser::Page(0),
+            ObjectHandle::null(),
+            &mut skip_stream_parameters,
+        )
+        .unwrap();
+        assert!(maps.objects_for(&ObjectUser::Page(0)).is_empty());
+    }
+
+    #[test]
+    fn set_object_reference_redirect_cycle_records_each_hop_once() {
+        let mut pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                      /Resources 4 0 R >>",
+                ),
+                (4, b"<< /Marker 5 0 R >>"),
+                (5, b"<< /Marker 4 0 R >>"),
+            ],
+            b"",
+        );
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Reference(ObjectRef::new(4, 0)),
+        );
+
+        let maps = build_maps(&mut pdf, 1);
+        assert_eq!(
+            maps.objects_for(&ObjectUser::Page(0)),
+            &BTreeSet::from([
+                ObjectRef::new(3, 0),
+                ObjectRef::new(4, 0),
+                ObjectRef::new(5, 0),
+            ])
+        );
+    }
+
+    #[test]
+    fn direct_reference_redirect_reaches_the_canonical_target() {
+        let mut pdf = open_pdf(
+            &[
+                (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+                (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                (
+                    3,
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+                ),
+                (6, b"<< /Marker true >>"),
+            ],
+            b"",
+        );
+        let direct_reference =
+            ObjectHandle::from_value(ObjectValue::Reference(ObjectRef::new(6, 0)));
+        let mut maps = Optimization::default();
+        let mut skip_stream_parameters = |_: Option<ObjectRef>, _: &ObjectHandle| 1;
+        maps.update_object_maps(
+            &mut pdf,
+            ObjectUser::Page(0),
+            direct_reference,
+            &mut skip_stream_parameters,
+        )
+        .unwrap();
+        assert!(maps
+            .objects_for(&ObjectUser::Page(0))
+            .contains(&ObjectRef::new(6, 0)));
     }
 
     #[test]
