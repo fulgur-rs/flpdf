@@ -293,11 +293,24 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     /// Whether the document uses a weak encryption method such as RC4 or R=5.
+    ///
+    /// Falls back to the pre-authentication `encryption_inspection` snapshot
+    /// when the authenticated `EncryptionState` is absent -- for example a
+    /// document returned by [`Self::open_for_encryption_inspection`] after a
+    /// `BadPassword` open, which never populates `encryption`. Both sources
+    /// compute the same revision/crypt-filter classification.
     pub fn uses_weak_crypto(&self) -> bool {
         self.encryption
             .borrow()
             .as_ref()
-            .is_some_and(|encryption| encryption.weak_crypto)
+            .map(|encryption| encryption.weak_crypto)
+            .or_else(|| {
+                self.encryption_inspection
+                    .borrow()
+                    .as_ref()
+                    .map(|inspection| inspection.weak_crypto)
+            })
+            .unwrap_or(false)
     }
 
     /// Advisory standard security handler permissions from `/P`, if the document is encrypted.

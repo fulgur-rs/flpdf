@@ -60,6 +60,48 @@ fn unicode_mode_reads_non_utf8_password_file_as_raw_bytes() {
         .success();
 }
 
+/// qpdf's `getTrimmedUserPassword()`/`QPDFJob::showEncryption` report the raw
+/// authenticated password bytes verbatim; a password read from
+/// `--password-file` can be non-UTF-8. The CLI must not lossy-convert those
+/// bytes (which would replace them with U+FFFD) when rendering the
+/// `--show-encryption` report.
+#[test]
+fn top_level_show_encryption_preserves_non_utf8_password_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("encrypted.pdf");
+    let password_file = temp.path().join("password.bin");
+    let password = b"\xff\xfeA";
+    fs::write(&input, encrypted_fixture_with_password(password)).unwrap();
+    fs::write(&password_file, password).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--show-encryption",
+            "--password-mode=unicode",
+            &format!("--password-file={}", password_file.display()),
+        ])
+        .arg(&input)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "show-encryption must succeed with the correct (non-UTF8) password: {:?}",
+        output.status
+    );
+    let needle = b"User password = \xff\xfeA\n";
+    assert!(
+        output
+            .stdout
+            .windows(needle.len())
+            .any(|window| window == needle),
+        "the raw password bytes must appear verbatim in the report, not \
+         lossy-converted to U+FFFD replacement characters: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn explicit_unicode_mode_authenticates_composed_password() {
     check_cmd("v5-aes-256-r6-utf8.pdf", "café", Some("unicode"))

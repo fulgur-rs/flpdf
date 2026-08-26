@@ -225,6 +225,12 @@ pub(crate) struct EncryptionInspectionState {
     pub(crate) user_password: Vec<u8>,
     pub(crate) user_password_matched: bool,
     pub(crate) owner_password_matched: bool,
+    /// Whether the standard security handler uses RC4 or R=5, matching
+    /// [`EncryptionState::weak_crypto`]'s classification. Computed here
+    /// (before authentication) from the same revision/crypt-filter fields,
+    /// so `Pdf::uses_weak_crypto` can report this after a `BadPassword` open
+    /// that never populates the authenticated `EncryptionState`.
+    pub(crate) weak_crypto: bool,
 }
 
 /// Parse the qpdf-owned `/Encrypt` parameters before authentication.
@@ -276,6 +282,27 @@ pub(crate) fn parse_inspection_state(encrypt: &Dictionary) -> Result<EncryptionI
     } else {
         ("none", "none", "none", Vec::new())
     };
+    // Same classification `authenticate` computes per revision branch
+    // (`weak_crypto = revision == 5 || rc4_in_use()` for R5/R6, otherwise
+    // `rc4_in_use()` alone) -- password-independent, so it is available
+    // before authentication even attempts a candidate.
+    let effective = |cf: EncryptionMode| {
+        if v >= 4 {
+            cf
+        } else {
+            EncryptionMode::Rc4
+        }
+    };
+    let rc4_in_use = matches!(effective(cf_stream), EncryptionMode::Rc4)
+        || matches!(effective(cf_string), EncryptionMode::Rc4)
+        || crypt_filters
+            .values()
+            .any(|mode| matches!(mode, EncryptionMode::Rc4));
+    let weak_crypto = if matches!(r, 5 | 6) {
+        r == 5 || rc4_in_use
+    } else {
+        rc4_in_use
+    };
 
     Ok(EncryptionInspectionState {
         v,
@@ -295,6 +322,7 @@ pub(crate) fn parse_inspection_state(encrypt: &Dictionary) -> Result<EncryptionI
         user_password: Vec::new(),
         user_password_matched: false,
         owner_password_matched: false,
+        weak_crypto,
     })
 }
 

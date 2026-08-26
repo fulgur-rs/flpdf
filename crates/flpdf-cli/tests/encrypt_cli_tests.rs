@@ -9,6 +9,7 @@
 
 use assert_cmd::Command;
 use flpdf::{Pdf, PdfOpenOptions};
+use predicates::prelude::*;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
@@ -2968,4 +2969,122 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
              --static-aes-iv invocation must be byte-identical to each other"
         );
     }
+}
+
+// ── Round-2 Codex review findings on the top-level --show-encryption ──────
+// surface (dispatch conflicts, --no-warn threading, --update-from-json
+// routing). Verified against qpdf 11.9.0 directly (see comments below).
+
+/// `--check-linearization` must reject `--show-encryption`: without this
+/// clap conflict, `check_linearization` wins the dispatch chain in `main()`
+/// and `--show-encryption` is silently dropped rather than surfaced as a
+/// usage error.
+#[test]
+fn top_level_check_linearization_conflicts_with_show_encryption() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--check-linearization", "--show-encryption"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `--json` must reject `--show-encryption` for the same reason: `run_json`
+/// wins the dispatch chain in `main()`, so the combination would otherwise
+/// silently run JSON mode and drop `--show-encryption`.
+#[test]
+fn top_level_json_conflicts_with_show_encryption() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json", "--show-encryption"])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `--overlay`/`--underlay` are rewrite-output modifiers; the top-level
+/// dispatch predicate that decides whether the target is a rewrite must
+/// exclude `--show-encryption`, or the overlay would be silently dropped
+/// instead of producing the usage-error diagnostic.
+#[test]
+fn top_level_overlay_rejected_with_show_encryption() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--overlay")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg("--")
+        .arg("--show-encryption")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--overlay/--underlay can only be used with rewrite output",
+        ));
+}
+
+/// `--update-from-json` combined with `--show-encryption` must route through
+/// the JSON-input-inspection consumer (which applies the update before
+/// rendering the report), not the plain file-backed `--show-encryption`
+/// path (which would silently ignore `--update-from-json` entirely). A
+/// nonexistent `--update-from-json` path distinguishes the two: routed
+/// correctly, opening that path fails; silently ignored, the command would
+/// succeed and print the encryption report as if `--update-from-json` had
+/// never been given.
+#[test]
+fn top_level_show_encryption_honors_update_from_json_routing() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .arg("--update-from-json=/nonexistent/does-not-exist.json")
+        .arg("--show-encryption")
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .assert()
+        .failure();
+}
+
+/// `--no-warn` must suppress *all* diagnostic output for `--show-encryption`
+/// on a damaged-but-repairable input, matching qpdf's `--no-warn
+/// --show-encryption` (verified: `qpdf --no-warn --show-encryption
+/// repairable_input.pdf` prints only "File is not encrypted", with no
+/// `WARNING: ...` lines and no trailing "operation succeeded with warnings"
+/// summary) -- unlike `--check`, `--show-encryption` has no report body that
+/// defers and conditionally replays collected diagnostics, so `--no-warn`
+/// must drop them at open time instead.
+#[test]
+fn top_level_show_encryption_no_warn_suppresses_all_warning_output() {
+    let damaged = "../../tests/fixtures/test_driver/repairable_input.pdf";
+
+    let with_warnings = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--show-encryption", damaged])
+        .output()
+        .unwrap();
+    assert_eq!(with_warnings.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&with_warnings.stderr).contains("WARNING"),
+        "sanity check: the undamaged-path run must still show warnings live: {:?}",
+        String::from_utf8_lossy(&with_warnings.stderr)
+    );
+
+    let no_warn = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--no-warn", "--show-encryption", damaged])
+        .output()
+        .unwrap();
+    assert_eq!(no_warn.status.code(), Some(3));
+    assert!(
+        no_warn.stderr.is_empty(),
+        "--no-warn must suppress all --show-encryption diagnostic output \
+         (live WARNING lines and the trailing summary), matching qpdf: {:?}",
+        String::from_utf8_lossy(&no_warn.stderr)
+    );
+    assert_eq!(
+        normalize_text_newlines(&no_warn.stdout),
+        b"File is not encrypted\n",
+        "--no-warn --show-encryption must print only the qpdf report body"
+    );
 }
