@@ -551,7 +551,31 @@ impl PageOffsetHintTable {
             }
         };
         for ids in &mut shared_ids_per_page {
-            ids.sort_by_key(|&shared_idx| shared_sort_key(shared_idx));
+            // Preserve mode represents a folded container with a synthetic
+            // new-number sentinel, while a surviving plain source object can
+            // legitimately have that same number. In that alias case qpdf's
+            // shared-table walk keeps the plain source object before the
+            // container; otherwise the source-container key would make the
+            // second linearization reverse the two identifiers.
+            let plain_aliases: std::collections::BTreeSet<u32> = ids
+                .iter()
+                .filter_map(|&shared_idx| {
+                    let entry = &shared_hints[shared_idx as usize];
+                    (entry.object_ref.generation != u16::MAX).then_some(entry.object_ref.number)
+                })
+                .collect();
+            ids.sort_by_key(|&shared_idx| {
+                let entry = &shared_hints[shared_idx as usize];
+                let key = shared_sort_key(shared_idx);
+                if entry.object_ref.generation == u16::MAX
+                    && key.0 == 0
+                    && plain_aliases.contains(&entry.object_ref.number)
+                {
+                    (key.0, key.1.max(entry.object_ref.number).saturating_add(1))
+                } else {
+                    key
+                }
+            });
         }
 
         // qpdf rejects page 0 entries that list shared identifiers
@@ -1157,6 +1181,55 @@ mod tests {
             "pre-optimization plain shared objects must sort by source \
              object number, not physical output number, even when this \
              page also references a folded ObjStm container"
+        );
+    }
+
+    #[test]
+    fn preserve_container_source_key_collision_keeps_plain_alias_before_container() {
+        let mut plan = two_page_plan_with_reordered_shared_objects();
+        // Fold a page-0 source member into new container 8 while object 8 is
+        // also a real plain shared object. This is the exact identity alias
+        // produced by the first Generate -> Preserve relinearization of
+        // lin-special: the sentinel container and the plain source entry have
+        // the same object number in the folded hint list.
+        plan.shared_hints[1].referencing_pages = vec![1];
+        let renumber = RenumberMap::from_plan(&plan);
+        let member_to_container =
+            std::collections::BTreeMap::from([(ObjectRef::new(6, 0), (8, 0))]);
+        let container_shared_sort_key = std::collections::BTreeMap::from([(8, (0u8, 7u32))]);
+        let table = PageOffsetHintTable::from_plan(
+            &plan,
+            &renumber,
+            &member_to_container,
+            &container_shared_sort_key,
+            &Default::default(),
+            &Default::default(),
+        );
+        let folded = plan.canonical_shared_hints(
+            &member_to_container,
+            &renumber,
+            &Default::default(),
+            &Default::default(),
+        );
+        let plain_idx = folded
+            .iter()
+            .position(|entry| {
+                entry.object_ref == ObjectRef::new(8, 0) && entry.referencing_pages == vec![1]
+            })
+            .expect("plain object alias is in the shared hint list") as u32;
+        let container_idx = folded
+            .iter()
+            .position(|entry| {
+                entry.object_ref == ObjectRef::new(8, u16::MAX)
+                    && entry.referencing_pages == vec![1]
+            })
+            .expect("folded container alias is in the shared hint list")
+            as u32;
+        let ids = &table.entries[1].shared_object_ids;
+        assert!(
+            ids.iter().position(|&id| id == plain_idx)
+                < ids.iter().position(|&id| id == container_idx),
+            "a Preserve source-key collision must keep the plain alias before its folded container"
         );
     }
 
