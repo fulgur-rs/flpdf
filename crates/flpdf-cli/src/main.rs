@@ -6716,7 +6716,13 @@ mod tests {
         let mut seen = HashSet::new();
         let warnings = apply_normalize_content(&mut pdf, page_ref, &mut seen).unwrap();
 
-        assert_eq!(warnings, vec![true]);
+        assert_eq!(
+            warnings,
+            vec![ContentNormalizationWarning {
+                parsed_offset: None,
+                last_token_was_bad: true,
+            }]
+        );
         assert_eq!(seen, HashSet::from([stream_ref]));
         let stream = pdf
             .resolve_object(stream_ref)
