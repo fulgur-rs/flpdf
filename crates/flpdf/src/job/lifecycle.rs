@@ -926,6 +926,9 @@ mod tests {
 
         match result {
             Err(Error::System(message)) => assert_eq!(message, "unable to find /Root dictionary"),
+            // cov:ignore-start: diagnostic panic arms reachable only if this
+            // regression test itself starts failing in an unexpected shape;
+            // the passing-suite path always takes the arm above.
             Err(other) => {
                 panic!("expected the dangling-/Root error, got a different error: {other}")
             }
@@ -934,6 +937,7 @@ mod tests {
                  proving the root walk ran rather than being skipped as a \
                  (mis-detected) authentication failure"
             ),
+            // cov:ignore-end
         }
     }
 
