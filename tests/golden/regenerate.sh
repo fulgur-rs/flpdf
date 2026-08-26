@@ -2155,6 +2155,16 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
     "$FIX/one-page.pdf" "$REF/one-page/linearize.pdf"
 echo "one-page/linearize.pdf"
 
+# --- linearize-indirect-extensions: qpdf's prepareFileForWrite directizes an
+# indirect Catalog /Extensions dictionary before optimization, then the
+# linearized writer replaces /ADBE while preserving the /XYZW developer prefix.
+# This is the active .3.2.8.18 catalog-resolution boundary. ---
+mkdir -p "$REF/linearize-indirect-extensions"
+qpdf --linearize --deterministic-id --warning-exit-0 \
+    "$FIX/linearize-indirect-extensions.pdf" \
+    "$REF/linearize-indirect-extensions/linearize.pdf"
+echo "linearize-indirect-extensions/linearize.pdf"
+
 # --- shared-page-two-parents: the same /Page leaf is a kid of two different
 # /Pages parents that carry different inherited /Rotate (A: 90, B: 180). qpdf's
 # cache()/getAllPagesInternal clones the 2nd occurrence into a new page object;

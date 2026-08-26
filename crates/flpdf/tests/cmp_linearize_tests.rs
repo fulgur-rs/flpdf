@@ -200,6 +200,14 @@ fn nonid_id0_linearized_is_byte_identical_to_qpdf() {
     assert_linearize_byte_identical("nonid-id0.pdf", "nonid-id0");
 }
 
+#[test]
+fn indirect_extensions_linearized_is_byte_identical_to_qpdf() {
+    assert_linearize_byte_identical(
+        "linearize-indirect-extensions.pdf",
+        "linearize-indirect-extensions",
+    );
+}
+
 // flpdf-8wo1: the /Pages node holds a DIRECT /Resources dict (not a
 // reference) and the /Page leaf has no local /Resources, so linearization
 // must push the inherited /Resources down to the leaf (minting a fresh
