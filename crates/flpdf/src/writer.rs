@@ -9609,6 +9609,46 @@ mod tests {
     }
 
     #[test]
+    fn inject_adbe_extension_directizes_an_indirect_adbe_before_comparing() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog)
+            .expect("canonical Catalog must resolve");
+        let adbe = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.7".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(2)),
+            ]))
+            .expect("indirect ADBE must be allocated");
+        catalog
+            .replace_key(
+                b"/Extensions",
+                ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]),
+            )
+            .expect("Extensions must be installed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        inject_adbe_extension(&mut pdf, "1.7", 2)
+            .expect("indirect but matching ADBE must be directized and preserved");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        let extensions = catalog.get_key(b"/Extensions");
+        let adbe = extensions.get_key(b"/ADBE");
+        assert!(
+            adbe.is_direct(),
+            "the comparison must run against the directized value, matching qpdf's \
+             prepareFileForWrite ordering, not leave the original indirect ADBE untouched"
+        );
+    }
+
+    #[test]
     fn strip_adbe_extension_directizes_a_valid_indirect_adbe_with_other_prefix() {
         let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
             .expect("fixture must open");
