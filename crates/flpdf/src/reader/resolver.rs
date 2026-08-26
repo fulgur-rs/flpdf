@@ -747,6 +747,10 @@ struct ParsedObjectAtOffset {
     description: String,
     end_before_space: i64,
     end_after_space: i64,
+    /// The tokenizer start of the token after the parsed object value. qpdf's
+    /// `readObject` leaves this in the input source's last-offset state when
+    /// the object was already cached before an offset read.
+    trailing_start: Option<u64>,
 }
 
 /// qpdf only reconstructs the xref table for damage found while reading the
@@ -2108,6 +2112,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             description,
             end_before_space,
             end_after_space,
+            trailing_start: _,
         } = parsed;
         let handle = self.get_object_handle(object_ref);
         if malformed && matches!(&value, ObjectValue::Null) {
@@ -2585,25 +2590,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok((parsed.value, parsed.parsed_offset))
     }
 
-    /// Read and cache the object whose indirect header starts at `offset`.
+    /// Read an object at a physical offset and return the source position that
+    /// qpdf's `readHintStream` would use for a subsequent damage warning.
     ///
-    /// qpdf's `QPDF::readObjectAtOffset` is intentionally independent of the
-    /// effective xref entry: linearization `/H[0]` names a physical source
-    /// position, and the object generation found in that header is the
-    /// identity used for the returned handle.  Keep that distinction on the
-    /// canonical resolver rather than routing the caller through
-    /// `resolve(ObjectRef)` and trusting a possibly stale xref row.
-    pub(crate) fn resolve_at_offset(
+    /// qpdf only updates an unresolved object's cached end offsets in
+    /// `readObjectAtOffset`. If the object was already cached, the input's last
+    /// tokenizer offset remains the trailing-token start. If it was unresolved,
+    /// the direct whitespace scan advances the last offset to
+    /// `end_after_space`. Keep both cases as operation metadata rather than
+    /// storing a hint-specific field on every `ObjectHandle`.
+    pub(crate) fn resolve_at_offset_with_damage_offset(
         &self,
         offset: u64,
         expected: ObjectRef,
-    ) -> Result<ObjectHandle> {
+    ) -> Result<(ObjectHandle, Option<u64>)> {
+        let was_resolved = self.get_object_handle(expected).is_resolved();
         let parsed = self
             .read_object_at_offset_with_description(offset, expected, true, false)
             .map_err(ReadObjectAtOffsetError::into_error)?;
+        let damage_offset = if was_resolved {
+            parsed.trailing_start
+        } else {
+            u64::try_from(parsed.end_after_space).ok()
+        };
         let object_ref = parsed.object_ref;
         self.cache_parsed_object(parsed);
-        Ok(self.get_object_handle(object_ref))
+        Ok((self.get_object_handle(object_ref), damage_offset))
     }
 
     fn read_object_at_offset_with_description(
@@ -2614,7 +2626,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         try_recovery: bool,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
-        let (found, parsed, trailing, object_header_offset) = {
+        let (found, parsed, trailing, trailing_start, object_header_offset) = {
             let mut input = self.live_input();
             let mut tokenizer = LiveTokenSource::new(&mut input);
             let number = read_live_header_integer(
@@ -2700,8 +2712,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
             } else {
                 None
             };
+            let trailing_start = trailing
+                .as_ref()
+                .and_then(|token| u64::try_from(token.start).ok());
             input.finish().map_err(ReadObjectAtOffsetError::Body)?;
-            (found, parsed, trailing, object_header_offset)
+            (
+                found,
+                parsed,
+                trailing,
+                trailing_start,
+                object_header_offset,
+            )
         };
 
         if found.is_some_and(|object_ref| object_ref.number == 0) {
@@ -2770,6 +2791,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 description: String::new(),
                 end_before_space,
                 end_after_space,
+                trailing_start,
             });
         }
 
@@ -2812,6 +2834,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 description: stream_description,
                 end_before_space,
                 end_after_space,
+                trailing_start,
             })
         } else {
             if !trailing.is_word_value(b"endobj") {
@@ -2835,6 +2858,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 description,
                 end_before_space,
                 end_after_space,
+                trailing_start,
             })
         }
     }

@@ -806,10 +806,10 @@ fn show_with_pdf(
         return not_linearized();
     }
 
-    // qpdf's `showLinearizationData` calls `checkLinearizationInternal`
-    // (`QPDF_linearization.cc:838-843`) and always dumps after the check. The
-    // canonical warning route now preserves the same ordered soft messages;
-    // the CLI owns their logger emission and exit-3 completion.
+    // qpdf's `showLinearizationData` reads and decodes the hint tables first,
+    // then calls `checkLinearizationInternal`, and always dumps after the
+    // check (`QPDF_linearization.cc:837-846`). The canonical warning route
+    // preserves that order; the CLI owns logger emission and exit-3 completion.
     let mut warnings = match check_linearization_parameters(pdf)? {
         LinearizationParameterCheck::Clean => Vec::new(),
         LinearizationParameterCheck::Warning(message) => vec![message.to_owned()],
@@ -821,8 +821,8 @@ fn show_with_pdf(
         }
     };
 
-    // qpdf's showLinearizationData wraps readLinearizationData and
-    // dumpLinearizationDataInternal in a single try/catch
+    // qpdf's showLinearizationData wraps readLinearizationData,
+    // checkLinearizationInternal, and dumpLinearizationDataInternal in a single try/catch
     // (QPDF_linearization.cc:837-846): a QPDFExc thrown by either step
     // collapses to one bare linearizationWarning(e.what()) with no dump
     // (QPDF::linearizationWarning, `:63-67` — the message carries no
@@ -831,47 +831,17 @@ fn show_with_pdf(
     // in job/check.rs instead). checkLinearizationInternal sits inside the
     // same try block but never throws — every mismatch it finds is a soft
     // warning that does not stop the dump (`:452-470` for /T specifically).
-    // Reproduce that split here: a Malformed error from load_hint_stream
-    // through the hint-table decode below replaces whatever warnings have
-    // accumulated so far with that one message and skips the dump, but
-    // check_linearization_warnings's InvalidParam (matched separately,
-    // right below) appends instead and lets the dump proceed.
+    // Reproduce that split here: a Malformed error from the hint-stream load
+    // or hint-table decode replaces whatever warnings have accumulated so far
+    // with that one message and skips the dump, but
+    // check_linearization_warnings's InvalidParam appends after successful
+    // readLinearizationData and lets the dump proceed.
     let tables = (|| -> std::result::Result<
         (LinParameters, HPageOffset, HSharedObject, Option<HGeneric>),
         ShowTablesError,
     > {
             // 2. Param-dict values (qpdf's LinParameters).
             let params = read_lin_parameters(&param_dict, file_size)?;
-            match check_linearization_warnings(pdf, file_bytes, true) {
-                Ok(messages) => warnings.extend(messages),
-                // cov:ignore-start: a Cursor<Vec<u8>> cannot produce a source I/O error;
-                // retain the defensive mapping for the generic checker contract.
-                Err(LinearizationCheckError::Io(error)) => {
-                    return Err(ShowLinearizationError::Io(error).into()); // cov:ignore: in-memory source failures are defensive
-                }
-                // cov:ignore-end
-                // flpdf's /T backscan (check.rs:710-726) remains a tracked qpdf
-                // parity debt. It reports as InvalidParam because it has no
-                // qpdf throw counterpart to fall back to -- qpdf's own /T check
-                // (QPDF_linearization.cc:452-470) is a soft warning inside
-                // checkLinearizationInternal, which never throws. Append the
-                // message as a warning and keep building the dump, instead of
-                // treating this the way a genuine readLinearizationData throw
-                // is treated below.
-                Err(LinearizationCheckError::InvalidParam { message }) => {
-                    warnings.push(message);
-                }
-                // cov:ignore-start: show_with_pdf already confirmed
-                // pdf.is_linearized() above, so check_linearization_warnings
-                // cannot reach its own NotLinearized arm from here.
-                Err(LinearizationCheckError::NotLinearized) => {
-                    return Err(malformed!(
-                        "not a linearized PDF: the first object in the file has no /Linearized key"
-                    )
-                    .into());
-                } // cov:ignore-end
-            }
-
             // 3. Locate, resolve, and decompress the hint stream object at /H[0].
             //
             // An unreadable/out-of-bounds/undecodable hint stream is caught here,
@@ -939,6 +909,41 @@ fn show_with_pdf(
                 // cov:ignore-end
                 None => None,
             };
+
+            // qpdf checks the already-read linearization data only after
+            // `readLinearizationData` has completed (`QPDF_linearization.cc:
+            // 837-846`). Keeping this after both hint streams have loaded is
+            // also important for the qpdf damage offset: a failed first load
+            // must not be retried after its object has entered the cache.
+            match check_linearization_warnings(pdf, file_bytes, true) {
+                Ok(messages) => warnings.extend(messages),
+                // cov:ignore-start: a Cursor<Vec<u8>> cannot produce a source I/O error;
+                // retain the defensive mapping for the generic checker contract.
+                Err(LinearizationCheckError::Io(error)) => {
+                    return Err(ShowLinearizationError::Io(error).into()); // cov:ignore: in-memory source failures are defensive
+                }
+                // cov:ignore-end
+                // flpdf's /T backscan (check.rs:710-726) remains a tracked qpdf
+                // parity debt. It reports as InvalidParam because it has no
+                // qpdf throw counterpart to fall back to -- qpdf's own /T check
+                // (QPDF_linearization.cc:452-470) is a soft warning inside
+                // checkLinearizationInternal, which never throws. Append the
+                // message as a warning and keep building the dump, instead of
+                // treating this the way a genuine readLinearizationData throw
+                // is treated below.
+                Err(LinearizationCheckError::InvalidParam { message }) => {
+                    warnings.push(message);
+                }
+                // cov:ignore-start: show_with_pdf already confirmed
+                // pdf.is_linearized() above, so check_linearization_warnings
+                // cannot reach its own NotLinearized arm from here.
+                Err(LinearizationCheckError::NotLinearized) => {
+                    return Err(malformed!(
+                        "not a linearized PDF: the first object in the file has no /Linearized key"
+                    )
+                    .into());
+                } // cov:ignore-end
+            }
 
             Ok((params, page_offset, shared_object, outline))
         })();
@@ -2415,6 +2420,73 @@ mod tests {
             result.warnings,
             [
                 "badHn.pdf (linearization dictionary, offset 594): hint table is not a stream"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn non_stream_hint_short_trailing_token_uses_qpdf_read_offset() {
+        let mut bytes = compat_linearized_bytes();
+        let s_pos = bytes.windows(3).position(|w| w == b"/S ").expect("hint /S");
+        let stream_pos = bytes[s_pos..]
+            .windows(7)
+            .position(|w| w == b"stream\n")
+            .map(|position| s_pos + position)
+            .expect("hint stream keyword");
+        // Keep the file length and all later offsets fixed while changing the
+        // trailing token from six bytes to three bytes plus whitespace.
+        bytes[stream_pos..stream_pos + 7].copy_from_slice(b"bad   \n");
+
+        let result = show_linearization_bytes_with_warnings(&bytes, "short-trailing.pdf")
+            .expect("a non-endobj trailing token is a qpdf warning");
+        assert_eq!(
+            result.warnings,
+            [
+                "short-trailing.pdf (linearization dictionary, offset 660): hint table is not a stream"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn cached_non_stream_hint_short_trailing_token_uses_token_start() {
+        let mut bytes = compat_linearized_bytes();
+        let s_pos = bytes.windows(3).position(|w| w == b"/S ").expect("hint /S");
+        let stream_pos = bytes[s_pos..]
+            .windows(7)
+            .position(|w| w == b"stream\n")
+            .map(|position| s_pos + position)
+            .expect("hint stream keyword");
+        bytes[stream_pos..stream_pos + 7].copy_from_slice(b"bad   \n");
+
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("fixture should open");
+        let (_, first_offset) = pdf
+            .resolve_at_offset_with_damage_offset(601, ObjectRef::new(5, 0))
+            .expect("first offset read should succeed");
+        assert_eq!(first_offset, Some(660));
+        let error = load_hint_stream_with_damage(&mut pdf, &bytes, 601, 118)
+            .expect_err("a cached non-stream hint object is damaged");
+        match error {
+            HintStreamLoadError::Damage(damage) => assert_eq!(damage.offset, 653),
+            HintStreamLoadError::Core(error) => panic!("unexpected core error: {error}"),
+        }
+    }
+
+    #[test]
+    fn uncached_non_stream_hint_short_trailing_token_uses_end_after_space() {
+        let mut bytes = compat_linearized_bytes();
+        // Object 7 is not resolved by the linearization parameter preflight;
+        // qpdf therefore reports the first non-whitespace byte after its
+        // terminator rather than the terminator token's start.
+        replace_hint_offset(&mut bytes, b"908");
+
+        let result = show_linearization_bytes_with_warnings(&bytes, "uncached-trailing.pdf")
+            .expect("an uncached non-stream hint object is a qpdf warning");
+        assert_eq!(
+            result.warnings,
+            [
+                "uncached-trailing.pdf (linearization dictionary, offset 939): hint table is not a stream"
                     .to_owned()
             ]
         );

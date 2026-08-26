@@ -1524,15 +1524,14 @@ pub(crate) fn load_hint_stream_with_damage<R: Read + Seek>(
     // hint stream with a non-zero generation (e.g. after incremental update)
     // is still locatable.
     let hint_ref = ObjectRef::new(obj_num, obj_gen);
-    let hint_obj = pdf.resolve_at_offset(offset as u64, hint_ref)?;
-    // qpdf's `InputSource::getLastOffset()` remains at the start of the
-    // `endobj` token when `readObject` reports a non-stream hint object. The
-    // canonical resolver stores the extent immediately after that token, so
-    // subtract the token width to preserve qpdf's damagedPDF location.
-    let hint_object_damage_offset = u64::try_from(hint_obj.end_offsets().0)
-        .ok()
-        .and_then(|offset| offset.checked_sub(b"endobj".len() as u64))
-        .unwrap_or_else(|| pdf.source_last_offset());
+    let (hint_obj, hint_object_damage_offset) =
+        pdf.resolve_at_offset_with_damage_offset(offset as u64, hint_ref)?;
+    // qpdf's readHintStream supplies no explicit offset for this damage. The
+    // resolver returns the operation-specific last offset; retain the source
+    // seam as a defensive fallback for recovered empty objects without a
+    // trailing token.
+    let hint_object_damage_offset =
+        hint_object_damage_offset.unwrap_or_else(|| pdf.source_last_offset());
     let Some(hint_dict) = hint_obj.as_stream_dict() else {
         if hint_obj.is_null() {
             return Err(HintStreamLoadError::Damage(HintStreamDamage::new(
