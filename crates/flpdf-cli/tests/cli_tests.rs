@@ -1744,6 +1744,70 @@ fn rewrite_min_version_raises_header_on_low_source() {
 }
 
 #[test]
+fn top_level_min_version_with_extension_level_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--min-version=1.7.1",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.7\n"));
+    assert!(contains(&bytes, b"/BaseVersion /1.7"));
+    assert!(contains(&bytes, b"/ExtensionLevel 1"));
+}
+
+#[test]
+fn rewrite_force_version_with_extension_level_emits_base_header_and_adbe_pair() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--static-id",
+            "--force-version=1.8.5",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(bytes.starts_with(b"%PDF-1.8\n"));
+    assert!(contains(&bytes, b"/BaseVersion /1.8"));
+    assert!(contains(&bytes, b"/ExtensionLevel 5"));
+}
+
+#[test]
+fn top_level_force_version_invalid_value_is_rejected_before_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("out.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--force-version=not-a-version",
+            "../../tests/fixtures/minimal.pdf",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --force-version"));
+
+    assert!(!output.exists());
+}
+
+#[test]
 fn rewrite_force_version_honored_without_mutation() {
     // Regression for flpdf-9hc.13.1: `--remove-unreferenced-resources=no`
     // must not change the canonical writer route or silently drop
