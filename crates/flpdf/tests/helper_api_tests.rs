@@ -283,7 +283,7 @@ fn acroform_smoke_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn acroform_helper_field_infos_match_manual_and_resolve_indirect_value() {
+fn acroform_helper_field_infos_match_manual_and_retain_indirect_handle() {
     let bytes = acroform_smoke_pdf();
     let mut pdf = flpdf::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
 
@@ -324,26 +324,27 @@ fn acroform_helper_field_infos_match_manual_and_resolve_indirect_value() {
     assert_eq!(infos[1].full_name, "city");
 
     // F1's value is a direct string: verify direct /V retrieval works too,
-    // alongside the indirect resolution checked for F2 below.
+    // alongside the indirect handle resolution checked for F2 below.
     assert_eq!(
-        infos[0].value,
-        Some(flpdf::Object::String(b"Alice".to_vec()))
+        infos[0].value.as_ref().and_then(|value| value.as_string()),
+        Some(b"Alice".to_vec())
     );
 
-    // F2's value must be the RESOLVED string, not the indirect reference:
-    // field_infos() dereferences indirect /V via deref_leaf (review pattern #2).
+    // F2's value must retain the resolved handle's payload and identity:
+    // field_infos() follows indirect /V through the canonical handle route.
     assert_eq!(
-        infos[1].value,
-        Some(flpdf::Object::String(b"Paris".to_vec()))
+        infos[1].value.as_ref().and_then(|value| value.as_string()),
+        Some(b"Paris".to_vec())
+    );
+    assert_eq!(
+        infos[1].value.as_ref().and_then(|value| value.object_ref()),
+        Some(flpdf::ObjectRef::new(6, 0)),
+        "field_infos must retain the indirect value handle identity"
     );
 
-    // Note: `AcroFormDocumentHelper::field_value()` returns `/V` WITHOUT
-    // dereferencing an indirect reference, so for F2 it yields
-    // `Object::Reference(6 0)` and the caller must resolve it themselves. This is
-    // an inconsistency with the auto-resolving `field_infos()` path (tracked
-    // separately as a P2 bug). We deliberately do not assert that raw-reference
-    // output; the indirect-/V resolve path is already guarded above via
-    // `field_infos()[1].value == Object::String(b"Paris")`.
+    // `AcroFormDocumentHelper::field_value()` returns `/V` as a live handle,
+    // so the caller can choose whether to inspect its current payload or retain
+    // its indirect identity. `field_infos()` uses the same handle boundary.
 }
 
 // ---------------------------------------------------------------------------
@@ -771,14 +772,17 @@ fn acroform_inheritance_pdf() -> Vec<u8> {
 /// field tree and does not stamp same-document field dictionaries.
 #[test]
 fn acroform_inherited_da_is_read_without_materializing_fields() {
-    use flpdf::{Object, ObjectRef};
+    use flpdf::ObjectRef;
     let mut pdf = flpdf::Pdf::open_mem_owned(acroform_inheritance_pdf()).unwrap();
 
     let fields = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(fields[1].object_ref, ObjectRef::new(5, 0));
     assert_eq!(
-        fields[1].default_appearance,
-        Some(Object::String(b"/Helv 12 Tf 0 g".to_vec()))
+        fields[1]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"/Helv 12 Tf 0 g".to_vec())
     );
 
     let field = pdf.resolve_object(ObjectRef::new(5, 0)).unwrap();

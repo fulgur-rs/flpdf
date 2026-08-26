@@ -14,8 +14,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src_path = common::write_temp("forms-src", &common::build_acroform_pdf())?;
     let mut pdf = Pdf::open(BufReader::new(File::open(&src_path)?))?;
 
-    // `field_infos` reconstructs each field's dotted full name and resolves
-    // inherited `/FT` / `/V` (following indirect references when present).
+    // `field_infos` reconstructs each field's dotted full name and retains
+    // inherited `/FT` `/V` as live handles (following indirect references when
+    // their payload is inspected).
     let infos = pdf.acroform()?.field_infos()?;
     for info in &infos {
         let ft = info
@@ -24,7 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_else(|| "?".into());
         let value = match &info.value {
-            Some(v) => format!("{v:?}"),
+            Some(v) => v
+                .as_string()
+                .map(|value| String::from_utf8_lossy(&value).into_owned())
+                .unwrap_or_else(|| format!("{v:?}")),
             None => "<none>".into(),
         };
         println!("  {} : /{} = {}", info.full_name, ft, value);

@@ -47,7 +47,12 @@ fn acroform_active_resolution_uses_live_handle_route() {
                 "{marker} still contains raw resolution marker {legacy:?}"
             );
         }
-        for canonical in ["get_object_handle", "resolve(", "try_get_key", "try_as_dictionary"] {
+        let canonical = if marker == "fn acroform_dict" {
+            ["try_get_key", "resolve_to_terminal", "try_as_dictionary"]
+        } else {
+            ["get_object_handle", "resolve(", "try_as_dictionary"]
+        };
+        for canonical in canonical {
             assert!(
                 section.contains(canonical),
                 "{marker} must contain canonical handle marker {canonical:?}"
@@ -171,7 +176,7 @@ Run:
 ```bash
 cargo test -p flpdf --test legacy_route_cutover_tests acroform_active_resolution_uses_live_handle_route
 cargo test -p flpdf --test acroform_document_helper_tests
-cargo test -p flpdf --test helper_api_tests acroform_helper_field_infos_match_manual_and_resolve_indirect_value
+cargo test -p flpdf --test helper_api_tests acroform_helper_field_infos_match_manual_and_retain_indirect_handle
 cargo test -p flpdf --lib acroform_document_helper
 ```
 
