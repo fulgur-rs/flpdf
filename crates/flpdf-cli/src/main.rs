@@ -4973,12 +4973,20 @@ fn page_ops_active(p: &PageOpArgs) -> bool {
     !p.pages.is_empty() || !p.rotate.is_empty() || p.split_pages.is_some() || p.empty
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentNormalizationWarning {
+    parsed_offset: Option<u64>,
+    last_token_was_bad: bool,
+}
+
 /// Normalize all page content streams in an in-memory PDF graph.
 ///
 /// Shared by the plain and linearized rewrite paths so both use the same page
 /// traversal, indirect `/Contents` handling, alias deduplication, and warning
 /// order.
-fn normalize_page_contents<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<Vec<bool>> {
+fn normalize_page_contents<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+) -> CliResult<Vec<ContentNormalizationWarning>> {
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
     let page_refs = pages::page_refs(pdf)?;
@@ -5002,7 +5010,7 @@ fn apply_normalize_content<R: std::io::Read + std::io::Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     seen: &mut HashSet<ObjectRef>,
-) -> CliResult<Vec<bool>> {
+) -> CliResult<Vec<ContentNormalizationWarning>> {
     let mut warnings = Vec::new();
     let page = pdf.get_object_handle(page_ref);
     pdf.resolve(&page)?;
@@ -5043,7 +5051,7 @@ fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
     stream_ref: ObjectRef,
     stream: ObjectHandle,
     seen: &mut HashSet<ObjectRef>,
-) -> CliResult<Option<bool>> {
+) -> CliResult<Option<ContentNormalizationWarning>> {
     if !seen.insert(stream_ref) {
         return Ok(None);
     }
@@ -5057,7 +5065,10 @@ fn normalize_and_store_stream_handle<R: std::io::Read + std::io::Seek>(
     let normalized = normalize_content_stream(decoded.as_ref());
     let warning = normalized
         .any_bad_tokens()
-        .then(|| normalized.last_token_was_bad());
+        .then(|| ContentNormalizationWarning {
+            parsed_offset: u64::try_from(stream.get_parsed_offset()).ok(),
+            last_token_was_bad: normalized.last_token_was_bad(),
+        });
     let normalized = normalized.into_bytes();
 
     // Remove filter / encode-form keys and install the fresh direct length;
@@ -6068,11 +6079,14 @@ fn finish_warning_state(has_warnings: bool, creates_output: bool) -> CliResult<(
     }
 }
 
-fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) -> CliResult<()> {
-    let location = diagnostic_location(input, None);
+fn emit_content_normalization_warnings(
+    input: &Path,
+    warning: ContentNormalizationWarning,
+) -> CliResult<()> {
+    let location = diagnostic_location(input, warning.parsed_offset);
     let mut message =
         format!("WARNING: {location}: content normalization encountered bad tokens\n");
-    if last_token_was_bad {
+    if warning.last_token_was_bad {
         message.push_str(&format!(
             "WARNING: {location}: normalized content ended with a bad token; \
              you may be able to resolve this by coalescing content streams in \
@@ -6091,7 +6105,7 @@ fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) -
 fn finish_rewrite_warnings<R: Read + Seek>(
     input: &Path,
     pdf: &Pdf<R>,
-    normalization_last_bad: &[bool],
+    normalization_warnings: &[ContentNormalizationWarning],
     creates_output: bool,
 ) -> CliResult<()> {
     // qpdf retains open-time warnings in the document warning collection and
@@ -6099,10 +6113,10 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     // full collection here, not only warnings added after this route opened
     // the document.
     let has_repair_warnings = !pdf.repair_diagnostics().entries().is_empty();
-    for &last_bad in normalization_last_bad {
-        emit_content_normalization_warnings(input, last_bad)?;
+    for &warning in normalization_warnings {
+        emit_content_normalization_warnings(input, warning)?;
     }
-    if normalization_last_bad.is_empty() && !has_repair_warnings {
+    if normalization_warnings.is_empty() && !has_repair_warnings {
         return Ok(());
     }
     finish_warning_state(true, creates_output)
