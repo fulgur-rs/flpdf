@@ -3035,6 +3035,13 @@ qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
     "$REF/overlay/three-page-overlay-one-page-qdf.pdf"
 echo "overlay/three-page-overlay-one-page-qdf.pdf"
 
+# QDF: a destination page with an existing annotation retains that annotation
+# while a content-only overlay installs /Fx0 and /Fx1.
+qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
+    "$FIX/link-annot-no-acroform.pdf" --overlay "$FIX/one-page.pdf" --to=1 -- \
+    "$REF/overlay/overlay-destination-existing-annotation.pdf"
+echo "overlay/overlay-destination-existing-annotation.pdf"
+
 # QDF: same page carries both overlay + underlay (order-preservation test).
 qpdf --static-id --qdf --no-original-object-ids --warning-exit-0 \
     "$FIX/three-page.pdf" --overlay "$FIX/one-page.pdf" -- \

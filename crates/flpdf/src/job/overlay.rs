@@ -1634,6 +1634,49 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
     }
 
+    #[test]
+    fn overlay_destination_existing_annotation_is_byte_identical_qdf() {
+        let mut dest = fixture("link-annot-no-acroform.pdf");
+        let mut source = fixture("one-page.pdf");
+        let dest_page = page_refs(&mut dest).unwrap()[0];
+        let before = dest
+            .resolve_object(dest_page)
+            .unwrap()
+            .into_dict()
+            .unwrap()
+            .get("Annots")
+            .and_then(Object::as_array)
+            .expect("destination fixture must have an annotation array")
+            .to_vec();
+
+        apply_overlay_spec(
+            &mut dest,
+            &mut source,
+            OverlayKind::Overlay,
+            &pr(""),
+            &pr("1"),
+            None,
+        )
+        .unwrap();
+
+        let after = dest
+            .resolve_object(dest_page)
+            .unwrap()
+            .into_dict()
+            .unwrap()
+            .get("Annots")
+            .and_then(Object::as_array)
+            .expect("destination annotations must survive the overlay rewrite")
+            .to_vec();
+        assert_eq!(after, before, "overlay must preserve destination annotations");
+
+        let actual = write_qdf_nooid(&mut dest);
+        assert_byte_identical(
+            &actual,
+            "overlay-destination-existing-annotation.pdf",
+        );
+    }
+
     /// Overlay onto a dest whose `/AcroForm/Fields` is stored as an
     /// indirect reference (`/Fields 5 0 R`) instead of a direct array —
     /// a valid PDF shape. Exercises
