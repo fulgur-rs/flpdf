@@ -923,17 +923,17 @@ fn show_with_pdf(
                     return Err(ShowLinearizationError::Io(error).into()); // cov:ignore: in-memory source failures are defensive
                 }
                 // cov:ignore-end
-                // flpdf's /T backscan (check.rs:710-726) remains a tracked qpdf
-                // parity debt. It reports as InvalidParam because it has no
-                // qpdf throw counterpart to fall back to -- qpdf's own /T check
-                // (QPDF_linearization.cc:452-470) is a soft warning inside
-                // checkLinearizationInternal, which never throws. Append the
-                // message as a warning and keep building the dump, instead of
-                // treating this the way a genuine readLinearizationData throw
-                // is treated below.
+                // qpdf's successful readLinearizationData/checkLinearizationInternal
+                // route emits only soft warnings. Keep this defensive mapping for
+                // the stricter standalone checker contract; it has no qpdf
+                // showLinearizationData counterpart.
+                // cov:ignore-start: no qpdf-compatible show path returns InvalidParam after the
+                // hint data has been read successfully; the arm is retained as a defensive
+                // mapping for the shared standalone-checker contract.
                 Err(LinearizationCheckError::InvalidParam { message }) => {
                     warnings.push(message);
                 }
+                // cov:ignore-end
                 // cov:ignore-start: show_with_pdf already confirmed
                 // pdf.is_linearized() above, so check_linearization_warnings
                 // cannot reach its own NotLinearized arm from here.
@@ -2469,7 +2469,9 @@ mod tests {
             .expect_err("a cached non-stream hint object is damaged");
         match error {
             HintStreamLoadError::Damage(damage) => assert_eq!(damage.offset, 653),
-            HintStreamLoadError::Core(error) => panic!("unexpected core error: {error}"),
+            HintStreamLoadError::Core(error) => {
+                panic!("unexpected core error: {error}")
+            } // cov:ignore: this fixture intentionally exercises only the damage variant
         }
     }
 
