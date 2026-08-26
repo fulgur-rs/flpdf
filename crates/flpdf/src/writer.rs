@@ -3782,46 +3782,45 @@ fn write_pclm<R: Read + Seek, W: Write>(
     for item in &plan.items {
         match *item {
             pclm::Item::Source { source, output } => {
-                let mut object = pdf.resolve_object(source)?;
-                // cov:ignore-start: the PCLm plan is built from the same validated
-                // reference graph used for this rewrite; malformed remap input is rejected upstream.
-                crate::writer::rewrite_renumber::renumber_qpdf_refs_in_place(
-                    pdf,
-                    &mut object,
-                    &plan.old_to_new,
-                )?;
-                // cov:ignore-end
                 let offset = bytes.len();
                 bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
-                match object {
-                    Object::Stream(stream) => {
-                        // PCLm image-strip pages never carry a registered
-                        // token filter (AcroForm appearance regeneration is
-                        // the only producer), so `is_data_modified` is always
-                        // false here.
-                        let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
-                            stream,
-                            options,
-                            false,
-                            true,
-                            pdf.recovered_stream_eol(source),
-                            false,
-                            false,
-                        );
-                        // cov:ignore-start: PCLm supplies a Vec sink and no encrypted
-                        // string emitter, so this in-memory serializer has no error edge.
-                        write_reencoded_object(
-                            &mut bytes,
-                            &reencoded,
-                            source_filter_is_lone_flate,
-                            options,
-                            None,
-                            output,
-                            StreamEncryptionOptions::new(None, true),
+                let object = pdf.get_object_handle(source);
+                pdf.resolve(&object)?;
+                let map = |object_ref: ObjectRef| {
+                    // qpdf's PCLm queue only renumbers objects reached by its
+                    // page/contents/image walk. A dangling reference in an
+                    // emitted object is therefore serialized with its source
+                    // identity, just as the previous in-place rewriter did.
+                    Ok(plan
+                        .old_to_new
+                        .get(&object_ref)
+                        .copied()
+                        .unwrap_or(object_ref))
+                };
+                let removed_refs: BTreeSet<ObjectRef> =
+                    pdf.deleted_object_refs().into_iter().collect();
+                if object.as_stream_dict().is_some() {
+                    let (stream_dict, stream_data, refiltered, _) =
+                        plain::body::canonical_stream_output_with_status(
+                            &object, options, false, false,
                         )?;
-                        // cov:ignore-end
-                    }
-                    other => other.write_pdf(&mut bytes),
+                    stream_dict.write_stream_body_with_ref_map_and_removed(
+                        &mut bytes,
+                        refiltered,
+                        &map,
+                        &removed_refs,
+                    )?;
+                    serialize::write_stream_payload(
+                        &mut bytes,
+                        &stream_data,
+                        options.newline_before_endstream,
+                    );
+                } else {
+                    object.write_object_with_ref_map_and_removed(
+                        &mut bytes,
+                        &map,
+                        &removed_refs,
+                    )?;
                 }
                 bytes.extend_from_slice(b"\nendobj\n");
                 offsets.insert(output.number, (0, offset));
