@@ -232,8 +232,12 @@ fn ensure_value_owned_by_pdf<R: Read + Seek>(pdf: &Pdf<R>, value: &ObjectHandle)
     Ok(())
 }
 
-fn ensure_tree_root_pdf(root_pdf_id: Option<u64>, pdf_id: u64) -> Result<()> {
-    if root_pdf_id.is_some_and(|owner| owner != pdf_id) {
+fn ensure_tree_root_pdf(root: &ObjectHandle, root_pdf_id: Option<u64>, pdf_id: u64) -> Result<()> {
+    let belongs_to_another_pdf = match root_pdf_id {
+        Some(owner) => owner != pdf_id,
+        None => !root.belongs_exclusively_to_pdf(pdf_id),
+    };
+    if belongs_to_another_pdf {
         return Err(Error::Unsupported(
             "name/number tree root belongs to a different Pdf".to_string(),
         ));
@@ -1074,16 +1078,10 @@ impl<K: TreeKey> NNTree<K> {
 
     fn ensure_root<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<ObjectHandle> {
         let pdf_id = pdf.unique_id();
+        ensure_tree_root_pdf(&self.root, self.root_pdf_id, pdf_id)?;
         if self.root_pdf_id.is_none() {
-            if !self.root.belongs_exclusively_to_pdf(pdf_id) {
-                return Err(Error::Unsupported(
-                    "name/number tree root belongs to a different Pdf".to_string(),
-                ));
-            }
             self.root.claim_tree_pdf(pdf_id)?;
             self.root_pdf_id = Some(pdf_id);
-        } else {
-            ensure_tree_root_pdf(self.root_pdf_id, pdf_id)?;
         }
         Ok(self.root.clone())
     }
@@ -1291,9 +1289,11 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<Option<ObjectHandle>> {
+        // cov:ignore-start: public cursor removal and the keyed remove path validate current first
         let Some((_, removed_value)) = cursor.cloned_current() else {
             return Ok(None);
         };
+        // cov:ignore-end
         let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
         let item_number = cursor.item_number.expect("valid cursor has an item");
         let dictionary = self.load_node(pdf, &leaf)?;
@@ -2211,13 +2211,13 @@ impl<K: TreeKey> NNTree<K> {
         if let Some(resolved_key) = resolved_key::<K, _>(pdf, &key)? {
             self.insert_resolved_with_allocator(pdf, allocator, resolved_key, key, value)
         } else {
+            // cov:ignore-start: increment skips later malformed keys before repair observes them
             // qpdf can insert the first pair into an empty replacement
             // before its next insert observes that the key is invalid. Later
             // malformed keys are skipped by increment and never reach this
             // path.
             let cursor = self.begin(pdf)?;
             if cursor.positioned() {
-                // cov:ignore-start: increment skips later malformed keys before repair observes them
                 Err(structural_error(
                     self.root_node(pdf)?.diagnostic_ref(),
                     "item at index 0 is not the right type",

@@ -570,6 +570,24 @@ fn trees_reject_reusing_a_root_with_another_pdf() {
     let mut first_pdf = empty_pdf();
     let mut second_pdf = empty_pdf();
 
+    let mut owned_names = NameTree::new_empty(&mut first_pdf, true).expect("name-tree root");
+    let error = owned_names
+        .find_object(&mut second_pdf, b"missing")
+        .expect_err("an owned name-tree root cannot be used with another PDF");
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: name/number tree root belongs to a different Pdf"
+    );
+
+    let mut owned_numbers = NumberTree::new_empty(&mut first_pdf, true).expect("number-tree root");
+    let error = owned_numbers
+        .find_object(&mut second_pdf, 0)
+        .expect_err("an owned number-tree root cannot be used with another PDF");
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: name/number tree root belongs to a different Pdf"
+    );
+
     let mut names = NameTree::new(empty_name_tree_root(), true);
     assert!(names
         .find_object(&mut first_pdf, b"missing")
