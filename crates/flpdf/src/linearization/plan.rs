@@ -38,7 +38,9 @@ use crate::writer::object_streams::{
     collect_indirect_objstm_length_refs, eligibility_context, is_eligible_for_objstm_handle,
     ObjectStreamMode, PlannerConfig,
 };
-use crate::{Object, ObjectRef, Pdf, Result};
+#[cfg(test)]
+use crate::Object;
+use crate::{ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek};
 
@@ -109,20 +111,10 @@ impl SharedObjectHintEntry {
 /// bytes). A `Reference(r)` is pushed to `out` as-is.  The caller is
 /// responsible for cycle detection and transitive expansion.
 ///
-/// `pub(crate)`: also reused by
-/// `crate::linearization::writer::resolve_catalog_adbe_status` to answer a
-/// shape-independent "does this subtree contain any indirect reference
-/// anywhere" question for the Catalog's `/Extensions` value, rather than
-/// hand-rolling a second traversal for that unrelated purpose. That second
-/// caller passes the Catalog's raw, UNRESOLVED `/Extensions` value (never a
-/// value obtained via [`Pdf::resolve`]/[`Pdf::resolve_borrowed`]), so the
-/// `/Length`-skip in the `Object::Stream` arm below never applies to it: the
-/// parser only ever produces `Object::Stream` as the top-level result of
-/// resolving an indirect object, never as a value nested inside another
-/// object's array/dictionary body, so an unresolved subtree cannot contain
-/// one. Any stream reachable from `/Extensions` is necessarily behind an
-/// `Object::Reference` first, which this function already records as an
-/// indirect reference before it would ever need to look inside the target.
+/// Test-only legacy Object fixture walker retained for the plan module's
+/// raw-value unit tests. Production closure and writer paths use the
+/// handle-native collectors below.
+#[cfg(test)]
 pub(crate) fn collect_direct_refs(
     obj: &Object,
     depth: usize,
