@@ -487,6 +487,30 @@ fn acroform_active_resolution_uses_live_handle_route() {
             "AcroFormFieldInfo::{field} must preserve live ObjectHandle values"
         );
     }
+
+    let appearance = source
+        .split_once("pub fn set_default_appearance")
+        .expect("set_default_appearance must remain present")
+        .1
+        .split_once("\n    fn ")
+        .expect("set_default_appearance must be followed by another helper")
+        .0;
+    for legacy in ["set_object(", "Object::Dictionary", "Object::String"] {
+        assert!(
+            !appearance.contains(legacy),
+            "set_default_appearance still contains raw mutation marker {legacy:?}"
+        );
+    }
+    for canonical in [
+        "replace_key",
+        "mark_object_handle_dirty",
+        "ObjectHandle::string",
+    ] {
+        assert!(
+            appearance.contains(canonical),
+            "set_default_appearance must contain canonical marker {canonical:?}"
+        );
+    }
 }
 
 #[test]
