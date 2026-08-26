@@ -445,6 +445,46 @@ fn resource_pruning_callbacks_use_only_the_handle_parser_route() {
 }
 
 #[test]
+fn acroform_active_resolution_uses_live_handle_route() {
+    let source = include_str!("../src/acroform_document_helper.rs");
+    for marker in ["fn acroform_dict", "fn resolve_dict"] {
+        let section = source
+            .split_once(marker)
+            .expect("AcroForm resolver marker must remain present")
+            .1
+            .split_once("\n    fn ")
+            .expect("AcroForm resolver must be followed by another helper")
+            .0;
+        for legacy in [
+            "resolve_borrowed",
+            "resolve_object",
+            "Object::Reference",
+            "Object::Dictionary",
+            "dict.clone()",
+        ] {
+            assert!(
+                !section.contains(legacy),
+                "{marker} still contains raw resolution marker {legacy:?}"
+            );
+        }
+        for canonical in ["get_object_handle", "resolve(", "try_get_key", "try_as_dictionary"] {
+            assert!(
+                section.contains(canonical),
+                "{marker} must contain canonical handle marker {canonical:?}"
+            );
+        }
+    }
+
+    for field in ["value", "default_value", "default_appearance"] {
+        let marker = format!("pub {field}: Option<ObjectHandle>");
+        assert!(
+            source.contains(&marker),
+            "AcroFormFieldInfo::{field} must preserve live ObjectHandle values"
+        );
+    }
+}
+
+#[test]
 fn page_closure_production_uses_the_canonical_handle_route() {
     let source = include_str!("../src/page_closure.rs");
     let production = source
