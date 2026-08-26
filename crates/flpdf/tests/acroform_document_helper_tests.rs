@@ -315,7 +315,7 @@ fn fields_follows_holder_chain_carrier() {
 }
 
 #[test]
-fn field_infos_materialize_inherited_values_and_full_names() {
+fn field_infos_retain_inherited_handles_and_full_names() {
     let bytes = inherited_field_info_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
@@ -327,13 +327,19 @@ fn field_infos_materialize_inherited_values_and_full_names() {
     assert_eq!(fields[0].full_name, "parent");
     assert_eq!(fields[0].field_type, Some(b"Tx".to_vec()));
     assert_eq!(
-        fields[0].default_value,
-        Some(Object::String(b"parent-default".to_vec()))
+        fields[0]
+            .default_value
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"parent-default".to_vec())
     );
     assert_eq!(fields[0].field_flags, Some(3));
     assert_eq!(
-        fields[0].default_appearance,
-        Some(Object::String(b"/Doc 10 Tf 0 g".to_vec()))
+        fields[0]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"/Doc 10 Tf 0 g".to_vec())
     );
     assert_eq!(fields[0].quadding, Some(1));
     assert_eq!(fields[0].max_len, Some(20));
@@ -343,17 +349,23 @@ fn field_infos_materialize_inherited_values_and_full_names() {
     assert_eq!(fields[1].full_name, "parent.child");
     assert_eq!(fields[1].field_type, Some(b"Tx".to_vec()));
     assert_eq!(
-        fields[1].value,
-        Some(Object::String(b"child-value".to_vec()))
+        fields[1].value.as_ref().and_then(|value| value.as_string()),
+        Some(b"child-value".to_vec())
     );
     assert_eq!(
-        fields[1].default_value,
-        Some(Object::String(b"parent-default".to_vec()))
+        fields[1]
+            .default_value
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"parent-default".to_vec())
     );
     assert_eq!(fields[1].field_flags, Some(3));
     assert_eq!(
-        fields[1].default_appearance,
-        Some(Object::String(b"/Child 11 Tf 1 g".to_vec()))
+        fields[1]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"/Child 11 Tf 1 g".to_vec())
     );
     assert_eq!(fields[1].quadding, Some(1));
     assert_eq!(fields[1].max_len, Some(20));
@@ -379,7 +391,10 @@ fn field_infos_skip_pure_widget_kids_but_keep_merged_widget_fields() {
         ]
     );
     assert_eq!(fields[1].full_name, "field.merged");
-    assert_eq!(fields[1].value, Some(Object::String(b"yes".to_vec())));
+    assert_eq!(
+        fields[1].value.as_ref().and_then(|value| value.as_string()),
+        Some(b"yes".to_vec())
+    );
     assert_eq!(fields[2].full_name, "field");
     assert_eq!(fields[3].full_name, "field");
 }
@@ -398,7 +413,7 @@ fn field_infos_decode_utf16be_field_name_paths() {
 }
 
 #[test]
-fn field_infos_materialize_indirect_inherited_values() {
+fn field_infos_retain_indirect_inherited_handles() {
     let bytes = indirect_field_info_values_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
@@ -408,15 +423,21 @@ fn field_infos_materialize_indirect_inherited_values() {
     assert_eq!(fields[0].partial_name, Some(b"parent".to_vec()));
     assert_eq!(fields[0].full_name, "parent");
     assert_eq!(fields[0].field_type, Some(b"Tx".to_vec()));
-    assert_eq!(fields[0].value, None);
+    assert!(fields[0].value.is_none());
     assert_eq!(
-        fields[0].default_value,
-        Some(Object::String(b"parent-default".to_vec()))
+        fields[0]
+            .default_value
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"parent-default".to_vec())
     );
     assert_eq!(fields[0].field_flags, Some(3));
     assert_eq!(
-        fields[0].default_appearance,
-        Some(Object::String(b"/Doc 10 Tf 0 g".to_vec()))
+        fields[0]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"/Doc 10 Tf 0 g".to_vec())
     );
     assert_eq!(fields[0].quadding, Some(1));
     assert_eq!(fields[0].max_len, Some(20));
@@ -425,16 +446,22 @@ fn field_infos_materialize_indirect_inherited_values() {
     assert_eq!(fields[1].full_name, "parent.child");
     assert_eq!(fields[1].field_type, Some(b"Tx".to_vec()));
     assert_eq!(
-        fields[1].value,
-        Some(Object::String(b"child-value".to_vec()))
+        fields[1].value.as_ref().and_then(|value| value.as_string()),
+        Some(b"child-value".to_vec())
     );
     assert_eq!(
-        fields[1].default_value,
-        Some(Object::String(b"parent-default".to_vec()))
+        fields[1]
+            .default_value
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"parent-default".to_vec())
     );
     assert_eq!(
-        fields[1].default_appearance,
-        Some(Object::String(b"/Child 11 Tf 1 g".to_vec()))
+        fields[1]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"/Child 11 Tf 1 g".to_vec())
     );
     assert_eq!(fields[1].quadding, Some(1));
     assert_eq!(fields[1].max_len, Some(20));
@@ -450,6 +477,23 @@ fn missing_or_malformed_acroform_shapes_are_noops() {
     let malformed_bytes = malformed_acroform_pdf();
     let mut malformed = Pdf::open_mem_owned(malformed_bytes).unwrap();
     assert!(malformed.acroform().unwrap().fields().unwrap().is_empty());
+}
+
+#[test]
+fn indirect_non_dictionary_acroform_is_absent_like_qpdf() {
+    let bytes = build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "42"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+    assert!(pdf.acroform().unwrap().fields().unwrap().is_empty());
+    assert!(pdf.acroform().unwrap().field_infos().unwrap().is_empty());
 }
 
 #[test]
@@ -583,6 +627,57 @@ fn default_appearance_materializes_direct_catalog_acroform() {
 }
 
 #[test]
+fn default_appearance_creates_missing_acroform_handle() {
+    let mut pdf = Pdf::open_mem_owned(empty_pdf()).unwrap();
+    let da = b"/Helv 12 Tf 0 g".to_vec();
+
+    pdf.acroform()
+        .unwrap()
+        .set_default_appearance(da.clone())
+        .unwrap();
+
+    let catalog = pdf.resolve_object(ObjectRef::new(1, 0)).unwrap();
+    let Object::Dictionary(catalog_dict) = catalog else {
+        panic!("catalog should be a dictionary");
+    };
+    let acroform_ref = catalog_dict
+        .get_ref("AcroForm")
+        .expect("missing AcroForm must be installed as an indirect object");
+    let acroform = pdf.resolve_object(acroform_ref).unwrap();
+    let Object::Dictionary(acroform_dict) = acroform else {
+        panic!("created AcroForm should be a dictionary");
+    };
+    assert_eq!(acroform_dict.get("DA"), Some(&Object::String(da)));
+    assert_eq!(
+        acroform_dict.get("Fields"),
+        Some(&Object::Array(Vec::new()))
+    );
+}
+
+#[test]
+fn default_appearance_rejects_a_non_dictionary_catalog() {
+    let bytes = build_pdf(
+        &[
+            (1, "42"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+        ],
+        1,
+    );
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+    let error = pdf
+        .acroform()
+        .unwrap()
+        .set_default_appearance(Vec::new())
+        .expect_err("a non-dictionary Catalog must retain the labeled error");
+    assert_eq!(
+        error.to_string(),
+        "unsupported PDF feature: catalog object 1 0 R is not a dictionary"
+    );
+}
+
+#[test]
 fn default_appearance_is_read_as_inherited_without_materializing_fields() {
     let bytes = form_pdf();
     let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
@@ -601,7 +696,13 @@ fn default_appearance_is_read_as_inherited_without_materializing_fields() {
 
     let fields = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(fields[1].object_ref, ObjectRef::new(6, 0));
-    assert_eq!(fields[1].default_appearance, Some(Object::String(da)));
+    assert_eq!(
+        fields[1]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(da)
+    );
 
     let child = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap();
     let Object::Dictionary(child_dict) = child else {
@@ -621,8 +722,11 @@ fn parent_field_appearance_is_read_as_inherited_without_materialization() {
     let fields = pdf.acroform().unwrap().field_infos().unwrap();
     assert_eq!(fields[1].object_ref, ObjectRef::new(6, 0));
     assert_eq!(
-        fields[1].default_appearance,
-        Some(Object::String(b"/Parent 11 Tf 1 0 0 rg".to_vec()))
+        fields[1]
+            .default_appearance
+            .as_ref()
+            .and_then(|value| value.as_string()),
+        Some(b"/Parent 11 Tf 1 0 0 rg".to_vec())
     );
 
     let child = pdf.resolve_object(ObjectRef::new(6, 0)).unwrap();

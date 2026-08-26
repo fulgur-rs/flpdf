@@ -12,7 +12,6 @@ use crate::object::MAX_INLINE_DEPTH;
 use crate::object_handle::{ObjectHandle, ObjectHandleIdentity, ResourceConflicts};
 use crate::page_object_helper::PageObjectHelper;
 use crate::pdf_string::utf8_value;
-use crate::ref_chain::resolve_ref_chain;
 use crate::resource_replacer::{replace_resource_names, ResourceRenames};
 use crate::{
     Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result,
@@ -85,9 +84,10 @@ fn record_field_name(cache: &mut AcroFormCache, field: ObjectHandle, name: Strin
 
 /// Effective metadata for one AcroForm field-tree node.
 ///
-/// Values are materialized from the current node plus inherited field-tree
-/// state. `/DA`, `/Q`, and `/MaxLen` may inherit from `/AcroForm` defaults.
-#[derive(Debug, Clone, PartialEq)]
+/// Values are retained as live handles from the current node plus inherited
+/// field-tree state. `/DA`, `/Q`, and `/MaxLen` may inherit from `/AcroForm`
+/// defaults.
+#[derive(Debug, Clone)]
 pub struct AcroFormFieldInfo {
     /// The field dictionary object.
     pub object_ref: ObjectRef,
@@ -98,13 +98,13 @@ pub struct AcroFormFieldInfo {
     /// Effective `/FT` field type.
     pub field_type: Option<Vec<u8>>,
     /// Effective `/V` field value.
-    pub value: Option<Object>,
+    pub value: Option<ObjectHandle>,
     /// Effective `/DV` default field value.
-    pub default_value: Option<Object>,
+    pub default_value: Option<ObjectHandle>,
     /// Effective `/Ff` field flags.
     pub field_flags: Option<i64>,
     /// Effective `/DA` default appearance.
-    pub default_appearance: Option<Object>,
+    pub default_appearance: Option<ObjectHandle>,
     /// Effective `/Q` quadding value.
     pub quadding: Option<i64>,
     /// Effective `/MaxLen` text-field maximum length.
@@ -115,10 +115,10 @@ pub struct AcroFormFieldInfo {
 struct FieldInheritance {
     full_name: String,
     field_type: Option<Vec<u8>>,
-    value: Option<Object>,
-    default_value: Option<Object>,
+    value: Option<ObjectHandle>,
+    default_value: Option<ObjectHandle>,
     field_flags: Option<i64>,
-    default_appearance: Option<Object>,
+    default_appearance: Option<ObjectHandle>,
     quadding: Option<i64>,
     max_len: Option<i64>,
 }
@@ -256,14 +256,14 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.get("Fields").cloned())? else {
+        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
 
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for item in fields {
-            if let Object::Reference(field_ref) = item {
+            if let Some(field_ref) = item.object_ref().or_else(|| item.as_reference()) {
                 self.walk_field_tree(field_ref, &mut seen, &mut out)?;
             }
         }
@@ -286,15 +286,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.get("Fields").cloned())? else {
+        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
 
-        // `?` is not usable inside a struct literal, so materialize the
-        // AcroForm-default leaves (which may be indirect) into locals first.
-        let default_appearance = deref_leaf(self.pdf, acroform.get("DA").cloned())?;
-        let quadding = inherited_integer(self.pdf, &acroform, "Q")?;
-        let max_len = inherited_integer(self.pdf, &acroform, "MaxLen")?;
+        let default_appearance = deref_leaf_handle(self.pdf, acroform.try_get_key(b"/DA")?)?;
+        let quadding = inherited_integer(self.pdf, &acroform, b"/Q")?;
+        let max_len = inherited_integer(self.pdf, &acroform, b"/MaxLen")?;
         let inherited = FieldInheritance {
             default_appearance,
             quadding,
@@ -305,7 +303,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for item in fields {
-            if let Object::Reference(field_ref) = item {
+            if let Some(field_ref) = item.object_ref().or_else(|| item.as_reference()) {
                 self.walk_field_info_tree(field_ref, inherited.clone(), &mut seen, &mut out, 0)?;
             }
         }
@@ -1678,10 +1676,9 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// - Any error from [`Pdf::resolve`].
     pub fn set_default_appearance(&mut self, appearance: Vec<u8>) -> Result<()> {
         let acroform_ref = self.ensure_acroform_ref()?;
-        let mut acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
-        acroform.insert("DA", Object::String(appearance));
-        self.pdf
-            .set_object(acroform_ref, Object::Dictionary(acroform));
+        let acroform = self.resolve_dict(acroform_ref, "AcroForm")?;
+        acroform.replace_key(b"/DA", ObjectHandle::string(appearance))?;
+        self.pdf.mark_object_handle_dirty(&acroform)?;
         Ok(())
     }
 
@@ -1690,35 +1687,19 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(None);
         };
         let catalog = self.resolve_dict(root_ref, "catalog")?;
-        Ok(catalog.get_ref("AcroForm"))
+        let acroform = catalog.try_get_key(b"/AcroForm")?;
+        Ok(acroform.object_ref().or_else(|| acroform.as_reference()))
     }
 
-    fn acroform_dict(&mut self) -> Result<Option<Dictionary>> {
+    fn acroform_dict(&mut self) -> Result<Option<ObjectHandle>> {
         let Some(root_ref) = self.pdf.root_ref() else {
             return Ok(None);
         };
         let catalog = self.resolve_dict(root_ref, "catalog")?;
-        match catalog.get("AcroForm").cloned() {
-            None | Some(Object::Null) => Ok(None),
-            Some(Object::Dictionary(dict)) => Ok(Some(dict)),
-            // qpdf's `analyze()` (`QPDFAcroFormDocumentHelper.cc:241-243`)
-            // reads `/AcroForm` through `getKey`, which transparently
-            // dereferences, then treats a non-dictionary result as absent
-            // with no warning, regardless of whether the source was direct
-            // or indirect. `resolve_dict`'s hard `Err` on a non-dictionary
-            // target is the right contract for callers that already know
-            // they hold a field/annotation reference, but not here: this
-            // method's own direct-value arms above already return `None`
-            // for a malformed `/AcroForm`, and an indirect reference to the
-            // same malformed shapes must degrade the same way.
-            Some(Object::Reference(acroform_ref)) => {
-                match self.pdf.resolve_borrowed(acroform_ref)? {
-                    Object::Dictionary(dict) => Ok(Some(dict.clone())),
-                    _ => Ok(None),
-                }
-            }
-            Some(_) => Ok(None),
-        }
+        let acroform = self
+            .pdf
+            .resolve_to_terminal(&catalog.try_get_key(b"/AcroForm")?)?;
+        Ok(acroform.try_as_dictionary()?.is_some().then_some(acroform))
     }
 
     pub(crate) fn ensure_acroform_ref(&mut self) -> Result<ObjectRef> {
@@ -1727,47 +1708,36 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
 
         let root_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-        let mut catalog = self.resolve_dict(root_ref, "catalog")?;
-        let new_ref = self.next_object_ref()?;
-        let acroform = match catalog.get("AcroForm").cloned() {
-            Some(Object::Dictionary(dict)) => dict,
-            _ => {
-                let mut dict = Dictionary::new();
-                dict.insert("Fields", Object::Array(Vec::new()));
-                dict
-            }
+        let catalog = self.resolve_dict(root_ref, "catalog")?;
+        let existing = catalog.try_get_key(b"/AcroForm")?;
+        let acroform = if existing.try_as_dictionary()?.is_some() {
+            existing.shallow_copy()?
+        } else {
+            ObjectHandle::dictionary(vec![(b"/Fields".to_vec(), ObjectHandle::array(Vec::new()))])
         };
-
-        catalog.insert("AcroForm", Object::Reference(new_ref));
-        self.pdf.set_object(new_ref, Object::Dictionary(acroform));
-        self.pdf.set_object(root_ref, Object::Dictionary(catalog));
+        let new_acroform = self.pdf.make_indirect_object_handle(acroform)?;
+        let new_ref = new_acroform
+            .object_ref()
+            .expect("make_indirect_object_handle returns an indirect handle");
+        catalog.replace_key(b"/AcroForm", new_acroform)?;
+        self.pdf.mark_object_handle_dirty(&catalog)?;
         self.invalidate_cache();
         Ok(new_ref)
     }
 
-    fn next_object_ref(&self) -> Result<ObjectRef> {
-        let next = self
-            .pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-        Ok(ObjectRef::new(next, 0))
-    }
-
-    fn resolve_dict(&mut self, object_ref: ObjectRef, label: &str) -> Result<Dictionary> {
-        match self.pdf.resolve_borrowed(object_ref)? {
-            Object::Dictionary(dict) => Ok(dict.clone()),
-            _ => Err(Error::Unsupported(format!(
+    fn resolve_dict(&mut self, object_ref: ObjectRef, label: &str) -> Result<ObjectHandle> {
+        let handle = self.pdf.get_object_handle(object_ref);
+        self.pdf.resolve(&handle)?;
+        if handle.try_as_dictionary()?.is_some() {
+            Ok(handle)
+        } else {
+            Err(Error::Unsupported(format!(
                 "{label} object {object_ref} is not a dictionary"
-            ))),
+            )))
         }
     }
 
-    fn resolve_field_dict(&mut self, field_ref: ObjectRef) -> Result<Dictionary> {
+    fn resolve_field_dict(&mut self, field_ref: ObjectRef) -> Result<ObjectHandle> {
         self.resolve_dict(field_ref, "field")
     }
 
@@ -1798,11 +1768,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         out.push(field_ref);
 
         let field = self.resolve_field_dict(field_ref)?;
-        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
+        let Some(kids) = resolve_array_value(self.pdf, field.try_get_key(b"/Kids")?)? else {
             return Ok(());
         };
         for kid in kids {
-            if let Object::Reference(kid_ref) = kid {
+            if let Some(kid_ref) = kid.object_ref().or_else(|| kid.as_reference()) {
                 self.walk_field_tree_rec(kid_ref, seen, out, depth + 1)?;
             }
         }
@@ -1827,13 +1797,13 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         }
 
         let field = self.resolve_field_dict(field_ref)?;
-        if is_pure_widget_annotation(&field) {
+        if is_pure_widget_annotation(&field)? {
             return Ok(());
         }
         let current = inherited.apply(self.pdf, &field)?;
-        let partial_name = deref_leaf(self.pdf, field.get("T").cloned())?
+        let partial_name = deref_leaf_handle(self.pdf, field.try_get_key(b"/T")?)?
             .as_ref()
-            .and_then(Object::as_string)
+            .and_then(ObjectHandle::as_string)
             .map(|name| name.to_vec());
 
         out.push(AcroFormFieldInfo {
@@ -1849,11 +1819,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             max_len: current.max_len,
         });
 
-        let Some(kids) = resolve_array_value(self.pdf, field.get("Kids").cloned())? else {
+        let Some(kids) = resolve_array_value(self.pdf, field.try_get_key(b"/Kids")?)? else {
             return Ok(());
         };
         for kid in kids {
-            if let Object::Reference(kid_ref) = kid {
+            if let Some(kid_ref) = kid.object_ref().or_else(|| kid.as_reference()) {
                 self.walk_field_info_tree(kid_ref, current.clone(), seen, out, depth + 1)?;
             }
         }
@@ -1862,11 +1832,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 }
 
 impl FieldInheritance {
-    fn apply<R: Read + Seek>(&self, pdf: &mut Pdf<R>, field: &Dictionary) -> Result<Self> {
-        let partial_name = deref_leaf(pdf, field.get("T").cloned())?
+    fn apply<R: Read + Seek>(&self, pdf: &mut Pdf<R>, field: &ObjectHandle) -> Result<Self> {
+        let partial_name = deref_leaf_handle(pdf, field.try_get_key(b"/T")?)?
             .as_ref()
-            .and_then(Object::as_string)
-            .map(decode_field_name);
+            .and_then(ObjectHandle::as_string)
+            .map(|name| decode_field_name(&name));
         let full_name = match (self.full_name.is_empty(), partial_name.as_deref()) {
             (_, None) => self.full_name.clone(),
             (true, Some(name)) => name.to_string(),
@@ -1875,15 +1845,15 @@ impl FieldInheritance {
 
         Ok(Self {
             full_name,
-            field_type: inherited_name(pdf, field, "FT")?.or_else(|| self.field_type.clone()),
-            value: inherited_object(pdf, field, "V")?.or_else(|| self.value.clone()),
-            default_value: inherited_object(pdf, field, "DV")?
+            field_type: inherited_name(pdf, field, b"/FT")?.or_else(|| self.field_type.clone()),
+            value: inherited_object(pdf, field, b"/V")?.or_else(|| self.value.clone()),
+            default_value: inherited_object(pdf, field, b"/DV")?
                 .or_else(|| self.default_value.clone()),
-            field_flags: inherited_integer(pdf, field, "Ff")?.or(self.field_flags),
-            default_appearance: inherited_object(pdf, field, "DA")?
+            field_flags: inherited_integer(pdf, field, b"/Ff")?.or(self.field_flags),
+            default_appearance: inherited_object(pdf, field, b"/DA")?
                 .or_else(|| self.default_appearance.clone()),
-            quadding: inherited_integer(pdf, field, "Q")?.or(self.quadding),
-            max_len: inherited_integer(pdf, field, "MaxLen")?.or(self.max_len),
+            quadding: inherited_integer(pdf, field, b"/Q")?.or(self.quadding),
+            max_len: inherited_integer(pdf, field, b"/MaxLen")?.or(self.max_len),
         })
     }
 }
@@ -2029,51 +1999,43 @@ fn ensure_foreign_indirect<R: Read + Seek>(
     source.make_indirect_object_handle(handle)
 }
 
-/// Resolve one level of indirection for a metadata leaf value. A resolved
-/// `Object::Null` (freed/unknown ref) is treated as absent to match
-/// `inherited_object`'s existing Null handling. A direct (non-reference)
-/// value passes through unchanged, so this is a no-op for already-materialized
-/// PDFs.
-fn deref_leaf<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<Option<Object>> {
-    match value {
-        Some(Object::Reference(object_ref)) => match pdf.resolve_object(object_ref)? {
-            Object::Null => Ok(None),
-            resolved => Ok(Some(resolved)),
-        },
-        other => Ok(other),
-    }
+/// Resolve one level of indirection for a metadata leaf handle. A resolved
+/// null (freed/unknown ref) is treated as absent to match qpdf's inherited
+/// value lookup. Direct values pass through unchanged.
+fn deref_leaf_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: ObjectHandle,
+) -> Result<Option<ObjectHandle>> {
+    let value = pdf.resolve_to_terminal(&value)?;
+    Ok((!value.is_null()).then_some(value))
 }
 
 fn inherited_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field: &Dictionary,
-    key: &str,
-) -> Result<Option<Object>> {
-    match deref_leaf(pdf, field.get(key).cloned())? {
-        Some(Object::Null) | None => Ok(None),
-        Some(value) => Ok(Some(value)),
-    }
+    field: &ObjectHandle,
+    key: &[u8],
+) -> Result<Option<ObjectHandle>> {
+    deref_leaf_handle(pdf, field.try_get_key(key)?)
 }
 
 fn inherited_name<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field: &Dictionary,
-    key: &str,
+    field: &ObjectHandle,
+    key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    Ok(deref_leaf(pdf, field.get(key).cloned())?
+    Ok(inherited_object(pdf, field, key)?
         .as_ref()
-        .and_then(Object::as_name)
-        .map(|name| name.to_vec()))
+        .and_then(ObjectHandle::as_name))
 }
 
 fn inherited_integer<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    field: &Dictionary,
-    key: &str,
+    field: &ObjectHandle,
+    key: &[u8],
 ) -> Result<Option<i64>> {
-    Ok(deref_leaf(pdf, field.get(key).cloned())?
+    Ok(inherited_object(pdf, field, key)?
         .as_ref()
-        .and_then(Object::as_integer))
+        .and_then(ObjectHandle::as_integer))
 }
 
 #[allow(dead_code)]
@@ -2127,24 +2089,32 @@ fn transformed_annotation_rectangle<R: Read + Seek>(
     ))
 }
 
-fn is_pure_widget_annotation(field: &Dictionary) -> bool {
-    let is_widget = matches!(
-        field.get("Subtype"),
-        Some(Object::Name(name)) if name.as_slice() == b"Widget"
-    );
-    let has_field_entries = field.get("T").is_some()
-        || field.get("FT").is_some()
-        || field.get("Kids").is_some()
-        || field.get("V").is_some()
-        || field.get("DV").is_some()
-        || field.get("Ff").is_some()
-        || field.get("TU").is_some()
-        || field.get("TM").is_some()
-        || field.get("DA").is_some()
-        || field.get("Q").is_some()
-        || field.get("MaxLen").is_some();
+fn is_pure_widget_annotation(field: &ObjectHandle) -> Result<bool> {
+    let is_widget = field
+        .try_get_key(b"/Subtype")?
+        .try_as_name()?
+        .is_some_and(|name| name == b"Widget");
+    let mut has_field_entries = false;
+    for key in [
+        b"/T".as_slice(),
+        b"/FT".as_slice(),
+        b"/Kids".as_slice(),
+        b"/V".as_slice(),
+        b"/DV".as_slice(),
+        b"/Ff".as_slice(),
+        b"/TU".as_slice(),
+        b"/TM".as_slice(),
+        b"/DA".as_slice(),
+        b"/Q".as_slice(),
+        b"/MaxLen".as_slice(),
+    ] {
+        if field.try_has_key(key)? {
+            has_field_entries = true;
+            break;
+        }
+    }
 
-    is_widget && !has_field_entries
+    Ok(is_widget && !has_field_entries)
 }
 
 fn decode_field_name(name: &[u8]) -> String {
@@ -2175,15 +2145,12 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, acroform.get("Fields").cloned())? else {
+        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
         Ok(fields
             .into_iter()
-            .filter_map(|item| match item {
-                Object::Reference(field_ref) => Some(field_ref),
-                _ => None,
-            })
+            .filter_map(|item| item.object_ref().or_else(|| item.as_reference()))
             .collect())
     }
 
@@ -2199,7 +2166,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(false);
         };
-        Ok(resolve_array_value(self.pdf, acroform.get("Fields").cloned())?.is_some())
+        Ok(resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)?.is_some())
     }
 }
 
@@ -2341,24 +2308,13 @@ fn collect_refs_in_dict<R: Read + Seek>(
 
 fn resolve_array_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    value: Option<Object>,
-) -> Result<Option<Vec<Object>>> {
-    match value {
-        None | Some(Object::Null) => Ok(None),
-        Some(Object::Array(values)) => Ok(Some(values)),
-        Some(value @ Object::Reference(_)) => {
-            // The array carrier itself may be a holder chain (`/Fields 20 0 R →
-            // 21 0 R → [..]`); follow it to the terminal so a doubled-indirect
-            // carrier yields its array instead of being dropped as a non-array.
-            // The terminal is returned by value, so the array moves out without
-            // the prior `.clone()`.
-            match resolve_ref_chain(pdf, &value)?.0 {
-                Object::Array(values) => Ok(Some(values)),
-                _ => Ok(None), // Null or non-array terminal
-            }
-        }
-        Some(_) => Ok(None),
-    }
+    value: ObjectHandle,
+) -> Result<Option<Vec<ObjectHandle>>> {
+    // The array carrier itself may be a holder chain (`/Fields 20 0 R →
+    // 21 0 R → [..]`); follow it to the terminal so a doubled-indirect
+    // carrier yields its array instead of being dropped as a non-array.
+    let value = pdf.resolve_to_terminal(&value)?;
+    value.try_as_array()
 }
 
 fn resource_renames_from_conflicts(conflicts: &ResourceConflicts) -> ResourceRenames {
