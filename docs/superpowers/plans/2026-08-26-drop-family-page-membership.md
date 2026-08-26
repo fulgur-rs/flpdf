@@ -17,7 +17,7 @@
 - Modify: `crates/flpdf/src/thread_bead_p.rs` test module
 - Modify: `crates/flpdf/src/objr_obj_annot_p.rs` test module
 
-- [ ] **Step 1: Add structure `/Pg` preservation tests.**
+- [x] **Step 1: Add structure `/Pg` preservation tests.**
 
 Use the existing `base_objs()` and `keep_3_and_5()` helpers. Add one test with
 `StructElem 20` carrying `/Pg 30 0 R` and object 30 defined as
@@ -28,7 +28,7 @@ must remain after `drop_struct_elem_dangling_pg`. Update the test helper's
 `RebuildResult` to set that exact removed-page set while retaining its current
 `ref_map`.
 
-- [ ] **Step 2: Add orphan-page preservation tests for thread and OBJR `/P`.**
+- [x] **Step 2: Add orphan-page preservation tests for thread and OBJR `/P`.**
 
 In each module, add an object 30 with the orphan page dictionary above. For
 the thread test, use the existing `p_resolving_to_non_page_left_unchanged`
@@ -38,7 +38,7 @@ Populate `removed_pages` with page 4. Assert that `/P 30 0 R` remains after
 the pass. Existing removed-page and surviving-page tests must remain unchanged
 in their observable assertions.
 
-- [ ] **Step 3: Run the new tests and verify RED.**
+- [x] **Step 3: Run the new tests and verify RED.**
 
 ```bash
 cargo test -p flpdf --lib struct_tree_pg::tests::pg_resolving_to_non_page_left_unchanged
@@ -64,7 +64,7 @@ git commit -m "test: expose drop family page membership gap"
 - Modify: `crates/flpdf/src/thread_bead_p.rs`
 - Modify: `crates/flpdf/src/objr_obj_annot_p.rs`
 
-- [ ] **Step 1: Change structure `/Pg` to use `removed_pages`.**
+- [x] **Step 1: Change structure `/Pg` to use `removed_pages`.**
 
 Thread `&result.removed_pages` through `walk_kids`, `walk_kid_ref`, and
 `process_elem_dict`. Keep this surviving remap branch:
@@ -88,7 +88,7 @@ match surviving.get(pg) {
 Update all calls and comments to describe page-tree membership rather than
 `ref_map` absence. Do not change `/Obj` collection or `/K` traversal.
 
-- [ ] **Step 2: Change thread bead `/P` to use `removed_pages`.**
+- [x] **Step 2: Change thread bead `/P` to use `removed_pages`.**
 
 Pass `&result.removed_pages` into `remap_or_drop_bead_p`. After the existing
 `resolve_to_terminal_ref`, use membership before the remap/drop match:
@@ -115,7 +115,7 @@ match surviving.get(&page_ref) {
 Remove `is_page_dict` and its now-unused tests/comments. Keep malformed
 non-reference and chain-resolution behavior unchanged.
 
-- [ ] **Step 3: Change OBJR annotation `/P` to use `removed_pages`.**
+- [x] **Step 3: Change OBJR annotation `/P` to use `removed_pages`.**
 
 Pass `&result.removed_pages` into `remap_or_drop_annot_p`. After resolving the
 terminal ref, return unchanged unless it is in `surviving` or
@@ -124,7 +124,7 @@ Remove the `is_page_dict` helper and its type-based gate. Keep the annotation
 object resolution and `set_object` write-back boundary unchanged for this
 semantic slice.
 
-- [ ] **Step 4: Run GREEN focused tests.**
+- [x] **Step 4: Run GREEN focused tests.**
 
 ```bash
 cargo test -p flpdf --lib struct_tree_pg
