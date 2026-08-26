@@ -108,6 +108,10 @@ fn reader_production_has_no_raw_materialization_bridge() {
         "pub fn resolve_object(",
         "pub fn resolve_borrowed(",
         "lift_object_to_handle",
+        "resolve_to_cache",
+        "materialize_canonical_compatibility_value",
+        "materialize_handle_for_legacy",
+        "legacy_resolution_state_synced",
     ] {
         assert!(
             !production.contains(legacy),
