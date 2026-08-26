@@ -46,6 +46,31 @@ fn golden(stem: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
 }
 
+/// Linearize one fixture with qpdf's fixed test identifier. A fixture without
+/// a source `/ID` can otherwise differ in deterministic-ID seed material while
+/// the layout under test remains identical.
+fn flpdf_linearized_objstm_static(fixture: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat")
+        .join(fixture);
+    let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
+    let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
+}
+
+fn golden_static(stem: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/references")
+        .join(stem)
+        .join("linearize-objstm-static.pdf");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read golden {path:?}: {e}"))
+}
+
 /// Linearize `fixture` with `--object-streams=preserve` via the public API and
 /// return the complete back-patched bytes. Unlike `generate`, this keeps the
 /// source document's ObjStm membership (qpdf's `preserveObjectStreams`).
@@ -514,6 +539,35 @@ fn firstpage_private_container_precedes_shared_generate_byte_identical_to_qpdf()
     assert_strict(
         "objstm-lin-firstpage-private-before-shared.pdf",
         "objstm-lin-firstpage-private-before-shared",
+    );
+}
+
+// flpdf-25kg.6.20: a direct inherited /MediaBox array is promoted by
+// optimization after Generate has allocated its ObjStm placeholder. qpdf
+// classifies the promoted object as lc_first_page_private and places its plain
+// body before the first-half ObjStm container; it must not be swept into the
+// post-container pass used by first-page shared mints and outline streams.
+#[test]
+fn firstpage_private_optimization_mint_precedes_container_structurally() {
+    let fixture = "objstm-lin-firstpage-private-mint.pdf";
+    let stem = "objstm-lin-firstpage-private-mint";
+    report(
+        fixture,
+        &mask_id1(&flpdf_linearized_objstm_static(fixture)),
+        &mask_id1(&golden_static(stem)),
+        "structural layout (ignoring /ID[1])",
+    );
+}
+
+#[test]
+fn firstpage_private_optimization_mint_precedes_container_byte_identical_to_qpdf() {
+    let fixture = "objstm-lin-firstpage-private-mint.pdf";
+    let stem = "objstm-lin-firstpage-private-mint";
+    report(
+        fixture,
+        &flpdf_linearized_objstm_static(fixture),
+        &golden_static(stem),
+        "full bytes",
     );
 }
 

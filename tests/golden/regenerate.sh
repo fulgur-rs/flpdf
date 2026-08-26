@@ -2609,6 +2609,17 @@ qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-firstpage-private-before-shared.pdf" \
     "$REF/objstm-lin-firstpage-private-before-shared/linearize-objstm.pdf"
 
+# --- objstm-lin-firstpage-private-mint: a non-scalar inherited page attribute
+# promoted by optimize is first-page-private. qpdf keeps this plain object
+# before the generated first-half ObjStm container (flpdf-25kg.6.20). ---
+mkdir -p "$REF/objstm-lin-firstpage-private-mint"
+qpdf --linearize --object-streams=generate --deterministic-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-mint.pdf" \
+    "$REF/objstm-lin-firstpage-private-mint/linearize-objstm.pdf"
+qpdf --linearize --object-streams=generate --static-id --warning-exit-0 \
+    "$FIX/objstm-lin-firstpage-private-mint.pdf" \
+    "$REF/objstm-lin-firstpage-private-mint/linearize-objstm-static.pdf"
+
 mkdir -p "$REF/objstm-lin-firstpage-private-before-shared-bearing"
 qpdf --linearize --object-streams=preserve --deterministic-id --warning-exit-0 \
     "$FIX/objstm-lin-firstpage-private-before-shared-bearing.pdf" \
