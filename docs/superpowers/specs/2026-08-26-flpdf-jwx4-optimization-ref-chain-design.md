@@ -47,8 +47,11 @@ behavior, while qpdf-parsed values never enter this branch.
 - Add unit regressions for one-hop and multi-hop `Pdf::set_object` redirects,
   including the non-top page boundary.
 - Retain the existing null visibility test unchanged.
-- Update `docs/qpdf-correspondence.md` only if the implementation changes the
-  documented optimization boundary; no new qpdf deviation marker is needed.
+- Keep the existing `qpdf-deviation` marker on the redirect branch: it records
+  that this compatibility compensation is limited to `Pdf::set_object`'s
+  flpdf-only shape and is not a qpdf parsed-graph route. Update
+  `docs/qpdf-correspondence.md` if the implementation changes the documented
+  optimization boundary.
 
 Out of scope: parser behavior, qpdf null visibility, `resolve_to_terminal_ref`,
 writer layout, and the deferred final legacy-route deletion.
