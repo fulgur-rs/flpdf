@@ -19,7 +19,7 @@
 - Modify: `tests/golden/regenerate.sh`
 - Create: `tests/golden/references/linearize-indirect-extensions/linearize.pdf`
 
-- [ ] **Step 1: Add the route contract before production edits.**
+- [x] **Step 1: Add the route contract before production edits.**
 
 Extract `compute_outline_hint_info` and `resolve_catalog_adbe_status` by their
 function markers. Assert that their production slices contain the canonical
@@ -27,7 +27,7 @@ function markers. Assert that their production slices contain the canonical
 where applicable, and contain none of `resolve_borrowed`,
 `Object::Dictionary`, `Object::Reference`, or `.as_dict()`.
 
-- [ ] **Step 2: Add a real one-page indirect-extension fixture and qpdf golden command.**
+- [x] **Step 2: Add a real one-page indirect-extension fixture and qpdf golden command.**
 
 The fixture must contain a valid one-page `/Pages` tree and a Catalog with
 `/Extensions 4 0 R`; object 4 contains `/ADBE` and `/XYZW`. Add its golden
@@ -39,7 +39,7 @@ qpdf --linearize --deterministic-id --warning-exit-0 \
   tests/golden/references/linearize-indirect-extensions/linearize.pdf
 ```
 
-- [ ] **Step 3: Add the byte-parity integration test.**
+- [x] **Step 3: Add the byte-parity integration test.**
 
 Use the existing `flpdf_linearized` and `assert_linearize_byte_identical`
 helpers in `cmp_linearize_tests.rs`:
@@ -54,7 +54,7 @@ fn indirect_extensions_linearized_is_byte_identical_to_qpdf() {
 }
 ```
 
-- [ ] **Step 4: Run the new tests and record the expected RED failure.**
+- [x] **Step 4: Run the new tests and record the expected RED failure.**
 
 ```bash
 cargo test -p flpdf --test linearization_route_contract_tests linearization_catalog_resolution_uses_live_handles
@@ -77,7 +77,7 @@ git commit -m "test: expose linearization catalog raw route"
 - Modify: `crates/flpdf/src/linearization/writer.rs:3178-3219`
 - Test: `crates/flpdf/src/linearization/writer.rs` focused unit module
 
-- [ ] **Step 1: Implement the minimal canonical preparation helper.**
+- [x] **Step 1: Implement the minimal canonical preparation helper.**
 
 Resolve the live root handle and use this exact operation order:
 
@@ -117,7 +117,7 @@ so both replacement cases share it. Keep qpdf's `makeDirect(false)` stream
 failure and cycle error behavior; do not use `resolve_object` or a recursive
 raw-value walk.
 
-- [ ] **Step 2: Move the snapshot before preparation and cover failure cleanup.**
+- [x] **Step 2: Move the snapshot before preparation and cover failure cleanup.**
 
 In `write_linearized_for_pdf_writer`, capture
 `snapshot_catalog_extensions(pdf)` before calling
@@ -127,7 +127,7 @@ call runs when preparation, planning, or emission returns an error by enclosing
 the latter operations in a `Result` closure and restoring before returning its
 result.
 
-- [ ] **Step 3: Add directization unit tests and run GREEN.**
+- [x] **Step 3: Add directization unit tests and run GREEN.**
 
 Test that an indirect dictionary-valued `/Extensions` becomes a direct handle,
 that an indirect `/ADBE` becomes direct, that non-dictionary `/Extensions` is
@@ -153,14 +153,14 @@ git commit -m "fix: prepare linearization catalog before planning"
 - Modify: `crates/flpdf/src/linearization/writer.rs:3760-3810`
 - Test: `crates/flpdf/src/linearization/writer.rs` existing rejection tests
 
-- [ ] **Step 1: Migrate `compute_outline_hint_info`.**
+- [x] **Step 1: Migrate `compute_outline_hint_info`.**
 
 Resolve the Catalog through `get_object_handle` and `Pdf::resolve`, retrieve
 `/Outlines` with `try_get_key`, and derive its `ObjectRef` from
 `object_ref().or_else(|| as_reference())`. Preserve the existing `unit_of`,
 the ObjStm container mapping, and the existing `None` behavior for no outlines.
 
-- [ ] **Step 2: Simplify ADBE status to a canonical visible-key check.**
+- [x] **Step 2: Simplify ADBE status to a canonical visible-key check.**
 
 Remove `orphans_indirect_object` and all raw `Object` matching from
 `CatalogAdbeStatus`. Resolve the live Catalog, obtain `/Extensions` with
@@ -169,7 +169,7 @@ Remove `orphans_indirect_object` and all raw `Object` matching from
 `Unsupported` branch from `write_linearized_impl`; retain the effective-level
 injection/strip dispatch.
 
-- [ ] **Step 3: Replace tests that pin the rejected behavior.**
+- [x] **Step 3: Replace tests that pin the rejected behavior.**
 
 Rename the top-level indirect-extension, indirect-ADBE, indirect-extension-level,
 and non-dictionary cases to assert successful canonical linearization where
@@ -177,7 +177,7 @@ qpdf succeeds. Keep the malformed-array case only if a live qpdf probe shows a
 matching result; otherwise remove the flpdf-only rejection assertion and test
 the qpdf-observable behavior at the correct writer boundary.
 
-- [ ] **Step 4: Run focused GREEN tests.**
+- [x] **Step 4: Run focused GREEN tests.**
 
 ```bash
 cargo test -p flpdf --lib linearization::writer
@@ -202,7 +202,7 @@ git commit -m "refactor: route linearization catalog through handles"
 - Test: `crates/flpdf/tests/show_linearization_tests.rs`
 - Test: `crates/flpdf-cli/tests/compat_matrix_tests.rs`
 
-- [ ] **Step 1: Run qpdf-focused differential and CLI tests.**
+- [x] **Step 1: Run qpdf-focused differential and CLI tests.**
 
 ```bash
 cargo test -p flpdf --test cmp_linearize_tests --features qpdf-zlib-compat
@@ -212,7 +212,7 @@ cargo test -p flpdf --test show_linearization_tests
 cargo test -p flpdf-cli --test compat_matrix_tests
 ```
 
-- [ ] **Step 2: Run formatting and static quality gates.**
+- [x] **Step 2: Run formatting and static quality gates.**
 
 ```bash
 cargo fmt --all -- --check
@@ -224,7 +224,7 @@ python3 -m unittest scripts/tests/test_qpdf_deviation_markers.py
 python3 scripts/check-qpdf-deviation-markers.py --check
 ```
 
-- [ ] **Step 3: Run the complete workspace and differential gates.**
+- [x] **Step 3: Run the complete workspace and differential gates.**
 
 ```bash
 cargo test --workspace
@@ -244,14 +244,14 @@ not 100%. Commit any test-only coverage additions separately.
 - Modify: `docs/superpowers/plans/2026-08-26-linearization-catalog-handle-resolution.md`
 - Modify: Beads issue `flpdf-egzr.3.2.8.18`
 
-- [ ] **Step 1: Self-review the exact diff and qpdf correspondence.**
+- [x] **Step 1: Self-review the exact diff and qpdf correspondence.**
 
 Confirm the production census has no active `resolve_borrowed` or raw
 Catalog resolution in `linearization/writer.rs`, the qpdf source citations
 match the implementation, and no `canonical_*` rename or unrelated module
 cleanup slipped into the diff.
 
-- [ ] **Step 2: Rebase and rerun the affected gates.**
+- [x] **Step 2: Rebase and rerun the affected gates.**
 
 ```bash
 git fetch origin
