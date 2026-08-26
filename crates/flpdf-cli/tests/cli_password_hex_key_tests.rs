@@ -313,6 +313,27 @@ fn hex_key_check_weak_rc4_inspectable_exit_0() {
     );
 }
 
+#[test]
+fn hex_key_r6_does_not_validate_perms() {
+    // qpdf skips R=6 `/Perms` validation when the supplied value is a raw
+    // file-encryption key. An arbitrary key is therefore still accepted by
+    // the read-only inspection path, with no `/Perms` warning.
+    let assert = flpdf()
+        .args([
+            "show-encryption",
+            "--password=0000000000000000000000000000000000000000000000000000000000000000",
+            "--password-is-hex-key",
+            V5_R6,
+        ])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        !stderr.contains("/Perms"),
+        "raw-key R=6 inspection must not validate /Perms, got: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Acceptance 3: --suppress-password-recovery is accepted on a successful
 // password path. Its recovery behavior is covered in password_recovery_tests.

@@ -655,6 +655,9 @@ pub(crate) fn check_owner_password_v4_with_user_password(
 /// remaining bytes match the corresponding prefix of the PDF password padding
 /// constant. Otherwise the original bytes are preserved.
 pub(crate) fn trim_user_password(password: &[u8]) -> Vec<u8> {
+    if password.len() < PASSWORD_PADDING.len() {
+        return password.to_vec();
+    }
     for index in 0..password.len() {
         if password[index] == PASSWORD_PADDING[0]
             && password.len() - index <= PASSWORD_PADDING.len()
@@ -2123,6 +2126,13 @@ mod tests {
         let mut long = vec![b'A'; 40];
         long[0] = PASSWORD_PADDING[0];
         assert_eq!(trim_user_password(&long), long);
+    }
+
+    #[test]
+    fn trim_user_password_preserves_short_password_starting_with_padding() {
+        // qpdf leaves passwords shorter than the full key width untouched;
+        // this is a real password, not a truncated padding suffix.
+        assert_eq!(trim_user_password(b"("), b"(");
     }
 
     // ── Test fixture constants ────────────────────────────────────────────────

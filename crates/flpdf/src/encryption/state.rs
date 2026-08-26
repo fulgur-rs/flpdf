@@ -494,7 +494,10 @@ pub(crate) fn authenticate(
         )
     };
 
-    let perms_warning = if revision == 6 {
+    // qpdf's raw-key branch bypasses password recovery entirely, including
+    // the R=6 /Perms validation that belongs to the password-authenticated
+    // path (QPDF_encryption.cc:907-950).
+    let perms_warning = if revision == 6 && !password_is_hex_key {
         r6_perms_warning(encrypt, &file_key, permissions, encrypt_metadata)?
     } else {
         None
