@@ -111,6 +111,41 @@ impl Default for WriterOptions {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct CliVersionOptions {
+    min: Option<(String, i64)>,
+    force: Option<(String, i64)>,
+}
+
+fn parse_cli_version_options(
+    min: Option<&str>,
+    force: Option<&str>,
+) -> CliResult<CliVersionOptions> {
+    let parse = |name: &str, value: Option<&str>| -> CliResult<Option<(String, i64)>> {
+        value
+            .map(|value| {
+                flpdf::parse_pdf_version_spec(value)
+                    .ok_or_else(|| format!("invalid {name} value: {value:?}").into())
+            })
+            .transpose()
+    };
+    Ok(CliVersionOptions {
+        min: parse("--min-version", min)?,
+        force: parse("--force-version", force)?,
+    })
+}
+
+fn apply_cli_version_options(options: &mut WriterOptions, versions: &CliVersionOptions) {
+    if let Some((version, extension_level)) = &versions.min {
+        options.min_version = Some(version.clone());
+        options.min_extension_level = Some(*extension_level);
+    }
+    if let Some((version, extension_level)) = &versions.force {
+        options.force_version = Some(version.clone());
+        options.force_extension_level = Some(*extension_level);
+    }
+}
+
 /// Translate the CLI's effective writer options into the reusable library
 /// configuration that qpdf reapplies to every split-page output writer.
 fn writer_configuration(options: &WriterOptions, linearize: bool) -> WriterConfiguration {
@@ -518,6 +553,17 @@ struct Cli {
     /// of `flpdf rewrite --linearize`).
     #[arg(long)]
     linearize: bool,
+
+    /// Set a minimum PDF version for the output header. An optional third
+    /// component is qpdf's Adobe extension level, e.g. `1.7.3`.
+    #[arg(long = "min-version")]
+    min_version: Option<String>,
+
+    /// Force the output PDF version and optional Adobe extension level,
+    /// ignoring the input version (qpdf `--force-version`).
+    #[arg(long = "force-version")]
+    force_version: Option<String>,
+
     /// Use a fixed value for the trailer /ID's changing identifier
     /// (top-level alias of `flpdf rewrite --static-id`). Testing only;
     /// never for production output. This qpdf-shaped alias mirrors qpdf,
@@ -1816,6 +1862,15 @@ fn main() {
         }
     };
     let args = Cli::parse_from(residual_args);
+    let top_level_version_options =
+        match parse_cli_version_options(args.min_version.as_deref(), args.force_version.as_deref())
+        {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("flpdf: {error}");
+                std::process::exit(1);
+            }
+        };
     let normalize_content = normalize_content_enabled(args.normalize_content, args.qdf);
 
     // --static-id produces a fixed, non-unique trailer /ID. It exists only
@@ -1959,6 +2014,7 @@ fn main() {
             args.deterministic_id,
             args.static_id,
             args.preserve_unreferenced,
+            &top_level_version_options,
         )
     } else if !args.add_attachment.is_empty() {
         run_add_attachment(
@@ -1971,6 +2027,7 @@ fn main() {
             args.static_id,
             args.preserve_unreferenced,
             args.verbose,
+            &top_level_version_options,
         )
     } else if !args.copy_attachments_from.is_empty() {
         run_copy_attachments_from(
@@ -1983,6 +2040,7 @@ fn main() {
             args.static_id,
             args.preserve_unreferenced,
             args.verbose,
+            &top_level_version_options,
         )
     } else if args.linearize {
         // --linearize is incompatible with the page-extraction pipeline:
@@ -2007,6 +2065,7 @@ fn main() {
             content_normalization_set: args.normalize_content.is_some(),
             ..WriterOptions::default()
         };
+        apply_cli_version_options(&mut options, &top_level_version_options);
         // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
@@ -2097,6 +2156,7 @@ fn main() {
             qdf: args.qdf,
             ..WriterOptions::default()
         };
+        apply_cli_version_options(&mut options, &top_level_version_options);
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
                 "y" => options.compress_streams = Some(CompressStreams::Yes),
@@ -2162,6 +2222,7 @@ fn main() {
             qdf: args.qdf,
             ..WriterOptions::default()
         };
+        apply_cli_version_options(&mut options, &top_level_version_options);
         // Top-level `--qdf` is an alias of `rewrite --qdf`; both configure the
         // same canonical qpdf writer.
         // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
@@ -2585,18 +2646,16 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             run_show_encryption_key(&cmd.input, cmd.repair, &cmd.password)
         }
         Commands::Rewrite(cmd) => {
-            if let Some(ref v) = cmd.force_version {
-                if parse_pdf_version(v).is_none() {
-                    eprintln!("flpdf: invalid --force-version value: {:?}", v);
+            let version_options = match parse_cli_version_options(
+                cmd.min_version.as_deref(),
+                cmd.force_version.as_deref(),
+            ) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("flpdf: {error}");
                     std::process::exit(1);
                 }
-            }
-            if let Some(ref v) = cmd.min_version {
-                if parse_pdf_version(v).is_none() {
-                    eprintln!("flpdf: invalid --min-version value: {:?}", v);
-                    std::process::exit(1);
-                }
-            }
+            };
             // QDF is inherently non-linearized; reject the combination with a
             // fatal diagnostic, mirroring the rewrite/--linearize rejection
             // above. (The top-level `--qdf --linearize` form is
@@ -2610,8 +2669,6 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 static_id: cmd.static_id,
                 deterministic_id: cmd.deterministic_id,
                 static_aes_iv: cmd.static_aes_iv,
-                min_version: cmd.min_version,
-                force_version: cmd.force_version,
                 no_original_object_ids: cmd.no_original_object_ids,
                 preserve_unreferenced_objects: cmd.preserve_unreferenced,
                 // `--qdf` and `--deterministic-id` configure the canonical writer's
@@ -2637,6 +2694,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 recompress_flate: cmd.recompress_flate,
                 ..WriterOptions::default()
             };
+            apply_cli_version_options(&mut options, &version_options);
             // `rewrite --encrypt` / `--copy-encryption`: wire encryption
             // onto WriterOptions (shared with the top-level surface via
             // apply_encryption_options).
@@ -6390,6 +6448,7 @@ fn run_add_attachment(
     static_id: bool,
     preserve_unreferenced: bool,
     verbose: bool,
+    version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--add-attachment: missing input PDF")?;
     let output = output.ok_or("--add-attachment: missing output PDF")?;
@@ -6427,12 +6486,13 @@ fn run_add_attachment(
 
     job.add_attachments(&mut pdf, &attachment_options)?;
 
-    let options = WriterOptions {
+    let mut options = WriterOptions {
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
+    apply_cli_version_options(&mut options, version_options);
     write_with_pdf_writer(
         &mut pdf,
         &output,
@@ -6460,6 +6520,7 @@ fn run_remove_attachment(
     deterministic_id: bool,
     static_id: bool,
     preserve_unreferenced: bool,
+    version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--remove-attachment: missing input PDF")?;
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
@@ -6471,12 +6532,13 @@ fn run_remove_attachment(
         return Err(format!("--remove-attachment: key {:?} not found in document", key).into());
     }
 
-    let options = WriterOptions {
+    let mut options = WriterOptions {
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
+    apply_cli_version_options(&mut options, version_options);
     let mut standard_output = None;
     write_with_pdf_writer(
         &mut pdf,
@@ -6542,6 +6604,7 @@ fn run_copy_attachments_from(
     static_id: bool,
     preserve_unreferenced: bool,
     verbose: bool,
+    version_options: &CliVersionOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("--copy-attachments-from: missing input PDF")?;
     let output = output.ok_or("--copy-attachments-from: missing output PDF")?;
@@ -6584,12 +6647,13 @@ fn run_copy_attachments_from(
         },
     )?;
 
-    let writer_options = WriterOptions {
+    let mut writer_options = WriterOptions {
         deterministic_id,
         static_id,
         preserve_unreferenced_objects: preserve_unreferenced,
         ..WriterOptions::default()
     };
+    apply_cli_version_options(&mut writer_options, version_options);
     write_with_pdf_writer(
         &mut pdf,
         &output,

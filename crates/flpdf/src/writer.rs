@@ -1961,18 +1961,33 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
         ObjectHandle::dictionary(Vec::new())
     };
 
-    // Overwrite /ADBE wholesale, leaving any other developer prefix keys alone.
-    let adbe = ObjectHandle::dictionary(vec![
-        (
-            b"/BaseVersion".to_vec(),
-            ObjectHandle::name(version.as_bytes().to_vec()),
-        ),
-        (
-            b"/ExtensionLevel".to_vec(),
-            ObjectHandle::integer(extension_level),
-        ),
-    ]);
-    extensions.replace_key(b"/ADBE", adbe)?;
+    // qpdf preserves an existing ADBE dictionary when its version pair is
+    // already the final pair, including extra keys such as `/URL`. Its
+    // `prepareFileForWrite` step directizes the ADBE value before the unparse
+    // decision, so do the same before comparing the two required fields.
+    let mut adbe = extensions.try_get_key(b"/ADBE")?;
+    if adbe.is_indirect() {
+        adbe.make_direct(false)?;
+        extensions.replace_key(b"/ADBE", adbe.clone())?;
+    }
+    let preserves_existing = adbe.try_as_dictionary()?.is_some()
+        && adbe
+            .try_get_key(b"/BaseVersion")?
+            .try_is_name_and_equals(version.as_bytes())?
+        && adbe.try_get_key(b"/ExtensionLevel")?.try_as_integer()? == Some(extension_level);
+    if !preserves_existing {
+        let replacement = ObjectHandle::dictionary(vec![
+            (
+                b"/BaseVersion".to_vec(),
+                ObjectHandle::name(version.as_bytes().to_vec()),
+            ),
+            (
+                b"/ExtensionLevel".to_vec(),
+                ObjectHandle::integer(extension_level),
+            ),
+        ]);
+        extensions.replace_key(b"/ADBE", replacement)?;
+    }
 
     catalog.replace_key(b"/Extensions", extensions)?;
     pdf.set_object_handle(root_ref, catalog)?;
@@ -9548,6 +9563,89 @@ mod tests {
             .expect("Extensions must remain a dictionary");
         assert!(keys.contains(b"/XYZW".as_slice()));
         assert!(keys.contains(b"/ADBE".as_slice()));
+    }
+
+    #[test]
+    fn inject_adbe_extension_preserves_matching_adbe_dictionary() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog)
+            .expect("canonical Catalog must resolve");
+        let adbe = ObjectHandle::dictionary(vec![
+            (
+                b"/BaseVersion".to_vec(),
+                ObjectHandle::name(b"1.7".to_vec()),
+            ),
+            (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(2)),
+            (
+                b"/URL".to_vec(),
+                ObjectHandle::string(b"http://something.adobe.com".to_vec()),
+            ),
+        ]);
+        catalog
+            .replace_key(
+                b"/Extensions",
+                ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]),
+            )
+            .expect("Extensions must be installed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        inject_adbe_extension(&mut pdf, "1.7", 2).expect("matching ADBE must be preserved");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        let rendered = catalog.get_key(b"/Extensions").get_key(b"/ADBE").unparse();
+        let needle = b"/URL (http://something.adobe.com)";
+        assert!(
+            rendered
+                .windows(needle.len())
+                .any(|window| window == needle),
+            "matching ADBE dictionary must preserve qpdf's extra keys: {:?}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn inject_adbe_extension_directizes_an_indirect_adbe_before_comparing() {
+        let mut pdf = crate::Pdf::open_mem(Arc::from(build_ext_injection_source()))
+            .expect("fixture must open");
+        let root = pdf.root_ref().expect("fixture must have a root");
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog)
+            .expect("canonical Catalog must resolve");
+        let adbe = pdf
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![
+                (
+                    b"/BaseVersion".to_vec(),
+                    ObjectHandle::name(b"1.7".to_vec()),
+                ),
+                (b"/ExtensionLevel".to_vec(), ObjectHandle::integer(2)),
+            ]))
+            .expect("indirect ADBE must be allocated");
+        catalog
+            .replace_key(
+                b"/Extensions",
+                ObjectHandle::dictionary(vec![(b"/ADBE".to_vec(), adbe)]),
+            )
+            .expect("Extensions must be installed");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("Catalog must belong to this Pdf");
+
+        inject_adbe_extension(&mut pdf, "1.7", 2)
+            .expect("indirect but matching ADBE must be directized and preserved");
+
+        let catalog = pdf.get_object_handle(root);
+        pdf.resolve(&catalog).expect("Catalog must resolve");
+        let extensions = catalog.get_key(b"/Extensions");
+        let adbe = extensions.get_key(b"/ADBE");
+        assert!(
+            adbe.is_direct(),
+            "the comparison must run against the directized value, matching qpdf's \
+             prepareFileForWrite ordering, not leave the original indirect ADBE untouched"
+        );
     }
 
     #[test]

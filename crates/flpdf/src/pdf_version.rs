@@ -75,6 +75,25 @@ pub fn parse_pdf_version(value: &str) -> Option<PdfVersion> {
     PdfVersion::parse(value)
 }
 
+/// Parses qpdf's job version syntax `M.m[.E]` into the header version and
+/// optional extension level. The returned version is always the two-component
+/// string that qpdf passes to `QPDFWriter`; the third component is never a PDF
+/// header version.
+pub fn parse_pdf_version_spec(value: &str) -> Option<(String, i64)> {
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse::<u8>().ok()?;
+    let minor = parts.next()?.parse::<u8>().ok()?;
+    let extension_level = match parts.next() {
+        None => 0,
+        Some(level) if !level.is_empty() => level.parse::<i64>().ok()?,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((format!("{major}.{minor}"), extension_level))
+}
+
 #[cfg(test)]
 mod tests {
     use super::PdfVersion;
