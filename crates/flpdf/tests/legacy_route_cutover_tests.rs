@@ -573,10 +573,15 @@ fn overlay_destination_page_rewrite_uses_live_handles() {
         .and_then(|(_, rest)| rest.split_once("#[cfg(test)]").map(|(body, _)| body))
         .expect("overlay page application function must remain present");
     let rewrite = function
-        .split_once("// 5. Rewrite the page dictionary")
+        .split_once("// 5. Rewrite only")
         .and_then(|(_, rest)| rest.split_once("    Ok(())"))
         .map(|(body, _)| body)
         .expect("overlay page rewrite boundary must remain present");
+    let page_helper = source
+        .split_once("fn overlay_page_handle")
+        .and_then(|(_, rest)| rest.split_once("/// Allocate the next available object reference"))
+        .map(|(body, _)| body)
+        .expect("overlay page handle helper must remain present");
 
     for legacy in [
         "resolve_borrowed",
@@ -591,7 +596,6 @@ fn overlay_destination_page_rewrite_uses_live_handles() {
     }
     for canonical in [
         "get_object_handle",
-        "resolve(&",
         "replace_key(",
         "mark_object_handle_dirty",
     ] {
@@ -600,6 +604,10 @@ fn overlay_destination_page_rewrite_uses_live_handles() {
             "overlay destination page rewrite must use canonical handle marker {canonical:?}"
         );
     }
+    assert!(
+        page_helper.contains("resolve(&"),
+        "overlay page handle helper must resolve the canonical page handle"
+    );
 }
 
 #[test]
