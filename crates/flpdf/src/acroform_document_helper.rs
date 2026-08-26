@@ -256,8 +256,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, Some(acroform.try_get_key(b"/Fields")?))?
-        else {
+        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
 
@@ -287,12 +286,11 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, Some(acroform.try_get_key(b"/Fields")?))?
-        else {
+        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
 
-        let default_appearance = deref_leaf_handle(self.pdf, Some(acroform.try_get_key(b"/DA")?))?;
+        let default_appearance = deref_leaf_handle(self.pdf, acroform.try_get_key(b"/DA")?)?;
         let quadding = inherited_integer(self.pdf, &acroform, b"/Q")?;
         let max_len = inherited_integer(self.pdf, &acroform, b"/MaxLen")?;
         let inherited = FieldInheritance {
@@ -1770,7 +1768,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         out.push(field_ref);
 
         let field = self.resolve_field_dict(field_ref)?;
-        let Some(kids) = resolve_array_value(self.pdf, Some(field.try_get_key(b"/Kids")?))? else {
+        let Some(kids) = resolve_array_value(self.pdf, field.try_get_key(b"/Kids")?)? else {
             return Ok(());
         };
         for kid in kids {
@@ -1803,7 +1801,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             return Ok(());
         }
         let current = inherited.apply(self.pdf, &field)?;
-        let partial_name = deref_leaf_handle(self.pdf, Some(field.try_get_key(b"/T")?))?
+        let partial_name = deref_leaf_handle(self.pdf, field.try_get_key(b"/T")?)?
             .as_ref()
             .and_then(ObjectHandle::as_string)
             .map(|name| name.to_vec());
@@ -1821,7 +1819,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
             max_len: current.max_len,
         });
 
-        let Some(kids) = resolve_array_value(self.pdf, Some(field.try_get_key(b"/Kids")?))? else {
+        let Some(kids) = resolve_array_value(self.pdf, field.try_get_key(b"/Kids")?)? else {
             return Ok(());
         };
         for kid in kids {
@@ -1835,7 +1833,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
 
 impl FieldInheritance {
     fn apply<R: Read + Seek>(&self, pdf: &mut Pdf<R>, field: &ObjectHandle) -> Result<Self> {
-        let partial_name = deref_leaf_handle(pdf, Some(field.try_get_key(b"/T")?))?
+        let partial_name = deref_leaf_handle(pdf, field.try_get_key(b"/T")?)?
             .as_ref()
             .and_then(ObjectHandle::as_string)
             .map(|name| decode_field_name(&name));
@@ -2006,11 +2004,8 @@ fn ensure_foreign_indirect<R: Read + Seek>(
 /// value lookup. Direct values pass through unchanged.
 fn deref_leaf_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    value: Option<ObjectHandle>,
+    value: ObjectHandle,
 ) -> Result<Option<ObjectHandle>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
     let value = pdf.resolve_to_terminal(&value)?;
     Ok((!value.is_null()).then_some(value))
 }
@@ -2020,7 +2015,7 @@ fn inherited_object<R: Read + Seek>(
     field: &ObjectHandle,
     key: &[u8],
 ) -> Result<Option<ObjectHandle>> {
-    deref_leaf_handle(pdf, Some(field.try_get_key(key)?))
+    deref_leaf_handle(pdf, field.try_get_key(key)?)
 }
 
 fn inherited_name<R: Read + Seek>(
@@ -2150,8 +2145,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(Vec::new());
         };
-        let Some(fields) = resolve_array_value(self.pdf, Some(acroform.try_get_key(b"/Fields")?))?
-        else {
+        let Some(fields) = resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)? else {
             return Ok(Vec::new());
         };
         Ok(fields
@@ -2172,7 +2166,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
         let Some(acroform) = self.acroform_dict()? else {
             return Ok(false);
         };
-        Ok(resolve_array_value(self.pdf, Some(acroform.try_get_key(b"/Fields")?))?.is_some())
+        Ok(resolve_array_value(self.pdf, acroform.try_get_key(b"/Fields")?)?.is_some())
     }
 }
 
@@ -2314,11 +2308,8 @@ fn collect_refs_in_dict<R: Read + Seek>(
 
 fn resolve_array_value<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    value: Option<ObjectHandle>,
+    value: ObjectHandle,
 ) -> Result<Option<Vec<ObjectHandle>>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
     // The array carrier itself may be a holder chain (`/Fields 20 0 R →
     // 21 0 R → [..]`); follow it to the terminal so a doubled-indirect
     // carrier yields its array instead of being dropped as a non-array.
