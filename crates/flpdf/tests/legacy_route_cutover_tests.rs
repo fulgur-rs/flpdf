@@ -184,6 +184,35 @@ fn objr_annotation_removed_page_production_uses_object_handles() {
 }
 
 #[test]
+fn subset_prune_production_uses_handle_reachability() {
+    let source = include_str!("../src/subset_prune.rs");
+    let production = source
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .expect("subset_prune.rs has a test module")
+        .0;
+
+    for legacy in [
+        "resolve_borrowed",
+        "resolve_object(",
+        "Object::",
+        "materialize(",
+        "set_object(",
+        "Dictionary",
+    ] {
+        assert!(
+            !production.contains(legacy),
+            "subset_prune production still contains the raw route marker {legacy:?}"
+        );
+    }
+    for canonical in ["ObjectHandle", "walk_handle_contents", "pdf.resolve"] {
+        assert!(
+            production.contains(canonical),
+            "subset_prune production must use the canonical handle marker {canonical:?}"
+        );
+    }
+}
+
+#[test]
 fn acroform_top_level_field_uses_the_canonical_form_field_helper() {
     let acroform = include_str!("../src/acroform_document_helper.rs");
     let page_specs = include_str!("../src/job/page_specs.rs");
