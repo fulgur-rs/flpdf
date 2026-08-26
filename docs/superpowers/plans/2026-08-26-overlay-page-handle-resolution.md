@@ -148,7 +148,7 @@ git commit -m "refactor: route overlay destination rewrite through handles"
 - Verify: `crates/flpdf/tests/legacy_route_cutover_tests.rs`
 - Verify: `tests/golden/regenerate.sh`
 
-- [ ] **Step 1: Run qpdf differential and CLI overlay tests.**
+- [x] **Step 1: Run qpdf differential and CLI overlay tests.**
 
 ```bash
 cargo test -p flpdf --lib job::overlay --features qpdf-zlib-compat
@@ -159,7 +159,7 @@ cargo test -p flpdf-cli --test compat_matrix_tests
 Expected: all overlay annotation-copy, malformed-page, multi-source, and CLI
 compatibility tests pass.
 
-- [ ] **Step 2: Run formatting and static quality gates.**
+- [x] **Step 2: Run formatting and static quality gates.**
 
 ```bash
 cargo fmt --all -- --check
@@ -171,7 +171,7 @@ python3 -m unittest scripts/tests/test_qpdf_deviation_markers.py
 python3 scripts/check-qpdf-deviation-markers.py --check
 ```
 
-- [ ] **Step 3: Run workspace and changed-line coverage gates.**
+- [x] **Step 3: Run workspace and changed-line coverage gates.**
 
 ```bash
 cargo test --workspace
@@ -191,7 +191,7 @@ executable lines. Add a focused test before proceeding if coverage is below
 - Modify: `docs/superpowers/plans/2026-08-26-overlay-page-handle-resolution.md`
 - Modify: Beads issue `flpdf-egzr.3.2.8.17`
 
-- [ ] **Step 1: Self-review the diff against qpdf.**
+- [x] **Step 1: Self-review the diff against qpdf.**
 
 Confirm the production route has no raw page snapshot, qpdf citations match,
 the old `overlay_annotations.rs` scope was not pulled in, and no
