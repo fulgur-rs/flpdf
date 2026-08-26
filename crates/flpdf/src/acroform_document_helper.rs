@@ -2323,7 +2323,7 @@ fn resolve_array_value<R: Read + Seek>(
     // 21 0 R → [..]`); follow it to the terminal so a doubled-indirect
     // carrier yields its array instead of being dropped as a non-array.
     let value = pdf.resolve_to_terminal(&value)?;
-    Ok(value.try_as_array()?)
+    value.try_as_array()
 }
 
 fn resource_renames_from_conflicts(conflicts: &ResourceConflicts) -> ResourceRenames {
