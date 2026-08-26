@@ -2469,9 +2469,10 @@ mod tests {
             .expect_err("a cached non-stream hint object is damaged");
         match error {
             HintStreamLoadError::Damage(damage) => assert_eq!(damage.offset, 653),
+            // cov:ignore-start: this fixture intentionally exercises only the damage variant
             HintStreamLoadError::Core(error) => {
                 panic!("unexpected core error: {error}")
-            } // cov:ignore: this fixture intentionally exercises only the damage variant
+            } // cov:ignore-end
         }
     }
 
