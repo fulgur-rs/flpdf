@@ -66,8 +66,9 @@ use std::io::{Read, Seek};
 ///
 /// `result` is the [`RebuildResult`] returned by
 /// [`crate::pages::tree_rebuild::rebuild_page_tree`]; its `ref_map` encodes the
-/// old → new page mapping (a page absent from the map was removed; a page
-/// present maps to `ref_map[old][0]`). `objr_obj_targets` are the OBJR `/Obj`
+/// old → new mapping for surviving page-tree leaves, while `removed_pages`
+/// identifies the exact original page-tree leaves removed by the rebuild.
+/// `objr_obj_targets` are the OBJR `/Obj`
 /// references collected during the structure-tree walk
 /// ([`crate::struct_tree_pg::drop_struct_elem_dangling_pg`]).
 ///
@@ -76,8 +77,10 @@ use std::io::{Read, Seek};
 /// dictionary whose `/P` is a reference to a removed page, the `/P` key is
 /// dropped so the page is garbage-collected by the subsequent subset sweep
 /// ([`crate::subset_prune::prune_after_subset`]); when `/P` points at a
-/// surviving page it is remapped to the page's new ref. A target with no `/P`,
-/// or a `/P` that is not a reference, is left unchanged. The function mutates
+/// surviving page it is remapped to the page's new ref. A `/P` pointing at a
+/// non-page object or a page-like object outside the original page tree is left
+/// unchanged. A target with no `/P`, or a `/P` that is not a reference, is also
+/// left unchanged. The function mutates
 /// `pdf` in place and succeeds silently when `objr_obj_targets` is empty.
 ///
 /// # Errors
@@ -94,6 +97,7 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
         .iter()
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
+    let removed_pages = &result.removed_pages;
 
     let mut visited: BTreeSet<ObjectRef> = BTreeSet::new();
     for &start in objr_obj_targets {
@@ -114,7 +118,7 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
         let Some(mut annot) = concrete.into_dict() else {
             continue;
         };
-        if remap_or_drop_annot_p(pdf, &mut annot, &surviving)? {
+        if remap_or_drop_annot_p(pdf, &mut annot, &surviving, removed_pages)? {
             pdf.set_object(annot_ref, Object::Dictionary(annot));
         }
     }
@@ -126,33 +130,24 @@ pub fn drop_objr_obj_annot_dangling_p<R: Read + Seek>(
 ///
 /// `/P` is by spec an indirect reference to the page the annotation is on; any
 /// other form is malformed and left unchanged. A surviving target is remapped to
-/// its new ref (an identity remap in a single-document rebuild); a removed target
-/// has the key dropped so the page is garbage-collected.
+/// its new ref (an identity remap in a single-document rebuild); a target in
+/// `removed_pages` has the key dropped so the page is garbage-collected. A
+/// reference that is neither a surviving nor a removed original page-tree leaf
+/// is left unchanged, even if it resolves to a `/Type /Page` dictionary.
 fn remap_or_drop_annot_p<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     annot: &mut Dictionary,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
 ) -> Result<bool> {
     let p_ref = match annot.get("P") {
         Some(Object::Reference(r)) => *r,
         _ => return Ok(false),
     };
     // Normalize a possible reference-to-reference chain to the terminal page ref.
-    let (p_concrete, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
+    let (_, terminal) = resolve_ref_chain(pdf, &Object::Reference(p_ref))?;
     let page_ref = terminal.unwrap_or(p_ref);
-    // /P must resolve to a page (or to `null`). An OBJR /Obj can reference a
-    // non-annotation object whose /P means something else (e.g. a
-    // /Type /StructElem whose /P is the parent structure element); such a /P,
-    // which resolves to a live non-page object, is left unchanged.
-    //
-    // A removed page that a surviving outline / named destination still
-    // references is replaced with `null` *in place* by the earlier null-out pass
-    // ([`crate::outline_dest_remap`]) before this pass runs, so its /P resolves
-    // to `null` here rather than to a /Type /Page dict. That is still a removed
-    // page and its /P must be dropped (qpdf parity). Only the null-out pass nulls
-    // objects before this pass runs — the other extraction passes drop keys, not
-    // objects — so a `null` terminal here unambiguously means a removed page.
-    if !is_page_dict(&p_concrete) && !matches!(p_concrete, Object::Null) {
+    if !surviving.contains_key(&page_ref) && !removed_pages.contains(&page_ref) {
         return Ok(false);
     }
     match surviving.get(&page_ref) {
@@ -168,13 +163,6 @@ fn remap_or_drop_annot_p<R: Read + Seek>(
             Ok(true)
         }
     }
-}
-
-/// `true` when `obj` is a `<< /Type /Page ... >>` dictionary.
-fn is_page_dict(obj: &Object) -> bool {
-    obj.as_dict()
-        .and_then(|d| d.get("Type"))
-        .is_some_and(|t| matches!(t, Object::Name(n) if n == b"Page"))
 }
 
 #[cfg(test)]
@@ -249,7 +237,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
-            ..Default::default()
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
         }
     }
 
@@ -495,6 +483,28 @@ mod tests {
         assert!(
             matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
             "a /P resolving to a non-page object must be left unchanged",
+        );
+    }
+
+    #[test]
+    fn p_resolving_to_orphan_page_left_unchanged() {
+        let mut objs = base();
+        objs.insert(
+            30,
+            "<< /Type /Annot /Subtype /Text /P 60 0 R /Rect [0 0 10 10] >>".into(),
+        );
+        objs.insert(
+            60,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        drop_objr_obj_annot_dangling_p(&mut pdf, &keep_3_and_5(), &[ObjectRef::new(30, 0)])
+            .expect("orphan-page /P");
+
+        assert!(
+            matches!(annot(&mut pdf, 30).get("P"), Some(Object::Reference(r)) if r.number == 60),
+            "a /P to a page outside the original page tree must be left unchanged",
         );
     }
 

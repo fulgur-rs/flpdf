@@ -118,6 +118,7 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
         .iter()
         .filter_map(|(&old, new_refs)| new_refs.first().map(|&new| (old, new)))
         .collect();
+    let removed_pages = &result.removed_pages;
     let mut state = WalkState::default();
 
     let catalog_ref = match pdf.root_ref() {
@@ -144,7 +145,8 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
                 root.get("K").cloned()
             };
             if let Some(k) = k {
-                let (new_k, changed) = walk_kids(pdf, k, &surviving, 0, max_depth, &mut state)?;
+                let (new_k, changed) =
+                    walk_kids(pdf, k, &surviving, removed_pages, 0, max_depth, &mut state)?;
                 if changed {
                     let root_obj = pdf.resolve_borrowed(root_ref)?;
                     if let Some(root) = root_obj.as_dict() {
@@ -159,7 +161,8 @@ pub fn drop_struct_elem_dangling_pg_with_max_depth<R: Read + Seek>(
         // catalog. The rebuilt /K is written back through the catalog.
         Some(Object::Dictionary(mut root)) => {
             if let Some(k) = root.remove("K") {
-                let (new_k, changed) = walk_kids(pdf, k, &surviving, 0, max_depth, &mut state)?;
+                let (new_k, changed) =
+                    walk_kids(pdf, k, &surviving, removed_pages, 0, max_depth, &mut state)?;
                 root.insert("K", new_k);
                 if changed {
                     let cat_obj = pdf.resolve_borrowed(catalog_ref)?;
@@ -188,6 +191,7 @@ fn walk_kids<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     k: Object,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
@@ -199,11 +203,12 @@ fn walk_kids<R: Read + Seek>(
     }
     match k {
         Object::Reference(r) => {
-            walk_kid_ref(pdf, r, surviving, depth, max_depth, state)?;
+            walk_kid_ref(pdf, r, surviving, removed_pages, depth, max_depth, state)?;
             Ok((Object::Reference(r), false))
         }
         Object::Dictionary(dict) => {
-            let (dict, changed) = process_elem_dict(pdf, dict, surviving, depth, max_depth, state)?;
+            let (dict, changed) =
+                process_elem_dict(pdf, dict, surviving, removed_pages, depth, max_depth, state)?;
             Ok((Object::Dictionary(dict), changed))
         }
         Object::Array(items) => {
@@ -212,12 +217,19 @@ fn walk_kids<R: Read + Seek>(
             for item in items {
                 match item {
                     Object::Reference(r) => {
-                        walk_kid_ref(pdf, r, surviving, depth, max_depth, state)?;
+                        walk_kid_ref(pdf, r, surviving, removed_pages, depth, max_depth, state)?;
                         new_items.push(Object::Reference(r));
                     }
                     Object::Dictionary(d) => {
-                        let (new_dict, dict_changed) =
-                            process_elem_dict(pdf, d, surviving, depth, max_depth, state)?;
+                        let (new_dict, dict_changed) = process_elem_dict(
+                            pdf,
+                            d,
+                            surviving,
+                            removed_pages,
+                            depth,
+                            max_depth,
+                            state,
+                        )?;
                         new_items.push(Object::Dictionary(new_dict));
                         changed |= dict_changed;
                     }
@@ -245,6 +257,7 @@ fn walk_kid_ref<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     r: ObjectRef,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
@@ -254,7 +267,8 @@ fn walk_kid_ref<R: Read + Seek>(
     }
     match pdf.resolve_object(r)? {
         Object::Dictionary(dict) => {
-            let (dict, changed) = process_elem_dict(pdf, dict, surviving, depth, max_depth, state)?;
+            let (dict, changed) =
+                process_elem_dict(pdf, dict, surviving, removed_pages, depth, max_depth, state)?;
             if changed {
                 pdf.set_object(r, Object::Dictionary(dict));
             }
@@ -264,6 +278,7 @@ fn walk_kid_ref<R: Read + Seek>(
                 pdf,
                 Object::Array(items),
                 surviving,
+                removed_pages,
                 depth,
                 max_depth,
                 state,
@@ -291,6 +306,7 @@ fn process_elem_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut dict: Dictionary,
     surviving: &BTreeMap<ObjectRef, ObjectRef>,
+    removed_pages: &BTreeSet<ObjectRef>,
     depth: usize,
     max_depth: usize,
     state: &mut WalkState,
@@ -299,7 +315,7 @@ fn process_elem_dict<R: Read + Seek>(
 
     // /Pg is by spec an indirect reference to a page object; any other form is
     // malformed and left unchanged. A surviving target is remapped to its new
-    // ref; a removed target has the key dropped so the page is garbage-collected.
+    // ref; only an original page-tree leaf in removed_pages is dropped.
     if let Some(Object::Reference(pg)) = dict.get("Pg") {
         match surviving.get(pg) {
             Some(&new) => {
@@ -308,10 +324,11 @@ fn process_elem_dict<R: Read + Seek>(
                     changed = true;
                 }
             }
-            None => {
+            None if removed_pages.contains(pg) => {
                 dict.remove("Pg");
                 changed = true;
             }
+            None => {}
         }
     }
 
@@ -341,7 +358,15 @@ fn process_elem_dict<R: Read + Seek>(
             // Not a structure element: keep /K verbatim, do not walk it.
             dict.insert("K", k);
         } else {
-            let (new_k, k_changed) = walk_kids(pdf, k, surviving, depth + 1, max_depth, state)?;
+            let (new_k, k_changed) = walk_kids(
+                pdf,
+                k,
+                surviving,
+                removed_pages,
+                depth + 1,
+                max_depth,
+                state,
+            )?;
             dict.insert("K", new_k);
             changed |= k_changed;
         }
@@ -460,7 +485,7 @@ mod tests {
         RebuildResult {
             new_kids: vec![ObjectRef::new(3, 0), ObjectRef::new(5, 0)],
             ref_map,
-            ..Default::default()
+            removed_pages: [ObjectRef::new(4, 0)].into_iter().collect(),
         }
     }
 
@@ -638,6 +663,37 @@ mod tests {
             matches!(objr_pg, Some(Object::Reference(r)) if r.number == 7),
             "OBJR surviving /Pg must be remapped to the new ref, got {objr_pg:?}"
         );
+    }
+
+    #[test]
+    fn pg_resolving_to_non_page_left_unchanged() {
+        let mut objs = base_objs();
+        objs.insert(20, "<< /Type /StructElem /S /P /Pg 30 0 R >>".into());
+        objs.insert(30, "<< /Type /Whatever >>".into());
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("non-page /Pg");
+
+        let elem = elem_dict(&mut pdf, 20);
+        let pg = elem.get("Pg");
+        assert!(matches!(pg, Some(Object::Reference(r)) if r.number == 30));
+    }
+
+    #[test]
+    fn pg_resolving_to_orphan_page_left_unchanged() {
+        let mut objs = base_objs();
+        objs.insert(20, "<< /Type /StructElem /S /P /Pg 30 0 R >>".into());
+        objs.insert(
+            30,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        drop_struct_elem_dangling_pg(&mut pdf, &keep_3_and_5()).expect("orphan-page /Pg");
+
+        let elem = elem_dict(&mut pdf, 20);
+        let pg = elem.get("Pg");
+        assert!(matches!(pg, Some(Object::Reference(r)) if r.number == 30));
     }
 
     #[test]
@@ -861,6 +917,26 @@ mod tests {
             matches!(&arr[1], Object::String(s) if s == b"noise"),
             "non-kid array entry must round-trip unchanged, got {:?}",
             arr[1]
+        );
+    }
+
+    #[test]
+    fn direct_dict_kid_error_propagates_from_array() {
+        // A direct dictionary inside a `/K` array can itself contain a nested
+        // `/K`; an error from that nested walk must propagate through the
+        // direct-dictionary array arm.
+        let mut objs = base_objs();
+        objs.insert(
+            10,
+            "<< /Type /StructTreeRoot /K [ << /Type /StructElem /S /P /K 42 >> ] >>".into(),
+        );
+        let mut pdf = open(&objs);
+
+        let err = drop_struct_elem_dangling_pg_with_max_depth(&mut pdf, &keep_3_and_5(), 1)
+            .expect_err("nested direct array kid must hit the depth limit");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "over-deep direct array kid must surface Unsupported, got {err:?}"
         );
     }
 
