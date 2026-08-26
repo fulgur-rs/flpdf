@@ -1399,7 +1399,9 @@ fn top_level_linearize_normalize_content_preserves_warning_exit() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("bad-content.pdf");
     let output = temp.path().join("normalized-linearized.pdf");
-    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    let input_bytes = one_page_pdf_with_content(b"\r<0g");
+    let offset = stream_data_offset(&input_bytes);
+    std::fs::write(&input, &input_bytes).unwrap();
 
     let result = Command::cargo_bin("flpdf")
         .unwrap()
@@ -1415,9 +1417,9 @@ fn top_level_linearize_normalize_content_preserves_warning_exit() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {}: content normalization encountered bad tokens\n\
-             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
              flpdf: operation succeeded with warnings; resulting file may have some problems\n",
             input.display(),
             input.display(),
@@ -4009,6 +4011,15 @@ fn one_page_pdf_with_content(content: &[u8]) -> Vec<u8> {
     ])
 }
 
+fn stream_data_offset(bytes: &[u8]) -> u64 {
+    let marker = b"stream\n";
+    let marker_pos = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("fixture must contain a newline-terminated stream marker");
+    u64::try_from(marker_pos + marker.len()).expect("fixture offset fits u64")
+}
+
 /// One page whose effective `/Resources` is an indirect dictionary inherited
 /// from the `/Pages` node. The `--pages` resource-prune route must shallow-copy
 /// that dictionary onto the selected leaf before pruning, matching qpdf's
@@ -4901,7 +4912,9 @@ fn rewrite_normalize_content_bad_token_writes_output_warns_and_exits_three() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("bad-content.pdf");
     let output = temp.path().join("normalized.pdf");
-    std::fs::write(&input, one_page_pdf_with_content(b"\r<0g")).unwrap();
+    let input_bytes = one_page_pdf_with_content(b"\r<0g");
+    let offset = stream_data_offset(&input_bytes);
+    std::fs::write(&input, &input_bytes).unwrap();
 
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -4911,8 +4924,8 @@ fn rewrite_normalize_content_bad_token_writes_output_warns_and_exits_three() {
         .assert()
         .code(3)
         .stderr(predicate::str::contains(format!(
-            "WARNING: {}: content normalization encountered bad tokens",
-            input.display()
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens",
+            input.display(),
         )))
         .stderr(predicate::str::contains(
             "normalized content ended with a bad token",
@@ -4938,7 +4951,9 @@ fn rewrite_normalize_content_follows_indirect_contents_array() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("indirect-array-bad-content.pdf");
     let output = temp.path().join("normalized.pdf");
-    std::fs::write(&input, one_page_pdf_with_indirect_contents_array(b"\r<0g")).unwrap();
+    let input_bytes = one_page_pdf_with_indirect_contents_array(b"\r<0g");
+    let offset = stream_data_offset(&input_bytes);
+    std::fs::write(&input, &input_bytes).unwrap();
 
     let result = Command::cargo_bin("flpdf")
         .unwrap()
@@ -4953,9 +4968,9 @@ fn rewrite_normalize_content_follows_indirect_contents_array() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {}: content normalization encountered bad tokens\n\
-             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
              flpdf: operation succeeded with warnings; resulting file may have some problems\n",
             input.display(),
             input.display(),
@@ -5094,7 +5109,9 @@ fn rewrite_normalize_content_duplicate_array_stream_warns_once() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("duplicate-array-bad-content.pdf");
     let output = temp.path().join("normalized.pdf");
-    std::fs::write(&input, one_page_pdf_with_duplicate_content_array(b"<0g")).unwrap();
+    let input_bytes = one_page_pdf_with_duplicate_content_array(b"<0g");
+    let offset = stream_data_offset(&input_bytes);
+    std::fs::write(&input, &input_bytes).unwrap();
 
     let result = Command::cargo_bin("flpdf")
         .unwrap()
@@ -5109,9 +5126,9 @@ fn rewrite_normalize_content_duplicate_array_stream_warns_once() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {}: content normalization encountered bad tokens\n\
-             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
              flpdf: operation succeeded with warnings; resulting file may have some problems\n",
             input.display(),
             input.display(),
@@ -5125,7 +5142,9 @@ fn rewrite_normalize_content_deduplicates_terminal_stream_aliases() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("aliased-bad-content.pdf");
     let output = temp.path().join("normalized.pdf");
-    std::fs::write(&input, two_page_pdf_with_indirect_content_aliases(b"\r<0g")).unwrap();
+    let input_bytes = two_page_pdf_with_indirect_content_aliases(b"\r<0g");
+    let offset = stream_data_offset(&input_bytes);
+    std::fs::write(&input, &input_bytes).unwrap();
 
     let result = Command::cargo_bin("flpdf")
         .unwrap()
@@ -5140,9 +5159,9 @@ fn rewrite_normalize_content_deduplicates_terminal_stream_aliases() {
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
         format!(
-            "WARNING: {}: content normalization encountered bad tokens\n\
-             WARNING: {}: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
-             WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
+            "WARNING: {} (offset {offset}): content normalization encountered bad tokens\n\
+             WARNING: {} (offset {offset}): normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents\n\
+             WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.\n\
              flpdf: operation succeeded with warnings; resulting file may have some problems\n",
             input.display(),
             input.display(),
@@ -5164,7 +5183,9 @@ fn rewrite_normalize_content_keeps_lazy_repair_warnings_before_normalization_war
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("lazy-and-bad-content.pdf");
     let output = temp.path().join("normalized.pdf");
-    std::fs::write(&input, one_page_pdf_with_stale_length_and_content(b"<0g")).unwrap();
+    let input_bytes = one_page_pdf_with_stale_length_and_content(b"<0g");
+    let offset = stream_data_offset(&input_bytes);
+    std::fs::write(&input, &input_bytes).unwrap();
 
     let result = Command::cargo_bin("flpdf")
         .unwrap()
@@ -5206,11 +5227,11 @@ fn rewrite_normalize_content_keeps_lazy_repair_warnings_before_normalization_war
         &lines[normalization_start..],
         [
             format!(
-                "WARNING: {}: content normalization encountered bad tokens",
+                "WARNING: {} (offset {offset}): content normalization encountered bad tokens",
                 input.display()
             ),
             format!(
-                "WARNING: {}: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
+                "WARNING: {} (offset {offset}): Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
                 input.display()
             ),
             "flpdf: operation succeeded with warnings; resulting file may have some problems"
