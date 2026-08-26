@@ -283,6 +283,10 @@ impl Optimization {
             // Re-dispatch that value through the same stack so every
             // redirect hop remains an object-user, matching the pre-handle
             // traversal and keeping in-memory page maps stable.
+            // qpdf-deviation: re-dispatch compensates for a Pdf::set_object
+            // bare-reference redirect that has no qpdf counterpart (see
+            // reader.rs::resolve_to_terminal_ref and the same compensation in
+            // optimization/inherited_attrs.rs and pages.rs).
             if let Some(reference) = pending.object.as_reference() {
                 if let Some(object_ref) = pending.object.object_ref() {
                     if !visited.insert(object_ref) {
