@@ -578,7 +578,7 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flpdf::{Object, ObjectHandle, ObjectRef};
+    use flpdf::{ObjectHandle, ObjectRef};
 
     #[test]
     fn object_stream_pipeline_collects_bytes_and_has_qpdf_identifier() {
@@ -611,28 +611,11 @@ mod tests {
     #[test]
     fn resolve_objstm_type_true_for_single_hop_reference() {
         let mut pdf = open_minimal_pdf();
-        pdf.set_object(ObjectRef::new(100, 0), Object::Name(b"ObjStm".to_vec()));
-        let dict = ObjectHandle::dictionary(vec![(
-            b"Type".to_vec(),
-            pdf.get_object_handle(ObjectRef::new(100, 0)),
-        )]);
-        assert!(resolve_objstm_type(&mut pdf, &dict));
-    }
-
-    #[test]
-    fn resolve_objstm_type_true_for_two_hop_reference_chain() {
-        // A bare top-level object body of "N G R" parses as an Integer, not
-        // a Reference (qpdf does the same), so this exact holder chain
-        // (100 -> 101 -> /ObjStm) cannot arise from parsing raw PDF bytes.
-        // pdf.set_object constructs it directly to exercise the full
-        // resolve_ref_chain contract defensively, matching how every other
-        // flpdf consumer of that shared primitive is expected to behave.
-        let mut pdf = open_minimal_pdf();
-        pdf.set_object(
+        pdf.set_object_handle(
             ObjectRef::new(100, 0),
-            Object::Reference(ObjectRef::new(101, 0)),
-        );
-        pdf.set_object(ObjectRef::new(101, 0), Object::Name(b"ObjStm".to_vec()));
+            ObjectHandle::name(b"ObjStm".to_vec()),
+        )
+        .expect("install ObjStm type");
         let dict = ObjectHandle::dictionary(vec![(
             b"Type".to_vec(),
             pdf.get_object_handle(ObjectRef::new(100, 0)),

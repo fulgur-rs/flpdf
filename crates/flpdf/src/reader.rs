@@ -1602,7 +1602,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// The legacy [`Self::set_object`] API remains unchanged for consumers that
     /// still provide a materialized [`Object`].
     #[allow(dead_code)] // writer consumer cutover is flpdf-egzr.3.2.5
-    pub(crate) fn set_object_handle(
+    pub fn set_object_handle(
         &mut self,
         object_ref: ObjectRef,
         replacement: ObjectHandle,

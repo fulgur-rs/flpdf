@@ -1,18 +1,19 @@
 //! External-crate coverage for the public canonical array mutation boundary.
 
-use flpdf::{Object, ObjectHandle, ObjectRef, Pdf, PdfWriter};
+use flpdf::{ObjectHandle, ObjectRef, Pdf, PdfWriter};
 
 #[test]
 fn external_consumer_can_mutate_an_indirect_array_in_place() {
     let mut pdf = Pdf::empty().expect("create an empty PDF");
     let array_ref = ObjectRef::new(9, 0);
-    pdf.set_object(
+    pdf.set_object_handle(
         array_ref,
-        Object::Array(vec![
-            Object::String(b"keep".to_vec()),
-            Object::String(b"replace".to_vec()),
+        ObjectHandle::array(vec![
+            ObjectHandle::string(b"keep".to_vec()),
+            ObjectHandle::string(b"replace".to_vec()),
         ]),
-    );
+    )
+    .expect("install array");
 
     let array = pdf.get_object_handle(array_ref);
     array
@@ -52,11 +53,17 @@ fn external_consumer_can_mark_a_direct_child_array_dirty_for_write_back() {
     };
 
     let mut reopened = Pdf::open_mem_owned(output).expect("reopen written PDF");
-    let catalog = reopened
-        .resolve_object(root_ref)
+    let catalog = reopened.get_object_handle(root_ref);
+    reopened
+        .resolve(&catalog)
         .expect("resolve the rewritten catalog");
     assert_eq!(
-        catalog.as_dict().and_then(|dict| dict.get("DirectValues")),
-        Some(&Object::Array(vec![Object::Integer(1), Object::Integer(2)]))
+        catalog.get_key(b"/DirectValues").as_array().map(|items| {
+            items
+                .iter()
+                .filter_map(ObjectHandle::as_integer)
+                .collect::<Vec<_>>()
+        }),
+        Some(vec![1, 2])
     );
 }

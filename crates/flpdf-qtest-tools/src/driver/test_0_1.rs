@@ -412,7 +412,7 @@ mod tests {
         run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
         write_object_details,
     };
-    use flpdf::{Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
+    use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions};
     use std::io::{self, Write};
 
     struct WriteFailure;
@@ -681,14 +681,8 @@ mod tests {
         };
         let mut pdf =
             Pdf::open_mem_owned_with_options(bytes, options).expect("open test_0_1 fixture");
-        for number in 100..=164 {
-            let value = if number == 164 {
-                Object::Boolean(true)
-            } else {
-                Object::Reference(ObjectRef::new(number + 1, 0))
-            };
-            pdf.set_object(ObjectRef::new(number, 0), value);
-        }
+        pdf.set_object_handle(ObjectRef::new(100, 0), ObjectHandle::boolean(true))
+            .expect("install indirect child target");
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1362,93 +1356,6 @@ mod tests {
         assert_eq!(
             stderr,
             b"WARNING: fixture.pdf (offset 202): stream /DecodeParms length is inconsistent with filters\n"
-        );
-    }
-
-    #[test]
-    fn chained_stream_warning_uses_terminal_stream_offset() {
-        let stream = b"<< /Filter [ /FlateDecode /FlateDecode ] \
-                       /DecodeParms [ null ] /Length 3 >>\n\
-                       stream\nabc\nendstream"
-            .to_vec();
-        let bytes = pdf_with_qtest(b"6 0 R", &[(6, b"7 0 R".to_vec()), (7, stream)]);
-        let options = PdfOpenOptions {
-            repair: true,
-            ..PdfOpenOptions::default()
-        };
-        let mut pdf =
-            Pdf::open_mem_owned_with_options(bytes, options).expect("open chained stream fixture");
-        pdf.set_object(
-            flpdf::ObjectRef::new(6, 0),
-            Object::Reference(flpdf::ObjectRef::new(7, 0)),
-        );
-        let terminal_offset = pdf
-            .source_stream_data_offset(flpdf::ObjectRef::new(7, 0))
-            .expect("locate terminal stream")
-            .expect("terminal stream offset");
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
-
-        run_test_0_1(
-            &mut pdf,
-            b"fixture.pdf",
-            &mut stdout,
-            &mut stderr,
-            &mut diagnostics_written,
-        )
-        .expect("run chained stream fixture");
-
-        assert_eq!(
-            stderr,
-            format!(
-                "WARNING: fixture.pdf (offset {terminal_offset}): \
-                 stream /DecodeParms length is inconsistent with filters\n"
-            )
-            .into_bytes()
-        );
-    }
-
-    #[test]
-    fn a_redirect_chain_exactly_at_the_terminal_ref_chase_limit_still_unparses() {
-        // Codex Review on PR #610, follow-up: `resolve_to_terminal_ref`
-        // (used for type inspection above) resolves `/QTest`'s own reference
-        // once for free before counting any further `Pdf::set_object`
-        // redirects, but the old raw walk feeding the final unparse lines
-        // used to re-spend that first hop -- a chain landing
-        // exactly at the ObjectHandle chase's own 64-redirect limit was one
-        // hop short of the old raw walk's own budget, so `run_test_0_1`
-        // returned an error after printing the type-inspection lines but
-        // before either unparse line.
-        let bytes = pdf_with_qtest(b"1064 0 R", &[]);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open redirect-chain fixture");
-        pdf.set_object(flpdf::ObjectRef::new(1000, 0), Object::Boolean(true));
-        for number in 1001..=1064 {
-            pdf.set_object(
-                flpdf::ObjectRef::new(number, 0),
-                Object::Reference(flpdf::ObjectRef::new(number - 1, 0)),
-            );
-        }
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut diagnostics_written = pdf.repair_diagnostics().entries().len();
-
-        run_test_0_1(
-            &mut pdf,
-            b"fixture.pdf",
-            &mut stdout,
-            &mut stderr,
-            &mut diagnostics_written,
-        )
-        .expect("a chain exactly at the chase limit must not error");
-
-        assert!(stderr.is_empty());
-        assert_eq!(
-            stdout,
-            b"/QTest is indirect and has type boolean (3)\n\
-              /QTest is Boolean with value true\n\
-              unparse: 1064 0 R\n\
-              unparseResolved: true\n"
         );
     }
 

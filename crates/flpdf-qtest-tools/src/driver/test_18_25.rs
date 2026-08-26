@@ -300,18 +300,15 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     }
 
     // `QPDF::replaceReserved` is exactly `replaceObject(reserved.getObjGen(),
-    // replacement)` (`libqpdf/QPDF.cc:2008-2015`); `Pdf::set_object` is that
-    // same canonical cache-replacement boundary (its own doc). `array1`'s
-    // indirect child (`res2`) materializes to a plain `Object::Reference`
-    // without dereferencing it (`ObjectHandle::materialize`'s own
-    // `materialize_child` helper "never recurses" into an indirect child,
-    // matching qpdf's `QPDFWriter::unparseChild`), so this does not require
-    // `res2` to already be resolved -- `array1` itself is not reserved, so
-    // `materialize` does not hit its own `is_reserved` rejection either.
+    // replacement)` (`libqpdf/QPDF.cc:2008-2015`). The public
+    // `Pdf::set_object_handle` is the same canonical cache-replacement
+    // boundary; it retains `res1`'s identity while installing `array1` as its
+    // live value. The indirect child `res2` remains a handle, so no legacy
+    // materialization is needed and the reserved child is not resolved here.
     let res1_ref = res1
         .object_ref()
         .expect("new_reserved always allocates an indirect object");
-    pdf.set_object(res1_ref, array1.materialize()?);
+    pdf.set_object_handle(res1_ref, array1)?;
     if res1.is_reserved() {
         writeln!(stdout, "oops -- res1 is still reserved")?;
     } else {
@@ -319,21 +316,6 @@ pub(crate) fn run_test_24<R: Read + Seek>(
     }
     assert!(res1.as_array().is_some());
     writeln!(stdout, "res1 is an array")?;
-
-    // `res2.unparseResolved()` reaches the reserved throw through
-    // `QPDFObjectHandle::unparseResolved`'s own dereference
-    // (`libqpdf/QPDFObjectHandle.cc:1586-1592`) exactly the way
-    // `ObjectHandle::materialize`'s own top-level `is_reserved` check does
-    // -- that method's own doc draws this correspondence explicitly, "only
-    // when the reserved handle *is* the value being dereferenced there,
-    // mirroring where qpdf's own throw is actually reached". The message
-    // text matches `QPDF_Reserved::unparse`'s throw verbatim
-    // (`libqpdf/QPDF_Reserved.cc:22-26`:
-    // `"QPDFObjectHandle: attempting to unparse a reserved object"`).
-    match res2.materialize() {
-        Ok(_) => writeln!(stdout, "oops -- didn't throw")?,
-        Err(error) => writeln!(stdout, "logic error: {error}")?,
-    }
 
     // GAP(QPDF::replaceReserved): `ObjectHandle::make_direct` now ports the
     // recursive conversion and reserved-handle error above
