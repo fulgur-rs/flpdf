@@ -197,7 +197,7 @@ Confirm the production route has no raw page snapshot, qpdf citations match,
 the old `overlay_annotations.rs` scope was not pulled in, and no
 `canonical_*`/overlay naming cleanup slipped into this issue.
 
-- [ ] **Step 2: Rebase and rerun all gates.**
+- [x] **Step 2: Rebase and rerun all gates.**
 
 ```bash
 git fetch --prune origin
